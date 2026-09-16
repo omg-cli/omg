@@ -18,6 +18,7 @@ See the [release overview and complete commit ledger](releases/v0.1.223.md).
 
 ### Daemon updates
 
+- Serialize native APT cache lifetimes across daemon request and background workers. A Debian QEMU restart exposed a SIGSEGV while both paths could enter libapt concurrently; retain the lock through cache destruction and test concurrent native status queries.
 - Update `omg` and `omgd` together from the same verified release archive. Refuse incomplete pairs, stage both binaries before replacing either, serialize concurrent updaters, and restore previous files on replacement failures.
 - Include `omgd` in every Linux and macOS release archive. Self-update now reports both installed binaries and reminds users to restart an already-running daemon.
 
