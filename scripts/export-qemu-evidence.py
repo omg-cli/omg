@@ -32,7 +32,11 @@ HOST_FILES = {
     "benchmark-driver-sha256.txt", "cases.tsv", "controller-id.txt", "release-checksum.txt",
 }
 GUEST_FILES = {
-    "qemu-startup.log",
+    "qemu-startup.log", "daemon-lifecycle.json",
+    "daemon-direct.log", "daemon-foreground.log",
+    "daemon-direct-status.txt", "daemon-foreground-status.txt",
+    "daemon-direct-duplicate.txt", "daemon-foreground-duplicate.txt",
+    "daemon-direct-launcher.txt", "daemon-foreground-launcher.txt",
     "exit-code", "audit-directory-after.txt", "audit-directory-metadata.txt",
     "index-update.txt", "search.txt", "omg-info.txt", "native-info.txt",
     "local-package.sha256", "local-consent.txt", "system-audit-verify.txt",

@@ -503,6 +503,7 @@ if [[ "$benchmark" == true ]]; then
   fi
   sha256sum "$work/benchmark-hyperfine.sh" "$work/record-benchmark-run.py" > "$work/benchmark-driver-sha256.txt"
 fi
+cp "$here/qemu-daemon-check.sh" "$work/qemu-daemon-check.sh"
 cat > "$work/guest-check.sh" <<'GUEST'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -533,6 +534,9 @@ printf '%s  release.tar.gz\n' "$digest" | sha256sum -c -
 tar -xzf release.tar.gz
 bin="$HOME/omg-${tag}-${guest_arch}-linux-${distro}/omg"
 [[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
+daemon="${bin%/*}/omgd"
+[[ -x "$daemon" ]]
+[[ $("$daemon" --version | head -1 | tr -d '[:space:]') == "omgd${tag#v}" ]]
 case "$distro" in
   arch) sudo -n pacman -Syu --noconfirm >/dev/null || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
   debian|ubuntu)
@@ -560,6 +564,9 @@ version=$("${version_cmd[@]}")
 [[ "$distro" != arch ]] || version=${version#tree }
 [[ $(awk '$1 == "Name:" {print $2}' evidence/omg-info.txt) == tree ]]
 [[ $(awk '$1 == "Version:" {print $2}' evidence/omg-info.txt) == "$version" ]]
+# Exercise both direct daemon startup and the actual CLI foreground launcher
+# while the package databases and installed fixture are available.
+timeout --kill-after=5s 240s bash "$HOME/qemu-daemon-check.sh" "$bin" "$HOME/evidence"
 if [[ "$benchmark" == true ]]; then
   case "$distro" in
     arch) sudo -n pacman -S --noconfirm --needed hyperfine jq || exit 120 ;;
@@ -621,6 +628,7 @@ GUEST
 opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
+timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
 if [[ "$benchmark" == true ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/benchmark-hyperfine.sh bench@127.0.0.1:benchmark-hyperfine.sh
 fi
@@ -635,6 +643,17 @@ guest_rc=$(<"$work/guest/evidence/exit-code")
 if [[ ! "$guest_rc" =~ ^[0-9]+$ || "$guest_rc" != "$rc" ]]; then
   printf 'Guest exit %s differs from transport exit %s\n' "$guest_rc" "$rc" >&2
   exit 3
+fi
+if [[ "$rc" == 0 ]]; then
+  # A zero guest exit alone is insufficient: require the daemon probe receipt.
+  daemon_receipt="$work/guest/evidence/daemon-lifecycle.json"
+  if ! [[ -f "$daemon_receipt" && $(wc -c < "$daemon_receipt") -le 4096 ]] || ! jq -e '
+    .schema_version == 1 and .direct == true and .foreground == true and
+    .ipc == true and .singleton == true and .shutdown == true and .restart == true
+  ' "$daemon_receipt" >/dev/null; then
+    printf 'Missing or incomplete daemon lifecycle evidence\n' >&2
+    exit 1
+  fi
 fi
 if [[ "$benchmark" == true && "$rc" == 0 ]]; then
   case "$distro" in

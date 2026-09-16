@@ -66,6 +66,8 @@ on:
       - "scripts/report-smoke-sentry.sh"
       - ".github/workflows/qemu-matrix.yml"
       - ".github/workflows/qemu-lane.yml"
+      - "scripts/qemu-daemon-check.sh"
+      - "scripts/test_qemu_daemon_contract.py"
       - "scripts/qemu-image-cache.py"
       - "scripts/test_qemu_image_cache.py"
   schedule:
@@ -135,6 +137,7 @@ jobs:
           python3 -m unittest discover -s tests -p test_qemu_workflow.py
           python3 -m unittest discover -s tests -p test_qemu_verdict.py
           python3 -m unittest discover -s scripts -p test_prepare_qemu_release.py
+          python3 -m unittest discover -s scripts -p test_qemu_daemon_contract.py
           python3 -m unittest discover -s scripts -p test_qemu_image_cache.py
           python3 -m unittest discover -s scripts -p test_qemu_process_isolation.py
           python3 -m unittest discover -s scripts -p test_qemu_controller_floor.py
@@ -343,6 +346,7 @@ jobs:
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
           mkdir -p "omg-v${VERSION}-aarch64-linux-${{ matrix.distro }}"
           cp target/release/omg "omg-v${VERSION}-aarch64-linux-${{ matrix.distro }}/"
+          cp target/release/omgd "omg-v${VERSION}-aarch64-linux-${{ matrix.distro }}/"
           cp README.md LICENSE "omg-v${VERSION}-aarch64-linux-${{ matrix.distro }}/"
           tar -czf "omg-v${VERSION}-aarch64-linux-${{ matrix.distro }}.tar.gz" "omg-v${VERSION}-aarch64-linux-${{ matrix.distro }}"
           sha256sum "omg-v${VERSION}-aarch64-linux-${{ matrix.distro }}.tar.gz" > "omg-v${VERSION}-aarch64-linux-${{ matrix.distro }}.tar.gz.sha256"
@@ -410,6 +414,7 @@ jobs:
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
           mkdir -p "omg-v${VERSION}-aarch64-linux-ubuntu"
           cp target/release/omg "omg-v${VERSION}-aarch64-linux-ubuntu/"
+          cp target/release/omgd "omg-v${VERSION}-aarch64-linux-ubuntu/"
           cp README.md LICENSE "omg-v${VERSION}-aarch64-linux-ubuntu/"
           tar -czf "omg-v${VERSION}-aarch64-linux-ubuntu.tar.gz" "omg-v${VERSION}-aarch64-linux-ubuntu"
           sha256sum "omg-v${VERSION}-aarch64-linux-ubuntu.tar.gz" > "omg-v${VERSION}-aarch64-linux-ubuntu.tar.gz.sha256"

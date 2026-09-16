@@ -180,6 +180,7 @@ jobs:
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
           mkdir -p "omg-v${VERSION}-x86_64-linux-debian"
           cp target/release/omg "omg-v${VERSION}-x86_64-linux-debian/"
+          cp target/release/omgd "omg-v${VERSION}-x86_64-linux-debian/"
           cp README.md LICENSE "omg-v${VERSION}-x86_64-linux-debian/"
           tar -czvf "omg-v${VERSION}-x86_64-linux-debian.tar.gz" "omg-v${VERSION}-x86_64-linux-debian"
           sha256sum "omg-v${VERSION}-x86_64-linux-debian.tar.gz" > "omg-v${VERSION}-x86_64-linux-debian.tar.gz.sha256"
@@ -223,6 +224,7 @@ jobs:
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
           mkdir -p "omg-v${VERSION}-x86_64-linux-ubuntu"
           cp target/release/omg "omg-v${VERSION}-x86_64-linux-ubuntu/"
+          cp target/release/omgd "omg-v${VERSION}-x86_64-linux-ubuntu/"
           cp README.md LICENSE "omg-v${VERSION}-x86_64-linux-ubuntu/"
           tar -czvf "omg-v${VERSION}-x86_64-linux-ubuntu.tar.gz" "omg-v${VERSION}-x86_64-linux-ubuntu"
           sha256sum "omg-v${VERSION}-x86_64-linux-ubuntu.tar.gz" > "omg-v${VERSION}-x86_64-linux-ubuntu.tar.gz.sha256"
@@ -273,6 +275,7 @@ jobs:
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
           mkdir -p "omg-v${VERSION}-x86_64-linux-fedora"
           cp target/release/omg "omg-v${VERSION}-x86_64-linux-fedora/"
+          cp target/release/omgd "omg-v${VERSION}-x86_64-linux-fedora/"
           cp README.md LICENSE "omg-v${VERSION}-x86_64-linux-fedora/"
           tar -czvf "omg-v${VERSION}-x86_64-linux-fedora.tar.gz" "omg-v${VERSION}-x86_64-linux-fedora"
           sha256sum "omg-v${VERSION}-x86_64-linux-fedora.tar.gz" > "omg-v${VERSION}-x86_64-linux-fedora.tar.gz.sha256"

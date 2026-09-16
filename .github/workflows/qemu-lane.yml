@@ -89,9 +89,7 @@ jobs:
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
           mkdir -p "omg-v${VERSION}-x86_64-linux-${{ inputs.distro }}"
           cp target/release/omg "omg-v${VERSION}-x86_64-linux-${{ inputs.distro }}/"
-          if [[ "${{ inputs.distro }}" == "arch" ]]; then
-            cp target/release/omgd "omg-v${VERSION}-x86_64-linux-${{ inputs.distro }}/"
-          fi
+          cp target/release/omgd "omg-v${VERSION}-x86_64-linux-${{ inputs.distro }}/"
           cp README.md LICENSE "omg-v${VERSION}-x86_64-linux-${{ inputs.distro }}/"
           tar -czf "omg-v${VERSION}-x86_64-linux-${{ inputs.distro }}.tar.gz" "omg-v${VERSION}-x86_64-linux-${{ inputs.distro }}"
           sha256sum "omg-v${VERSION}-x86_64-linux-${{ inputs.distro }}.tar.gz" > "omg-v${VERSION}-x86_64-linux-${{ inputs.distro }}.tar.gz.sha256"
@@ -158,6 +156,7 @@ jobs:
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
           mkdir -p "omg-v${VERSION}-x86_64-linux-ubuntu"
           cp target/release/omg "omg-v${VERSION}-x86_64-linux-ubuntu/"
+          cp target/release/omgd "omg-v${VERSION}-x86_64-linux-ubuntu/"
           cp README.md LICENSE "omg-v${VERSION}-x86_64-linux-ubuntu/"
           tar -czf "omg-v${VERSION}-x86_64-linux-ubuntu.tar.gz" "omg-v${VERSION}-x86_64-linux-ubuntu"
           sha256sum "omg-v${VERSION}-x86_64-linux-ubuntu.tar.gz" > "omg-v${VERSION}-x86_64-linux-ubuntu.tar.gz.sha256"
