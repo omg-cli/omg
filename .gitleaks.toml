@@ -24,4 +24,4 @@ description = "Public QEMU rust-cache namespace"
 condition = "AND"
 regexTarget = "line"
 regexes = ['''^\s*prefix-key: qemu-staged-v1\s*$''']
-paths = ['''^\.github/workflows/qemu-matrix\.yml$''']
+paths = ['''^\.github/workflows/qemu-(matrix|lane)\.yml$''']

@@ -355,16 +355,18 @@ timeout 30 docker exec "$controller" bash /work/check-qemu-controller.sh "$qemu_
 # A cache hit is only a transport optimization: copy and hash the bytes before
 # handing them to the controller, then verify again there and against policy.
 cache_file=
+cache_hit=false
 if [[ -n "$image_cache" ]]; then
   cache_file="$image_cache/${hash_tool%sum}-$image_hash.qcow2"
   if timeout 90 python3 "$here/qemu-image-cache.py" "$cache_file" "$work/guest/base.qcow2" --algorithm "${hash_tool%sum}" --digest "$image_hash" > "$work/image-cache.log" 2>&1; then
+    cache_hit=true
     printf 'verified cache hit\n' >> "$work/image-cache.log"
   else
     printf 'cache miss; downloading pinned image\n' >> "$work/image-cache.log"
   fi
 fi
 timeout 360 docker exec "$controller" bash -c 'set -e; cd /work/guest; if [[ ! -f base.qcow2 ]]; then curl --fail --location --max-time 300 -o base.qcow2 "$1"; fi; printf "%s  base.qcow2\n" "$2" | "$3" -c -' _ "$image_url" "$image_hash" "$hash_tool" > "$work/image-setup.log" 2>&1
-if [[ -n "$cache_file" ]]; then
+if [[ -n "$cache_file" && "$cache_hit" == false ]]; then
   timeout 90 python3 "$here/qemu-image-cache.py" "$work/guest/base.qcow2" "$cache_file" --algorithm "${hash_tool%sum}" --digest "$image_hash" >> "$work/image-cache.log" 2>&1
 fi
 if [[ -n "$image_policy" ]]; then
