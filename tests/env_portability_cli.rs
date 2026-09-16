@@ -1,5 +1,5 @@
 //! Exercise manifest preview/export through the actual CLI in isolated homes.
-mod common;
+pub mod common;
 
 use common::TestProject;
 use omg_lib::core::env::fingerprint::EnvironmentState;
