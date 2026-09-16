@@ -807,6 +807,12 @@ pub enum PrivacyCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum EnvCommands {
+    /// Preview portable environment requirements without installing or copying files
+    Plan {
+        /// Target platform and architecture
+        #[arg(long, value_parser = ["arch-x86_64", "debian-x86_64", "ubuntu-x86_64", "fedora-x86_64", "macos-aarch64"])]
+        target: String,
+    },
     /// Capture current environment state to omg.lock
     Capture,
     /// Check for drift against omg.lock
@@ -1324,6 +1330,14 @@ mod tests {
     fn workspace_environment_command_is_truthfully_named() {
         assert!(Cli::try_parse_from(["omg", "workspace", "check"]).is_ok());
         assert!(Cli::try_parse_from(["omg", "workspace", "sync"]).is_err());
+    }
+
+    #[test]
+    fn environment_plan_requires_an_explicit_supported_target() {
+        assert!(Cli::try_parse_from(["omg", "env", "plan", "--target", "ubuntu-x86_64"]).is_ok());
+        assert!(Cli::try_parse_from(["omg", "env", "plan"]).is_err());
+        assert!(Cli::try_parse_from(["omg", "env", "plan", "--target", "nixos-x86_64"]).is_err());
+        assert!(Cli::try_parse_from(["omg", "env", "apply"]).is_err());
     }
 
     #[test]
