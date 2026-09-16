@@ -199,11 +199,10 @@ class SecurityBoundaryTests(unittest.TestCase):
             self.assertNotIn('restore-keys:', workflow)
             self.assertIn('--image-cache "$RUNNER_TEMP/qemu-image-cache"', workflow)
 
-    def test_release_builds_only_package_targets_without_removing_daemon_tests(self):
+    def test_all_distros_keep_daemon_release_compilation_and_unit_tests(self):
         self.assertEqual(TEXT.count('cargo test --lib --bins '), 4)
-        self.assertIn('binaries=(--bin omg)', LANE)
-        self.assertIn('if [[ "${{ inputs.distro }}" == arch ]]; then binaries+=(--bin omgd); fi', LANE)
-        self.assertEqual(TEXT.count('cargo build --timings --release --bin omg '), 3)
+        self.assertEqual(TEXT.count('cargo build --timings --release --no-default-features '), 4)
+        self.assertNotIn('--bin omg', TEXT)
 
     def test_github_token_is_step_scoped(self):
         self.assertNotRegex(TEXT, r'(?m)^  GH_TOKEN:')

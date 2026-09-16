@@ -19,7 +19,7 @@ Exa research: nine searches, 45 requested result slots across scheduling, compil
 
 Measured PR #431 QEMU run 35024702965: staged builds 14m55s–17m46s; guests 4m47s–7m05s. All guests waited until 21:35:16Z; Debian build finished 21:32:23Z. Independent scheduling removes that dependency, but runner queues and the longest lane still bound total latency. No percentage speedup promised.
 
-Main run 35045977829 subsequently passed. Its Debian Cargo report showed omg binary 137.6s, aws-lc-sys build script 132.66s, omgd binary 91.39s, and omg library 87.07s. Binary builds overlapped, so these durations cannot be added or treated as guaranteed wall-clock savings. Non-Arch archives exclude omgd: stop compiling that unused release binary while retaining every library/binary unit test. Arch still builds both release binaries.
+Main run 35045977829 subsequently passed. Its Debian Cargo report showed omg binary 137.6s, aws-lc-sys build script 132.66s, omgd binary 91.39s, and omg library 87.07s. Binary builds overlapped, so these durations cannot be added or treated as guaranteed wall-clock savings. Non-Arch archives currently exclude omgd, but source and launcher support the daemon across Unix platforms. This is a packaging gap, not evidence that release compilation is redundant. Keep all daemon release builds.
 
 ## Implementation
 
@@ -27,7 +27,7 @@ Main run 35045977829 subsequently passed. Its Debian Cargo report showed omg bin
 - [x] Update workflow regression tests to inspect the reusable file; execute staged/published selection and failure/cancellation/missing-job cases. Keep `QEMU matrix result` fail-closed and release gate names stable.
 - [x] Add `scripts/qemu-image-cache.py` for digest-verified atomic copy. Missing/corrupt cached data must never be executed. Test SHA256/SHA512, damaged bytes, symlinks, invalid writes and destination preservation.
 - [x] Wire optional `--image-cache` into the harness; cache only the pinned distro/architecture image. Restore/save with SHA-pinned Actions. Only trusted default-branch runs save shared image caches. Hash the actual image in the controller before boot and retain manifest verification.
-- [x] Select only packaged release binaries in staged builds (`omg` everywhere, `omgd` additionally on Arch); retain all existing `cargo test --lib --bins` checks.
+- [x] Preserve daemon release compilation on every distro and all library/binary unit tests; do not infer product support from existing packaging omissions.
 - [ ] Run focused workflow, image, provenance, process-isolation, inventory, egress and reporting regressions plus Bash syntax/YAML checks. Review full diff, commit and open a `perf(ci):` PR; examine actual hosted results before claiming success.
 
 ## Decisions against speculative work

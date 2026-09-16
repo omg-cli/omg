@@ -327,7 +327,7 @@ jobs:
 
       - name: Build
         run: |
-          cargo build --timings --release --bin omg --no-default-features --features ${{ matrix.features }} --locked
+          cargo build --timings --release --no-default-features --features ${{ matrix.features }} --locked
 
       - name: Preserve compiler timings
         if: always()
@@ -394,7 +394,7 @@ jobs:
         run: cargo test --lib --bins --no-default-features --features debian,pgp,license --locked --no-fail-fast -- --test-threads=1
 
       - name: Build
-        run: cargo build --timings --release --bin omg --no-default-features --features debian,pgp,license --locked
+        run: cargo build --timings --release --no-default-features --features debian,pgp,license --locked
 
       - name: Preserve compiler timings
         if: always()

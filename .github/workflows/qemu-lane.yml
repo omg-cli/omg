@@ -73,9 +73,7 @@ jobs:
       - name: Build
         run: |
           export RUSTFLAGS="-C target-cpu=x86-64-v2"
-          binaries=(--bin omg)
-          if [[ "${{ inputs.distro }}" == arch ]]; then binaries+=(--bin omgd); fi
-          cargo build --timings --release "${binaries[@]}" --no-default-features --features ${{ inputs.features }} --locked
+          cargo build --timings --release --no-default-features --features ${{ inputs.features }} --locked
 
       - name: Preserve compiler timings
         if: always()
@@ -144,7 +142,7 @@ jobs:
         run: cargo test --lib --bins --no-default-features --features debian,pgp,license --locked --no-fail-fast -- --test-threads=1
 
       - name: Build
-        run: cargo build --timings --release --bin omg --no-default-features --features debian,pgp,license --locked
+        run: cargo build --timings --release --no-default-features --features debian,pgp,license --locked
 
       - name: Preserve compiler timings
         if: always()
