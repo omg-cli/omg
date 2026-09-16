@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class NetworkScopeTests(unittest.TestCase):
     def test_workflow_requires_namespace_isolation(self):
-        workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text()
+        workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
         self.assertEqual(workflow.count("--inventory-isolate-hermetic"), 2)
         runner = (ROOT / "scripts/qemu-inventory.sh").read_text()
         self.assertIn('--isolate-hermetic) isolate_hermetic=true', runner)

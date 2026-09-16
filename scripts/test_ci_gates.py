@@ -71,7 +71,12 @@ class QemuConcurrencyTests(unittest.TestCase):
     def test_matrix_jobs_have_distinct_concurrency_groups(self) -> None:
         workflow = CI_YML.with_name("qemu-matrix.yml").read_text(encoding="utf-8")
         groups: list[str] = []
-        for job in ["build-staged", "build-staged-arm", "guest", "guest-arm"]:
+        # x64 lanes inherit parent-workflow cancellation. A reusable workflow
+        # must not reuse the parent's group and cancel its own caller.
+        lane = CI_YML.with_name("qemu-lane.yml").read_text(encoding="utf-8")
+        self.assertNotIn("concurrency:", lane)
+        self.assertIn("uses: ./.github/workflows/qemu-lane.yml", job_block(workflow, "guest"))
+        for job in ["build-staged-arm", "guest-arm"]:
             block = job_block(workflow, job)
             match = re.search(r"^      group: (.+)$", block, re.MULTILINE)
             if match is None:

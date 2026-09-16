@@ -28,7 +28,7 @@ HOST_FILES = {
     "inventory-admission.json",
     "storage-faults.json", "storage-faults.log",
     "egress-policy.json", "egress-policy.log",
-    "image-provenance.json",
+    "image-provenance.json", "image-cache.log",
     "benchmark-driver-sha256.txt", "cases.tsv", "controller-id.txt", "release-checksum.txt",
 }
 GUEST_FILES = {

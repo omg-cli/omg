@@ -8,6 +8,7 @@ release_dir=
 inventory_file=
 inventory_policy=
 image_policy=
+image_cache=
 arch=
 print_pins=false
 benchmark=false
@@ -23,13 +24,14 @@ root="$HOME/.cache/build-targets/omg-qemu-benchmark"
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 while (($#)); do
   case "$1" in
-    --distro|--release|--staged-dir|--release-dir|--inventory-file|--inventory-policy|--image-policy|--evidence-dir|--inventory-tiers|--arch)
+    --distro|--release|--staged-dir|--release-dir|--inventory-file|--inventory-policy|--image-policy|--image-cache|--evidence-dir|--inventory-tiers|--arch)
       [[ $# -ge 2 && -n "$2" ]] || exit 2
       case "$1" in
         --distro) distro=$2 ;; --release) tag=$2 ;; --staged-dir) staged_dir=$2 ;; --evidence-dir) root=$2 ;;
         --release-dir) release_dir=$2 ;; --inventory-file) inventory_file=$2 ;;
         --inventory-policy) inventory_policy=$2 ;;
         --image-policy) image_policy=$2 ;;
+        --image-cache) image_cache=$2 ;;
         --inventory-tiers) inventory_tiers=$2 ;; --arch) arch=$2 ;;
       esac
       shift 2 ;;
@@ -50,7 +52,7 @@ Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|ubuntu|fedora]
   [--evidence-dir DIR] [--benchmark] [--benchmark-transactions COUNT]
   [--print-pins] [--inventory-tiers CSV] [--inventory-allow-mutations]
   [--inventory-policy JSON]
-  [--image-policy JSON]
+  [--image-policy JSON] [--image-cache DIR]
   [--inventory-isolate-hermetic]
 
 Runs disposable KVM guests with pinned images, reboot, sudo, package lifecycle,
@@ -206,6 +208,7 @@ if [[ "$distro" == all ]]; then
   [[ -z "$inventory_file" ]] || args+=(--inventory-file "$inventory_file")
   [[ -z "$inventory_policy" ]] || args+=(--inventory-policy "$inventory_policy")
   [[ -z "$image_policy" ]] || args+=(--image-policy "$image_policy")
+  [[ -z "$image_cache" ]] || args+=(--image-cache "$image_cache")
   [[ "$benchmark" == false ]] || args+=(--benchmark)
   [[ "$transaction_samples" == 0 ]] || args+=(--benchmark-transactions "$transaction_samples")
   [[ -z "$inventory_tiers" ]] || args+=(--inventory-tiers "$inventory_tiers")
@@ -349,7 +352,21 @@ fi
 timeout --kill-after=5s 600 docker exec "$controller" sh -c "apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends $qemu_pkg qemu-utils cloud-image-utils openssh-client curl ca-certificates $firmware_pkg jq" > "$work/controller-setup.log" 2>&1
 cp "$here/check-qemu-controller.sh" "$work/check-qemu-controller.sh"
 timeout 30 docker exec "$controller" bash /work/check-qemu-controller.sh "$qemu_pkg" > "$work/controller-security.log" 2>&1
-timeout 360 docker exec "$controller" bash -c 'set -e; cd /work/guest; curl --fail --location --max-time 300 -o base.qcow2 "$1"; printf "%s  base.qcow2\n" "$2" | "$3" -c -' _ "$image_url" "$image_hash" "$hash_tool" > "$work/image-setup.log" 2>&1
+# A cache hit is only a transport optimization: copy and hash the bytes before
+# handing them to the controller, then verify again there and against policy.
+cache_file=
+if [[ -n "$image_cache" ]]; then
+  cache_file="$image_cache/${hash_tool%sum}-$image_hash.qcow2"
+  if timeout 90 python3 "$here/qemu-image-cache.py" "$cache_file" "$work/guest/base.qcow2" --algorithm "${hash_tool%sum}" --digest "$image_hash" > "$work/image-cache.log" 2>&1; then
+    printf 'verified cache hit\n' >> "$work/image-cache.log"
+  else
+    printf 'cache miss; downloading pinned image\n' >> "$work/image-cache.log"
+  fi
+fi
+timeout 360 docker exec "$controller" bash -c 'set -e; cd /work/guest; if [[ ! -f base.qcow2 ]]; then curl --fail --location --max-time 300 -o base.qcow2 "$1"; fi; printf "%s  base.qcow2\n" "$2" | "$3" -c -' _ "$image_url" "$image_hash" "$hash_tool" > "$work/image-setup.log" 2>&1
+if [[ -n "$cache_file" ]]; then
+  timeout 90 python3 "$here/qemu-image-cache.py" "$work/guest/base.qcow2" "$cache_file" --algorithm "${hash_tool%sum}" --digest "$image_hash" >> "$work/image-cache.log" 2>&1
+fi
 if [[ -n "$image_policy" ]]; then
   timeout 90 python3 "$here/verify-qemu-image.py" --manifest "$image_policy" --identity "$distro-$arch" \
     --url "$image_url" --digest "$image_hash" --image "$work/guest/base.qcow2" > "$work/image-provenance.json"
