@@ -28,10 +28,10 @@ class DaemonContractTests(unittest.TestCase):
             self.assertTrue(marker.exists(), 'unrelated process suppressed daemon startup')
             self.assertEqual(marker.read_text(), 'daemon')
 
-    def test_linux_release_and_staged_archives_ship_matching_daemon(self):
+    def test_release_and_staged_archives_ship_matching_daemon(self):
         for name in ('release.yml', 'qemu-matrix.yml', 'qemu-lane.yml'):
             text = (ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
-            destinations = re.findall(r'cp target/release/omg ("[^\n]*linux[^\n]*")', text)
+            destinations = re.findall(r'cp target/release/omg ("[^\n]*(?:linux|darwin)[^\n]*")', text)
             self.assertTrue(destinations, name)
             for destination in destinations:
                 self.assertIn('cp target/release/omgd ' + destination, text, (name, destination))

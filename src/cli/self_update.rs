@@ -148,13 +148,11 @@ pub async fn run(force: bool, version: Option<String>) -> Result<()> {
         }
 
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory for update")?;
-        let new_binary = extract_update_binary(&bytes, temp_dir.path(), &archive_name)
-            .context("Failed to extract update binary")?
-            .ok_or_else(|| anyhow::anyhow!("update archive did not contain an 'omg' binary"))?;
+        let (new_binary, new_daemon) = extract_update_pair(&bytes, temp_dir.path(), &archive_name)?;
 
         let current_exe = env::current_exe().context("Failed to find current executable path")?;
-        install_binary_atomically(&new_binary, &current_exe)
-            .context("Failed to install updated binary")
+        install_update_pair(&new_binary, &new_daemon, &current_exe)
+            .context("Failed to install updated OMG binaries")
     })
     .await??;
 
@@ -163,24 +161,40 @@ pub async fn run(force: bool, version: Option<String>) -> Result<()> {
         style::maybe_color("✓", |t| t.green().to_string())
     );
     println!(
-        "  {} is now installed.",
+        "  omg and omgd {} are now installed.",
         style::maybe_color(&format!("v{target_version}"), |t| t.cyan().to_string())
+    );
+    println!(
+        "  Restart any running omgd to load the updated daemon (restart its user service, or log out and back in)."
     );
 
     Ok(())
 }
 
-fn install_binary_atomically(
+fn stage_update_binary(
     new_binary: &std::path::Path,
     destination: &std::path::Path,
-) -> Result<()> {
+) -> Result<tempfile::NamedTempFile> {
     let parent = destination
         .parent()
         .context("Current executable has no parent directory")?;
     let mut staged = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("Failed to stage update in {}", parent.display()))?;
-    let mut source = fs::File::open(new_binary)
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits());
+    }
+    let mut source = options
+        .open(new_binary)
         .with_context(|| format!("Failed to open update payload {}", new_binary.display()))?;
+    anyhow::ensure!(
+        source.metadata()?.is_file(),
+        "Update payload is not a regular file"
+    );
     std::io::copy(&mut source, staged.as_file_mut())
         .context("Failed to copy update payload into executable directory")?;
 
@@ -196,6 +210,13 @@ fn install_binary_atomically(
         .as_file_mut()
         .sync_all()
         .context("Failed to sync updated binary")?;
+    Ok(staged)
+}
+
+fn persist_update_binary(
+    staged: tempfile::NamedTempFile,
+    destination: &std::path::Path,
+) -> Result<()> {
     staged
         .persist(destination)
         .map_err(|error| error.error)
@@ -204,9 +225,137 @@ fn install_binary_atomically(
     Ok(())
 }
 
-/// Cap on decompressed update payload: a release tarball holds one binary
-/// (~10-30 MiB), so anything larger is a decompression bomb.
-const MAX_UPDATE_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(test)]
+fn install_binary_atomically(
+    new_binary: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<()> {
+    persist_update_binary(stage_update_binary(new_binary, destination)?, destination)
+}
+
+fn install_update_pair(
+    cli: &std::path::Path,
+    daemon: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<()> {
+    install_update_pair_with(cli, daemon, destination, persist_update_binary)
+}
+
+fn extract_update_pair(
+    bytes: &[u8],
+    directory: &std::path::Path,
+    archive_name: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let cli = extract_update_binary(bytes, directory, archive_name)?
+        .context("Update archive did not contain an 'omg' binary")?;
+    let daemon = cli.with_file_name("omgd");
+    anyhow::ensure!(
+        daemon.is_file(),
+        "Update archive did not contain an 'omgd' binary; refusing a partial update"
+    );
+    Ok((cli, daemon))
+}
+
+// Two renames are not an atomic pair. Stage everything first and roll back
+// reported I/O failures; never claim success with only one binary installed.
+fn install_update_pair_with(
+    cli: &std::path::Path,
+    daemon: &std::path::Path,
+    destination: &std::path::Path,
+    mut replace: impl FnMut(tempfile::NamedTempFile, &std::path::Path) -> Result<()>,
+) -> Result<()> {
+    let parent = destination.parent().context("Executable has no parent")?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits());
+    }
+    let lock = options.open(parent.join(".omg-self-update.lock"))?;
+    let metadata = lock.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "Unsafe self-update lock");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(metadata.nlink() == 1, "Unsafe hard-linked self-update lock");
+    }
+    lock.try_lock()
+        .context("Another self-update is in progress; retry when it finishes")?;
+    // Keep the lock file: unlinking it would let another updater lock a new inode.
+    let destinations = [
+        destination.with_file_name("omgd"),
+        destination.to_path_buf(),
+    ];
+    anyhow::ensure!(
+        destinations[0] != destinations[1],
+        "CLI and daemon destinations overlap"
+    );
+    let mut backups = Vec::new();
+    for (index, path) in destinations.iter().enumerate() {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.is_file(),
+                    "Refusing non-regular update destination {}",
+                    path.display()
+                );
+                let backup = stage_update_binary(path, path)?;
+                backup.as_file().set_permissions(metadata.permissions())?;
+                backup.as_file().sync_all()?;
+                backups.push(Some(backup));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && index == 0 => {
+                backups.push(None)
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Cannot back up {}", path.display()));
+            }
+        }
+    }
+    let staged = [
+        stage_update_binary(daemon, &destinations[0])?,
+        stage_update_binary(cli, &destinations[1])?,
+    ];
+    for (index, new_binary) in staged.into_iter().enumerate() {
+        if let Err(error) = replace(new_binary, &destinations[index]) {
+            let mut recovery_errors = Vec::new();
+            for (path, backup) in destinations.iter().zip(backups) {
+                let restored = match backup {
+                    Some(backup) => match backup.persist(path) {
+                        Ok(_) => crate::core::safe_ops::sync_parent_directory_sync(path),
+                        Err(failed) => {
+                            let reason = failed.error.to_string();
+                            let retained = failed.file.keep().map(|(_, path)| path);
+                            Err(anyhow::anyhow!("{reason}; recovery copy: {retained:?}"))
+                        }
+                    },
+                    None => match fs::remove_file(path) {
+                        Ok(()) => crate::core::safe_ops::sync_parent_directory_sync(path),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(error.into()),
+                    },
+                };
+                if let Err(recovery) = restored {
+                    recovery_errors.push(format!("{}: {recovery:#}", path.display()));
+                }
+            }
+            if recovery_errors.is_empty() {
+                return Err(error).context("Update failed; previous OMG binaries restored");
+            }
+            anyhow::bail!(
+                "Update failed: {error:#}; rollback needs attention: {}",
+                recovery_errors.join("; ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Two bounded binaries plus tar headers and release documentation.
+const MAX_UPDATE_DECOMPRESSED_BYTES: u64 = 130 * 1024 * 1024;
 
 /// Cap on entry count: a release archive holds a wrapper dir plus binaries.
 const MAX_UPDATE_ARCHIVE_ENTRIES: usize = 16;
@@ -214,12 +363,12 @@ const MAX_UPDATE_ARCHIVE_ENTRIES: usize = 16;
 /// Cap on a single extracted update binary.
 const MAX_UPDATE_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Extract only the `omg` binary from a release archive.
+/// Extract only the `omg` and `omgd` binaries from a release archive.
 ///
 /// CI wraps the payload in a directory named after the archive
 /// (`omg-v1.2.3-x86_64-linux-debian/omg`); a flat root-level `omg` layout is
 /// accepted as a fallback. Unlike a general extractor this allowlists those
-/// two paths and materializes a single regular file: symlinks, hard links,
+/// two layouts and materializes only regular files: symlinks, hard links,
 /// and special entries fail closed instead of being created, so a malicious
 /// archive cannot stage link-traversal writes or plant entries outside the
 /// temp dir, and the decompression budget stops bombs.
@@ -234,6 +383,8 @@ fn extract_update_binary(
         .strip_suffix(".tar.gz")
         .map(|stem| std::path::PathBuf::from(stem).join("omg"));
     let flat = std::path::PathBuf::from("omg");
+    let daemon_wrapper = wrapper.as_ref().map(|path| path.with_file_name("omgd"));
+    let daemon_flat = std::path::PathBuf::from("omgd");
 
     let cursor = std::io::Cursor::new(bytes);
     let decoder = flate2::read::GzDecoder::new(cursor);
@@ -242,6 +393,7 @@ fn extract_update_binary(
     let mut archive = tar::Archive::new(budgeted);
 
     let mut found: Option<std::path::PathBuf> = None;
+    let mut found_daemon: Option<std::path::PathBuf> = None;
     let mut entries = 0usize;
     for entry in archive.entries().context("Failed to read update archive")? {
         entries += 1;
@@ -256,14 +408,15 @@ fn extract_update_binary(
         else {
             continue;
         };
-        let wanted = Some(&relative) == wrapper.as_ref() || relative == flat;
+        let wanted_cli = Some(&relative) == wrapper.as_ref() || relative == flat;
+        let wanted_daemon = Some(&relative) == daemon_wrapper.as_ref() || relative == daemon_flat;
+        let wanted = wanted_cli || wanted_daemon;
         let entry_type = entry.header().entry_type();
-        if entry_type.is_dir() {
+        if entry_type.is_dir() && !wanted {
             continue;
         }
         if !wanted {
-            // Release archives carry exactly one payload binary; anything
-            // else is ignored rather than published.
+            // Documentation is ignored rather than published.
             continue;
         }
         anyhow::ensure!(
@@ -272,7 +425,11 @@ fn extract_update_binary(
             relative.display()
         );
         anyhow::ensure!(
-            found.is_none(),
+            if wanted_cli {
+                found.is_none()
+            } else {
+                found_daemon.is_none()
+            },
             "Update archive contains a duplicate binary entry: {}",
             relative.display()
         );
@@ -282,6 +439,10 @@ fn extract_update_binary(
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
         let mut content = Vec::new();
+        anyhow::ensure!(
+            entry.size() <= MAX_UPDATE_BINARY_BYTES,
+            "Update binary exceeds the size bound"
+        );
         entry
             .read_to_end(&mut content)
             .context("Failed to read update binary from archive")?;
@@ -291,7 +452,17 @@ fn extract_update_binary(
         );
         fs::write(&dest_path, &content)
             .with_context(|| format!("Failed to stage update binary {}", dest_path.display()))?;
-        found = Some(dest_path);
+        if wanted_cli {
+            found = Some(dest_path);
+        } else {
+            found_daemon = Some(dest_path);
+        }
+    }
+    if let (Some(cli), Some(daemon)) = (&found, &found_daemon) {
+        anyhow::ensure!(
+            cli.parent() == daemon.parent(),
+            "Update binaries use inconsistent archive layouts"
+        );
     }
     Ok(found)
 }
@@ -1016,6 +1187,205 @@ mod tests {
         let checksum: u32 = raw[0..512].iter().map(|byte| u32::from(*byte)).sum();
         let encoded = format!("{checksum:06o}\0 ");
         raw[148..156].copy_from_slice(encoded.as_bytes());
+    }
+
+    #[test]
+    fn update_extraction_stages_daemon_from_same_archive() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let bytes = update_test_archive(&[("omg", b"new cli"), ("omgd", b"new daemon")]);
+        extract_update_binary(&bytes, tmp.path(), "omg-v1.2.3-x86_64-linux-arch.tar.gz")
+            .expect("extract pair");
+        assert_eq!(
+            fs::read(tmp.path().join("omgd")).expect("daemon staged"),
+            b"new daemon"
+        );
+    }
+
+    #[test]
+    fn update_pair_requires_both_binaries_before_installation() {
+        for entries in [
+            vec![("omg", b"cli".as_slice())],
+            vec![("omgd", b"daemon".as_slice())],
+        ] {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let bytes = update_test_archive(&entries);
+            assert!(extract_update_pair(&bytes, tmp.path(), "release.tar.gz").is_err());
+        }
+    }
+
+    #[test]
+    fn update_pair_accepts_matching_flat_and_wrapped_layouts() {
+        for prefix in ["", "release/"] {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let cli_name = format!("{prefix}omg");
+            let daemon_name = format!("{prefix}omgd");
+            let bytes = update_test_archive(&[(&cli_name, b"cli"), (&daemon_name, b"daemon")]);
+            let (cli, daemon) =
+                extract_update_pair(&bytes, tmp.path(), "release.tar.gz").expect("pair");
+            assert_eq!(fs::read(cli).expect("cli"), b"cli");
+            assert_eq!(fs::read(daemon).expect("daemon"), b"daemon");
+        }
+    }
+
+    #[test]
+    fn update_pair_rejects_duplicate_daemon_and_mixed_layouts() {
+        for entries in [
+            vec![
+                ("omg", b"cli".as_slice()),
+                ("omgd", b"one".as_slice()),
+                ("omgd", b"two".as_slice()),
+            ],
+            vec![
+                ("omg", b"cli".as_slice()),
+                ("release/omgd", b"daemon".as_slice()),
+            ],
+            vec![
+                ("omg", b"cli".as_slice()),
+                ("omgd", b"daemon".as_slice()),
+                ("release/omg", b"other".as_slice()),
+            ],
+        ] {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            assert!(
+                extract_update_pair(&update_test_archive(&entries), tmp.path(), "release.tar.gz")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn update_pair_rejects_daemon_link_and_directory_entries() {
+        for entry_type in [
+            tar::EntryType::Symlink,
+            tar::EntryType::Link,
+            tar::EntryType::Directory,
+        ] {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(entry_type);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_link_name("omg").expect("link name");
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "omgd", std::io::empty())
+                .expect("entry");
+            let bytes = gzip_bytes(&builder.into_inner().expect("tar"));
+            let tmp = tempfile::tempdir().expect("temp dir");
+            assert!(extract_update_binary(&bytes, tmp.path(), "release.tar.gz").is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    fn pair_fixture(
+        old_daemon: bool,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let cli = tmp.path().join("new-omg");
+        let daemon = tmp.path().join("new-omgd");
+        let bin = tmp.path().join("bin");
+        fs::create_dir(&bin).expect("bin");
+        fs::write(&cli, b"new cli").expect("cli");
+        fs::write(&daemon, b"new daemon").expect("daemon");
+        fs::write(bin.join("omg"), b"old cli").expect("old cli");
+        if old_daemon {
+            fs::write(bin.join("omgd"), b"old daemon").expect("old daemon");
+        }
+        (tmp, cli, daemon, bin.join("omg"))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_pair_installs_both_including_previously_missing_daemon() {
+        use std::os::unix::fs::PermissionsExt;
+        for old_daemon in [true, false] {
+            let (_tmp, cli, daemon, destination) = pair_fixture(old_daemon);
+            install_update_pair(&cli, &daemon, &destination).expect("update pair");
+            assert_eq!(fs::read(&destination).expect("installed cli"), b"new cli");
+            let daemon = destination.with_file_name("omgd");
+            assert_eq!(fs::read(&daemon).expect("installed daemon"), b"new daemon");
+            for path in [&destination, &daemon] {
+                assert_eq!(
+                    fs::metadata(path).expect("metadata").permissions().mode() & 0o777,
+                    0o755
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_pair_staging_failure_preserves_both_installed_files() {
+        let (_tmp, cli, daemon, destination) = pair_fixture(true);
+        fs::remove_file(&cli).expect("missing CLI payload");
+        assert!(install_update_pair(&cli, &daemon, &destination).is_err());
+        assert_eq!(fs::read(&destination).expect("cli"), b"old cli");
+        assert_eq!(
+            fs::read(destination.with_file_name("omgd")).expect("daemon"),
+            b"old daemon"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_pair_restores_both_after_second_replace_or_sync_failure() {
+        for old_daemon in [true, false] {
+            for fail_after_rename in [true, false] {
+                let (_tmp, cli, daemon, destination) = pair_fixture(old_daemon);
+                let mut count = 0;
+                let result =
+                    install_update_pair_with(&cli, &daemon, &destination, |staged, path| {
+                        count += 1;
+                        if count == 2 {
+                            if fail_after_rename {
+                                persist_update_binary(staged, path)?;
+                            }
+                            anyhow::bail!("injected replacement/sync failure");
+                        }
+                        persist_update_binary(staged, path)
+                    });
+                assert!(
+                    format!("{:#}", result.expect_err("must fail"))
+                        .contains("previous OMG binaries restored")
+                );
+                assert_eq!(fs::read(&destination).expect("cli restored"), b"old cli");
+                let path = destination.with_file_name("omgd");
+                if old_daemon {
+                    assert_eq!(fs::read(path).expect("daemon restored"), b"old daemon");
+                } else {
+                    assert!(!path.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_pair_rejects_concurrent_updater_and_symlink_destination() {
+        let (tmp, cli, daemon, destination) = pair_fixture(true);
+        let lock =
+            fs::File::create(destination.with_file_name(".omg-self-update.lock")).expect("lock");
+        lock.try_lock().expect("hold lock");
+        assert!(
+            format!(
+                "{:#}",
+                install_update_pair(&cli, &daemon, &destination).expect_err("locked")
+            )
+            .contains("Another self-update")
+        );
+        drop(lock);
+        let target = tmp.path().join("unrelated");
+        fs::write(&target, b"untouched").expect("target");
+        fs::remove_file(destination.with_file_name("omgd")).expect("remove daemon");
+        std::os::unix::fs::symlink(&target, destination.with_file_name("omgd")).expect("symlink");
+        assert!(install_update_pair(&cli, &daemon, &destination).is_err());
+        assert_eq!(fs::read(&target).expect("target"), b"untouched");
+        assert_eq!(fs::read(&destination).expect("cli"), b"old cli");
     }
 
     #[test]

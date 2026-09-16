@@ -309,6 +309,7 @@ jobs:
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
           mkdir -p "omg-v${VERSION}-aarch64-darwin"
           cp target/release/omg "omg-v${VERSION}-aarch64-darwin/"
+          cp target/release/omgd "omg-v${VERSION}-aarch64-darwin/"
           cp README.md LICENSE "omg-v${VERSION}-aarch64-darwin/"
           tar -czf "omg-v${VERSION}-aarch64-darwin.tar.gz" "omg-v${VERSION}-aarch64-darwin"
           shasum -a 256 "omg-v${VERSION}-aarch64-darwin.tar.gz" > "omg-v${VERSION}-aarch64-darwin.tar.gz.sha256"
