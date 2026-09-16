@@ -5,6 +5,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -18,6 +19,11 @@ use crate::package_managers::types::{
 use rust_apt::Cache;
 use rust_apt::cache::{PackageSort, Upgrade};
 use rust_apt::progress::{AcquireProgress, InstallProgress};
+
+// libapt uses process-global configuration and is not thread-safe. A cache
+// created on a blocking worker must retain this lease through its final use
+// AND destruction; locking only Cache::new still permits concurrent FFI.
+static APT_CACHE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Default)]
 pub struct AptPackageManager;
@@ -189,7 +195,10 @@ impl crate::package_managers::PackageManager for AptPackageManager {
                     })
                     .collect());
             }
-            Ok(local_to_packages(list_installed_fast()?))
+            let installed = tokio::task::spawn_blocking(list_installed_fast)
+                .await
+                .context("APT installed-package task failed")??;
+            Ok(local_to_packages(installed))
         })
     }
 
@@ -222,7 +231,9 @@ impl crate::package_managers::PackageManager for AptPackageManager {
             {
                 return Ok(explicit);
             }
-            list_explicit()
+            tokio::task::spawn_blocking(list_explicit)
+                .await
+                .context("APT explicit-package task failed")?
         })
     }
 
@@ -271,7 +282,7 @@ impl crate::package_managers::PackageManager for AptPackageManager {
 ///
 /// Returns at most 100 matches ordered by package iteration order.
 pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     let mut results = Vec::with_capacity(64);
     let query_lower = query.to_lowercase();
 
@@ -319,7 +330,7 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
 
 /// Detailed metadata for one package from the APT cache, if present.
 pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     let Some(pkg) = cache.get(name) else {
         return Ok(None);
     };
@@ -345,7 +356,7 @@ pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
 
 /// Installed packages from the APT cache (`rust-apt` FFI path).
 pub fn list_installed_fast() -> Result<Vec<LocalPackage>> {
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     let mut packages = Vec::with_capacity(512);
 
     for pkg in cache.packages(&PackageSort::default()) {
@@ -359,7 +370,7 @@ pub fn list_installed_fast() -> Result<Vec<LocalPackage>> {
 
 /// Explicitly installed (non-auto) packages, sorted alphabetically.
 pub fn list_explicit() -> Result<Vec<String>> {
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     let mut explicit = Vec::with_capacity(256);
 
     for pkg in cache.packages(&PackageSort::default()) {
@@ -375,7 +386,7 @@ pub fn list_explicit() -> Result<Vec<String>> {
 /// All available package names across configured repositories, sorted and
 /// deduplicated.
 pub fn list_all_package_names() -> Result<Vec<String>> {
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     let mut names = Vec::with_capacity(4096);
 
     for pkg in cache.packages(&PackageSort::default()) {
@@ -390,7 +401,7 @@ pub fn list_all_package_names() -> Result<Vec<String>> {
 /// Auto-installed packages that no longer have dependents
 /// (`apt-get autoremove` candidates).
 pub fn list_orphans() -> Result<Vec<String>> {
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     let mut orphans = Vec::with_capacity(32);
     for pkg in cache.packages(&PackageSort::default()) {
         if pkg.is_auto_removable() {
@@ -421,7 +432,7 @@ pub async fn remove_orphans() -> Result<()> {
 
 /// Upgradable packages as `(name, installed_version, candidate_version)`.
 pub fn list_updates() -> Result<Vec<(String, String, String)>> {
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     let mut updates = Vec::with_capacity(64);
 
     for pkg in cache.packages(&PackageSort::default()) {
@@ -449,7 +460,7 @@ pub fn list_updates() -> Result<Vec<(String, String, String)>> {
 /// through [`crate::package_managers::debian_db::resolve_status_counts`] so a
 /// failed accurate query never masquerades as zero orphans/updates.
 pub fn get_system_status() -> Result<(usize, usize, usize, usize)> {
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     let mut installed_count = 0;
     let mut explicit_count = 0;
     let mut orphans_count = 0;
@@ -480,10 +491,16 @@ pub fn get_system_status() -> Result<(usize, usize, usize, usize)> {
     ))
 }
 
-fn open_cache(local_files: &[String]) -> Result<Cache> {
+fn open_cache(local_files: &[String]) -> Result<(MutexGuard<'static, ()>, Cache)> {
+    let guard = APT_CACHE_LOCK
+        .lock()
+        .map_err(|_| anyhow!("APT cache lock poisoned; restart OMG before accessing libapt"))?;
     ensure_apt_fetch_dirs();
     let files: Vec<&str> = local_files.iter().map(String::as_str).collect();
-    Cache::new(&files).map_err(|e| anyhow!("APT cache error: {e:?}"))
+    let cache = Cache::new(&files).map_err(|e| anyhow!("APT cache error: {e:?}"))?;
+    // Callers bind the guard first and cache second: reverse local drop order
+    // destroys the cache before releasing the process-wide lease.
+    Ok((guard, cache))
 }
 
 /// Staging directories libapt fetches into. The `apt-get` CLI creates these
@@ -585,7 +602,7 @@ fn remove_blocking(packages: &[String]) -> Result<()> {
 }
 
 fn remove_blocking_inner(packages: &[String]) -> Result<()> {
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     for pkg_name in packages {
         let pkg = cache
             .get(pkg_name)
@@ -627,7 +644,7 @@ fn update_blocking() -> Result<()> {
 
 fn update_blocking_inner() -> Result<()> {
     crate::core::security::policy::require_native_plan_support("APT")?;
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     cache
         .upgrade(Upgrade::SafeUpgrade)
         .map_err(|e| anyhow!("APT upgrade error: {e:?}"))?;
@@ -645,7 +662,7 @@ fn update_blocking_inner() -> Result<()> {
 }
 
 fn sync_databases_blocking() -> Result<()> {
-    let cache = open_cache(&[])?;
+    let (_apt_guard, cache) = open_cache(&[])?;
     let mut progress = AcquireProgress::apt();
     cache
         .update(&mut progress)
@@ -727,6 +744,54 @@ fn local_to_packages(local_pkgs: Vec<LocalPackage>) -> Vec<Package> {
 #[cfg(unix)]
 mod tests {
     use super::{APT_FETCH_DIRS, apt_install_error, ensure_fetch_dirs};
+
+    #[test]
+    #[serial_test::serial]
+    fn concurrent_native_status_queries_preserve_consistent_counts() {
+        let expected = super::get_system_status().expect("baseline native APT status");
+        assert!(
+            expected.0 > 0,
+            "regression requires a real installed APT database"
+        );
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..8 {
+                            assert_eq!(
+                                super::get_system_status().expect("concurrent APT query"),
+                                expected
+                            );
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("native APT query worker");
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_cache_retains_exclusive_lease_until_destroyed() {
+        let (guard, cache) = super::open_cache(&[]).expect("native cache");
+        assert!(super::APT_CACHE_LOCK.try_lock().is_err());
+        // Exercise an actual native cache read while the lease is held.
+        assert!(
+            cache
+                .packages(&rust_apt::cache::PackageSort::default())
+                .next()
+                .is_some()
+        );
+        drop(cache);
+        assert!(super::APT_CACHE_LOCK.try_lock().is_err());
+        drop(guard);
+        assert!(super::APT_CACHE_LOCK.try_lock().is_ok());
+    }
 
     fn failed_output(stderr: &[u8]) -> std::process::Output {
         use std::os::unix::process::ExitStatusExt as _;

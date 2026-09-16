@@ -535,7 +535,10 @@ tar -xzf release.tar.gz
 bin="$HOME/omg-${tag}-${guest_arch}-linux-${distro}/omg"
 [[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 daemon="${bin%/*}/omgd"
-[[ -x "$daemon" ]]
+if [[ ! -x "$daemon" ]]; then
+  printf 'Release %s for %s is missing executable omgd; publish an archive containing both omg and omgd.\n' "$tag" "$distro" >&2
+  exit 1
+fi
 [[ $("$daemon" --version | head -1 | tr -d '[:space:]') == "omgd${tag#v}" ]]
 case "$distro" in
   arch) sudo -n pacman -Syu --noconfirm >/dev/null || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
