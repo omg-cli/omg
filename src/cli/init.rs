@@ -759,6 +759,10 @@ fn ensure_shell_config_parent(config_path: &Path) -> Result<()> {
     })
 }
 
+// Let the launcher check this user's socket and ping the daemon. A process-name
+// check can match another user's daemon or a process that is not serving IPC.
+const DAEMON_SHELL_START: &str = "omg daemon >/dev/null 2>&1 &";
+
 fn install_shell_hook(stdout: &mut io::Stdout, shell: Shell, start_daemon: bool) -> Result<()> {
     let config_path = resolve_config_path(shell)?;
     let hook_cmd = shell.hook_command();
@@ -790,7 +794,7 @@ fn install_shell_hook(stdout: &mut io::Stdout, shell: Shell, start_daemon: bool)
             file,
             "# Start OMG daemon if not running (for 22x faster searches)"
         )?;
-        writeln!(file, "pgrep -x omgd >/dev/null || omg daemon &>/dev/null &")?;
+        writeln!(file, "{DAEMON_SHELL_START}")?;
     }
 
     writeln!(file, "{hook_cmd}")?;

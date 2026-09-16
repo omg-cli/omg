@@ -13,6 +13,21 @@ BASH = os.environ.get('OMG_TEST_BASH') or ('C:/Program Files/Git/bin/bash.exe' i
 
 
 class DaemonContractTests(unittest.TestCase):
+    def test_shell_startup_does_not_skip_this_users_ipc_check_for_another_process(self):
+        source = (ROOT / 'src/cli/init.rs').read_text(encoding='utf-8')
+        command = re.search(r'const DAEMON_SHELL_START: &str = "([^"]+)";', source).group(1)
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'launcher-called'
+            # A name-only process lookup finds an unrelated daemon. Startup
+            # must still ask OMG to check the current user's own socket.
+            script = 'pgrep() { return 0; }; omg() { printf "%s" "$1" > "$MARKER"; };\n'
+            result = subprocess.run([BASH, '-euc', script + command + '\nwait'],
+                                    env=dict(os.environ, MARKER=marker.as_posix()),
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(marker.exists(), 'unrelated process suppressed daemon startup')
+            self.assertEqual(marker.read_text(), 'daemon')
+
     def test_linux_release_and_staged_archives_ship_matching_daemon(self):
         for name in ('release.yml', 'qemu-matrix.yml', 'qemu-lane.yml'):
             text = (ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
