@@ -807,6 +807,12 @@ pub enum PrivacyCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum EnvCommands {
+    /// Print a starter .omg.toml environment section from an existing omg.lock
+    Export {
+        /// Platform where the lockfile was captured (not the destination)
+        #[arg(long, value_parser = ["arch-x86_64", "debian-x86_64", "ubuntu-x86_64", "fedora-x86_64", "macos-aarch64"])]
+        source_target: String,
+    },
     /// Preview portable environment requirements without installing or copying files
     Plan {
         /// Target platform and architecture
@@ -1334,6 +1340,10 @@ mod tests {
 
     #[test]
     fn environment_plan_requires_an_explicit_supported_target() {
+        assert!(
+            Cli::try_parse_from(["omg", "env", "export", "--source-target", "arch-x86_64"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["omg", "env", "export"]).is_err());
         assert!(Cli::try_parse_from(["omg", "env", "plan", "--target", "ubuntu-x86_64"]).is_ok());
         assert!(Cli::try_parse_from(["omg", "env", "plan"]).is_err());
         assert!(Cli::try_parse_from(["omg", "env", "plan", "--target", "nixos-x86_64"]).is_err());

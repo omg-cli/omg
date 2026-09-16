@@ -1,5 +1,27 @@
 # Portable environment planning
 
+## Start from an existing capture
+
+On a backend supported by `omg env capture`, capture the current machine and
+print a starter manifest:
+
+```bash
+omg env capture
+omg env export --source-target arch-x86_64
+```
+
+Specify the platform where the capture was made, not the intended destination.
+The old lock schema cannot verify this declaration. Export validates the existing
+lockfile, prints TOML, and does not overwrite `.omg.toml`. Review and merge the
+printed `[environment]` section into your configuration. It includes captured
+runtime versions and package names, not package versions, dotfile contents, or
+machine credentials. The existing capture's runtime/backend coverage limits apply.
+
+For a different OS, add explicit package mappings, then preview that target.
+Export never assumes matching package names are equivalent across platforms.
+
+## Preview the destination
+
 `omg env plan --target ubuntu-x86_64` reads the current directory's `.omg.toml`
 and prints a JSON preview. It does not install tools, execute scripts, copy
 dotfiles, contact registries, or change `omg.lock`.
