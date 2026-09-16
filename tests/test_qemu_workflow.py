@@ -11,7 +11,9 @@ import textwrap
 import unittest
 
 WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/qemu-matrix.yml'
-TEXT = WORKFLOW.read_text(encoding='utf-8')
+PARENT = WORKFLOW.read_text(encoding='utf-8')
+LANE = WORKFLOW.with_name('qemu-lane.yml').read_text(encoding='utf-8')
+TEXT = PARENT.replace('\n  guest:\n', '\n  lane-caller:\n') + LANE
 
 
 def literal(text, key, indent):
@@ -66,6 +68,8 @@ class QemuWorkflowTests(unittest.TestCase):
                 self.assertEqual(values['x64'], str(arch != 'arm64').lower())
                 self.assertEqual(values['arm64'], str(staged and arch != 'x64' and distro != 'arch').lower())
                 self.assertEqual(json.loads(values['distros']), ['arch', 'debian', 'ubuntu', 'fedora'] if distro == 'all' else [distro])
+                self.assertEqual(sorted(row['distro'] for row in json.loads(values['lanes'])),
+                                 sorted(json.loads(values['distros'])))
                 for key, allowed in [('build-x64', ['arch', 'debian', 'fedora']), ('build-arm64', ['debian', 'fedora'])]:
                     self.assertEqual([row['distro'] for row in json.loads(values[key])], allowed if distro == 'all' else [distro] if distro in allowed else [])
                 self.assertEqual(values['tag'], 'v' + re.search(r'^version = "([^"]+)"', (WORKFLOW.parents[2] / 'Cargo.toml').read_text(), re.M)[1] if staged else 'v9.8.7')
@@ -84,11 +88,11 @@ class QemuWorkflowTests(unittest.TestCase):
 
     def test_guest_uses_resolved_artifact_mode_for_every_event(self):
         download = step('Download staged binaries')
-        self.assertIn("if: needs.prepare.outputs.staged == 'true'", download)
+        self.assertIn("if: inputs.staged", download)
         guest = step('Run disposable guest lifecycle + read benchmarks + inventory rows')
-        self.assertIn('STAGED: ${{ needs.prepare.outputs.staged }}', guest)
+        self.assertIn('STAGED: ${{ inputs.staged }}', guest)
         script = literal(guest, 'run', 8)
-        script = script.replace('${{ matrix.distro }}', 'arch').replace('${{ needs.prepare.outputs.tag }}', 'v1.2.3')
+        script = script.replace('${{ inputs.distro }}', 'arch').replace('${{ inputs.tag }}', 'v1.2.3')
         # Execute the real argument-selection shell, substituting only the VM launch.
         script = script.replace('./scripts/benchmark-qemu.sh', 'printf "%s\\n"')
         for event, staged in [('push', True), ('pull_request', True),
@@ -136,7 +140,7 @@ class QemuWorkflowTests(unittest.TestCase):
 class ReportingIntegrationTests(unittest.TestCase):
     def test_published_guests_resolve_contract_before_running_without_token(self):
         prepare = step('Prepare published release')
-        self.assertIn("if: needs.prepare.outputs.staged != 'true'", prepare)
+        self.assertIn("if: ${{ !inputs.staged }}", prepare)
         self.assertIn('prepare-qemu-release.py', prepare)
         run = step('Run disposable guest lifecycle + read benchmarks + inventory rows')
         self.assertIn('--release-dir published', run)
@@ -171,10 +175,34 @@ class ReportingIntegrationTests(unittest.TestCase):
 class SecurityBoundaryTests(unittest.TestCase):
     def test_pr_jobs_never_receive_sentry_secrets(self):
         blocks = re.split(r'(?=^      - )', TEXT, flags=re.M)
-        secret_blocks = [block for block in blocks if 'OMG_SMOKE_SENTRY_DSN:' in block]
+        secret_blocks = [block for block in blocks if '          OMG_SMOKE_SENTRY_DSN:' in block]
         self.assertEqual(len(secret_blocks), 3)
         for block in secret_blocks:
             self.assertIn("        if: github.event_name != 'pull_request'", block)
+        self.assertIn("OMG_SMOKE_SENTRY_DSN: ${{ github.event_name != 'pull_request' && secrets.OMG_SMOKE_SENTRY_DSN || '' }}", PARENT)
+        self.assertNotIn('secrets: inherit', PARENT)
+
+    def test_each_distro_has_an_independent_build_guest_dependency(self):
+        caller = PARENT.split('\n  guest:\n', 1)[1].split('\n  arm-runner-health:', 1)[0]
+        self.assertIn('needs: prepare', caller)
+        self.assertIn('uses: ./.github/workflows/qemu-lane.yml', caller)
+        self.assertNotIn('needs: [prepare, build', caller)
+        self.assertIn('needs: [build-staged, build-staged-ubuntu]', LANE)
+        self.assertIn("inputs.distro != 'ubuntu' && needs.build-staged.result == 'success'", LANE)
+        self.assertIn("inputs.distro == 'ubuntu' && needs.build-staged-ubuntu.result == 'success'", LANE)
+        self.assertNotIn('concurrency:', LANE)
+
+    def test_image_caches_never_save_from_prs_and_do_not_cache_guest_state(self):
+        for workflow in (PARENT, LANE):
+            self.assertIn("github.ref == 'refs/heads/main' && github.event_name != 'pull_request'", workflow)
+            self.assertIn('path: ${{ runner.temp }}/qemu-image-cache', workflow)
+            self.assertNotIn('restore-keys:', workflow)
+            self.assertIn('--image-cache "$RUNNER_TEMP/qemu-image-cache"', workflow)
+
+    def test_all_distros_keep_daemon_release_compilation_and_unit_tests(self):
+        self.assertEqual(TEXT.count('cargo test --lib --bins '), 4)
+        self.assertEqual(TEXT.count('cargo build --timings --release --no-default-features '), 4)
+        self.assertNotIn('--bin omg', TEXT)
 
     def test_github_token_is_step_scoped(self):
         self.assertNotRegex(TEXT, r'(?m)^  GH_TOKEN:')

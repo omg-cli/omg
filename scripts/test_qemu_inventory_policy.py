@@ -89,7 +89,7 @@ class PolicyTests(unittest.TestCase):
         cases = rules["inventories"][hashlib.sha256(content).hexdigest()]["cases"]
         self.assertEqual(len(cases), len(content.splitlines()) - 1)
         self.assertEqual(len({case["id"] for case in cases}), len(cases))
-        workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text()
+        workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
         self.assertEqual(workflow.count("--inventory-policy tests/qemu-inventory-policy.json"), 2)
 
 

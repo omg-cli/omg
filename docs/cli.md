@@ -1256,9 +1256,11 @@ omg self-update [OPTIONS] [aliases: up]
 
 **Features:**
 
-- **Atomic Binary Replacement**: Replaces the current binary with the latest version from [GitHub Releases](https://github.com/PyRo1121/omg/releases).
+- **Paired Binary Updates**: Installs `omg` and `omgd` from the same verified release archive. Both files are staged before replacement; failures restore the previous files. Each replacement is atomic, but the pair is not one atomic filesystem transaction.
 - **Progress Tracking**: Real-time progress bar showing download speed and estimated time remaining.
 - **Verification**: Automatically verifies the signature of the downloaded binary before installation.
+
+Archives missing either binary are rejected before installation. Restart any running daemon after updating to load the new code; replacing its executable does not restart it. For the systemd user service, run `systemctl --user restart omgd.service`. Otherwise stop the existing daemon through the mechanism used to launch it, then run `omg daemon`. An update that reports a rollback problem identifies retained recovery files and must not be treated as successful.
 
 **Examples:**
 
@@ -1903,7 +1905,7 @@ These counters have no universal latency guarantee.
 - `info`: package details
 - `list` / `ls`: list runtimes
 - `dash` / `d`: terminal dashboard
-- `self-update` / `up`: update CLI binary
+- `self-update` / `up`: update CLI and daemon binaries together
 
 Execution paths and costs depend on the backend and daemon availability.
 

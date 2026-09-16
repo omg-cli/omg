@@ -100,7 +100,7 @@ omg daemon-status
 omg daemon
 ```
 
-`omg daemon` launches the separate `omgd` binary in the background. Use `omg daemon --foreground` to see its output, or configure the optional [user service](./configuration.md). The current Arch archive includes `omgd`; the other release packaging steps include only `omg`. Those archives alone cannot provide daemon-dependent commands. A matching `omgd` build must also be installed.
+`omg daemon` launches the separate `omgd` binary in the background. Use `omg daemon --foreground` to see its output, or configure the optional [user service](./configuration.md). Release packaging includes matching `omg` and `omgd` binaries for every Linux and macOS target. Older non-Arch archives, including v0.1.222, lack `omgd`; use a release containing the matched pair for daemon-dependent commands.
 
 ## Update or uninstall
 
@@ -109,6 +109,8 @@ For a standalone release installation:
 ```bash
 omg self-update
 ```
+
+The paired updater requires both binaries in the same verified archive and restores the previous files if replacement fails. Restart an already-running daemon afterward to load its new executable (`systemctl --user restart omgd.service` for the user service). Older installed updaters replace only the CLI: after the first upgrade to a release containing this fix, run `omg self-update --force` once to repair the daemon as well.
 
 For an AUR-managed installation, update through your AUR package manager instead. Do not mix installation methods without checking which binary `command -v omg` selects.
 

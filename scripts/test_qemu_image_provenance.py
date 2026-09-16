@@ -65,7 +65,7 @@ class ImageProvenanceTests(unittest.TestCase):
     def test_verification_precedes_image_parser_and_is_required_by_ci(self):
         source = (ROOT / "scripts/benchmark-qemu.sh").read_text()
         self.assertLess(source.index('"$here/verify-qemu-image.py"'), source.index("qemu-img info base.qcow2"))
-        workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text()
+        workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
         self.assertEqual(workflow.count("--image-policy tests/qemu-image-provenance/manifest.json"), 2)
 
 
