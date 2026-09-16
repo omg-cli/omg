@@ -165,7 +165,7 @@ pub async fn run(force: bool, version: Option<String>) -> Result<()> {
         style::maybe_color(&format!("v{target_version}"), |t| t.cyan().to_string())
     );
     println!(
-        "  Restart any running omgd to load the updated daemon (restart its user service, or log out and back in)."
+        "  Restart any running omgd to load the updated daemon: restart its user service, or stop the existing daemon and run 'omg daemon'."
     );
 
     Ok(())
@@ -308,7 +308,7 @@ fn install_update_pair_with(
                 backups.push(Some(backup));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && index == 0 => {
-                backups.push(None)
+                backups.push(None);
             }
             Err(error) => {
                 return Err(error).with_context(|| format!("Cannot back up {}", path.display()));

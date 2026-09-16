@@ -17,7 +17,7 @@ Existing published versions missing omgd will now fail the stricter nightly life
 
 - [x] Fix simulated guest evidence in release-smoke fixtures and assert missing/invalid daemon receipts remain harness failures. Hosted preparation passed on 667f17f6.
 - [x] Remove the shell hook's global process-name gate. Another user's `omgd` must not suppress this user's socket/IPC check. The launcher already performs that check and enforces singleton ownership. Executable Bash regression covers a successful unrelated process lookup.
-- [ ] Self-update currently extracts/replaces only `omg`, leaving the installed `omgd` at its old version. Implement paired extraction, bounded archive validation, staging and failure recovery before declaring daemon upgrades supported. Do not just overwrite one binary then the other without recovery tests.
+- [x] Implement paired self-update extraction, bounded archive validation, staging, locking and failure recovery with regression tests. See the paired self-update plan for validation and limitations; hosted Linux verification is pending.
 - [ ] Check service-managed upgrades and restart behavior, including an already running old daemon.
 
 Research: [pgrep manual](https://man7.org/linux/man-pages/man1/pgrep.1.html) confirms that name matching alone is not scoped to an effective user. Socket ping is stronger than adding a user filter because a matching process can still be unresponsive.
