@@ -361,6 +361,11 @@ case "$1" in
         work=$(<"$FAKE_QEMU_STATE")
         mkdir -p "$work/guest/evidence"
         printf '%s\n' "${FAKE_QEMU_GUEST_EXIT:-0}" > "$work/guest/evidence/exit-code"
+        case ${FAKE_QEMU_DAEMON_RECEIPT:-valid} in
+          valid) printf '%s\n' '{"schema_version":1,"direct":true,"foreground":true,"ipc":true,"singleton":true,"shutdown":true,"restart":true}' > "$work/guest/evidence/daemon-lifecycle.json" ;;
+          invalid) printf '%s\n' '{"schema_version":1,"ipc":false}' > "$work/guest/evidence/daemon-lifecycle.json" ;;
+          missing) ;;
+        esac
         if [[ ${FAKE_QEMU_BENCHMARK:-0} == 1 ]]; then
           benchmark="$work/guest/evidence/benchmarks"
           mkdir -p "$benchmark"
@@ -404,13 +409,16 @@ done
 [[ -n "$child_result" ]] || fail 'interrupted QEMU child did not record its exit'
 
 export FAKE_QEMU_INFO_EXIT=0 FAKE_QEMU_STATE="$scratch/qemu-controller"
-for scenario in pass product-failure product-exit-three timeout cleanup-failure transport-failure missing-receipt kernel-crash controller-oom missing-health; do
+for scenario in pass product-failure product-exit-three timeout cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon kernel-crash controller-oom missing-health; do
+  export FAKE_QEMU_DAEMON_RECEIPT=valid
   export FAKE_QEMU_GUEST_EXIT=0 FAKE_QEMU_CLEANUP_FAIL=0 FAKE_QEMU_MISSING_RECEIPT=0
   export FAKE_QEMU_SERIAL='Linux version 6.12 fixture' FAKE_QEMU_OOM=false FAKE_QEMU_HEALTH_MISSING=0
   unset FAKE_QEMU_TRANSPORT_EXIT
   expected_rc=0
   expected_result=PASS
   case "$scenario" in
+    missing-daemon) export FAKE_QEMU_DAEMON_RECEIPT=missing; expected_rc=1; expected_result=HARNESS_ERROR ;;
+    invalid-daemon) export FAKE_QEMU_DAEMON_RECEIPT=invalid; expected_rc=1; expected_result=HARNESS_ERROR ;;
     kernel-crash) export FAKE_QEMU_SERIAL='Kernel panic - not syncing: fixture'; expected_rc=120; expected_result=HARNESS_ERROR ;;
     controller-oom) export FAKE_QEMU_OOM=true; expected_rc=120; expected_result=HARNESS_ERROR ;;
     missing-health) export FAKE_QEMU_HEALTH_MISSING=1; expected_rc=120; expected_result=HARNESS_ERROR ;;
