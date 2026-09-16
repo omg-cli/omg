@@ -287,6 +287,9 @@ omg run test -- --nocapture
 ```
 
 ### 4. Declarative Environment Locking (`omg.lock`)
+
+For a read-only preview of portable tool requirements and explicit platform mappings, use `omg env plan --target ubuntu-x86_64` with an `[environment]` section in `.omg.toml`. This does not install packages or apply dotfiles. See [portable environment planning](docs/environment-portability.md).
+
 Record package and runtime versions and detect drift across developer workstations and CI pipelines. Environment fingerprinting requires an Arch or Debian package backend; Fedora currently refuses these operations explicitly:
 
 ```bash

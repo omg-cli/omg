@@ -1,4 +1,5 @@
 import hashlib
+import csv
 import importlib.util
 import json
 from pathlib import Path
@@ -12,6 +13,15 @@ SPEC.loader.exec_module(POLICY)
 
 
 class PolicyTests(unittest.TestCase):
+    def test_current_inventory_has_exact_policy_case_set(self):
+        inventory = ROOT / "tests/cli_behavior_inventory.tsv"
+        rules = json.loads((ROOT / "tests/qemu-inventory-policy.json").read_text())
+        cases = rules["inventories"][hashlib.sha256(inventory.read_bytes()).hexdigest()]["cases"]
+        with inventory.open(newline="") as source:
+            expected = {row["case"] for row in csv.DictReader(source, delimiter="\t")}
+        self.assertEqual({case["id"] for case in cases}, expected)
+        self.assertEqual(len(cases), len(expected))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

@@ -155,6 +155,9 @@ jobs:
       - name: Run portable tests
         run: cargo nextest run --lib --bins --no-default-features --features pgp,license --locked --profile ci
 
+      - name: Verify portable environment CLI round-trip
+        run: cargo nextest run --test env_portability_cli --no-default-features --features pgp,license --locked --profile ci
+
   #############################################################################
   # STAGE 2: Platform Matrix (Linux containers)
   # Parallel builds across Arch, Debian, Fedora
