@@ -12,10 +12,22 @@ OMG is the fastest unified package manager for Linux, replacing pacman, yay, nvm
 
 ## [Unreleased]
 
+## [0.1.223] - 2026-09-16
+
+See the [release overview and complete commit ledger](releases/v0.1.223.md).
+
 ### Daemon updates
 
 - Update `omg` and `omgd` together from the same verified release archive. Refuse incomplete pairs, stage both binaries before replacing either, serialize concurrent updaters, and restore previous files on replacement failures.
 - Include `omgd` in every Linux and macOS release archive. Self-update now reports both installed binaries and reminds users to restart an already-running daemon.
+
+### CI and QEMU
+
+- Require real daemon startup, IPC, singleton, shutdown and restart checks in every selected Linux guest, with bounded evidence and mandatory receipts.
+- Explain missing daemon payloads explicitly in guest failure logs; v0.1.222 non-Arch archives do not satisfy the stricter check.
+- Start each distro guest as soon as its own build completes and cache only digest-verified base images.
+- Restore GitHub-hosted runners after the Blacksmith trial, skip documentation-only builds where appropriate, and restore quick-gate caching.
+- Check the current user's daemon socket at shell startup instead of trusting a global process-name match.
 
 ## [0.1.222] - 2026-09-15
 

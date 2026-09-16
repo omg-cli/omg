@@ -137,7 +137,7 @@ after the checksum and provenance checks above, on Arch x86_64:
 \`\`\`bash
 tar -xzf omg-v${version}-x86_64-linux-arch.tar.gz
 cd omg-v${version}-x86_64-linux-arch
-sudo cp omg /usr/local/bin/
+sudo install -m 0755 omg omgd /usr/local/bin/
 \`\`\`
 
 ---
