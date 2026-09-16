@@ -12,12 +12,12 @@ const TARGETS: &[&str] = &[
     "macos-aarch64",
 ];
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Project {
     environment: Manifest,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     schema_version: u32,
@@ -150,9 +150,80 @@ pub fn to_json(content: &str, target: &str) -> Result<String> {
         .context("Cannot serialize environment plan")
 }
 
+/// Export observed names as intent, mapped only to the caller-declared source.
+/// The old lock schema cannot establish its capture platform or exact packages.
+pub fn from_snapshot(
+    runtimes: BTreeMap<String, String>,
+    packages: Vec<String>,
+    source_target: &str,
+) -> Result<String> {
+    ensure!(
+        TARGETS.contains(&source_target),
+        "Unsupported source target"
+    );
+    let tools: BTreeSet<String> = packages.into_iter().collect();
+    let mappings = tools
+        .iter()
+        .map(|name| (name.clone(), name.clone()))
+        .collect();
+    let project = Project {
+        environment: Manifest {
+            schema_version: 1,
+            tools,
+            runtimes,
+            packages: BTreeMap::from([(source_target.to_string(), mappings)]),
+            dotfiles: BTreeMap::new(),
+        },
+    };
+    let content =
+        toml::to_string_pretty(&project).context("Cannot serialize environment manifest")?;
+    // Apply the same bounds and identifier rules as a handwritten manifest.
+    plan(&content, source_target)?;
+    Ok(format!(
+        "# Starter intent from omg.lock; review before use.\n\
+         # Source platform is user-declared; package versions are not captured.\n\
+         # Other platforms require explicit mappings. No dotfiles or secrets exported.\n\n{content}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::plan;
+
+    #[test]
+    fn snapshot_export_roundtrips_without_guessing_other_platforms() {
+        let content = super::from_snapshot(
+            std::collections::BTreeMap::from([("node".into(), "22.1.0".into())]),
+            vec!["git".into(), "git".into()],
+            "arch-x86_64",
+        )
+        .unwrap();
+        let source = plan(&content, "arch-x86_64").unwrap();
+        assert_eq!(source.packages.len(), 1);
+        assert_eq!(source.packages["git"], "git");
+        assert!(source.dotfiles.is_empty());
+        let destination = plan(&content, "ubuntu-x86_64").unwrap();
+        assert!(destination.packages.is_empty());
+        assert_eq!(destination.unmapped_tools, vec!["git"]);
+        assert_eq!(destination.runtimes["node"], "22.1.0");
+    }
+
+    #[test]
+    fn snapshot_export_refuses_unsafe_names_and_unknown_platforms() {
+        for package in ["--root", "a\nmalicious", "../path"] {
+            assert!(
+                super::from_snapshot(
+                    std::collections::BTreeMap::new(),
+                    vec![package.into()],
+                    "arch-x86_64"
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            super::from_snapshot(std::collections::BTreeMap::new(), vec![], "unknown").is_err()
+        );
+    }
 
     const MANIFEST: &str = r#"
 [scripts]
