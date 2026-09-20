@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used seventy-two searches (265 requested result slots),
+Exa research used seventy-three searches (267 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -642,6 +642,26 @@ host; no packages are changed. Normal daemon-disabled counter queries still
 match native Fedora counts in plain and both JSON flag positions. All 50 DNF
 unit tests, scoped library Clippy and the quick workflow gate pass locally.
 This is local fault evidence, not a new hosted QEMU failure-injection contract.
+
+The Fedora reproduction is now part of the guest daemon/lifecycle check. It
+binds a failing DNF executable only inside a
+[private mount namespace](https://man7.org/linux/man-pages/man1/unshare.1.html),
+then [drops identity and capabilities](https://man7.org/linux/man-pages/man1/setpriv.1.html)
+before invoking the submitted OMG binary. It requires exit one, empty success
+output and the exact backend cause; a timeout, missing tool, permission error
+or a fabricated zero does not satisfy the refusal. The host requires Fedora's
+named fault receipt, while other distros explicitly declare no such probe.
+Fault stdout/stderr are retained through the bounded evidence allowlist and a
+diagnostic excerpt reaches the lifecycle log used by automatic issue reporting.
+
+The daemon fixture formerly left its temporary state behind. Cleanup now runs
+on reference-query failures too, and successful removal precedes the positive
+receipt. Tests reproduce the old leftover-state success and reject both a
+failed removal and a no-op removal. Nine daemon harness tests pass on all four
+WSL distros, and the exact new fault probe passes locally against the repaired
+Fedora binary as uid 1000. The quick gate and full release/QEMU fixture suite
+pass. Hosted execution of this new fault contract is still pending; no native
+or architecture coverage claim follows from the shell fixtures.
 
 ### Runtime download connection recovery
 
