@@ -70,6 +70,16 @@ class ReportingBoundaryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     REPORT.archive_rows(self.archive(name, content, mode), {self.row()["case_id"]})
 
+    def test_duplicate_json_keys_cannot_replace_a_failure_with_success(self):
+        payload = json.dumps([self.row()]).replace('"result": "FAIL"', '"result": "FAIL", "result": "PASS"')
+        with self.assertRaises(ValueError):
+            REPORT.archive_rows(self.archive("run/results.json", payload), {self.row()["case_id"]})
+
+    def test_case_identity_must_match_its_distro(self):
+        row = dict(self.row(), distro="debian")
+        with self.assertRaises(ValueError):
+            REPORT.archive_rows(self.archive("run/results.json", json.dumps([row])), {row["case_id"]})
+
     def test_report_rows_must_use_default_branch_case_identities(self):
         with self.assertRaises(ValueError):
             REPORT.archive_rows(

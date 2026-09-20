@@ -59,6 +59,15 @@ def canonical_case_ids(policy):
     return identifiers
 
 
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
 def archive_rows(content, allowed_cases):
     if len(content) > MAX_DOWNLOAD:
         raise ValueError("artifact download exceeds limit")
@@ -82,7 +91,7 @@ def archive_rows(content, allowed_cases):
                 continue
             if member.file_size > 1024 * 1024:
                 raise ValueError("result exceeds limit")
-            payload = json.loads(archive.read(member))
+            payload = json.loads(archive.read(member), object_pairs_hook=unique_object)
             if not isinstance(payload, list) or len(payload) > 1000:
                 raise ValueError("invalid result collection")
             for row in payload:
@@ -91,6 +100,8 @@ def archive_rows(content, allowed_cases):
                         or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", row["case_id"])
                         or row["case_id"] not in allowed_cases
                         or row.get("distro") not in ("arch", "debian", "ubuntu", "fedora")
+                        or (row["case_id"] != "qemu-matrix-workflow"
+                            and not row["case_id"].startswith(f"qemu-{row['distro']}-"))
                         or row.get("result") not in FAILURES | {"PASS", "SKIPPED"}
                         or type(row.get("exit_code")) is not int
                         or not -1 <= row["exit_code"] <= 255
