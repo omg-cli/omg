@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used fifty-seven searches (234 requested result slots),
+Exa research used fifty-eight searches (236 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -383,7 +383,8 @@ Temporarily disabling the production result truncation in the isolated Arch clon
 made the regression fail on limit zero with three unexpected records; restoring
 the production source made it pass. This is mock-backed query behavior, not AUR
 filtering or native repository metadata coverage.
-# Native explicit-query parity follow-up
+
+### Native explicit-query parity follow-up
 
 The strengthened QEMU daemon probe passed locally on Arch, Ubuntu 26.04,
 Fedora 44 and Debian 13 with native backends, without mock package state.
@@ -396,3 +397,20 @@ negative controls reject wrong names, duplicates, wrong counts and extra JSON.
 Guest jq provisioning precedes this unconditional probe even when benchmarks
 are disabled; hyperfine remains conditional. These checks supplement existing
 transport fixtures and do not prove every native RPC or transaction contract.
+
+### Runtime discovery failure contracts
+
+Exa follow-up checked GitHub's official [rate-limit rules](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)
+and [HTTP failure guidance](https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api).
+A loopback HTTP regression now supplies a valid first release page followed by
+403/429 exhausted quota, ordinary 403, HTTP 500, malformed JSON or an invalid
+release-list schema. It asserts complete failure instead of a partial catalog,
+correct quota classification/reset diagnostics, source context for other errors,
+pagination arguments and the discovery user agent. All six cases passed with
+the Arch, Debian, Ubuntu and Fedora feature builds locally. This validates the
+shared production fetcher; live upstream quota and full CLI download fixtures
+remain separate unresolved work.
+A temporary isolated-checkout mutation returning accumulated releases after
+quota exhaustion failed this regression with the partial catalog exposed.
+Restoring the production source passed all 56 shared runtime-helper tests on
+Arch. No production runtime behavior was changed in this follow-up.
