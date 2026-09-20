@@ -28,6 +28,7 @@ use omg_lib::daemon::protocol::{
 use omg_lib::daemon::server;
 use omg_lib::package_managers::mock::MockPackageManager;
 use serial_test::serial;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -62,10 +63,26 @@ struct RealServerFixture {
 
 impl RealServerFixture {
     async fn new() -> Result<Self> {
+        Self::with_packages(&[], &[]).await
+    }
+
+    async fn with_packages(installed: &[(&str, &str)], available: &[(&str, &str)]) -> Result<Self> {
         init_test_env();
-        let temp_dir = TempDir::new().context("failed to create fixture temp dir")?;
+        let temp_dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .context("failed to create private fixture temp dir")?;
         let data_dir = temp_dir.path().join("data");
         std::fs::create_dir_all(&data_dir)?;
+        let installed: std::collections::BTreeMap<_, _> = installed.iter().copied().collect();
+        let available: std::collections::BTreeMap<_, _> = available.iter().copied().collect();
+        std::fs::write(
+            data_dir.join("mock_state_pacman.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "installed": installed,
+                "available": available,
+            }))?,
+        )?;
 
         // Scoped env: audit logger and persistent cache capture their data-dir
         // paths during construction (same isolation pattern as daemon_e2e_ipc).
@@ -85,6 +102,8 @@ impl RealServerFixture {
         )?);
 
         let socket_path = temp_dir.path().join("cov18.sock");
+        omg_lib::core::paths::validate_socket_parent(&socket_path)
+            .context("fixture must satisfy production socket-directory validation")?;
         let listener = UnixListener::bind(&socket_path)?;
         let server = tokio::spawn(server::run(
             listener,
@@ -257,6 +276,198 @@ fn assert_pong(response: Response, expected_id: u64) {
     }
 }
 
+async fn request_on_wire(fixture: &RealServerFixture, request: Request) -> Result<Response> {
+    let mut stream = fixture.connect().await?;
+    send_raw_frame(
+        &mut stream,
+        &omg_lib::daemon::protocol::encode_frame(&request)?,
+    )
+    .await?;
+    read_response(&mut stream).await
+}
+
+#[tokio::test]
+#[serial]
+async fn package_inventory_and_updates_survive_the_production_transport() -> Result<()> {
+    // Literal backend state, not expected values computed by another handler.
+    // This proves real transport with an injected backend, not native ALPM.
+    let fixture = RealServerFixture::with_packages(
+        &[("git", "2.0.0"), ("firefox", "122.0.0")],
+        &[("git", "2.1.0"), ("firefox", "122.0.0")],
+    )
+    .await?;
+    match request_on_wire(&fixture, Request::Status { id: 721 }).await? {
+        Response::Success {
+            id: 721,
+            result: ResponseResult::Status(status),
+        } => {
+            assert_eq!(status.total_packages, 2);
+            assert_eq!(status.explicit_packages, 2);
+            assert_eq!(status.orphan_packages, 0);
+            assert_eq!(status.updates_available, 1);
+        }
+        other => panic!("status returned {other:?}"),
+    }
+    match request_on_wire(&fixture, Request::Explicit { id: 722 }).await? {
+        Response::Success {
+            id: 722,
+            result: ResponseResult::Explicit(mut result),
+        } => {
+            result.packages.sort();
+            assert_eq!(result.packages, vec!["firefox", "git"]);
+        }
+        other => panic!("explicit packages returned {other:?}"),
+    }
+    match request_on_wire(&fixture, Request::ExplicitCount { id: 723 }).await? {
+        Response::Success {
+            id: 723,
+            result: ResponseResult::ExplicitCount(count),
+        } => assert_eq!(count, 2),
+        other => panic!("explicit count returned {other:?}"),
+    }
+    match request_on_wire(&fixture, Request::ListUpdates { id: 724 }).await? {
+        Response::Success {
+            id: 724,
+            result: ResponseResult::ListUpdates(updates),
+        } => {
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].name, "git");
+            assert_eq!(updates[0].old_version, "2.0.0");
+            assert_eq!(updates[0].new_version, "2.1.0");
+            assert_eq!(updates[0].repo, "extra");
+        }
+        other => panic!("updates returned {other:?}"),
+    }
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn clearing_search_cache_forces_a_new_lookup_over_real_ipc() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let baseline = metrics_probe(&fixture).await?;
+    // An unseeded query avoids interference from the background prewarm list.
+    for (id, expected_hits, expected_misses) in [(701, 0, 1), (702, 1, 1), (704, 1, 2)] {
+        if id == 704 {
+            match request_on_wire(&fixture, Request::CacheClear { id: 703 }).await? {
+                Response::Success {
+                    id: 703,
+                    result: ResponseResult::Message(message),
+                } => assert_eq!(message, "cleared"),
+                other => panic!("cache clear returned {other:?}"),
+            }
+        }
+        match request_on_wire(
+            &fixture,
+            Request::Search {
+                id,
+                query: "cov18-cache-invalidation-unique-query".into(),
+                limit: Some(2),
+            },
+        )
+        .await?
+        {
+            Response::Success {
+                id: response_id,
+                result: ResponseResult::Search(result),
+            } => {
+                assert_eq!(response_id, id);
+                assert!(result.packages.is_empty());
+                assert_eq!(result.total, 0);
+            }
+            other => panic!("search returned {other:?}"),
+        }
+        let metrics = metrics_probe(&fixture).await?;
+        assert_eq!(metrics.cache_hits - baseline.cache_hits, expected_hits);
+        assert_eq!(
+            metrics.cache_misses - baseline.cache_misses,
+            expected_misses
+        );
+    }
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn package_info_cache_preserves_metadata_and_missing_package_identity() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let baseline = metrics_probe(&fixture).await?;
+    // The mock catalog declares git 2.43.0 with this literal description.
+    // Repeat both paths to exercise positive and negative cache responses.
+    for id in [731, 733] {
+        match request_on_wire(
+            &fixture,
+            Request::Info {
+                id,
+                package: "git".into(),
+            },
+        )
+        .await?
+        {
+            Response::Success {
+                id: response_id,
+                result: ResponseResult::Info(info),
+            } => {
+                assert_eq!(response_id, id);
+                assert_eq!(info.name, "git");
+                assert_eq!(info.version, "2.43.0");
+                assert_eq!(info.description, "Version control");
+                assert_eq!(
+                    info.source,
+                    omg_lib::daemon::protocol::WirePackageSource::Official
+                );
+            }
+            other => panic!("package info returned {other:?}"),
+        }
+        match request_on_wire(
+            &fixture,
+            Request::Info {
+                id: id + 1,
+                package: "cov18-absent-package".into(),
+            },
+        )
+        .await?
+        {
+            Response::Error {
+                id: response_id,
+                code,
+                message,
+            } => {
+                assert_eq!(response_id, id + 1);
+                assert_eq!(code, error_codes::PACKAGE_NOT_FOUND);
+                assert_eq!(message, "Package not found: cov18-absent-package");
+            }
+            other => panic!("missing package returned {other:?}"),
+        }
+    }
+    let metrics = metrics_probe(&fixture).await?;
+    assert_eq!(metrics.cache_hits - baseline.cache_hits, 1);
+    assert_eq!(metrics.cache_misses - baseline.cache_misses, 2);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn isolated_refresh_refusal_preserves_server_liveness() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    match request_on_wire(&fixture, Request::RefreshIndex { id: 711 }).await? {
+        Response::Error { id, code, message } => {
+            assert_eq!(id, 711);
+            assert_eq!(code, error_codes::INVALID_PARAMS);
+            assert_eq!(
+                message,
+                "Index refresh is unavailable in an isolated daemon"
+            );
+        }
+        other => panic!("isolated refresh returned {other:?}"),
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 712 }).await?,
+        712,
+    );
+    fixture.shutdown().await
+}
+
 #[tokio::test]
 #[serial]
 async fn custom_socket_publishes_status_in_its_private_directory() -> Result<()> {
@@ -272,9 +483,16 @@ async fn custom_socket_publishes_status_in_its_private_directory() -> Result<()>
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await;
+    .await
+    .with_context(|| {
+        format!(
+            "custom socket never received valid private fast status: file_exists={}, decodable={}",
+            status_path.is_file(),
+            omg_lib::core::fast_status::FastStatus::read_from_file(&status_path).is_some()
+        )
+    });
     fixture.shutdown().await?;
-    let status = published.context("custom socket never received its private fast-status file")?;
+    let status = published?;
     assert_eq!(status.total_packages, 0);
     assert_eq!(status.explicit_packages, 0);
     assert_eq!(status.updates_available, 0);

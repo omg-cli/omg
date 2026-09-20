@@ -25,3 +25,10 @@ condition = "AND"
 regexTarget = "line"
 regexes = ['''^\s*prefix-key: qemu-staged-v1\s*$''']
 paths = ['''^\.github/workflows/qemu-(matrix|lane)\.yml$''']
+
+[[rules.allowlists]]
+description = "Public macOS rust-cache namespace"
+condition = "AND"
+regexTarget = "line"
+regexes = ['''^\s*prefix-key: "v2-macos-dependencies"\s*$''']
+paths = ['''^\.github/workflows/ci\.yml$''']

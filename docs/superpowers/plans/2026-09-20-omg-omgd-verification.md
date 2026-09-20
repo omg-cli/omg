@@ -148,7 +148,7 @@ Contract record shape:
 
 **Interfaces:** Reuse `RealServerFixture`, `send_raw_frame`, `read_response` and production `server::run`. Retain a server task handle and explicit bounded shutdown in the fixture; do not silently leak tasks. Real `omgd` subprocess tests own signal/socket/lock behavior.
 
-- [ ] Add a fragmented-frame test that writes one byte at a time, then a coalesced two-frame test on the same stream. Assert both response IDs and precise result variants; a timeout is a failure.
+- [x] Add a fragmented-frame test that writes one byte at a time, then a coalesced two-frame test on the same stream. Assert both response IDs and precise result variants; a timeout is a failure. Verified by the real-server test in coverage run 35518049105 on 9081f40f; the separate custom-socket regression failed in that run.
 
 ```rust
 let payload = omg_lib::daemon::protocol::encode_frame(&Request::Ping { id: 901 })?;
