@@ -213,7 +213,7 @@ class NativeReceipts(unittest.TestCase):
                 'omg.runtime.' + name + '.fixture' for name in (
                     'nvmrc', 'python-pin', 'tool-versions', 'go-mod', 'multi-runtime',
                     'pin-precedence', 'rust-pin', 'rust-pin-locked', 'engines-range', 'which-node',
-                    'uninstall-lifecycle')} | {
+                    'uninstall-lifecycle', 'which-registry')} | {
                 'omg.environment.' + name + '.fixture' for name in (
                     'capture-registry', 'php-restore', 'registry-restore', 'unsupported-capture')})
         for contract in mapped:

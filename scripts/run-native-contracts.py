@@ -34,6 +34,7 @@ BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
         'test_go_mod_version', 'test_multi_runtime_detection', 'test_conflicting_version_files',
         'test_rust_toolchain_toml', 'rust_stable_pin_refuses_a_concurrent_mutation_without_activation',
         'test_package_json_engines', 'test_which_shows_active_runtime',
+        'which_resolves_every_runtime_with_project_parent_global_precedence_without_mutation',
         'every_runtime_uninstall_preserves_active_siblings_and_external_state')) | frozenset(
     'omg::env_lockfile_integrity::' + name for name in (
         'capture_records_every_registered_runtime_and_check_detects_its_drift',

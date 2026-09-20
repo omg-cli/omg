@@ -1609,6 +1609,57 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omg.runtime.which-registry.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg which",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "all-68-runtime-empty-global-parent-and-project-selection",
+          "child-pins-merge-with-inherited-parent-pins",
+          "eight-runtime-aliases-and-fast-versus-normal-dispatch",
+          "dangling-global-links-not-reported-as-active"
+        ],
+        "state": [
+          "pin-file-bytes-global-links-and-selected-sentinel-preserved"
+        ]
+      },
+      "scope": "Debug CLI version reporting with isolated directories and real symlinks; not native package transactions; does not certify executable selection, installation, shell PATH, JSON output, every pin-file format or concurrent filesystem mutation",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::which_resolves_every_runtime_with_project_parent_global_precedence_without_mutation",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "all-68-runtime-empty-global-parent-and-project-selection",
+            "child-pins-merge-with-inherited-parent-pins",
+            "eight-runtime-aliases-and-fast-versus-normal-dispatch",
+            "dangling-global-links-not-reported-as-active",
+            "pin-file-bytes-global-links-and-selected-sentinel-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

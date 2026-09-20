@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used seventy-three searches (267 requested result slots),
+Exa research used seventy-four searches (269 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -662,6 +662,29 @@ WSL distros, and the exact new fault probe passes locally against the repaired
 Fedora binary as uid 1000. The quick gate and full release/QEMU fixture suite
 pass. Hosted execution of this new fault contract is still pending; no native
 or architecture coverage claim follows from the shell fixtures.
+
+### Registry-wide active-version reporting
+
+`which` previously had a behavioral fixture for Node only. The new contract
+checks all 68 compiled runtime names through both the fast and normal dispatch
+paths: no selection, a valid global link, parent pins, partial child overrides,
+return to the global selection, and dangling links. Eight aliases use the same
+canonical selection. Expected versions come from distinct fixture values;
+parent/child pin bytes, selected payload sentinel bytes, and current links are
+checked for preservation. Cleanup of both nested project directories is checked.
+The project-parent-global precedence is specified by OMG's CLI documentation;
+[mise's configuration hierarchy](https://mise.jdx.dev/configuration) was reviewed
+as a comparison, not substituted for OMG's own contract.
+
+A deliberate mutation removing registry-tool global selection fails on
+`actionlint` (expected `1.2.3`, observed no version). Production was restored
+and compared with the worktree. The owning runtime target passes on all four
+WSL builds: 35 selected tests, including five opt-in network tests that return
+explicitly unexecuted without network permission. Those five are not evidence
+of downloads, and the test count is not a behavioral coverage percentage.
+The added bounded receipt covers version reporting and preserved state; it
+does not certify executable activation, shell PATH, every pin format or JSON.
+Existing broader gaps remain open.
 
 ### Runtime download connection recovery
 

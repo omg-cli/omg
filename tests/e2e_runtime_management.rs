@@ -907,3 +907,94 @@ fn test_which_requires_runtime_argument() {
     result.assert_failure();
     result.assert_stderr_contains("required arguments were not provided");
 }
+
+#[test]
+#[cfg(unix)]
+fn which_resolves_every_runtime_with_project_parent_global_precedence_without_mutation() {
+    let mut project = TestProject::new();
+    let parent = project.dir;
+    project.dir = tempfile::tempdir_in(parent.path()).unwrap();
+    let names = omg_lib::cli::runtimes::known_runtimes().unwrap();
+    assert_eq!(
+        names.len(),
+        68,
+        "Review selection fixtures when the registry changes"
+    );
+    let check = |runtime: &str, expected: Option<&str>| {
+        for args in [vec!["which", runtime], vec!["--quiet", "which", runtime]] {
+            let output = project.run(&args);
+            output.assert_success();
+            let expected = expected.map_or_else(
+                || format!("{runtime}: no version set (check .tool-versions, .nvmrc, etc.)"),
+                |version| format!("{runtime} {version}"),
+            );
+            assert_eq!(output.stdout.trim(), expected, "{args:?}");
+        }
+    };
+    for runtime in &names {
+        check(runtime, None);
+        let versions = project.data_dir.path().join("versions").join(runtime);
+        std::fs::create_dir_all(versions.join("1.2.3")).unwrap();
+        std::fs::write(versions.join("1.2.3/sentinel"), b"selected fixture bytes").unwrap();
+        std::os::unix::fs::symlink(versions.join("1.2.3"), versions.join("current")).unwrap();
+        check(runtime, Some("1.2.3"));
+    }
+    let parent_pins: String = names.iter().map(|name| format!("{name} 2.3.4\n")).collect();
+    let parent_path = parent.path().join(".tool-versions");
+    std::fs::write(&parent_path, &parent_pins).unwrap();
+    for runtime in &names {
+        check(runtime, Some("2.3.4"));
+    }
+    let child_pins: String = names
+        .iter()
+        .step_by(2)
+        .map(|name| format!("{name} 4.5.6\n"))
+        .collect();
+    let child_path = project.create_file(".tool-versions", &child_pins);
+    for (index, runtime) in names.iter().enumerate() {
+        check(
+            runtime,
+            Some(if index % 2 == 0 { "4.5.6" } else { "2.3.4" }),
+        );
+    }
+    for (alias, canonical) in [
+        ("NodeJS", "node"),
+        ("python3", "python"),
+        ("GOLANG", "go"),
+        ("rustlang", "rust"),
+        ("jdk", "java"),
+        ("openjdk", "java"),
+        ("bunjs", "bun"),
+        ("ziglang", "zig"),
+    ] {
+        let index = names.iter().position(|name| name == canonical).unwrap();
+        check(alias, Some(if index % 2 == 0 { "4.5.6" } else { "2.3.4" }));
+    }
+    assert_eq!(std::fs::read_to_string(&parent_path).unwrap(), parent_pins);
+    assert_eq!(std::fs::read_to_string(&child_path).unwrap(), child_pins);
+    std::fs::remove_file(&child_path).unwrap();
+    std::fs::remove_file(&parent_path).unwrap();
+    for runtime in &names {
+        check(runtime, Some("1.2.3"));
+        let versions = project.data_dir.path().join("versions").join(runtime);
+        assert_eq!(
+            std::fs::read_link(versions.join("current")).unwrap(),
+            versions.join("1.2.3")
+        );
+        assert_eq!(
+            std::fs::read(versions.join("1.2.3/sentinel")).unwrap(),
+            b"selected fixture bytes"
+        );
+        std::fs::remove_file(versions.join("current")).unwrap();
+        std::os::unix::fs::symlink(versions.join("missing"), versions.join("current")).unwrap();
+        check(runtime, None);
+        assert_eq!(
+            std::fs::read_link(versions.join("current")).unwrap(),
+            versions.join("missing")
+        );
+    }
+    project.close_checked();
+    let parent_path = parent.path().to_owned();
+    parent.close().unwrap();
+    assert!(!parent_path.exists());
+}
