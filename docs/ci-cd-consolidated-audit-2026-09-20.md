@@ -300,3 +300,25 @@ Checkpoint 56cc1bf1 subsequently passed all nine workflows, including CI
 native artifact reuse therefore have hosted confirmation before the behavioral
 receipt batch is published. Final independent review and the remaining semantic,
 daemon, native fault and interaction work are still pending.
+
+### Daemon transport regression batch
+
+The three CLI fixture contracts passed on Debian, Trixie, Ubuntu and pure Debian
+in CI 35517223784. The pure owner retained 1,463 passed executions, 32 skipped,
+zero failed and zero retried; skips are not covered contracts.
+
+The next daemon batch retains and joins the production server task, checks IPC
+readiness, exercises SIGTERM draining and explicitly removes its fixture state.
+It adds fragmented/coalesced frames, partial-frame disconnect recovery, bounded
+response allocation and truncated-response rejection. The active-connection
+oracle waits for explicit counts instead of sampling a potentially unsettled
+baseline after a fixed delay. An exhaustive request match and witnesses generated
+from one test macro bind all 15 compiled Request variants to the reviewed manifest.
+This is inventory/codec evidence, not successful handler coverage.
+
+A new custom-socket regression requires the fast-status file beside that socket.
+Static inspection shows public server::run currently derives the path globally;
+the hosted regression is expected to expose this before a production repair.
+Rustfmt and TOML parsing pass locally; this Windows host cannot execute the Linux
+server tests. The batch's Rust outcomes remain pending. Automatic QEMU failure
+issue reporting is unchanged, and no synthetic production issue is created.

@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used thirty-five searches (171 requested result slots),
+Exa research used thirty-six searches (174 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -45,6 +45,7 @@ Selected primary sources were read and checked against repository code.
 | [Cargo feature ownership](https://doc.rust-lang.org/stable/cargo/reference/features.html) | Keep supported success tests on their backend lanes; test explicit portable refusal separately | A cfg-disabled test contributes no behavioral coverage on that build |
 | [Nextest JUnit](https://nexte.st/docs/machine-readable/junit/) | Preserve successful output or explicit receipts for runtime skips | Default success-output and skipped-test reporting can hide early returns; check installed version |
 | [Nextest binary lists](https://nexte.st/docs/machine-readable/list/) and [executable environment](https://nexte.st/docs/configuration/env-vars/) | Bind CLI fixture receipts to the owning package's non-test executables and check the child helper's actual compiled path | A parser harness digest cannot identify a CLI subprocess; mock backend assertions do not certify native transactions |
+| [Tokio task ownership](https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html) and [Unix signals](https://docs.rs/tokio/latest/tokio/signal/unix/struct.Signal.html) | Retain the real-server task, establish readiness through IPC and join its SIGTERM drain before fixture cleanup | Dropping a handle detaches it; abort does not prove graceful shutdown. Signal listeners affect the whole test process, so server tests remain serial |
 | [Proptest timeouts](https://proptest-rs.github.io/proptest/proptest/forking.html) | Bound generated tests and replace accidental public-network parsing checks with deterministic fixtures | Forking and timeout settings do not create a behavioral oracle |
 | [Mutation timeouts](https://mutants.rs/timeouts.html) | Measure the unmutated owner suite before selecting mutation deadlines | The current 60-second deadline is shorter than some existing unmutated integration tests |
 | [GitHub privileged workflows](https://docs.github.com/en/actions/reference/security/secure-use) | Preserve overflow failure identities in trusted generated artifacts; keep PR artifacts away from issue-write execution | Only allowlisted data is admitted; requested artifact retention remains subject to repository limits |

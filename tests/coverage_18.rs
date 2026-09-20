@@ -55,8 +55,9 @@ const RATE_LIMITED_MESSAGE: &str = "Rate limit exceeded. Please slow down.";
 // ═══════════════════════════════════════════════════════════════════════════════
 
 struct RealServerFixture {
-    _temp_dir: TempDir,
+    temp_dir: Option<TempDir>,
     socket_path: PathBuf,
+    server: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl RealServerFixture {
@@ -85,36 +86,66 @@ impl RealServerFixture {
 
         let socket_path = temp_dir.path().join("cov18.sock");
         let listener = UnixListener::bind(&socket_path)?;
-        tokio::spawn(server::run(
+        let server = tokio::spawn(server::run(
             listener,
             Arc::clone(&state),
             socket_path.clone(),
         ));
 
-        // Wait until the accept loop is actually serving connections.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if UnixStream::connect(&socket_path).await.is_ok() {
-                break;
-            }
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "real daemon never became connectable on {}",
-                socket_path.display()
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-
-        Ok(Self {
-            _temp_dir: temp_dir,
+        let fixture = Self {
+            temp_dir: Some(temp_dir),
             socket_path,
-        })
+            server: Some(server),
+        };
+        // A bound socket alone does not prove the accept loop or signal
+        // listeners have been polled. Require a real production response.
+        metrics_probe(&fixture).await?;
+        Ok(fixture)
     }
 
     async fn connect(&self) -> Result<UnixStream> {
         UnixStream::connect(&self.socket_path)
             .await
             .with_context(|| format!("connect to {}", self.socket_path.display()))
+    }
+
+    async fn shutdown(mut self) -> Result<()> {
+        let server = self.server.as_mut().context("missing server task")?;
+        anyhow::ensure!(
+            !server.is_finished(),
+            "server exited before fixture shutdown"
+        );
+        // These serial tests own the sole server in their test process.
+        // Exercise its real SIGTERM drain, rather than detaching the task.
+        nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)?;
+        match timeout(Duration::from_secs(35), &mut *server).await {
+            Ok(result) => result.context("server task panicked")??,
+            Err(error) => {
+                server.abort();
+                if timeout(Duration::from_secs(5), &mut *server).await.is_err() {
+                    eprintln!("server task did not acknowledge cancellation");
+                }
+                return Err(error).context("server did not drain after SIGTERM");
+            }
+        }
+        drop(self.server.take());
+        anyhow::ensure!(
+            UnixStream::connect(&self.socket_path).await.is_err(),
+            "server still accepts connections after shutdown"
+        );
+        let directory = self.temp_dir.take().context("missing fixture directory")?;
+        let path = directory.path().to_path_buf();
+        directory.close().context("fixture directory cleanup")?;
+        anyhow::ensure!(!path.exists(), "fixture directory survived cleanup");
+        Ok(())
+    }
+}
+
+impl Drop for RealServerFixture {
+    fn drop(&mut self) {
+        if let Some(server) = &self.server {
+            server.abort();
+        }
     }
 }
 
@@ -136,12 +167,17 @@ async fn send_raw_frame(stream: &mut UnixStream, payload: &[u8]) -> Result<()> {
 /// new frame arrived (connection closed by the peer).
 async fn try_read_raw_frame(stream: &mut UnixStream) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
-    match stream.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    if stream.read(&mut len_buf[..1]).await? == 0 {
+        return Ok(None);
     }
+    stream.read_exact(&mut len_buf[1..]).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 8 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "response exceeds fixture allocation budget",
+        ));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(Some(buf))
@@ -186,8 +222,8 @@ async fn metrics_probe(fixture: &RealServerFixture) -> Result<MetricsSnapshot> {
     send_raw_frame(&mut stream, &bytes).await?;
     match read_response(&mut stream).await? {
         Response::Success {
+            id: 0xBEEF,
             result: ResponseResult::Metrics(snapshot),
-            ..
         } => Ok(snapshot),
         other => Err(anyhow::anyhow!(
             "expected a Metrics snapshot response, got {other:?}"
@@ -199,6 +235,113 @@ async fn metrics_probe(fixture: &RealServerFixture) -> Result<MetricsSnapshot> {
 /// request, so metric-delta assertions exercise the real serving path.
 async fn requests_failed_probe(fixture: &RealServerFixture) -> Result<u64> {
     Ok(metrics_probe(fixture).await?.requests_failed)
+}
+
+fn ping_wire(id: u64) -> Result<Vec<u8>> {
+    let payload = omg_lib::daemon::protocol::encode_frame(&Request::Ping { id })?;
+    let mut wire = u32::try_from(payload.len())?.to_be_bytes().to_vec();
+    wire.extend_from_slice(&payload);
+    Ok(wire)
+}
+
+fn assert_pong(response: Response, expected_id: u64) {
+    match response {
+        Response::Success {
+            id,
+            result: ResponseResult::Ping(message),
+        } => {
+            assert_eq!(id, expected_id);
+            assert_eq!(message, "pong");
+        }
+        other => panic!("expected matching pong, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn custom_socket_publishes_status_in_its_private_directory() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let status_path = fixture.socket_path.with_file_name("omg.status");
+    let published = timeout(READ_TIMEOUT, async {
+        loop {
+            if let Some(status) =
+                omg_lib::core::fast_status::FastStatus::read_validated(&status_path)
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    fixture.shutdown().await?;
+    let status = published.context("custom socket never received its private fast-status file")?;
+    assert_eq!(status.total_packages, 0);
+    assert_eq!(status.explicit_packages, 0);
+    assert_eq!(status.updates_available, 0);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn fragmented_then_coalesced_frames_preserve_response_order_and_ids() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let mut stream = fixture.connect().await?;
+    for byte in ping_wire(901)? {
+        stream.write_all(&[byte]).await?;
+        tokio::task::yield_now().await;
+    }
+    assert_pong(read_response(&mut stream).await?, 901);
+    let mut coalesced = ping_wire(902)?;
+    coalesced.extend_from_slice(&ping_wire(903)?);
+    stream.write_all(&coalesced).await?;
+    assert_pong(read_response(&mut stream).await?, 902);
+    assert_pong(read_response(&mut stream).await?, 903);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn incomplete_frames_disconnect_without_breaking_a_fresh_client() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let wire = ping_wire(910)?;
+    for length in [1, 3, 4, wire.len() - 1] {
+        let mut interrupted = fixture.connect().await?;
+        interrupted.write_all(&wire[..length]).await?;
+        interrupted.shutdown().await?;
+        drop(interrupted);
+        let mut fresh = fixture.connect().await?;
+        fresh.write_all(&ping_wire(911 + length as u64)?).await?;
+        assert_pong(read_response(&mut fresh).await?, 911 + length as u64);
+    }
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+async fn response_reader_rejects_oversized_length_without_allocating_body() -> Result<()> {
+    let (mut reader, mut writer) = UnixStream::pair()?;
+    writer.write_all(&u32::MAX.to_be_bytes()).await?;
+    let error = timeout(READ_TIMEOUT, try_read_raw_frame(&mut reader))
+        .await?
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    Ok(())
+}
+
+#[tokio::test]
+async fn response_reader_distinguishes_clean_eof_from_truncated_frames() -> Result<()> {
+    for wire in [vec![0, 0], vec![0, 0, 0, 3, 1]] {
+        let (mut reader, mut writer) = UnixStream::pair()?;
+        writer.write_all(&wire).await?;
+        drop(writer);
+        let error = timeout(READ_TIMEOUT, try_read_raw_frame(&mut reader))
+            .await?
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+    let (mut reader, writer) = UnixStream::pair()?;
+    drop(writer);
+    assert!(try_read_raw_frame(&mut reader).await?.is_none());
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -251,7 +394,7 @@ async fn version_mismatch_gets_exact_parse_error_then_connection_closes() -> Res
         baseline + 1,
         "each version-mismatch rejection must count exactly one failed request metric"
     );
-    Ok(())
+    fixture.shutdown().await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -294,7 +437,7 @@ async fn frame_too_short_for_header_gets_parse_error_then_connection_closes() ->
         baseline + 1,
         "malformed header must bump requests_failed"
     );
-    Ok(())
+    fixture.shutdown().await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -326,7 +469,7 @@ async fn four_kib_frame_reaches_protocol_parser_before_rejection() -> Result<()>
 
     let after = requests_failed_probe(&fixture).await?;
     assert_eq!(after, baseline + 1);
-    Ok(())
+    fixture.shutdown().await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -363,7 +506,7 @@ async fn undecodable_payload_gets_parse_error_validation_failure_then_close() ->
     let after = requests_failed_probe(&fixture).await?;
     assert_eq!(after, baseline + 1);
 
-    Ok(())
+    fixture.shutdown().await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -415,7 +558,7 @@ async fn oversized_frame_tears_down_silently_without_any_response_frame() -> Res
         baseline + 1,
         "frame-decode failure must bump requests_failed even though nothing is answered"
     );
-    Ok(())
+    fixture.shutdown().await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -512,15 +655,15 @@ async fn rate_limited_burst_rejects_with_exact_envelope_and_keeps_connection_ope
             panic!("connection must stay usable after a rate-limit rejection, got {other:?}")
         }
     }
-    Ok(())
+    fixture.shutdown().await
 }
 
 #[tokio::test]
 #[serial]
 async fn active_connection_metric_returns_to_baseline_after_disconnect() -> Result<()> {
     let fixture = RealServerFixture::new().await?;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let baseline = metrics_probe(&fixture).await?.active_connections;
+    // The metrics probe itself is the one expected live connection.
+    wait_for_active_connections(&fixture, 1).await?;
 
     let mut stream = fixture.connect().await?;
     let ping = omg_lib::daemon::protocol::encode_frame(&Request::Ping { id: 0xCAFE })?;
@@ -529,18 +672,23 @@ async fn active_connection_metric_returns_to_baseline_after_disconnect() -> Resu
         read_response(&mut stream).await?,
         Response::Success { id: 0xCAFE, .. }
     ));
+    wait_for_active_connections(&fixture, 2).await?;
     drop(stream);
+    wait_for_active_connections(&fixture, 1).await?;
+    fixture.shutdown().await
+}
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+async fn wait_for_active_connections(fixture: &RealServerFixture, expected: i64) -> Result<()> {
+    let deadline = Instant::now() + READ_TIMEOUT;
     loop {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        let active = metrics_probe(&fixture).await?.active_connections;
-        if active == baseline {
+        let active = metrics_probe(fixture).await?.active_connections;
+        if active == expected {
             return Ok(());
         }
         anyhow::ensure!(
             Instant::now() < deadline,
-            "active connections never returned to baseline {baseline}; last value was {active}"
+            "active connections never reached {expected}; last value was {active}"
         );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }

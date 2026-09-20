@@ -31,6 +31,11 @@ retries = 0
 filter = 'test(=test_parse_disabled_source) | test(=test_cli_status_shows_debian_info) | test(=test_cli_debian_respects_ci_mode) | test(=cli_receipt_rejects_a_different_product_executable) | test(=apt_integration::test_update_check_with_mock_updates)'
 retries = 0
 
+# Production transport and shutdown failures must remain first-attempt failures.
+[[profile.default.overrides]]
+filter = 'binary(=coverage_18)'
+retries = 0
+
 [profile.ci]
 test-threads = "num-cpus"
 fail-fast = false

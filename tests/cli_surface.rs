@@ -6,6 +6,66 @@ use clap::{Arg, ArgAction, ArgGroup, Command, CommandFactory, Parser, error::Err
 use omg_lib::cli::{Cli, Commands};
 use serde_json::{Value, json};
 
+#[test]
+fn daemon_request_inventory_matches_every_compiled_variant() {
+    use omg_lib::daemon::protocol::{PROTOCOL_VERSION, Request, encode_frame, split_frame};
+    use std::collections::BTreeSet;
+
+    // Generate the exhaustive match and witnesses from the same list. A new
+    // variant cannot be acknowledged in the match while omitted from witnesses.
+    macro_rules! request_inventory {
+        ($($variant:ident { $($field:ident: $value:expr),* $(,)? }),+ $(,)?) => {{
+            fn identity(request: &Request) -> &'static str {
+                match request {
+                    $(Request::$variant { .. } => concat!("ipc:", stringify!($variant))),+
+                }
+            }
+            let requests = [$(Request::$variant { $($field: $value),* }),+];
+            let mut identities = BTreeSet::new();
+            for (index, request) in requests.iter().enumerate() {
+                assert_eq!(request.id(), index as u64 + 1);
+                let encoded = encode_frame(request).unwrap();
+                let (version, payload) = split_frame(&encoded).unwrap();
+                assert_eq!(version, PROTOCOL_VERSION);
+                let decoded: Request = bitcode::deserialize(payload).unwrap();
+                assert_eq!(serde_json::to_value(&decoded).unwrap(), serde_json::to_value(request).unwrap());
+                assert!(identities.insert(identity(request).to_owned()));
+            }
+            identities
+        }};
+    }
+
+    let observed = request_inventory! {
+        Search { id: 1, query: "literal -- query".into(), limit: Some(0) },
+        Info { id: 2, package: "fixture-package".into() },
+        Status { id: 3 },
+        Explicit { id: 4 },
+        ExplicitCount { id: 5 },
+        SecurityAudit { id: 6 },
+        Ping { id: 7 },
+        CacheStats { id: 8 },
+        CacheClear { id: 9 },
+        RefreshIndex { id: 10 },
+        Metrics { id: 11 },
+        Suggest { id: 12, query: "package".into(), limit: None },
+        DebianSearch { id: 13, query: "two words".into(), limit: Some(17) },
+        Health { id: 14 },
+        ListUpdates { id: 15 },
+    };
+    let manifest: Value = serde_json::from_str(include_str!("contracts/manifest.json")).unwrap();
+    let declared: BTreeSet<_> = manifest["interfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["id"].as_str().filter(|id| id.starts_with("ipc:")))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        observed, declared,
+        "daemon request inventory requires review"
+    );
+}
+
 fn command<'a>(document: &'a Value, path: &str) -> &'a Value {
     document["commands"]
         .as_array()
