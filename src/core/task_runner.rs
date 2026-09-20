@@ -1887,6 +1887,88 @@ build = "node"
     }
 
     #[test]
+    fn resolve_nvm_alias_follows_a_chain_to_its_version() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("alias/lts")).unwrap();
+        fs::write(temp.path().join("alias/default"), "lts/jod\n").unwrap();
+        fs::write(temp.path().join("alias/lts/jod"), "v22.14.0\n").unwrap();
+        assert_eq!(
+            resolve_nvm_alias(temp.path(), "default").unwrap(),
+            Some("v22.14.0".to_string())
+        );
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn resolve_nvm_alias_ignores_comments_and_blank_lines() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("alias")).unwrap();
+        fs::write(
+            temp.path().join("alias/default"),
+            "# selected version\n\n  v22.14.0 # local pin\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_nvm_alias(temp.path(), "default").unwrap(),
+            Some("v22.14.0".to_string())
+        );
+        fs::write(temp.path().join("alias/default"), "# no pin\n\n").unwrap();
+        assert!(resolve_nvm_alias(temp.path(), "default").unwrap().is_none());
+        temp.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_nvm_alias_lts_directory_resolves_the_default_lts_alias() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("alias/lts")).unwrap();
+        // nvm stores '*' as a literal alias filename on Unix, not a glob.
+        fs::write(temp.path().join("alias/lts/*"), "lts/jod\n").unwrap();
+        fs::write(temp.path().join("alias/lts/jod"), "v22.14.0\n").unwrap();
+        for requested in ["lts", "lts/*"] {
+            assert_eq!(
+                resolve_nvm_alias(temp.path(), requested).unwrap(),
+                Some("v22.14.0".to_string())
+            );
+        }
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn resolve_nvm_alias_rejects_cycles() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("alias")).unwrap();
+        fs::write(temp.path().join("alias/first"), "second\n").unwrap();
+        fs::write(temp.path().join("alias/second"), "first\n").unwrap();
+        let error = resolve_nvm_alias(temp.path(), "first").unwrap_err();
+        assert!(error.to_string().contains("cycle"), "{error:#}");
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn resolve_nvm_alias_rejects_parent_traversal() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("alias")).unwrap();
+        fs::write(temp.path().join("outside"), "v22.14.0\n").unwrap();
+        assert!(resolve_nvm_alias(temp.path(), "../outside").is_err());
+        fs::write(temp.path().join("alias/default"), "../outside\n").unwrap();
+        assert!(resolve_nvm_alias(temp.path(), "default").is_err());
+        temp.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_nvm_alias_rejects_symlinks_outside_its_alias_directory() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("alias")).unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "v22.14.0\n").unwrap();
+        std::os::unix::fs::symlink(&outside, temp.path().join("alias/default")).unwrap();
+        assert!(resolve_nvm_alias(temp.path(), "default").is_err());
+        temp.close().unwrap();
+    }
+
+    #[test]
     fn resolve_nvm_alias_unreadable_fails_closed() {
         let temp = TempDir::new().unwrap();
         let alias_dir = temp.path().join("alias");
@@ -1903,6 +1985,9 @@ build = "node"
         let result = resolve_nvm_alias(temp.path(), "lts");
         let _ = fs::set_permissions(&alias, original);
         if !blocked {
+            eprintln!(
+                "[omg-skip] current user can read mode-000 alias; permission denial not exercised"
+            );
             return;
         }
         assert!(

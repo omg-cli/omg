@@ -36,6 +36,11 @@ retries = 0
 filter = 'binary(=coverage_18)'
 retries = 0
 
+# Alias cycles and path escapes are deterministic failures, never retryable.
+[[profile.default.overrides]]
+filter = 'test(core::task_runner::tests::resolve_nvm_alias_)'
+retries = 0
+
 [profile.ci]
 test-threads = "num-cpus"
 fail-fast = false

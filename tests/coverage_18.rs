@@ -437,7 +437,7 @@ async fn package_info_cache_preserves_metadata_and_missing_package_identity() ->
                 assert_eq!(code, error_codes::PACKAGE_NOT_FOUND);
                 assert_eq!(message, "Package not found: cov18-absent-package");
             }
-            other => panic!("missing package returned {other:?}"),
+            other @ Response::Success { .. } => panic!("missing package returned {other:?}"),
         }
     }
     let metrics = metrics_probe(&fixture).await?;
@@ -459,7 +459,7 @@ async fn isolated_refresh_refusal_preserves_server_liveness() -> Result<()> {
                 "Index refresh is unavailable in an isolated daemon"
             );
         }
-        other => panic!("isolated refresh returned {other:?}"),
+        other @ Response::Success { .. } => panic!("isolated refresh returned {other:?}"),
     }
     assert_pong(
         request_on_wire(&fixture, Request::Ping { id: 712 }).await?,
