@@ -254,3 +254,24 @@ The shared readiness barrier can delay an individual guest, so the next hosted
 run must measure both total runner time and whole-gate latency. No speedup is
 claimed until that comparison exists. Readiness logs and admission-failure
 diagnostics remain available alongside the trusted QEMU issue-reporting path.
+
+### Native artifact reuse checkpoint 5116471f
+
+QEMU run 35505933279 passed all four guests using early native CI artifacts.
+Each guest independently passed source/recipe/run/attempt and archive/binary digest
+admission in 2–4 seconds; all duplicate staged-build jobs were skipped.
+Including preparation and aggregation, observed QEMU runner time was 31m35s
+versus 47m42s on 00ce6237 (about 34% lower). Guest durations were Arch 321s,
+Debian 325s, Fedora 352s and Ubuntu 425s; preparation consumed 466s.
+Workflow completion took 15m02s versus 12m56s: the shared artifact barrier traded
+about two minutes of latency for fewer runner minutes. These are individual
+observations, not whole-CI savings or guaranteed improvements.
+
+CI 35505933163 exposed a Trixie workflow regression: its container defaulted to
+sh, so the new Bash conditional selected the wrong branch. Other native owners
+passed. The follow-up explicitly selects Bash and extends the recipe regression
+test to verify that selection. It also preserves independent guest diagnosis
+when a sibling producer has no artifact: readiness logs absence under one shared
+deadline, while each guest still performs mandatory admission and retains its
+lifecycle failure evidence. Invalid identities remain blocking. The focused
+65-test suite and actionlint passed; a new hosted checkpoint is still required.

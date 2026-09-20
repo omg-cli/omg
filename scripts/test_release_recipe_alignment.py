@@ -15,6 +15,8 @@ class ReleaseRecipeAlignment(unittest.TestCase):
     def test_ci_release_cpu_baseline_matches_arch_and_generic_distros(self):
         ci = job_block((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'), 'linux-matrix')
         block = ci.split('      - name: Build release\n', 1)[1].split('\n      - name:', 1)[0]
+        # Container jobs default to sh; this recipe uses Bash conditional syntax.
+        self.assertIn('        shell: bash\n', block)
         raw = block.split('        run: ', 1)[1]
         command = textwrap.dedent(raw[2:]) if raw.startswith('|\n') else raw.strip()
         for distro, cpu in (('arch', '-C target-cpu=x86-64-v2'), ('debian', ''), ('fedora', ''), ('debian-trixie', '')):

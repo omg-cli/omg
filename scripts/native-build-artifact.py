@@ -149,6 +149,10 @@ def api_json(path):
     return json.loads(api(path), object_pairs_hook=unique_object, parse_constant=reject_constant)
 
 
+class ArtifactUnavailable(ValueError):
+    """Scheduling absence; each guest must still enforce full admission."""
+
+
 def find_native_artifact(root, distro, context, event, timeout=1500):
     require(distro in FEATURES, 'unsupported native owner')
     repository = context['GITHUB_REPOSITORY']
@@ -200,10 +204,11 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
                         and isinstance(artifact.get('created_at'), str)
                         and artifact['created_at'] >= run['run_started_at'], 'stale or invalid native artifact')
                 return artifact, run, expected_run
-            require(run.get('status') != 'completed', 'CI finished without the required native artifact')
+            if run.get('status') == 'completed':
+                raise ArtifactUnavailable('CI finished without the required native artifact')
         time.sleep(delay)
         delay = min(30, delay * 1.5)
-    raise ValueError('CI native artifact did not become available before the deadline')
+    raise ArtifactUnavailable('CI native artifact did not become available before the deadline')
 
 
 def ready(root, lanes, context, event, timeout=1500):
@@ -213,11 +218,20 @@ def ready(root, lanes, context, event, timeout=1500):
     require(len(distros) == len(lanes) and all(isinstance(distro, str) and distro in FEATURES for distro in distros)
             and len(set(distros)) == len(distros), 'duplicate or foreign native lanes')
     started = time.monotonic()
+    availability = {}
     for distro in distros:
         remaining = timeout - (time.monotonic() - started)
-        require(remaining > 0, 'native readiness deadline exceeded')
-        artifact, run, _ = find_native_artifact(root, distro, context, event, timeout=remaining)
+        try:
+            if remaining <= 0:
+                raise ArtifactUnavailable('shared native readiness deadline exceeded')
+            artifact, run, _ = find_native_artifact(root, distro, context, event, timeout=remaining)
+        except ArtifactUnavailable as error:
+            availability[distro] = 'unavailable'
+            print(f'Unavailable: {distro}: {error}; guest admission remains mandatory', flush=True)
+            continue
+        availability[distro] = 'available'
         print(f'Available: {distro}, CI run {run["id"]}, attempt {run["run_attempt"]}, artifact {artifact["id"]}', flush=True)
+    return availability
 
 
 def reuse(root, distro, image, features, destination, context, event, timeout=1500):

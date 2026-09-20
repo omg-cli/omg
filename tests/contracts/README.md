@@ -58,6 +58,10 @@ unchanged. No coverage-instrumented binary can substitute for the release pair.
 The preparation job waits once for artifact availability before allocating guest
 runners. Metadata readiness does not admit binaries: each guest independently
 verifies its archive and has a short deadline if the producer changes attempts.
+An unavailable producer does not suppress sibling guests: readiness records that
+absence and each guest enforces admission, retaining its own lifecycle failure
+evidence. Invalid producer identity still blocks the coordinator. The coordinator
+uses one shared deadline, including when a producer never uploads its artifact.
 This adds a shared readiness barrier, so compare total runner minutes and guest
 completion time on hosted runs before claiming a measured speedup.
 The trusted automatic QEMU issue reporter still owns failure publication.

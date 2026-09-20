@@ -302,6 +302,7 @@ jobs:
           cache-workspace-crates: false
 
       - name: Build release
+        shell: bash
         env:
           DISTRO: ${{ matrix.platform }}
           BUILD_IMAGE: ${{ matrix.image }}
