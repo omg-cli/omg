@@ -34,6 +34,13 @@ final-status-level = "all"
 retries = { backoff = "exponential", count = 2, delay = "1s", jitter = true }
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "omg-tests"
+# Runtime [omg-skip] early returns must remain distinguishable from execution.
+store-success-output = true
+store-failure-output = true
+
 [profile.ci-junit]
 test-threads = "num-cpus"
 fail-fast = false
@@ -41,7 +48,7 @@ retries = { backoff = "exponential", count = 2, delay = "1s", jitter = true }
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [profile.ci-junit.junit]
-path = "target/nextest/junit.xml"
+path = "junit.xml"
 report-name = "omg-tests"
 
 [profile.dev]

@@ -71,8 +71,13 @@ jobs:
         run: cargo test --lib --bins --no-default-features --features ${{ inputs.features }} --locked --no-fail-fast -- --test-threads=1
 
       - name: Build
+        env:
+          DISTRO: ${{ inputs.distro }}
         run: |
-          export RUSTFLAGS="-C target-cpu=x86-64-v2"
+          # Match release.yml: only the Arch release raises the CPU baseline.
+          if [[ "$DISTRO" == arch ]]; then
+            export RUSTFLAGS="-C target-cpu=x86-64-v2"
+          fi
           cargo build --timings --release --no-default-features --features ${{ inputs.features }} --locked
 
       - name: Preserve compiler timings

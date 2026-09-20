@@ -4,9 +4,11 @@ from pathlib import Path
 import subprocess
 import tempfile
 import textwrap
+import tomllib
 import unittest
 
 from test_ci_gates import CI_YML, job_block
+from test_native_contracts import NATIVE
 
 
 class RequiredResultsTests(unittest.TestCase):
@@ -40,7 +42,28 @@ class RequiredResultsTests(unittest.TestCase):
     def test_binary_unit_targets_in_every_unit_lane(self):
         text = CI_YML.read_text(encoding="utf-8")
         for job in ("portable", "linux-matrix", "macos", "ubuntu"):
-            self.assertIn("cargo nextest run --lib --bins", job_block(text, job))
+            self.assertIn("python3 scripts/run-native-contracts.py --features", job_block(text, job))
+        for feature in ('pgp,license', 'arch,pgp,license', 'debian,pgp,license',
+                        'fedora,pgp,license', 'macos,pgp,license'):
+            args = NATIVE.cargo_test_args(feature)
+            self.assertEqual(args[:2], ['--lib', '--bins'])
+            self.assertEqual(args[args.index('--test') + 1], 'cli_surface')
+            self.assertEqual(args[args.index('--features') + 1], feature)
+            self.assertIn('--locked', args)
+            self.assertIn('--no-default-features', args)
+        self.assertEqual(NATIVE.cargo_test_args('debian-pure')[:2], ['--lib', '--bins'])
+
+    def test_native_reports_keep_success_output_and_first_parser_failures(self):
+        config = tomllib.loads((CI_YML.parents[2] / '.config/nextest.toml').read_text())
+        junit = config['profile']['ci']['junit']
+        self.assertEqual(junit['path'], 'junit.xml')
+        self.assertTrue(junit['store-success-output'])
+        self.assertTrue(junit['store-failure-output'])
+        parser_rules = [rule for rule in config['profile']['default']['overrides']
+                        if 'binary(=cli_surface)' in rule['filter']]
+        self.assertEqual(len(parser_rules), 1)
+        self.assertEqual(parser_rules[0]['retries'], 0)
+        self.assertIn('socket_parser_preserves_literal_paths', parser_rules[0]['filter'])
 
     def test_sandbox_lane_requires_tools_and_security_cases(self):
         block = job_block(CI_YML.read_text(encoding="utf-8"), "sandbox-cancellation")

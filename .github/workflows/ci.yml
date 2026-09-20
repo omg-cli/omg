@@ -8,7 +8,7 @@
 # - cargo-nextest: 10-35% faster test execution
 # - Artifact caching: Shared caches across jobs
 # - Timeout protection: Prevents runaway jobs
-# - Test reporting: nextest terminal output (JUnit profile removed as unused)
+# - Test reporting: exact nextest selection, JUnit attempts and parser receipts
 
 name: CI
 
@@ -153,13 +153,13 @@ jobs:
           tool: nextest
 
       - name: Run portable tests
-        run: cargo nextest run --lib --bins --test cli_surface --no-default-features --features pgp,license --locked --profile ci
+        run: python3 scripts/run-native-contracts.py --features pgp,license
 
       - name: Verify pure Debian parser and daemon contracts
         env:
           OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces/debian-pure
           OMG_CONTRACT_PLATFORM: debian-pure
-        run: cargo nextest run --bin omgd --test cli_surface --no-default-features --features debian-pure --locked --profile ci
+        run: python3 scripts/run-native-contracts.py --features debian-pure
 
       - name: Preserve compiled parser surfaces
         if: always()
@@ -193,7 +193,7 @@ jobs:
             features: arch,pgp,license
             setup: |
               pacman -Syu --noconfirm
-              pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq
+              pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
                 -o /tmp/rustup-init
@@ -210,7 +210,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo \
+                ca-certificates curl git build-essential pkg-config sudo python3 \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
@@ -228,7 +228,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo \
+                ca-certificates curl git build-essential pkg-config sudo python3 \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
@@ -245,7 +245,7 @@ jobs:
             features: fedora,pgp,license
             setup: |
               dnf install -y --setopt=install_weak_deps=False \
-                git clang cmake openssl-devel pkgconfig findutils curl procps-ng \
+                git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 \
                 rpm dnf sqlite yum-utils fedora-release
               rpm --initdb
               dnf makecache --refresh
@@ -301,7 +301,13 @@ jobs:
           cache-workspace-crates: false
 
       - name: Build release
-        run: cargo build --release --no-default-features --features ${{ matrix.features }} --locked
+        env:
+          DISTRO: ${{ matrix.platform }}
+        run: |
+          if [[ "$DISTRO" == arch ]]; then
+            export RUSTFLAGS="-C target-cpu=x86-64-v2"
+          fi
+          cargo build --release --no-default-features --features ${{ matrix.features }} --locked
 
       - name: Platform clippy
         run: |
@@ -316,9 +322,7 @@ jobs:
         run: cargo nextest --version
 
       - name: Run unit tests
-        run: |
-          cargo nextest run --lib --bins --test cli_surface --no-default-features --features ${{ matrix.features }} \
-            --locked --profile ci --no-fail-fast
+        run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
 
       - name: Prepare sandbox regression executable
         if: matrix.platform == 'arch'
@@ -339,13 +343,6 @@ jobs:
           path: target/sandbox-test/omg-lib-tests
           retention-days: 1
           if-no-files-found: error
-
-      - name: Run platform-specific integration tests
-        run: |
-          if [[ "${{ matrix.platform }}" == "fedora" ]]; then
-            cargo nextest run --test fedora_tests --no-default-features --features ${{ matrix.features }} \
-              --locked --profile ci --no-fail-fast
-          fi
 
       - name: Debian deterministic benchmark regression check
         if: matrix.platform == 'debian'
@@ -664,7 +661,7 @@ jobs:
         run: cargo nextest --version
 
       - name: Run unit tests
-        run: cargo nextest run --lib --bins --test cli_surface --no-default-features --features macos,pgp,license --locked --profile ci
+        run: python3 scripts/run-native-contracts.py --features macos,pgp,license
 
       - name: Install Homebrew test packages
         run: |
@@ -751,7 +748,7 @@ jobs:
         run: cargo nextest --version
 
       - name: Run unit tests
-        run: cargo nextest run --lib --bins --test cli_surface --no-default-features --features debian,pgp,license --locked --profile ci
+        run: python3 scripts/run-native-contracts.py --features debian,pgp,license
 
       - name: Verify binary
         run: |

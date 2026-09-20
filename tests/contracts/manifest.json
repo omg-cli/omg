@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Initial parser mappings only; behavioral import and receipt producers are incomplete",
+  "status": "Parser mappings with native execution adapters; behavioral import remains incomplete",
   "inventory_source": "Verified compiled artifacts from CI run 35500460442, checkout d2554cd7f1b22e3c706660c390867b9203c6c7aa",
   "contracts": [
     {

@@ -1136,17 +1136,11 @@
         "omg run --using",
         "omg run --verbose",
         "omg run --watch",
-        "omg run <args>",
         "omg run <task>",
-        "omg search",
         "omg search --all-commands",
         "omg search --detailed",
-        "omg search --json",
-        "omg search --limit",
         "omg search --no-aur",
         "omg search --quiet",
-        "omg search --verbose",
-        "omg search <query>",
         "omg self-update",
         "omg self-update --all-commands",
         "omg self-update --force",
@@ -1338,7 +1332,6 @@
         "omg tool update <name>",
         "omg update",
         "omg update --all-commands",
-        "omg update --aur-only",
         "omg update --check",
         "omg update --dry-run",
         "omg update --fast",
@@ -2527,17 +2520,11 @@
         "omg run --using",
         "omg run --verbose",
         "omg run --watch",
-        "omg run <args>",
         "omg run <task>",
-        "omg search",
         "omg search --all-commands",
         "omg search --detailed",
-        "omg search --json",
-        "omg search --limit",
         "omg search --no-aur",
         "omg search --quiet",
-        "omg search --verbose",
-        "omg search <query>",
         "omg self-update",
         "omg self-update --all-commands",
         "omg self-update --force",
@@ -2729,7 +2716,6 @@
         "omg tool update <name>",
         "omg update",
         "omg update --all-commands",
-        "omg update --aur-only",
         "omg update --check",
         "omg update --dry-run",
         "omg update --fast",
@@ -2843,32 +2829,6 @@
       ]
     },
     {
-      "owner": "src/bin/omgd.rs",
-      "reason": "Existing tests are not yet reconciled into execution receipts; no behavioral coverage credit is assigned",
-      "platforms": [
-        "portable",
-        "debian-pure",
-        "arch",
-        "debian",
-        "debian-trixie",
-        "fedora",
-        "ubuntu",
-        "macos"
-      ],
-      "missing": [
-        "parser",
-        "refusal",
-        "success",
-        "state",
-        "fault",
-        "concurrency"
-      ],
-      "surfaces": [
-        "omgd",
-        "omgd --socket"
-      ]
-    },
-    {
       "owner": "daemon",
       "reason": "Production transport/lifecycle assertions and per-request ownership are not yet reconciled",
       "platforms": [
@@ -2908,6 +2868,61 @@
         "transport:omgd.frames",
         "transport:omgd.connection-cap",
         "cache:omgd.refresh"
+      ]
+    },
+    {
+      "owner": "src/cli/args.rs",
+      "reason": "Parser assertions do not establish successful behavior, state changes or fault handling",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "missing": [
+        "refusal",
+        "success",
+        "state",
+        "fault",
+        "concurrency"
+      ],
+      "surfaces": [
+        "omg run <args>",
+        "omg search",
+        "omg search --json",
+        "omg search --limit",
+        "omg search --verbose",
+        "omg search <query>",
+        "omg update --aur-only"
+      ]
+    },
+    {
+      "owner": "src/bin/omgd.rs",
+      "reason": "Parser assertions do not establish successful behavior, state changes or fault handling",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "missing": [
+        "refusal",
+        "success",
+        "state",
+        "fault",
+        "concurrency"
+      ],
+      "surfaces": [
+        "omgd",
+        "omgd --socket"
       ]
     }
   ]
