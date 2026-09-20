@@ -1,8 +1,10 @@
 """Receipts must derive from observed executions of reviewed assertions."""
 import importlib.util
+import copy
 import json
 from pathlib import Path
 import unittest
+import tempfile
 
 from test_contract_coverage import fixture
 
@@ -25,6 +27,91 @@ def parser_fixture():
 
 
 class NativeReceipts(unittest.TestCase):
+    def test_behavior_subjects_bind_real_product_pair_and_owning_harness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / 'target'
+            (target / 'debug').mkdir(parents=True)
+            for name in ('omg', 'omgd', 'suite'):
+                (target / 'debug' / name).write_bytes(name.encode())
+            listing = {
+                'rust-build-meta': {'target-directory': str(target), 'non-test-binaries': {
+                    'owning-package': [dict(name=name, kind='bin-exe', path='debug/' + name,
+                                           **{'build-platform': 'target'}) for name in ('omg', 'omgd')]}},
+                'rust-suites': {'omg::debian_e2e_tests': {
+                    'package-id': 'owning-package', 'binary-path': str(target / 'debug/suite')}}}
+            subjects = NATIVE.behavior_subjects(listing, root)
+            self.assertEqual(set(subjects), {'omg', 'omgd', 'harness'})
+            self.assertEqual(subjects['omg'], target / 'debug/omg')
+            for fault in ('missing', 'duplicate', 'kind', 'platform', 'foreign-harness'):
+                invalid = copy.deepcopy(listing)
+                binaries = invalid['rust-build-meta']['non-test-binaries']['owning-package']
+                if fault == 'missing':
+                    binaries.pop()
+                elif fault == 'duplicate':
+                    binaries.append(dict(binaries[0]))
+                elif fault == 'kind':
+                    binaries[0]['kind'] = 'lib'
+                elif fault == 'platform':
+                    binaries[0]['build-platform'] = 'host'
+                else:
+                    (root / 'foreign').write_bytes(b'foreign harness')
+                    invalid['rust-suites']['omg::debian_e2e_tests']['binary-path'] = str(root / 'foreign')
+                with self.subTest(fault=fault), self.assertRaises(ValueError):
+                    NATIVE.behavior_subjects(invalid, root)
+            for path in ('../foreign', str(root / 'foreign')):
+                listing['rust-build-meta']['non-test-binaries']['owning-package'][0]['path'] = path
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    NATIVE.behavior_subjects(listing, root)
+
+    def test_behavior_adapter_cannot_promote_unreviewed_test_or_skip(self):
+        manifest, provenance, report, _ = parser_fixture()
+        contract = manifest['contracts'][0]
+        contract.update(requires=['success', 'state'], assertions={'success': ['exact-status'], 'state': ['read-only']})
+        binding = contract['tests'][0]
+        identity = 'omg::debian_e2e_tests::test_cli_status_shows_debian_info'
+        binding.update(lane='native-cli-fixture', id=identity, evidence=['success', 'state'],
+                       assertions=['exact-status', 'read-only', 'fixture-cleanup'])
+        provenance['lane'] = 'native-cli-fixture'
+        report['tests'][identity] = report['tests'].pop('install-dry-run-state')
+        receipts, _ = NATIVE.behavior_receipts(manifest, provenance, report)
+        self.assertEqual(receipts[0]['evidence'], ['success', 'state'])
+        self.assertEqual(receipts[0]['cleanup'], 'PASS')
+        _, surfaces, _, _, _ = fixture()
+        admission = NATIVE.COVERAGE.admit(manifest, surfaces, receipts, provenance, [contract['id']])
+        self.assertTrue(admission['passed'])
+        self.assertEqual(admission['evidence']['parser']['passed'], 0)
+        self.assertEqual(admission['evidence']['state']['passed'], 1)
+        binding['assertions'].remove('fixture-cleanup')
+        with self.assertRaisesRegex(ValueError, 'cleanup'):
+            NATIVE.behavior_receipts(manifest, provenance, report)
+        binding['assertions'].append('fixture-cleanup')
+        report['tests'][identity]['attempts'].insert(0, {'result': 'FAIL', 'duration_ms': 1})
+        receipts, _ = NATIVE.behavior_receipts(manifest, provenance, report)
+        self.assertEqual([row['result'] for row in receipts], ['FAIL', 'PASS'])
+        self.assertEqual(receipts[0]['cleanup'], 'NOT_STARTED')
+        self.assertEqual(receipts[0]['evidence'], [])
+        report['tests'][identity]['runtime_skip'] = True
+        receipts, _ = NATIVE.behavior_receipts(manifest, provenance, report)
+        self.assertEqual(receipts[0]['result'], 'BLOCKED')
+        self.assertEqual(receipts[0]['evidence'], [])
+        binding['id'] = 'unreviewed-test'
+        with self.assertRaises(ValueError):
+            NATIVE.behavior_receipts(manifest, provenance, report)
+
+    def test_real_behavior_manifest_has_only_reviewed_mappings_and_explicit_cleanup(self):
+        root = Path(__file__).resolve().parents[1]
+        manifest = json.loads((root / 'tests/contracts/manifest.json').read_text())
+        mapped = [contract for contract in manifest['contracts']
+                  if any(binding['lane'] == 'native-cli-fixture' for binding in contract['tests'])]
+        self.assertEqual(len(mapped), 3)
+        for contract in mapped:
+            self.assertTrue(contract['critical'])
+            self.assertIn('not native package transactions', contract['scope'])
+            for binding in contract['tests']:
+                self.assertIn(binding['id'], NATIVE.BEHAVIOR_TESTS)
+                self.assertIn('fixture-cleanup', binding['assertions'])
+
     def test_platform_policy_matches_real_native_selection(self):
         root = Path(__file__).resolve().parents[1]
         policy = json.loads((root / 'tests/contracts/platforms.json').read_text())

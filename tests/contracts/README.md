@@ -22,7 +22,18 @@ The `cli-surfaces-*` artifacts contain, per owner:
   assertions, first-failure history and explicit debt. Admission errors are
   preserved in `admission-error.json` and fail the owning job.
 
-Only reviewed parser mappings are translated by this adapter. A JUnit pass
+For Debian, Trixie, Ubuntu and pure Debian, `execution/behavior/` separately
+records three reviewed CLI fixture contracts: status, JSON status and explicit
+installation consent. The actual debug `omg`/`omgd` pair and owning integration
+harness are hashed before and after execution. The child helper checks that its
+compiled CLI path matches the admitted subject, reaps children and checks home
+cleanup; the two mapped tests explicitly close their state directories.
+The status fixture asserts exact seeded counts, unchanged state and independent
+empty state. Consent asserts refusal without `--yes`, unchanged refused state,
+and exact installed versions after consent. These use a mock Debian backend;
+they do not certify native transactions or daemon behavior. Wider gaps remain.
+
+Only explicitly reviewed mappings are translated. A generic JUnit pass
 cannot automatically certify state changes, cleanup or successful transactions.
 The QEMU inventory/evidence gate and trusted automatic issue reporter remain
 separate and mandatory. Native receipts do not replace their native DB, process,

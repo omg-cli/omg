@@ -28,7 +28,7 @@ retries = 0
 
 # Isolated Debian fixture contracts must not hide their first failure.
 [[profile.default.overrides]]
-filter = 'test(=test_parse_disabled_source) | test(=test_cli_status_shows_debian_info) | test(=test_cli_debian_respects_ci_mode) | test(=apt_integration::test_update_check_with_mock_updates)'
+filter = 'test(=test_parse_disabled_source) | test(=test_cli_status_shows_debian_info) | test(=test_cli_debian_respects_ci_mode) | test(=cli_receipt_rejects_a_different_product_executable) | test(=apt_integration::test_update_check_with_mock_updates)'
 retries = 0
 
 [profile.ci]

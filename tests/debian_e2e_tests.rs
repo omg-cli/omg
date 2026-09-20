@@ -811,6 +811,32 @@ fn test_cli_update_check_debian() {
 }
 
 #[test]
+fn cli_receipt_rejects_a_different_product_executable() {
+    const CHILD: &str = "OMG_RECEIPT_IDENTITY_NEGATIVE_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok("1") {
+        run_omg_cli(&["--version"]).assert_success();
+        return;
+    }
+    let harness = std::env::current_exe().unwrap();
+    let output = std::process::Command::new(&harness)
+        .args([
+            "--exact",
+            "cli_receipt_rejects_a_different_product_executable",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .env("OMG_CONTRACT_EXPECTED_CLI", &harness)
+        .output()
+        .expect("run receipt identity negative control");
+    assert!(!output.status.success(), "wrong executable was accepted");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("CLI fixture executable differs from the admitted receipt subject")
+    );
+}
+
+#[test]
 fn test_cli_status_shows_debian_info() {
     let data = TempDir::new().expect("temp data dir");
     let mock = omg_lib::package_managers::mock::MockPackageManager::new_in("debian", data.path());
@@ -853,6 +879,10 @@ fn test_cli_status_shows_debian_info() {
     let status: serde_json::Value = serde_json::from_str(&empty.stdout).unwrap();
     assert_eq!(status["total_packages"], 0);
     assert_eq!(status["updates_available"], 0);
+    let fixture_path = data.path().to_path_buf();
+    drop(mock);
+    data.close().expect("status fixture cleanup");
+    assert!(!fixture_path.exists());
 }
 
 #[test]
@@ -1046,6 +1076,10 @@ fn test_cli_debian_respects_ci_mode() {
     assert_eq!(installed.len(), 2);
     assert_eq!(installed["curl"], "2.0.0");
     assert_eq!(installed["git"], "3.2.1");
+    let fixture_path = data.path().to_path_buf();
+    drop(mock);
+    data.close().expect("consent fixture cleanup");
+    assert!(!fixture_path.exists());
 }
 
 #[test]

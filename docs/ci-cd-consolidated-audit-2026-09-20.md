@@ -275,3 +275,28 @@ when a sibling producer has no artifact: readiness logs absence under one shared
 deadline, while each guest still performs mandatory admission and retains its
 lifecycle failure evidence. Invalid identities remain blocking. The focused
 65-test suite and actionlint passed; a new hosted checkpoint is still required.
+
+### Behavioral evidence import (prepared after 56cc1bf1)
+
+Three contracts now map reviewed exact assertions in two Debian CLI fixtures:
+human status, JSON status and explicit install consent. Their separate adapter
+binds the actual debug child executable and owning test harness before/after the
+single existing nextest run, rejects skips/unreviewed mappings, and preserves
+failed attempts. The fixtures assert private state cleanup; a subprocess negative
+control rejects a test harness substituted for the product executable. This is
+mock-backend CLI evidence, not native transaction or daemon coverage. The broader
+inventory remains explicitly incomplete. Local adapter/selection tests pass;
+the new Rust assertions and generated receipts require hosted execution.
+
+The completed 5116471f coverage run 35505933179 retained LCOV with 53,911 of
+70,574 reported source lines hit (76.4%) and 5,817 of 7,593 functions hit.
+This is the arch,pgp,license instrumented build, including compiled in-source
+test code; disabled features and other platforms are not represented. LCOV
+reported BRF=0 and BRH=0, so branch coverage is unavailable, not 100%.
+These instrumentation totals must not substitute for behavioral contract counts.
+
+Checkpoint 56cc1bf1 subsequently passed all nine workflows, including CI
+35516409756 and QEMU 35516409883 with all four guests. The shell correction and
+native artifact reuse therefore have hosted confirmation before the behavioral
+receipt batch is published. Final independent review and the remaining semantic,
+daemon, native fault and interaction work are still pending.

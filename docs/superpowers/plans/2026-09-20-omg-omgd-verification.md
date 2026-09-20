@@ -119,11 +119,11 @@ Contract record shape:
 
 - [x] Add fixture tests for missing Debian integration binaries, all-filtered selection, duplicated IDs, expected unsupported cases, and a legitimate nonempty selection.
 - [ ] Test a nominally passing result containing `[omg-skip]`: it must not satisfy executed coverage. Preserve successful-test output or structured skip receipts so early-return skips cannot disappear from nextest/JUnit admission. Map system/network/destructive opt-ins to isolated owners explicitly.
-- [ ] Run the existing Debian/debian-pure/Fedora integration files in compatible native owners, preserving the distinction between libapt-backed and pure Rust binaries. Expose environment/dependency failures; do not label them product passes.
-- [ ] Reuse a producer only when toolchain, features, target ABI, profile and instrumentation match. Coverage builds are distinct from uninstrumented release guests.
-- [ ] Make the critical contract group retries zero; preserve first-attempt data for other tests. Keep doctests under an explicit Cargo owner because nextest does not execute them.
-- [ ] Verify selection-checker tests and actionlint, then hosted feature lanes. Unknown source paths select the full affected matrix.
-- [ ] Commit feature-owner and selection changes together; no empty feature lane accepted as green.
+- [x] Run the existing Debian/debian-pure/Fedora integration files in compatible native owners, preserving the distinction between libapt-backed and pure Rust binaries. Expose environment/dependency failures; do not label them product passes.
+- [x] Reuse a producer only when toolchain, features, target ABI, profile and instrumentation match. Coverage builds are distinct from uninstrumented release guests.
+- [x] Make the critical contract group retries zero; preserve first-attempt data for other tests. Keep doctests under an explicit Cargo owner because nextest does not execute them.
+- [x] Verify selection-checker tests and actionlint, then hosted feature lanes. Unknown source paths select the full affected matrix.
+- [x] Commit feature-owner and selection changes together; no empty feature lane accepted as green.
 
 ### Task 5: Close CLI semantic gaps using existing fixtures
 
