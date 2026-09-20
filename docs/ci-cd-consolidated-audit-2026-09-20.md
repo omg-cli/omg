@@ -157,3 +157,25 @@ the portable baseline then exposed seven team tests assuming a package backend.
 Their native success contracts are retained; portable builds receive explicit
 unsupported-operation and unchanged-state contracts. Future baseline runs use
 `--no-fail-fast` to collect all failing integration binaries in one run.
+
+
+## Baseline repair evidence on fc233d04
+
+All four x86-64 QEMU lanes, instrumented coverage and Docker passed. Docker
+completed in 6m53s after a production Rust source change (image step 6m17s,
+std-only test-driver compilation one second). Coverage took 10m31s. These are
+individual observed runs, not a statistical performance guarantee.
+
+The complete portable baseline now passes the environment/backend refusal,
+metrics isolation and unscanned-status repairs, but still fails two package-info
+cases. The mock package/backend pair selected the Arch-specific path in a build
+without that path. The next repair pairs distro and package explicitly and uses
+the generic mock adapter for portable builds. Baseline failures now retain
+compiled dependency caches; workspace crates retain the action's default pruning.
+The baseline must pass before parser/contract inventory implementation begins.
+
+QEMU reporting now retains all admitted failure identities in a source/attempt-bound
+catalog even when more than 25 cases fail. The issue-write cap is preserved with
+an aggregate issue linked to a 30-day reporter artifact. Duplicate JSON keys and
+case/distro mismatches are rejected. Local reporter tests cover API failures,
+invalid artifacts and cancellations without posting synthetic issues.

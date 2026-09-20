@@ -33,37 +33,28 @@ use tempfile::TempDir;
 // TEST UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "arch")]
-const fn known_system_package() -> &'static str {
-    "pacman"
+// Arch and Debian info use feature-gated fast paths. A portable build must
+// exercise the generic adapter with a non-Arch mock, not name a pacman backend
+// whose compiled lookup path is absent. Keep the fixture package and distro
+// together so they cannot accidentally refer to different mock databases.
+const fn backend_fixture() -> (&'static str, &'static str) {
+    if cfg!(feature = "arch") {
+        ("arch", "pacman")
+    } else if cfg!(any(feature = "debian", feature = "debian-pure")) {
+        ("debian", "apt")
+    } else if cfg!(feature = "macos") {
+        ("macos", "homebrew")
+    } else {
+        ("fedora", "dnf")
+    }
 }
 
-#[cfg(all(
-    not(feature = "arch"),
-    any(feature = "debian", feature = "debian-pure")
-))]
 const fn known_system_package() -> &'static str {
-    "apt"
-}
-
-#[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
-const fn known_system_package() -> &'static str {
-    // The isolated child uses the Arch mock database even in portable builds.
-    "pacman"
+    backend_fixture().1
 }
 
 fn run_for_compiled_backend(args: &[&str]) -> CommandResult {
-    #[cfg(all(
-        not(feature = "arch"),
-        any(feature = "debian", feature = "debian-pure")
-    ))]
-    return run_omg_with_env(args, &[("OMG_TEST_DISTRO", "debian")]);
-
-    #[cfg(any(
-        feature = "arch",
-        not(any(feature = "debian", feature = "debian-pure"))
-    ))]
-    run_omg(args)
+    run_omg_with_env(args, &[("OMG_TEST_DISTRO", backend_fixture().0)])
 }
 
 /// Create a temporary project directory with common config files

@@ -61,6 +61,9 @@ jobs:
           # Mutants uses scratch build directories, not the root target.
           cache-targets: ${{ github.event_name == 'pull_request' || inputs.baseline-only == true }}
           cache-bin: false
+          # Failed baselines still compiled valid dependencies. Preserve that
+          # work while repairs are verified; GitHub isolates PR cache writes.
+          cache-on-failure: true
 
       - name: Validate portable mutation baseline
         if: github.event_name == 'pull_request' || inputs.baseline-only == true
