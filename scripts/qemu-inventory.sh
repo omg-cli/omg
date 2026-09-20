@@ -9,6 +9,48 @@
 set -euo pipefail
 # BEGIN PRODUCT OUTPUT ORACLE
 # This exact function is sent to the guest and exercised by fault-injection tests.
+check_native_counter() {
+  local distro=$1 counter=$2 output=$3 status=0 expected actual
+  local -a native=()
+  case "$distro:$counter" in
+    arch:ec) native=(pacman -Qqe) ;;
+    arch:tc) native=(pacman -Qq) ;;
+    arch:oc) native=(pacman -Qdtq) ;;
+    arch:uc) native=(pacman -Quq) ;;
+    debian:tc|ubuntu:tc) native=(dpkg-query -W '-f=${db:Status-Status}\n') ;;
+    debian:ec|ubuntu:ec) native=(apt-mark showmanual) ;;
+    debian:oc|ubuntu:oc) native=(apt-get -s autoremove) ;;
+    debian:uc|ubuntu:uc) native=(apt list --upgradable) ;;
+    fedora:tc) native=(rpm -qa --qf '%{NAME}.%{ARCH}\n') ;;
+    fedora:ec) native=(dnf --cacheonly repoquery --userinstalled --qf '%{name}\n') ;;
+    fedora:oc) native=(dnf --cacheonly repoquery --unneeded --qf '%{name}.%{arch}\n') ;;
+    fedora:uc) native=(dnf --cacheonly repoquery --upgrades --latest-limit=1 --qf '%{name}.%{arch}\n') ;;
+    *) return 2 ;;
+  esac
+  timeout --kill-after=2s 30 "${native[@]}" > native-counter.raw 2> native-counter.stderr || status=$?
+  # pacman uses 1 for an empty query; never accept a diagnostic-bearing error.
+  if [[ "$distro" == arch && "$status" == 1 && ! -s native-counter.raw && ! -s native-counter.stderr ]]; then status=0; fi
+  if [[ "$status" != 0 ]]; then
+    printf 'native counter reference failed: %s %s exit=%s\n' "$distro" "$counter" "$status" >&2
+    head -c 4096 native-counter.stderr >&2
+    return 2
+  fi
+  expected=$(
+    set -o pipefail
+    case "$distro:$counter" in
+      debian:tc|ubuntu:tc) awk '$0 == "installed" {n++} END {print n+0}' native-counter.raw ;;
+      debian:oc|ubuntu:oc) awk '/^Remv / {n++} END {print n+0}' native-counter.raw ;;
+      debian:uc|ubuntu:uc) awk '$1 ~ /\// {n++} END {print n+0}' native-counter.raw ;;
+      *:ec|fedora:oc|fedora:uc) sort -u native-counter.raw | awk 'NF {n++} END {print n+0}' ;;
+      *) awk 'NF {n++} END {print n+0}' native-counter.raw ;;
+    esac
+  ) || { printf 'native counter reference processing failed\n' >&2; return 2; }
+  [[ $(wc -c < "$output") -le 32 ]] || { printf 'assertion failed: counter output exceeds scalar size\n' >&2; return 1; }
+  actual=$(cat "$output")
+  printf 'native counter %s expected=%s actual=%s\n' "$counter" "$expected" "$actual" >&2
+  [[ "$actual" =~ ^[0-9]+$ && "$actual" == "$expected" ]]
+}
+
 check_python_install() {
   local version=$1 base expected active executable output
   base="$OMG_DATA_DIR/versions/python"
@@ -243,11 +285,21 @@ IFS= read -r header < "$tsv"
 [[ "$header" == $'case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup' ]] || exit 2
 awk -F '\t' 'NR > 1 { if (NF != 10) exit 1; for (i = 1; i <= NF; i++) if ($i == "") exit 1 }' "$tsv" || exit 2
 declare -A row_args=() row_requires=() row_tier=() row_safety=() row_ux=() row_exit=() row_targets=() row_assertions=()
+counter_for_case() {
+  case "$1" in
+    explicit-shortcut) printf ec ;; total-shortcut) printf tc ;;
+    orphan-shortcut) printf oc ;; updates-shortcut) printf uc ;;
+  esac
+}
 while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
   [[ "$id" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && -z "${row_args[$id]:-}" ]] || exit 2
   [[ "$r" == - || "$r" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || exit 2
   [[ "$r" == - || -n "${row_args[$r]:-}" ]] || exit 2
   jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and (explode | index(0) == null))' <<< "$aj" >/dev/null || exit 2
+  counter=$(counter_for_case "$id")
+  if [[ -n "$counter" ]]; then
+    jq -e --arg counter "$counter" 'length == 1 and .[0] == $counter' <<< "$aj" >/dev/null || exit 2
+  fi
   case "$s" in read|isolated-write|controlled-error|help-boundary|interactive|package-mutation|service-mutation) ;; *) exit 2 ;; esac
   case "$u" in pass|declared) ;; *) exit 2 ;; esac
   [[ "$t" != *, && "$t" != ,* && "$t" != *,,* ]] || exit 2
@@ -402,6 +454,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; for hook in pre-commit post-checkout post-merge; do printf '#!/bin/sh\\n# user-owned hook fixture\\nexit 23\\n' > \".git/hooks/\$hook\"; chmod 640 \".git/hooks/\$hook\"; done"
   fi
   arg_string=$(quote_args "$args_json")
+  counter=$(counter_for_case "$case")
+  if [[ -n "$counter" ]]; then
+    remote+="; $(declare -f check_native_counter)"
+  fi
   if [[ "$case" == runtime-python-install ]]; then
     runtime_version=$(jq -r '.[2]' <<< "$args_json")
     remote+="; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f check_python_install)"
@@ -409,6 +465,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote+="; run_omg $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log; then assertion=1; fi"
+  if [[ -n "$counter" ]]; then
+    remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_native_counter '$distro' '$counter' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+    remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: counter fixture cleanup failed\\n' >&2; assertion=1; fi"
+  fi
   if [[ "$case" == runtime-python-install ]]; then
     remote+="; if [ \"\$rc\" = 0 ] && ! check_python_install '$runtime_version'; then assertion=1; fi"
     remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: Python fixture cleanup failed\\n' >&2; assertion=1; fi"
@@ -426,6 +486,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   start=$SECONDS
   transport=0
   budget=$(( (row_timeout + 5) * (${#chain[@]} + 1) + 15 ))
+  if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
   timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
   elapsed=$((SECONDS - start))
   verdict=HARNESS_ERROR; rc=$transport

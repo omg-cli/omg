@@ -26,7 +26,9 @@ require = COVERAGE.require
 
 BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
     'test_cli_status_shows_debian_info', 'test_cli_debian_respects_ci_mode')) | frozenset({
-    'omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state'}) | frozenset(
+    'omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state',
+    'omg::cli_comprehensive::explicit_shortcut_uses_the_same_isolated_state_as_explicit_count',
+    'omg::cli_comprehensive::prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments'}) | frozenset(
     'omg::e2e_runtime_management::' + name for name in (
         'test_detect_nvmrc', 'test_detect_python_version', 'test_detect_tool_versions',
         'test_go_mod_version', 'test_multi_runtime_detection', 'test_conflicting_version_files',

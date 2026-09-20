@@ -207,7 +207,9 @@ class NativeReceipts(unittest.TestCase):
         self.assertEqual({contract['id'] for contract in mapped}, {
             'omg.status.fixture', 'omg.status.json.fixture', 'omg.install.consent.fixture',
             'omg.search.records.fixture', 'omg.search.query.fixture',
-            'omg.search.limit.fixture', 'omg.search.json.fixture'} | {
+            'omg.search.limit.fixture', 'omg.search.json.fixture',
+            'omg.explicit.records.fixture', 'omg.explicit.count.fixture'} | {
+                'omg.counter.' + name + '.fixture' for name in ('ec', 'tc', 'oc', 'uc')} | {
                 'omg.runtime.' + name + '.fixture' for name in (
                     'nvmrc', 'python-pin', 'tool-versions', 'go-mod', 'multi-runtime',
                     'pin-precedence', 'rust-pin', 'rust-pin-locked', 'engines-range', 'which-node',

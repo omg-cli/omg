@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used seventy searches (261 requested result slots),
+Exa research used seventy-one searches (263 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -579,7 +579,9 @@ missing from the inventory. Their gaps remain explicit. Reviewed schema updates
 apply the same unconditional command additions to the prior eight hosted owner
 artifacts; actual new local compiled schemas match on all four WSL owners.
 Hosted compilation must verify the remaining owners before those schema updates
-can be treated as confirmed. Native counters without a daemon/cache and native
+can be treated as confirmed. Revision `5032cab8` subsequently passed all nine
+hosted workflows, including native owner admission and all four QEMU guests.
+Native counters without a daemon/cache and native
 install-reason filtering require separate evidence.
 
 Native follow-through reproduced `tc`, `oc` and `uc` failing on Ubuntu when no
@@ -597,6 +599,31 @@ distros. Observed total/explicit/orphan/update counts were Arch 188/9/0/0,
 Ubuntu 609/34/0/66, Debian 269/115/0/32 and Fedora 353/59/0/123. These local
 read-only observations do not prove transaction recovery or nonzero orphan
 fixtures; hosted QEMU remains required.
+
+The four QEMU counter rows now compare canonical scalar output against native
+package commands, rather than accepting exit zero. References use pacman,
+dpkg-query/APT, and RPM/cache-only DNF; APT orphan counting uses the documented
+`Remv` records from [read-only simulation](https://man.archlinux.org/man/apt-get.8.en).
+The [pacman query contract](https://man.archlinux.org/man/pacman.8.en) determines
+the explicit and orphan selections. Reference execution is bounded; a failed
+reference produces BLOCKED with its diagnostic, not a fabricated zero or a
+product failure. Expected and actual counts remain in the row's diagnostic log
+for existing QEMU reporting. Counter fixtures have checked cleanup.
+
+Full-runner fault injection reproduced two false passes: an exit-zero product
+returning the wrong count, and a failed native-output sorting stage becoming a
+zero count. Both now fail their respective gates. The 19 output-oracle tests
+pass on all four WSL distros, including native command failures, malformed
+scalars, and pacman's empty-query versus diagnostic-bearing exit-one cases.
+Real OMG binaries and native commands also pass all four counter rows on each
+WSL distro through a local SSH shim; those checks are not QEMU guest provenance.
+The release/QEMU fixture suite passes. Six bounded counter/explicit fixture
+contracts bind the existing owning tests on Linux backend builds; they do not
+close broader native, daemon, transaction, or nonzero-orphan gaps.
+The 26 reporter tests also verify these specific counter diagnostics reach the
+issue helper with source/attempt identity: exit-zero mismatches remain FAIL;
+BLOCKED native references use the existing HARNESS_ERROR issue projection while
+retaining the reference diagnostic. No synthetic issue is posted.
 
 ### Runtime download connection recovery
 

@@ -1339,6 +1339,276 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omg.counter.ec.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg ec",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-fixture-count",
+          "plain-and-json-global-flag-positions"
+        ],
+        "refusal": [
+          "extra-positional-rejected-with-diagnostic-and-empty-stdout"
+        ]
+      },
+      "scope": "isolated mock package counts; not native package transactions; does not certify native dependency reasons, nonzero orphans, cache freshness or daemon counters",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments",
+          "evidence": [
+            "success",
+            "refusal"
+          ],
+          "assertions": [
+            "independently-specified-fixture-count",
+            "plain-and-json-global-flag-positions",
+            "extra-positional-rejected-with-diagnostic-and-empty-stdout",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.counter.tc.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg tc",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-fixture-count",
+          "plain-and-json-global-flag-positions"
+        ],
+        "refusal": [
+          "extra-positional-rejected-with-diagnostic-and-empty-stdout"
+        ]
+      },
+      "scope": "isolated mock package counts; not native package transactions; does not certify native dependency reasons, nonzero orphans, cache freshness or daemon counters",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments",
+          "evidence": [
+            "success",
+            "refusal"
+          ],
+          "assertions": [
+            "independently-specified-fixture-count",
+            "plain-and-json-global-flag-positions",
+            "extra-positional-rejected-with-diagnostic-and-empty-stdout",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.counter.oc.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg oc",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-fixture-count",
+          "plain-and-json-global-flag-positions"
+        ],
+        "refusal": [
+          "extra-positional-rejected-with-diagnostic-and-empty-stdout"
+        ]
+      },
+      "scope": "isolated mock package counts; not native package transactions; does not certify native dependency reasons, nonzero orphans, cache freshness or daemon counters",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments",
+          "evidence": [
+            "success",
+            "refusal"
+          ],
+          "assertions": [
+            "independently-specified-fixture-count",
+            "plain-and-json-global-flag-positions",
+            "extra-positional-rejected-with-diagnostic-and-empty-stdout",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.counter.uc.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg uc",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-fixture-count",
+          "plain-and-json-global-flag-positions"
+        ],
+        "refusal": [
+          "extra-positional-rejected-with-diagnostic-and-empty-stdout"
+        ]
+      },
+      "scope": "isolated mock package counts; not native package transactions; does not certify native dependency reasons, nonzero orphans, cache freshness or daemon counters",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments",
+          "evidence": [
+            "success",
+            "refusal"
+          ],
+          "assertions": [
+            "independently-specified-fixture-count",
+            "plain-and-json-global-flag-positions",
+            "extra-positional-rejected-with-diagnostic-and-empty-stdout",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.explicit.records.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg explicit",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-empty-and-sorted-populated-json-records",
+          "available-only-packages-excluded"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "isolated all-explicit mock package records; not native package transactions; does not certify native dependency-reason filtering or daemon queries",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::explicit_shortcut_uses_the_same_isolated_state_as_explicit_count",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "independently-specified-empty-and-sorted-populated-json-records",
+            "available-only-packages-excluded",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.explicit.count.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg explicit --count",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-empty-and-populated-plain-and-json-counts",
+          "available-only-packages-excluded"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "isolated all-explicit mock package records; not native package transactions; does not certify native dependency-reason filtering or daemon queries",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::explicit_shortcut_uses_the_same_isolated_state_as_explicit_count",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "independently-specified-empty-and-populated-plain-and-json-counts",
+            "available-only-packages-excluded",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

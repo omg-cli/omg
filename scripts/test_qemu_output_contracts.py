@@ -14,6 +14,52 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class OutputContracts(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_counter_rows_require_native_counts_and_block_failed_references(self):
+        cases = {'ec': 'explicit-shortcut', 'tc': 'total-shortcut',
+                 'oc': 'orphan-shortcut', 'uc': 'updates-shortcut'}
+        native = {
+            'pacman': "printf 'alpha\\nbeta\\n'\n",
+            'rpm': "printf 'alpha.x86_64\\nbeta.x86_64\\n'\n",
+            'dnf': "[[ \"$1\" == --cacheonly ]] || exit 19\nprintf 'alpha.x86_64\\nbeta.x86_64\\n'\n",
+            'dpkg-query': "printf 'installed\\nconfig-files\\ninstalled\\n'\n",
+            'apt-mark': "printf 'alpha\\nbeta\\n'\n",
+            'apt-get': "[[ \"$1\" == -s && \"$2\" == autoremove ]] || exit 19\nprintf 'Reading lists...\\nRemv alpha [1.0]\\nRemv beta [2.0]\\n'\n",
+            'apt': "printf 'Listing...\\nalpha/stable 2 amd64 [upgradable from: 1]\\nbeta/stable 3 amd64 [upgradable from: 2]\\n'\n",
+        }
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            for command, case in cases.items():
+                rows = [f'{case}\t["{command}"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+                for value, verdict in [('2', 'PASS'), ('0', 'FAIL')]:
+                    with self.subTest(distro=distro, command=command, value=value):
+                        result, evidence, logs = self.run_inventory(
+                            f'printf "{value}\\n"\n', rows, native_commands=native, distro=distro)
+                        self.assertEqual(evidence[0]['result'], verdict, logs)
+                        self.assertEqual(result.returncode, int(verdict == 'FAIL'), result.stderr)
+                        self.assertIn(f'native counter {command} expected=2 actual={value}', logs[case + '.log'])
+            broken = {name: 'echo native-reference-failed >&2\nexit 17\n' for name in native}
+            result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
+                                                       native_commands=broken, distro=distro)
+            self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('native counter reference failed', logs[case + '.log'])
+        rows = ['explicit-shortcut\t["ec"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
+            native_commands=dict(native, sort='exit 17\n'))
+        self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+        self.assertNotEqual(result.returncode, 0)
+        for output in ('02', 'two', '2\n2', '9' * 40):
+            with self.subTest(malformed_output=output):
+                result, evidence, _ = self.run_inventory(
+                    'printf %s ' + shlex.quote(output) + '\n', rows, native_commands=native)
+                self.assertEqual(evidence[0]['result'], 'FAIL')
+                self.assertNotEqual(result.returncode, 0)
+        for diagnostic, verdict in [('', 'PASS'), ('echo database-unavailable >&2\n', 'BLOCKED')]:
+            result, evidence, _ = self.run_inventory('printf "0\\n"\n', rows,
+                native_commands={'pacman': diagnostic + 'exit 1\n'})
+            self.assertEqual(evidence[0]['result'], verdict)
+            self.assertEqual(result.returncode, int(verdict != 'PASS'))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_python_install_requires_active_executable_and_exact_version(self):
         rows = ['runtime-python-install\t["use","python","3.12.14"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
         for fault in ('missing', 'inactive', 'wrong-version', 'broken', 'escaped', 'version-escaped', 'none'):
@@ -109,7 +155,7 @@ class OutputContracts(unittest.TestCase):
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
-    def run_inventory(self, product, rows):
+    def run_inventory(self, product, rows, *, native_commands=None, distro='arch'):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -118,6 +164,10 @@ class OutputContracts(unittest.TestCase):
             root = Path(directory)
             for name in ('home', 'bin', 'guest'):
                 (root / name).mkdir()
+            for name, content in (native_commands or {}).items():
+                tool = root / 'bin' / name
+                tool.write_text('#!/usr/bin/env bash\n' + content, encoding='utf-8', newline='\n')
+                tool.chmod(0o755)
             binary = root / 'product'
             binary.write_text('#!/usr/bin/env bash\n' + product, encoding='utf-8', newline='\n')
             binary.chmod(0o755)
@@ -135,7 +185,7 @@ class OutputContracts(unittest.TestCase):
                 [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'),
                  str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
                  '--binary', shell_path(binary), '--tsv', str(inventory),
-                 '--distro', 'arch', '--tiers', 'hermetic', '--tag', 'fixture'],
+                 '--distro', distro, '--tiers', 'hermetic', '--tag', 'fixture'],
                 env=env, capture_output=True, text=True, timeout=30)
             evidence = root / 'inventory/results.json'
             self.assertTrue(evidence.exists(), result.stdout + result.stderr)
