@@ -133,7 +133,8 @@ def sha256_file(path):
 
 def cargo_test_args(features):
     active = COVERAGE.strings(features.split(','))
-    suites = ['cli_surface', 'git_hooks_contract', 'coverage_18']
+    suites = ['cli_surface', 'git_hooks_contract', 'coverage_18',
+              'e2e_runtime_management', 'env_lockfile_integrity']
     if active & {'arch', 'debian', 'debian-pure', 'fedora'}:
         suites.append('cli_comprehensive')
     if active & {'debian', 'debian-pure'}:
@@ -172,6 +173,8 @@ def main():
             (evidence / name).unlink(missing_ok=True)
         source = command_output(['git', 'rev-parse', 'HEAD'])
         require(source == os.environ['OMG_CONTRACT_SOURCE_SHA'], 'checkout source mismatch')
+        manifest = COVERAGE.read_json('tests/contracts/manifest.json')
+        manifest['gaps'] = COVERAGE.read_json('tests/contracts/gaps.json')['gaps']
         features = args.features.split(',')
         # Cargo/nextest target runners apply to the host platform too. Preserve
         # all other suites' privilege model; only the isolated CLI harness drops root.
@@ -244,8 +247,6 @@ def main():
         execution = SELECTION.reconcile(listing, junit.read_bytes(), required_binaries)
         write_json(evidence / 'selection.json', execution)
         require(execution['executed_required_binaries'], 'required test binary had no executed tests')
-        manifest = COVERAGE.read_json('tests/contracts/manifest.json')
-        manifest['gaps'] = COVERAGE.read_json('tests/contracts/gaps.json')['gaps']
         receipts, required = parser_receipts(manifest, provenance, execution)
         write_json(evidence / 'receipts.json', receipts)
         write_json(evidence / 'required.json', required)

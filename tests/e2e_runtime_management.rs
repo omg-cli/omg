@@ -7,10 +7,10 @@
 //! - `hook`: per-shell integration scripts, rejection of unknown shells
 //! - `which`: active-version reporting and required runtime argument
 //!
-//! Version-file *detection* is asserted offline on every run: the
-//! "Detected version <v> from file" line is printed before any network or
-//! install work begins (src/cli/runtimes.rs:126), so detection tests cap the
-//! command runtime right after detection and stay fast and hermetic.
+//! Node/Python/Go version-file tests seed executable installed fixtures and
+//! require successful activation, exact current paths and executable output.
+//! These prove selection, not download/extraction. Rust channel detection is
+//! still a bounded detection-only probe and must not count as activation.
 //! Tests that genuinely download runtimes are gated behind
 //! `require_network_tests!` and assert concrete success output plus a
 //! named cause on the failure path.
@@ -49,6 +49,51 @@ fn assert_detected(result: &CommandResult, version: &str) {
         output.contains("Detected version") && output.contains(version),
         "expected \"Detected version {version} from file\", got:\n{output}"
     );
+}
+
+fn seed_installed_runtime(project: &TestProject, runtime: &str, version: &str, executable: &str) {
+    let binary = project
+        .data_dir
+        .path()
+        .join(format!("versions/{runtime}/{version}/bin/{executable}"));
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::write(
+        &binary,
+        format!("#!/bin/sh\nprintf '%s\\n' 'fixture-{runtime}-{version}'\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn assert_active_runtime(
+    project: &TestProject,
+    result: &CommandResult,
+    runtime: &str,
+    version: &str,
+    executable: &str,
+) {
+    result.assert_success();
+    assert_detected(result, version);
+    let base = project.data_dir.path().join(format!("versions/{runtime}"));
+    let current = base.join(format!("current/bin/{executable}"));
+    assert_eq!(
+        std::fs::canonicalize(&current).unwrap(),
+        std::fs::canonicalize(base.join(format!("{version}/bin/{executable}"))).unwrap(),
+        "Detected version must become the active runtime"
+    );
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new(current).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            format!("fixture-{runtime}-{version}\n").as_bytes()
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -365,12 +410,14 @@ fn test_detect_nvmrc() {
 
     let project = TestProject::new();
     project.create_file(".nvmrc", "20.10.0");
+    seed_installed_runtime(&project, "node", "20.10.0", "node");
 
     let result = project.run_with_env(
         &["use", "node"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
-    assert_detected(&result, "20.10.0");
+    assert_active_runtime(&project, &result, "node", "20.10.0", "node");
+    project.close_checked();
 }
 
 #[test]
@@ -379,12 +426,14 @@ fn test_detect_python_version() {
 
     let project = TestProject::new();
     project.create_file(".python-version", "3.11.0");
+    seed_installed_runtime(&project, "python", "3.11.0", "python3");
 
     let result = project.run_with_env(
         &["use", "python"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
-    assert_detected(&result, "3.11.0");
+    assert_active_runtime(&project, &result, "python", "3.11.0", "python3");
+    project.close_checked();
 }
 
 #[test]
@@ -393,12 +442,14 @@ fn test_detect_tool_versions() {
 
     let project = TestProject::new();
     project.with_tool_versions(&[("node", "20.10.0"), ("python", "3.11.0")]);
+    seed_installed_runtime(&project, "node", "20.10.0", "node");
 
     let result = project.run_with_env(
         &["use", "node"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
-    assert_detected(&result, "20.10.0");
+    assert_active_runtime(&project, &result, "node", "20.10.0", "node");
+    project.close_checked();
 }
 
 #[test]
@@ -441,12 +492,14 @@ fn test_go_mod_version() {
 
     let project = TestProject::new();
     project.create_file("go.mod", "module test\n\ngo 1.21");
+    seed_installed_runtime(&project, "go", "1.21", "go");
 
     let result = project.run_with_env(
         &["use", "go"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
-    assert_detected(&result, "1.21");
+    assert_active_runtime(&project, &result, "go", "1.21", "go");
+    project.close_checked();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -459,16 +512,24 @@ fn test_multi_runtime_detection() {
 
     let project = TestProject::new();
     project.with_tool_versions(&[("node", "20.10.0"), ("python", "3.11.0"), ("go", "1.21")]);
+    for (runtime, version, executable) in [
+        ("node", "20.10.0", "node"),
+        ("python", "3.11.0", "python3"),
+        ("go", "1.21", "go"),
+    ] {
+        seed_installed_runtime(&project, runtime, version, executable);
+    }
 
     let env = [("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)];
     let node_result = project.run_with_env(&["use", "node"], &env);
-    assert_detected(&node_result, "20.10.0");
+    assert_active_runtime(&project, &node_result, "node", "20.10.0", "node");
 
     let python_result = project.run_with_env(&["use", "python"], &env);
-    assert_detected(&python_result, "3.11.0");
+    assert_active_runtime(&project, &python_result, "python", "3.11.0", "python3");
 
     let go_result = project.run_with_env(&["use", "go"], &env);
-    assert_detected(&go_result, "1.21");
+    assert_active_runtime(&project, &go_result, "go", "1.21", "go");
+    project.close_checked();
 }
 
 #[test]
@@ -478,6 +539,8 @@ fn test_conflicting_version_files() {
     let project = TestProject::new();
     project.create_file(".nvmrc", "18.0.0");
     project.with_tool_versions(&[("node", "20.10.0")]);
+    seed_installed_runtime(&project, "node", "18.0.0", "node");
+    seed_installed_runtime(&project, "node", "20.10.0", "node");
 
     // Precedence contract: within a directory, VERSION_FILES order wins —
     // .nvmrc is listed before .tool-versions and detect_versions keeps the
@@ -487,13 +550,14 @@ fn test_conflicting_version_files() {
         &["use", "node"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
-    assert_detected(&result, "18.0.0");
+    assert_active_runtime(&project, &result, "node", "18.0.0", "node");
 
     let output = result.combined_output();
     assert!(
         !output.contains("20.10.0"),
         ".nvmrc must take precedence over .tool-versions, got:\n{output}"
     );
+    project.close_checked();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

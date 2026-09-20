@@ -3,7 +3,7 @@
 set -euo pipefail
 [[ $# -gt 0 ]] || exit 2
 case "${1##*/}" in
-  cli_comprehensive-*)
+  cli_comprehensive-*|e2e_runtime_management-*|env_lockfile_integrity-*)
     if [[ $(id -u) == 0 ]]; then
       exec runuser -u nobody -- "$@"
     fi

@@ -91,10 +91,21 @@ the expanded checkout inventory, so old release evidence is not reinterpreted.
 Linux backend owners also execute the backend-independent CLI comprehensive
 cases; Arch-specific package fixtures retain their Arch owner. All native owners
 require nonempty hook and production daemon transport targets. In root Linux CI
-containers, a recorded target runner drops only the comprehensive CLI harness to
+containers, a recorded target runner drops the isolated CLI fixture harnesses to
 an unprivileged identity, keeping fixture paths separate from real root state.
 These additional JUnit results are execution evidence, not automatic behavioral
 coverage credit in the contract manifest.
+
+Runtime management and lockfile integrity are also explicit, nonempty native
+owners on every platform. Root Linux runners drop these CLI fixture harnesses
+to an unprivileged identity, and failures are not retried. The runtime suite has
+five opt-in network cases: when disabled, their `[omg-skip]` output is reported
+as unexecuted even though libtest itself prints `ok`. A green target does not
+prove those network behaviors. Six Node/Python/Go pin scenarios now require
+successful activation, exact current executable paths, executable identity and
+checked fixture cleanup. These installed fixtures do not prove downloading or
+extraction. Rust channel detection and opt-in network assertions still require
+review before receiving broader behavioral coverage credit.
 
 JUnit's skipped-test reporting varies by nextest version. The independent list
 supplies ignored/filtered counts even when no XML row exists. A selected test

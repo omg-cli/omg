@@ -8,6 +8,7 @@ import tempfile
 import os
 import shutil
 import subprocess
+from unittest.mock import patch
 
 from test_contract_coverage import fixture
 
@@ -24,7 +25,8 @@ class NativeRunner(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             root.chmod(0o755)
-            for name in ('cli_comprehensive-fixture', 'other-fixture'):
+            for name in ('cli_comprehensive-fixture', 'e2e_runtime_management-fixture',
+                         'env_lockfile_integrity-fixture', 'other-fixture'):
                 binary = root / name
                 binary.write_text('#!/bin/sh\nid -u\nprintf "%s\\n" "$1"\nexit 23\n')
                 binary.chmod(0o755)
@@ -33,7 +35,7 @@ class NativeRunner(unittest.TestCase):
                 self.assertEqual(result.returncode, 23, result.stderr)
                 uid, argument = result.stdout.splitlines()
                 self.assertEqual(argument, 'argument with spaces')
-                if os.getuid() == 0 and name.startswith('cli_comprehensive-'):
+                if os.getuid() == 0 and name != 'other-fixture':
                     self.assertNotEqual(int(uid), 0)
                 else:
                     self.assertEqual(int(uid), os.getuid())
@@ -52,6 +54,51 @@ def parser_fixture():
 
 
 class NativeReceipts(unittest.TestCase):
+    def test_entrypoint_loads_contracts_before_binding_and_reports_binding_failure(self):
+        manifest = {'contracts': [{'id': 'reviewed-contract'}]}
+        gaps = [{'id': 'known-gap'}]
+        listing = {'rust-suites': {
+            name: {'binary-path': name} for name in ('omg::cli_surface', 'omg::bin/omgd')}}
+
+        def read_json(path):
+            return {'manifest.json': manifest, 'gaps.json': {'gaps': gaps},
+                    'list.json': listing}[Path(path).name]
+
+        def reject_binding(loaded, provenance, observed, root):
+            self.assertEqual(loaded['contracts'], manifest['contracts'])
+            self.assertEqual(loaded['gaps'], gaps)
+            self.assertEqual(observed, listing)
+            raise ValueError('owning behavior harness is missing')
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {'OMG_CONTRACT_SURFACE_OUT': directory,
+                    'OMG_CONTRACT_SOURCE_SHA': 'current-source', 'GITHUB_RUN_ID': '123',
+                    'GITHUB_RUN_ATTEMPT': '1', 'OMG_CONTRACT_PLATFORM': 'test-owner'}), \
+                patch.object(NATIVE.sys, 'argv', ['runner', '--features', 'arch']), \
+                patch.object(NATIVE.sys, 'platform', 'win32'), \
+                patch.object(NATIVE, 'command_output', return_value='current-source'), \
+                patch.object(NATIVE, 'sha256_file', return_value='a' * 64), \
+                patch.object(NATIVE.COVERAGE, 'read_json', side_effect=read_json), \
+                patch.object(NATIVE.SELECTION, 'selected_tests'), \
+                patch.object(NATIVE, 'mapped_behavior_subjects', side_effect=reject_binding) as binding, \
+                patch.object(NATIVE.subprocess, 'run') as command:
+            self.assertEqual(NATIVE.main(), 2)
+            binding.assert_called_once()
+            self.assertEqual(command.call_count, 1)
+            self.assertEqual(command.call_args.args[0][:3], ['cargo', 'nextest', 'list'])
+            error = json.loads((Path(directory) / 'execution/admission-error.json').read_text())
+            self.assertEqual(error['error'], 'owning behavior harness is missing')
+
+    def test_runtime_and_environment_contracts_have_all_platform_owners(self):
+        policy = json.loads((Path(__file__).resolve().parents[1] / 'tests/contracts/platforms.json').read_text())
+        required = {'e2e_runtime_management', 'env_lockfile_integrity'}
+        for owner in policy['owners']:
+            with self.subTest(owner=owner['id']):
+                args = NATIVE.cargo_test_args(','.join(owner['features']))
+                selected = {args[index + 1] for index, value in enumerate(args) if value == '--test'}
+                self.assertTrue(required <= selected)
+                self.assertTrue(required <= set(owner['native_integration_suites']))
+
     def test_behavior_subjects_bind_real_product_pair_and_owning_harness(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -182,7 +229,8 @@ class NativeReceipts(unittest.TestCase):
             with self.subTest(features=features):
                 args = NATIVE.cargo_test_args(features)
                 tests = {args[index + 1] for index, value in enumerate(args) if value == '--test'}
-                shared = {'cli_surface', 'git_hooks_contract', 'coverage_18'}
+                shared = {'cli_surface', 'git_hooks_contract', 'coverage_18',
+                          'e2e_runtime_management', 'env_lockfile_integrity'}
                 if set(features.split(',')) & {'arch', 'debian', 'debian-pure', 'fedora'}:
                     shared.add('cli_comprehensive')
                 self.assertEqual(tests, expected | shared)
