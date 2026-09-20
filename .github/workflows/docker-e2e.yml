@@ -9,6 +9,7 @@ on:
     paths:
       - "src/**"
       - "tests/docker_e2e.rs"
+      - "scripts/test_docker_workflow.py"
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
@@ -21,6 +22,11 @@ on:
     # Run nightly to catch regressions
     - cron: "0 2 * * *"
   workflow_dispatch:
+    inputs:
+      cold_cache:
+        description: "Rebuild all layers and refresh native packages"
+        type: boolean
+        default: false
 
 concurrency:
   group: docker-e2e-${{ github.ref }}
@@ -45,25 +51,62 @@ jobs:
         with:
           toolchain: "1.95.0"
 
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Compile std-only Docker test driver
+        shell: bash
+        run: rustc --edition=2024 --test tests/docker_e2e.rs -o "$RUNNER_TEMP/docker-e2e-tests"
+
+      - name: Prepare build evidence
+        id: evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/docker-e2e-evidence"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          native_refresh=$(date -u +%F)
+          echo "native-refresh=$native_refresh" >> "$GITHUB_OUTPUT"
+          printf 'revision=%s\nnative-refresh=%s\n' "$GITHUB_SHA" "$native_refresh" \
+            > "$RUNNER_TEMP/docker-e2e-evidence/build.txt"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build native Arch test image
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-docker-e2e-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-docker-e2e-
+          context: .
+          file: Dockerfile.arch-e2e
+          load: true
+          push: false
+          tags: omg-arch-e2e:${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: NATIVE_REFRESH=${{ steps.evidence.outputs.native-refresh }}
+          cache-from: type=gha,version=2,scope=docker-e2e-arch
+          cache-to: type=gha,version=2,scope=docker-e2e-arch,mode=max,ignore-error=true
+          no-cache: ${{ github.event_name == 'schedule' || inputs.cold_cache == true }}
+
+      - name: Verify image provenance
+        shell: bash
+        env:
+          IMAGE_ID: ${{ steps.image.outputs.imageid }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(docker image inspect --format '{{.Id}}' "$IMAGE_ID")" = "$IMAGE_ID"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE_ID")" = "$GITHUB_SHA"
+          printf 'image-id=%s\n' "$IMAGE_ID" >> "$RUNNER_TEMP/docker-e2e-evidence/build.txt"
 
       - name: Run Docker E2E Tests
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/docker-e2e-evidence"
-          OMG_RUN_DOCKER_TESTS=1 cargo test --no-default-features --features pgp,license --test docker_e2e --locked -- --ignored --test-threads=1 \
+          "$RUNNER_TEMP/docker-e2e-tests" --ignored --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/docker-e2e-evidence/tests.log"
         env:
           RUST_BACKTRACE: 1
+          OMG_RUN_DOCKER_TESTS: "1"
+          OMG_DOCKER_IMAGE: ${{ steps.image.outputs.imageid }}
 
       - name: Upload test results
         if: always()

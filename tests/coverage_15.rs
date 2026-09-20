@@ -242,9 +242,9 @@ fn init_is_idempotent_second_run_reports_already_installed() {
     );
 }
 
-/// init --defaults captures an omg.lock fingerprint into the working directory.
+/// init --defaults captures a fingerprint only when a package backend exists.
 #[test]
-fn init_defaults_writes_omg_lock_in_working_directory() {
+fn init_defaults_respects_fingerprint_backend_availability() {
     let project = TestProject::new();
     let home = tempfile::TempDir::new().expect("home tempdir");
     let result = project.run_with_env(
@@ -259,15 +259,25 @@ fn init_defaults_writes_omg_lock_in_working_directory() {
     result.assert_success();
     result.assert_stdout_contains("Capturing environment...");
 
-    let lock = project.read_file("omg.lock").expect("omg.lock captured");
-    assert!(
-        lock.contains("schema_version"),
-        "lockfile must carry schema_version\ncontent: {lock}"
-    );
-    assert!(
-        lock.contains("hash ="),
-        "lockfile must carry a state hash\ncontent: {lock}"
-    );
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
+    {
+        let lock = project.read_file("omg.lock").expect("omg.lock captured");
+        assert!(
+            lock.contains("schema_version"),
+            "lockfile must carry schema_version\ncontent: {lock}"
+        );
+        assert!(
+            lock.contains("hash ="),
+            "lockfile must carry a state hash\ncontent: {lock}"
+        );
+    }
+    #[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
+    {
+        result.assert_stdout_contains(
+            "Environment fingerprinting is not available without an Arch or Debian package backend",
+        );
+        assert!(!project.file_exists("omg.lock"));
+    }
 }
 
 #[test]

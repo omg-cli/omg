@@ -252,26 +252,16 @@ jobs:
 
       # sccache temporarily disabled due to service outage
 
-      - name: Cache cargo registry
+      - name: Cache Rust dependencies
         if: inputs.skip-cache != true
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: v1-${{ matrix.platform }}-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: v1-${{ matrix.platform }}-registry-
-
-      - name: Cache target
-        if: inputs.skip-cache != true
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target
-          key: v1-${{ matrix.platform }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            v1-${{ matrix.platform }}-target-${{ hashFiles('**/Cargo.lock') }}-
-            v1-${{ matrix.platform }}-target-
+          prefix-key: v2-platform-dependencies
+          # Never restore across distro ABI or feature contracts. The action
+          # additionally keys rustc, Cargo config, lockfiles and compiler flags.
+          shared-key: ${{ matrix.platform }}-${{ matrix.image }}-${{ matrix.features }}
+          cache-bin: false
+          cache-workspace-crates: false
 
       - name: Build release
         run: cargo build --release --no-default-features --features ${{ matrix.features }} --locked
@@ -552,23 +542,14 @@ jobs:
       - name: Fix git permissions
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Cache cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache Rust dependencies
+        if: inputs.skip-cache != true
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: v1-xsec-${{ matrix.platform }}-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: v1-xsec-${{ matrix.platform }}-registry-
-
-      - name: Cache target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target
-          key: v1-xsec-${{ matrix.platform }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            v1-xsec-${{ matrix.platform }}-target-
+          prefix-key: v2-intersection-dependencies
+          shared-key: ${{ matrix.platform }}-${{ matrix.image }}-${{ matrix.features }}
+          cache-bin: false
+          cache-workspace-crates: false
 
       - name: Check all targets
         run: cargo check --all-targets --no-default-features --features ${{ matrix.features }} --locked

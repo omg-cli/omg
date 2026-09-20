@@ -1,11 +1,15 @@
-# Arch Linux image for the local Compose smoke tests.
-FROM archlinux:latest@sha256:b860afd5823683f7ea389ba5f00d812f4fe55f6f286dea329d2abeefa535e309
+# Arch Linux image for the local Compose smoke tests and Docker E2E CI.
+FROM archlinux:latest@sha256:b860afd5823683f7ea389ba5f00d812f4fe55f6f286dea329d2abeefa535e309 AS native
 
 ENV CARGO_HOME=/root/.cargo \
     RUSTUP_HOME=/root/.rustup
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-RUN pacman -Syu --noconfirm && \
+# CI supplies the UTC date: native packages are cached for at most one day.
+# Scheduled/cold-cache runs bypass the cache entirely.
+ARG NATIVE_REFRESH=local
+RUN echo "Native package refresh: ${NATIVE_REFRESH}" && \
+    pacman -Syu --noconfirm && \
     pacman -S --noconfirm \
         base-devel \
         git \
@@ -19,6 +23,7 @@ RUN pacman -Syu --noconfirm && \
         clang \
         cmake
 
+FROM native AS toolchain
 RUN curl --proto '=https' --tlsv1.2 -fsSL \
         https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
         -o /usr/local/bin/rustup-init \
@@ -27,10 +32,25 @@ RUN curl --proto '=https' --tlsv1.2 -fsSL \
     && /usr/local/bin/rustup-init -y --profile minimal --default-toolchain 1.95.0 \
     && rm -f /usr/local/bin/rustup-init
 
+RUN cargo install cargo-chef --version 0.1.78 --locked -j 2
+
 WORKDIR /opt/omg
+
+FROM toolchain AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path /tmp/omg-recipe.json
+
+FROM toolchain AS builder
+COPY --from=planner /tmp/omg-recipe.json /tmp/omg-recipe.json
+# Ordinary image layers (not cache mounts) are exported by the GHA cache.
+# Keep toolchain, path, profile and default Arch features identical to the build.
+RUN cargo chef cook --release --locked -j 2 --recipe-path /tmp/omg-recipe.json
 COPY . .
 RUN cargo build --release --locked -j 2
-RUN install -m 0755 target/release/omg /usr/local/bin/omg
+
+FROM native AS runtime
+COPY --from=builder /opt/omg/target/release/omg /usr/local/bin/omg
+RUN chmod 0755 /usr/local/bin/omg
 
 RUN useradd -m -G wheel -s /bin/bash testuser && \
     echo "%wheel ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
