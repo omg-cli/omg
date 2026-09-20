@@ -8,6 +8,15 @@ from pathlib import Path
 LIMIT = 1024 * 1024
 
 
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate inventory evidence key")
+        result[key] = value
+    return result
+
+
 def read(path):
     if path.is_symlink() or not path.is_file() or path.stat().st_size > LIMIT:
         raise ValueError("invalid inventory evidence file")
@@ -19,14 +28,14 @@ def read(path):
 
 
 def admit(policy, inventory, results, summary, distro, tiers):
-    rules = json.loads(read(policy))
+    rules = json.loads(read(policy), object_pairs_hook=unique_object)
     digest = hashlib.sha256(read(inventory)).hexdigest()
     selection = rules["inventories"][digest]
     profile = rules["profiles"][tiers]
     expected = {"qemu-" + distro + "-" + row["id"]: row
                 for row in selection["cases"] if set(row["tiers"]) & set(profile)}
-    rows = json.loads(read(results))
-    completion = json.loads(read(summary))
+    rows = json.loads(read(results), object_pairs_hook=unique_object)
+    completion = json.loads(read(summary), object_pairs_hook=unique_object)
     if not isinstance(rows, list) or not rows or len(rows) != len(expected):
         raise ValueError("missing or extra selected cases")
     counts = dict(selected=len(expected), executed=0, passed=0, failed=0,

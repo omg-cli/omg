@@ -70,9 +70,9 @@ fn walk(command: &Command, path: &str, commands: &mut Vec<Value>) {
             "hidden": arg.is_hide_set(),
             "action": format!("{:?}", arg.get_action()),
             "arity": arg.get_num_args().map(|range| json!({"min": range.min_values(), "max": range.max_values()})),
-            "value_names": arg.get_value_names().map(|names| names.iter().map(|name| name.as_str()).collect::<Vec<_>>()),
+            "value_names": arg.get_value_names().map(|names| names.iter().map(clap::builder::Str::as_str).collect::<Vec<_>>()),
             "value_delimiter": arg.get_value_delimiter().map(|value| value.to_string()),
-            "value_terminator": arg.get_value_terminator().map(|value| value.as_str()),
+            "value_terminator": arg.get_value_terminator().map(clap::builder::Str::as_str),
             "possible_values": possible_values,
             "defaults": arg.get_default_values().iter().map(|value| value.to_str().expect("UTF-8 parser default")).collect::<Vec<_>>(),
             "env": arg.get_env().map(|value| value.to_str().expect("UTF-8 parser env name")),
@@ -93,7 +93,7 @@ fn walk(command: &Command, path: &str, commands: &mut Vec<Value>) {
             let multiple = group.clone().is_multiple();
             json!({
                 "id": group.get_id().as_str(),
-                "arguments": sorted(group.get_args().map(|id| id.as_str())),
+                "arguments": sorted(group.get_args().map(clap::Id::as_str)),
                 "required": group.is_required_set(),
                 "multiple": multiple,
             })

@@ -83,6 +83,24 @@ class PolicyTests(unittest.TestCase):
         self.summary.write_text('{"complete":true,"pass":0,"fail":1,"skipped":1}')
         self.assertFalse(self.admit()["passed"])
 
+    def test_duplicate_json_keys_cannot_replace_failure_or_completion(self):
+        self.results.write_text(json.dumps(self.rows))
+        original_results = self.results.read_text()
+        original_summary = self.summary.read_text()
+        for target in ('results', 'summary'):
+            with self.subTest(target=target):
+                self.results.write_text(original_results)
+                self.summary.write_text(original_summary)
+                if target == 'results':
+                    self.results.write_text(original_results.replace(
+                        '"result": "PASS"', '"result": "FAIL", "result": "PASS"', 1))
+                else:
+                    self.summary.write_text(original_summary.replace(
+                        '"complete":true', '"complete":false,"complete":true', 1))
+                with self.assertRaises(ValueError):
+                    POLICY.admit(self.policy, self.inventory, self.results,
+                                 self.summary, 'arch', 'hermetic')
+
     def test_current_inventory_and_workflow_have_reviewed_policy(self):
         content = (ROOT / "tests/cli_behavior_inventory.tsv").read_bytes().replace(b"\r\n", b"\n")
         rules = json.loads((ROOT / "tests/qemu-inventory-policy.json").read_text())
