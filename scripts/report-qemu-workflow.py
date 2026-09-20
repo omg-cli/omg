@@ -111,6 +111,13 @@ def projection(rows, successful_main):
             selected[key] = dict(row, result="HARNESS_ERROR" if row["result"] == "BLOCKED" else row["result"])
         elif successful_main and row["result"] == "PASS" and key not in selected:
             selected[key] = row
+    # The matrix job emits an aggregate receipt whenever a lane fails. Once
+    # detailed evidence identifies that failure, filing both adds no diagnosis.
+    # Keep the aggregate when it is the only failure (and keep PASS closures).
+    if any(row["case_id"] != "qemu-matrix-workflow" and row["result"] in FAILURES
+           for row in selected.values()):
+        selected = {key: row for key, row in selected.items()
+                    if row["case_id"] != "qemu-matrix-workflow" or row["result"] not in FAILURES}
     if sum(row["result"] in FAILURES for row in selected.values()) > 25:
         raise ValueError("more than 25 failing cases; report workflow aggregate")
     return list(selected.values())

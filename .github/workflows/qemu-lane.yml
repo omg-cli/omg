@@ -98,6 +98,7 @@ jobs:
         with:
           name: staged-${{ inputs.distro }}
           path: omg-v*.tar.gz*
+          compression-level: 0
           retention-days: 7
           if-no-files-found: error
 
@@ -165,6 +166,7 @@ jobs:
         with:
           name: staged-ubuntu
           path: omg-v*.tar.gz*
+          compression-level: 0
           retention-days: 7
           if-no-files-found: error
 

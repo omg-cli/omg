@@ -21,7 +21,7 @@ RUN = r"run-[a-zA-Z0-9-]+"
 HOST_FILES = {
     "results.json", "sentry-results.json", "metadata.txt", "host-metadata.txt",
     "cleanup.log", "reporting.log", "reporting-status.json", "kvm-probe.log", "engine-preflight.log",
-    "controller-setup.log", "controller-security.log", "image-setup.log", "boot.log", "guest-check.log",
+    "controller-setup.log", "controller-security.log", "controller-pull.log", "image-setup.log", "boot.log", "guest-check.log",
     "evidence-copy.log", "benchmark-validation.log", "transactions.log",
     "transaction-validation.log", "inventory.log",
     "guest-health.json", "controller-health.json", "controller-final-state.json", "health-validation.log",

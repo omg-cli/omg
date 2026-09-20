@@ -36,6 +36,8 @@ on:
       - "benchmark-hyperfine.sh"
       - "scripts/record-benchmark-run.py"
       - "scripts/benchmark-qemu.sh"
+      - "scripts/pull-qemu-controller.sh"
+      - "scripts/test_qemu_controller_pull.py"
       - "scripts/prepare-qemu-release.py"
       - "scripts/test_prepare_qemu_release.py"
       - "scripts/test_qemu_process_isolation.py"
@@ -355,6 +357,7 @@ jobs:
         with:
           name: staged-arm-${{ matrix.distro }}
           path: omg-v*.tar.gz*
+          compression-level: 0
           retention-days: 7
           if-no-files-found: error
 
@@ -423,6 +426,7 @@ jobs:
         with:
           name: staged-arm-ubuntu
           path: omg-v*.tar.gz*
+          compression-level: 0
           retention-days: 7
           if-no-files-found: error
 

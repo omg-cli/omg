@@ -79,6 +79,18 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(REPORT.projection([self.row("PASS")], True), [self.row("PASS")])
         self.assertEqual(REPORT.projection([self.row(), self.row("PASS")], True), [self.row()])
 
+    def test_detailed_failures_replace_duplicate_aggregate_issue(self):
+        aggregate = dict(self.row(), case_id="qemu-matrix-workflow", distro="ubuntu")
+        for rows in ([aggregate, self.row()], [self.row(), aggregate]):
+            self.assertEqual(REPORT.projection(rows, False), [self.row()])
+        self.assertEqual(REPORT.projection([aggregate], False), [aggregate])
+        self.assertEqual(REPORT.projection([aggregate, self.row("PASS")], False), [aggregate])
+
+    def test_successful_main_can_still_close_historical_aggregate(self):
+        aggregate = dict(self.row("PASS"), case_id="qemu-matrix-workflow", distro="ubuntu")
+        self.assertEqual(REPORT.projection([aggregate], True), [aggregate])
+        self.assertEqual(REPORT.projection([aggregate], False), [])
+
     def test_identity_binds_repo_workflow_commit_and_attempt(self):
         live = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                     head_sha="a" * 40, workflow_id=20, path=".github/workflows/qemu-matrix.yml",
