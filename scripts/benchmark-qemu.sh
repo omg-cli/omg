@@ -572,13 +572,15 @@ version=$("${version_cmd[@]}")
 [[ $(awk '$1 == "Version:" {print $2}' evidence/omg-info.txt) == "$version" ]]
 # Exercise both direct daemon startup and the actual CLI foreground launcher
 # while the package databases and installed fixture are available.
+guest_tools=(jq)
+[[ "$benchmark" != true ]] || guest_tools+=(hyperfine)
+case "$distro" in
+  arch) sudo -n pacman -S --noconfirm --needed "${guest_tools[@]}" || exit 120 ;;
+  debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${guest_tools[@]}" || exit 120 ;;
+  fedora) sudo -n dnf install -y "${guest_tools[@]}" || exit 120 ;;
+esac
 timeout --kill-after=5s 240s bash "$HOME/qemu-daemon-check.sh" "$bin" "$HOME/evidence"
 if [[ "$benchmark" == true ]]; then
-  case "$distro" in
-    arch) sudo -n pacman -S --noconfirm --needed hyperfine jq || exit 120 ;;
-    debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends hyperfine jq || exit 120 ;;
-    fedora) sudo -n dnf install -y hyperfine jq || exit 120 ;;
-  esac
   OMG_BENCH_BINARY="$bin" OMG_BENCH_EXPORT_DIR="$HOME/evidence/benchmarks" \
     bash "$HOME/benchmark-hyperfine.sh" --guest || exit 120
 fi
@@ -655,7 +657,7 @@ if [[ "$rc" == 0 ]]; then
   daemon_receipt="$work/guest/evidence/daemon-lifecycle.json"
   if ! [[ -f "$daemon_receipt" && $(wc -c < "$daemon_receipt") -le 4096 ]] || ! jq -e '
     .schema_version == 1 and .direct == true and .foreground == true and
-    .ipc == true and .singleton == true and .shutdown == true and .restart == true
+    .ipc == true and .singleton == true and .shutdown == true and .restart == true and .query_parity == true
   ' "$daemon_receipt" >/dev/null; then
     printf 'Missing or incomplete daemon lifecycle evidence\n' >&2
     exit 1

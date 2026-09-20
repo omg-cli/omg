@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 # Run as the unprivileged guest user against the binaries in the tested archive.
 set -euo pipefail
+# BEGIN EXPLICIT QUERY ORACLE
+check_explicit_query_outputs() {
+  local expected=$1 listing=$2 count=$3 shortcut=$4 jsoncount=$5 wanted output
+  wanted=$(jq -er 'select(type == "array" and length > 0 and all(.[]; type == "string")) | length' "$expected") || return 1
+  jq -e -s --slurpfile expected "$expected" '
+    length == 1 and (.[0] | type == "object") and
+    (.[0].packages | type == "array") and
+    (.[0].packages | sort) == $expected[0] and
+    .[0].count == ($expected[0] | length)
+  ' "$listing" >/dev/null || return 1
+  for output in "$count" "$shortcut"; do
+    jq -e -s --argjson wanted "$wanted" 'length == 1 and .[0] == $wanted' "$output" >/dev/null || return 1
+  done
+  jq -e -s --argjson wanted "$wanted" 'length == 1 and (.[0] | type == "object") and .[0].count == $wanted' "$jsoncount" >/dev/null
+}
+# END EXPLICIT QUERY ORACLE
 [[ $# == 2 && $(id -u) != 0 ]] || exit 2
 bin=$(realpath "$1")
 daemon="${bin%/*}/omgd"
@@ -13,6 +29,29 @@ chmod 700 "$state"
 export OMG_SOCKET_PATH="$state/omg.sock"
 export OMG_DATA_DIR="$state/data" OMG_DAEMON_DATA_DIR="$state/daemon"
 export OMG_CACHE_DIR="$state/cache" OMG_CONFIG_DIR="$state/config"
+# Independent native inventory, captured before starting either daemon mode.
+# These commands query package state; none installs or removes packages.
+source /etc/os-release
+case "$ID" in
+  arch) timeout 30 pacman -Qqe > "$evidence/native-explicit.txt" ;;
+  debian|ubuntu) timeout 30 apt-mark showmanual > "$evidence/native-explicit.txt" ;;
+  fedora) timeout 30 dnf --cacheonly repoquery --userinstalled --qf '%{name}\n' > "$evidence/native-explicit.txt" ;;
+  *) printf 'Unsupported native query fixture: %s\n' "$ID" >&2; exit 2 ;;
+esac
+jq -Rn '[inputs | select(length > 0)] | sort | unique' < "$evidence/native-explicit.txt" > "$evidence/native-explicit.json"
+query_cli() {
+  local label=$1
+  timeout 15 "$bin" --json explicit > "$evidence/$label-explicit.json"
+  timeout 15 "$bin" explicit --count > "$evidence/$label-count.txt"
+  timeout 15 "$bin" ec > "$evidence/$label-shortcut.txt"
+  timeout 15 "$bin" --json explicit --count > "$evidence/$label-count.json"
+  if ! check_explicit_query_outputs "$evidence/native-explicit.json" \
+    "$evidence/$label-explicit.json" "$evidence/$label-count.txt" \
+    "$evidence/$label-shortcut.txt" "$evidence/$label-count.json"; then
+    printf 'assertion failed: %s explicit listing/count differs from native package inventory\n' "$label" >&2
+    return 1
+  fi
+}
 daemon_pid= launcher_pid=
 cleanup() {
   local status=$?
@@ -66,6 +105,14 @@ for mode in direct foreground; do
   [[ $(readlink "/proc/$daemon_pid/exe") == "$daemon" ]]
   [[ $(stat -c '%u' "$OMG_SOCKET_PATH") == "$(id -u)" ]]
   [[ $(stat -c '%a' "$OMG_SOCKET_PATH") == 600 ]]
+  requests_before=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-status.txt")
+  [[ "$requests_before" =~ ^[0-9]+$ ]]
+  query_cli "daemon-$mode"
+  timeout 5 "$bin" daemon-status > "$evidence/daemon-$mode-after-queries.txt" 2>&1
+  requests_after=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
+  failed_after=$(awk '/Requests failed:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
+  [[ "$requests_after" =~ ^[0-9]+$ && "$failed_after" == 0 ]]
+  [[ "$requests_after" -ge $((requests_before + 4)) ]]
   inode=$(stat -c '%i' "$OMG_SOCKET_PATH")
   # A second direct daemon must fail, not replace the live socket or hang.
   duplicate_status=0
@@ -86,4 +133,5 @@ for mode in direct foreground; do
   daemon_pid= launcher_pid=
   [[ ! -e "$OMG_SOCKET_PATH" && ! -L "$OMG_SOCKET_PATH" ]]
 done
-printf '{"schema_version":1,"direct":true,"foreground":true,"ipc":true,"singleton":true,"shutdown":true,"restart":true}\n' > "$evidence/daemon-lifecycle.json"
+OMG_DISABLE_DAEMON=1 query_cli daemon-stopped
+printf '{"schema_version":1,"direct":true,"foreground":true,"ipc":true,"singleton":true,"shutdown":true,"restart":true,"query_parity":true}\n' > "$evidence/daemon-lifecycle.json"

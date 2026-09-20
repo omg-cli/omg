@@ -383,3 +383,16 @@ Temporarily disabling the production result truncation in the isolated Arch clon
 made the regression fail on limit zero with three unexpected records; restoring
 the production source made it pass. This is mock-backed query behavior, not AUR
 filtering or native repository metadata coverage.
+# Native explicit-query parity follow-up
+
+The strengthened QEMU daemon probe passed locally on Arch, Ubuntu 26.04,
+Fedora 44 and Debian 13 with native backends, without mock package state.
+Each run compared four CLI listing/count forms with native package-manager
+output during both daemon launch modes and after shutdown, while asserting
+increasing daemon request counts and zero reported failures. The receipt gate
+now requires query parity. Diagnostic export preserves the expected inventory,
+actual outputs and counters for failure investigation. Eight malformed-output
+negative controls reject wrong names, duplicates, wrong counts and extra JSON.
+Guest jq provisioning precedes this unconditional probe even when benchmarks
+are disabled; hyperfine remains conditional. These checks supplement existing
+transport fixtures and do not prove every native RPC or transaction contract.

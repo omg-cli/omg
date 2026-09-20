@@ -111,3 +111,12 @@ uses one shared deadline, including when a producer never uploads its artifact.
 This adds a shared readiness barrier, so compare total runner minutes and guest
 completion time on hosted runs before claiming a measured speedup.
 The trusted automatic QEMU issue reporter still owns failure publication.
+
+The unconditional native daemon probe compares `--json explicit`,
+`explicit --count`, `ec`, and `--json explicit --count` against an independent
+native package inventory on Arch, Debian, Ubuntu and Fedora. It checks both
+direct and CLI foreground daemon startup, increasing request counters with no
+reported failures, and direct CLI queries after shutdown. A mandatory
+`query_parity` receipt prevents missing checks from passing admission. Exact
+query outputs and daemon counters are allowlisted diagnostic artifacts. This
+does not establish coverage of every RPC variant or native transaction.

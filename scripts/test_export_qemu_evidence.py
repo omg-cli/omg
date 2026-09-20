@@ -29,6 +29,19 @@ TRANSACTION_PRIVATE = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_native_query_diagnostics_are_confined_to_guest_evidence(self):
+        names = ["native-explicit.txt", "native-explicit.json",
+                 "daemon-direct-after-queries.txt", "daemon-foreground-after-queries.txt"]
+        names += [f"{label}-{suffix}"
+                  for label in ("daemon-direct", "daemon-foreground", "daemon-stopped")
+                  for suffix in ("explicit.json", "count.txt", "shortcut.txt", "count.json")]
+        for name in names:
+            with self.subTest(name=name):
+                self.assertTrue(exporter.allowed_file(("run-test", "guest", "evidence", name)))
+                self.assertFalse(exporter.allowed_file(("run-test", name)))
+                self.assertFalse(exporter.allowed_file(("run-test", "guest", "evidence", "config", name)))
+                self.assertFalse(exporter.allowed_file(("run-test", "guest", "evidence", name + ".bak")))
+
     def test_transaction_diagnostics_are_allowed_only_at_trial_root(self):
         prefix = ("run-test", "transactions", "trials", "install-omg-001", "transaction-trial")
         for name in TRANSACTION_DIAGNOSTICS:

@@ -13,6 +13,53 @@ BASH = os.environ.get('OMG_TEST_BASH') or ('C:/Program Files/Git/bin/bash.exe' i
 
 
 class DaemonContractTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'guest dependency setup requires POSIX bash')
+    def test_guest_query_tools_are_installed_with_benchmarks_disabled(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        setup = source.split('guest_tools=(jq)', 1)[1].split('timeout --kill-after=5s 240s', 1)[0]
+        setup = 'guest_tools=(jq)' + setup
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            for benchmark in ('true', 'false'):
+                with self.subTest(distro=distro, benchmark=benchmark):
+                    result = subprocess.run(
+                        [BASH, '-euc', 'sudo() { printf "%s\\n" "$@"; };\n' + setup],
+                        env=dict(os.environ, distro=distro, benchmark=benchmark),
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    args = result.stdout.splitlines()
+                    self.assertEqual(args.count('jq'), 1)
+                    self.assertEqual(args.count('hyperfine'), int(benchmark == 'true'))
+
+    def test_query_parity_receipt_is_mandatory(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        gate = source.split('  daemon_receipt=', 1)[1].split('\nfi\n', 1)[0]
+        self.assertIn('.query_parity == true', gate)
+
+    @unittest.skipIf(os.name == 'nt', 'native query oracle requires POSIX jq')
+    def test_query_oracle_rejects_wrong_names_counts_duplicates_and_extra_json(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        begin = source.index('# BEGIN EXPLICIT QUERY ORACLE')
+        end = source.index('# END EXPLICIT QUERY ORACLE', begin)
+        function = source[begin:end]
+        good = {'expected': '["bash","git"]',
+                'listing': '{"packages":["git","bash"],"count":2}',
+                'count': '2', 'shortcut': '2', 'jsoncount': '{"count":2}'}
+        cases = [(good, True)]
+        for key, value in [('listing', '{"packages":["bash","wrong"],"count":2}'),
+                           ('listing', '{"packages":["bash","git","git"],"count":2}'),
+                           ('listing', '{"packages":["bash","git"],"count":3}'),
+                           ('count', '3'), ('shortcut', '3'), ('jsoncount', '{"count":"2"}'),
+                           ('count', '0\n2'), ('listing', '{}\n' + good['listing'])]:
+            cases.append((dict(good, **{key: value}), False))
+        for files, passed in cases:
+            with self.subTest(files=files), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name, content in files.items():
+                    (root / name).write_text(content)
+                result = subprocess.run([BASH, '-c', function + '\ncheck_explicit_query_outputs expected listing count shortcut jsoncount'],
+                                        cwd=root, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
     def test_shell_startup_does_not_skip_this_users_ipc_check_for_another_process(self):
         source = (ROOT / 'src/cli/init.rs').read_text(encoding='utf-8')
         command = re.search(r'const DAEMON_SHELL_START: &str = "([^"]+)";', source).group(1)
@@ -43,7 +90,7 @@ class DaemonContractTests(unittest.TestCase):
         gate = source.split('  daemon_receipt=', 1)[1].split('\nfi\n', 1)[0]
         gate = 'daemon_receipt=' + gate
         good = dict(schema_version=1, direct=True, foreground=True, ipc=True,
-                    singleton=True, shutdown=True, restart=True)
+                    singleton=True, shutdown=True, restart=True, query_parity=True)
         cases = [(good, True), (None, False)]
         for key in good:
             missing = dict(good)
