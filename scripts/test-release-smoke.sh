@@ -311,10 +311,15 @@ cat > "$scratch/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$1" in
+  pull)
+    [[ $# -eq 2 && "$2" =~ ^debian:trixie@sha256:[0-9a-f]{64}$ ]] || exit 99
+    if [[ ${FAKE_QEMU_PULL_EXIT:-0} != 0 ]]; then printf 'manifest unknown\n' >&2; fi
+    exit "${FAKE_QEMU_PULL_EXIT:-0}" ;;
   version)
     if [[ -n ${FAKE_QEMU_SUITE_PID:-} ]]; then kill -TERM "$FAKE_QEMU_SUITE_PID"; fi
     exit "${FAKE_QEMU_INFO_EXIT:-42}" ;;
   run)
+    [[ "$2" == --pull=never ]] || exit 99
     for argument in "$@"; do
       if [[ "$argument" == type=bind,src=*,dst=/work ]]; then
         work=${argument#type=bind,src=}
@@ -409,7 +414,8 @@ done
 [[ -n "$child_result" ]] || fail 'interrupted QEMU child did not record its exit'
 
 export FAKE_QEMU_INFO_EXIT=0 FAKE_QEMU_STATE="$scratch/qemu-controller"
-for scenario in pass product-failure product-exit-three timeout cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon kernel-crash controller-oom missing-health; do
+for scenario in pass pull-failure product-failure product-exit-three timeout cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon kernel-crash controller-oom missing-health; do
+  export FAKE_QEMU_PULL_EXIT=0
   export FAKE_QEMU_DAEMON_RECEIPT=valid
   export FAKE_QEMU_GUEST_EXIT=0 FAKE_QEMU_CLEANUP_FAIL=0 FAKE_QEMU_MISSING_RECEIPT=0
   export FAKE_QEMU_SERIAL='Linux version 6.12 fixture' FAKE_QEMU_OOM=false FAKE_QEMU_HEALTH_MISSING=0
@@ -417,6 +423,7 @@ for scenario in pass product-failure product-exit-three timeout cleanup-failure 
   expected_rc=0
   expected_result=PASS
   case "$scenario" in
+    pull-failure) export FAKE_QEMU_PULL_EXIT=1; expected_rc=3; expected_result=HARNESS_ERROR ;;
     missing-daemon) export FAKE_QEMU_DAEMON_RECEIPT=missing; expected_rc=1; expected_result=HARNESS_ERROR ;;
     invalid-daemon) export FAKE_QEMU_DAEMON_RECEIPT=invalid; expected_rc=1; expected_result=HARNESS_ERROR ;;
     kernel-crash) export FAKE_QEMU_SERIAL='Kernel panic - not syncing: fixture'; expected_rc=120; expected_result=HARNESS_ERROR ;;
