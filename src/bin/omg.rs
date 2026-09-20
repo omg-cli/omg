@@ -316,14 +316,25 @@ fn parse_fast_counter_cmd(args: &[String]) -> Option<FastCounter> {
     }
 }
 
-fn print_fast_counter(counter: FastCounter, total: u32, explicit: u32, orphans: u32, updates: u32) {
+fn print_fast_counter(
+    counter: FastCounter,
+    total: u32,
+    explicit: u32,
+    orphans: u32,
+    updates: u32,
+    json: bool,
+) {
     let value = match counter {
         FastCounter::Total => total,
         FastCounter::Explicit => explicit,
         FastCounter::Orphan => orphans,
         FastCounter::Updates => updates,
     };
-    println!("{value}");
+    if json {
+        println!("{}", serde_json::json!({"count": value}));
+    } else {
+        println!("{value}");
+    }
 }
 
 #[cfg(unix)]
@@ -348,9 +359,42 @@ fn try_fast_counter(args: &[String]) -> Result<bool> {
     let Some(counter) = parse_fast_counter_cmd(args) else {
         return Ok(false);
     };
+    try_print_counter(counter, false)
+}
 
+async fn run_counter(counter: FastCounter, json: bool) -> Result<()> {
+    if try_print_counter(counter, json)? {
+        return Ok(());
+    }
+    let manager = omg_lib::package_managers::get_package_manager()?;
+    let (total, explicit, orphans, updates) = manager.get_status(false).await?;
+    print_fast_counter(
+        counter,
+        total.try_into()?,
+        explicit.try_into()?,
+        orphans.try_into()?,
+        updates.try_into()?,
+        json,
+    );
+    Ok(())
+}
+
+fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
     if counter == FastCounter::Explicit {
-        packages::explicit_sync(true)?;
+        packages::explicit_sync_with_json(true, json)?;
+        return Ok(true);
+    }
+
+    if omg_lib::core::paths::test_mode() {
+        let (total, explicit, orphans, updates) = omg_lib::package_managers::get_system_status()?;
+        print_fast_counter(
+            counter,
+            total.try_into()?,
+            explicit.try_into()?,
+            orphans.try_into()?,
+            updates.try_into()?,
+            json,
+        );
         return Ok(true);
     }
 
@@ -361,34 +405,41 @@ fn try_fast_counter(args: &[String]) -> Result<bool> {
             status.explicit_packages,
             status.orphan_packages,
             status.updates_available,
+            json,
         );
         return Ok(true);
     }
 
     #[cfg(unix)]
     if let Ok((total, explicit, orphans, updates)) = fast_status_from_daemon() {
-        print_fast_counter(counter, total, explicit, orphans, updates);
+        print_fast_counter(counter, total, explicit, orphans, updates, json);
         return Ok(true);
     }
 
     #[cfg(feature = "arch")]
     if let Ok((total, explicit, orphans)) = omg_lib::package_managers::pacman_db::get_counts_fast()
     {
-        let updates = omg_lib::package_managers::pacman_db::check_updates_cached()
-            .map_or(0, |updates| updates.len() as u32);
+        let updates = if counter == FastCounter::Updates {
+            omg_lib::package_managers::pacman_db::check_updates_cached()?
+                .len()
+                .try_into()?
+        } else {
+            0 // Other counter selections do not consume the updates field.
+        };
         print_fast_counter(
             counter,
             total as u32,
             explicit as u32,
             orphans as u32,
             updates,
+            json,
         );
         return Ok(true);
     }
 
-    anyhow::bail!(
-        "could not retrieve package status (try 'omg status' or start daemon with 'omg daemon')"
-    );
+    // A cache/daemon miss must reach the selected backend through the normal
+    // async dispatcher, including Debian and Fedora. Do not invent zero counts.
+    Ok(false)
 }
 
 /// Ultra-fast path for explicit --count (bypasses tokio entirely)
@@ -995,6 +1046,10 @@ const fn command_name(command: &Commands) -> &'static str {
         Commands::Migrate { .. } => "migrate",
         Commands::Clean { .. } => "clean",
         Commands::Explicit { .. } => "explicit",
+        Commands::ExplicitCount => "ec",
+        Commands::TotalCount => "tc",
+        Commands::OrphanCount => "oc",
+        Commands::UpdateCount => "uc",
         Commands::Sync => "sync",
         Commands::Use { .. } => "use",
         Commands::List { .. } => "list",
@@ -1331,6 +1386,10 @@ async fn dispatch_command(command: &Commands, ctx: &omg_lib::cli::CliContext) ->
             Commands::Search { .. }
                 | Commands::Info { .. }
                 | Commands::Explicit { .. }
+                | Commands::ExplicitCount
+                | Commands::TotalCount
+                | Commands::OrphanCount
+                | Commands::UpdateCount
                 | Commands::List { .. }
                 | Commands::Status { .. }
                 | Commands::History { .. }
@@ -1429,6 +1488,10 @@ async fn dispatch_command(command: &Commands, ctx: &omg_lib::cli::CliContext) ->
         Commands::Explicit { count } => {
             packages::explicit_sync_with_json(*count, ctx.json)?;
         }
+        Commands::ExplicitCount => run_counter(FastCounter::Explicit, ctx.json).await?,
+        Commands::TotalCount => run_counter(FastCounter::Total, ctx.json).await?,
+        Commands::OrphanCount => run_counter(FastCounter::Orphan, ctx.json).await?,
+        Commands::UpdateCount => run_counter(FastCounter::Updates, ctx.json).await?,
         Commands::Sync => {
             packages::sync().await?;
         }

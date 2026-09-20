@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used sixty-six searches (253 requested result slots),
+Exa research used seventy searches (261 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -552,3 +552,68 @@ package-backend contract. Four bounded environment receipts preserve those owner
 boundaries. Remote Gist publication, interactive migration application, rolling
 Rust refresh, real package transactions and broad behavioral inventory gaps are
 not certified by these fixture results.
+
+### Counter commands and independently specified package counts
+
+The explicit-count fixture previously used OMG's own returned package list as
+its count oracle. It now requires independently specified empty and populated
+records, sorted names, available-only exclusion, exact JSON/list/count forms,
+unchanged mock state and checked cleanup. Mock packages are all explicit; this
+does not certify native dependency-reason filtering described by
+[DNF5 repoquery](https://dnf5.readthedocs.io/en/latest/commands/repoquery.8.html).
+
+The stronger test exposed `omg --json ec` failing as an unrecognized command.
+All four prompt counters existed only in the pre-parser fast path and were
+absent from Clap's compiled inventory. They are now declared commands using the
+same counter renderer as the retained fast path. Global JSON/quiet/verbose
+positions follow [Clap's global argument contract](https://docs.rs/clap/latest/clap/struct.Arg.html#method.global).
+Non-explicit counters also respect isolated test state before consulting caches.
+Exact fixture counts, JSON output and extra-positional refusal are verified for
+all four commands. A mutation adding one to the total count fails the new test.
+
+The restored comprehensive CLI targets pass on Arch (84), Ubuntu/Debian (79
+each) and Fedora (78); these include parser/help tests, not that many behavioral
+contracts. The 23 binary unit tests and scoped Clippy also pass. Eight additive
+grammar entries expose 12 help surfaces and 20 behavioral surfaces previously
+missing from the inventory. Their gaps remain explicit. Reviewed schema updates
+apply the same unconditional command additions to the prior eight hosted owner
+artifacts; actual new local compiled schemas match on all four WSL owners.
+Hosted compilation must verify the remaining owners before those schema updates
+can be treated as confirmed. Native counters without a daemon/cache and native
+install-reason filtering require separate evidence.
+
+Native follow-through reproduced `tc`, `oc` and `uc` failing on Ubuntu when no
+daemon/status cache existed. Cache misses now reach the selected asynchronous
+backend through normal dispatch. Arch update-query errors propagate instead of
+becoming zero. Fedora's orphan query also lacked `--cacheonly`; the extended
+query-policy test failed before the repair. Its read-only path now follows
+[DNF5's documented cache-only semantics](https://dnf5.readthedocs.io/en/latest/misc/caching.7.html).
+The 50 DNF unit tests and its owning CLI target pass after the repair.
+
+Unprivileged native WSL checks with private HOME/data/cache and the daemon
+disabled compare all four counters with pacman, dpkg-query/apt-mark/APT, or
+RPM/DNF results. Plain output and both JSON flag positions match on all four
+distros. Observed total/explicit/orphan/update counts were Arch 188/9/0/0,
+Ubuntu 609/34/0/66, Debian 269/115/0/32 and Fedora 353/59/0/123. These local
+read-only observations do not prove transaction recovery or nonzero orphan
+fixtures; hosted QEMU remains required.
+
+### Runtime download connection recovery
+
+[QEMU run 35541086222](https://github.com/omg-cli/omg/actions/runs/35541086222)
+failed Fedora's Python install because GitHub reset the connection before the
+archive response. The other eight workflows passed; the failed run is retained,
+not reclassified as successful. Both SHA-256 and SHA-512 runtime download paths
+now use the existing transport-error policy for at most three GET attempts with
+bounded backoff and warning logs. URL validation still precedes the request.
+This follows [HTTP idempotent request semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2).
+Only pre-response transport failure is retried: HTTP responses, streamed bodies,
+checksum validation and installation remain outside that loop. No test retry
+or QEMU verdict suppression was added.
+
+Loopback tests verify one timeout followed by success, HTTP 403/404 preservation,
+and exhaustion after three proxy connection failures. Those tests pass on all
+four WSL builds. Real Python 3.12.14 installation, exact executable identity and
+checked cleanup also pass on all four with synthetic mode disabled. A subsequent
+hosted revision must still validate the real guest path; local success cannot
+erase the original failure or guarantee upstream availability.

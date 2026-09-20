@@ -836,11 +836,11 @@ impl DnfPackageManager {
             RepositoryQuery::Unneeded => "--unneeded",
         };
         let mut args = Vec::new();
-        // list_updates is a cached read. Its caller owns any explicit sync;
-        // repoquery must not refresh expired metadata behind --check/--no-sync.
+        // Status/update/orphan queries are cached reads. Their callers own any
+        // explicit sync; repoquery must not refresh metadata behind a read.
         if matches!(
             query,
-            RepositoryQuery::Installed | RepositoryQuery::Upgrades
+            RepositoryQuery::Installed | RepositoryQuery::Upgrades | RepositoryQuery::Unneeded
         ) {
             args.push("--cacheonly".to_owned());
         }
@@ -1502,7 +1502,11 @@ mod tests {
 
     #[test]
     fn update_queries_never_refresh_repository_metadata() {
-        for query in [RepositoryQuery::Installed, RepositoryQuery::Upgrades] {
+        for query in [
+            RepositoryQuery::Installed,
+            RepositoryQuery::Upgrades,
+            RepositoryQuery::Unneeded,
+        ] {
             let args = DnfPackageManager::repository_query_args(query).unwrap();
             assert!(args.iter().any(|arg| arg == "--cacheonly"), "{args:?}");
         }
