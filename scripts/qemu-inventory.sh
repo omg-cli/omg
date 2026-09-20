@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# qemu-inventory.sh — drive tests/cli_behavior_inventory.tsv rows inside a
+# qemu-inventory.sh â€” drive tests/cli_behavior_inventory.tsv rows inside a
 # running QEMU guest over SSH and record machine-readable evidence.
 #
 # The guest must already be up (see scripts/benchmark-qemu.sh, which calls
@@ -108,6 +108,7 @@ done
 [[ "$row_timeout" =~ ^[0-9]+$ && "$row_timeout" -gt 0 ]] || exit 2
 case "$distro" in arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
 for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3; done
+overlap_fixture=$(jq -rn --rawfile fixture "$(dirname "$0")/workspace-overlap-fixture.sh" '$fixture | @sh')
 [[ "$binary" == /* && "$binary" != *$'\n'* ]] || exit 2
 [[ "$ssh_user" =~ ^[a-z_][a-z0-9_-]*$ && "$ssh_port" =~ ^[0-9]+$ ]] || exit 2
 [[ "$tiers" =~ ^[a-z,-]+$ && "$tiers" != ,* && "$tiers" != *, && "$tiers" != *,,* ]] || exit 2
@@ -317,9 +318,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
   remote="set -eu; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
-  remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-task-ok\n' > Makefile"
+  remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n' > Makefile"
+  remote+="; printf '%s' $overlap_fixture > workspace-overlap.sh"
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
-  remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\n' > project/Makefile"
+  remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
   remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_product_output)"
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.

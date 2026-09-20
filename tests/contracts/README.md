@@ -53,8 +53,10 @@ or recovery coverage. Those stronger contracts still require explicit assertions
 The workspace scenarios use two registered projects with distinct task markers.
 Filtered execution requires the selected marker once and the excluded marker zero
 times; sequential and parallel unfiltered execution require both exactly once,
-without relying on output order. This verifies selection and completion, not actual
-parallel overlap or every argument interaction. Git-hook install/force-install rows
+without relying on output order. The parallel row runs a shared bounded rendezvous fixture: neither task can
+complete without observing its peer. Serial negative controls must time out and
+remove their ready signals. This proves overlap of two independent tasks, not
+every dependency schedule or argument interaction. Git-hook install/force-install rows
 require three regular executable scripts with the expected markers and valid shell
 syntax; uninstall requires their absence. This does not establish hook runtime
 semantics or preservation of user-modified hooks. The native inventory runner uses

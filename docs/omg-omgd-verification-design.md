@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used forty-nine searches (213 requested result slots),
+Exa research used fifty searches (216 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -49,6 +49,7 @@ Selected primary sources were read and checked against repository code.
 | [NIST combinatorial test generation and expected outputs](https://csrc.nist.gov/csrc/media/projects/automated-combinatorial-testing-for-software/documents/auto-test--tutorial.pdf) | Strengthen expected-output checks before adding flag combinations to QEMU; input selection and its behavioral oracle are distinct obligations | Pairwise coverage cannot certify higher-order interactions or compensate for incorrect expected results |
 | [Git hook requirements](https://git-scm.com/docs/githooks) | Assert installed hooks are executable regular scripts and removed hooks are absent; isolate global/system Git configuration in guest fixtures | Default-directory fixtures do not cover core.hooksPath, linked worktrees, user-edited hooks, or execution semantics |
 | [which 8.0.5 source archive](https://static.crates.io/crates/which/which-8.0.5.crate) | Check the selected executable path rather than accepting an existing NVM bin directory; inspected finder/checker source after verifying the Cargo.lock SHA-256 | One Exa query returned no results and versioned docs were unavailable; the locked source confirms absolute-path checks without execution, not binary identity or successful startup |
+| [Tokio barrier](https://docs.rs/tokio/latest/tokio/sync/struct.Barrier.html) | Require both workspace tasks to rendezvous before either emits a success marker | The process fixture uses bounded filesystem signals, not Tokio itself; demonstrates overlap of these two tasks, not throughput or all dependency schedules |
 | [GitHub artifact retention](https://docs.github.com/en/actions/tutorials/store-and-share-data) and [token permissions](https://github.com/github/docs/blob/main/content/actions/tutorials/authenticate-with-github_token.md) | Preserve actionable failure summaries in issues and link bounded artifacts; keep issue writes in the trusted reporter | Artifacts expire and PR execution must not receive issue-write credentials |
 | [GitHub job prerequisites](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-jobs) | One readiness coordinator avoids four idle artifact consumers; each guest still validates the exact binary pair | A shared barrier can increase an individual guest's latency; measure runner time and whole-gate latency separately |
 | [GitHub container shells](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/run-jobs-in-a-container) | Declare Bash explicitly for the native build recipe's Bash conditionals | Tests executing a recipe in Bash must also check the workflow selects that shell; container defaults use sh |

@@ -147,7 +147,7 @@ hook-uninstall	["hook","--uninstall","bash"]	isolated-write	0	pass	-	hermetic	he
 hooks-install-force	["hooks","install","--force"]	isolated-write	0	pass	hooks-install	hermetic	hermetic:pass	hooks-installed	tempdir-drop
 workspace-add-second	["workspace","add","project","--name","other"]	isolated-write	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
 workspace-run-flags	["workspace","run","--parallel","--filter","fixture","--yes","smoke"]	read	0	pass	workspace-add-second	hermetic	hermetic:pass	workspace-filtered-output	tempdir-drop
-workspace-run-parallel-all	["workspace","run","--parallel","--yes","smoke"]	read	0	pass	workspace-add-second	hermetic	hermetic:pass	workspace-all-output	tempdir-drop
+workspace-run-parallel-all	["workspace","run","--parallel","--yes","overlap"]	read	0	pass	workspace-add-second	hermetic	hermetic:pass	workspace-all-output	tempdir-drop
 workspace-run-sequential-all	["workspace","run","--yes","smoke"]	read	0	pass	workspace-add-second	hermetic	hermetic:pass	workspace-all-output	tempdir-drop
 complete-full	["complete","--shell","bash","--current","se","--last","omg","--full","omg se"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-log-flags	["audit","log","--limit","3","--severity","error","--export","${ROOT}/audit-log-export.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop

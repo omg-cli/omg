@@ -490,6 +490,7 @@ if [[ -n "$inventory_tiers" ]]; then
   # The inventory executor runs inside the controller (same netns as the
   # guest); /work is bind-mounted there.
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
+  cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"
   cp "$tsv" "$work/cases.tsv"
   if [[ "$inventory_isolation" == true ]]; then
     cp "$inventory_policy" "$work/inventory-policy.json"

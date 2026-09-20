@@ -834,12 +834,16 @@ fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
 
-    project.create_file("Makefile", ".PHONY: smoke\nsmoke:\n\t@echo smoke-task-ok\n");
+    project.create_file("Makefile", ".PHONY: smoke overlap\nsmoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n");
+    project.create_file(
+        "workspace-overlap.sh",
+        include_str!("../scripts/workspace-overlap-fixture.sh"),
+    );
     project.create_file("README.md", "# CLI behavior smoke fixture\n");
     project.create_file("project/README.md", "# Nested audit fixture\n");
     project.create_file(
         "project/Makefile",
-        ".PHONY: smoke\nsmoke:\n\t@echo nested-smoke-task-ok\n",
+        ".PHONY: smoke overlap\nsmoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n",
     );
 
     let pacman_local = project
@@ -1033,7 +1037,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                                 metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
                             }) && std::fs::read_to_string(&path)
                                 .is_ok_and(|text| text.lines().any(|line| line == marker))
-                                && Command::new("sh")
+                                && std::process::Command::new("sh")
                                     .arg("-n")
                                     .arg(&path)
                                     .output()
