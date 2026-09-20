@@ -836,6 +836,14 @@ impl DnfPackageManager {
             RepositoryQuery::Unneeded => "--unneeded",
         };
         let mut args = Vec::new();
+        // list_updates is a cached read. Its caller owns any explicit sync;
+        // repoquery must not refresh expired metadata behind --check/--no-sync.
+        if matches!(
+            query,
+            RepositoryQuery::Installed | RepositoryQuery::Upgrades
+        ) {
+            args.push("--cacheonly".to_owned());
+        }
         if matches!(
             query,
             RepositoryQuery::InstalledSizes(_)
@@ -1491,6 +1499,14 @@ fn reject_unsealed_local_rpm_targets(packages: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_queries_never_refresh_repository_metadata() {
+        for query in [RepositoryQuery::Installed, RepositoryQuery::Upgrades] {
+            let args = DnfPackageManager::repository_query_args(query).unwrap();
+            assert!(args.iter().any(|arg| arg == "--cacheonly"), "{args:?}");
+        }
+    }
 
     #[test]
     fn local_rpm_operands_are_refused_until_they_can_be_sealed() {

@@ -33,7 +33,7 @@ retries = 0
 
 # Production transport and shutdown failures must remain first-attempt failures.
 [[profile.default.overrides]]
-filter = 'binary(=coverage_18)'
+filter = 'binary(=coverage_18) | binary(=cli_comprehensive) | binary(=git_hooks_contract)'
 retries = 0
 
 # Alias cycles and path escapes are deterministic failures, never retryable.

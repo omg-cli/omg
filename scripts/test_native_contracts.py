@@ -5,6 +5,9 @@ import json
 from pathlib import Path
 import unittest
 import tempfile
+import os
+import shutil
+import subprocess
 
 from test_contract_coverage import fixture
 
@@ -12,6 +15,28 @@ SPEC = importlib.util.spec_from_file_location(
     'native_contracts', Path(__file__).with_name('run-native-contracts.py'))
 NATIVE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(NATIVE)
+
+
+@unittest.skipUnless(os.name == 'posix' and shutil.which('runuser'), 'requires Linux runuser')
+class NativeRunner(unittest.TestCase):
+    def test_cli_runner_drops_root_and_preserves_arguments_and_exit(self):
+        runner = Path(__file__).with_name('native-test-runner.sh').resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o755)
+            for name in ('cli_comprehensive-fixture', 'other-fixture'):
+                binary = root / name
+                binary.write_text('#!/bin/sh\nid -u\nprintf "%s\\n" "$1"\nexit 23\n')
+                binary.chmod(0o755)
+                result = subprocess.run(['bash', str(runner), str(binary), 'argument with spaces'],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 23, result.stderr)
+                uid, argument = result.stdout.splitlines()
+                self.assertEqual(argument, 'argument with spaces')
+                if os.getuid() == 0 and name.startswith('cli_comprehensive-'):
+                    self.assertNotEqual(int(uid), 0)
+                else:
+                    self.assertEqual(int(uid), os.getuid())
 
 
 def parser_fixture():
@@ -133,7 +158,10 @@ class NativeReceipts(unittest.TestCase):
             with self.subTest(features=features):
                 args = NATIVE.cargo_test_args(features)
                 tests = {args[index + 1] for index, value in enumerate(args) if value == '--test'}
-                self.assertEqual(tests, expected | {'cli_surface'})
+                shared = {'cli_surface', 'git_hooks_contract', 'coverage_18'}
+                if set(features.split(',')) & {'arch', 'debian', 'debian-pure', 'fedora'}:
+                    shared.add('cli_comprehensive')
+                self.assertEqual(tests, expected | shared)
 
     def test_receipt_binds_reviewed_parser_assertion_and_harness_identity(self):
         manifest, provenance, report, required = parser_fixture()

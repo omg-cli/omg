@@ -9,6 +9,45 @@
 set -euo pipefail
 # BEGIN PRODUCT OUTPUT ORACLE
 # This exact function is sent to the guest and exercised by fault-injection tests.
+check_hook_lifecycle() (
+  # Execute the installed scripts unchanged in a disposable second repository.
+  local hooks=$1 fixture output
+  fixture=$(mktemp -d) || exit 1
+  trap 'rm -rf -- "$fixture"' EXIT
+  cd "$fixture" || exit 1
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  hook_git() {
+    git -c user.name='OMG fixture' -c user.email=fixture@example.invalid \
+      -c commit.gpgsign=false -c core.hooksPath="$hooks" "$@"
+  }
+  expect_notice() {
+    local expected=$1 message=$2
+    shift 2
+    output=$(hook_git "$@" 2>&1) || { printf 'assertion failed: Git operation %s: %s\n' "$*" "$output" >&2; return 1; }
+    if { [[ "$expected" == yes ]] && [[ "$output" != *"$message"* ]]; } \
+      || { [[ "$expected" == no ]] && [[ "$output" == *"$message"* ]]; }; then
+      printf 'assertion failed: hook notice expected=%s during %s: %s\n' "$expected" "$*" "$output" >&2; return 1
+    fi
+  }
+  hook_git init -q -b baseline || exit 1
+  printf 'baseline\n' > omg.lock
+  hook_git add omg.lock || exit 1
+  expect_notice no 'omg.lock has unstaged changes' commit -qm baseline || exit 1
+  printf 'changed\n' > omg.lock
+  expect_notice yes 'omg.lock has unstaged changes' commit --allow-empty -m unstaged || exit 1
+  [[ $(hook_git show HEAD:omg.lock) == baseline ]] || exit 1
+  hook_git checkout -qb changed || exit 1
+  hook_git add omg.lock || exit 1
+  expect_notice no 'omg.lock has unstaged changes' commit -qm changed || exit 1
+  [[ $(hook_git show HEAD:omg.lock) == changed ]] || exit 1
+  expect_notice yes 'Environment changed on branch switch' checkout baseline || exit 1
+  expect_notice no 'Environment changed on branch switch' checkout baseline || exit 1
+  printf 'working tree edit\n' > omg.lock
+  expect_notice no 'Environment changed on branch switch' checkout -- omg.lock || exit 1
+  expect_notice yes 'Environment changed after merge' merge --ff-only changed || exit 1
+  [[ $(cat omg.lock) == changed ]] || exit 1
+  expect_notice no 'Environment changed after merge' merge --ff-only changed || exit 1
+)
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5
   if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
@@ -37,7 +76,10 @@ check_product_output() {
               printf 'assertion failed: installed hook is missing, invalid, or not executable: %s\n' "$hook" >&2; return 1
             fi
           fi
-        done ;;
+        done
+        if [[ "$assertion" == hooks-installed ]] && ! check_hook_lifecycle "$PWD/.git/hooks"; then
+          printf 'assertion failed: installed hook lifecycle contract\n' >&2; return 1
+        fi ;;
       workspace-filtered-output|workspace-all-output)
         local primary nested expected_nested=0
         primary=$(grep -Fxc 'smoke-task-ok' "$stdout" || true)
@@ -322,7 +364,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote+="; printf '%s' $overlap_fixture > workspace-overlap.sh"
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
-  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_product_output)"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_product_output)"
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')

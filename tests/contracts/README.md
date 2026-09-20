@@ -58,10 +58,21 @@ complete without observing its peer. Serial negative controls must time out and
 remove their ready signals. This proves overlap of two independent tasks, not
 every dependency schedule or argument interaction. Git-hook install/force-install rows
 require three regular executable scripts with the expected markers and valid shell
-syntax; uninstall requires their absence. This does not establish hook runtime
-semantics or preservation of user-modified hooks. The native inventory runner uses
-the same assertions. Published inventory policy hashes are retained separately from
+syntax; uninstall requires their absence. QEMU additionally runs those installed
+scripts through real Git commits, branch/file checkouts and fast-forward merges in
+a disposable repository, with positive and negative notice and lockfile assertions.
+The separate native hook target checks the same lifecycle and manual child failure
+propagation. User-modified hook preservation remains a separate contract.
+Published inventory policy hashes are retained separately from
 the expanded checkout inventory, so old release evidence is not reinterpreted.
+
+Linux backend owners also execute the backend-independent CLI comprehensive
+cases; Arch-specific package fixtures retain their Arch owner. All native owners
+require nonempty hook and production daemon transport targets. In root Linux CI
+containers, a recorded target runner drops only the comprehensive CLI harness to
+an unprivileged identity, keeping fixture paths separate from real root state.
+These additional JUnit results are execution evidence, not automatic behavioral
+coverage credit in the contract manifest.
 
 JUnit's skipped-test reporting varies by nextest version. The independent list
 supplies ignored/filtered counts even when no XML row exists. A selected test

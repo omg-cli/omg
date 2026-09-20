@@ -1,6 +1,8 @@
 """Exercise the exact guest output oracle with plausible false-green products."""
 import os
 import json
+import re
+import shlex
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,6 +13,42 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    def generated_hooks(self):
+        source = (ROOT / 'src/cli/git_hooks.rs').read_text(encoding='utf-8')
+        return {name: (re.search(r'const ' + constant + r': &str = r#"(.*?)"#;', source, re.S).group(1), 0o755)
+                for name, constant in [('pre-commit', 'PRE_COMMIT_HOOK'),
+                                       ('post-checkout', 'POST_CHECKOUT_HOOK'),
+                                       ('post-merge', 'POST_MERGE_HOOK')]}
+
+    def test_executable_noop_hooks_cannot_satisfy_behavior(self):
+        hooks = self.generated_hooks()
+        result = self.run_oracle(assertion='hooks-installed', hooks=hooks)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in hooks:
+            with self.subTest(hook=name):
+                content, mode = hooks[name]
+                changed = dict(hooks)
+                changed[name] = (content.splitlines()[0] + '\n' + content.splitlines()[1] + '\nexit 0\n', mode)
+                result = self.run_oracle(assertion='hooks-installed', hooks=changed)
+                self.assertNotEqual(result.returncode, 0, f'{name} did nothing but passed')
+                self.assertIn('assertion failed:', result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_actual_runner_executes_installed_hook_contracts(self):
+        rows = ['hooks\t["hooks","install"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\thooks-installed\ttempdir-drop']
+        for disabled in (False, True):
+            with self.subTest(disabled=disabled):
+                product = 'mkdir -p .git/hooks\n'
+                for name, (content, _) in self.generated_hooks().items():
+                    if disabled:
+                        content = '\n'.join(content.splitlines()[:2]) + '\nexit 0\n'
+                    product += f'printf %s {shlex.quote(content)} > .git/hooks/{name}\nchmod 755 .git/hooks/{name}\n'
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual(result.returncode, 1 if disabled else 0, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'FAIL' if disabled else 'PASS')
+                if disabled:
+                    self.assertIn('hook notice', logs['hooks.log'])
+
     def test_failure_diagnosis_precedes_long_product_output(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('# BEGIN ROW LOG')
@@ -167,8 +205,7 @@ esac
         self.assertEqual(self.run_oracle(assertion='workspace-filtered-output', stdout='smoke-task-ok\n').returncode, 0)
 
     def test_hook_state_rejects_missing_invalid_or_leftover_hooks(self):
-        hooks = {name: (f'#!/bin/sh\n# OMG {label} Hook\nexit 0\n', 0o755)
-                 for name, label in [('pre-commit', 'Pre-commit'), ('post-checkout', 'Post-checkout'), ('post-merge', 'Post-merge')]}
+        hooks = self.generated_hooks()
         self.assertNotEqual(self.run_oracle(assertion='hooks-installed', hooks={}).returncode, 0)
         self.assertEqual(self.run_oracle(assertion='hooks-installed', hooks=hooks).returncode, 0)
         for replacement in ('#!/bin/sh\nexit 0\n', '#!/bin/sh\n# OMG Pre-commit Hook\nif\n'):

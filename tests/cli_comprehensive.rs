@@ -1,6 +1,16 @@
 //! Broad CLI smoke and behavior contracts for OMG commands.
 
-#![cfg(feature = "arch")]
+// These contracts use isolated mock package state and child-local configuration.
+// Exercise each Linux backend build instead of silently selecting zero tests.
+#![cfg(all(
+    target_os = "linux",
+    any(
+        feature = "arch",
+        feature = "debian",
+        feature = "debian-pure",
+        feature = "fedora"
+    )
+))]
 
 pub mod common;
 
@@ -141,6 +151,28 @@ impl Safety {
             Self::ServiceMutation => "service-mutation",
             Self::Interactive => "interactive",
         }
+    }
+}
+
+#[test]
+fn behavior_inventory_keeps_hook_and_workspace_assertions() {
+    let cases = behavior_cases();
+    for case in &cases {
+        assert_eq!(Safety::parse(case.safety.as_str(), 1), case.safety);
+    }
+    for (id, assertion) in [
+        ("hooks-install", Assertion::HooksInstalled),
+        ("hooks-install-force", Assertion::HooksInstalled),
+        ("workspace-run-parallel-all", Assertion::WorkspaceAllOutput),
+    ] {
+        let case = cases
+            .iter()
+            .find(|case| case.id == id)
+            .expect("required behavioral case");
+        assert!(
+            case.assertions.contains(&assertion),
+            "{id} lost its behavioral assertion"
+        );
     }
 }
 
@@ -830,6 +862,7 @@ fn behavior_inventory_declaration_args_parse() {
     }
 }
 
+#[cfg(feature = "arch")]
 fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
@@ -923,12 +956,14 @@ fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
     )
 }
 
+#[cfg(feature = "arch")]
 fn has_ansi(text: &str) -> bool {
     text.as_bytes().windows(2).any(|pair| pair == b"\x1b[")
 }
 
 #[test]
 #[serial]
+#[cfg(feature = "arch")] // This inventory fixture explicitly seeds a pacman database.
 fn behavior_inventory_runs_in_hermetic_state() {
     use std::fmt::Write as _;
     use std::time::Instant;
@@ -1265,6 +1300,7 @@ mod install_tests {
     // Contract: dry-run exits 0 and explicitly promises no changes
     // (observed: "No changes will be made (dry run)").
     #[test]
+    #[cfg(feature = "arch")] // The installed package fixture is pacman.
     fn test_install_dry_run() {
         let result = run_omg(&["install", "--dry-run", "pacman"]);
         result.assert_success();
@@ -1316,6 +1352,19 @@ mod update_tests {
         result.assert_success();
         result.assert_stdout_contains("Checking for updates · cached");
         result.assert_no_ansi();
+        assert!(
+            !result.stdout.contains("Synced"),
+            "--check refreshed package metadata"
+        );
+        for flag in ["--dry-run", "--no-sync"] {
+            let preview = run_omg(&["update", flag]);
+            preview.assert_success();
+            assert!(
+                !preview.stdout.contains("Synced"),
+                "{flag} refreshed package metadata: {}",
+                preview.stdout
+            );
+        }
     }
 }
 
@@ -1497,6 +1546,7 @@ mod env_tests {
     }
 
     #[test]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn redirected_environment_drift_output_has_no_ansi() {
         let project = TestProject::new();
         let capture = project.run(&["env", "capture"]);
@@ -1564,6 +1614,7 @@ mod security_tests {
     }
 
     #[test]
+    #[cfg(feature = "license")]
     fn test_account_help() {
         let result = run_omg(&["account", "--help"]);
         result.assert_success();
@@ -1571,6 +1622,7 @@ mod security_tests {
     }
 
     #[test]
+    #[cfg(feature = "license")]
     fn account_link_does_not_prompt_without_a_terminal() {
         let result = run_omg_with_env(
             &["account", "link", "invalid-token"],
@@ -1586,6 +1638,14 @@ mod security_tests {
             "non-interactive account linking must not consume stdin:\n{}",
             result.stdout
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "license"))]
+    fn account_is_explicitly_unavailable_without_license_feature() {
+        let result = run_omg(&["account", "--help"]);
+        assert_eq!(result.exit_code, 2);
+        result.assert_stderr_contains("unrecognized subcommand 'account'");
     }
 }
 
@@ -1796,6 +1856,7 @@ mod meta_tests {
 // PACKAGE OPERATIONS
 // ===================
 
+#[cfg(feature = "arch")]
 mod package_ops_tests {
     use super::*;
 
@@ -1803,6 +1864,7 @@ mod package_ops_tests {
     // subcommands (src/cli/args.rs:172-189). The old invocations were clap errors
     // whose message happened to contain "cache"/"orphans", so they passed vacuously.
     #[test]
+    #[cfg(feature = "arch")] // Cache cleanup support and this preview are Arch-specific.
     fn test_clean_cache_dry_run() {
         let result = run_omg(&["clean", "--cache", "--dry-run"]);
         result.assert_success();
@@ -1819,6 +1881,7 @@ mod package_ops_tests {
     }
 
     #[test]
+    #[cfg(feature = "arch")] // This fixture supplies Arch orphan metadata.
     fn test_clean_orphans_dry_run() {
         let result = run_omg(&["clean", "--orphans", "--dry-run"]);
         result.assert_success();
@@ -1891,6 +1954,7 @@ mod workflow_tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "arch")] // This fixture resolves git through the Arch fast info path.
     fn test_search_then_info() {
         // Workflow: search for package, then get info
         let search_result = run_omg(&["search", "git"]);

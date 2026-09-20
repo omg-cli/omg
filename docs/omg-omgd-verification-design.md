@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used fifty-four searches (228 requested result slots),
+Exa research used fifty-seven searches (234 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -321,3 +321,53 @@ success, exit-23, and signal tests. The six-test target passed locally on Arch,
 Ubuntu, Fedora, and Debian using their respective feature builds. This does not
 cover merge conflicts, every Git configuration, or every generated-hook branch.
 Research: [Git hook invocation contracts](https://git-scm.com/docs/githooks).
+
+### Expanded Linux execution and QEMU hook assertions
+
+The QEMU installed-hook oracle now exercises the installed scripts directly via
+an absolute `core.hooksPath` in a disposable second repository. Commit, branch
+checkout, file checkout, fast-forward merge and no-op controls verify notices and
+lockfile state. Replacing each script with an executable no-op reproduced three
+false passes before the stronger oracle; all are rejected afterward. The full
+16-test oracle suite passed on Arch, Ubuntu, Fedora and Debian WSL. Fedora needed
+its missing local gawk prerequisite. The existing failure receipt/log path remains
+unchanged, including automatic trusted-run issue reporting.
+
+The broad CLI harness previously selected zero tests on non-Arch feature builds.
+Backend-independent cases now compile for Linux backend owners. The pacman database
+inventory, Arch package-info/install/orphan/cache fixtures retain their Arch owner;
+Fedora environment capture remains explicitly unsupported by its compiled backend.
+These restrictions remain coverage debt, not successful native transaction tests.
+Local unprivileged results: 82 CLI tests on Arch, 77 on Ubuntu/Debian, 76 on Fedora,
+plus six hook tests on each. Execution admission now requires these selected
+binaries and the production daemon transport suite to be nonempty; deterministic
+failures have no nextest retries.
+
+WSL default root execution exposed fixture contamination: production root data
+paths deliberately ignore caller environment overrides and use `/var/lib/omg`.
+Dedicated local `omg-audit` accounts now execute the CLI fixtures. The native CI
+runner drops only the CLI comprehensive test harness to nobody inside root
+containers, preserving other suites' privilege model. An actual Arch root-wrapper
+run passed all 82 tests; wrapper controls preserve argv, exit status and ordinary
+suite identity. Root path protections are unchanged.
+
+The newly owned non-Arch CLI tests exposed `update --check` syncing databases.
+The common update lane now skips explicit sync for check, dry-run and no-sync
+modes, consistent with the Arch lane. DNF query-level cache behavior is checked
+separately; mocked CLI output alone cannot prove absence of backend network work.
+
+Research: [Git core.hooksPath](https://git-scm.com/docs/git-config),
+[DNF cache-only semantics](https://dnf.readthedocs.io/en/latest/command_ref.html),
+[nextest target runners](https://nexte.st/docs/features/target-runners/).
+
+Final local evidence for this batch: the license-off `debian-pure` build passed
+76 CLI tests, 17 daemon transport target tests and six hook tests. Its absent
+account command is now asserted as an explicit parser refusal, rather than
+counting that refusal as a successful account interaction. Fedora's new DNF
+cache-only regression failed before the repair; all 50 DNF backend tests passed
+afterward. The actual Fedora `omg update --check` then succeeded without mock mode
+as uid 1000 in a network namespace with no network interfaces configured and all
+capability sets dropped, querying cached native package metadata. It listed updates
+without installing them. Quick gate: 259 tests, two explicit skips. The previous
+6c07cad6 hosted baseline passed all nine workflows including all four QEMU guests;
+this expanded batch still requires its own hosted validation.

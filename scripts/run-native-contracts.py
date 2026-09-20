@@ -111,7 +111,9 @@ def sha256_file(path):
 
 def cargo_test_args(features):
     active = COVERAGE.strings(features.split(','))
-    suites = ['cli_surface']
+    suites = ['cli_surface', 'git_hooks_contract', 'coverage_18']
+    if active & {'arch', 'debian', 'debian-pure', 'fedora'}:
+        suites.append('cli_comprehensive')
     if active & {'debian', 'debian-pure'}:
         suites.extend(['debian_tests', 'debian_daemon_tests', 'debian_ipc_tests',
                        'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests'])
@@ -149,6 +151,13 @@ def main():
         source = command_output(['git', 'rev-parse', 'HEAD'])
         require(source == os.environ['OMG_CONTRACT_SOURCE_SHA'], 'checkout source mismatch')
         features = args.features.split(',')
+        # Cargo/nextest target runners apply to the host platform too. Preserve
+        # all other suites' privilege model; only the isolated CLI harness drops root.
+        if sys.platform == 'linux' and os.geteuid() == 0:
+            host = command_output(['rustc', '-vV']).split('host: ', 1)[1].splitlines()[0]
+            runner_key = 'CARGO_TARGET_' + host.upper().replace('-', '_') + '_RUNNER'
+            require(runner_key not in os.environ, 'root native runner conflicts with configured target runner')
+            os.environ[runner_key] = 'bash scripts/native-test-runner.sh'
         COVERAGE.strings(features)
         cargo_args = cargo_test_args(args.features)
         recipe = {
@@ -159,9 +168,11 @@ def main():
             'env': {key: value for key, value in sorted(os.environ.items())
                     if key in ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC_WRAPPER',
                                'RUSTC_WORKSPACE_WRAPPER', 'CARGO_BUILD_TARGET')
-                    or key.startswith('CARGO_PROFILE_')},
+                    or key.startswith('CARGO_PROFILE_')
+                    or (key.startswith('CARGO_TARGET_') and key.endswith('_RUNNER'))},
             'files': {name: sha256_file(name) for name in
-                      ('Cargo.toml', 'Cargo.lock', '.config/nextest.toml', '.github/workflows/ci.yml')},
+                      ('Cargo.toml', 'Cargo.lock', '.config/nextest.toml', '.github/workflows/ci.yml',
+                       'scripts/native-test-runner.sh')},
         }
         if Path('.cargo/config.toml').is_file():
             recipe['files']['.cargo/config.toml'] = sha256_file('.cargo/config.toml')
