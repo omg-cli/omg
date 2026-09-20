@@ -50,9 +50,9 @@ env:
 jobs:
   #############################################################################
   # STAGE 1: Quick Gate
-  # Fast checks that gate expensive platform builds. Runs make
-  # ci-local-quick for real (not a dry run), so budget ~5 min cold,
-  # ~2 min warm via the Rust cache.
+  # Formatting, shell syntax and policy tests gate platform builds.
+  # Portable Rust owns portable Clippy and fuzz compilation, so these
+  # independent checks do not delay every platform behind a second build.
   #############################################################################
   quick-gate:
     name: "Quick Gate"
@@ -78,20 +78,11 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.95.0"
-          components: rustfmt, clippy
+          components: rustfmt
 
-      - name: Setup cache
-        if: steps.changes.outputs.required == 'true' && inputs.skip-cache != true
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: "v1-quick-gate"
-          shared-key: "quick-gate"
-
-      - name: Check local CI targets
+      - name: Run quick workflow checks
         if: steps.changes.outputs.required == 'true'
-        env:
-          CI_LOCAL_TARGET_DIR: ${{ github.workspace }}/target
-        run: make ci-local-quick
+        run: make ci-workflow-quick
 
       - name: Verify installer destination safety
         run: bash tests/installer_security.sh
@@ -130,6 +121,11 @@ jobs:
         run: |
           cargo clippy --all-targets --no-default-features \
             --features debian-pure --locked -- -D warnings
+
+      - name: Check fuzz targets
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
 
       - name: Check Bash and Zsh package completion
         run: |
