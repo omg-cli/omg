@@ -182,5 +182,20 @@ for operation in create comment close view; do
 done
 unset FAKE_FAIL_OPERATION
 
+# 16. Contradictory evidence must not file and then close the same failure.
+printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PRODUCT_FAIL","exit_code":1,"elapsed_seconds":2},{"case_id":"search-tree","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":2}]' > "$results"
+: > "$CALL_LOG"
+if bash "$runner" "$results" --run-url https://run/16 --source qemu 2>"$scratch/error"; then
+  fail "contradictory results were accepted"
+fi
+[[ -s "$CALL_LOG" ]] && fail "contradictory results reached GitHub"
+
+# 17. A QEMU expected-refusal assertion can PASS with observed exit 1.
+# Its runner already checked the expected code; preserve that verdict.
+printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PASS","exit_code":1,"elapsed_seconds":2}]' > "$results"
+: > "$CALL_LOG"
+out=$(bash "$runner" "$results" --run-url https://run/17 --source qemu); assert_rc 0 "$?" "expected-refusal"
+grep -q "issue close 7" "$CALL_LOG" || fail "expected-refusal lost verified closure"
+
 if [[ "$failures" -ne 0 ]]; then printf '%s failure(s)\n' "$failures" >&2; exit 1; fi
 printf 'qa-file-issue harness: all green\n'

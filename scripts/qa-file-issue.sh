@@ -48,6 +48,8 @@ failures="$(jq -ce '
   def distro: type == "string" and IN("arch", "debian", "ubuntu", "fedora", "macos");
   if type != "array" then error("results must be an array") else . end |
   if length > 10000 then error("too many results") else . end |
+  if (map([.distro, .case_id]) | unique | length) != length
+  then error("duplicate case identity") else . end |
   if all(.[];
     (.case_id | identifier) and
     (.distro | distro) and

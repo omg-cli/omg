@@ -46,6 +46,17 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(REPORT.archive_rows(output.getvalue(), {case["case_id"]}),
                          [case, self.row()])
 
+    def test_expected_refusal_pass_preserves_observed_nonzero_exit(self):
+        # The inventory runner marks a checked expected refusal as PASS while
+        # retaining the command's observed exit code. Do not reinterpret it.
+        row = dict(self.row("PASS"), exit_code=1)
+        self.assertEqual(
+            REPORT.archive_rows(
+                self.archive("run-a/results.json", json.dumps([row])),
+                {row["case_id"]},
+            ), [row],
+        )
+
     def test_poisoned_archive_members_and_results_fail(self):
         for name, content, mode in (("../results.json", "[]", 0),
                                     ("/results.json", "[]", 0),
