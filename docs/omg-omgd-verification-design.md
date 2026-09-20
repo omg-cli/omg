@@ -21,12 +21,12 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used twelve searches requesting five candidates each (60 result slots),
+Exa research used thirteen searches requesting five candidates each (65 result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
-The additional implementation search checks concrete Clap reflection APIs.
-Results overlap; these are not 60 distinct verified authorities.
+Additional implementation searches check concrete Clap reflection APIs and LLVM
+coverage interpretation. Results overlap; these are not 65 distinct verified authorities.
 Selected primary sources were read and checked against repository code.
 
 | Source | Application here | Limit |
@@ -36,6 +36,7 @@ Selected primary sources were read and checked against repository code.
 | [NVM alias layout](https://github.com/nvm-sh/nvm/blob/master/README.md) | Test real LTS alias directories independently of isolated task fixtures | Fixture isolation does not establish production NVM compatibility |
 | [Docker stage inheritance](https://docs.docker.com/build/building/multi-stage/) | Validate external image digests and local stage references separately | Unknown stage references still require an external digest |
 | [GitHub artifact retention](https://docs.github.com/en/actions/tutorials/store-and-share-data) and [token permissions](https://github.com/github/docs/blob/main/content/actions/tutorials/authenticate-with-github_token.md) | Preserve actionable failure summaries in issues and link bounded artifacts; keep issue writes in the trusted reporter | Artifacts expire and PR execution must not receive issue-write credentials |
+| [LLVM coverage export](https://llvm.org/docs/CommandGuide/llvm-cov.html) | Interpret LCOV line/branch data separately from contract adequacy | No exported branches does not mean branches are fully tested |
 | [Tokio testing](https://tokio.rs/tokio/topics/testing) | Controlled time for isolated async deadline tests; scripted AsyncRead/AsyncWrite failures | Paused Tokio time does not control kernel sockets or external processes |
 | [Tokio shutdown](https://tokio.rs/tokio/topics/shutdown) | Verify signal detection, cancellation propagation and bounded draining separately and together | A signal-delivery test alone does not prove resources were released |
 | [Loom](https://docs.rs/loom/latest/loom/) | Model small synchronization/atomic ownership components where production types can be instrumented | It is not an automatic model checker for the whole Tokio daemon |
@@ -77,6 +78,20 @@ rows; Debian/Ubuntu integration selection; debian-pure runtime behavior; aliases
 short flags, default/valid/invalid values and option interactions; production
 daemon partial frames, backpressure, connection-cap recovery and shutdown during
 in-flight operations; supported ARM execution; release-vs-debug behavior.
+
+The LCOV artifact from coverage run 35493540276 at d752a841 reports 53,807/70,514
+source-file lines hit (76.31%), CLI modules 14,791/21,316 (69.39%), and daemon
+modules plus `src/bin/omgd.rs` 2,929/3,427 (85.47%). It contains zero branch
+records. This is an Arch-feature snapshot from a run with one failing bootstrap
+policy assertion; it is not final passing evidence, all-platform coverage, or
+the percentage of behaviors tested. Source-file totals can include inline unit
+test code and exclude feature-disabled files. Preserve these limitations.
+
+`tests/common/mod.rs::report_skip` only prints `[omg-skip]` and callers can return
+success. Neither ci.yml nor coverage.yml sets the system/network opt-ins, so
+runner PASS totals can include runtime-skipped cases. Evidence admission must
+distinguish those from executed assertions; required contracts need a suitable
+native/VM owner, not a blanket enabling of destructive tests on shared runners.
 
 ## Authoritative inventories
 

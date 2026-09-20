@@ -118,6 +118,7 @@ Contract record shape:
 **Interfaces:** Per lane, retain `cargo nextest list --message-format json` output and the run's JUnit/results artifact. `check-test-selection.py` compares expected integration binaries/test IDs against discovered and executed identities. A cfg-disabled binary cannot satisfy its platform contract.
 
 - [ ] Add fixture tests for missing Debian integration binaries, all-filtered selection, duplicated IDs, expected unsupported cases, and a legitimate nonempty selection.
+- [ ] Test a nominally passing result containing `[omg-skip]`: it must not satisfy executed coverage. Preserve successful-test output or structured skip receipts so early-return skips cannot disappear from nextest/JUnit admission. Map system/network/destructive opt-ins to isolated owners explicitly.
 - [ ] Run the existing Debian/debian-pure/Fedora integration files in compatible native owners, preserving the distinction between libapt-backed and pure Rust binaries. Expose environment/dependency failures; do not label them product passes.
 - [ ] Reuse a producer only when toolchain, features, target ABI, profile and instrumentation match. Coverage builds are distinct from uninstrumented release guests.
 - [ ] Make the critical contract group retries zero; preserve first-attempt data for other tests. Keep doctests under an explicit Cargo owner because nextest does not execute them.
