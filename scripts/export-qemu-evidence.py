@@ -50,6 +50,13 @@ GUEST_FILES.update(
     for label in ("daemon-direct", "daemon-foreground", "daemon-stopped")
     for suffix in ("explicit.json", "count.txt", "shortcut.txt", "count.json")
 )
+GUEST_FILES.update(
+    f"{label}{suffix}"
+    for label in ("daemon-direct-sigint", "daemon-foreground-sigint")
+    for suffix in (".log", "-status.txt", "-duplicate.txt", "-launcher.txt",
+                   "-after-queries.txt", "-explicit.json", "-count.txt",
+                   "-shortcut.txt", "-count.json")
+)
 BENCH_FILES = {
     "summary.json", "preflight.json", "os-release", "boot-id.txt", "cpuinfo.txt",
     "meminfo.txt", "kernel.txt", "binary-sha256.txt", "hyperfine-version.txt",

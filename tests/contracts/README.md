@@ -120,3 +120,7 @@ reported failures, and direct CLI queries after shutdown. A mandatory
 `query_parity` receipt prevents missing checks from passing admission. Exact
 query outputs and daemon counters are allowlisted diagnostic artifacts. This
 does not establish coverage of every RPC variant or native transaction.
+The probe also sends SIGINT to both direct and foreground-launched daemon
+processes, verifies successful termination and socket removal, and starts the
+next lifecycle against the same private state. Admission requires `sigint: true`;
+signal-specific logs and query outputs remain separate exported artifacts.

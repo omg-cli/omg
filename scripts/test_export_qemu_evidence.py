@@ -35,6 +35,11 @@ class AllowlistTests(unittest.TestCase):
         names += [f"{label}-{suffix}"
                   for label in ("daemon-direct", "daemon-foreground", "daemon-stopped")
                   for suffix in ("explicit.json", "count.txt", "shortcut.txt", "count.json")]
+        names += [f"{label}{suffix}"
+                  for label in ("daemon-direct-sigint", "daemon-foreground-sigint")
+                  for suffix in (".log", "-status.txt", "-duplicate.txt", "-launcher.txt",
+                                 "-after-queries.txt", "-explicit.json", "-count.txt",
+                                 "-shortcut.txt", "-count.json")]
         for name in names:
             with self.subTest(name=name):
                 self.assertTrue(exporter.allowed_file(("run-test", "guest", "evidence", name)))

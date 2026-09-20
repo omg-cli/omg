@@ -374,7 +374,7 @@ case "$1" in
         mkdir -p "$work/guest/evidence"
         printf '%s\n' "${FAKE_QEMU_GUEST_EXIT:-0}" > "$work/guest/evidence/exit-code"
         case ${FAKE_QEMU_DAEMON_RECEIPT:-valid} in
-          valid) printf '%s\n' '{"schema_version":1,"direct":true,"foreground":true,"ipc":true,"singleton":true,"shutdown":true,"restart":true,"query_parity":true}' > "$work/guest/evidence/daemon-lifecycle.json" ;;
+          valid) printf '%s\n' '{"schema_version":1,"direct":true,"foreground":true,"ipc":true,"singleton":true,"shutdown":true,"restart":true,"query_parity":true,"sigint":true}' > "$work/guest/evidence/daemon-lifecycle.json" ;;
           invalid) printf '%s\n' '{"schema_version":1,"ipc":false}' > "$work/guest/evidence/daemon-lifecycle.json" ;;
           missing) ;;
         esac

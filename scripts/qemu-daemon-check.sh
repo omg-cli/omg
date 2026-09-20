@@ -71,8 +71,8 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
-for mode in direct foreground; do
-  if [[ "$mode" == direct ]]; then
+for mode in direct foreground direct-sigint foreground-sigint; do
+  if [[ "$mode" == direct* ]]; then
     "$daemon" > "$evidence/daemon-$mode.log" 2>&1 &
     launcher_pid=$!; daemon_pid=$launcher_pid
   else
@@ -122,7 +122,11 @@ for mode in direct foreground; do
   [[ $(stat -c '%i' "$OMG_SOCKET_PATH") == "$inode" ]]
   timeout 5 "$bin" daemon > "$evidence/daemon-$mode-launcher.txt" 2>&1
   grep -Fq 'already running' "$evidence/daemon-$mode-launcher.txt"
-  kill -TERM "$daemon_pid"
+  if [[ "$mode" == *-sigint ]]; then
+    kill -INT "$daemon_pid"
+  else
+    kill -TERM "$daemon_pid"
+  fi
   stopped=false
   for _ in {1..150}; do
     if ! kill -0 "$launcher_pid" 2>/dev/null; then stopped=true; break; fi
@@ -134,4 +138,4 @@ for mode in direct foreground; do
   [[ ! -e "$OMG_SOCKET_PATH" && ! -L "$OMG_SOCKET_PATH" ]]
 done
 OMG_DISABLE_DAEMON=1 query_cli daemon-stopped
-printf '{"schema_version":1,"direct":true,"foreground":true,"ipc":true,"singleton":true,"shutdown":true,"restart":true,"query_parity":true}\n' > "$evidence/daemon-lifecycle.json"
+printf '{"schema_version":1,"direct":true,"foreground":true,"ipc":true,"singleton":true,"shutdown":true,"restart":true,"query_parity":true,"sigint":true}\n' > "$evidence/daemon-lifecycle.json"

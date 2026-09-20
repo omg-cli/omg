@@ -655,9 +655,10 @@ fi
 if [[ "$rc" == 0 ]]; then
   # A zero guest exit alone is insufficient: require the daemon probe receipt.
   daemon_receipt="$work/guest/evidence/daemon-lifecycle.json"
-  if ! [[ -f "$daemon_receipt" && $(wc -c < "$daemon_receipt") -le 4096 ]] || ! jq -e '
+  if ! [[ -f "$daemon_receipt" && $(wc -c < "$daemon_receipt") -le 4096 ]] || ! jq -e -s '
+    length == 1 and (.[0] | type == "object") and (.[0] |
     .schema_version == 1 and .direct == true and .foreground == true and
-    .ipc == true and .singleton == true and .shutdown == true and .restart == true and .query_parity == true
+    .ipc == true and .singleton == true and .shutdown == true and .restart == true and .query_parity == true and .sigint == true)
   ' "$daemon_receipt" >/dev/null; then
     printf 'Missing or incomplete daemon lifecycle evidence\n' >&2
     exit 1

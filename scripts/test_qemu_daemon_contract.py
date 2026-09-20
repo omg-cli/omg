@@ -90,7 +90,7 @@ class DaemonContractTests(unittest.TestCase):
         gate = source.split('  daemon_receipt=', 1)[1].split('\nfi\n', 1)[0]
         gate = 'daemon_receipt=' + gate
         good = dict(schema_version=1, direct=True, foreground=True, ipc=True,
-                    singleton=True, shutdown=True, restart=True, query_parity=True)
+                    singleton=True, shutdown=True, restart=True, query_parity=True, sigint=True)
         cases = [(good, True), (None, False)]
         for key in good:
             missing = dict(good)
@@ -98,13 +98,18 @@ class DaemonContractTests(unittest.TestCase):
             cases.append((missing, False))
             wrong = dict(good, **{key: 'true'})
             cases.append((wrong, False))
-        for receipt, expected in cases:
+            cases.append((dict(good, **{key: False}), False))
+        serialized = [(None if receipt is None else json.dumps(receipt), expected)
+                      for receipt, expected in cases]
+        serialized += [('{}\n' + json.dumps(good), False),
+                       (json.dumps(good) + '\n' + json.dumps(good), False)]
+        for receipt, expected in serialized:
             with self.subTest(receipt=receipt), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 evidence = root / 'guest/evidence'
                 evidence.mkdir(parents=True)
                 if receipt is not None:
-                    (evidence / 'daemon-lifecycle.json').write_text(json.dumps(receipt))
+                    (evidence / 'daemon-lifecycle.json').write_text(receipt)
                 result = subprocess.run([BASH, '-euc', gate], env=dict(os.environ, work=root.as_posix()),
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, expected, result.stderr)

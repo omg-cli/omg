@@ -397,6 +397,14 @@ negative controls reject wrong names, duplicates, wrong counts and extra JSON.
 Guest jq provisioning precedes this unconditional probe even when benchmarks
 are disabled; hyperfine remains conditional. These checks supplement existing
 transport fixtures and do not prove every native RPC or transaction contract.
+The next extension repeats direct and foreground startup with SIGINT shutdown,
+verifying successful process exit, socket removal and subsequent startup against
+the same private state. All four native WSL backends passed. SIGINT has its own
+mandatory receipt field and separately allowlisted diagnostic files. This does
+not yet test shutdown during an in-flight transaction or forced-death recovery.
+Adversarial receipt tests also reproduced a false-pass when multiple JSON
+documents ended with a valid receipt. The host gate now admits exactly one
+complete object, rejecting missing, false, mistyped or concatenated evidence.
 
 ### Runtime discovery failure contracts
 
