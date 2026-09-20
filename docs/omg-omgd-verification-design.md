@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used thirty searches requesting five candidates each (150 result slots),
+Exa research used thirty-two searches requesting five candidates each (160 result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -35,6 +35,8 @@ Selected primary sources were read and checked against repository code.
 | --- | --- | --- |
 | [Clap Command reflection](https://docs.rs/clap/latest/clap/struct.Command.html) and [grammar](https://docs.rs/clap/latest/clap/_concepts/index.html) | Generate the interface inventory from compiled Clap definitions, including subcommands, arguments and aliases | Parsing is not proof that an operation has the intended effect |
 | [Rust child environments](https://doc.rust-lang.org/std/process/struct.Command.html) | Override fixture paths on each child; preserve explicit test overrides | Do not mutate shared process environment in parallel tests |
+| [Rust test isolation](https://doc.rust-lang.org/book/ch11-02-running-tests.html) | Root-run debug mock adapters must use private fixture state; assert a separate child sees an empty inventory | Production root path protections remain in force |
+| [APT sources](https://manpages.debian.org/bookworm/apt/sources.list.5) | Preserve commented repository metadata with enabled=false and distinguish enabled acquisition entries | Retaining disabled configuration is not permission to fetch it |
 | [NVM alias layout](https://github.com/nvm-sh/nvm/blob/master/README.md) | Test real LTS alias directories independently of isolated task fixtures | Fixture isolation does not establish production NVM compatibility |
 | [Docker stage inheritance](https://docs.docker.com/build/building/multi-stage/) | Validate external image digests and local stage references separately | Unknown stage references still require an external digest |
 | [GitHub artifact retention](https://docs.github.com/en/actions/tutorials/store-and-share-data) and [token permissions](https://github.com/github/docs/blob/main/content/actions/tutorials/authenticate-with-github_token.md) | Preserve actionable failure summaries in issues and link bounded artifacts; keep issue writes in the trusted reporter | Artifacts expire and PR execution must not receive issue-write credentials |

@@ -99,8 +99,16 @@ deb http://example.com/enabled stable main
 
     let repos = parse_sources_list_content(content, Path::new("/test")).unwrap();
 
-    assert_eq!(repos.len(), 1, "Disabled sources should be ignored");
+    // Configuration tooling retains disabled entries; acquisition must be
+    // able to distinguish them from enabled repositories.
+    assert_eq!(repos.len(), 2);
+    assert_eq!(repos[0].uri, "http://example.com/enabled");
     assert_eq!(repos[0].suite, "stable");
+    assert!(repos[0].enabled);
+    assert_eq!(repos[1].uri, "http://example.com/disabled");
+    assert_eq!(repos[1].suite, "unstable");
+    assert!(!repos[1].enabled);
+    assert_eq!(repos.iter().filter(|repo| repo.enabled).count(), 1);
 }
 
 #[test]
@@ -804,10 +812,38 @@ fn test_cli_update_check_debian() {
 
 #[test]
 fn test_cli_status_shows_debian_info() {
-    let result = run_omg_cli(&["status"]);
-    // Dual-path: success renders the System Status overview; failure names its
-    // cause instead of exiting silently.
-    assert_dual_path_contract(&result, "System Status", "Error", "Debian status");
+    let data = TempDir::new().expect("temp data dir");
+    let mock = omg_lib::package_managers::mock::MockPackageManager::new_in("debian", data.path());
+    mock.set_installed_version("git", "1.0.0").unwrap();
+    mock.set_installed_version("curl", "2.0.0").unwrap();
+    mock.set_available_version("git", "1.1.0").unwrap();
+    let state_path = data.path().join("mock_state_apt.json");
+    let before = std::fs::read(&state_path).unwrap();
+    let data_env = [("OMG_DATA_DIR", data.path().to_str().unwrap())];
+
+    let result = run_omg_debian(&["status", "--json"], &data_env);
+    result.assert_success();
+    let status: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(status["total_packages"], 2);
+    assert_eq!(status["explicit_packages"], 2);
+    assert_eq!(status["orphan_packages"], 0);
+    assert_eq!(status["updates_available"], 1);
+    assert!(status["query_time_ms"].as_f64().unwrap() >= 0.0);
+
+    let result = run_omg_debian(&["status"], &data_env);
+    result.assert_success();
+    result.assert_stdout_contains("2 packages installed");
+    result.assert_stdout_contains("2 explicit");
+    result.assert_stdout_contains("Not scanned");
+    assert_no_arch_terms(&result.combined_output(), "Debian status");
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+
+    // A separate invocation must not inherit this fixture or root-run state.
+    let empty = run_omg_cli(&["status", "--json"]);
+    empty.assert_success();
+    let status: serde_json::Value = serde_json::from_str(&empty.stdout).unwrap();
+    assert_eq!(status["total_packages"], 0);
+    assert_eq!(status["updates_available"], 0);
 }
 
 #[test]
@@ -966,9 +1002,20 @@ fn test_cli_debian_concurrent_operations() {
 
 #[test]
 fn test_cli_debian_respects_ci_mode() {
-    // CI=1 must run a mock install of a known default package to completion
-    // without any interactive prompt.
-    let result = run_omg_debian(&["install", "git"], &[("CI", "1")]);
+    // CI does not grant installation consent. Refusal must leave the exact
+    // fixture unchanged; explicit --yes must install into that same fixture.
+    let data = TempDir::new().expect("temp data dir");
+    let mock = omg_lib::package_managers::mock::MockPackageManager::new_in("debian", data.path());
+    mock.set_installed_version("curl", "2.0.0").unwrap();
+    let state_path = data.path().join("mock_state_apt.json");
+    let before = std::fs::read(&state_path).unwrap();
+    let data_env = [("CI", "1"), ("OMG_DATA_DIR", data.path().to_str().unwrap())];
+    let refused = run_omg_debian(&["install", "git"], &data_env);
+    assert_eq!(refused.exit_code, 1);
+    assert!(refused.combined_output().contains("Use --yes"));
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+
+    let result = run_omg_debian(&["install", "git", "--yes"], &data_env);
     assert_runs_without_panic(&result, "CI-mode install");
     result.assert_success();
 
@@ -982,6 +1029,16 @@ fn test_cli_debian_respects_ci_mode() {
     assert!(
         combined.contains("Installed"),
         "CI-mode install must confirm the install: {combined}"
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
+    let installed = state["installed"].as_object().unwrap();
+    assert_eq!(installed.len(), 2);
+    assert_eq!(installed["curl"], "2.0.0");
+    assert!(
+        installed["git"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty())
     );
 }
 

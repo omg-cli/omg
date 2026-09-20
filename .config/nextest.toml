@@ -26,6 +26,11 @@ retries = 0
 filter = 'binary(=cli_surface) | test(=tests::export_omgd_surface) | test(=tests::socket_parser_preserves_literal_paths_and_rejects_conflicting_repeats)'
 retries = 0
 
+# Isolated Debian fixture contracts must not hide their first failure.
+[[profile.default.overrides]]
+filter = 'test(=test_parse_disabled_source) | test(=test_cli_status_shows_debian_info) | test(=test_cli_debian_respects_ci_mode) | test(=apt_integration::test_update_check_with_mock_updates)'
+retries = 0
+
 [profile.ci]
 test-threads = "num-cpus"
 fail-fast = false
