@@ -9,11 +9,9 @@
 //!
 //! Node/Python/Go version-file tests seed executable installed fixtures and
 //! require successful activation, exact current paths and executable output.
-//! These prove selection, not download/extraction. Rust channel detection is
-//! still a bounded detection-only probe and must not count as activation.
+//! These prove selection, not download/extraction.
 //! Tests that genuinely download runtimes are gated behind
-//! `require_network_tests!` and assert concrete success output plus a
-//! named cause on the failure path.
+//! `require_network_tests!`; failures never count as successful downloads.
 
 #![expect(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
 
@@ -21,9 +19,7 @@ pub mod common;
 
 use common::*;
 
-/// Command cap for detection-only probes: startup + version-file parsing is
-/// milliseconds; anything longer is install work we deliberately do not wait
-/// for. The detected-version line has already been printed by then.
+/// Bound local selection and activation; a timeout is not a successful result.
 const DETECTION_TIMEOUT_SECS: &str = "15";
 
 /// Command cap for gated end-to-end installs (download + extract + switch).
@@ -94,6 +90,43 @@ fn assert_active_runtime(
             format!("fixture-{runtime}-{version}\n").as_bytes()
         );
     }
+}
+
+/// This proves an executable installation, not independent latest/LTS selection.
+fn assert_downloaded_runtime(
+    project: &TestProject,
+    runtime: &str,
+    requested: &str,
+    executable: &str,
+) {
+    let base = project.data_dir.path().join(format!("versions/{runtime}"));
+    let active = std::fs::canonicalize(base.join("current")).unwrap();
+    assert_eq!(
+        active.parent().unwrap(),
+        std::fs::canonicalize(&base).unwrap()
+    );
+    let resolved = active.file_name().unwrap().to_str().unwrap();
+    if !matches!(requested, "latest" | "lts") {
+        assert_eq!(resolved, requested);
+    }
+    assert!(resolved.split('.').count() >= 3 && resolved.chars().next().unwrap().is_ascii_digit());
+    let output = std::process::Command::new(active.join("bin").join(executable))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "installed executable failed: {output:?}"
+    );
+    let expected = if runtime == "node" {
+        format!("v{resolved}")
+    } else {
+        format!("Python {resolved}")
+    };
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+    let listed = project.run(&["list", runtime]);
+    listed.assert_success();
+    assert!(listed.stdout.contains(resolved));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -195,41 +228,17 @@ fn test_use_invalid_runtime() {
 fn test_use_node_with_version() {
     init_test_env();
     require_network_tests!();
-
     let project = TestProject::new();
     let result = project.run_with_env(
         &["use", "node", "20.10.0"],
-        &[("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS)],
+        &[
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS),
+            ("OMG_TEST_MODE", "0"),
+        ],
     );
-    let output = result.combined_output();
-    assert!(
-        !output.contains("panicked at"),
-        "`omg use node 20.10.0` must not panic:\n{output}"
-    );
-
-    if result.success {
-        // Success must show the concrete switch...
-        assert!(
-            output.contains("Switching node to version 20.10.0"),
-            "successful switch must name runtime and version:\n{output}"
-        );
-        // ...and persist: the version must be listed afterwards.
-        let list = project.run(&["list", "node"]);
-        list.assert_success();
-        assert!(
-            list.stdout.contains("20.10.0"),
-            "installed version must appear in `omg list node`:\n{}",
-            list.stdout
-        );
-    } else {
-        // Failure must name its cause.
-        assert!(
-            output.contains("internet connection")
-                || output.contains("not found")
-                || output.contains("Failed"),
-            "failed switch must name its cause:\n{output}"
-        );
-    }
+    result.assert_success();
+    assert_downloaded_runtime(&project, "node", "20.10.0", "node");
+    project.close_checked();
 }
 
 #[cfg(unix)]
@@ -257,95 +266,53 @@ fn successful_runtime_switch_is_visible_at_default_verbosity() {
 fn test_use_python_with_version() {
     init_test_env();
     require_network_tests!();
-
     let project = TestProject::new();
     let result = project.run_with_env(
-        &["use", "python", "3.11.0"],
-        &[("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS)],
+        // Match the published QEMU fixture; PBS 20260901 supplies this asset.
+        // The former 3.11.0 fixture returned "not found", which used to pass.
+        &["use", "python", "3.12.14"],
+        &[
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS),
+            ("OMG_TEST_MODE", "0"),
+        ],
     );
-    let output = result.combined_output();
-    assert!(
-        !output.contains("panicked at"),
-        "`omg use python 3.11.0` must not panic:\n{output}"
-    );
-
-    if result.success {
-        assert!(
-            output.contains("Switching python to version 3.11.0"),
-            "successful switch must name runtime and version:\n{output}"
-        );
-        let list = project.run(&["list", "python"]);
-        list.assert_success();
-        assert!(
-            list.stdout.contains("3.11.0"),
-            "installed version must appear in `omg list python`:\n{}",
-            list.stdout
-        );
-    } else {
-        // e.g. upstream python-build-standalone has no matching release:
-        // the error must echo the requested version ("Python 3.11.0 not
-        // found. Try: omg list python --available").
-        assert!(
-            output.contains("3.11.0"),
-            "failed switch must name the requested version:\n{output}"
-        );
-    }
+    result.assert_success();
+    assert_downloaded_runtime(&project, "python", "3.12.14", "python3");
+    project.close_checked();
 }
 
 #[test]
 fn test_use_node_latest() {
     init_test_env();
     require_network_tests!();
-
-    let result = run_capped(&["use", "node", "latest"], INSTALL_TIMEOUT_SECS);
-    let output = result.combined_output();
-    assert!(
-        !output.contains("panicked at"),
-        "'latest' alias handling must not panic:\n{output}"
+    let project = TestProject::new();
+    let result = project.run_with_env(
+        &["use", "node", "latest"],
+        &[
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS),
+            ("OMG_TEST_MODE", "0"),
+        ],
     );
-
-    if result.success {
-        // The command acknowledges the alias request concretely before
-        // resolving it upstream.
-        assert!(
-            output.contains("Switching node to version latest"),
-            "successful alias use must acknowledge the request:\n{output}"
-        );
-    } else {
-        assert!(
-            output.to_lowercase().contains("failed")
-                || output.contains("internet connection")
-                || output.contains("No Node.js versions found upstream"),
-            "failed 'latest' resolution must name its cause:\n{output}"
-        );
-    }
+    result.assert_success();
+    assert_downloaded_runtime(&project, "node", "latest", "node");
+    project.close_checked();
 }
 
 #[test]
 fn test_use_node_lts() {
     init_test_env();
     require_network_tests!();
-
-    let result = run_capped(&["use", "node", "lts"], INSTALL_TIMEOUT_SECS);
-    let output = result.combined_output();
-    assert!(
-        !output.contains("panicked at"),
-        "'lts' handling must not panic:\n{output}"
+    let project = TestProject::new();
+    let result = project.run_with_env(
+        &["use", "node", "lts"],
+        &[
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS),
+            ("OMG_TEST_MODE", "0"),
+        ],
     );
-
-    if result.success {
-        assert!(
-            output.contains("Switching node to version lts"),
-            "successful alias use must acknowledge the request:\n{output}"
-        );
-    } else {
-        assert!(
-            output.to_lowercase().contains("failed")
-                || output.contains("internet connection")
-                || output.contains("No LTS"),
-            "failed 'lts' resolution must name its cause:\n{output}"
-        );
-    }
+    result.assert_success();
+    assert_downloaded_runtime(&project, "node", "lts", "node");
+    project.close_checked();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -470,6 +437,20 @@ fn test_package_json_engines() {
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
     assert_detected(&result, ">=18.0.0");
+    result.assert_failure();
+    assert!(
+        result
+            .combined_output()
+            .contains("Invalid character '>' in version string")
+    );
+    assert!(
+        !project
+            .data_dir
+            .path()
+            .join("versions/node/current")
+            .exists()
+    );
+    project.close_checked();
 }
 
 #[test]
@@ -477,13 +458,65 @@ fn test_rust_toolchain_toml() {
     init_test_env();
 
     let project = TestProject::new();
-    project.create_file("rust-toolchain.toml", "[toolchain]\nchannel = \"stable\"");
+    let host_os = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        other => panic!("missing Rust fixture host for {other}"),
+    };
+    let toolchain = format!("1.93.1-{}-{host_os}", std::env::consts::ARCH);
+    project.create_file("rust-toolchain.toml", "[toolchain]\nchannel = \"1.93.1\"");
+    seed_installed_runtime(&project, "rust", &toolchain, "rustc");
 
     let result = project.run_with_env(
         &["use", "rust"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
+    result.assert_success();
+    assert_detected(&result, "1.93.1");
+    let current = project
+        .data_dir
+        .path()
+        .join("versions/rust/current/bin/rustc");
+    assert_eq!(
+        std::fs::canonicalize(&current).unwrap(),
+        std::fs::canonicalize(
+            project
+                .data_dir
+                .path()
+                .join(format!("versions/rust/{toolchain}/bin/rustc"))
+        )
+        .unwrap()
+    );
+    let output = std::process::Command::new(current).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        format!("fixture-rust-{toolchain}\n").as_bytes()
+    );
+    project.close_checked();
+}
+
+#[test]
+#[cfg(unix)]
+fn rust_stable_pin_refuses_a_concurrent_mutation_without_activation() {
+    let project = TestProject::new();
+    project.create_file("rust-toolchain.toml", "[toolchain]\nchannel = \"stable\"");
+    let versions = project.data_dir.path().join("versions/rust");
+    std::fs::create_dir_all(&versions).unwrap();
+    let lock = std::fs::File::create(versions.join(".mutation.lock")).unwrap();
+    lock.lock().unwrap();
+    let result = project.run_with_env(&["use", "rust"], &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "5")]);
+    result.assert_failure();
     assert_detected(&result, "stable");
+    assert!(
+        result
+            .combined_output()
+            .contains("Another Rust toolchain operation is running")
+    );
+    assert!(std::fs::symlink_metadata(versions.join("current")).is_err());
+    assert_eq!(std::fs::read_dir(&versions).unwrap().count(), 1);
+    drop(lock);
+    project.close_checked();
 }
 
 #[test]
@@ -683,38 +716,16 @@ fn test_hook_invalid_shell() {
 
 #[test]
 fn test_which_shows_active_runtime() {
-    init_test_env();
-
-    let result = run_omg(&["which", "node"]);
-
-    let output = result.combined_output();
-    assert!(
-        !output.contains("panicked at"),
-        "`omg which node` must not panic:\n{output}"
-    );
-
-    if result.success {
-        // Exactly one of the two documented outcomes
-        // (handle_which_command in src/bin/omg.rs):
-        //   "<runtime> <version>"  when a version is set
-        //   "<runtime>: no version set (...)" otherwise
-        let has_no_version = output.contains("no version set");
-        let has_version_line = output.lines().any(|line| {
-            line.split_whitespace()
-                .nth(1)
-                .is_some_and(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        });
-        assert!(
-            has_no_version || has_version_line,
-            "`omg which node` must print either a version or the explicit \
-             'no version set' notice:\n{output}"
-        );
-    } else {
-        assert!(
-            output.contains("failed to resolve active version for node"),
-            "resolution errors must name the runtime:\n{output}"
-        );
-    }
+    let project = TestProject::new();
+    let empty = project.run(&["which", "node"]);
+    empty.assert_success();
+    empty.assert_stdout_contains("node: no version set");
+    seed_installed_runtime(&project, "node", "20.10.0", "node");
+    project.run(&["use", "node", "20.10.0"]).assert_success();
+    let selected = project.run(&["which", "node"]);
+    selected.assert_success();
+    assert_eq!(selected.stdout.trim(), "node 20.10.0");
+    project.close_checked();
 }
 
 #[test]

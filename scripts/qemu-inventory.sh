@@ -9,6 +9,21 @@
 set -euo pipefail
 # BEGIN PRODUCT OUTPUT ORACLE
 # This exact function is sent to the guest and exercised by fault-injection tests.
+check_python_install() {
+  local version=$1 base expected active executable output
+  base="$OMG_DATA_DIR/versions/python"
+  expected="$base/$version"
+  active=$(readlink -f "$base/current") || active=""
+  executable=$(readlink -f "$base/current/bin/python3") || executable=""
+  if [[ "$active" != "$expected" || ! -L "$base/current" || -L "$expected" \
+        || "$executable" != "$expected/"* || ! -f "$executable" || ! -x "$executable" ]]; then
+    printf 'assertion failed: Python %s lacks an active executable inside its installed version\n' "$version" >&2; return 1
+  fi
+  if ! output=$(timeout --kill-after=2s 10 "$executable" --version 2>&1) \
+      || [[ "$output" != "Python $version" ]]; then
+    printf 'assertion failed: Python executable version expected=%s observed=%s\n' "$version" "$output" >&2; return 1
+  fi
+}
 check_hook_lifecycle() (
   # Execute the installed scripts unchanged in a disposable second repository.
   local hooks=$1 fixture output
@@ -257,6 +272,9 @@ while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
   row_exit["$id"]="$resolved"; row_targets["$id"]="$tg"; row_assertions["$id"]="$a"
+  if [[ "$id" == runtime-python-install ]]; then
+    jq -e 'length == 3 and .[0] == "use" and .[1] == "python" and (.[2] | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$aj" >/dev/null || exit 2
+  fi
 done < <(tail -n +2 "$tsv")
 
 # Replay only prerequisites permitted by the same target and safety gates.
@@ -384,9 +402,17 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; for hook in pre-commit post-checkout post-merge; do printf '#!/bin/sh\\n# user-owned hook fixture\\nexit 23\\n' > \".git/hooks/\$hook\"; chmod 640 \".git/hooks/\$hook\"; done"
   fi
   arg_string=$(quote_args "$args_json")
+  if [[ "$case" == runtime-python-install ]]; then
+    runtime_version=$(jq -r '.[2]' <<< "$args_json")
+    remote+="; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f check_python_install)"
+  fi
   remote+="; run_omg $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log; then assertion=1; fi"
+  if [[ "$case" == runtime-python-install ]]; then
+    remote+="; if [ \"\$rc\" = 0 ] && ! check_python_install '$runtime_version'; then assertion=1; fi"
+    remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: Python fixture cleanup failed\\n' >&2; assertion=1; fi"
+  fi
   # A receipt is emitted only after setup and the command complete. SSH
   # transport/tool failures cannot satisfy an expected product refusal.
   remote+="; printf '\nOMG_QEMU_RECEIPT:%s:%s:%s\n' \"\$execution_phase\" \"\$rc\" \"\$assertion\""

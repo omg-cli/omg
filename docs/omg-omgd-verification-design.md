@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used fifty-nine searches (238 requested result slots),
+Exa research used sixty-one searches (243 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -452,3 +452,36 @@ force replacement, status classification and repeated uninstall, using both
 default and space-containing custom hook directories. All seven hook tests passed
 on all four WSL builds. A production mutation ignoring the force flag failed the
 new regression; restoring production behavior passed the full hook target.
+
+### Runtime outcome audit
+
+The runtime suite previously accepted a detected-version line even when the
+command timed out, and several network cases accepted either success or a
+broad error. Those are inadequate installation or activation oracles.
+Installed Node/Python/Go and pinned Rust fixtures now require successful exit,
+exact activation paths and executable identity; `which` checks both empty state
+and the exact selected version. The Rust stable-channel refusal holds an actual
+mutation lock and requires its specific error and unchanged state. The
+[official toolchain naming](https://rust-lang.github.io/rustup/concepts/toolchains.html)
+and [toolchain file documentation](https://rust-lang.github.io/rustup/overrides.html)
+inform the fixture; this is OMG's native manager, not a test of rustup.
+
+The strict Python network check exposed the old 3.11.0 fixture's `not found`
+response, which the former assertion accepted. The success fixture now matches
+QEMU's 3.12.14. The [official PBS 20260901 release](https://github.com/astral-sh/python-build-standalone/releases/tag/20260901)
+and GitHub release API confirmed the Linux install-only asset and SHA-256 digest.
+Opt-in downloads disable synthetic mode and must activate and execute the exact
+resolved runtime. A refused connection fails the Node test. All 32 selected tests
+(including one harness helper) passed with network enabled on each of the four
+WSL builds, with zero network skips. That is bounded local execution evidence,
+not 32 newly covered behavioral surfaces or exact hosted-revision provenance.
+Latest/LTS downloads still lack an independent upstream-selection oracle.
+
+QEMU's Python row had the same exit-only blind spot: a no-op product returned
+PASS. Its runner now isolates runtime state and requires the exact activated
+interpreter, contained paths, successful executable output and checked cleanup.
+Six defective states are rejected by the actual runner regression. All 18 output
+oracle tests passed on all four WSL distros. The SSH-shim runner also passed with
+each distro's real local OMG binary and a real Python download; those shim runs
+are not guest-boot evidence or admitted per-distro provenance. Existing trusted
+QEMU issue publication and diagnosis capture remain unchanged.

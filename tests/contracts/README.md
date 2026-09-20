@@ -103,9 +103,13 @@ five opt-in network cases: when disabled, their `[omg-skip]` output is reported
 as unexecuted even though libtest itself prints `ok`. A green target does not
 prove those network behaviors. Six Node/Python/Go pin scenarios now require
 successful activation, exact current executable paths, executable identity and
-checked fixture cleanup. These installed fixtures do not prove downloading or
-extraction. Rust channel detection and opt-in network assertions still require
-review before receiving broader behavioral coverage credit.
+checked fixture cleanup. A pinned Rust toolchain has the same activation checks;
+a locked stable-channel selection must refuse with the concurrency error and
+leave no active toolchain. These installed fixtures do not prove downloading or
+extraction. Opt-in downloads now disable synthetic runtime mode, require success
+and execute the installed binary with the exact resolved version. Latest/LTS
+installation still needs an independent selection oracle before alias-resolution
+coverage credit; download failure is never accepted as successful installation.
 
 JUnit's skipped-test reporting varies by nextest version. The independent list
 supplies ignored/filtered counts even when no XML row exists. A selected test
@@ -157,3 +161,11 @@ The probe also sends SIGINT to both direct and foreground-launched daemon
 processes, verifies successful termination and socket removal, and starts the
 next lifecycle against the same private state. Admission requires `sigint: true`;
 signal-specific logs and query outputs remain separate exported artifacts.
+
+QEMU's `runtime-python-install` row requires a numeric requested version, uses
+private runtime state, checks the active link and executable stay inside the
+installed version, and runs that interpreter to verify its exact version.
+A missing, inactive, wrong-version, broken or escaped installation fails even
+when the CLI exits zero. Cleanup is checked before the row passes. This stronger
+oracle also applies to reviewed published inventories with that row identity;
+it does not change their recorded hashes or pretend they gained other tests.
