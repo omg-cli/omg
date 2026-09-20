@@ -7,6 +7,11 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - tests/exhaustive_cli_matrix.rs
+      - tests/integration_suite.rs
+      - tests/metrics_tests.rs
+      - tests/security_tests.rs
+      - src/cli/tea/status_model.rs
       - tests/coverage_15.rs
       - tests/coverage_4.rs
       - tests/coverage_5.rs

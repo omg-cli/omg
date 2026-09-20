@@ -1,10 +1,22 @@
 #![expect(clippy::unwrap_used)]
 use omg_lib::core::metrics::GLOBAL_METRICS;
 use omg_lib::daemon::handlers::{DaemonState, handle_request};
+use omg_lib::daemon::index::PackageIndex;
 use omg_lib::daemon::protocol::{Request, Response, ResponseResult};
+use omg_lib::package_managers::mock::MockPackageManager;
 use serial_test::serial;
 use std::sync::Arc;
 use tempfile::TempDir;
+
+// Metrics dispatch has no dependency on the host package database. Explicit
+// dependencies exercise the real handlers and cache under every feature set.
+fn isolated_state(temp_dir: &TempDir) -> Arc<DaemonState> {
+    let manager = Arc::new(MockPackageManager::new_in("arch", temp_dir.path()));
+    Arc::new(
+        DaemonState::new_isolated(temp_dir.path(), PackageIndex::empty(), manager)
+            .expect("isolated daemon state must initialize"),
+    )
+}
 
 #[tokio::test]
 #[serial]
@@ -12,23 +24,11 @@ async fn test_metrics_collection() {
     // Setup
     let temp_dir = TempDir::new().unwrap();
 
-    // Initialize with scoped env: the daemon and audit logger capture their
-    // data-dir paths during construction, so isolation holds after the guard
-    // restores the process environment. State creation is a hard requirement:
-    // a construction failure must fail this test, not silently skip it.
-    let data_dir = temp_dir.path().to_path_buf();
-    let state: Arc<DaemonState> = temp_env::with_vars(
-        [
-            ("OMG_DAEMON_DATA_DIR", Some(data_dir.as_os_str())),
-            ("OMG_DATA_DIR", Some(data_dir.as_os_str())),
-        ],
-        || {
-            let _ = omg_lib::core::security::init_audit_logger();
-            DaemonState::new()
-                .map(Arc::new)
-                .expect("DaemonState::new must succeed for metrics collection tests")
-        },
-    );
+    temp_env::with_var("OMG_DATA_DIR", Some(temp_dir.path()), || {
+        omg_lib::core::security::init_audit_logger()
+    })
+    .expect("audit logger must initialize");
+    let state = isolated_state(&temp_dir);
 
     // Get initial metrics
     let initial = GLOBAL_METRICS.snapshot();
@@ -100,15 +100,7 @@ async fn test_metrics_collection() {
 #[serial]
 async fn test_security_audit_metrics() {
     let temp_dir = TempDir::new().unwrap();
-    let daemon_data_dir = temp_dir.path().to_path_buf();
-    let state: Arc<DaemonState> = temp_env::with_vars(
-        [("OMG_DAEMON_DATA_DIR", Some(daemon_data_dir.as_os_str()))],
-        || {
-            DaemonState::new()
-                .map(Arc::new)
-                .expect("DaemonState::new must succeed for security audit metrics tests")
-        },
-    );
+    let state = isolated_state(&temp_dir);
 
     let initial = GLOBAL_METRICS.snapshot();
 
