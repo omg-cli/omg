@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used fifty-two searches (222 requested result slots),
+Exa research used fifty-three searches (225 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -57,6 +57,7 @@ Selected primary sources were read and checked against repository code.
 | [Pinned Rust cache key implementation](https://github.com/Swatinem/rust-cache/blob/6323deb102c322ba6fcbdcafc7e3dddab59af2b6/src/config.ts) | Preserve compiler/environment/manifest hashes while recovering the macOS cache namespace and excluding cached helper binaries | A restore miss plus reservation failure does not by itself prove eviction, a concurrent writer or a service defect; verify a later restore |
 | [GitHub cache limits and eviction](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching) | Measure cache occupancy and verify both saving and subsequent restoration | Near-limit occupancy is not proof of eviction; do not change paid storage settings as a speculative fix |
 | [Cargo feature ownership](https://doc.rust-lang.org/stable/cargo/reference/features.html) | Keep supported success tests on their backend lanes; test explicit portable refusal separately | A cfg-disabled test contributes no behavioral coverage on that build |
+| [Cargo test targets](https://doc.rust-lang.org/cargo/reference/cargo-targets.html) | Verify actual test execution under each feature recipe; enable mock-backed Unix daemon transport tests outside Arch | Fedora reproduced a zero-test success before removing the unnecessary Arch gate; this expands transport coverage, not native backend transaction coverage |
 | [Nextest JUnit](https://nexte.st/docs/machine-readable/junit/) | Preserve successful output or explicit receipts for runtime skips | Default success-output and skipped-test reporting can hide early returns; check installed version |
 | [Nextest binary lists](https://nexte.st/docs/machine-readable/list/) and [executable environment](https://nexte.st/docs/configuration/env-vars/) | Bind CLI fixture receipts to the owning package's non-test executables and check the child helper's actual compiled path | A parser harness digest cannot identify a CLI subprocess; mock backend assertions do not certify native transactions |
 | [Tokio task ownership](https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html) and [Unix signals](https://docs.rs/tokio/latest/tokio/signal/unix/struct.Signal.html) | Retain the real-server task, establish readiness through IPC and join its SIGTERM drain before fixture cleanup | Dropping a handle detaches it; abort does not prove graceful shutdown. Signal listeners affect the whole test process, so server tests remain serial |
@@ -285,3 +286,26 @@ covered even when the CI caller is non-root. This is network isolation evidence,
 not a general filesystem sandbox. Ubuntu 26.04 and Fedora 44 WSL are additional
 local feedback owners; they do not replace disposable QEMU transaction/recovery
 lanes or establish coverage of unexecuted scenarios.
+
+The local hook execution regression confirmed that a child exiting 23 still made
+`omg hooks run` return success. The wrapper now returns an error containing the
+child status. `tests/git_hooks_contract.rs` checks an execution receipt plus success,
+nonzero exit and signal termination for all three managed hook names. It is
+compiled on Unix independently of backend feature flags; it does not claim that
+the generated hook templates have been exercised through every Git operation.
+
+The daemon transport suite previously compiled to zero tests without the Arch
+feature. Its fixture injects `MockPackageManager` and uses Unix APIs, so its gate
+now follows Unix support. Fedora and Ubuntu locally execute all 17 tests after the
+change, rather than silently omitting the suite.
+
+QEMU run 35531270230 retained an Ubuntu Python-install failure caused by GitHub's
+unauthenticated API rate limit (HTTP 403, remaining quota zero). Its 175 executed
+inventory rows had 174 passes and one failure; three reviewed rows were skipped.
+The admission checker correctly returned 1 for valid failing evidence, but the
+caller treated every nonzero status as a harness error. The caller now preserves
+independent lifecycle evidence for a validated product failure while still failing
+the overall run. A full harness regression reproduced the classification defect;
+controls require invalid policy evidence and simultaneous harness failures to
+remain harness errors. Live API availability remains an explicit dependency;
+this change does not bypass the failing installation or remove its diagnosis.

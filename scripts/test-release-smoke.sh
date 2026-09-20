@@ -345,14 +345,21 @@ case "$1" in
           jq -Rn --arg verdict "$FAKE_INVENTORY_RESULT" '
             [inputs | split("\t") | select(.[6] == "hermetic") |
               {case_id:("qemu-arch-" + .[0]), distro:"arch", result:$verdict,
-               artifact_source:"inventory", exit_code:0, elapsed_seconds:0, stderr:"fixture-private-token"}]' < "$work/cases.tsv" > "$work/inventory/results.json"
+               artifact_source:"inventory", network_scope:"offline", exit_code:0, elapsed_seconds:0, stderr:"fixture-private-token"}]' < "$work/cases.tsv" > "$work/inventory/results.json"
           printf '{"complete":true}\n' > "$work/inventory/summary.json"
           case "${FAKE_INVENTORY_SHAPE:-}" in
             partial) jq '.[0:1]' "$work/inventory/results.json" > "$work/inventory/next.json" ;;
             mixed) jq '.[0].result = "FAIL" | .[1].result = "BLOCKED"' "$work/inventory/results.json" > "$work/inventory/next.json" ;;
+            mixed-harness) jq '.[0].result = "FAIL" | .[1].result = "HARNESS_ERROR"' "$work/inventory/results.json" > "$work/inventory/next.json" ;;
             incomplete) printf '{"complete":false}\n' > "$work/inventory/summary.json" ;;
           esac
           [[ ! -f "$work/inventory/next.json" ]] || mv "$work/inventory/next.json" "$work/inventory/results.json"
+          if [[ ${FAKE_INVENTORY_COUNTS:-0} == 1 ]]; then
+            jq '{complete:true, pass:([.[]|select(.result=="PASS")]|length),
+                 fail:([.[]|select(.result=="FAIL" or .result=="BLOCKED" or .result=="HARNESS_ERROR")]|length),
+                 skipped:([.[]|select(.result=="SKIPPED")]|length)}' \
+              "$work/inventory/results.json" > "$work/inventory/summary.json"
+          fi
         fi
         exit "${FAKE_INVENTORY_EXIT:-0}"
       fi
@@ -482,6 +489,28 @@ for scenario in missing PASS FAIL HARNESS_ERROR BLOCKED SKIPPED partial mixed in
   assert_rc "$expected_rc" "$qemu_runner" --distro arch --release v9.9.9 --staged-dir "$scratch/valid" --inventory-tiers hermetic --evidence-dir "$scratch/qemu-inventory-$scenario"
   unset FAKE_INVENTORY_SHAPE
 done
+printf 'case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup\nfirst\t["status"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop\nsecond\t["info","bash"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop\n' > "$scratch/policy-cases.tsv"
+policy_digest=$(sha256sum "$scratch/policy-cases.tsv" | cut -d ' ' -f 1)
+jq -n --arg digest "$policy_digest" '{schema_version:1, profiles:{hermetic:["hermetic"]},
+  inventories:{($digest):{cases:(["first","second"]|map({id:.,tiers:["hermetic"],network_scope:"offline",allowed_skips:{}}))}}}' > "$scratch/inventory-policy.json"
+export FAKE_INVENTORY_RESULT=FAIL FAKE_INVENTORY_COUNTS=1
+assert_rc 1 "$qemu_runner" --distro arch --release v9.9.9 --staged-dir "$scratch/valid" \
+  --inventory-tiers hermetic --inventory-file "$scratch/policy-cases.tsv" \
+  --inventory-policy "$scratch/inventory-policy.json" --evidence-dir "$scratch/qemu-policy-product-failure"
+jq -e '.[0].result == "PASS" and .[0].exit_code == 0' \
+  "$(results_file "$scratch/qemu-policy-product-failure")" >/dev/null || fail 'valid failed inventory was relabeled as a lifecycle harness error'
+export FAKE_INVENTORY_SHAPE=mixed-harness
+assert_rc 1 "$qemu_runner" --distro arch --release v9.9.9 --staged-dir "$scratch/valid" \
+  --inventory-tiers hermetic --inventory-file "$scratch/policy-cases.tsv" \
+  --inventory-policy "$scratch/inventory-policy.json" --evidence-dir "$scratch/qemu-policy-mixed-harness"
+jq -e '.[0].result == "HARNESS_ERROR"' "$(results_file "$scratch/qemu-policy-mixed-harness")" >/dev/null || fail 'product failure hid a simultaneous harness failure'
+unset FAKE_INVENTORY_SHAPE
+jq '.inventories = {}' "$scratch/inventory-policy.json" > "$scratch/invalid-inventory-policy.json"
+assert_rc 1 "$qemu_runner" --distro arch --release v9.9.9 --staged-dir "$scratch/valid" \
+  --inventory-tiers hermetic --inventory-file "$scratch/policy-cases.tsv" \
+  --inventory-policy "$scratch/invalid-inventory-policy.json" --evidence-dir "$scratch/qemu-policy-invalid"
+jq -e '.[0].result == "HARNESS_ERROR"' "$(results_file "$scratch/qemu-policy-invalid")" >/dev/null || fail 'product failure hid invalid policy admission'
+unset FAKE_INVENTORY_COUNTS
 export FAKE_INVENTORY_RESULT=PASS FAKE_INVENTORY_SHAPE=mixed
 export OMG_SMOKE_SENTRY_CONFIG="$scratch/sentry-config.json" FAKE_SENTRY_ENVELOPE="$scratch/qemu-envelope.txt"
 assert_rc 1 "$qemu_runner" --distro arch --release v9.9.9 --staged-dir "$scratch/valid" --inventory-tiers hermetic --evidence-dir "$scratch/qemu-row-telemetry"

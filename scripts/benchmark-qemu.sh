@@ -840,7 +840,15 @@ if [[ -n "$inventory_policy" ]]; then
   python3 "$here/check-qemu-inventory.py" --policy "$inventory_policy" --inventory "$tsv" \
     --results "$work/inventory/results.json" --summary "$work/inventory/summary.json" \
     --distro "$distro" --tiers "$inventory_tiers" > "$work/inventory-admission.json" || policy_rc=$?
-  if [[ "$policy_rc" != 0 ]]; then
+  if [[ "$policy_rc" == 1 && "$inventory_product_failure" == true ]] &&
+    jq -e '.schema_version == 1 and .passed == false and
+           (.counts.failed | type == "number") and .counts.failed > 0 and
+           .counts.harness_error == 0' "$work/inventory-admission.json" >/dev/null 2>&1; then
+    # Exit 1 with a validated failure receipt means the selected product
+    # cases failed. Preserve independent lifecycle evidence; the row failure
+    # still makes the overall command fail below. Invalid admission is exit 2.
+    :
+  elif [[ "$policy_rc" != 0 ]]; then
     [[ "$rc" != 0 ]] || rc=120
     inventory_harness_error=true
   fi

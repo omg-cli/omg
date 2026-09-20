@@ -1,4 +1,6 @@
-#![cfg(feature = "arch")]
+#![cfg(unix)]
+// The fixture injects a mock package manager; no native Arch APIs are used.
+// Keep real Unix transport/lifecycle coverage enabled for every backend build.
 
 //! Coverage 18: contract tests for `handle_client` early-reject paths in
 //! `src/daemon/server.rs`, driven end-to-end through the REAL server

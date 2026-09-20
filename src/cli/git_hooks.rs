@@ -362,15 +362,10 @@ pub fn run_hook(hook_name: &str) -> Result<()> {
         .status()
         .with_context(|| format!("Failed to execute {hook_name} hook"))?;
 
-    if status.success() {
-        println!("\n{} Hook completed successfully", style::success("✓"));
-    } else {
-        println!(
-            "\n{} Hook exited with code {}",
-            style::warning("⚠"),
-            status.code().unwrap_or(-1)
-        );
+    if !status.success() {
+        anyhow::bail!("Hook '{hook_name}' failed: {status}");
     }
+    println!("\n{} Hook completed successfully", style::success("✓"));
 
     Ok(())
 }
