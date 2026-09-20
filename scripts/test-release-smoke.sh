@@ -711,8 +711,9 @@ cat > "$scratch/fake inventory omg" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$1" in
-  fail) exit 1 ;;
-  exit-code) exit "$2" ;;
+  fail) printf 'deliberate fixture refusal\n' >&2; exit 1 ;;
+  silent-fail) exit 1 ;;
+  exit-code) printf 'deliberate fixture exit %s\n' "$2" >&2; exit "$2" ;;
   json) printf '{"ok":true}\n' ;;
   bad-json) printf 'not json\n' ;;
   artifact) printf '{}\n' > "$2" ;;
@@ -747,6 +748,8 @@ run_inventory transport 1 "$(inv_row refusal '["fail"]' 1)"
 inv_verdict transport refusal HARNESS_ERROR
 unset FAKE_INVENTORY_TRANSPORT
 run_inventory refusal 0 "$(inv_row refusal '["fail"]' 1)"
+run_inventory silent-refusal 1 "$(inv_row refusal '["silent-fail"]' 1)"
+inv_verdict silent-refusal refusal FAIL
 run_inventory path 0 "$(inv_row path '["path"]' 0)"
 inv_verdict refusal refusal PASS
 for code in 124 125 126 127 137; do
