@@ -631,7 +631,7 @@ fn parse_fast_list_tail(tail: &[String]) -> Option<(Option<&str>, bool)> {
     let mut json = false;
     for arg in tail {
         match arg.as_str() {
-            "--json" => json = true,
+            "--json" if !json => json = true,
             s if s.starts_with('-') => return None,
             s => {
                 if runtime.is_some() {
@@ -645,9 +645,9 @@ fn parse_fast_list_tail(tail: &[String]) -> Option<(Option<&str>, bool)> {
 }
 
 /// Ultra-fast path for list command
-fn try_fast_list(args: &[String]) -> bool {
+fn try_fast_list(args: &[String]) -> Result<bool> {
     if has_help_flag(args) {
-        return false;
+        return Ok(false);
     }
 
     if args.len() >= 2 && matches!(args[1].as_str(), "list" | "ls") {
@@ -655,18 +655,19 @@ fn try_fast_list(args: &[String]) -> bool {
             .iter()
             .any(|a| matches!(a.as_str(), "--available" | "-a"))
         {
-            return false;
+            return Ok(false);
         }
 
         let Some((runtime, json)) = parse_fast_list_tail(&args[2..]) else {
-            return false;
+            return Ok(false);
         };
 
-        if runtimes::list_versions_sync(runtime, json).is_ok() {
-            return true;
-        }
+        // The invocation is fully parsed. A backend failure belongs to the
+        // standard error reporter, not a second execution through clap.
+        runtimes::list_versions_sync(runtime, json)?;
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
 /// Ultra-fast path for status command
@@ -714,7 +715,7 @@ fn try_fast_paths(args: &[String]) -> Result<bool> {
         || try_fast_search(args)
         || try_fast_info(args)
         || try_fast_which(args)
-        || try_fast_list(args)
+        || try_fast_list(args)?
         || try_fast_status(args)
         || try_fast_hooks(args)
     {
@@ -1935,6 +1936,13 @@ mod fast_path_tests {
             parse_fast_list_tail(&args_or_panic(&["node", "python"])),
             None
         );
+        for tail in [
+            vec!["--json", "--json"],
+            vec!["--json", "node", "--json"],
+            vec!["node", "--json", "--json"],
+        ] {
+            assert_eq!(parse_fast_list_tail(&args_or_panic(&tail)), None);
+        }
     }
 
     #[test]

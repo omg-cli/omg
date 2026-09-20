@@ -704,6 +704,61 @@ fn test_list_invalid_runtime() {
     );
 }
 
+#[test]
+fn list_rejects_duplicate_json_flags_and_reports_backend_errors_once() {
+    let project = TestProject::new();
+    for command in ["list", "ls"] {
+        for args in [
+            vec![command, "node", "--json", "--json"],
+            vec![command, "--json", "node", "--json"],
+            vec!["--quiet", command, "node", "--json", "--json"],
+        ] {
+            let result = project.run(&args);
+            result.assert_failure();
+            result.assert_stderr_contains("cannot be used multiple times");
+            assert_eq!(result.exit_code, 2);
+            assert!(
+                result.stdout.is_empty(),
+                "invalid flags must not emit a list"
+            );
+        }
+        let unknown = project.run(&[command, "invalid-runtime-xyz"]);
+        unknown.assert_failure();
+        assert_eq!(unknown.exit_code, 1);
+        unknown.assert_stderr_contains("Unsupported runtime 'invalid-runtime-xyz'");
+        assert_eq!(
+            unknown
+                .stdout
+                .matches("invalid-runtime-xyz versions")
+                .count(),
+            1,
+            "fast-path refusal must not execute the normal renderer again"
+        );
+    }
+    let versions = project.data_dir.path().join("versions");
+    std::fs::write(&versions, b"not a versions directory").unwrap();
+    for args in [&["list", "node"][..], &["list"][..]] {
+        let result = project.run(args);
+        result.assert_failure();
+        result.assert_stderr_contains("Failed to list installed");
+        result.assert_stderr_contains("Not a directory");
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(
+            result.stdout.matches("versions").count(),
+            1,
+            "backend error must not render the command twice"
+        );
+    }
+    let json = project.run(&["list", "node", "--json"]);
+    json.assert_failure();
+    assert!(json.stdout.is_empty());
+    assert_eq!(
+        std::fs::read(versions).unwrap(),
+        b"not a versions directory"
+    );
+    project.close_checked();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // VERSION FILE DETECTION E2E TESTS
 // ═══════════════════════════════════════════════════════════════════════════════

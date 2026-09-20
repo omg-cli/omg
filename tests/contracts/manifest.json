@@ -1689,10 +1689,13 @@
           "staging-pending-synthetic-file-and-symlink-entries-excluded"
         ],
         "state": [
-          "runtime-current-links-payload-markers-and-external-bytes-preserved"
+          "runtime-current-links-payload-markers-and-external-bytes-preserved",
+          "invalid-versions-parent-bytes-preserved"
         ],
         "refusal": [
-          "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          "unreadable-parent-refuses-with-cause-and-no-json-success-payload",
+          "backend-error-reported-without-reexecuting-renderer",
+          "failed-json-emits-no-success-payload"
         ]
       },
       "scope": "Debug CLI with isolated installed-version directories; not native package transactions; does not certify downloaded payload validity, remote catalogs, vendor-specific version formats or concurrent mutation; permission probe covers a denied versions parent",
@@ -1712,6 +1715,20 @@
             "runtime-current-links-payload-markers-and-external-bytes-preserved",
             "fixture-cleanup",
             "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          ]
+        },
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_rejects_duplicate_json_flags_and_reports_backend_errors_once",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "backend-error-reported-without-reexecuting-renderer",
+            "failed-json-emits-no-success-payload",
+            "invalid-versions-parent-bytes-preserved",
+            "fixture-cleanup"
           ]
         }
       ]
@@ -1744,10 +1761,13 @@
           "staging-pending-synthetic-file-and-symlink-entries-excluded"
         ],
         "state": [
-          "runtime-current-links-payload-markers-and-external-bytes-preserved"
+          "runtime-current-links-payload-markers-and-external-bytes-preserved",
+          "invalid-versions-parent-bytes-preserved"
         ],
         "refusal": [
-          "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          "unreadable-parent-refuses-with-cause-and-no-json-success-payload",
+          "backend-error-reported-without-reexecuting-renderer",
+          "failed-json-emits-no-success-payload"
         ]
       },
       "scope": "Debug CLI with isolated installed-version directories; not native package transactions; does not certify downloaded payload validity, remote catalogs, vendor-specific version formats or concurrent mutation; permission probe covers a denied versions parent",
@@ -1767,6 +1787,20 @@
             "runtime-current-links-payload-markers-and-external-bytes-preserved",
             "fixture-cleanup",
             "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          ]
+        },
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_rejects_duplicate_json_flags_and_reports_backend_errors_once",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "backend-error-reported-without-reexecuting-renderer",
+            "failed-json-emits-no-success-payload",
+            "invalid-versions-parent-bytes-preserved",
+            "fixture-cleanup"
           ]
         }
       ]
@@ -1799,10 +1833,13 @@
           "staging-pending-synthetic-file-and-symlink-entries-excluded"
         ],
         "state": [
-          "runtime-current-links-payload-markers-and-external-bytes-preserved"
+          "runtime-current-links-payload-markers-and-external-bytes-preserved",
+          "invalid-versions-parent-bytes-preserved"
         ],
         "refusal": [
-          "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          "unreadable-parent-refuses-with-cause-and-no-json-success-payload",
+          "backend-error-reported-without-reexecuting-renderer",
+          "failed-json-emits-no-success-payload"
         ]
       },
       "scope": "Debug CLI with isolated installed-version directories; not native package transactions; does not certify downloaded payload validity, remote catalogs, vendor-specific version formats or concurrent mutation; permission probe covers a denied versions parent",
@@ -1822,6 +1859,20 @@
             "runtime-current-links-payload-markers-and-external-bytes-preserved",
             "fixture-cleanup",
             "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          ]
+        },
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_rejects_duplicate_json_flags_and_reports_backend_errors_once",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "backend-error-reported-without-reexecuting-renderer",
+            "failed-json-emits-no-success-payload",
+            "invalid-versions-parent-bytes-preserved",
+            "fixture-cleanup"
           ]
         }
       ]

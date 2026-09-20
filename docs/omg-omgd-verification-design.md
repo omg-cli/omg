@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used seventy-six searches (271 requested result slots),
+Exa research used seventy-seven searches (272 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -719,6 +719,20 @@ fixture executable root-owned before mounting it; OMG's trust checks remain
 unchanged. The exact probe then reaches the intended DNF failure and passes.
 Both diagnostics remain in the failed run's evidence. The other eight hosted
 workflows passed; this failed QEMU run is not reclassified or retried away.
+
+### List fast-path parity and single execution on errors
+
+The list shortcut accepted repeated `--json` flags, while the normal parser
+refused them under [Clap's default SetTrue conflict policy](https://docs.rs/clap/latest/clap/enum.ArgAction.html).
+The executable regression reproduced that false success for `list`/`ls`.
+Repeated flags now defer to the normal parser, preserving its specific usage
+error and empty stdout. A second regression then exposed a backend failure
+being retried through normal dispatch: one unknown-runtime request rendered
+two headers. Once the shortcut has parsed an invocation, its backend errors
+now reach the shared error reporter directly. Invalid directory state also
+fails once and retains its cause; JSON failures emit no success payload and
+preserve the original fixture bytes. Receipt bindings record those backend
+refusal/state assertions, not parser-only credit for duplicate flags.
 
 ### Runtime download connection recovery
 
