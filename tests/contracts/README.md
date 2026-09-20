@@ -108,8 +108,19 @@ a locked stable-channel selection must refuse with the concurrency error and
 leave no active toolchain. These installed fixtures do not prove downloading or
 extraction. Opt-in downloads now disable synthetic runtime mode, require success
 and execute the installed binary with the exact resolved version. Latest/LTS
-installation still needs an independent selection oracle before alias-resolution
-coverage credit; download failure is never accepted as successful installation.
+expectations come from Node's separate published TSV release table, selecting
+the highest eligible stable semantic version independently of OMG's JSON
+resolver. Upstream changes during execution fail visibly; there is no retry to
+hide them. Download failure is never accepted as successful installation.
+Eleven offline runtime fixture contracts are bound to their actual owning harness
+and product pair. Their named selection/refusal/state assertions and cleanup
+are admitted separately; broad runtime gaps and opt-in downloads remain outside
+that credit.
+The uninstall lifecycle runs every one of the 68 registered dispatches against
+real temporary directories and links: active-version refusal, inactive removal,
+missing/symlinked-version refusal, and preservation of sibling and external bytes.
+A registry-size change requires explicit fixture review. These fixtures do not
+prove concurrent filesystem race handling or successful installation of all tools.
 
 JUnit's skipped-test reporting varies by nextest version. The independent list
 supplies ignored/filtered counts even when no XML row exists. A selected test

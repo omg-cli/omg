@@ -26,7 +26,13 @@ require = COVERAGE.require
 
 BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
     'test_cli_status_shows_debian_info', 'test_cli_debian_respects_ci_mode')) | frozenset({
-    'omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state'})
+    'omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state'}) | frozenset(
+    'omg::e2e_runtime_management::' + name for name in (
+        'test_detect_nvmrc', 'test_detect_python_version', 'test_detect_tool_versions',
+        'test_go_mod_version', 'test_multi_runtime_detection', 'test_conflicting_version_files',
+        'test_rust_toolchain_toml', 'rust_stable_pin_refuses_a_concurrent_mutation_without_activation',
+        'test_package_json_engines', 'test_which_shows_active_runtime',
+        'every_runtime_uninstall_preserves_active_siblings_and_external_state'))
 
 
 def parser_receipts(manifest, provenance, report):

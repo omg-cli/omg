@@ -118,12 +118,16 @@ class NativeReceipts(unittest.TestCase):
             (target / 'debug/search-suite').write_bytes(b'search harness')
             listing['rust-suites']['omg::cli_comprehensive'] = {
                 'package-id': 'owning-package', 'binary-path': str(target / 'debug/search-suite')}
+            (target / 'debug/runtime-suite').write_bytes(b'runtime harness')
+            listing['rust-suites']['omg::e2e_runtime_management'] = {
+                'package-id': 'owning-package', 'binary-path': str(target / 'debug/runtime-suite')}
             manifest, _, _, provenance, _ = fixture()
             manifest['contracts'][0]['tests'] = [
                 {'lane': 'native-cli-fixture', 'id': name} for name in sorted(NATIVE.BEHAVIOR_TESTS)]
             combined = NATIVE.mapped_behavior_subjects(manifest, provenance, listing, root)
             self.assertEqual(set(combined), {'omg', 'omgd',
-                'harness:omg::debian_e2e_tests', 'harness:omg::cli_comprehensive'})
+                'harness:omg::debian_e2e_tests', 'harness:omg::cli_comprehensive',
+                'harness:omg::e2e_runtime_management'})
             missing = copy.deepcopy(listing)
             del missing['rust-suites']['omg::cli_comprehensive']
             with self.assertRaisesRegex(ValueError, 'missing owning'):
@@ -200,7 +204,11 @@ class NativeReceipts(unittest.TestCase):
         self.assertEqual({contract['id'] for contract in mapped}, {
             'omg.status.fixture', 'omg.status.json.fixture', 'omg.install.consent.fixture',
             'omg.search.records.fixture', 'omg.search.query.fixture',
-            'omg.search.limit.fixture', 'omg.search.json.fixture'})
+            'omg.search.limit.fixture', 'omg.search.json.fixture'} | {
+                'omg.runtime.' + name + '.fixture' for name in (
+                    'nvmrc', 'python-pin', 'tool-versions', 'go-mod', 'multi-runtime',
+                    'pin-precedence', 'rust-pin', 'rust-pin-locked', 'engines-range', 'which-node',
+                    'uninstall-lifecycle')})
         for contract in mapped:
             self.assertTrue(contract['critical'])
             self.assertIn('not native package transactions', contract['scope'])

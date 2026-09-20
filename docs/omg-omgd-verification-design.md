@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used sixty-one searches (243 requested result slots),
+Exa research used sixty-four searches (249 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -485,3 +485,35 @@ oracle tests passed on all four WSL distros. The SSH-shim runner also passed wit
 each distro's real local OMG binary and a real Python download; those shim runs
 are not guest-boot evidence or admitted per-distro provenance. Existing trusted
 QEMU issue publication and diagnosis capture remain unchanged.
+
+### Independent Node alias expectations and runtime receipts
+
+Latest/LTS checks now read Node's [published tabular release index](https://nodejs.org/dist/index.tab)
+and select the highest stable semantic version, filtering by the named LTS
+column when requested. This uses neither OMG's JSON parser nor its resolver,
+and an unordered fixture verifies the oracle's selection and refusal behavior.
+A deliberate production mutation installed working Node 20.10.0 for `latest`;
+the new assertion failed against expected 26.9.0. Restoring production passed
+all 33 selected runtime tests with network enabled on all four WSL builds.
+Two of those tests validate harness helpers, not product behavior. The
+[official Node 26 announcement](https://nodejs.org/en/blog/release/v26.0.0)
+confirms its October 2026 LTS transition; expectations follow upstream metadata
+rather than pinning the current LTS major in the test.
+
+Eleven bounded offline runtime contracts now bind their exact assertions to the
+runtime integration harness and actual product executable hashes. They cover
+named pin selection/precedence, activation, locked Rust refusal, unsupported
+engine-range refusal and Node `which` state. `which` switches between two
+versions and verifies that querying preserves the active link. All corresponding
+native owners execute these tests without retries. No broad gap was removed,
+and opt-in network cases are not counted by this offline receipt mapping.
+
+The additional uninstall lifecycle visits all 68 registered runtime/tool
+managers. For each it verifies active-version refusal and byte preservation,
+inactive removal, preservation of a sibling active link and an external file
+referenced by an internal symlink, then missing and symlinked-version refusals.
+The [Rust removal documentation](https://doc.rust-lang.org/std/fs/fn.remove_dir_all.html)
+informs the external-file check; it does not justify a claim about all races.
+This scenario passed on all four WSL builds. Removing the shared active-version
+guard deliberately failed the test; restored production passed the full Arch
+runtime target. Runtime install coverage is not inferred from removal fixtures.

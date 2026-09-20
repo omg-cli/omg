@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Reviewed parser, Debian status/consent and exact mock search contracts; broader behavioral inventory remains incomplete",
+  "status": "Reviewed parser, Debian status/consent, exact mock search and bounded runtime fixture contracts; broader behavioral inventory remains incomplete",
   "inventory_source": "Verified compiled artifacts from CI run 35500460442, checkout d2554cd7f1b22e3c706660c390867b9203c6c7aa",
   "contracts": [
     {
@@ -656,6 +656,507 @@
           "assertions": [
             "single-json-array-exact-names-versions-sources",
             "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.nvmrc.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "nvmrc-node-selection"
+        ],
+        "state": [
+          "exact-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_detect_nvmrc",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "nvmrc-node-selection",
+            "exact-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.python-pin.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "python-pin-selection"
+        ],
+        "state": [
+          "exact-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_detect_python_version",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "python-pin-selection",
+            "exact-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.tool-versions.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "tool-versions-node-selection"
+        ],
+        "state": [
+          "exact-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_detect_tool_versions",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "tool-versions-node-selection",
+            "exact-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.go-mod.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "go-mod-selection"
+        ],
+        "state": [
+          "exact-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_go_mod_version",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "go-mod-selection",
+            "exact-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.multi-runtime.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "three-runtime-pin-selection"
+        ],
+        "state": [
+          "each-exact-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_multi_runtime_detection",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "three-runtime-pin-selection",
+            "each-exact-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.pin-precedence.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "nvmrc-precedes-tool-versions"
+        ],
+        "state": [
+          "selected-executable-not-competing-pin"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_conflicting_version_files",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "nvmrc-precedes-tool-versions",
+            "selected-executable-not-competing-pin",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.rust-pin.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "rust-toolchain-pinned-selection"
+        ],
+        "state": [
+          "host-specific-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_rust_toolchain_toml",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "rust-toolchain-pinned-selection",
+            "host-specific-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.rust-pin-locked.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "specific-concurrent-mutation-error"
+        ],
+        "state": [
+          "no-activation-or-new-runtime-state"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::rust_stable_pin_refuses_a_concurrent_mutation_without_activation",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "specific-concurrent-mutation-error",
+            "no-activation-or-new-runtime-state",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.engines-range.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "unsupported-range-validation-error"
+        ],
+        "state": [
+          "no-active-node-version"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_package_json_engines",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "unsupported-range-validation-error",
+            "no-active-node-version",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.which-node.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg which",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "empty-and-exact-selected-node-output"
+        ],
+        "state": [
+          "selection-preserved-by-which"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_which_shows_active_runtime",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "empty-and-exact-selected-node-output",
+            "selection-preserved-by-which",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.uninstall-lifecycle.fixture",
+      "source": "src/runtimes/common.rs",
+      "binary": "omg",
+      "surface": "omg use --uninstall",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "inactive-version-removed-for-all-68-registered-tools"
+        ],
+        "refusal": [
+          "active-missing-and-symlinked-version-specific-refusals"
+        ],
+        "state": [
+          "active-link-sibling-and-external-bytes-preserved"
+        ]
+      },
+      "scope": "Debug CLI with isolated runtime directories, real symlinks and checked cleanup; covers all registered dispatches for the named removal/refusal cases, not downloads or concurrent filesystem races; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::every_runtime_uninstall_preserves_active_siblings_and_external_state",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "inactive-version-removed-for-all-68-registered-tools",
+            "active-missing-and-symlinked-version-specific-refusals",
+            "active-link-sibling-and-external-bytes-preserved",
             "fixture-cleanup"
           ]
         }
