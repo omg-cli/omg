@@ -68,10 +68,29 @@ def unique_object(pairs):
     return result
 
 
-def archive_rows(content, allowed_cases):
+def diagnostic_excerpt(raw):
+    # Redact before truncating: cutting a token's prefix first could prevent
+    # the issue helper from recognizing the remaining credential bytes.
+    text = raw.decode("utf-8", errors="replace")
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if token := os.environ.get(name):
+            text = text.replace(token, "[redacted-token]")
+    text = re.sub(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+", "[redacted-token]", text)
+    text = re.sub(r"Bearer [A-Za-z0-9._~+/=-]+", "Bearer [redacted]", text, flags=re.IGNORECASE)
+    text = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
+                  "[redacted-private-key]", text, flags=re.DOTALL)
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07", "", text)
+    text = text.replace("\r", "\n").replace("```", "[code fence]")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = "\n".join(text.splitlines()[-12:])
+    return text.encode("utf-8")[-1300:].decode("utf-8", errors="ignore")
+
+
+def archive_rows(content, allowed_cases, diagnostics=None):
     if len(content) > MAX_DOWNLOAD:
         raise ValueError("artifact download exceeds limit")
     rows = []
+    row_sources = []
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
         members = archive.infolist()
         if len(members) > 5000 or sum(member.file_size for member in members) > 256 * 1024 * 1024:
@@ -109,6 +128,35 @@ def archive_rows(content, allowed_cases):
                         or not 0 <= row["elapsed_seconds"] <= 86400):
                     raise ValueError("invalid result row")
                 rows.append({key: row[key] for key in ("case_id", "distro", "result", "exit_code", "elapsed_seconds")})
+                row_sources.append((row, path.parent))
+        # Admission above validates every archive member before any diagnostic
+        # is consumed. Read only logs named by a validated failing case; never
+        # extract files or execute artifact content. The issue helper applies
+        # its existing secret scrubber before publication.
+        if diagnostics is not None:
+            members_by_name = {member.filename: member for member in members}
+            for row, parent in row_sources:
+                if row["result"] not in FAILURES or row["case_id"] == "qemu-matrix-workflow":
+                    continue
+                key = row["case_id"], row["distro"]
+                diagnostics.pop(key, None)
+                case = row["case_id"].removeprefix(f"qemu-{row['distro']}-")
+                if parent.name == "inventory":
+                    candidates = [parent / "rows" / f"{case}{suffix}.log"
+                                  for suffix in (".stderr", "", ".stdout")]
+                elif case in ("lifecycle", "aarch64-lifecycle"):
+                    candidates = [parent / "guest-check.log"]
+                else:
+                    candidates = []
+                for candidate in candidates:
+                    member = members_by_name.get(str(candidate))
+                    if member is None or member.file_size > 8 * 1024 * 1024:
+                        continue
+                    raw = archive.read(member)
+                    if not raw.strip():
+                        continue
+                    diagnostics[key] = diagnostic_excerpt(raw)
+                    break
     return rows
 
 
@@ -173,6 +221,7 @@ def main():
         main_ref = json.loads(api(f"repos/{repository}/git/ref/heads/main"))
         successful_main = main_ref["object"]["sha"] == run["head_sha"]
     rows = []
+    diagnostics = {}
     evidence_error = False
     try:
         listing = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100"))
@@ -189,7 +238,7 @@ def main():
                 raise ValueError("invalid artifact identity or size")
             rows.extend(archive_rows(
                 api(f"repos/{repository}/actions/artifacts/{artifact['id']}/zip", MAX_DOWNLOAD),
-                allowed_cases,
+                allowed_cases, diagnostics,
             ))
         selected = projection(rows, successful_main)
     except (ValueError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError):
@@ -244,7 +293,10 @@ def main():
                     f"Observed: {row['result']}, exit {row['exit_code']}, elapsed {row['elapsed_seconds']}s\n"
                     f"Evidence invalid/unavailable: {evidence_error}\n"
                     "Exit status alone does not establish the root cause. Inspect the linked run's logs and artifacts.\n"
-                    + "\n".join(details[:24]) + "\n" + catalog_note)
+                    + "\n".join(details[:6]) + "\n"
+                    + "Case diagnostic (untrusted log excerpt, redacted by issue helper):\n"
+                    + diagnostics.get((row["case_id"], row["distro"]), "No case log available; inspect linked artifacts.")
+                    + "\n" + catalog_note)
         run_url = f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}"
         subprocess.run(["bash", "scripts/qa-file-issue.sh", str(results), "--repo", repository,
                         "--source", "qemu-matrix", "--run-url", run_url], check=True, timeout=180)

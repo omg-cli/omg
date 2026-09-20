@@ -37,6 +37,57 @@ class ReportingBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(result, [self.row()])
 
+    def test_failed_case_excerpt_is_bounded_and_does_not_include_other_files(self):
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/inventory/results.json", json.dumps([self.row()]))
+            archive.writestr("run-a/inventory/rows/search.log", "command result\n" + "x" * 2000)
+            archive.writestr("run-a/inventory/rows/search.stderr.log", "the actual failure")
+            archive.writestr("run-a/inventory/rows/other.stderr.log", "unrelated secret")
+            archive.writestr("run-a/environment.txt", "private environment")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {self.row()["case_id"]}, diagnostics)
+        excerpt = diagnostics[("qemu-arch-search", "arch")]
+        self.assertIn("the actual failure", excerpt)
+        self.assertNotIn("unrelated secret", excerpt)
+        self.assertNotIn("private environment", excerpt)
+        self.assertLessEqual(len(excerpt.encode("utf-8")), 1400)
+
+    def test_excerpt_redacts_known_credentials_before_truncation(self):
+        secret = "ghp_" + "a" * 1500
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run/inventory/results.json", json.dumps([self.row()]))
+            archive.writestr("run/inventory/rows/search.stderr.log",
+                             secret + "\nBearer credential-value\n```\n\x1b[31mfailure\x1b[0m")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {self.row()["case_id"]}, diagnostics)
+        excerpt = diagnostics[(self.row()["case_id"], "arch")]
+        self.assertNotIn("a" * 20, excerpt)
+        self.assertNotIn("credential-value", excerpt)
+        self.assertNotIn("```", excerpt)
+        self.assertNotIn("[31m", excerpt)
+        self.assertIn("failure", excerpt)
+
+    def test_lifecycle_excerpt_uses_only_its_run_root(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/results.json", json.dumps([row]))
+            archive.writestr("run-a/guest-check.log", "daemon failed to restart")
+            archive.writestr("run-b/guest-check.log", "unrelated run")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        self.assertIn("daemon failed to restart", diagnostics[(row["case_id"], "arch")])
+        self.assertNotIn("unrelated run", diagnostics[(row["case_id"], "arch")])
+
+    def test_successful_rows_never_supply_failure_excerpts(self):
+        row = self.row("PASS")
+        diagnostics = {}
+        REPORT.archive_rows(self.archive("run/results.json", json.dumps([row])),
+                            {row["case_id"]}, diagnostics)
+        self.assertEqual(diagnostics, {})
+
     def test_transaction_receipts_do_not_poison_case_reporting(self):
         output = io.BytesIO()
         case = self.row("PASS")
@@ -141,7 +192,7 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(REPORT.projection([aggregate], False), [])
 
     def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
-                           corrupt=False, expired=False, helper_fails=False):
+                           corrupt=False, expired=False, helper_fails=False, case_log=None):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=".github/workflows/qemu-matrix.yml",
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -149,7 +200,12 @@ class ReportingBoundaryTests(unittest.TestCase):
         event = dict(repository={"full_name": "owner/repo"}, workflow_run=run)
         artifact = dict(id=30, name="qemu-evidence-arch", size_in_bytes=100,
                         created_at=run["run_started_at"], expired=expired)
-        payload = self.archive("run/results.json", "{" if corrupt else json.dumps(rows))
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run/inventory/results.json", "{" if corrupt else json.dumps(rows))
+            if case_log is not None:
+                archive.writestr("run/inventory/rows/search.stderr.log", case_log)
+        payload = output.getvalue()
         calls = []
         def api(path, *args):
             if path.endswith("/actions/runs/10"):
@@ -164,7 +220,9 @@ class ReportingBoundaryTests(unittest.TestCase):
                 return json.dumps(dict(jobs=[]))
             self.fail(f"unexpected API request: {path}")
         def subprocess_run(argv, **kwargs):
-            calls.append((argv[1], json.loads(Path(argv[2]).read_text())))
+            root = Path(argv[2]).parent
+            transcripts = {path.parent.name: path.read_text() for path in root.glob("*/transcript.txt")}
+            calls.append((argv[1], json.loads(Path(argv[2]).read_text()), transcripts))
             if helper_fails and argv[1] == "scripts/qa-file-issue.sh":
                 raise REPORT.subprocess.CalledProcessError(1, argv)
         with tempfile.TemporaryDirectory() as directory:
@@ -195,6 +253,16 @@ class ReportingBoundaryTests(unittest.TestCase):
                 self.assertFalse(catalog["evidence_invalid_or_unavailable"])
                 self.assertEqual(len(calls[0][1]), 1)
                 self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-workflow")
+
+    def test_case_diagnostic_reaches_issue_helper_with_identity_and_redaction(self):
+        calls, _ = self.run_report_fixture([self.row()],
+                                           case_log="expected package missing\nBearer private-token")
+        transcript = calls[0][2]["arch-qemu-arch-search"]
+        self.assertIn("expected package missing", transcript)
+        self.assertIn("Commit: " + "a" * 40, transcript)
+        self.assertIn("Attempt: 2", transcript)
+        self.assertNotIn("private-token", transcript)
+        self.assertIn("actions/runs/50", transcript)
 
     def test_unavailable_evidence_keeps_visible_aggregate(self):
         for options in (dict(corrupt=True), dict(expired=True)):
