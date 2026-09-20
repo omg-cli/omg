@@ -1,6 +1,6 @@
 # OMG Makefile - Development and Testing Targets
 
-.PHONY: help build release test test-lib check fmt fmt-check clippy clippy-strict clean bench bench-fast bench-hyperfine bench-hyperfine-fast bench-charts docker-debian docker-ubuntu docker-test docker-debian-shell docker-ubuntu-shell install audit dev dev-stop dev-check test-property test-fuzz test-fuzz-quick test-advanced test-security qa coverage tdd ci-local-quick ci-local-full check-shell-syntax
+.PHONY: help build release test test-lib check fmt fmt-check clippy clippy-strict clean bench bench-fast bench-hyperfine bench-hyperfine-fast bench-charts docker-debian docker-ubuntu docker-test docker-debian-shell docker-ubuntu-shell install audit dev dev-stop dev-check test-property test-fuzz test-fuzz-quick test-advanced test-security qa coverage tdd ci-workflow-quick ci-local-quick ci-local-full check-shell-syntax
 
 # Default target - show help
 .DEFAULT_GOAL := help
@@ -271,12 +271,15 @@ check-shell-syntax:
 		bash -n "$$script" || exit $$?; \
 	done
 
-ci-local-quick: check-shell-syntax
+# Hosted prerequisite: no compilation before independent platform jobs.
+ci-workflow-quick: check-shell-syntax
 	cargo fmt --all -- --check
-	cargo check --all-targets --no-default-features --features pgp,license --locked
-	cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
 	python3 -m unittest discover -s scripts -p 'test_*.py'
 	python3 tests/test_terminal_update_notice.py
+
+ci-local-quick: ci-workflow-quick
+	cargo check --all-targets --no-default-features --features pgp,license --locked
+	cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
 
 ci-local-full: ci-local-quick
 	cargo clippy --all-targets --no-default-features --features pgp,license \
