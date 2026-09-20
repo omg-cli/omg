@@ -104,6 +104,7 @@ fn search_json_preserves_exact_records_ranking_limits_and_package_state() {
             }
         }
     }
+    project.close_checked();
 }
 
 fn command_paths() -> Vec<Vec<String>> {

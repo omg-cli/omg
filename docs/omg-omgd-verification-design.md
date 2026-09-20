@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used fifty-eight searches (236 requested result slots),
+Exa research used fifty-nine searches (238 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -422,3 +422,33 @@ A temporary isolated-checkout mutation returning accumulated releases after
 quota exhaustion failed this regression with the partial catalog exposed.
 Restoring the production source passed all 56 shared runtime-helper tests on
 Arch. No production runtime behavior was changed in this follow-up.
+
+### Evidence accuracy and hook force adequacy
+
+The user's 95% target remains an acceptance goal, not permission to manufacture
+passing cases or trim the inventory. Reporting tests never count as product
+coverage. Fully evidenced surfaces exclude parser/help-only results, partial
+contracts, failed cleanup and explicit gaps. The initial 866 behavioral surfaces
+per licensed Linux owner still include provisional gap classifications; their
+domain review must finish before any percentage can certify the goal. Current
+per-lane reports cannot claim coverage for other lanes or architectures.
+
+Four exact mock-search contracts are now bound to the CLI pair and their owning
+comprehensive harness, with explicit fixture cleanup. Multi-harness admission
+rejects missing owners and differing product pairs. Broader native, fault and
+interaction gaps remain intact. Research used the official
+[nextest machine-readable metadata](https://nexte.st/docs/machine-readable/list/).
+
+The old QEMU force-install row accepted a product that ignored `--force`: its
+prerequisite had already installed identical hooks. A failing negative control
+proved the blind spot. The row now replaces those hooks with different user
+content and non-executable permissions before invoking the product; the existing
+content, executable and actual Git lifecycle assertions then require replacement.
+All 17 QEMU output-oracle tests passed on all four WSL distros.
+
+A separate CLI lifecycle regression verifies non-force idempotency (bytes,
+inode and mode), preservation of user-owned hooks by install/uninstall, explicit
+force replacement, status classification and repeated uninstall, using both
+default and space-containing custom hook directories. All seven hook tests passed
+on all four WSL builds. A production mutation ignoring the force flag failed the
+new regression; restoring production behavior passed the full hook target.

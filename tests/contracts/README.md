@@ -4,6 +4,19 @@ The manifest is an incremental assertion inventory, not a coverage claim.
 Parser tests establish grammar only. `gaps.json` retains missing behavioral
 evidence even for interfaces with passing parser contracts.
 
+`behavioral_progress` is a conservative per-lane evidence summary. Its
+denominator is the distinct supported surfaces with behavioral requirements or
+explicit behavioral gaps, including non-CLI interfaces. A surface earns credit
+only if all its reviewed behavioral contracts passed and no behavioral gap
+remains. Parser/help-only results, failed cleanup, missing owners and partial
+assertions earn no credit. The 95% target uses integer arithmetic; displayed
+rounding cannot pass it. An empty denominator is unavailable, never 100%.
+The current inventory still contains provisional gap classifications. Until
+`behavioral_inventory_reviewed` is explicitly true after their domain review,
+the report cannot certify the target even if its displayed percentage is high.
+This is not a test pass percentage, source-code coverage, or a claim about
+other lanes/platforms. Broader gaps remain until reviewed evidence closes them.
+
 Native CI invokes `scripts/run-native-contracts.py` around the existing nextest
 run. It lists the exact feature selection, requires nonempty owned suites,
 captures JUnit output, and hashes the actual parser test harnesses before and
@@ -32,6 +45,15 @@ The status fixture asserts exact seeded counts, unchanged state and independent
 empty state. Consent asserts refusal without `--yes`, unchanged refused state,
 and exact installed versions after consent. These use a mock Debian backend;
 they do not certify native transactions or daemon behavior. Wider gaps remain.
+
+Linux native-backend owners additionally bind four reviewed exact-search
+contracts to the comprehensive CLI harness and the debug product pair. They
+check canonical/alias records, case-insensitive ranking, limit boundaries,
+machine output and unchanged mock package state, then explicitly close all
+fixture directories. All owning harnesses are hashed before and after execution;
+different product pairs or omitted harnesses fail admission. No AUR filtering,
+native repository behavior, human detailed output or quiet-mode coverage is
+inferred from these JSON fixtures, and their wider gap records remain intact.
 
 Only explicitly reviewed mappings are translated. A generic JUnit pass
 cannot automatically certify state changes, cleanup or successful transactions.

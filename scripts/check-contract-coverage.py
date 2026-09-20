@@ -303,6 +303,7 @@ def admit(manifest, surfaces, receipts, provenance, required_contracts):
     counts = dict(supported=len(relevant), required=len(required), executed=0,
                   passed=0, failed=0, skipped=0, retried=0, gaps=len(current_gaps))
     evidence_counts = {kind: dict(required=0, executed=0, passed=0, failed=0, skipped=0) for kind in sorted(KINDS)}
+    passed_contracts = set()
     for identity in sorted(required):
         keys = [key for key in expected if key[0] == identity]
         results = [outcomes[key] for key in keys]
@@ -311,6 +312,8 @@ def admit(manifest, surfaces, receipts, provenance, required_contracts):
         counts['retried'] += any(len(attempts[key]) > 1 for key in keys)
         outcome = 'failed' if 'FAIL' in results else ('passed' if all(result == 'PASS' for result in results) else 'skipped')
         counts[outcome] += 1
+        if outcome == 'passed':
+            passed_contracts.add(identity)
         for kind in relevant[identity]['requires']:
             selected = [key for key in keys if kind in expected[key]['evidence']]
             total = evidence_counts[kind]
@@ -328,11 +331,43 @@ def admit(manifest, surfaces, receipts, provenance, required_contracts):
     return {'schema_version': 1, 'platform': provenance['platform'], 'lane': provenance['lane'],
             'source_sha': provenance['source_sha'], 'counts': counts, 'evidence': evidence_counts,
             'gaps': current_gaps, 'attempts': history,
+            'behavioral_progress': behavioral_progress(relevant, current_gaps, passed_contracts,
+                inventory_reviewed=manifest.get('behavioral_inventory_reviewed') is True),
             'passed': counts['passed'] == counts['required']}
+
+
+def behavioral_progress(contracts, gaps, passed_contracts, *, inventory_reviewed=False):
+    """Conservative current-lane progress, never a percentage of test passes.
+
+    A surface earns credit only after every reviewed behavioral contract passes
+    and every explicit behavioral gap has been closed. Other lanes' contracts
+    remain uncredited until their evidence is admitted by an aggregate owner.
+    """
+    behavioral = KINDS - {'parser', 'help'}
+    required = {}
+    blocked = set()
+    for identity, contract in contracts.items():
+        if set(contract['requires']) & behavioral:
+            required.setdefault(contract['surface'], set()).add(identity)
+    for gap in gaps:
+        if set(gap['missing']) & behavioral:
+            required.setdefault(gap['surface'], set())
+            blocked.add(gap['surface'])
+    covered = sorted(surface for surface, owners in required.items()
+                     if owners and surface not in blocked and owners <= passed_contracts)
+    total = len(required)
+    return {'scope': 'admitted-current-lane-only', 'inventory_reviewed': inventory_reviewed, 'supported': total,
+            'covered': len(covered), 'covered_surfaces': covered,
+            'uncovered_surfaces': sorted(set(required) - set(covered)),
+            'percent': round(100 * len(covered) / total, 2) if total else None,
+            'target_percent': 95,
+            'target_met': bool(inventory_reviewed and total and len(covered) * 100 >= total * 95)}
 
 
 def render_markdown(report):
     counts = report['counts']
+    progress = report['behavioral_progress']
+    percentage = 'unavailable' if progress['percent'] is None else str(progress['percent']) + '%'
     rows = [
         'Contract execution for ' + report['platform'].replace('|', '\\|').replace('`', "'") + '.',
         '',
@@ -340,6 +375,11 @@ def render_markdown(report):
         f"executed: {counts['executed']}; passed: {counts['passed']}; "
         f"failed: {counts['failed']}; skipped: {counts['skipped']}.",
         f"Explicit gaps: {counts['gaps']}. Gaps and skips are not passing coverage.",
+        f"Fully evidenced behavioral surfaces in this lane: {progress['covered']}/{progress['supported']} "
+        f"({percentage}); target: 95%. Parser/help passes do not count. "
+        "This lane alone does not certify other lanes or distros.",
+        "Behavioral inventory review: " + ('complete.' if progress['inventory_reviewed'] else
+            'incomplete; the current denominator is provisional and cannot certify the target.'),
         '',
         '| Evidence | Required | Executed | Passed | Failed | Skipped |',
         '| --- | ---: | ---: | ---: | ---: | ---: |',

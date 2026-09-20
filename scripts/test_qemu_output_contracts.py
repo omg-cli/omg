@@ -49,6 +49,25 @@ class OutputContracts(unittest.TestCase):
                 if disabled:
                     self.assertIn('hook notice', logs['hooks.log'])
 
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_force_row_requires_replacing_user_content_not_reinstalling_identical_hooks(self):
+        rows = [
+            'hooks-install\t["hooks","install"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\thooks-installed\ttempdir-drop',
+            'hooks-install-force\t["hooks","install","--force"]\tisolated-write\t0\tpass\thooks-install\thermetic\thermetic:pass\thooks-installed\ttempdir-drop',
+        ]
+        for ignored in (False, True):
+            with self.subTest(ignored=ignored):
+                product = 'mkdir -p .git/hooks\n'
+                if ignored:
+                    product += 'if [[ "${3:-}" == --force ]]; then exit 0; fi\n'
+                for name, (content, _) in self.generated_hooks().items():
+                    product += f'printf %s {shlex.quote(content)} > .git/hooks/{name}\nchmod 755 .git/hooks/{name}\n'
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual(result.returncode, int(ignored), result.stderr)
+                self.assertEqual([row['result'] for row in evidence], ['PASS', 'FAIL' if ignored else 'PASS'])
+                if ignored:
+                    self.assertIn('assertion failed: installed hook', logs['hooks-install-force.log'])
+
     def test_failure_diagnosis_precedes_long_product_output(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('# BEGIN ROW LOG')

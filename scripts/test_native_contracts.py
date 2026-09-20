@@ -68,6 +68,27 @@ class NativeReceipts(unittest.TestCase):
             subjects = NATIVE.behavior_subjects(listing, root)
             self.assertEqual(set(subjects), {'omg', 'omgd', 'harness'})
             self.assertEqual(subjects['omg'], target / 'debug/omg')
+            (target / 'debug/search-suite').write_bytes(b'search harness')
+            listing['rust-suites']['omg::cli_comprehensive'] = {
+                'package-id': 'owning-package', 'binary-path': str(target / 'debug/search-suite')}
+            manifest, _, _, provenance, _ = fixture()
+            manifest['contracts'][0]['tests'] = [
+                {'lane': 'native-cli-fixture', 'id': name} for name in sorted(NATIVE.BEHAVIOR_TESTS)]
+            combined = NATIVE.mapped_behavior_subjects(manifest, provenance, listing, root)
+            self.assertEqual(set(combined), {'omg', 'omgd',
+                'harness:omg::debian_e2e_tests', 'harness:omg::cli_comprehensive'})
+            missing = copy.deepcopy(listing)
+            del missing['rust-suites']['omg::cli_comprehensive']
+            with self.assertRaisesRegex(ValueError, 'missing owning'):
+                NATIVE.mapped_behavior_subjects(manifest, provenance, missing, root)
+            foreign = copy.deepcopy(listing)
+            (target / 'debug/foreign-omg').write_bytes(b'wrong product')
+            foreign['rust-suites']['omg::cli_comprehensive']['package-id'] = 'other-package'
+            foreign['rust-build-meta']['non-test-binaries']['other-package'] = [
+                dict(row, path='debug/foreign-omg' if row['name'] == 'omg' else row['path'])
+                for row in foreign['rust-build-meta']['non-test-binaries']['owning-package']]
+            with self.assertRaisesRegex(ValueError, 'different product'):
+                NATIVE.mapped_behavior_subjects(manifest, provenance, foreign, root)
             for fault in ('missing', 'duplicate', 'kind', 'platform', 'foreign-harness'):
                 invalid = copy.deepcopy(listing)
                 binaries = invalid['rust-build-meta']['non-test-binaries']['owning-package']
@@ -129,7 +150,10 @@ class NativeReceipts(unittest.TestCase):
         manifest = json.loads((root / 'tests/contracts/manifest.json').read_text())
         mapped = [contract for contract in manifest['contracts']
                   if any(binding['lane'] == 'native-cli-fixture' for binding in contract['tests'])]
-        self.assertEqual(len(mapped), 3)
+        self.assertEqual({contract['id'] for contract in mapped}, {
+            'omg.status.fixture', 'omg.status.json.fixture', 'omg.install.consent.fixture',
+            'omg.search.records.fixture', 'omg.search.query.fixture',
+            'omg.search.limit.fixture', 'omg.search.json.fixture'})
         for contract in mapped:
             self.assertTrue(contract['critical'])
             self.assertIn('not native package transactions', contract['scope'])

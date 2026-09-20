@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Parser mappings and three reviewed CLI fixture contracts; broader behavioral import remains incomplete",
+  "status": "Reviewed parser, Debian status/consent and exact mock search contracts; broader behavioral inventory remains incomplete",
   "inventory_source": "Verified compiled artifacts from CI run 35500460442, checkout d2554cd7f1b22e3c706660c390867b9203c6c7aa",
   "contracts": [
     {
@@ -484,6 +484,178 @@
             "ci-does-not-grant-consent",
             "refusal-unchanged",
             "exact-installed-versions",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.records.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "canonical-and-s-alias-exact-records"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "debug CLI with isolated mock native-backend selection; not native package transactions; does not certify AUR filtering or human detailed/quiet output",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "canonical-and-s-alias-exact-records",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.query.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search <query>",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "case-insensitive-exact-prefix-word-ranking"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "debug CLI with isolated mock native-backend selection; not native package transactions; does not certify AUR filtering or human detailed/quiet output",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "case-insensitive-exact-prefix-word-ranking",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.limit.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search --limit",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "limits-zero-one-two-and-over-result-count"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "debug CLI with isolated mock native-backend selection; not native package transactions; does not certify AUR filtering or human detailed/quiet output",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "limits-zero-one-two-and-over-result-count",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.json.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search --json",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "single-json-array-exact-names-versions-sources"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "debug CLI with isolated mock native-backend selection; not native package transactions; does not certify AUR filtering or human detailed/quiet output",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "single-json-array-exact-names-versions-sources",
+            "package-state-byte-identical",
             "fixture-cleanup"
           ]
         }

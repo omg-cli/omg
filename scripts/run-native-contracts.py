@@ -25,7 +25,8 @@ require = COVERAGE.require
 
 
 BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
-    'test_cli_status_shows_debian_info', 'test_cli_debian_respects_ci_mode'))
+    'test_cli_status_shows_debian_info', 'test_cli_debian_respects_ci_mode')) | frozenset({
+    'omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state'})
 
 
 def parser_receipts(manifest, provenance, report):
@@ -36,12 +37,12 @@ def behavior_receipts(manifest, provenance, report):
     return execution_receipts(manifest, provenance, report, behavior=True)
 
 
-def behavior_subjects(listing, root):
+def behavior_subjects(listing, root, suite_name='omg::debian_e2e_tests'):
     """Resolve the same package's child executables, never its parser harness."""
     meta = listing['rust-build-meta']
     target = Path(meta['target-directory']).resolve(strict=True)
     require(target.is_relative_to(root.resolve()), 'target directory escapes checkout')
-    suite = listing['rust-suites']['omg::debian_e2e_tests']
+    suite = listing['rust-suites'][suite_name]
     subjects = {'harness': Path(suite['binary-path'])}
     for row in meta['non-test-binaries'][suite['package-id']]:
         if row['name'] not in ('omg', 'omgd'):
@@ -57,6 +58,27 @@ def behavior_subjects(listing, root):
         require(path.is_file() and not path.is_symlink()
                 and path.resolve(strict=True).is_relative_to(target), 'unsafe behavior executable')
     return subjects
+
+
+def mapped_behavior_subjects(manifest, provenance, listing, root):
+    """Bind every reviewed owning harness, refusing foreign product pairs."""
+    suites = set()
+    for contract in manifest['contracts']:
+        if COVERAGE.applies(contract, provenance):
+            for binding in contract['tests']:
+                if binding['lane'] == 'native-cli-fixture':
+                    require(binding['id'] in BEHAVIOR_TESTS, 'unreviewed behavior test')
+                    suites.add(binding['id'].rsplit('::', 1)[0])
+    combined = {}
+    for suite in sorted(suites):
+        require(suite in listing['rust-suites'], 'missing owning behavior harness')
+        subjects = behavior_subjects(listing, root, suite)
+        for name in ('omg', 'omgd'):
+            require(name not in combined or combined[name] == subjects[name],
+                    'behavior harnesses use different product executables')
+            combined[name] = subjects[name]
+        combined['harness:' + suite] = subjects['harness']
+    return combined
 
 
 def execution_receipts(manifest, provenance, report, *, behavior):
@@ -199,8 +221,7 @@ def main():
             'features': sorted(features), 'lane': 'native-parser',
         }
         write_json(evidence / 'provenance.json', provenance)
-        behavior_paths = (behavior_subjects(listing, Path.cwd())
-                          if 'omg::debian_e2e_tests' in listing['rust-suites'] else {})
+        behavior_paths = mapped_behavior_subjects(manifest, provenance, listing, Path.cwd())
         behavior_hashes = {name: sha256_file(path) for name, path in behavior_paths.items()}
         behavior_directory = evidence / 'behavior'
         behavior_directory.mkdir(exist_ok=True)
@@ -238,7 +259,9 @@ def main():
                         for name, path in behavior_paths.items()), 'behavior executable changed during execution')
             behavior_provenance = dict(provenance, lane='native-cli-fixture', subject_kind='debug-cli-mock-backend',
                                        binaries={name: behavior_hashes[name] for name in ('omg', 'omgd')},
-                                       harness_sha256=behavior_hashes['harness'])
+                                       harnesses_sha256={name.removeprefix('harness:'): value
+                                                        for name, value in behavior_hashes.items()
+                                                        if name.startswith('harness:')})
             behavior_provenance['recipe_sha256'] = hashlib.sha256(json.dumps(
                 {'recipe': recipe, 'subjects': behavior_hashes}, sort_keys=True,
                 separators=(',', ':')).encode()).hexdigest()
