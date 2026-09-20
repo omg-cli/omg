@@ -149,6 +149,19 @@ def check_surface_digests(manifest, surfaces, provenance):
         require(actual == selected[surface['binary']], 'compiled surface digest changed; review inventory')
 
 
+def expand_gaps(records):
+    require(isinstance(records, list), 'invalid gap inventory')
+    for record in records:
+        require(isinstance(record, dict), 'invalid gap record')
+        require(('surface' in record) != ('surfaces' in record), 'ambiguous gap surface')
+        if 'surface' in record:
+            yield record
+        else:
+            for surface in sorted(strings(record['surfaces'])):
+                yield {**{key: value for key, value in record.items() if key != 'surfaces'},
+                       'surface': surface}
+
+
 def admit(manifest, surfaces, receipts, provenance, required_contracts):
     schema(manifest)
     schema(provenance)
@@ -163,6 +176,21 @@ def admit(manifest, surfaces, receipts, provenance, required_contracts):
     require(isinstance(binaries, dict) and binaries and set(binaries) <= {'omg', 'omgd'}
             and all(digest(value, 64) for value in binaries.values()), 'invalid binary provenance')
     observed = surface_ids(surfaces, provenance)
+    interfaces = manifest.get('interfaces', [])
+    require(isinstance(interfaces, list), 'invalid non-CLI interface inventory')
+    interface_owners = {}
+    interface_ids = set()
+    for interface in interfaces:
+        require(isinstance(interface, dict) and text(interface.get('id'))
+                and text(interface.get('source')) and text(interface.get('binary')),
+                'unowned non-CLI interface')
+        identity = interface['id']
+        require(identity not in interface_ids and ':' in identity, 'duplicate or invalid non-CLI interface')
+        interface_ids.add(identity)
+        if applies(interface, provenance):
+            require(interface['binary'] in binaries and identity not in observed, 'foreign interface binary')
+            observed.add(identity)
+            interface_owners[identity] = interface
     required = strings(required_contracts)
     records = manifest.get('contracts')
     require(isinstance(records, list), 'invalid contract manifest')
@@ -182,13 +210,17 @@ def admit(manifest, surfaces, receipts, provenance, required_contracts):
             strings(values)
         if applies(contract, provenance):
             require(text(contract.get('binary')) and contract['binary'] in binaries, 'unknown contract binary')
-            require(contract['surface'] == contract['binary']
-                    or contract['surface'].startswith(contract['binary'] + ' '), 'foreign contract surface')
+            if contract['surface'] in interface_owners:
+                owner = interface_owners[contract['surface']]
+                require(contract['binary'] == owner['binary'] and contract['source'] == owner['source'],
+                        'non-CLI interface owner mismatch')
+            else:
+                require(contract['surface'] == contract['binary']
+                        or contract['surface'].startswith(contract['binary'] + ' '), 'foreign contract surface')
             require(contract['surface'] in observed, 'stale contract surface')
             relevant[identity] = contract
             mapped.add(contract['surface'])
-    gaps = manifest.get('gaps', [])
-    require(isinstance(gaps, list), 'invalid gap inventory')
+    gaps = expand_gaps(manifest.get('gaps', []))
     current_gaps = []
     gap_keys = set()
     for gap in gaps:
@@ -234,7 +266,10 @@ def admit(manifest, surfaces, receipts, provenance, required_contracts):
         binary = row.get('binary')
         require(binary == contract['binary'] and row.get('binary_sha256') == binaries[binary], 'binary identity mismatch')
         attempt = row.get('attempt')
-        require(type(attempt) is int and 1 <= attempt <= 100, 'invalid execution attempt')
+        attempt_count = row.get('attempt_count')
+        require(type(attempt_count) is int and 1 <= attempt_count <= 100,
+                'missing execution completion count')
+        require(type(attempt) is int and 1 <= attempt <= attempt_count, 'invalid execution attempt')
         executions = attempts.setdefault(key, {})
         require(attempt not in executions, 'duplicate execution attempt')
         result = row.get('result')
@@ -255,6 +290,9 @@ def admit(manifest, surfaces, receipts, provenance, required_contracts):
     require(set(attempts) == set(expected), 'missing expected test execution')
     outcomes = {}
     for key, executions in attempts.items():
+        totals = {row['attempt_count'] for row in executions.values()}
+        require(len(totals) == 1 and len(executions) == next(iter(totals)),
+                'incomplete or inconsistent execution history')
         require(set(executions) == set(range(1, len(executions) + 1)), 'missing execution attempt')
         rows = [executions[index] for index in range(1, len(executions) + 1)]
         considered = rows if relevant[key[0]]['critical'] else rows[-1:]

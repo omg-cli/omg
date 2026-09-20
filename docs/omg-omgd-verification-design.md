@@ -21,12 +21,14 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used twenty-six searches requesting five candidates each (130 result slots),
+Exa research used twenty-eight searches requesting five candidates each (140 result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
 Additional implementation searches check concrete Clap reflection APIs and LLVM
-coverage interpretation. Results overlap; these are not 65 distinct verified authorities.
+coverage interpretation and a local Python execution failure. Results overlap;
+these are not distinct verified authorities. The Python search results do not
+establish the cause of the observed local failure.
 Selected primary sources were read and checked against repository code.
 
 | Source | Application here | Limit |

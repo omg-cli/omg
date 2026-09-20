@@ -52,7 +52,7 @@ def fixture():
                 'platform', 'os', 'arch', 'features', 'lane')}
     receipt.update(schema_version=1, contract=contract['id'], binary='omg',
                    binary_sha256=provenance['binaries']['omg'],
-                   test_id='install-dry-run-state', attempt=1, result='PASS',
+                   test_id='install-dry-run-state', attempt=1, attempt_count=1, result='PASS',
                    evidence=['success', 'state'],
                    assertions=['exit-zero', 'database-unchanged'], duration_ms=1,
                    seed=None, cleanup='PASS')
@@ -118,6 +118,7 @@ class ContractAdmission(unittest.TestCase):
 
     def test_first_critical_failure_survives_a_passing_retry(self):
         args = list(fixture())
+        args[2][0]['attempt_count'] = 2
         retry = copy.deepcopy(args[2][0])
         retry['attempt'] = 2
         args[2][0]['result'] = 'FAIL'
@@ -191,6 +192,7 @@ class ContractAdmission(unittest.TestCase):
 
     def test_original_failure_details_remain_in_report(self):
         args = list(fixture())
+        args[2][0]['attempt_count'] = 2
         retry = copy.deepcopy(args[2][0])
         retry['attempt'] = 2
         args[2][0].update(result='FAIL', seed='saved-seed')
@@ -198,6 +200,12 @@ class ContractAdmission(unittest.TestCase):
         report = COVERAGE.admit(*args)
         self.assertEqual(report['attempts'][0]['attempts'][0]['result'], 'FAIL')
         self.assertEqual(report['attempts'][0]['attempts'][0]['seed'], 'saved-seed')
+
+    def test_missing_final_attempt_is_not_assumed_to_be_a_clean_run(self):
+        args = list(fixture())
+        args[2][0]['attempt_count'] = 2
+        with self.assertRaises(ValueError):
+            COVERAGE.admit(*args)
 
     def test_existing_option_constraints_cannot_change_without_inventory_review(self):
         args = list(fixture())
@@ -210,6 +218,57 @@ class ContractAdmission(unittest.TestCase):
         args[0]['surface_digests'] = []
         with self.assertRaises(ValueError):
             COVERAGE.admit(*args)
+
+    def test_non_cli_contract_requires_an_explicit_owned_interface(self):
+        args = list(fixture())
+        contract = args[0]['contracts'][0]
+        args[0]['gaps'].append({
+            'surface': contract['surface'], 'platforms': ['arch'], 'owner': 'cli',
+            'reason': 'not mapped', 'missing': ['success', 'state'],
+        })
+        contract.update(surface='config:telemetry', source='src/core/config.rs')
+        args[0]['interfaces'] = [{
+            'id': 'config:telemetry', 'binary': 'omg', 'source': 'src/core/config.rs',
+            'platforms': ['arch'],
+        }]
+        self.assertTrue(COVERAGE.admit(*args)['passed'])
+        args[0]['interfaces'].clear()
+        with self.assertRaises(ValueError):
+            COVERAGE.admit(*args)
+
+    def test_grouped_gaps_remain_exact_without_wildcards_or_duplicates(self):
+        args = list(fixture())
+        gap = args[0]['gaps'][0]
+        gap['surfaces'] = [gap.pop('surface')]
+        self.assertEqual(COVERAGE.admit(*args)['counts']['gaps'], 1)
+        gap['surfaces'].append(gap['surfaces'][0])
+        with self.assertRaises(ValueError):
+            COVERAGE.admit(*args)
+
+    def test_large_inventory_reconciles_repeated_feature_owners(self):
+        args = list(fixture())
+        extra = []
+        for index in range(1000):
+            path = f'omg fixture-{index}'
+            args[1][0]['commands'].append({'path': path, 'arguments': [
+                {'id': 'limit', 'long': 'limit', 'short': None, 'index': None}]})
+            extra.extend([path, path + ' --limit'])
+        args[0]['gaps'].append({
+            'surfaces': extra, 'platforms': ['arch'], 'owner': 'fixture',
+            'reason': 'synthetic checker scale test, not product coverage',
+            'missing': ['parser', 'help', 'refusal', 'success', 'state', 'fault', 'concurrency'],
+        })
+        payload = {key: value for key, value in args[1][0].items() if key != 'build'}
+        args[0]['surface_digests'][0]['sha256'] = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+        for features in (['arch', 'license', 'pgp'], ['debian-pure'], [], ['license']) * 3:
+            args[3]['features'] = features
+            args[1][0]['build']['features'] = features
+            args[2][0]['features'] = features
+            args[0]['surface_digests'][0]['features'] = features
+            report = COVERAGE.admit(*args)
+            self.assertTrue(report['passed'])
+            self.assertEqual(report['counts']['gaps'], 2001)
 
 
 class StrictEvidenceReader(unittest.TestCase):

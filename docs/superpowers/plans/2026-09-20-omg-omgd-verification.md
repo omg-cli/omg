@@ -65,7 +65,7 @@ The Rust commands require their native Linux dependencies; Windows policy checks
 
 **Interfaces:** Test helper `surface(command: clap::Command) -> serde_json::Value` recursively returns a sorted `schema_version: 1` document. Each command has canonical path, aliases and hidden status. Each argument has ID, long/short names and aliases, positional index, global/required status, action, arity, possible values, defaults and exposed conflict/group constraints. Explicit parser-case records cover constraints Clap does not expose through stable reflection. No source-text approximation is accepted for the public surface.
 
-- [ ] Add synthetic parser tests with a hidden command, short alias, global flag, positional, default and constrained enum. Verify the exporter fails to exist before implementation.
+- [x] Add synthetic parser tests with a hidden command, short alias, global flag, positional, default and constrained enum. Verify the exporter fails to exist before implementation.
 
 ```rust
 #[test]
@@ -84,12 +84,12 @@ fn surface_includes_hidden_commands_and_short_options() {
 }
 ```
 
-- [ ] Implement traversal after `Command::build()`, using Clap's getters verified against the locked Clap version. Sort only after collecting canonical IDs; reject collisions instead of overwriting them.
-- [ ] Export `omg_lib::cli::Cli::command()` from the integration test and private `Args::command()` from OMGD's own unit-test module. Use `OMG_CONTRACT_SURFACE_OUT` only inside test code to write artifacts; normal test runs need no output directory.
-- [ ] Execute exporters for portable, arch, debian, debian-pure, fedora and macos supported builds. Record OS, architecture and exact feature list in each artifact. Windows must explicitly report OMGD unavailable if it is not built there.
-- [ ] Add parser round-trip cases for canonical/alias/short/long forms, legal boundary values, conflicting options, repeated arguments and `--` forwarding; assert exact parsed values or precise Clap error kinds.
-- [ ] Verify `cargo test --test cli_surface` per supported feature owner; OMGD exporter under `cargo test --bin omgd`. Compare exported surfaces rather than assuming feature sets are identical.
-- [ ] Commit only the exporter, fixtures and platform manifest after the owning checks pass.
+- [x] Implement traversal after `Command::build()`, using Clap's getters verified against the locked Clap version. Sort only after collecting canonical IDs; reject collisions instead of overwriting them.
+- [x] Export `omg_lib::cli::Cli::command()` from the integration test and private `Args::command()` from OMGD's own unit-test module. Use `OMG_CONTRACT_SURFACE_OUT` only inside test code to write artifacts; normal test runs need no output directory.
+- [x] Execute exporters for portable, arch, debian, debian-pure, fedora and macos supported builds. Record OS, architecture and exact feature list in each artifact. Windows must explicitly report OMGD unavailable if it is not built there.
+- [x] Add parser round-trip cases for canonical/alias/short/long forms, legal boundary values, conflicting options, repeated arguments and `--` forwarding; assert exact parsed values or precise Clap error kinds.
+- [x] Verify `cargo test --test cli_surface` per supported feature owner; OMGD exporter under `cargo test --bin omgd`. Compare exported surfaces rather than assuming feature sets are identical.
+- [x] Commit only the exporter, fixtures and platform manifest after the owning checks pass.
 
 ### Task 3: Contract manifest, execution receipts and honest coverage admission
 
