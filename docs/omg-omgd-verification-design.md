@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used fifty-three searches (225 requested result slots),
+Exa research used fifty-four searches (228 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -309,3 +309,15 @@ the overall run. A full harness regression reproduced the classification defect;
 controls require invalid policy evidence and simultaneous harness failures to
 remain harness errors. Live API availability remains an explicit dependency;
 this change does not bypass the failing installation or remove its diagnosis.
+
+### Generated hook lifecycle coverage
+
+The Unix-wide `git_hooks_contract` target now invokes actual Git commits,
+branch and file checkouts, and fast-forward merges after installing the generated
+OMG hooks. Positive and negative assertions check unstaged versus staged lockfile
+warnings, branch versus file checkout notices, merge versus no-op notices, and
+committed/worktree lockfile contents. These supplement the existing manual-hook
+success, exit-23, and signal tests. The six-test target passed locally on Arch,
+Ubuntu, Fedora, and Debian using their respective feature builds. This does not
+cover merge conflicts, every Git configuration, or every generated-hook branch.
+Research: [Git hook invocation contracts](https://git-scm.com/docs/githooks).
