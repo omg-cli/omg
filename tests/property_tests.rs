@@ -17,6 +17,16 @@ use common::assertions::assert_process_completed;
 use common::*;
 use proptest::prelude::*;
 
+// Preserve the ordinary fast-dispatch path for normal queries, while values
+// beginning with '-' must reach the product as data rather than CLI options.
+fn literal_query_args<'a>(command: &'a str, value: &'a str) -> Vec<&'a str> {
+    if value.starts_with('-') {
+        vec![command, "--", value]
+    } else {
+        vec![command, value]
+    }
+}
+
 #[cfg(test)]
 mod process_completion_oracle {
     use crate::common::CommandResult;
@@ -114,7 +124,7 @@ proptest! {
     /// Any string input to search should not crash (excluding null bytes which Command rejects)
     #[test]
     fn prop_search_never_crashes(query in "[^\x00]*") {
-        let result = run_omg(&["search", &query]);
+        let result = run_omg(&literal_query_args("search", &query));
         assert_process_completed(&result);
 
         if result.success && !result.stdout.is_empty() {
@@ -138,7 +148,7 @@ proptest! {
     /// Any string input to info should not crash
     #[test]
     fn prop_info_never_crashes(package in "[a-zA-Z0-9_-]{1,100}") {
-        let result = run_omg(&["info", &package]);
+        let result = run_omg(&literal_query_args("info", &package));
         assert_process_completed(&result);
     }
 
@@ -154,7 +164,7 @@ proptest! {
         path in "[a-z]{1,10}(/[a-z]{1,10}){0,5}"
     ) {
         let input = format!("{prefix}{path}");
-        let result = run_omg(&["info", &input]);
+        let result = run_omg(&literal_query_args("info", &input));
         assert_process_completed(&result);
         // Should not expose system files
         prop_assert!(!result.stdout.contains("/etc/passwd"));
@@ -168,7 +178,7 @@ proptest! {
         word in "[a-z]{1,10}"
     ) {
         let input = format!("{word}{meta}{word}");
-        let result = run_omg(&["search", &input]);
+        let result = run_omg(&literal_query_args("search", &input));
         assert_process_completed(&result);
 
         prop_assert!(!result.stdout.contains("root:"), "Should not leak /etc/passwd");
@@ -227,7 +237,7 @@ proptest! {
         // happens to be set in the test process.
         let canary = format!("canary-{var_name}-must-not-expand");
         let input = format!("${{{var_name}}}");
-        let result = run_omg_with_env(&["search", &input], &[(&var_name, canary.as_str())]);
+        let result = run_omg_with_env(&literal_query_args("search", &input), &[(&var_name, canary.as_str())]);
         assert_process_completed(&result);
         prop_assert!(
             !result.stdout.contains(&canary),
@@ -238,7 +248,7 @@ proptest! {
     /// Unicode inputs should be handled safely
     #[test]
     fn prop_unicode_safe(s in "\\PC{1,50}") {
-        let result = run_omg(&["search", &s]);
+        let result = run_omg(&literal_query_args("search", &s));
         assert_process_completed(&result);
 
         // UTF-8 validity is guaranteed by the harness (`from_utf8_lossy`),
@@ -261,7 +271,7 @@ proptest! {
     #[test]
     fn prop_long_input_handled(len in 100usize..10000) {
         let long_input: String = "a".repeat(len);
-        let result = run_omg(&["search", &long_input]);
+        let result = run_omg(&literal_query_args("search", &long_input));
         assert_process_completed(&result);
 
         prop_assert!(
@@ -604,7 +614,7 @@ proptest! {
     fn prop_package_name_handling(
         name in "[a-z][a-z0-9-]{2,50}"
     ) {
-        let result = run_omg(&["info", &name]);
+        let result = run_omg(&literal_query_args("info", &name));
         assert_process_completed(&result);
     }
 
@@ -615,7 +625,7 @@ proptest! {
         number in 0u32..100
     ) {
         let name = format!("{prefix}{number}");
-        let result = run_omg(&["search", &name]);
+        let result = run_omg(&literal_query_args("search", &name));
         assert_process_completed(&result);
     }
 
@@ -625,7 +635,7 @@ proptest! {
         parts in prop::collection::vec("[a-z]{2,10}", 2..5)
     ) {
         let name = parts.join("-");
-        let result = run_omg(&["info", &name]);
+        let result = run_omg(&literal_query_args("info", &name));
         assert_process_completed(&result);
     }
 }
@@ -637,6 +647,41 @@ proptest! {
 #[cfg(test)]
 mod regression {
     use super::*;
+
+    #[test]
+    fn regression_option_shaped_search_queries_are_literals() {
+        use clap::Parser;
+        use clap::error::ErrorKind;
+        use omg_lib::cli::{Cli, Commands};
+
+        for (value, kind) in [
+            ("-V", ErrorKind::DisplayVersion),
+            ("--version", ErrorKind::DisplayVersion),
+            ("-h", ErrorKind::DisplayHelp),
+            ("--help", ErrorKind::DisplayHelp),
+        ] {
+            let option = Cli::try_parse_from(["omg", "search", value])
+                .expect_err("option requests help or version");
+            assert_eq!(option.kind(), kind);
+            let args = literal_query_args("search", value);
+            let literal = Cli::try_parse_from(std::iter::once("omg").chain(args.iter().copied()))
+                .expect("end-of-options preserves the literal query");
+            let Commands::Search { query, .. } = literal.command else {
+                panic!("expected search command");
+            };
+            assert_eq!(query, value);
+            let result = run_omg(&args);
+            assert_process_completed(&result);
+            assert!(
+                !result.stdout.starts_with("omg-search "),
+                "literal query printed version"
+            );
+            assert!(
+                !result.stdout.contains("Usage:"),
+                "literal query printed help"
+            );
+        }
+    }
 
     #[test]
     fn regression_empty_string_search() {

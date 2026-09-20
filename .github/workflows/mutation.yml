@@ -9,6 +9,8 @@ on:
     paths:
       - tests/exhaustive_cli_matrix.rs
       - tests/integration_suite.rs
+      - tests/property_tests.rs
+      - tests/property_tests.proptest-regressions
       - tests/metrics_tests.rs
       - tests/security_tests.rs
       - src/cli/tea/status_model.rs

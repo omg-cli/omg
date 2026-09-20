@@ -15,6 +15,12 @@ retries = 1
 filter = 'test(=core::usage::tests::concurrent_locked_updates_do_not_lose_counters) | test(=core::usage::tests::locked_sync_timestamp_merge_does_not_lose_concurrent_counters) | test(=core::usage::tests::simultaneous_first_usage_locks_share_one_inode)'
 retries = 0
 
+# Generated counterexamples are regression evidence. A new random run must
+# not turn the first failure into a green result or waste a second campaign.
+[[profile.default.overrides]]
+filter = 'binary(=property_tests)'
+retries = 0
+
 [profile.ci]
 test-threads = "num-cpus"
 fail-fast = false
