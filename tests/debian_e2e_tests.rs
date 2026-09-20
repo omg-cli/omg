@@ -835,6 +835,15 @@ fn test_cli_status_shows_debian_info() {
     result.assert_stdout_contains("2 packages installed");
     result.assert_stdout_contains("2 explicit");
     result.assert_stdout_contains("Not scanned");
+    let updates = result
+        .stdout
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("Updates"))
+        .expect("status must report updates");
+    assert_eq!(
+        updates.split_whitespace().collect::<Vec<_>>(),
+        ["Updates", "1"]
+    );
     assert_no_arch_terms(&result.combined_output(), "Debian status");
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
 
@@ -1007,6 +1016,7 @@ fn test_cli_debian_respects_ci_mode() {
     let data = TempDir::new().expect("temp data dir");
     let mock = omg_lib::package_managers::mock::MockPackageManager::new_in("debian", data.path());
     mock.set_installed_version("curl", "2.0.0").unwrap();
+    mock.set_available_version("git", "3.2.1").unwrap();
     let state_path = data.path().join("mock_state_apt.json");
     let before = std::fs::read(&state_path).unwrap();
     let data_env = [("CI", "1"), ("OMG_DATA_DIR", data.path().to_str().unwrap())];
@@ -1035,11 +1045,7 @@ fn test_cli_debian_respects_ci_mode() {
     let installed = state["installed"].as_object().unwrap();
     assert_eq!(installed.len(), 2);
     assert_eq!(installed["curl"], "2.0.0");
-    assert!(
-        installed["git"]
-            .as_str()
-            .is_some_and(|version| !version.is_empty())
-    );
+    assert_eq!(installed["git"], "3.2.1");
 }
 
 #[test]
