@@ -21,6 +21,11 @@ retries = 0
 filter = 'binary(=property_tests)'
 retries = 0
 
+# Parser inventory and its exact grammar assertions are deterministic gates.
+[[profile.default.overrides]]
+filter = 'binary(=cli_surface) | test(=tests::export_omgd_surface) | test(=tests::socket_parser_preserves_literal_paths_and_rejects_conflicting_repeats)'
+retries = 0
+
 [profile.ci]
 test-threads = "num-cpus"
 fail-fast = false

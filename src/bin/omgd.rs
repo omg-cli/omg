@@ -320,9 +320,62 @@ fn claim_daemon_lock(socket_path: &std::path::Path) -> Result<DaemonClaim> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
+#[path = "../../tests/support/cli_surface.rs"]
+mod cli_surface;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_omgd_surface() {
+        use clap::CommandFactory;
+        let document = cli_surface::surface(Args::command());
+        let root = document["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .find(|entry| entry["path"] == "omgd")
+            .expect("daemon root");
+        let socket = root["arguments"]
+            .as_array()
+            .expect("arguments")
+            .iter()
+            .find(|entry| entry["id"] == "socket")
+            .expect("socket argument");
+        assert_eq!(socket["short"], "s");
+        assert_eq!(socket["long"], "socket");
+        cli_surface::write_artifact("omgd", document);
+    }
+
+    #[test]
+    fn socket_parser_preserves_literal_paths_and_rejects_conflicting_repeats() {
+        use clap::error::ErrorKind;
+        for option in ["-s", "--socket"] {
+            let args = Args::try_parse_from(["omgd", option, "/tmp/a space/omg.sock"]).unwrap();
+            assert_eq!(args.socket, Some(PathBuf::from("/tmp/a space/omg.sock")));
+        }
+        assert!(Args::try_parse_from(["omgd"]).unwrap().socket.is_none());
+        assert_eq!(
+            Args::try_parse_from(["omgd", "--socket"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidValue
+        );
+        assert_eq!(
+            Args::try_parse_from(["omgd", "-s", "one", "--socket", "two"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            Args::try_parse_from(["omgd", "--foreground"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnknownArgument
+        );
+    }
 
     #[test]
     fn lock_claim_rejects_symlink_and_preserves_target() {

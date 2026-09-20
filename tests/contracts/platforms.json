@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "feature_scope": "Explicit public Cargo features; implicit optional-dependency features are resolved by Cargo.lock and the recipe",
+  "owners": [
+    {"id":"portable", "os":"linux", "arch":"x86_64", "features":["license","pgp"], "default_features":false, "workflow":"ci.yml", "job":"portable", "omgd":true},
+    {"id":"debian-pure", "os":"linux", "arch":"x86_64", "features":["debian-pure"], "default_features":false, "workflow":"ci.yml", "job":"portable", "omgd":true},
+    {"id":"arch", "os":"linux", "arch":"x86_64", "features":["arch","license","pgp"], "default_features":false, "workflow":"ci.yml", "job":"linux-matrix", "omgd":true},
+    {"id":"debian", "os":"linux", "arch":"x86_64", "features":["debian","license","pgp"], "default_features":false, "workflow":"ci.yml", "job":"linux-matrix", "omgd":true},
+    {"id":"debian-trixie", "os":"linux", "arch":"x86_64", "features":["debian","license","pgp"], "default_features":false, "workflow":"ci.yml", "job":"linux-matrix", "omgd":true},
+    {"id":"fedora", "os":"linux", "arch":"x86_64", "features":["fedora","license","pgp"], "default_features":false, "workflow":"ci.yml", "job":"linux-matrix", "omgd":true},
+    {"id":"ubuntu", "os":"linux", "arch":"x86_64", "features":["debian","license","pgp"], "default_features":false, "workflow":"ci.yml", "job":"ubuntu", "omgd":true},
+    {"id":"macos", "os":"macos", "arch":"aarch64", "features":["license","macos","pgp"], "default_features":false, "workflow":"ci.yml", "job":"macos", "omgd":true}
+  ],
+  "gaps": [
+    {"id":"windows", "omgd":false, "reason":"Production daemon has only a refusal stub; no Windows CLI execution owner is established"},
+    {"id":"linux-aarch64", "reason":"Conditional QEMU/release lanes exist; compiled parser surface export is not yet owned there"},
+    {"id":"debian-pgp", "reason":"License-off native compile owner exists, but its parser execution is not yet owned; debian-pure provides a distinct license-off parser observation"},
+    {"id":"docker_tests", "reason":"Privileged test feature is not an ordinary platform; execution ownership must be reconciled separately"}
+  ]
+}

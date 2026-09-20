@@ -93,6 +93,10 @@ jobs:
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
+      OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
+      OMG_CONTRACT_PLATFORM: portable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -149,7 +153,22 @@ jobs:
           tool: nextest
 
       - name: Run portable tests
-        run: cargo nextest run --lib --bins --no-default-features --features pgp,license --locked --profile ci
+        run: cargo nextest run --lib --bins --test cli_surface --no-default-features --features pgp,license --locked --profile ci
+
+      - name: Verify pure Debian parser and daemon contracts
+        env:
+          OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces/debian-pure
+          OMG_CONTRACT_PLATFORM: debian-pure
+        run: cargo nextest run --bin omgd --test cli_surface --no-default-features --features debian-pure --locked --profile ci
+
+      - name: Preserve compiled parser surfaces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-surfaces-portable
+          path: target/contract-surfaces/
+          retention-days: 14
+          if-no-files-found: error
 
   #############################################################################
   # STAGE 2: Platform Matrix (Linux containers)
@@ -161,6 +180,10 @@ jobs:
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
+      OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
+      OMG_CONTRACT_PLATFORM: ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
@@ -294,7 +317,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          cargo nextest run --lib --bins --no-default-features --features ${{ matrix.features }} \
+          cargo nextest run --lib --bins --test cli_surface --no-default-features --features ${{ matrix.features }} \
             --locked --profile ci --no-fail-fast
 
       - name: Prepare sandbox regression executable
@@ -364,6 +387,15 @@ jobs:
           name: omg-${{ matrix.platform }}
           path: target/release/omg
           retention-days: 7
+          if-no-files-found: error
+
+      - name: Preserve compiled parser surfaces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-surfaces-${{ matrix.platform }}
+          path: target/contract-surfaces/
+          retention-days: 14
           if-no-files-found: error
 
   sandbox-cancellation:
@@ -593,6 +625,10 @@ jobs:
     if: (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act
     runs-on: macos-14
     timeout-minutes: 30
+    env:
+      OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
+      OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
+      OMG_CONTRACT_PLATFORM: macos
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -628,7 +664,7 @@ jobs:
         run: cargo nextest --version
 
       - name: Run unit tests
-        run: cargo nextest run --lib --bins --no-default-features --features macos,pgp,license --locked --profile ci
+        run: cargo nextest run --lib --bins --test cli_surface --no-default-features --features macos,pgp,license --locked --profile ci
 
       - name: Install Homebrew test packages
         run: |
@@ -650,6 +686,15 @@ jobs:
           path: target/release/omg
           retention-days: 7
 
+      - name: Preserve compiled parser surfaces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-surfaces-macos
+          path: target/contract-surfaces/
+          retention-days: 14
+          if-no-files-found: error
+
   #############################################################################
   # STAGE 2c: Ubuntu (matches the Ubuntu release artifact)
   #############################################################################
@@ -659,6 +704,10 @@ jobs:
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
+      OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
+      OMG_CONTRACT_PLATFORM: ubuntu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -702,7 +751,7 @@ jobs:
         run: cargo nextest --version
 
       - name: Run unit tests
-        run: cargo nextest run --lib --bins --no-default-features --features debian,pgp,license --locked --profile ci
+        run: cargo nextest run --lib --bins --test cli_surface --no-default-features --features debian,pgp,license --locked --profile ci
 
       - name: Verify binary
         run: |
@@ -715,6 +764,15 @@ jobs:
           name: omg-ubuntu
           path: target/release/omg
           retention-days: 7
+          if-no-files-found: error
+
+      - name: Preserve compiled parser surfaces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-surfaces-ubuntu
+          path: target/contract-surfaces/
+          retention-days: 14
           if-no-files-found: error
 
   #############################################################################
