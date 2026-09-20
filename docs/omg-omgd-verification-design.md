@@ -1,9 +1,9 @@
 # OMG and OMGD verification design
 
 Status: user-approved design (2026-09-20), not a claim of implemented coverage.
-CI optimization PR #440 must first pass its final revision. Its portable baseline
-found inherited NVM state leaking into hermetic fixtures; repair that prerequisite
-without ignoring tests or changing the production runtime resolver.
+CI optimization PR #440 must pass its final revision. Its initial portable baseline
+found inherited NVM state leaking into hermetic fixtures; that fixture repair was
+kept separate from subsequent production alias defects demonstrated by regressions.
 
 ## Meaning of complete coverage
 
@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used forty-three searches (195 requested result slots),
+Exa research used forty-five searches (201 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -44,6 +44,8 @@ Selected primary sources were read and checked against repository code.
 | [BuildKit GHA exporter](https://github.com/moby/buildkit/blob/master/cache/remotecache/gha/gha.go) | Do not assume registry-export compression options also apply to GitHub Actions caches | The inspected exporter uses its default compression configuration; unsupported flags are not a measured optimization |
 | [Zstandard environment controls](https://github.com/facebook/zstd/blob/dev/programs/zstd.1.md#environment-variables) and [Actions cache tar commands](https://github.com/actions/toolkit/blob/main/packages/cache/src/internal/tar.ts) | Trial level 6 for newly saved Rust cache archives without invalidating warm keys or changing compiler settings | Higher compression costs CPU; retain only with measured archive-size/save-time evidence and subsequent successful restores |
 | [Docker stage inheritance](https://docs.docker.com/build/building/multi-stage/) | Validate external image digests and local stage references separately | Unknown stage references still require an external digest |
+| [Docker GHA cache](https://docs.docker.com/build/cache/backends/gha/) and [cache management](https://docs.docker.com/build/ci/github-actions/cache/) | Investigate dependency-stage exports to reduce pressure from source-dependent compilation layers | Keep the current max export until measurements justify the storage versus identical-revision rebuild tradeoff; min alone would discard useful intermediate dependencies |
+| [Pinned tool installation](https://github.com/taiki-e/install-action#usage) | Preserve the pinned installer commit, which also pins unspecified tool versions | An omitted explicit tool version is not automatically a floating dependency with this action |
 | [GitHub artifact retention](https://docs.github.com/en/actions/tutorials/store-and-share-data) and [token permissions](https://github.com/github/docs/blob/main/content/actions/tutorials/authenticate-with-github_token.md) | Preserve actionable failure summaries in issues and link bounded artifacts; keep issue writes in the trusted reporter | Artifacts expire and PR execution must not receive issue-write credentials |
 | [GitHub job prerequisites](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-jobs) | One readiness coordinator avoids four idle artifact consumers; each guest still validates the exact binary pair | A shared barrier can increase an individual guest's latency; measure runner time and whole-gate latency separately |
 | [GitHub container shells](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/run-jobs-in-a-container) | Declare Bash explicitly for the native build recipe's Bash conditionals | Tests executing a recipe in Bash must also check the workflow selects that shell; container defaults use sh |

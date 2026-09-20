@@ -1948,6 +1948,49 @@ path = "hostile"
         assert!(resolve_nvm_alias(dir.path(), "lts").unwrap().is_none());
     }
 
+    #[test]
+    fn resolve_nvm_alias_follows_named_chains() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("alias/lts")).unwrap();
+        fs::write(dir.path().join("alias/default"), "lts/jod\n").unwrap();
+        fs::write(dir.path().join("alias/lts/jod"), "v22.14.0\n").unwrap();
+        assert_eq!(
+            resolve_nvm_alias(dir.path(), "default").unwrap().as_deref(),
+            Some("v22.14.0")
+        );
+        dir.close().unwrap();
+    }
+
+    #[test]
+    fn resolve_nvm_alias_strips_comments_and_empty_lines() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("alias")).unwrap();
+        fs::write(
+            dir.path().join("alias/default"),
+            "# selected runtime\n\n v22.14.0 # pinned LTS\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_nvm_alias(dir.path(), "default").unwrap().as_deref(),
+            Some("v22.14.0")
+        );
+        dir.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_nvm_alias_lts_directory_follows_default_alias() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("alias/lts")).unwrap();
+        fs::write(dir.path().join("alias/lts/*"), "lts/jod\n").unwrap();
+        fs::write(dir.path().join("alias/lts/jod"), "v22.14.0\n").unwrap();
+        assert_eq!(
+            resolve_nvm_alias(dir.path(), "lts").unwrap().as_deref(),
+            Some("v22.14.0")
+        );
+        dir.close().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_nvm_alias_symlink_cannot_escape_alias_directory() {

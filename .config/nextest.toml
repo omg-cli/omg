@@ -38,7 +38,7 @@ retries = 0
 
 # Alias cycles and path escapes are deterministic failures, never retryable.
 [[profile.default.overrides]]
-filter = 'test(core::task_runner::tests::resolve_nvm_alias_)'
+filter = 'test(core::task_runner::tests::resolve_nvm_alias_) | test(hooks::tests::resolve_nvm_alias_) | test(=nvm_alias_task_executes_the_selected_node_binary) | test(=nvm_directory_without_executable_node_never_starts_the_task)'
 retries = 0
 
 [profile.ci]
