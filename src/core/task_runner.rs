@@ -1296,7 +1296,7 @@ fn resolve_nvm_alias(nvm_dir: &std::path::Path, alias: &str) -> Result<Option<St
         else {
             return Ok(None);
         };
-        current = next.to_owned();
+        next.clone_into(&mut current);
         resolved_alias = true;
     }
     anyhow::bail!("Nvm alias chain exceeds 64 resolutions")
