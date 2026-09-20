@@ -22,6 +22,30 @@ check_product_output() {
   fi
   if [[ "$code" == 0 ]]; then
     case "$assertion" in
+      hooks-installed|hooks-absent)
+        local hook label hook_path
+        for hook in pre-commit post-checkout post-merge; do
+          hook_path=".git/hooks/$hook"
+          if [[ "$assertion" == hooks-absent ]]; then
+            if [[ -e "$hook_path" || -L "$hook_path" ]]; then
+              printf 'assertion failed: removed hook remains: %s\n' "$hook" >&2; return 1
+            fi
+          else
+            case "$hook" in pre-commit) label=Pre-commit ;; post-checkout) label=Post-checkout ;; post-merge) label=Post-merge ;; esac
+            if [[ ! -f "$hook_path" || -L "$hook_path" || ! -x "$hook_path" ]] \
+              || ! grep -Fxq "# OMG $label Hook" "$hook_path" || ! sh -n "$hook_path"; then
+              printf 'assertion failed: installed hook is missing, invalid, or not executable: %s\n' "$hook" >&2; return 1
+            fi
+          fi
+        done ;;
+      workspace-filtered-output|workspace-all-output)
+        local primary nested expected_nested=0
+        primary=$(grep -Fxc 'smoke-task-ok' "$stdout" || true)
+        nested=$(grep -Fxc 'nested-smoke-task-ok' "$stdout" || true)
+        [[ "$assertion" != workspace-all-output ]] || expected_nested=1
+        if [[ "$primary" != 1 || "$nested" != "$expected_nested" ]]; then
+          printf 'assertion failed: workspace task counts primary=%s nested=%s; expected primary=1 nested=%s\n' "$primary" "$nested" "$expected_nested" >&2; return 1
+        fi ;;
       json-stdout)
         if ! jq -e -s 'length == 1' "$stdout" >/dev/null 2>&1; then
           printf 'assertion failed: stdout is not exactly one JSON document\n' >&2; return 1
@@ -36,6 +60,21 @@ check_product_output() {
   return 0
 }
 # END PRODUCT OUTPUT ORACLE
+# BEGIN ROW LOG
+write_row_log() {
+  local destination=$1 stdout=$2 stderr=$3 identity=$4 verdict=$5
+  {
+    printf 'case=%s verdict=%s\n' "$identity" "$verdict"
+    # The trusted reporter bounds excerpts. Keep the diagnosis ahead of large
+    # JSON/list output, retaining the complete streams for artifact inspection.
+    grep -m 4 '^assertion failed:' "$stderr" || true
+    printf '\nstderr:\n'
+    cat "$stderr"
+    printf '\nstdout:\n'
+    cat "$stdout"
+  } > "$destination"
+}
+# END ROW LOG
 trap 'rc=$?; if [[ "$rc" == 2 ]]; then printf "error: invalid inventory configuration or row %s\n" "${id:-<preflight>}" >&2; fi' EXIT
 
 work=""; distro=""; tiers=""; tag=""; binary=""; tsv=""
@@ -171,7 +210,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|json-stdout|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json) ;; *) exit 2 ;; esac
+  case "$a" in -|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
   row_exit["$id"]="$resolved"; row_targets["$id"]="$tg"; row_assertions["$id"]="$a"
@@ -278,8 +317,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
   remote="set -eu; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
-  remote+="; export NO_COLOR=1 LC_ALL=C PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-ok\n' > Makefile"
+  remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-task-ok\n' > Makefile"
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
+  remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\n' > project/Makefile"
   remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_product_output)"
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
@@ -312,7 +352,6 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   budget=$(( (row_timeout + 5) * (${#chain[@]} + 1) + 15 ))
   timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
   elapsed=$((SECONDS - start))
-  cat "$out/rows/$case.stdout.log" "$out/rows/$case.stderr.log" > "$out/rows/$case.log"
   verdict=HARNESS_ERROR; rc=$transport
   receipt=$(tail -n 1 "$out/rows/$case.stdout.log")
   if [[ "$transport" == 0 && "$receipt" =~ ^OMG_QEMU_RECEIPT:(product|executor|dependency):([0-9]{1,3}):([01])$ ]]; then
@@ -328,6 +367,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       fi
     fi
   fi
+  write_row_log "$out/rows/$case.log" "$out/rows/$case.stdout.log" "$out/rows/$case.stderr.log" "$case" "$verdict"
   record "qemu-$distro-$case" "$verdict" "$rc" "$elapsed"
   if [[ "$verdict" == PASS ]]; then pass=$((pass+1)); else fail=$((fail+1)); fi
   printf 'case=%s exit=%s verdict=%s\n' "$case" "$rc" "$verdict"

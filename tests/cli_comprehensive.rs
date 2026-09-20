@@ -329,12 +329,20 @@ impl TargetExpectations {
 enum Assertion {
     JsonStdout,
     Artifact(String),
+    WorkspaceFilteredOutput,
+    WorkspaceAllOutput,
+    HooksInstalled,
+    HooksAbsent,
 }
 
 impl Assertion {
     fn parse(raw: &str, line_number: usize) -> Self {
         match raw {
             "json-stdout" => Self::JsonStdout,
+            "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
+            "workspace-all-output" => Self::WorkspaceAllOutput,
+            "hooks-installed" => Self::HooksInstalled,
+            "hooks-absent" => Self::HooksAbsent,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -829,6 +837,10 @@ fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
     project.create_file("Makefile", ".PHONY: smoke\nsmoke:\n\t@echo smoke-task-ok\n");
     project.create_file("README.md", "# CLI behavior smoke fixture\n");
     project.create_file("project/README.md", "# Nested audit fixture\n");
+    project.create_file(
+        "project/Makefile",
+        ".PHONY: smoke\nsmoke:\n\t@echo nested-smoke-task-ok\n",
+    );
 
     let pacman_local = project
         .pacman_root
@@ -1004,6 +1016,51 @@ fn behavior_inventory_runs_in_hermetic_state() {
         }
         for assertion in &case.assertions {
             match assertion {
+                Assertion::HooksInstalled | Assertion::HooksAbsent => {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    for (name, label) in [
+                        ("pre-commit", "Pre-commit"),
+                        ("post-checkout", "Post-checkout"),
+                        ("post-merge", "Post-merge"),
+                    ] {
+                        let path = project.path().join(".git/hooks").join(name);
+                        let valid = if matches!(assertion, Assertion::HooksAbsent) {
+                            path.symlink_metadata()
+                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        } else {
+                            let marker = format!("# OMG {label} Hook");
+                            path.symlink_metadata().is_ok_and(|metadata| {
+                                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                            }) && std::fs::read_to_string(&path)
+                                .is_ok_and(|text| text.lines().any(|line| line == marker))
+                                && Command::new("sh")
+                                    .arg("-n")
+                                    .arg(&path)
+                                    .output()
+                                    .is_ok_and(|output| output.status.success())
+                        };
+                        if !valid {
+                            issues.push(format!("hook {name} did not satisfy {assertion:?}"));
+                        }
+                    }
+                }
+                Assertion::WorkspaceFilteredOutput | Assertion::WorkspaceAllOutput => {
+                    let primary = result
+                        .stdout
+                        .lines()
+                        .filter(|line| *line == "smoke-task-ok")
+                        .count();
+                    let nested = result
+                        .stdout
+                        .lines()
+                        .filter(|line| *line == "nested-smoke-task-ok")
+                        .count();
+                    let expected_nested =
+                        usize::from(matches!(assertion, Assertion::WorkspaceAllOutput));
+                    if primary != 1 || nested != expected_nested {
+                        issues.push(format!("workspace task counts primary={primary} nested={nested}; expected primary=1 nested={expected_nested}"));
+                    }
+                }
                 Assertion::JsonStdout => {
                     if serde_json::from_str::<serde_json::Value>(&result.stdout).is_err() {
                         issues.push("JSON output did not parse".to_string());

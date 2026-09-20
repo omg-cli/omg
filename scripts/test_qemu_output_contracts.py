@@ -11,6 +11,24 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    def test_failure_diagnosis_precedes_long_product_output(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        begin = source.index('# BEGIN ROW LOG')
+        end = source.index('# END ROW LOG', begin)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'stdout').write_text('product output\n' * 100, encoding='utf-8', newline='\n')
+            (root / 'stderr').write_text('assertion failed: selected task did not run\n', encoding='utf-8', newline='\n')
+            result = subprocess.run(
+                [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                 source[begin:end] + '\nwrite_row_log row.log stdout stderr fixture FAIL', '_'],
+                cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            log = (root / 'row.log').read_text()
+            self.assertIn('assertion failed: selected task did not run', '\n'.join(log.splitlines()[:12]))
+            self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
+            self.assertEqual(log.count('product output'), 100)
+
     def run_inventory(self, product, rows):
         def shell_path(path):
             value = path.as_posix()
@@ -88,7 +106,7 @@ esac
         self.assertEqual([row['result'] for row in evidence], ['PASS', 'FAIL', 'BLOCKED'])
         self.assertIn('regular JSON document', logs['refuse.log'])
 
-    def run_oracle(self, safety='read', assertion='-', code=0, stdout='', stderr='', artifact=None):
+    def run_oracle(self, safety='read', assertion='-', code=0, stdout='', stderr='', artifact=None, hooks=None):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('# BEGIN PRODUCT OUTPUT ORACLE')
         end = source.index('# END PRODUCT OUTPUT ORACLE', begin)
@@ -99,6 +117,12 @@ esac
             (root / 'stderr').write_text(stderr, encoding='utf-8', newline='\n')
             if artifact is not None:
                 (root / 'manifest.json').write_text(artifact, encoding='utf-8', newline='\n')
+            if hooks is not None:
+                (root / '.git/hooks').mkdir(parents=True)
+                for name, (content, mode) in hooks.items():
+                    path = root / '.git/hooks' / name
+                    path.write_text(content, encoding='utf-8', newline='\n')
+                    path.chmod(mode)
             result = subprocess.run(
                 [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
                  function + '\ncheck_product_output "$@"', '_',
@@ -133,6 +157,51 @@ esac
         for content in ('', 'ok', '{}\n{}', 'notice\n{}'):
             self.assertNotEqual(self.run_oracle(assertion='json-stdout', stdout=content).returncode, 0)
         self.assertEqual(self.run_oracle(assertion='json-stdout', stdout='{"packages":[]}').returncode, 0)
+
+    def test_workspace_filter_requires_selected_task_once_and_excludes_other_task(self):
+        for output in ('', 'nested-smoke-task-ok\n',
+                       'smoke-task-ok\nsmoke-task-ok\n',
+                       'smoke-task-ok\nnested-smoke-task-ok\n'):
+            with self.subTest(output=output):
+                self.assertNotEqual(self.run_oracle(assertion='workspace-filtered-output', stdout=output).returncode, 0)
+        self.assertEqual(self.run_oracle(assertion='workspace-filtered-output', stdout='smoke-task-ok\n').returncode, 0)
+
+    def test_hook_state_rejects_missing_invalid_or_leftover_hooks(self):
+        hooks = {name: (f'#!/bin/sh\n# OMG {label} Hook\nexit 0\n', 0o755)
+                 for name, label in [('pre-commit', 'Pre-commit'), ('post-checkout', 'Post-checkout'), ('post-merge', 'Post-merge')]}
+        self.assertNotEqual(self.run_oracle(assertion='hooks-installed', hooks={}).returncode, 0)
+        self.assertEqual(self.run_oracle(assertion='hooks-installed', hooks=hooks).returncode, 0)
+        for replacement in ('#!/bin/sh\nexit 0\n', '#!/bin/sh\n# OMG Pre-commit Hook\nif\n'):
+            changed = dict(hooks, **{'pre-commit': (replacement, 0o755)})
+            self.assertNotEqual(self.run_oracle(assertion='hooks-installed', hooks=changed).returncode, 0)
+        self.assertNotEqual(self.run_oracle(assertion='hooks-absent', hooks=hooks).returncode, 0)
+        self.assertEqual(self.run_oracle(assertion='hooks-absent', hooks={}).returncode, 0)
+
+    @unittest.skipIf(os.name == 'nt', 'Windows does not model POSIX executable bits')
+    def test_hook_state_rejects_nonexecutable_hooks(self):
+        hooks = {name: (f'#!/bin/sh\n# OMG {label} Hook\nexit 0\n', 0o644)
+                 for name, label in [('pre-commit', 'Pre-commit'), ('post-checkout', 'Post-checkout'), ('post-merge', 'Post-merge')]}
+        self.assertNotEqual(self.run_oracle(assertion='hooks-installed', hooks=hooks).returncode, 0)
+
+    def test_workspace_all_requires_both_tasks_once_without_order_assumption(self):
+        for output in ('', 'smoke-task-ok\n', 'nested-smoke-task-ok\n',
+                       'smoke-task-ok\nnested-smoke-task-ok\nsmoke-task-ok\n'):
+            with self.subTest(output=output):
+                self.assertNotEqual(self.run_oracle(assertion='workspace-all-output', stdout=output).returncode, 0)
+        for output in ('smoke-task-ok\nnested-smoke-task-ok\n', 'nested-smoke-task-ok\nsmoke-task-ok\n'):
+            self.assertEqual(self.run_oracle(assertion='workspace-all-output', stdout=output).returncode, 0)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_inventory_routes_workspace_assertions_instead_of_accepting_exit_zero(self):
+        rows = [
+            'filtered\t["both"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tworkspace-filtered-output\ttempdir-drop',
+            'all\t["both"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tworkspace-all-output\ttempdir-drop',
+            'missing\t["one"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tworkspace-all-output\ttempdir-drop',
+        ]
+        product = 'printf "smoke-task-ok\\n"\nif [[ "$1" == both ]]; then printf "nested-smoke-task-ok\\n"; fi\n'
+        result, evidence, _ = self.run_inventory(product, rows)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual([row['result'] for row in evidence], ['FAIL', 'PASS', 'FAIL'])
 
 
 if __name__ == '__main__':

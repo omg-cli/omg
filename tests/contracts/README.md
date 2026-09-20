@@ -50,6 +50,17 @@ both the guest oracle and the full inventory runner with a local SSH substitute.
 These are output-quality checks, not semantic schema, flag interaction, state-change
 or recovery coverage. Those stronger contracts still require explicit assertions.
 
+The workspace scenarios use two registered projects with distinct task markers.
+Filtered execution requires the selected marker once and the excluded marker zero
+times; sequential and parallel unfiltered execution require both exactly once,
+without relying on output order. This verifies selection and completion, not actual
+parallel overlap or every argument interaction. Git-hook install/force-install rows
+require three regular executable scripts with the expected markers and valid shell
+syntax; uninstall requires their absence. This does not establish hook runtime
+semantics or preservation of user-modified hooks. The native inventory runner uses
+the same assertions. Published inventory policy hashes are retained separately from
+the expanded checkout inventory, so old release evidence is not reinterpreted.
+
 JUnit's skipped-test reporting varies by nextest version. The independent list
 supplies ignored/filtered counts even when no XML row exists. A selected test
 missing from XML is an error. `[omg-skip]` in successful output is counted as
