@@ -1660,6 +1660,171 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omg.runtime.list-installed.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg list",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "all-68-runtimes-active-and-inactive-versions-in-plain-and-json-output",
+          "independent-numeric-and-prerelease-order",
+          "staging-pending-synthetic-file-and-symlink-entries-excluded"
+        ],
+        "state": [
+          "runtime-current-links-payload-markers-and-external-bytes-preserved"
+        ],
+        "refusal": [
+          "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-version directories; not native package transactions; does not certify downloaded payload validity, remote catalogs, vendor-specific version formats or concurrent mutation; permission probe covers a denied versions parent",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomplete_state",
+          "evidence": [
+            "success",
+            "state",
+            "refusal"
+          ],
+          "assertions": [
+            "all-68-runtimes-active-and-inactive-versions-in-plain-and-json-output",
+            "independent-numeric-and-prerelease-order",
+            "staging-pending-synthetic-file-and-symlink-entries-excluded",
+            "runtime-current-links-payload-markers-and-external-bytes-preserved",
+            "fixture-cleanup",
+            "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.list-runtime.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg list <runtime>",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "per-runtime-exact-plain-and-json-lists-and-active-markers",
+          "independent-numeric-and-prerelease-order",
+          "staging-pending-synthetic-file-and-symlink-entries-excluded"
+        ],
+        "state": [
+          "runtime-current-links-payload-markers-and-external-bytes-preserved"
+        ],
+        "refusal": [
+          "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-version directories; not native package transactions; does not certify downloaded payload validity, remote catalogs, vendor-specific version formats or concurrent mutation; permission probe covers a denied versions parent",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomplete_state",
+          "evidence": [
+            "success",
+            "state",
+            "refusal"
+          ],
+          "assertions": [
+            "per-runtime-exact-plain-and-json-lists-and-active-markers",
+            "independent-numeric-and-prerelease-order",
+            "staging-pending-synthetic-file-and-symlink-entries-excluded",
+            "runtime-current-links-payload-markers-and-external-bytes-preserved",
+            "fixture-cleanup",
+            "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.list-json.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg list --json",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-empty-and-populated-json-arrays-and-ls-alias",
+          "independent-numeric-and-prerelease-order",
+          "staging-pending-synthetic-file-and-symlink-entries-excluded"
+        ],
+        "state": [
+          "runtime-current-links-payload-markers-and-external-bytes-preserved"
+        ],
+        "refusal": [
+          "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-version directories; not native package transactions; does not certify downloaded payload validity, remote catalogs, vendor-specific version formats or concurrent mutation; permission probe covers a denied versions parent",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomplete_state",
+          "evidence": [
+            "success",
+            "state",
+            "refusal"
+          ],
+          "assertions": [
+            "exact-empty-and-populated-json-arrays-and-ls-alias",
+            "independent-numeric-and-prerelease-order",
+            "staging-pending-synthetic-file-and-symlink-entries-excluded",
+            "runtime-current-links-payload-markers-and-external-bytes-preserved",
+            "fixture-cleanup",
+            "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

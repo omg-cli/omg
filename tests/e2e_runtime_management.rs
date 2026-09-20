@@ -504,6 +504,182 @@ fn test_list_specific_runtime() {
 }
 
 #[test]
+#[cfg(unix)]
+fn list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomplete_state() {
+    let project = TestProject::new();
+    let names = omg_lib::cli::runtimes::known_runtimes().unwrap();
+    assert_eq!(
+        names.len(),
+        68,
+        "Review installed-list fixtures when the registry changes"
+    );
+    let empty = project.run(&["list", "--json"]);
+    empty.assert_success();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&empty.stdout).unwrap(),
+        serde_json::json!(
+            names
+                .iter()
+                .map(|name| serde_json::json!({"runtime":name,"current":null,"installed":[]}))
+                .collect::<Vec<_>>()
+        )
+    );
+    let external = project.create_dir("external-version");
+    std::fs::write(external.join("sentinel"), b"external bytes").unwrap();
+    let installed = ["1.10.0", "1.10.0-rc.1", "1.9.0"];
+    for runtime in &names {
+        let versions = project.data_dir.path().join("versions").join(runtime);
+        for version in [
+            "1.9.0",
+            "1.10.0-rc.1",
+            "1.10.0",
+            ".staging",
+            "9.0.0",
+            "8.0.0",
+        ] {
+            std::fs::create_dir_all(versions.join(version)).unwrap();
+            std::fs::write(versions.join(version).join("sentinel"), b"fixture bytes").unwrap();
+        }
+        std::fs::write(versions.join("9.0.0/.omg-installing"), b"pending").unwrap();
+        std::fs::write(versions.join("8.0.0/.omg-test-mock"), b"synthetic").unwrap();
+        std::fs::write(versions.join("7.0.0"), b"not a directory").unwrap();
+        std::os::unix::fs::symlink(&external, versions.join("6.0.0")).unwrap();
+        std::os::unix::fs::symlink(versions.join("1.9.0"), versions.join("current")).unwrap();
+        for args in [
+            vec!["list", runtime, "--json"],
+            vec!["--json", "ls", runtime],
+        ] {
+            let result = project.run(&args);
+            result.assert_success();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap(),
+                serde_json::json!({"runtime":runtime,"current":"1.9.0","installed":installed}),
+                "{args:?}"
+            );
+        }
+        let plain = project.run(&["list", runtime]);
+        plain.assert_success();
+        let rows: Vec<_> = plain
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('•'))
+            .collect();
+        assert_eq!(
+            rows,
+            ["• 1.10.0", "• 1.10.0-rc.1", "• 1.9.0 (active)"],
+            "{runtime}"
+        );
+    }
+    let expected: Vec<_> = names
+        .iter()
+        .map(|name| serde_json::json!({"runtime":name,"current":"1.9.0","installed":installed}))
+        .collect();
+    for args in [&["list", "--json"][..], &["--json", "ls"][..]] {
+        let result = project.run(args);
+        result.assert_success();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap(),
+            serde_json::json!(expected)
+        );
+    }
+    let plain = project.run(&["list"]);
+    plain.assert_success();
+    let rows: Vec<_> = plain
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('•'))
+        .collect();
+    let expected: Vec<_> = names
+        .iter()
+        .flat_map(|name| {
+            [
+                format!("• {name} 1.10.0"),
+                format!("• {name} 1.10.0-rc.1"),
+                format!("• {name} 1.9.0 (active)"),
+            ]
+        })
+        .collect();
+    assert_eq!(
+        rows, expected,
+        "all-runtime listing must include inactive installed versions"
+    );
+    for runtime in &names {
+        let versions = project.data_dir.path().join("versions").join(runtime);
+        assert_eq!(
+            std::fs::read_link(versions.join("current")).unwrap(),
+            versions.join("1.9.0")
+        );
+        assert_eq!(
+            std::fs::read_link(versions.join("6.0.0")).unwrap(),
+            external
+        );
+        for version in [
+            "1.9.0",
+            "1.10.0-rc.1",
+            "1.10.0",
+            ".staging",
+            "9.0.0",
+            "8.0.0",
+        ] {
+            assert_eq!(
+                std::fs::read(versions.join(version).join("sentinel")).unwrap(),
+                b"fixture bytes"
+            );
+        }
+        assert_eq!(
+            std::fs::read(versions.join("9.0.0/.omg-installing")).unwrap(),
+            b"pending"
+        );
+        assert_eq!(
+            std::fs::read(versions.join("8.0.0/.omg-test-mock")).unwrap(),
+            b"synthetic"
+        );
+        assert_eq!(
+            std::fs::read(versions.join("7.0.0")).unwrap(),
+            b"not a directory"
+        );
+    }
+    assert_eq!(
+        std::fs::read(external.join("sentinel")).unwrap(),
+        b"external bytes"
+    );
+    // A denied parent prevents even stat() of the runtime directory. Treating
+    // Path::exists() == false as absence would invent a successful empty list.
+    use std::os::unix::fs::PermissionsExt as _;
+    let versions = project.data_dir.path().join("versions");
+    let permissions = std::fs::metadata(&versions).unwrap().permissions();
+    std::fs::set_permissions(&versions, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let denied_runtime = project.run(&["list", "node", "--json"]);
+    let denied_all = project.run(&["--json", "list"]);
+    std::fs::set_permissions(&versions, permissions).unwrap();
+    for denied in [denied_runtime, denied_all] {
+        denied.assert_failure();
+        denied.assert_stderr_contains("Failed to list installed");
+        denied.assert_stderr_contains("Permission denied");
+        assert!(
+            denied.stdout.is_empty(),
+            "failed JSON listing emitted a success payload"
+        );
+    }
+    for runtime in &names {
+        let versions = versions.join(runtime);
+        assert_eq!(
+            std::fs::read_link(versions.join("current")).unwrap(),
+            versions.join("1.9.0")
+        );
+        for version in installed {
+            assert_eq!(
+                std::fs::read(versions.join(version).join("sentinel")).unwrap(),
+                b"fixture bytes"
+            );
+        }
+    }
+    project.close_checked();
+}
+
+#[test]
 fn test_list_available_versions() {
     init_test_env();
     require_network_tests!();

@@ -35,6 +35,8 @@ check_fedora_reason_refusal() {
   # The mount is private to this process tree. Drop all capabilities and return
   # to the guest user's identity before running the actual submitted binary.
   timeout --kill-after=5s 30s sudo -n unshare --mount --propagation private -- bash -euc '
+    chown 0:0 "$1/dnf"
+    chmod 755 "$1/dnf"
     mount --bind "$1/dnf" /usr/bin/dnf
     chown "$3:$4" "$1"
     exec setpriv --reuid="$3" --regid="$4" --clear-groups --no-new-privs \

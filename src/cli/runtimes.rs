@@ -383,30 +383,15 @@ pub fn list_versions_sync(runtime: Option<&str>, json: bool) -> Result<()> {
         ui::print_header("OMG", "Installed runtime versions");
         ui::print_spacer();
 
-        for (name, mgr_version) in [
-            ("Node.js", NodeManager::new().current_version()),
-            ("Python", PythonManager::new().current_version()),
-            ("Rust", RustManager::new().current_version()),
-            ("Go", GoManager::new().current_version()),
-            ("Ruby", RubyManager::new().current_version()),
-            ("Java", JavaManager::new().current_version()),
-            ("Bun", BunManager::new().current_version()),
-            ("Pi", PiManager::new().current_version()),
-            ("Deno", DenoManager::new().current_version()),
-            ("Zig", ZigManager::new().current_version()),
-            (".NET", DotnetManager::new().current_version()),
-            ("Erlang/OTP", ErlangManager::new().current_version()),
-            ("PHP", PhpManager::new().current_version()),
-            ("Swift", SwiftManager::new().current_version()),
-        ] {
-            if let Some(v) = mgr_version {
-                ui::print_list_item(name, Some(&v));
-            }
-        }
-        for tool in crate::runtimes::tool_registry::REGISTRY_TOOLS {
-            let manager = GenericToolManager::for_spec(tool);
-            if let Some(v) = manager.current_version() {
-                ui::print_list_item(tool.name, Some(&v));
+        for runtime in known_runtimes()? {
+            if let Some((installed, current)) = native_version_info(&runtime) {
+                for version in installed
+                    .with_context(|| format!("Failed to list installed {runtime} versions"))?
+                {
+                    let metadata =
+                        (current.as_deref() == Some(version.as_str())).then_some("(active)");
+                    ui::print_list_item(&format!("{runtime} {version}"), metadata);
+                }
             }
         }
     }

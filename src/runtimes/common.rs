@@ -1537,12 +1537,16 @@ pub(crate) fn get_current_version(versions_dir: &Path) -> Option<String> {
 
 /// List installed versions in a directory
 pub(crate) fn list_installed_versions(versions_dir: &Path) -> Result<Vec<String>> {
-    if !versions_dir.exists() {
-        return Ok(Vec::new());
-    }
+    // Query once and preserve access errors: Path::exists() would turn an
+    // unreadable parent into a false, successful empty installation inventory.
+    let entries = match fs::read_dir(versions_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
 
     let mut versions = Vec::new();
-    for entry in fs::read_dir(versions_dir)? {
+    for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         // Skip the "current" symlink and dot-prefixed entries (e.g. staging

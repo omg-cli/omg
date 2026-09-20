@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used seventy-four searches (269 requested result slots),
+Exa research used seventy-six searches (271 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -685,6 +685,40 @@ of downloads, and the test count is not a behavioral coverage percentage.
 The added bounded receipt covers version reporting and preserved state; it
 does not certify executable activation, shell PATH, every pin format or JSON.
 Existing broader gaps remain open.
+
+### Installed-version inventory and inaccessible state
+
+The previous `list` tests mainly checked a header. Exact fixtures across all
+68 runtimes reproduced plain `omg list` omitting inactive installed versions,
+despite its documented all-installed-versions behavior. Plain aggregate output
+now uses the same installed inventory as per-runtime/JSON listing, with
+canonical runtime names and explicit active markers. Independent expected
+versions check numeric and prerelease ordering against
+[SemVer precedence](https://semver.org/spec/v2.0.0.html), plus exact empty and
+populated JSON, `ls`, and exclusion of staging, pending, synthetic, regular-file
+and external-symlink entries. Fixture bytes and links must remain unchanged.
+
+A denied-parent fixture exposed another false empty result: `Path::exists()`
+discarded permission errors before enumeration. Rust documents the
+[difference between absence and an indeterminate existence query](https://doc.rust-lang.org/stable/std/fs/fn.try_exists.html).
+The shared inventory now directly enumerates the directory, accepting only
+NotFound as empty and propagating access errors. Per-runtime and aggregate
+JSON queries must fail with the original permission cause and no success
+payload; the test restores its owned permissions before checking preserved
+state and cleanup. Broader remote catalogs and concurrency remain separate gaps.
+
+### Hosted probe ownership correction
+
+[QEMU run 35544001922](https://github.com/omg-cli/omg/actions/runs/35544001922)
+passed Arch, Ubuntu and Debian, but Fedora's new fault probe failed. OMG correctly
+refused the guest-user-owned injected DNF executable before executing it. The
+initial local driver had created that file as root, so it missed the ownership
+difference. The local reproduction now explicitly models guest ownership and
+reproduces the failure. Privileged namespace setup makes only the injected
+fixture executable root-owned before mounting it; OMG's trust checks remain
+unchanged. The exact probe then reaches the intended DNF failure and passes.
+Both diagnostics remain in the failed run's evidence. The other eight hosted
+workflows passed; this failed QEMU run is not reclassified or retried away.
 
 ### Runtime download connection recovery
 
