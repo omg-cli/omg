@@ -7,6 +7,35 @@
 # TSV `requires` DAG is satisfied naturally. Disposable guests make
 # package/service-mutation rows safe, but they still need --allow-mutations.
 set -euo pipefail
+# BEGIN PRODUCT OUTPUT ORACLE
+# This exact function is sent to the guest and exercised by fault-injection tests.
+check_product_output() {
+  local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5
+  if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
+    printf 'assertion failed: product emitted a panic report\n' >&2; return 1
+  fi
+  if [[ "$safety" == help-boundary ]] && ! grep -Fq 'Usage:' "$stdout"; then
+    printf 'assertion failed: help output lacks Usage\n' >&2; return 1
+  fi
+  if [[ "$code" != 0 ]] && ! grep -q '[^[:space:]]' "$stderr"; then
+    printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
+  fi
+  if [[ "$code" == 0 ]]; then
+    case "$assertion" in
+      json-stdout)
+        if ! jq -e -s 'length == 1' "$stdout" >/dev/null 2>&1; then
+          printf 'assertion failed: stdout is not exactly one JSON document\n' >&2; return 1
+        fi ;;
+      artifact:*)
+        local artifact=${assertion#artifact:}
+        if [[ ! -f "$artifact" || -L "$artifact" ]] || ! jq -e -s 'length == 1' "$artifact" >/dev/null 2>&1; then
+          printf 'assertion failed: artifact %s is not a regular JSON document\n' "$artifact" >&2; return 1
+        fi ;;
+    esac
+  fi
+  return 0
+}
+# END PRODUCT OUTPUT ORACLE
 trap 'rc=$?; if [[ "$rc" == 2 ]]; then printf "error: invalid inventory configuration or row %s\n" "${id:-<preflight>}" >&2; fi' EXIT
 
 work=""; distro=""; tiers=""; tag=""; binary=""; tsv=""
@@ -251,6 +280,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote="set -eu; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
   remote+="; export NO_COLOR=1 LC_ALL=C PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-ok\n' > Makefile"
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_product_output)"
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')
@@ -261,17 +291,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg $quoted_binary $pargs > '$p.prereq.log' 2> '$p.prereq.stderr.log'"
     remote+="; printf 'prereq $p exit=%s\n' \"\$rc\" >&2; cat '$p.prereq.log' '$p.prereq.stderr.log' >&2"
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
-    if [[ "${row_assertions[$p]}" == artifact:* ]]; then
-      remote+="; if [ \"\$rc\" = 0 ] && ! test -s '${row_assertions[$p]#artifact:}'; then printf '\nOMG_QEMU_RECEIPT:dependency:0:1\n'; exit 0; fi"
-    elif [[ "${row_assertions[$p]}" == json-stdout ]]; then
-      remote+="; if [ \"\$rc\" = 0 ] && ! jq -e -s 'length == 1' '$p.prereq.log' >/dev/null 2>&1; then printf '\nOMG_QEMU_RECEIPT:dependency:0:1\n'; exit 0; fi"
-    fi
+    remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
   done
   arg_string=$(quote_args "$args_json")
-  remote+="; run_omg $quoted_binary $arg_string; assertion=0"
-  if [[ "$assertions" == artifact:* ]]; then
-    remote+="; if [ \"\$rc\" = 0 ]; then test -s '${assertions#artifact:}' || assertion=1; fi"
-  fi
+  remote+="; run_omg $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+  remote+="; cat command.stdout.log; cat command.stderr.log >&2"
+  remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log; then assertion=1; fi"
   # A receipt is emitted only after setup and the command complete. SSH
   # transport/tool failures cannot satisfy an expected product refusal.
   remote+="; printf '\nOMG_QEMU_RECEIPT:%s:%s:%s\n' \"\$execution_phase\" \"\$rc\" \"\$assertion\""

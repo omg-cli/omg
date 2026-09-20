@@ -39,6 +39,17 @@ The QEMU inventory/evidence gate and trusted automatic issue reporter remain
 separate and mandatory. Native receipts do not replace their native DB, process,
 filesystem or recovery assertions.
 
+QEMU inventory execution additionally checks each selected product's own output:
+help must contain Usage, an expected failure must explain itself on stderr, panic
+reports cannot satisfy any expected exit, and JSON output/export assertions require
+exactly one valid document. Export artifacts must be regular files. The same checks
+apply to replayed prerequisites, whose failures block dependent cases; a prerequisite's
+diagnostic cannot satisfy the final command's error contract. Assertion diagnostics
+remain in the row logs consumed by failure reporting. Fault-injection tests exercise
+both the guest oracle and the full inventory runner with a local SSH substitute.
+These are output-quality checks, not semantic schema, flag interaction, state-change
+or recovery coverage. Those stronger contracts still require explicit assertions.
+
 JUnit's skipped-test reporting varies by nextest version. The independent list
 supplies ignored/filtered counts even when no XML row exists. A selected test
 missing from XML is an error. `[omg-skip]` in successful output is counted as
