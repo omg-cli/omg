@@ -47,6 +47,11 @@ GUEST_FILES = {
     "inventory-setup.txt", "container-engine.txt", "rust-toolchain.txt",
 }
 GUEST_FILES.update(
+    f"daemon-invalid-{index}.{stream}"
+    for index in range(7)
+    for stream in ("stdout", "stderr")
+)
+GUEST_FILES.update(
     f"{label}-{suffix}"
     for label in ("daemon-direct", "daemon-foreground", "daemon-stopped")
     for suffix in ("explicit.json", "count.txt", "shortcut.txt", "count.json")

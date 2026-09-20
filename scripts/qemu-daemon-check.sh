@@ -151,6 +151,32 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   [[ $(readlink "/proc/$daemon_pid/exe") == "$daemon" ]]
   [[ $(stat -c '%u' "$OMG_SOCKET_PATH") == "$(id -u)" ]]
   [[ $(stat -c '%a' "$OMG_SOCKET_PATH") == 600 ]]
+  # The pre-parser fast paths must reject duplicate Set/SetTrue flags even
+  # when an actual daemon can satisfy the query. Without a daemon, fallback
+  # to Clap can conceal a permissive fast parser.
+  if [[ "$mode" == direct ]]; then
+    invalid_invocations=(
+      'search bash --no-aur --no-aur'
+      'search bash --no-aur --limit 1 --limit 2'
+      's bash --no-aur --limit=1 --limit 2'
+      'info bash -q -q'
+      'info bash -qq'
+      'info bash --quiet -q'
+      'info bash -vqvq'
+    )
+    for index in "${!invalid_invocations[@]}"; do
+      read -r -a invalid_args <<< "${invalid_invocations[$index]}"
+      status=0
+      timeout 15 "$bin" "${invalid_args[@]}" > "$evidence/daemon-invalid-$index.stdout" \
+        2> "$evidence/daemon-invalid-$index.stderr" || status=$?
+      if [[ "$status" != 2 || -s "$evidence/daemon-invalid-$index.stdout" ]] \
+        || ! grep -Fq 'cannot be used multiple times' "$evidence/daemon-invalid-$index.stderr"; then
+        printf 'assertion failed: invalid CLI arguments accepted with daemon running: %s (exit %s)\n' \
+          "${invalid_invocations[$index]}" "$status" >&2
+        exit 1
+      fi
+    done
+  fi
   requests_before=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-status.txt")
   [[ "$requests_before" =~ ^[0-9]+$ ]]
   query_cli "daemon-$mode"

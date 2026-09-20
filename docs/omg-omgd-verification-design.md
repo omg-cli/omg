@@ -753,3 +753,22 @@ four WSL builds. Real Python 3.12.14 installation, exact executable identity and
 checked cleanup also pass on all four with synthetic mode disabled. A subsequent
 hosted revision must still validate the real guest path; local success cannot
 erase the original failure or guarantee upstream availability.
+
+### Read-only fast-path argument parity
+
+An actual Arch daemon exposed a dispatch-dependent grammar bug: repeated
+`search --no-aur` and `--limit` flags returned successful package results while
+those same arguments were rejected without the daemon. `info -q -q` and `-qq`
+also bypassed Clap and printed metadata. The handwritten fast parsers accepted
+repeated Set/SetTrue flags; the normal parser correctly rejects them under
+[Clap's argument-action contract](https://docs.rs/clap/latest/clap/enum.ArgAction.html).
+Fast search now defers duplicate options to Clap, and fast info tracks quiet
+flags across separate and bundled forms while retaining repeatable verbosity.
+
+The QEMU daemon lifecycle harness executes seven invalid invocations against
+the actual running daemon and requires exit 2, empty stdout, and the specific
+duplicate-argument diagnostic. Timeout, unrelated errors, and successful output
+fail the harness. Each command's stdout/stderr is exported from the existing
+bounded guest-evidence allowlist. These grammar checks receive no additional
+behavioral-coverage credit; they prevent a real backend from concealing invalid
+argument acceptance.

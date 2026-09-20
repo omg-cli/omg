@@ -486,12 +486,14 @@ fn try_fast_search(args: &[String]) -> bool {
     let mut query: Option<&str> = None;
     let mut no_aur = false;
     let mut limit: usize = 15;
+    let mut saw_limit = false;
     let mut i = 2usize;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "--no-aur" => no_aur = true,
-            "--limit" => {
+            "--no-aur" if !no_aur => no_aur = true,
+            "--limit" if !saw_limit => {
+                saw_limit = true;
                 i += 1;
                 if i >= args.len() {
                     return false;
@@ -501,7 +503,8 @@ fn try_fast_search(args: &[String]) -> bool {
                 };
                 limit = parsed;
             }
-            s if s.starts_with("--limit=") => {
+            s if s.starts_with("--limit=") && !saw_limit => {
+                saw_limit = true;
                 let Some(parsed) = parse_fast_limit(&s["--limit=".len()..]) else {
                     return false;
                 };
@@ -549,19 +552,24 @@ fn try_fast_info(args: &[String]) -> bool {
 fn info_package_from_fast_args(args: &[String]) -> Option<&str> {
     let mut package = None;
     let mut saw_info = false;
+    let mut saw_quiet = false;
     for token in args.iter().skip(1) {
         if token == "--" {
             return None;
         }
         match token.as_str() {
             "info" if !saw_info => saw_info = true,
-            "-v" | "-q" | "--verbose" | "--quiet" => {}
+            "-v" | "--verbose" => {}
+            "--quiet" if !saw_quiet => saw_quiet = true,
             s if s.starts_with("--") => return None,
             s if s.starts_with('-') => {
-                if s.chars().skip(1).all(|flag| matches!(flag, 'v' | 'q')) {
-                    continue;
+                for flag in s.chars().skip(1) {
+                    match flag {
+                        'v' => {}
+                        'q' if !saw_quiet => saw_quiet = true,
+                        _ => return None,
+                    }
                 }
-                return None;
             }
             s => {
                 if !saw_info || package.is_some() || s.is_empty() {
@@ -1680,6 +1688,30 @@ mod fast_path_tests {
             info_package_from_fast_args(&args(&["omg", "info", "-v"])),
             None
         );
+    }
+
+    #[test]
+    fn info_fast_path_defers_duplicate_quiet_flags_to_clap() {
+        for flags in [
+            vec!["-q", "-q"],
+            vec!["-qq"],
+            vec!["--quiet", "-q"],
+            vec!["-vqvq"],
+        ] {
+            let mut invocation = args(&["omg", "info", "bash"]);
+            invocation.extend(args(&flags));
+            assert_eq!(
+                info_package_from_fast_args(&invocation),
+                None,
+                "{invocation:?}"
+            );
+        }
+        for flag in ["-q", "--quiet", "-vvq", "-qvv"] {
+            assert_eq!(
+                info_package_from_fast_args(&args(&["omg", "info", "bash", flag])),
+                Some("bash")
+            );
+        }
     }
 
     #[test]
