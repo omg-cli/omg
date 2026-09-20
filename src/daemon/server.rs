@@ -115,13 +115,8 @@ pub async fn run(
     socket_path: PathBuf,
 ) -> Result<()> {
     init_audit_logger()?;
-    run_with_status_path(
-        listener,
-        state,
-        socket_path,
-        crate::core::paths::fast_status_path(),
-    )
-    .await
+    let fast_status_path = socket_path.with_file_name("omg.status");
+    run_with_status_path(listener, state, socket_path, fast_status_path).await
 }
 
 async fn write_fast_status_async(
