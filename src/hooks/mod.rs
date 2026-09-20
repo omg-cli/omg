@@ -827,38 +827,10 @@ fn nvm_node_bin(version: &str) -> Result<Option<PathBuf>> {
 }
 
 fn resolve_nvm_alias(nvm_dir: &Path, alias: &str) -> Result<Option<String>> {
-    let relative = Path::new(alias);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return Ok(None);
+    match crate::core::runtime_resolver::resolve_nvm_alias(nvm_dir, alias) {
+        Err(error) if error.is::<crate::core::runtime_resolver::NvmAliasRejection>() => Ok(None),
+        result => result,
     }
-
-    let alias_root = nvm_dir.join("alias");
-    let canonical_root = match alias_root.canonicalize() {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("Failed to resolve nvm alias directory"),
-    };
-    let candidate = alias_root.join(relative);
-    let canonical = match candidate.canonicalize() {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to resolve nvm alias {}", candidate.display()));
-        }
-    };
-    if !canonical.starts_with(&canonical_root) {
-        return Ok(None);
-    }
-    let Some(content) = read_pin_file(&canonical)? else {
-        return Ok(None);
-    };
-    let resolved = content.trim();
-    Ok((!resolved.is_empty()).then(|| resolved.to_string()))
 }
 
 // Runtime resolution helpers

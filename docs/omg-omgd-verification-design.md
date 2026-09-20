@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used forty-five searches (201 requested result slots),
+Exa research used forty-seven searches (207 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -46,6 +46,7 @@ Selected primary sources were read and checked against repository code.
 | [Docker stage inheritance](https://docs.docker.com/build/building/multi-stage/) | Validate external image digests and local stage references separately | Unknown stage references still require an external digest |
 | [Docker GHA cache](https://docs.docker.com/build/cache/backends/gha/) and [cache management](https://docs.docker.com/build/ci/github-actions/cache/) | Investigate dependency-stage exports to reduce pressure from source-dependent compilation layers | Keep the current max export until measurements justify the storage versus identical-revision rebuild tradeoff; min alone would discard useful intermediate dependencies |
 | [Pinned tool installation](https://github.com/taiki-e/install-action#usage) | Preserve the pinned installer commit, which also pins unspecified tool versions | An omitted explicit tool version is not automatically a floating dependency with this action |
+| [which 8.0.5 source archive](https://static.crates.io/crates/which/which-8.0.5.crate) | Check the selected executable path rather than accepting an existing NVM bin directory; inspected finder/checker source after verifying the Cargo.lock SHA-256 | One Exa query returned no results and versioned docs were unavailable; the locked source confirms absolute-path checks without execution, not binary identity or successful startup |
 | [GitHub artifact retention](https://docs.github.com/en/actions/tutorials/store-and-share-data) and [token permissions](https://github.com/github/docs/blob/main/content/actions/tutorials/authenticate-with-github_token.md) | Preserve actionable failure summaries in issues and link bounded artifacts; keep issue writes in the trusted reporter | Artifacts expire and PR execution must not receive issue-write credentials |
 | [GitHub job prerequisites](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-jobs) | One readiness coordinator avoids four idle artifact consumers; each guest still validates the exact binary pair | A shared barrier can increase an individual guest's latency; measure runner time and whole-gate latency separately |
 | [GitHub container shells](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/run-jobs-in-a-container) | Declare Bash explicitly for the native build recipe's Bash conditionals | Tests executing a recipe in Bash must also check the workflow selects that shell; container defaults use sh |
