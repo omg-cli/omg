@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used forty-one searches (189 requested result slots),
+Exa research used forty-three searches (195 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -41,6 +41,8 @@ Selected primary sources were read and checked against repository code.
 | [NVM recursive alias resolver](https://github.com/nvm-sh/nvm/blob/f695512c/nvm.sh) and [cycle tests](https://github.com/nvm-sh/nvm/blob/f695512c/test/fast/Aliases/circular/nvm_resolve_local_alias) | Add offline chained-alias and cycle regressions before changing runtime resolution | Reading a single alias file is not recursive resolution; proposed upstream patches are not evidence of merged behavior |
 | [Tempfile directory permissions](https://docs.rs/tempfile/latest/tempfile/struct.Builder.html#method.permissions) | Create daemon fixture directories explicitly with mode 0700 and validate before binding | TempDir defaults to 0777 filtered by umask; a default temporary directory is not necessarily private |
 | [Proptest shrinking budgets](https://docs.rs/proptest/latest/proptest/test_runner/struct.Config.html#structfield.max_shrink_time) | Bound counterexample minimization separately from generated-case execution when strengthening slow subprocess properties | A shrinking budget does not interrupt a running case; preserve seeds, failure persistence and the original failure |
+| [BuildKit GHA exporter](https://github.com/moby/buildkit/blob/master/cache/remotecache/gha/gha.go) | Do not assume registry-export compression options also apply to GitHub Actions caches | The inspected exporter uses its default compression configuration; unsupported flags are not a measured optimization |
+| [Zstandard environment controls](https://github.com/facebook/zstd/blob/dev/programs/zstd.1.md#environment-variables) and [Actions cache tar commands](https://github.com/actions/toolkit/blob/main/packages/cache/src/internal/tar.ts) | Trial level 6 for newly saved Rust cache archives without invalidating warm keys or changing compiler settings | Higher compression costs CPU; retain only with measured archive-size/save-time evidence and subsequent successful restores |
 | [Docker stage inheritance](https://docs.docker.com/build/building/multi-stage/) | Validate external image digests and local stage references separately | Unknown stage references still require an external digest |
 | [GitHub artifact retention](https://docs.github.com/en/actions/tutorials/store-and-share-data) and [token permissions](https://github.com/github/docs/blob/main/content/actions/tutorials/authenticate-with-github_token.md) | Preserve actionable failure summaries in issues and link bounded artifacts; keep issue writes in the trusted reporter | Artifacts expire and PR execution must not receive issue-write credentials |
 | [GitHub job prerequisites](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-jobs) | One readiness coordinator avoids four idle artifact consumers; each guest still validates the exact binary pair | A shared barrier can increase an individual guest's latency; measure runner time and whole-gate latency separately |

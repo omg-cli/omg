@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1224,17 +1224,82 @@ fn nvm_resolve_version(version: &str) -> Result<Option<String>> {
 }
 
 fn resolve_nvm_alias(nvm_dir: &std::path::Path, alias: &str) -> Result<Option<String>> {
-    let alias_path = nvm_dir.join("alias").join(alias);
-    match std::fs::read_to_string(&alias_path) {
-        Ok(content) => {
-            let resolved = content.trim();
-            Ok((!resolved.is_empty()).then(|| resolved.to_string()))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("Failed to read nvm alias {}", alias_path.display()))
-        }
+    fn validate_alias(alias: &str) -> Result<()> {
+        anyhow::ensure!(
+            !alias.is_empty()
+                && Path::new(alias)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_))),
+            "Invalid nvm alias path {alias:?}"
+        );
+        Ok(())
     }
+
+    validate_alias(alias)?;
+    let alias_directory = nvm_dir.join("alias");
+    let root = match std::fs::canonicalize(&alias_directory) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to resolve nvm alias directory {}",
+                    alias_directory.display()
+                )
+            });
+        }
+    };
+    anyhow::ensure!(
+        root.starts_with(std::fs::canonicalize(nvm_dir)?),
+        "Nvm alias directory escapes its installation directory"
+    );
+
+    let mut current = alias.to_owned();
+    let mut seen = HashSet::new();
+    let mut resolved_alias = false;
+    for _ in 0..64 {
+        validate_alias(&current)?;
+        anyhow::ensure!(
+            seen.insert(current.clone()),
+            "Nvm alias cycle at {current:?}"
+        );
+        let mut alias_path = root.join(&current);
+        // nvm represents its default LTS alias as the literal file alias/lts/*.
+        // Preserve support for an ordinary alias file named lts as well.
+        if current == "lts" && alias_path.is_dir() {
+            alias_path.push("*");
+        }
+        match std::fs::symlink_metadata(&alias_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(resolved_alias.then_some(current));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to inspect nvm alias {}", alias_path.display())
+                });
+            }
+        }
+        let resolved_path = std::fs::canonicalize(&alias_path)
+            .with_context(|| format!("Failed to resolve nvm alias {}", alias_path.display()))?;
+        anyhow::ensure!(
+            resolved_path.starts_with(&root),
+            "Nvm alias escapes its alias directory: {}",
+            alias_path.display()
+        );
+        let content = std::fs::read_to_string(&resolved_path)
+            .with_context(|| format!("Failed to read nvm alias {}", alias_path.display()))?;
+        let Some(next) = content
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or_default().trim())
+            .find(|line| !line.is_empty())
+        else {
+            return Ok(None);
+        };
+        current = next.to_owned();
+        resolved_alias = true;
+    }
+    anyhow::bail!("Nvm alias chain exceeds 64 resolutions")
 }
 
 fn parse_package_manager_name(value: &str) -> Result<String> {
