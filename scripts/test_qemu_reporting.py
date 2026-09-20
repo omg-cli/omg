@@ -4,6 +4,9 @@ import io
 import json
 from pathlib import Path
 import stat
+import os
+import tempfile
+from unittest.mock import patch
 import unittest
 import zipfile
 
@@ -97,10 +100,104 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(REPORT.projection([aggregate], False), [aggregate])
         self.assertEqual(REPORT.projection([aggregate, self.row("PASS")], False), [aggregate])
 
+    def test_failure_overflow_preserves_every_identity_with_bounded_issues(self):
+        failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(26)]
+        selected = REPORT.projection(failures, False)
+        self.assertEqual(selected, failures)
+        issues, catalog = REPORT.bound_issue_updates(selected)
+        self.assertEqual(catalog, failures)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["case_id"], "qemu-matrix-workflow")
+        self.assertEqual(issues[0]["result"], "HARNESS_ERROR")
+
+    def test_issue_limit_boundary_keeps_individual_diagnoses(self):
+        for count in (0, 1, 25):
+            failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(count)]
+            issues, catalog = REPORT.bound_issue_updates(failures)
+            self.assertEqual(issues, failures)
+            self.assertEqual(catalog, failures)
+
+    def test_overflow_cannot_both_open_and_close_aggregate(self):
+        failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(26)]
+        aggregate_pass = dict(self.row("PASS"), case_id="qemu-matrix-workflow", distro="ubuntu")
+        unrelated_pass = dict(self.row("PASS"), case_id="qemu-debian-search", distro="debian")
+        issues, catalog = REPORT.bound_issue_updates(failures + [aggregate_pass, unrelated_pass])
+        self.assertEqual(len(catalog), 26)
+        self.assertEqual(issues[1:], [unrelated_pass])
+
     def test_successful_main_can_still_close_historical_aggregate(self):
         aggregate = dict(self.row("PASS"), case_id="qemu-matrix-workflow", distro="ubuntu")
         self.assertEqual(REPORT.projection([aggregate], True), [aggregate])
         self.assertEqual(REPORT.projection([aggregate], False), [])
+
+    def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
+                           corrupt=False, expired=False, helper_fails=False):
+        run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
+                   head_sha="a" * 40, workflow_id=20, path=".github/workflows/qemu-matrix.yml",
+                   status="completed", event=event_kind, conclusion=conclusion,
+                   head_branch="main", run_started_at="2026-09-20T00:00:00Z")
+        event = dict(repository={"full_name": "owner/repo"}, workflow_run=run)
+        artifact = dict(id=30, name="qemu-evidence-arch", size_in_bytes=100,
+                        created_at=run["run_started_at"], expired=expired)
+        payload = self.archive("run/results.json", "{" if corrupt else json.dumps(rows))
+        calls = []
+        def api(path, *args):
+            if path.endswith("/actions/runs/10"):
+                return json.dumps(run)
+            if "/artifacts?" in path:
+                return json.dumps(dict(total_count=1, artifacts=[artifact]))
+            if path.endswith("/artifacts/30/zip"):
+                return payload
+            if path.endswith("/git/ref/heads/main"):
+                return json.dumps(dict(object=dict(sha=run["head_sha"])))
+            if "/jobs?" in path:
+                return json.dumps(dict(jobs=[]))
+            self.fail(f"unexpected API request: {path}")
+        def subprocess_run(argv, **kwargs):
+            calls.append((argv[1], json.loads(Path(argv[2]).read_text())))
+            if helper_fails and argv[1] == "scripts/qa-file-issue.sh":
+                raise REPORT.subprocess.CalledProcessError(1, argv)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            event_path = path / "event.json"
+            event_path.write_text(json.dumps(event))
+            with patch.dict(os.environ, GITHUB_REPOSITORY="owner/repo", GITHUB_EVENT_PATH=str(event_path),
+                            RUNNER_TEMP=directory, GITHUB_RUN_ID="50"), \
+                 patch.object(REPORT, "api", side_effect=api), \
+                 patch.object(REPORT, "canonical_case_ids", return_value={row["case_id"] for row in rows}), \
+                 patch.object(REPORT.subprocess, "run", side_effect=subprocess_run):
+                if helper_fails:
+                    with self.assertRaises(REPORT.subprocess.CalledProcessError):
+                        REPORT.main()
+                else:
+                    self.assertEqual(REPORT.main(), 0)
+            catalog_path = path / "qemu-issue-report/failures.json"
+            return calls, json.loads(catalog_path.read_text()) if catalog_path.exists() else None
+
+    def test_reporter_overflow_reaches_helper_and_preserves_catalog_on_api_failure(self):
+        failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(26)]
+        for helper_fails in (False, True):
+            with self.subTest(helper_fails=helper_fails):
+                calls, catalog = self.run_report_fixture(failures, helper_fails=helper_fails)
+                self.assertEqual(catalog["failures"], failures)
+                self.assertEqual(catalog["source_sha"], "a" * 40)
+                self.assertEqual(catalog["attempt"], 2)
+                self.assertFalse(catalog["evidence_invalid_or_unavailable"])
+                self.assertEqual(len(calls[0][1]), 1)
+                self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-workflow")
+
+    def test_unavailable_evidence_keeps_visible_aggregate(self):
+        for options in (dict(corrupt=True), dict(expired=True)):
+            with self.subTest(options=options):
+                calls, catalog = self.run_report_fixture([self.row()], **options)
+                self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+                self.assertEqual(calls[0][1][0]["result"], "HARNESS_ERROR")
+                self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-workflow")
+
+    def test_cancelled_run_makes_no_issue_updates(self):
+        calls, catalog = self.run_report_fixture([self.row()], conclusion="cancelled")
+        self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
 
     def test_identity_binds_repo_workflow_commit_and_attempt(self):
         live = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,

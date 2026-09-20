@@ -41,3 +41,12 @@ jobs:
           OMG_SMOKE_ENVIRONMENT: qemu-matrix
           OMG_SMOKE_RELEASE: unknown
         run: python3 scripts/report-qemu-workflow.py
+
+      - name: Preserve complete validated failure catalog
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qemu-issue-report
+          path: ${{ runner.temp }}/qemu-issue-report/failures.json
+          if-no-files-found: ignore
+          retention-days: 30

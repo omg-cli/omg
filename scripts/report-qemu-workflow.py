@@ -118,9 +118,27 @@ def projection(rows, successful_main):
            for row in selected.values()):
         selected = {key: row for key, row in selected.items()
                     if row["case_id"] != "qemu-matrix-workflow" or row["result"] not in FAILURES}
-    if sum(row["result"] in FAILURES for row in selected.values()) > 25:
-        raise ValueError("more than 25 failing cases; report workflow aggregate")
     return list(selected.values())
+
+
+def bound_issue_updates(selected):
+    """Bound issue creation without dropping the validated diagnostic catalog."""
+    failures = [row for row in selected if row["result"] in FAILURES]
+    if len(failures) <= 25:
+        return selected, failures
+    aggregate = dict(case_id="qemu-matrix-workflow", distro="ubuntu",
+                     result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
+    passes = [row for row in selected
+              if row["result"] == "PASS" and row["case_id"] != "qemu-matrix-workflow"]
+    return [aggregate, *passes], failures
+
+
+def write_failure_catalog(directory, run, repository, failures, evidence_error):
+    directory.mkdir(parents=True, exist_ok=True)
+    catalog = dict(schema_version=1, repository=repository, run_id=run["id"],
+                   attempt=run["run_attempt"], source_sha=run["head_sha"],
+                   evidence_invalid_or_unavailable=evidence_error, failures=failures)
+    directory.joinpath("failures.json").write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
 
 
 def main():
@@ -189,6 +207,20 @@ def main():
                 if step["conclusion"] not in ("success", "skipped"):
                     name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", step["name"])[:120]
                     details.append(f"  Step {step['number']}: {name} ({step['conclusion']})")
+    selected, failure_catalog = bound_issue_updates(selected)
+    report_directory = Path(os.environ["RUNNER_TEMP"]) / "qemu-issue-report"
+    write_failure_catalog(report_directory, run, repository, failure_catalog, evidence_error)
+    report_run = os.environ["GITHUB_RUN_ID"]
+    if not report_run.isdecimal():
+        raise ValueError("invalid reporter run ID")
+    catalog_note = (
+        f"Validated failing cases: {len(failure_catalog)}. "
+        "Complete identities and observations: qemu-issue-report/failures.json.\n"
+        f"Reporter artifacts: https://github.com/{repository}/actions/runs/{report_run}\n"
+        "Artifact retention requested: 30 days (repository retention limits apply).\n"
+    )
+    if len(failure_catalog) > 25:
+        catalog_note += "More than 25 cases failed; this aggregate bounds issue creation without discarding case evidence.\n"
     with tempfile.TemporaryDirectory() as directory:
         results = Path(directory) / "results.json"
         results.write_text(json.dumps(selected) + "\n")
@@ -201,7 +233,7 @@ def main():
                     f"Observed: {row['result']}, exit {row['exit_code']}, elapsed {row['elapsed_seconds']}s\n"
                     f"Evidence invalid/unavailable: {evidence_error}\n"
                     "Exit status alone does not establish the root cause. Inspect the linked run's logs and artifacts.\n"
-                    + "\n".join(details[:24]) + "\n")
+                    + "\n".join(details[:24]) + "\n" + catalog_note)
         run_url = f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}"
         subprocess.run(["bash", "scripts/qa-file-issue.sh", str(results), "--repo", repository,
                         "--source", "qemu-matrix", "--run-url", run_url], check=True, timeout=180)
