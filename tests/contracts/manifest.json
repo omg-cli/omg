@@ -1161,6 +1161,184 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omg.environment.capture-registry.fixture",
+      "source": "src/core/env/fingerprint.rs",
+      "binary": "omg",
+      "surface": "omg env capture",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "all-68-runtime-map-through-init-capture-export-snapshot"
+        ],
+        "state": [
+          "dry-run-artifacts-and-active-links-preserved"
+        ],
+        "refusal": [
+          "individual-runtime-drift-and-ci-validation-reject-changes"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-runtime fixtures and checked cleanup; not vendor downloads, remote Gist publication, native package transactions or rolling Rust refresh; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::capture_records_every_registered_runtime_and_check_detects_its_drift",
+          "evidence": [
+            "success",
+            "state",
+            "refusal"
+          ],
+          "assertions": [
+            "all-68-runtime-map-through-init-capture-export-snapshot",
+            "dry-run-artifacts-and-active-links-preserved",
+            "individual-runtime-drift-and-ci-validation-reject-changes",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.environment.php-restore.fixture",
+      "source": "src/core/env/fingerprint.rs",
+      "binary": "omg",
+      "surface": "omg snapshot restore",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "installed-php-restored-offline-with-exact-executable-output"
+        ],
+        "state": [
+          "installed-php-payload-preserved"
+        ],
+        "refusal": [
+          "missing-php-executable-fails-with-active-link-preserved"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-runtime fixtures and checked cleanup; not vendor downloads, remote Gist publication, native package transactions or rolling Rust refresh; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::snapshot_restores_installed_php_offline_without_replacing_its_payload",
+          "evidence": [
+            "success",
+            "state",
+            "refusal"
+          ],
+          "assertions": [
+            "installed-php-restored-offline-with-exact-executable-output",
+            "installed-php-payload-preserved",
+            "missing-php-executable-fails-with-active-link-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.environment.registry-restore.fixture",
+      "source": "src/core/env/fingerprint.rs",
+      "binary": "omg",
+      "surface": "omg snapshot restore",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "all-68-installed-runtimes-restored-and-executed"
+        ],
+        "state": [
+          "alternate-installed-payloads-preserved-and-ci-matches"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-runtime fixtures and checked cleanup; not vendor downloads, remote Gist publication, native package transactions or rolling Rust refresh; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::snapshot_restores_all_registered_installed_runtimes_and_executes_selected_payloads",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "all-68-installed-runtimes-restored-and-executed",
+            "alternate-installed-payloads-preserved-and-ci-matches",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.environment.unsupported-capture.fixture",
+      "source": "src/core/env/fingerprint.rs",
+      "binary": "omg",
+      "surface": "omg env capture",
+      "platforms": [
+        "portable",
+        "fedora",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "unsupported-package-backend-specific-error"
+        ],
+        "state": [
+          "absent-and-existing-lockfile-preserved"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-runtime fixtures and checked cleanup; not vendor downloads, remote Gist publication, native package transactions or rolling Rust refresh; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::capture_without_package_backend_refuses_without_creating_or_overwriting_lockfile",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "unsupported-package-backend-specific-error",
+            "absent-and-existing-lockfile-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

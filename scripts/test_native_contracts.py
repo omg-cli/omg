@@ -121,13 +121,16 @@ class NativeReceipts(unittest.TestCase):
             (target / 'debug/runtime-suite').write_bytes(b'runtime harness')
             listing['rust-suites']['omg::e2e_runtime_management'] = {
                 'package-id': 'owning-package', 'binary-path': str(target / 'debug/runtime-suite')}
+            (target / 'debug/env-suite').write_bytes(b'environment harness')
+            listing['rust-suites']['omg::env_lockfile_integrity'] = {
+                'package-id': 'owning-package', 'binary-path': str(target / 'debug/env-suite')}
             manifest, _, _, provenance, _ = fixture()
             manifest['contracts'][0]['tests'] = [
                 {'lane': 'native-cli-fixture', 'id': name} for name in sorted(NATIVE.BEHAVIOR_TESTS)]
             combined = NATIVE.mapped_behavior_subjects(manifest, provenance, listing, root)
             self.assertEqual(set(combined), {'omg', 'omgd',
                 'harness:omg::debian_e2e_tests', 'harness:omg::cli_comprehensive',
-                'harness:omg::e2e_runtime_management'})
+                'harness:omg::e2e_runtime_management', 'harness:omg::env_lockfile_integrity'})
             missing = copy.deepcopy(listing)
             del missing['rust-suites']['omg::cli_comprehensive']
             with self.assertRaisesRegex(ValueError, 'missing owning'):
@@ -208,7 +211,9 @@ class NativeReceipts(unittest.TestCase):
                 'omg.runtime.' + name + '.fixture' for name in (
                     'nvmrc', 'python-pin', 'tool-versions', 'go-mod', 'multi-runtime',
                     'pin-precedence', 'rust-pin', 'rust-pin-locked', 'engines-range', 'which-node',
-                    'uninstall-lifecycle')})
+                    'uninstall-lifecycle')} | {
+                'omg.environment.' + name + '.fixture' for name in (
+                    'capture-registry', 'php-restore', 'registry-restore', 'unsupported-capture')})
         for contract in mapped:
             self.assertTrue(contract['critical'])
             self.assertIn('not native package transactions', contract['scope'])

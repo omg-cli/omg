@@ -32,7 +32,12 @@ BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
         'test_go_mod_version', 'test_multi_runtime_detection', 'test_conflicting_version_files',
         'test_rust_toolchain_toml', 'rust_stable_pin_refuses_a_concurrent_mutation_without_activation',
         'test_package_json_engines', 'test_which_shows_active_runtime',
-        'every_runtime_uninstall_preserves_active_siblings_and_external_state'))
+        'every_runtime_uninstall_preserves_active_siblings_and_external_state')) | frozenset(
+    'omg::env_lockfile_integrity::' + name for name in (
+        'capture_records_every_registered_runtime_and_check_detects_its_drift',
+        'snapshot_restores_installed_php_offline_without_replacing_its_payload',
+        'snapshot_restores_all_registered_installed_runtimes_and_executes_selected_payloads',
+        'capture_without_package_backend_refuses_without_creating_or_overwriting_lockfile'))
 
 
 def parser_receipts(manifest, provenance, report):

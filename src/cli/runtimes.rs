@@ -128,6 +128,16 @@ fn validate_requested_version(runtime: &str, version: &str) -> Result<()> {
 }
 
 pub async fn use_version(runtime: &str, version: Option<&str>) -> Result<()> {
+    select_version(runtime, version, false).await
+}
+
+/// Restore saved state without refreshing an already-installed PHP channel.
+/// Explicit `use` retains PHP's documented rolling-channel refresh behavior.
+pub(crate) async fn restore_version(runtime: &str, version: &str) -> Result<()> {
+    select_version(runtime, Some(version), true).await
+}
+
+async fn select_version(runtime: &str, version: Option<&str>, restoring: bool) -> Result<()> {
     crate::core::security::validate_package_name(runtime)?;
     let runtime = canonical_runtime_name(runtime);
 
@@ -189,9 +199,12 @@ pub async fn use_version(runtime: &str, version: Option<&str>) -> Result<()> {
             install_or_use(&ErlangManager::new(), strip_version_prefix(&version)).await?;
         }
         "php" => {
-            PhpManager::new()
-                .install(strip_version_prefix(&version))
-                .await?;
+            let manager = PhpManager::new();
+            if restoring {
+                install_or_use(&manager, strip_version_prefix(&version)).await?;
+            } else {
+                manager.install(strip_version_prefix(&version)).await?;
+            }
         }
         "swift" => {
             install_or_use(&SwiftManager::new(), strip_version_prefix(&version)).await?;

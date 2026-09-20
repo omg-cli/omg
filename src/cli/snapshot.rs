@@ -376,7 +376,7 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
 
     for (runtime, _, target_ver) in &runtime_changes {
         println!("    Switching {runtime} to {target_ver}...");
-        crate::cli::runtimes::use_version(runtime, Some(target_ver)).await?;
+        crate::cli::runtimes::restore_version(runtime, target_ver).await?;
     }
 
     if has_package_changes {

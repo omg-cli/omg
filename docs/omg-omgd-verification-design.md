@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used sixty-four searches (249 requested result slots),
+Exa research used sixty-six searches (253 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -517,3 +517,38 @@ informs the external-file check; it does not justify a claim about all races.
 This scenario passed on all four WSL builds. Removing the shared active-version
 guard deliberately failed the test; restored production passed the full Arch
 runtime target. Runtime install coverage is not inferred from removal fixtures.
+
+### Complete managed-runtime capture and installed restoration
+
+An exact-map regression exposed that environment capture hardcoded only seven
+of the 68 registered runtime managers. Capture now probes the compiled registry
+in one awaited blocking filesystem pass. The Tokio documentation for
+[blocking tasks](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)
+and [join results](https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html)
+supports the bounded task and explicit error propagation; this is not a measured
+speedup or an injected task-panic test.
+
+The owning integration suite verifies all 68 captured entries, rejects each
+runtime's version drift, and follows the map through default setup, migration
+export, snapshot creation, CI validation and restore planning. Dry runs preserve
+saved bytes and active links. Actual snapshot restoration selects and executes
+all 68 installed fixture payloads and preserves the alternate installations.
+These fixtures prove installed selection, not vendor download correctness.
+
+Following restoration to its dispatcher exposed a second defect: restoring an
+installed PHP channel fetched GitHub releases and failed offline. Saved-state
+restoration now reuses that installed channel, while explicit `use` preserves
+PHP's rolling refresh behavior. The failing offline regression becomes green;
+removing the selected executable still fails with its specific diagnostic and
+preserves the previous active link. The distinction between installed reuse and
+explicit reinstallation is also described in the primary
+[mise use documentation](https://mise.jdx.dev/cli/use.html); OMG's own documented
+PHP behavior determines the implementation here.
+
+Final owning suites passed locally on Arch, Ubuntu and Debian (nine tests each),
+and Fedora (seven tests, including explicit unsupported fingerprinting refusal).
+Fedora/portable/macOS fingerprint capture remains unsupported by the existing
+package-backend contract. Four bounded environment receipts preserve those owner
+boundaries. Remote Gist publication, interactive migration application, rolling
+Rust refresh, real package transactions and broad behavioral inventory gaps are
+not certified by these fixture results.
