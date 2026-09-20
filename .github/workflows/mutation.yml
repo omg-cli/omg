@@ -8,6 +8,8 @@ on:
     branches: [main]
     paths:
       - tests/coverage_15.rs
+      - tests/coverage_4.rs
+      - tests/common/**
       - .github/workflows/mutation.yml
   workflow_dispatch:
     inputs:

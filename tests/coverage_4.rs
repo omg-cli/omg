@@ -83,6 +83,30 @@ fn write_cargo_project(project: &TestProject) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
+fn inherited_nvm_directory_does_not_leak_into_task_fixtures() {
+    // Reproduce hosted runners' NVM_DIR without modifying this test process's
+    // environment (other tests run concurrently).
+    let nvm = tempfile::tempdir().expect("external nvm directory");
+    fs::create_dir_all(nvm.path().join("alias/lts")).expect("external alias directory");
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "npm_extra_args_get_double_dash_separator_before_user_flags",
+            "--nocapture",
+        ])
+        .env("NVM_DIR", nvm.path())
+        .output()
+        .expect("spawn isolated regression probe");
+    assert!(
+        output.status.success(),
+        "host NVM state leaked into fixture:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+#[test]
 fn npm_extra_args_get_double_dash_separator_before_user_flags() {
     // Contract: for npm-detected tasks, user extra args must be preceded by a
     // `--` separator in the spawned argv (`npm run build -- <extra>`), because

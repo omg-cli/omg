@@ -133,3 +133,18 @@ hosted checks remain mandatory. Cache savings remain unmeasured on the final
 revision. The deliberate daily Docker freshness policy is documented above;
 rolling package upgrades in other existing native jobs remain unchanged.
 Broader CLI behavioral coverage is the next phase, not claimed complete here.
+
+## Hosted evidence on d752a841
+
+CI, security audit, release smoke, benchmark and all four x86-64 QEMU guest
+lanes passed. Coverage ran 2,835 tests: 2,834 passed, one bootstrap policy test
+incorrectly rejected a local Docker stage as an unpinned external image.
+The portable mutation baseline exposed inherited runner NVM state in task
+fixtures. Both failures remain blocking until their repairs pass hosted checks.
+
+Docker job attempt 1 took 14m17s cold, including 13m27s image build/cache export;
+attempt 2 on the same revision took 2m08s, including 79s for image build/reuse.
+All ten Docker tests passed on both attempts. This establishes same-revision
+warm reuse only, not source-change or long-term cache performance. Cold cache
+export has a measurable cost; retaining this optimization requires that reuse
+continues to offset it over real subsequent builds.
