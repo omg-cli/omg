@@ -112,7 +112,15 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   requests_after=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
   failed_after=$(awk '/Requests failed:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
   [[ "$requests_after" =~ ^[0-9]+$ && "$failed_after" == 0 ]]
-  [[ "$requests_after" -ge $((requests_before + 4)) ]]
+  # daemon-status itself contributes three requests between snapshots: the
+  # preceding Status plus the following Ping and Metrics. The three explicit
+  # forms use IPC; ec can legitimately read the daemon's binary status cache.
+  # Do not count diagnostic traffic as query coverage or require ec to lose
+  # its zero-IPC fast path once the background worker publishes that cache.
+  if [[ "$requests_after" -lt $((requests_before + 6)) ]]; then
+    printf 'assertion failed: %s queries did not produce enough daemon requests (%s -> %s requests)\n' "$mode" "$requests_before" "$requests_after" >&2
+    exit 1
+  fi
   inode=$(stat -c '%i' "$OMG_SOCKET_PATH")
   # A second direct daemon must fail, not replace the live socket or hang.
   duplicate_status=0
