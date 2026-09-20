@@ -103,12 +103,12 @@ Contract record shape:
 {"id":"omg.install.dry-run","source":"src/cli/args.rs","surface":"omg install --dry-run","platforms":["arch","debian","ubuntu","fedora"],"requires":["success","state"],"tests":[{"lane":"qemu","id":"install-dry-run-state","evidence":["success","state"]}]}
 ```
 
-- [ ] Build minimal valid fixtures for one surface, one contract and one receipt, then test rejection of missing/duplicate/unknown contracts, help substituted for success, stale SHA/digest/recipe, feature mismatch, empty test selection and unapproved skips.
-- [ ] Add a test that a failed first attempt followed by a passing retry remains a blocking critical result. A missing attempt sequence is invalid, not assumed clean.
-- [ ] Implement strict bounded JSON reading using existing evidence-reader conventions; reject symlinks, oversized artifacts and duplicate JSON keys. Reconcile expected and observed sets exactly before computing percentages.
+- [x] Build minimal valid fixtures for one surface, one contract and one receipt, then test rejection of missing/duplicate/unknown contracts, help substituted for success, stale SHA/digest/recipe, feature mismatch, empty test selection and unapproved skips.
+- [x] Add a test that a failed first attempt followed by a passing retry remains a blocking critical result. A missing attempt sequence is invalid, not assumed clean.
+- [x] Implement strict bounded JSON reading using existing evidence-reader conventions; reject symlinks, oversized artifacts and duplicate JSON keys. Reconcile expected and observed sets exactly before computing percentages.
 - [ ] Import existing tests by inspecting their assertions. Help, parser, refusal and success mappings are distinct. Every current unsupported or untested contract gets an explicit gap record with owner and missing evidence; none becomes success by being listed.
-- [ ] Produce a machine-readable report plus a readable table: supported, required, executed, passed, failed, skipped and gaps for each platform and evidence kind. Reject a denominator of zero.
-- [ ] Run `python3 -m unittest discover -s scripts -p 'test_contract_coverage.py'` and existing inventory/export suites. Mutation-probe the checker by dropping an expected receipt and changing one digest; both must fail.
+- [x] Produce a machine-readable report plus a readable table: supported, required, executed, passed, failed, skipped and gaps for each platform and evidence kind. Reject a denominator of zero.
+- [x] Run `python3 -m unittest discover -s scripts -p 'test_contract_coverage.py'` and existing inventory/export suites. Mutation-probe the checker by dropping an expected receipt and changing one digest; both must fail.
 - [ ] Commit the evidence machinery and the truthful initial gap inventory. Initial debt remains visible; new/unmapped interfaces are blocking immediately.
 
 ### Task 4: Give every native feature suite an execution owner
@@ -117,7 +117,7 @@ Contract record shape:
 
 **Interfaces:** Per lane, retain `cargo nextest list --message-format json` output and the run's JUnit/results artifact. `check-test-selection.py` compares expected integration binaries/test IDs against discovered and executed identities. A cfg-disabled binary cannot satisfy its platform contract.
 
-- [ ] Add fixture tests for missing Debian integration binaries, all-filtered selection, duplicated IDs, expected unsupported cases, and a legitimate nonempty selection.
+- [x] Add fixture tests for missing Debian integration binaries, all-filtered selection, duplicated IDs, expected unsupported cases, and a legitimate nonempty selection.
 - [ ] Test a nominally passing result containing `[omg-skip]`: it must not satisfy executed coverage. Preserve successful-test output or structured skip receipts so early-return skips cannot disappear from nextest/JUnit admission. Map system/network/destructive opt-ins to isolated owners explicitly.
 - [ ] Run the existing Debian/debian-pure/Fedora integration files in compatible native owners, preserving the distinction between libapt-backed and pure Rust binaries. Expose environment/dependency failures; do not label them product passes.
 - [ ] Reuse a producer only when toolchain, features, target ABI, profile and instrumentation match. Coverage builds are distinct from uninstrumented release guests.

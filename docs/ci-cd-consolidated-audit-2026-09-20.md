@@ -218,3 +218,39 @@ not proof that every miss was eviction. No paid storage setting was changed.
 documents the default 10 GB limit and eviction behavior;
 [the toolkit implementation](https://github.com/actions/toolkit/blob/main/packages/cache/src/cache.ts)
 enforces the comma and 512-character key restrictions.
+
+## Expanded-suite baseline and producer reuse
+
+All nine workflows pass on `00ce6237`, including [CI](https://github.com/omg-cli/omg/actions/runs/35504747019)
+and [QEMU](https://github.com/omg-cli/omg/actions/runs/35504747101).
+Selecting the previously omitted Debian suites exposed stale oracles and two
+fixture defects: root-run mock commands shared production state paths, and plain
+status bypassed the fixture used by JSON status. Both are repaired without
+changing production root path protections. Assertions now pin package/update
+counts, exact installed versions and unchanged package state after refusal.
+Pure Debian reports 1,462 executed/passing tests, 32 skipped and zero retries;
+those execution counts are not a behavioral coverage percentage.
+
+The QEMU sample before producer reuse used these elapsed job seconds:
+
+| Distro | Staged build | Guest |
+| --- | ---: | ---: |
+| Arch | 408 | 335 |
+| Debian | 343 | 330 |
+| Fedora | 326 | 395 |
+| Ubuntu | 258 | 441 |
+
+The eight jobs consumed 47.27 runner-minutes, excluding preparation/aggregation.
+On the same revision, native CI's release steps completed between 10:24:30 and
+10:27:47 UTC. Four separately waiting consumers could therefore spend roughly
+25 runner-minutes waiting, exceeding the 22.25 minutes used by staged builds.
+This is an estimate from timestamps, not a measured reuse run or a billing claim.
+
+The revised reuse design has one preparation job wait for artifact availability.
+Guests then independently check the API run/attempt, exact recipe, server digest,
+archive digest and both binaries. CI tests remain mandatory. Manual staged builds
+retain their serial tests; automatic runs move those tests to the native owner.
+The shared readiness barrier can delay an individual guest, so the next hosted
+run must measure both total runner time and whole-gate latency. No speedup is
+claimed until that comparison exists. Readiness logs and admission-failure
+diagnostics remain available alongside the trusted QEMU issue-reporting path.

@@ -294,6 +294,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v2-platform-dependencies
+          cache-on-failure: true
           # Never restore across distro ABI or feature contracts. The action
           # additionally keys rustc, Cargo config, lockfiles and compiler flags.
           shared-key: ${{ steps.cache-key.outputs.key }}
@@ -303,11 +304,25 @@ jobs:
       - name: Build release
         env:
           DISTRO: ${{ matrix.platform }}
+          BUILD_IMAGE: ${{ matrix.image }}
+          BUILD_FEATURES: ${{ matrix.features }}
         run: |
-          if [[ "$DISTRO" == arch ]]; then
-            export RUSTFLAGS="-C target-cpu=x86-64-v2"
+          if [[ "$DISTRO" == debian-trixie ]]; then
+            cargo build --release --no-default-features --features "$BUILD_FEATURES" --locked
+          else
+            python3 scripts/native-build-artifact.py build --distro "$DISTRO" \
+              --image "$BUILD_IMAGE" --features "$BUILD_FEATURES" --destination "$RUNNER_TEMP/native-release"
           fi
-          cargo build --release --no-default-features --features ${{ matrix.features }} --locked
+
+      - name: Upload native release pair
+        if: matrix.platform != 'debian-trixie'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-release-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-release/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Platform clippy
         run: |
@@ -323,6 +338,11 @@ jobs:
 
       - name: Run unit tests
         run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
+
+      - name: Run serial library and binary contracts
+        if: matrix.platform != 'debian-trixie'
+        # Preserve the former staged-QEMU libtest owner alongside nextest.
+        run: cargo test --lib --bins --no-default-features --features ${{ matrix.features }} --locked --no-fail-fast -- --test-threads=1
 
       - name: Prepare sandbox regression executable
         if: matrix.platform == 'arch'
@@ -731,9 +751,19 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: "v1-ubuntu-debian"
+          cache-on-failure: true
 
       - name: Build release
-        run: cargo build --release --no-default-features --features debian,pgp,license --locked
+        run: python3 scripts/native-build-artifact.py build --distro ubuntu --image ubuntu-24.04 --features debian,pgp,license --destination "$RUNNER_TEMP/native-release"
+
+      - name: Upload native release pair
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-release-ubuntu-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-release/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Platform clippy
         run: |
@@ -749,6 +779,9 @@ jobs:
 
       - name: Run unit tests
         run: python3 scripts/run-native-contracts.py --features debian,pgp,license
+
+      - name: Run serial library and binary contracts
+        run: cargo test --lib --bins --no-default-features --features debian,pgp,license --locked --no-fail-fast -- --test-threads=1
 
       - name: Verify binary
         run: |

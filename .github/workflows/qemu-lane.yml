@@ -1,8 +1,12 @@
-# One independent x64 build -> guest lane. Same-revision local caller only.
+# One x64 guest lane. Automatic runs reuse native CI; manual staged runs build here.
+# Same-revision local caller only.
 name: QEMU distro lane
 on:
   workflow_call:
     inputs:
+      reuse-ci:
+        default: false
+        type: boolean
       distro:
         required: true
         type: string
@@ -36,7 +40,7 @@ jobs:
 
   build-staged:
     name: "Staged build (${{ inputs.distro }})"
-    if: inputs.staged && inputs.distro != 'ubuntu'
+    if: inputs.staged && !inputs.reuse-ci && inputs.distro != 'ubuntu'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     container:
@@ -109,7 +113,7 @@ jobs:
 
   build-staged-ubuntu:
     name: "Staged build (ubuntu)"
-    if: inputs.staged && inputs.distro == 'ubuntu'
+    if: inputs.staged && !inputs.reuse-ci && inputs.distro == 'ubuntu'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -181,10 +185,14 @@ jobs:
     if: >-
       !cancelled() &&
       ((!inputs.staged && needs.build-staged.result == 'skipped' && needs.build-staged-ubuntu.result == 'skipped') ||
+       (inputs.staged && inputs.reuse-ci && needs.build-staged.result == 'skipped' && needs.build-staged-ubuntu.result == 'skipped') ||
        (inputs.staged && inputs.distro != 'ubuntu' && needs.build-staged.result == 'success' && needs.build-staged-ubuntu.result == 'skipped') ||
        (inputs.staged && inputs.distro == 'ubuntu' && needs.build-staged-ubuntu.result == 'success' && needs.build-staged.result == 'skipped'))
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -245,11 +253,34 @@ jobs:
           ls -l /dev/kvm
 
       - name: Download staged binaries
-        if: inputs.staged
+        if: inputs.staged && !inputs.reuse-ci
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: staged-${{ inputs.distro }}
           path: staged/
+
+      - name: Reuse verified native CI binaries
+        if: inputs.staged && inputs.reuse-ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISTRO: ${{ inputs.distro }}
+          BUILD_IMAGE: ${{ inputs.distro == 'ubuntu' && 'ubuntu-24.04' || inputs.image }}
+          BUILD_FEATURES: ${{ inputs.features }}
+        run: |
+          if python3 scripts/native-build-artifact.py reuse --distro "$DISTRO" \
+            --image "$BUILD_IMAGE" --features "$BUILD_FEATURES" --destination staged --timeout 60 \
+            2>&1 | tee "$RUNNER_TEMP/native-build.log"; then
+            :
+          else
+            rc=$?
+            evidence="$RUNNER_TEMP/qemu-evidence/run-native-build"
+            mkdir -p "$evidence"
+            cp "$RUNNER_TEMP/native-build.log" "$evidence/guest-check.log"
+            python3 scripts/ci-smoke-report.py status --distro "$DISTRO" --case-id "qemu-$DISTRO-lifecycle" --status failure --evidence-dir "$evidence"
+            exit "$rc"
+          fi
+          jq -s '.[0] + {native_build:.[1]}' "$RUNNER_TEMP/qemu-evidence/provenance.json" staged/native-build.json > "$RUNNER_TEMP/qemu-evidence/provenance.next.json"
+          mv "$RUNNER_TEMP/qemu-evidence/provenance.next.json" "$RUNNER_TEMP/qemu-evidence/provenance.json"
 
       - name: Benchmark harness regression checks
         run: |

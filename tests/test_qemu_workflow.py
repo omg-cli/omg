@@ -182,11 +182,13 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertIn("OMG_SMOKE_SENTRY_DSN: ${{ github.event_name != 'pull_request' && secrets.OMG_SMOKE_SENTRY_DSN || '' }}", PARENT)
         self.assertNotIn('secrets: inherit', PARENT)
 
-    def test_each_distro_has_an_independent_build_guest_dependency(self):
+    def test_manual_distro_builds_are_independent_and_automatic_guests_wait_once(self):
         caller = PARENT.split('\n  guest:\n', 1)[1].split('\n  arm-runner-health:', 1)[0]
         self.assertIn('needs: prepare', caller)
         self.assertIn('uses: ./.github/workflows/qemu-lane.yml', caller)
         self.assertNotIn('needs: [prepare, build', caller)
+        self.assertIn('native-build-artifact.py ready', PARENT)
+        self.assertIn('inputs.staged && inputs.reuse-ci', LANE)
         self.assertIn('needs: [build-staged, build-staged-ubuntu]', LANE)
         self.assertIn("inputs.distro != 'ubuntu' && needs.build-staged.result == 'success'", LANE)
         self.assertIn("inputs.distro == 'ubuntu' && needs.build-staged-ubuntu.result == 'success'", LANE)
@@ -208,6 +210,14 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertNotRegex(TEXT, r'(?m)^  GH_TOKEN:')
         for block in re.split(r'(?=^      - )', TEXT, flags=re.M):
             if 'GH_TOKEN:' in block:
+                if any(name in block for name in ('- name: Wait once for native release artifacts',
+                                                  '- name: Reuse verified native CI binaries')):
+                    self.assertIn('GH_TOKEN: ${{ github.token }}', block)
+                    self.assertIn('scripts/native-build-artifact.py', block)
+                    # PR artifact reads are intentional. The guest/coordinator
+                    # must not acquire the trusted reporter's write privileges.
+                    self.assertNotRegex(TEXT, r'(?m)^\s+(?:actions|contents|issues): write\s*$')
+                    continue
                 self.assertTrue(any(name in block for name in (
                     '- name: Resolve selection', '- name: Prepare published release',
                     '- name: File or update failure issues')), block)
