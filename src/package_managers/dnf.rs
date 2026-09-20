@@ -323,21 +323,16 @@ impl DnfPackageManager {
     fn apply_install_reasons(
         packages: &mut [InstalledPackage],
         user_installed: Result<HashSet<String>>,
-    ) {
-        match user_installed {
-            Ok(user_installed) => {
-                for package in packages {
-                    package.reason = if user_installed.contains(&package.name) {
-                        InstallReason::User
-                    } else {
-                        InstallReason::Dependency
-                    };
-                }
-            }
-            Err(error) => {
-                tracing::warn!("Could not load DNF install reasons: {error}");
-            }
+    ) -> Result<()> {
+        let user_installed = user_installed.context("Could not load DNF install reasons")?;
+        for package in packages {
+            package.reason = if user_installed.contains(&package.name) {
+                InstallReason::User
+            } else {
+                InstallReason::Dependency
+            };
         }
+        Ok(())
     }
 
     /// Load installed packages from RPM `SQLite` database
@@ -358,11 +353,11 @@ impl DnfPackageManager {
         Ok(packages)
     }
 
-    async fn apply_current_install_reasons(packages: &mut [InstalledPackage]) {
-        match tokio::task::spawn_blocking(Self::read_user_installed_names).await {
-            Ok(user_installed) => Self::apply_install_reasons(packages, user_installed),
-            Err(error) => tracing::warn!("DNF install-reason worker failed: {error}"),
-        }
+    async fn apply_current_install_reasons(packages: &mut [InstalledPackage]) -> Result<()> {
+        let user_installed = tokio::task::spawn_blocking(Self::read_user_installed_names)
+            .await
+            .context("DNF install-reason worker failed")?;
+        Self::apply_install_reasons(packages, user_installed)
     }
 
     /// Read RPM database, trying `SQLite` first then falling back to subprocess
@@ -1410,7 +1405,7 @@ impl PackageManager for DnfPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<(usize, usize, usize, usize)>> + Send + '_>> {
         Box::pin(async move {
             let mut installed = self.load_installed_packages().await?;
-            Self::apply_current_install_reasons(&mut installed).await;
+            Self::apply_current_install_reasons(&mut installed).await?;
             let total = installed.len();
             let explicit = installed
                 .iter()
@@ -1434,7 +1429,7 @@ impl PackageManager for DnfPackageManager {
     fn list_explicit(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
         Box::pin(async move {
             let mut installed = self.load_installed_packages().await?;
-            Self::apply_current_install_reasons(&mut installed).await;
+            Self::apply_current_install_reasons(&mut installed).await?;
 
             Ok(installed
                 .into_iter()
@@ -2090,12 +2085,34 @@ mod tests {
             reason: InstallReason::Dependency,
         }];
 
-        DnfPackageManager::apply_install_reasons(
+        let error = DnfPackageManager::apply_install_reasons(
             &mut packages,
             Err(anyhow::anyhow!("repoquery unavailable")),
+        )
+        .expect_err(
+            "unavailable install reasons must not become successful zero explicit packages",
         );
+        assert!(format!("{error:#}").contains("repoquery unavailable"));
 
         assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].reason, InstallReason::Dependency);
+        assert_eq!(packages[0].name, "bash");
+        assert_eq!(packages[0].version, "5.2");
+        assert_eq!(packages[0].release, "1.fc42");
+        assert_eq!(packages[0].summary, "GNU shell");
+
+        // A successful empty set is different from an unavailable query.
+        // A later successful observation must still be able to update reasons.
+        DnfPackageManager::apply_install_reasons(
+            &mut packages,
+            Ok(HashSet::from([
+                "bash".to_string(),
+                "not-installed".to_string(),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(packages[0].reason, InstallReason::User);
+        DnfPackageManager::apply_install_reasons(&mut packages, Ok(HashSet::new())).unwrap();
         assert_eq!(packages[0].reason, InstallReason::Dependency);
     }
 

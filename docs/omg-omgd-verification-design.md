@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used seventy-one searches (263 requested result slots),
+Exa research used seventy-two searches (265 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -624,6 +624,24 @@ The 26 reporter tests also verify these specific counter diagnostics reach the
 issue helper with source/attempt identity: exit-zero mismatches remain FAIL;
 BLOCKED native references use the existing HARNESS_ERROR issue projection while
 retaining the reference diagnostic. No synthetic issue is posted.
+
+Following the count path into Fedora's backend exposed another false success:
+installation-reason query errors were logged and discarded, leaving RPM's
+default dependency reasons. That is not an empty successful
+[DNF user-installed selection](https://dnf5.readthedocs.io/en/stable/commands/repoquery.8.html).
+The regression now requires error propagation without changing package records,
+and separately verifies successful empty and populated reason observations.
+Both status and explicit-list backend consumers propagate query/worker errors.
+
+A local Fedora private-mount-namespace probe made DNF fail while running the
+real CLI unprivileged against the real RPM inventory. Before the repair,
+`omg --json status --fast` exited zero with 353 total and zero explicit packages.
+Afterward it exits one, emits no JSON success payload, and retains the injected
+DNF diagnostic. The namespace isolates the replacement executable from the
+host; no packages are changed. Normal daemon-disabled counter queries still
+match native Fedora counts in plain and both JSON flag positions. All 50 DNF
+unit tests, scoped library Clippy and the quick workflow gate pass locally.
+This is local fault evidence, not a new hosted QEMU failure-injection contract.
 
 ### Runtime download connection recovery
 
