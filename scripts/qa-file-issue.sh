@@ -139,8 +139,20 @@ EOF
       errors=$((errors + 1))
     fi
   else
-    # Same run already recorded? Then there is nothing new to say.
-    if gh issue view "$existing" --repo "$repo" --json comments --jq '.comments[].body' 2>/dev/null | grep -Fq "$run_url"; then
+    # The first run is recorded in the issue body, later runs in comments.
+    # Match the complete run line so /runs/12 cannot hide a distinct /runs/1.
+    if jq -e --argjson number "$existing" --arg line "- run: $run_url" \
+        'any(.[]; .number == $number and ((.body // "" | split("\n")) | index($line) != null))' \
+        <<< "$open_issues" >/dev/null; then
+      continue
+    fi
+    # Same run already recorded in a recurrence comment? Nothing new to say.
+    if ! comments=$(gh issue view "$existing" --repo "$repo" --json comments --jq '.comments[].body'); then
+      printf 'warning: failed to read recurrence history for %s\n' "$fingerprint" >&2
+      errors=$((errors + 1))
+      continue
+    fi
+    if grep -Fq "]($run_url)" <<< "$comments"; then
       continue
     fi
     comment=$(printf 'Still failing on [%s](%s): `%s` (exit %s, %ss).' "$run_url" "$run_url" "$result" "$exit_code" "$elapsed")

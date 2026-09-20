@@ -21,11 +21,12 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used ten searches requesting five candidates each (50 result slots),
+Exa research used twelve searches requesting five candidates each (60 result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
-fault injection, NVM alias layout and Docker stage inheritance. Results overlap;
-these are not 50 distinct verified authorities.
+fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
+The additional implementation search checks concrete Clap reflection APIs.
+Results overlap; these are not 60 distinct verified authorities.
 Selected primary sources were read and checked against repository code.
 
 | Source | Application here | Limit |
@@ -34,6 +35,7 @@ Selected primary sources were read and checked against repository code.
 | [Rust child environments](https://doc.rust-lang.org/std/process/struct.Command.html) | Override fixture paths on each child; preserve explicit test overrides | Do not mutate shared process environment in parallel tests |
 | [NVM alias layout](https://github.com/nvm-sh/nvm/blob/master/README.md) | Test real LTS alias directories independently of isolated task fixtures | Fixture isolation does not establish production NVM compatibility |
 | [Docker stage inheritance](https://docs.docker.com/build/building/multi-stage/) | Validate external image digests and local stage references separately | Unknown stage references still require an external digest |
+| [GitHub artifact retention](https://docs.github.com/en/actions/tutorials/store-and-share-data) and [token permissions](https://github.com/github/docs/blob/main/content/actions/tutorials/authenticate-with-github_token.md) | Preserve actionable failure summaries in issues and link bounded artifacts; keep issue writes in the trusted reporter | Artifacts expire and PR execution must not receive issue-write credentials |
 | [Tokio testing](https://tokio.rs/tokio/topics/testing) | Controlled time for isolated async deadline tests; scripted AsyncRead/AsyncWrite failures | Paused Tokio time does not control kernel sockets or external processes |
 | [Tokio shutdown](https://tokio.rs/tokio/topics/shutdown) | Verify signal detection, cancellation propagation and bounded draining separately and together | A signal-delivery test alone does not prove resources were released |
 | [Loom](https://docs.rs/loom/latest/loom/) | Model small synchronization/atomic ownership components where production types can be instrumented | It is not an automatic model checker for the whole Tokio daemon |
@@ -191,6 +193,27 @@ replay minimized property/fuzz failures. Mutate assertion-critical branches to
 prove tests detect wrong results instead of merely reaching code.
 
 ## Acceptance gates and order of implementation
+
+Automatic QEMU failure issues are a required product of the pipeline, not optional
+noise to remove for speed. Preserve the existing trusted reporter, stable issue
+fingerprints, recurrence comments, failure excerpts and runbook links. Expanded
+contracts must retain that path. Critical evidence includes source and binary
+identity, platform/features, scenario/seed, expected versus actual result, safe
+reproduction instructions, cleanup state and logs/artifact links. Keep a bounded,
+redacted diagnosis in the issue because linked artifacts can expire.
+
+Prove reporting behavior with a fake GitHub API/CLI: create on a new failure,
+append on recurrence, deduplicate the same run, preserve distinct failures, track
+a recurrence after closure, and close only after the existing authoritative main
+verification. Missing/corrupt evidence must produce a visible harness diagnosis;
+API failure must fail reporting. More than the per-run issue limit must retain
+all failures in a linked aggregate rather than silently discarding the excess.
+Untrusted PR evidence remains available through checks/artifacts and must not
+gain write credentials. Do not weaken this boundary to increase issue volume.
+
+The user prioritizes broad detection first, then tracked remediation. Coverage
+growth and newly discovered issues are reported together; raw issue count is not
+an effectiveness score and a clean run is not proof that uncovered areas work.
 
 First finish #440's combined validation and record cold/warm costs. Next generate
 the inventories and import existing evidence. Then fail on uncovered new interfaces

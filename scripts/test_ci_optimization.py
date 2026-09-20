@@ -58,7 +58,7 @@ class OptimizationContracts(unittest.TestCase):
 
     def test_mutation_baseline_mode_cannot_weaken_full_score_gate(self):
         text = (WORKFLOWS / 'mutation.yml').read_text()
-        self.assertIn('cargo test --package omg --no-default-features --features pgp,license --locked', text)
+        self.assertIn('cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast', text)
         self.assertIn('if [ "$score" -lt 75 ]', text)
         self.assertIn('exit "$mutants_exit"', text)
         self.assertEqual(text.count("if: github.event_name != 'pull_request' && inputs.baseline-only != true"), 3)

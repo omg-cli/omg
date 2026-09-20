@@ -11,6 +11,7 @@ use common::{CommandResult, TestProject};
 use std::fs;
 use std::path::Path;
 
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
 use omg_lib::core::env::fingerprint::EnvironmentState;
 
 const ACCOUNT_LINK_HINT: &str = "No dashboard account linked";
@@ -218,6 +219,7 @@ fn status_outside_workspace_names_the_missing_workspace() {
 /// Contract: inside a crafted workspace, `status` reports team identity.
 #[test]
 #[serial]
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
 fn team_status_reports_local_workspace_without_an_account() {
     let project = TestProject::new();
     craft_workspace(&project);
@@ -228,6 +230,7 @@ fn team_status_reports_local_workspace_without_an_account() {
 
 #[test]
 #[serial]
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
 fn status_after_join_reports_the_current_remote() {
     let project = TestProject::new();
     craft_workspace(&project);
@@ -247,6 +250,7 @@ fn status_after_join_reports_the_current_remote() {
 /// produced by registering the configured local member.
 #[test]
 #[serial]
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
 fn status_in_workspace_reports_identity_empty_lock_and_member_count() {
     let project = TestProject::new();
     craft_workspace(&project);
@@ -267,6 +271,7 @@ fn status_in_workspace_reports_identity_empty_lock_and_member_count() {
 /// member as in-sync.
 #[test]
 #[serial]
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
 fn push_writes_valid_lockfile_and_records_lock_hash_in_status() {
     let project = TestProject::new();
     craft_workspace(&project);
@@ -311,6 +316,7 @@ fn push_writes_valid_lockfile_and_records_lock_hash_in_status() {
 /// purely local state and reports in-sync with a zero exit code.
 #[test]
 #[serial]
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
 fn pull_after_push_reports_local_sync_success() {
     let project = TestProject::new();
     craft_workspace(&project);
@@ -328,6 +334,7 @@ fn pull_after_push_reports_local_sync_success() {
 /// stdout, and names the `omg env check` diagnostic command.
 #[test]
 #[serial]
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
 fn pull_detects_drift_when_lock_differs_from_environment() {
     let project = TestProject::new();
     craft_workspace(&project);
@@ -358,6 +365,7 @@ fn pull_detects_drift_when_lock_differs_from_environment() {
 /// silently treated as in-sync or as drift.
 #[test]
 #[serial]
+#[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
 fn corrupted_lockfile_fails_pull_loudly_instead_of_reporting_state() {
     let project = TestProject::new();
     craft_workspace(&project);
@@ -375,6 +383,30 @@ fn corrupted_lockfile_fails_pull_loudly_instead_of_reporting_state() {
     res.assert_failure();
     res.assert_stderr_contains("Lockfile integrity check failed");
     res.assert_stderr_contains("stored hash does not match contents");
+}
+
+/// Backend-free builds must refuse fingerprint-dependent operations without
+/// publishing an empty environment or changing the durable team state.
+#[test]
+#[serial]
+#[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
+fn team_fingerprint_operations_without_backend_preserve_workspace() {
+    for operation in ["status", "push", "pull"] {
+        let project = TestProject::new();
+        craft_workspace(&project);
+        let status_path = project.path().join(".omg/team-status.json");
+        let config_path = project.path().join(".omg/team.toml");
+        let original_status = fs::read(&status_path).expect("read original status");
+        let original_config = fs::read(&config_path).expect("read original config");
+        let result = project.run(&["team", operation]);
+        result.assert_failure();
+        result.assert_stderr_contains(
+            "Environment fingerprinting is not available without an Arch or Debian package backend",
+        );
+        assert!(!project.path().join("omg.lock").exists());
+        assert_eq!(fs::read(&status_path).unwrap(), original_status);
+        assert_eq!(fs::read(&config_path).unwrap(), original_config);
+    }
 }
 
 /// Contract: pulling with a remote that is not a gist.github.com URL fails

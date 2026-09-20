@@ -148,3 +148,12 @@ All ten Docker tests passed on both attempts. This establishes same-revision
 warm reuse only, not source-change or long-term cache performance. Cold cache
 export has a measurable cost; retaining this optimization requires that reuse
 continues to offset it over real subsequent builds.
+
+On 47d4295d, a changed build context completed Docker in 6m54s (image step
+6m20s), with the test driver still compiling in one second. This is a more
+representative incremental sample than the same-revision rerun, although the
+production Rust source itself did not change. The NVM fixture regression passed;
+the portable baseline then exposed seven team tests assuming a package backend.
+Their native success contracts are retained; portable builds receive explicit
+unsupported-operation and unchanged-state contracts. Future baseline runs use
+`--no-fail-fast` to collect all failing integration binaries in one run.
