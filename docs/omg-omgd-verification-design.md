@@ -371,3 +371,15 @@ capability sets dropped, querying cached native package metadata. It listed upda
 without installing them. Quick gate: 259 tests, two explicit skips. The previous
 6c07cad6 hosted baseline passed all nine workflows including all four QEMU guests;
 this expanded batch still requires its own hosted validation.
+
+### Exact search-result regression
+
+An additional native CLI fixture now checks exact official package records,
+version strings, exact/prefix/word-boundary ranking, case-insensitive queries,
+`search`/`s`, short limits 0/1/2/9, detailed/short-detailed flags, quiet JSON and
+unchanged package-state bytes. It executes 24 combinations per selected backend.
+The candidate passed on Arch, Ubuntu, Fedora and license-off Debian locally.
+Temporarily disabling the production result truncation in the isolated Arch clone
+made the regression fail on limit zero with three unexpected records; restoring
+the production source made it pass. This is mock-backed query behavior, not AUR
+filtering or native repository metadata coverage.

@@ -44,6 +44,68 @@ fn explicit_shortcut_uses_the_same_isolated_state_as_explicit_count() {
     }
 }
 
+#[test]
+fn search_json_preserves_exact_records_ranking_limits_and_package_state() {
+    let distro = if cfg!(feature = "arch") {
+        "arch"
+    } else if cfg!(feature = "fedora") {
+        "fedora"
+    } else {
+        "debian"
+    };
+    let project = TestProject::for_distro(distro);
+    for (name, version) in [
+        ("qprobe", "1.2.3"),
+        ("qprobe-extra", "2.3.4"),
+        ("addon-qprobe", "3.4.5"),
+        ("unrelated", "4.5.6"),
+    ] {
+        project
+            .mock_available(name, version)
+            .expect("seed query fixture");
+    }
+    let backend = match distro {
+        "arch" => "pacman",
+        "fedora" => "dnf",
+        _ => "apt",
+    };
+    let state = project
+        .data_dir
+        .path()
+        .join(format!("mock_state_{backend}.json"));
+    let before = std::fs::read(&state).expect("fixture state");
+    // Independently specified exact > prefix > word-boundary ordering.
+    let expected = [
+        serde_json::json!({"name":"qprobe","version":"1.2.3","description":"","source":"Official"}),
+        serde_json::json!({"name":"qprobe-extra","version":"2.3.4","description":"","source":"Official"}),
+        serde_json::json!({"name":"addon-qprobe","version":"3.4.5","description":"","source":"Official"}),
+    ];
+    for command in ["search", "s"] {
+        for limit in [0usize, 1, 2, 9] {
+            for flags in [
+                &[][..],
+                &["--detailed", "--no-aur"][..],
+                &["-d", "--quiet"][..],
+            ] {
+                let limit_arg = limit.to_string();
+                let mut args = vec!["--json", command, "QPROBE", "-l", &limit_arg];
+                args.extend_from_slice(flags);
+                let result = project.run(&args);
+                result.assert_success();
+                result.assert_no_ansi();
+                let actual: Vec<serde_json::Value> = serde_json::from_str(&result.stdout)
+                    .expect("stdout must contain only the package JSON array");
+                assert_eq!(actual, expected[..limit.min(expected.len())], "{args:?}");
+                assert_eq!(
+                    std::fs::read(&state).unwrap(),
+                    before,
+                    "search mutated package state: {args:?}"
+                );
+            }
+        }
+    }
+}
+
 fn command_paths() -> Vec<Vec<String>> {
     fn collect(command: &clap::Command, prefix: &mut Vec<String>, paths: &mut Vec<Vec<String>>) {
         for subcommand in command.get_subcommands() {
