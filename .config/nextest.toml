@@ -41,6 +41,11 @@ retries = 0
 filter = 'test(core::task_runner::tests::resolve_nvm_alias_) | test(hooks::tests::resolve_nvm_alias_) | test(=nvm_alias_task_executes_the_selected_node_binary) | test(=nvm_directory_without_executable_node_never_starts_the_task)'
 retries = 0
 
+# Loopback HTTP failures must not disappear behind a second discovery attempt.
+[[profile.default.overrides]]
+filter = 'test(=runtimes::common::tests::github_release_http_failures_never_return_partial_catalogs)'
+retries = 0
+
 [profile.ci]
 test-threads = "num-cpus"
 fail-fast = false
