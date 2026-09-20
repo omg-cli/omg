@@ -46,8 +46,8 @@ Do not advance the implementation onto a broken baseline. Research the relevant 
 - [x] Add `NVM_DIR` isolation and a subprocess regression that reexecutes the exact affected test under an external NVM alias directory and requires `1 passed`.
 - [x] Recognize previously checked Docker stages while rejecting mutable external images, unknown stages and malformed digests; preserve pinned rustup/Cargo checks.
 - [x] Push scoped repair 47d4295d into the same PR.
-- [ ] Require hosted coverage and the full portable baseline to pass. Preserve skipped-test counts in evidence; they are not covered contracts.
-- [ ] Record final QEMU results for all selected distros and the exact source SHA. Compare source-changing Docker reuse with the existing cold 14m17s/warm 2m08s same-revision samples.
+- [x] Require hosted coverage and the full portable baseline to pass. Preserve skipped-test counts in evidence; they are not covered contracts.
+- [x] Record final QEMU results for all selected distros and the exact source SHA. Compare source-changing Docker reuse with the existing cold 14m17s/warm 2m08s same-revision samples.
 
 Verification:
 

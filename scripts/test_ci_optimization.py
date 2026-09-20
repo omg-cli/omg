@@ -1,5 +1,6 @@
 """Regression checks for the consolidated CI optimization contracts."""
 import os
+import hashlib
 from pathlib import Path
 import re
 import subprocess
@@ -19,6 +20,34 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_native_cache_recipe_keys_are_valid_and_keep_compatibility_boundaries(self):
+        script = step_script('ci.yml', 'Compute native cache identity')
+        recipes = [
+            ('debian', 'debian@sha256:abc', 'debian,pgp,license'),
+            ('debian', 'debian@sha256:def', 'debian,pgp,license'),
+            ('debian', 'debian@sha256:abc', 'debian,pgp'),
+            ('debian-trixie', 'debian@sha256:abc', 'debian,pgp,license'),
+        ]
+        keys = []
+        for platform, image, features in recipes:
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'output'
+                result = subprocess.run(
+                    [BASH, '-e', '-c', script],
+                    env=dict(os.environ, CACHE_PLATFORM=platform, CACHE_IMAGE=image,
+                             CACHE_FEATURES=features, GITHUB_OUTPUT=str(output)),
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                key = output.read_text().strip().removeprefix('key=')
+                self.assertRegex(key, r'^[a-f0-9]{64}$')
+                expected = hashlib.sha256(
+                    ''.join(value + '\0' for value in (platform, image, features)).encode()
+                ).hexdigest()
+                self.assertEqual(key, expected)
+                keys.append(key)
+        self.assertEqual(len(keys), len(set(keys)))
+
     def test_combined_audit_runs_every_policy_and_preserves_failure(self):
         script = step_script('audit.yml', 'Run cargo-deny (Supply Chain Security)')
         for status in (0, 1, 2, 4, 8):
@@ -48,7 +77,7 @@ class OptimizationContracts(unittest.TestCase):
                 self.assertNotRegex(text, r'(?m)^\s+path: target$')
                 self.assertIn('cache-workspace-crates: false', text)
         ci = (WORKFLOWS / 'ci.yml').read_text()
-        self.assertEqual(ci.count('shared-key: ${{ matrix.platform }}-${{ matrix.image }}-${{ matrix.features }}'), 2)
+        self.assertEqual(ci.count('shared-key: ${{ steps.cache-key.outputs.key }}'), 2)
         coverage = (WORKFLOWS / 'coverage.yml').read_text()
         self.assertIn('workspaces: . -> target/llvm-cov-target', coverage)
         self.assertIn('cargo llvm-cov nextest', coverage)

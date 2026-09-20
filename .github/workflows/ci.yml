@@ -252,6 +252,20 @@ jobs:
 
       # sccache temporarily disabled due to service outage
 
+      - name: Compute native cache identity
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_PLATFORM: ${{ matrix.platform }}
+          CACHE_IMAGE: ${{ matrix.image }}
+          CACHE_FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          # GitHub cache keys reject commas. Hash the complete compatibility
+          # tuple instead of dropping features or making a lossy replacement.
+          key=$(printf '%s\0' "$CACHE_PLATFORM" "$CACHE_IMAGE" "$CACHE_FEATURES" | sha256sum)
+          printf 'key=%s\n' "${key%% *}" >> "$GITHUB_OUTPUT"
+
       - name: Cache Rust dependencies
         if: inputs.skip-cache != true
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -259,7 +273,7 @@ jobs:
           prefix-key: v2-platform-dependencies
           # Never restore across distro ABI or feature contracts. The action
           # additionally keys rustc, Cargo config, lockfiles and compiler flags.
-          shared-key: ${{ matrix.platform }}-${{ matrix.image }}-${{ matrix.features }}
+          shared-key: ${{ steps.cache-key.outputs.key }}
           cache-bin: false
           cache-workspace-crates: false
 
@@ -542,12 +556,26 @@ jobs:
       - name: Fix git permissions
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Compute native cache identity
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_PLATFORM: ${{ matrix.platform }}
+          CACHE_IMAGE: ${{ matrix.image }}
+          CACHE_FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          # GitHub cache keys reject commas. Hash the complete compatibility
+          # tuple instead of dropping features or making a lossy replacement.
+          key=$(printf '%s\0' "$CACHE_PLATFORM" "$CACHE_IMAGE" "$CACHE_FEATURES" | sha256sum)
+          printf 'key=%s\n' "${key%% *}" >> "$GITHUB_OUTPUT"
+
       - name: Cache Rust dependencies
         if: inputs.skip-cache != true
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v2-intersection-dependencies
-          shared-key: ${{ matrix.platform }}-${{ matrix.image }}-${{ matrix.features }}
+          shared-key: ${{ steps.cache-key.outputs.key }}
           cache-bin: false
           cache-workspace-crates: false
 

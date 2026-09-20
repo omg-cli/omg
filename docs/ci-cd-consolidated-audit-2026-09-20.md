@@ -179,3 +179,42 @@ catalog even when more than 25 cases fail. The issue-write cap is preserved with
 an aggregate issue linked to a 30-day reporter artifact. Duplicate JSON keys and
 case/distro mismatches are rejected. Local reporter tests cover API failures,
 invalid artifacts and cancellations without posting synthetic issues.
+
+## Portable baseline on 2ad77381
+
+[The complete portable baseline](https://github.com/omg-cli/omg/actions/runs/35498224871)
+passed 1,951 tests, with 39 ignored. Its 85 result groups include 40 with no
+passing tests; cfg-disabled targets and ignored cases are not executed coverage.
+The package-info fixtures now select a mock backend supported by their compiled
+feature set. Native success assertions remain in place.
+
+Instrumented coverage on the preceding revision discovered a generated query
+`-V` selecting the real version flag. Generated literal queries now insert `--`
+only when needed, retaining the ordinary search fast path. The counterexample
+seed is saved, and a dedicated regression distinguishes literal queries from
+help/version flags. Property-test retries are disabled so a later random sample
+cannot conceal the first failure. Hosted coverage on 2ad77381 passed 2,840 tests
+with 43 skipped; native CI and all four selected QEMU distro lanes also passed.
+
+The trusted QEMU reporter now includes bounded per-case diagnostic excerpts,
+scrubbed before truncation, alongside source/run/attempt identities and the full
+failure catalog. Fake API tests verify reporting without creating artificial
+issues. The existing live lifecycle is demonstrated by issue #438, which recorded
+a scheduled failure and closed after verified main-run success; that historical
+event does not validate these newer, unmerged reporter changes.
+
+Successful jobs were not sufficient proof of caching. Inspecting 2ad77381 logs
+found five native/intersection cache restores rejected because their feature
+strings contained commas. The cache action reported success despite the validation
+error and never saved those caches. The repair hashes the NUL-separated platform,
+image and feature tuple; regression tests execute the workflow's key calculation
+and verify compatibility boundaries and valid bounded keys. Hosted save/restore
+verification remains required.
+
+The cache API reported 11,309,166,975 bytes across 28 entries at audit time;
+coverage had a cache miss. Cache eviction pressure is a separate measured risk,
+not proof that every miss was eviction. No paid storage setting was changed.
+[GitHub's cache reference](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
+documents the default 10 GB limit and eviction behavior;
+[the toolkit implementation](https://github.com/actions/toolkit/blob/main/packages/cache/src/cache.ts)
+enforces the comma and 512-character key restrictions.
