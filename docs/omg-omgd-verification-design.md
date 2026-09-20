@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used fifty searches (216 requested result slots),
+Exa research used fifty-two searches (222 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -50,6 +50,7 @@ Selected primary sources were read and checked against repository code.
 | [Git hook requirements](https://git-scm.com/docs/githooks) | Assert installed hooks are executable regular scripts and removed hooks are absent; isolate global/system Git configuration in guest fixtures | Default-directory fixtures do not cover core.hooksPath, linked worktrees, user-edited hooks, or execution semantics |
 | [which 8.0.5 source archive](https://static.crates.io/crates/which/which-8.0.5.crate) | Check the selected executable path rather than accepting an existing NVM bin directory; inspected finder/checker source after verifying the Cargo.lock SHA-256 | One Exa query returned no results and versioned docs were unavailable; the locked source confirms absolute-path checks without execution, not binary identity or successful startup |
 | [Tokio barrier](https://docs.rs/tokio/latest/tokio/sync/struct.Barrier.html) | Require both workspace tasks to rendezvous before either emits a success marker | The process fixture uses bounded filesystem signals, not Tokio itself; demonstrates overlap of these two tasks, not throughput or all dependency schedules |
+| [setpriv manual](https://man7.org/linux/man-pages/man1/setpriv.1.html), [capabilities manual](https://man7.org/linux/man-pages/man7/capabilities.7.html) | Drop bounding, inheritable and ambient capabilities alongside no-new-privileges, including UID 0 | Local Arch WSL exposed the retained-capability failure; tests now inspect all five capability sets under caller and root identities |
 | [GitHub artifact retention](https://docs.github.com/en/actions/tutorials/store-and-share-data) and [token permissions](https://github.com/github/docs/blob/main/content/actions/tutorials/authenticate-with-github_token.md) | Preserve actionable failure summaries in issues and link bounded artifacts; keep issue writes in the trusted reporter | Artifacts expire and PR execution must not receive issue-write credentials |
 | [GitHub job prerequisites](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-jobs) | One readiness coordinator avoids four idle artifact consumers; each guest still validates the exact binary pair | A shared barrier can increase an individual guest's latency; measure runner time and whole-gate latency separately |
 | [GitHub container shells](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/run-jobs-in-a-container) | Declare Bash explicitly for the native build recipe's Bash conditionals | Tests executing a recipe in Bash must also check the workflow selects that shell; container defaults use sh |
@@ -271,3 +272,16 @@ no zero-test feature lanes; first-attempt failures visible; critical correctness
 security checks first-failure blocking; valid mutation baselines and reviewed score
 results; and release evidence tied to the exact packaged binaries. Any external
 service or unsupported platform exception remains explicit and separately reported.
+
+### Local Linux verification added on 2026-09-20
+
+Arch WSL executed the 44228779 CLI behavior inventory successfully using Rust
+1.95.0 and arch/pgp/license. All fourteen output-contract and both overlap-fixture
+tests ran locally, including checks previously skipped on Windows. A full quick
+suite exposed retained capabilities when the namespace wrapper kept UID 0. The
+regression failed before explicit capability dropping and passed afterward; the
+quick suite then reported 256 tests with two explicit skips. The root path is now
+covered even when the CI caller is non-root. This is network isolation evidence,
+not a general filesystem sandbox. Ubuntu 26.04 and Fedora 44 WSL are additional
+local feedback owners; they do not replace disposable QEMU transaction/recovery
+lanes or establish coverage of unexecuted scenarios.

@@ -347,7 +347,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # Put the supervisor AND its receipt inside the namespace. A namespace
     # setup failure must be a transport/harness error, never an expected CLI
     # refusal. Drop back to the SSH user before creating fixtures or running OMG.
-    remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+    remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
   fi
   start=$SECONDS
   transport=0
