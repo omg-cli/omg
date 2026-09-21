@@ -393,6 +393,9 @@ pub(super) fn compose(
                                     value: native.published_severity.clone(),
                                 },
                             ]
+                            .into_iter()
+                            .filter(|property| !property.value.is_empty())
+                            .collect()
                         })
                         .unwrap_or_default(),
                 });

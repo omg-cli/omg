@@ -18,6 +18,8 @@ pub mod apt;
 #[cfg(feature = "arch")]
 pub mod arch;
 #[cfg(feature = "arch")]
+mod arch_advisory;
+#[cfg(feature = "arch")]
 pub mod aur;
 #[cfg(feature = "arch")]
 pub mod aur_deps;
