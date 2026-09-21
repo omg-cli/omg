@@ -9,6 +9,17 @@
 set -euo pipefail
 # BEGIN PRODUCT OUTPUT ORACLE
 # This exact function is sent to the guest and exercised by fault-injection tests.
+check_runtime_usage() {
+  local runtime=$1 mode
+  mode=$(stat -c %a "$OMG_DATA_DIR") || mode=""
+  if [[ "$mode" != 700 ]] || ! jq -e -s --arg runtime "$runtime" \
+    'length == 1 and (.[0] | .runtime_usage_counts[$runtime] == 1 and .commands.runtime_switch == 1 and .total_commands == 1)' \
+    "$OMG_DATA_DIR/usage.json" >/dev/null; then
+    printf 'assertion failed: runtime usage %s must persist exactly one switch in private data\n' "$runtime" >&2
+    return 1
+  fi
+}
+
 check_native_counter() {
   local distro=$1 counter=$2 output=$3 status=0 expected actual
   local -a native=()
@@ -648,7 +659,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then
     runtime_version=$(jq -r '.[2]' <<< "$args_json")
     runtime_name=$(jq -r '.[1]' <<< "$args_json")
-    remote+="; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install")"
+    remote+="; umask 0002; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install"); $(declare -f check_runtime_usage)"
   fi
   remote+="; run_omg $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
@@ -659,6 +670,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then
     remote+="; if [ \"\$rc\" = 0 ] && ! check_${runtime_name}_install '$runtime_version'; then assertion=1; fi"
+    remote+="; if [ \"\$rc\" = 0 ] && ! check_runtime_usage '$runtime_name'; then assertion=1; fi"
     remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: runtime fixture cleanup failed\\n' >&2; assertion=1; fi"
   fi
   # A receipt is emitted only after setup and the command complete. SSH

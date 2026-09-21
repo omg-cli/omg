@@ -13,6 +13,41 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    @staticmethod
+    def runtime_usage_fixture(runtime):
+        usage = json.dumps({'runtime_usage_counts': {runtime: 1},
+                            'commands': {'runtime_switch': 1}, 'total_commands': 1})
+        return ('mkdir -p "$OMG_DATA_DIR"\nchmod 700 "$OMG_DATA_DIR"\n'
+                f'printf %s {shlex.quote(usage)} > "$OMG_DATA_DIR/usage.json"\n')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_runtime_install_requires_private_persisted_usage(self):
+        rows = ['runtime-node-install\t["use","node","24.21.0"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        # The fake runtime satisfies the separate execution oracle so failures
+        # here must come from the state that the actual CLI failed to persist.
+        node = '#!/bin/sh\ncat >/dev/null\necho OMG_NODE_RUNTIME_OK:24.21.0\n'
+        product = self.runtime_usage_fixture('node')
+        product += 'base="$OMG_DATA_DIR/versions/node"\nmkdir -p "$base/24.21.0/bin" "$base/24.21.0/lib/node_modules/npm/bin"\n'
+        product += f'printf %s {shlex.quote(node)} > "$base/24.21.0/bin/node"\nchmod 755 "$base/24.21.0/bin/node"\n'
+        product += 'ln -s 24.21.0 "$base/current"\necho fixture > "$base/24.21.0/lib/node_modules/npm/bin/npm-cli.js"\n'
+        faults = {
+            'missing': 'rm "$OMG_DATA_DIR/usage.json"\n',
+            'invalid-json': 'echo broken > "$OMG_DATA_DIR/usage.json"\n',
+            'multiple-documents': 'echo "{}" >> "$OMG_DATA_DIR/usage.json"\n',
+            'writable': 'chmod 775 "$OMG_DATA_DIR"\n',
+            'wrong-runtime': 'sed -i s/node/python/g "$OMG_DATA_DIR/usage.json"\n',
+            'double-counted': 'sed -i s/1/2/g "$OMG_DATA_DIR/usage.json"\n',
+            'command-missing': 'sed -i s/runtime_switch/other/g "$OMG_DATA_DIR/usage.json"\n',
+            'none': '',
+        }
+        for fault, mutation in faults.items():
+            with self.subTest(fault=fault):
+                result, evidence, logs = self.run_inventory(product + mutation, rows)
+                self.assertEqual(evidence[0]['result'], 'PASS' if fault == 'none' else 'FAIL')
+                self.assertEqual(result.returncode, int(fault != 'none'))
+                if fault != 'none':
+                    self.assertIn('assertion failed: runtime usage', logs['runtime-node-install.log'])
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_counter_rows_require_native_counts_and_block_failed_references(self):
         cases = {'ec': 'explicit-shortcut', 'tc': 'total-shortcut',
@@ -82,7 +117,7 @@ class OutputContracts(unittest.TestCase):
                         product += 'mv "$base/3.12.14/bin/python3" "$OMG_DATA_DIR/external"\nln -s "$OMG_DATA_DIR/external" "$base/3.12.14/bin/python3"\n'
                     if fault == 'version-escaped':
                         product += 'mv "$base/3.12.14" "$OMG_DATA_DIR/external-version"\nln -s "$OMG_DATA_DIR/external-version" "$base/3.12.14"\n'
-                result, evidence, logs = self.run_inventory(product, rows)
+                result, evidence, logs = self.run_inventory(self.runtime_usage_fixture('python') + product, rows)
                 self.assertEqual(result.returncode, 0 if fault == 'none' else 1, result.stderr)
                 self.assertEqual(evidence[0]['result'], 'PASS' if fault == 'none' else 'FAIL')
                 if fault != 'none':
@@ -118,7 +153,7 @@ class OutputContracts(unittest.TestCase):
                 if fault in ('escaped', 'escaped-npm'):
                     target = 'bin/node' if fault == 'escaped' else 'lib/node_modules/npm/bin/npm-cli.js'
                     product += f'mv "$base/24.21.0/{target}" "$OMG_DATA_DIR/external"\nln -s "$OMG_DATA_DIR/external" "$base/24.21.0/{target}"\n'
-                result, evidence, logs = self.run_inventory(product, rows)
+                result, evidence, logs = self.run_inventory(self.runtime_usage_fixture('node') + product, rows)
                 self.assertEqual(result.returncode, 0 if fault == 'none' else 1, result.stderr)
                 self.assertEqual(evidence[0]['result'], 'PASS' if fault == 'none' else 'FAIL')
                 if fault == 'failure':
@@ -154,7 +189,7 @@ class OutputContracts(unittest.TestCase):
                     product += 'ln -s 1.27.1 "$base/current"\n'
                 if fault == 'escaped':
                     product += 'mv "$base/1.27.1/bin/go" "$OMG_DATA_DIR/external"\nln -s "$OMG_DATA_DIR/external" "$base/1.27.1/bin/go"\n'
-                result, evidence, logs = self.run_inventory(product, rows)
+                result, evidence, logs = self.run_inventory(self.runtime_usage_fixture('go') + product, rows)
                 self.assertEqual(result.returncode, 0 if fault == 'none' else 1, result.stderr)
                 self.assertEqual(evidence[0]['result'], 'PASS' if fault == 'none' else 'FAIL')
                 if fault == 'test-failure':
