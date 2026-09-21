@@ -1,0 +1,12 @@
+
+Package: broken-or-dep
+Version: 0.0.1
+Section: base
+Priority: optional
+Architecture: all
+Depends: not-exist (>= 3.6.1) | really-not-exist,
+         python3-not-exist,
+Maintainer: Your Name <you@email.com>
+Description: Rust FTW
+ This is only used for testing.
+ Why would you install this?
