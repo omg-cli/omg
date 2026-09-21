@@ -48,8 +48,24 @@ printf '{"oops":true}\n' > "$scratch/suite/bad/results.json"
 out=""; rc=0
 out=$("$runner" "$scratch/suite") || rc=$?
 [[ "$rc" -eq 1 ]] || fail "suite audit must exit 1, got $rc"
-grep -q "not a results.json array; skipped" <<< "$out" || fail "suite audit did not flag the junk file"
+grep -q "invalid results.json; audit incomplete" <<< "$out" || fail "suite audit did not flag the junk file"
 grep -q "files=2 failing-rows=1" <<< "$out" || fail "suite audit bad summary: $out"
+
+# Malformed evidence alone must not be mistaken for a healthy run.
+for invalid in '{"oops":true}' 'not json'; do
+  printf '%s\n' "$invalid" > "$scratch/invalid.json"
+  rc=0
+  out=$("$runner" "$scratch/invalid.json") || rc=$?
+  [[ "$rc" -eq 1 ]] || fail "invalid-only audit must exit 1, got $rc"
+  grep -q 'invalid-files=1' <<< "$out" || fail "audit omitted invalid evidence count"
+done
+
+# Valid evidence remains visible even when another input is unusable.
+rc=0
+out=$("$runner" "$scratch/invalid.json" "$scratch/clean.json") || rc=$?
+[[ "$rc" -eq 1 ]] || fail "mixed clean/invalid audit must exit 1, got $rc"
+grep -q 'verdicts: PASS=1' <<< "$out" || fail "invalid input hid valid evidence"
+grep -q 'files=2 failing-rows=0 invalid-files=1' <<< "$out" || fail "mixed audit bad summary"
 
 if [[ "$failures" -ne 0 ]]; then printf '%s failure(s)\n' "$failures" >&2; exit 1; fi
 printf 'qa-audit harness: all green\n'
