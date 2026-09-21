@@ -33,6 +33,8 @@ pub mod debian_db;
 pub mod debian_pure;
 #[cfg(feature = "fedora")]
 pub mod dnf;
+#[cfg(feature = "fedora")]
+mod dnf_advisory;
 // macOS Homebrew support - can be enabled via feature or auto-detected on macOS
 #[cfg(any(feature = "macos", target_os = "macos"))]
 pub mod homebrew;

@@ -913,6 +913,50 @@ impl DnfPackageManager {
             .context("DNF query timed out after 60 seconds")?
     }
 
+    fn advisory_command() -> Result<tokio::process::Command> {
+        let cache = crate::core::paths::cache_dir().join("dnf-security");
+        let cache = cache
+            .to_str()
+            .context("DNF advisory cache path is not UTF-8")?;
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        // A fresh user's cache can otherwise be populated from root's stale
+        // cache even with --refresh. Use one audit-owned cache for both paths.
+        command.args([
+            format!("--setopt=cachedir={cache}"),
+            format!("--setopt=system_cachedir={cache}"),
+            "--setopt=cacheonly=none".into(),
+        ]);
+        Ok(command)
+    }
+
+    async fn native_advisories() -> Result<
+        Vec<(
+            super::dnf_advisory::ApplicableAdvisory,
+            super::dnf_advisory::AdvisoryDetails,
+        )>,
+    > {
+        let mut outputs = Vec::with_capacity(2);
+        for details in [false, true] {
+            let mut command = Self::advisory_command()?;
+            command.args(super::dnf_advisory::query_args(details));
+            outputs.push(Self::query_output(command).await?);
+        }
+        let mut repositories = Self::advisory_command()?;
+        repositories.args([
+            "--cacheonly",
+            "--setopt=*.skip_if_unavailable=false",
+            "repo",
+            "info",
+            "--enabled",
+            "--json",
+        ]);
+        super::dnf_advisory::require_enabled_repositories(
+            &Self::query_output(repositories).await?,
+        )?;
+        super::dnf_advisory::join_advisories(&outputs[0], &outputs[1])
+    }
+
     async fn native_history(since: Option<u64>) -> Result<Vec<NativeTransaction>> {
         let range = since.map_or_else(|| "last".to_owned(), |id| format!("{}..last", id.max(1)));
         let mut command =
@@ -1231,6 +1275,26 @@ impl DnfPackageManager {
 }
 
 impl PackageManager for DnfPackageManager {
+    fn security_audit(
+        &self,
+    ) -> Option<
+        Pin<
+            Box<
+                dyn Future<Output = Result<crate::core::security::scan::SecurityAuditResult>>
+                    + Send
+                    + '_,
+            >,
+        >,
+    > {
+        Some(Box::pin(async {
+            super::dnf_advisory::audit_result(
+                Self::native_advisories()
+                    .await
+                    .context("Failed to query native security advisories")?,
+            )
+        }))
+    }
+
     fn name(&self) -> &'static str {
         "dnf"
     }
@@ -1494,6 +1558,51 @@ fn reject_unsealed_local_rpm_targets(packages: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_advisory_command_refuses_unavailable_repository() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        std::fs::create_dir(root.join("repos")).unwrap();
+        let configure = || {
+            let mut command = DnfPackageManager::advisory_command().unwrap();
+            command.args([
+                format!("--setopt=reposdir={}", root.join("repos").display()),
+                format!("--setopt=cachedir={}", root.join("cache").display()),
+                format!("--setopt=system_cachedir={}", root.join("cache").display()),
+                format!("--setopt=persistdir={}", root.join("persist").display()),
+                format!("--setopt=logdir={}", root.join("logs").display()),
+                format!(
+                    "--repofrompath=omg-fault,file://{}",
+                    root.join("missing").display()
+                ),
+                "--setopt=omg-fault.skip_if_unavailable=true".into(),
+            ]);
+            command
+        };
+        // Establish the real DNF false-clean behavior before testing our policy.
+        let mut permissive = configure();
+        permissive.args([
+            "--refresh",
+            "advisory",
+            "list",
+            "--available",
+            "--security",
+            "--json",
+        ]);
+        let output = DnfPackageManager::query_output(permissive).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+            serde_json::json!([])
+        );
+        let mut strict = configure();
+        strict.args(super::super::dnf_advisory::query_args(false));
+        let error = DnfPackageManager::query_output(strict).await.unwrap_err();
+        assert!(error.to_string().contains("DNF query failed"), "{error:#}");
+        let path = root.to_owned();
+        fixture.close().unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn update_queries_never_refresh_repository_metadata() {

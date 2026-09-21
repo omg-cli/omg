@@ -15,6 +15,22 @@ pub trait PackageManager: Send + Sync {
     /// Get the name of this package manager
     fn name(&self) -> &'static str;
 
+    /// Native advisory applicability, when supported. Failures are authoritative:
+    /// callers must not replace a failed native scan with a narrower source.
+    fn security_audit(
+        &self,
+    ) -> Option<
+        Pin<
+            Box<
+                dyn Future<Output = Result<crate::core::security::scan::SecurityAuditResult>>
+                    + Send
+                    + '_,
+            >,
+        >,
+    > {
+        None
+    }
+
     /// Search for packages
     fn search(
         &self,

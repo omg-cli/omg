@@ -501,6 +501,7 @@ impl TargetExpectations {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Assertion {
+    AuditSourceFailure,
     JsonStdout,
     Artifact(String),
     WorkspaceFilteredOutput,
@@ -512,6 +513,7 @@ enum Assertion {
 impl Assertion {
     fn parse(raw: &str, line_number: usize) -> Self {
         match raw {
+            "audit-source-failure" => Self::AuditSourceFailure,
             "json-stdout" => Self::JsonStdout,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
@@ -1151,10 +1153,16 @@ fn behavior_inventory_runs_in_hermetic_state() {
         }
         // The hermetic fixture always runs the arch mock backend, so the
         // arch expectation governs here; release lanes resolve their own.
-        let expected_exit = case
+        let mut expected_exit = case
             .expected_exit
             .expect("executable rows declare an exit code")
             .exit_for(Distro::Arch);
+        // Native offline guests have installed packages and must refuse an
+        // unavailable advisory source. This fixture has an empty mock inventory,
+        // so its distinct contract is a completed empty scan with exit zero.
+        if case.assertions.contains(&Assertion::AuditSourceFailure) {
+            expected_exit = 0;
+        }
         let args: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
         let started = Instant::now();
         let result = project.run_with_env(
@@ -1188,11 +1196,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
         if case.safety == Safety::HelpBoundary && !result.stdout.contains("Usage:") {
             issues.push("help boundary did not render Usage".to_string());
         }
-        if case
-            .expected_exit
-            .is_some_and(|exits| exits.exit_for(Distro::Arch) != 0)
-            && result.stderr.trim().is_empty()
-        {
+        if expected_exit != 0 && result.stderr.trim().is_empty() {
             issues.push("failure did not explain itself on stderr".to_string());
         }
         let audit_success = match case.id.as_str() {
@@ -1207,6 +1211,12 @@ fn behavior_inventory_runs_in_hermetic_state() {
         }
         for assertion in &case.assertions {
             match assertion {
+                Assertion::AuditSourceFailure => {
+                    assert!(
+                        audit_success.is_some(),
+                        "audit assertion requires an explicit empty-inventory oracle"
+                    );
+                }
                 Assertion::HooksInstalled | Assertion::HooksAbsent => {
                     use std::os::unix::fs::PermissionsExt as _;
                     for (name, label) in [

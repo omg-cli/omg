@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Every frame is `[u32 LE version][bitcode payload]`. Peers reject frames
 /// whose version differs instead of attempting a decode that could
 /// silently mis-map same-shaped variants.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Frame layout error for [`encode_frame`] / [`split_frame`].
 #[derive(Debug, thiserror::Error)]
@@ -484,6 +484,52 @@ mod tests {
         assert!(Request::ExplicitCount { id: 1 }.reads_arch_sync_catalog());
         assert!(Request::SecurityAudit { id: 1 }.reads_arch_sync_catalog());
         assert!(!Request::Ping { id: 1 }.reads_arch_sync_catalog());
+    }
+
+    #[test]
+    fn security_advisory_severity_survives_wire_roundtrip() {
+        use crate::core::security::scan::AdvisorySeverity;
+        let response = Response::Success {
+            id: 73,
+            result: ResponseResult::SecurityAudit(SecurityAuditResult {
+                total_vulnerabilities: 1,
+                high_severity: 1,
+                vulnerabilities: vec![(
+                    "package".into(),
+                    vec![Vulnerability {
+                        id: "FEDORA-fixture".into(),
+                        summary: "Published severity without CVSS".into(),
+                        score: None,
+                        advisory_severity: Some(AdvisorySeverity::Important),
+                        native_advisory: Some(crate::core::security::scan::NativeAdvisory {
+                            source: "dnf5".into(),
+                            advisory_nevra: "package-1-2.x86_64".into(),
+                            published_severity: "Important".into(),
+                            description: "Published finding".into(),
+                            references: vec![crate::core::security::scan::AdvisoryReference {
+                                id: "CVE-fixture".into(),
+                                kind: "cve".into(),
+                                url: "https://example.test/advisory".into(),
+                            }],
+                        }),
+                    }],
+                )],
+            }),
+        };
+        let frame = encode_frame(&response).unwrap();
+        let (_, payload) = split_frame(&frame).unwrap();
+        let decoded: Response = bitcode::deserialize(payload).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(response).unwrap()
+        );
+
+        let mut old_frame = frame;
+        old_frame[..4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(
+            split_frame(&old_frame),
+            Err(FrameError::VersionMismatch { peer: 2, ours: 3 })
+        ));
     }
 
     #[test]
