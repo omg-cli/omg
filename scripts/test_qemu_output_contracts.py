@@ -91,6 +91,40 @@ class OutputContracts(unittest.TestCase):
                     self.assertIn('missing-stdlib', logs['runtime-python-install.log'])
                     self.assertIn('exit=17', logs['runtime-python-install.log'])
 
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_node_install_rejects_success_without_installed_runtime(self):
+        rows = ['runtime-node-install\t["use","node","24.21.0"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        result, evidence, logs = self.run_inventory('printf "Installed Node.js 24.21.0\\n"\n', rows)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'FAIL')
+        self.assertIn('assertion failed: Node', logs['runtime-node-install.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_node_install_rejects_incomplete_or_nonexecuting_runtime(self):
+        rows = ['runtime-node-install\t["use","node","24.21.0"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        for fault in ('inactive', 'escaped', 'missing-npm', 'escaped-npm', 'version-only', 'noop', 'failure', 'none'):
+            with self.subTest(fault=fault):
+                # Successful mock models receipt admission only; real runtime
+                # behavior is exercised independently with the exact oracle.
+                body = {'version-only': 'echo v24.21.0\n', 'noop': 'exit 0\n',
+                        'failure': 'echo npm-probe-failed >&2\nexit 17\n'}.get(fault, 'echo OMG_NODE_RUNTIME_OK:24.21.0\n')
+                script = '#!/bin/sh\ncat >/dev/null\n' + body
+                product = 'base="$OMG_DATA_DIR/versions/node"\nmkdir -p "$base/24.21.0/bin" "$base/24.21.0/lib/node_modules/npm/bin"\n'
+                product += f'printf %s {shlex.quote(script)} > "$base/24.21.0/bin/node"\nchmod 755 "$base/24.21.0/bin/node"\n'
+                if fault != 'inactive':
+                    product += 'ln -s 24.21.0 "$base/current"\n'
+                if fault != 'missing-npm':
+                    product += 'echo fixture > "$base/24.21.0/lib/node_modules/npm/bin/npm-cli.js"\n'
+                if fault in ('escaped', 'escaped-npm'):
+                    target = 'bin/node' if fault == 'escaped' else 'lib/node_modules/npm/bin/npm-cli.js'
+                    product += f'mv "$base/24.21.0/{target}" "$OMG_DATA_DIR/external"\nln -s "$OMG_DATA_DIR/external" "$base/24.21.0/{target}"\n'
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual(result.returncode, 0 if fault == 'none' else 1, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'PASS' if fault == 'none' else 'FAIL')
+                if fault == 'failure':
+                    self.assertIn('npm-probe-failed', logs['runtime-node-install.log'])
+                    self.assertIn('exit=17', logs['runtime-node-install.log'])
+
     def generated_hooks(self):
         source = (ROOT / 'src/cli/git_hooks.rs').read_text(encoding='utf-8')
         return {name: (re.search(r'const ' + constant + r': &str = r#"(.*?)"#;', source, re.S).group(1), 0o755)

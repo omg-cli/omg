@@ -36,3 +36,11 @@ Preserved isolated fixture directories under `/home/omg-audit/`:
 - Fedora: `omg-node-behavior.tQx60a`
 
 These exploratory probes establish feasibility only. They used existing incremental binaries, retained fixtures for inspection and are not admitted coverage receipts or evidence of QEMU integration. Next implement the runner oracle, adversarial admission fixtures, policy identity and cleanup checks before collecting exact-revision evidence.
+
+## Runner implementation evidence
+
+The new row initially accepted a fake successful installer that created no runtime; the regression failed as expected. The runner now validates installation confinement and executes the behavior oracle, with bounded child processes and temporary npm fixtures removed before success. Admission tests reject missing/inactive/escaped runtimes, missing/escaped npm, version-only and no-op interpreters, and explicit program failure while preserving its exit code and diagnostic.
+
+The exact extracted runner oracle passed on the four real WSL installations listed above. Its first execution exposed a harness configuration error on all four: npm refuses the same `/dev/null` file for both global and user configuration. Separate empty fixture files fixed that setup defect. On Ubuntu, replacing bundled npm with a version-printing no-op caused the exact oracle to fail on the missing script output. Restoring the original file byte-for-byte restored the passing result. This demonstrates that npm version output is insufficient to satisfy the oracle.
+
+Hosted QEMU validation of this new row remains pending. These local checks do not establish the 95% target, hostile-runtime resistance, complete Node library correctness, all runtime flags, or independent final review.
