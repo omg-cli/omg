@@ -218,12 +218,19 @@ async fn run_with_status_path(
                 tracing::warn!("Failed to write fast status file: {error}");
             }
 
-            let scanner = crate::core::security::VulnerabilityScanner::new();
+            // Isolated fixtures must explicitly configure their advisory
+            // source before enabling unsolicited background network work.
+            if !state.background_security_scans {
+                return;
+            }
             let previous_vulns = state
                 .cache
                 .get_status()
                 .and_then(|status| status.scanned_vulnerability_count());
-            let scan = scanner.scan_system().await;
+            let scan = state
+                .scan_security()
+                .await
+                .map(|scan| scan.total_vulnerabilities);
             if let Err(error) = &scan {
                 tracing::warn!("Vulnerability scan failed during status refresh: {error}");
             }

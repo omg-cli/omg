@@ -186,3 +186,16 @@ One production legacy caller remains: `server.rs` background status refresh
 still calls `VulnerabilityScanner::scan_system`. Consolidation must verify cache
 publication and concurrent background/on-demand fetching; replacing it without
 those checks could introduce duplicate requests or stale status claims.
+
+Background scan consolidation: production status refresh now uses the same
+shared scan as requested audits, with a daemon-owned asynchronous scan lock.
+Isolated daemon construction disables unsolicited background advisory fetching;
+fixtures that test it must explicitly enable it and inject their HTTP endpoint.
+The real-server test requires status publication of all three paginated findings
+before requested audits, preserving the subsequent cache/error/recovery checks.
+Its previous implementation failed that publication deadline on Fedora.
+
+All production call sites of the older ALSA-only `scan_system` path have now
+been removed. The legacy public method and its tests remain; this change does
+not remove API compatibility. Explicit contention/cancellation coverage of the
+new scan lock and native advisory ecosystem coverage remain outstanding.

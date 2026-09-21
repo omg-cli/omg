@@ -118,6 +118,7 @@ async fn real_server_fetches_scores_and_rejects_failed_scans_before_recovery() -
         },
     )?;
     state.vulnerability_scanner = Arc::new(VulnerabilityScanner::with_osv_api_url(endpoint));
+    state.background_security_scans = true;
     let path = temp.path().join("audit.sock");
     let listener = UnixListener::bind(&path)?;
     let mut daemon = RunningTask(tokio::spawn(server::run(
@@ -126,6 +127,29 @@ async fn real_server_fetches_scores_and_rejects_failed_scans_before_recovery() -
         path.clone(),
     )));
     let mut socket = UnixStream::connect(&path).await?;
+    timeout(Duration::from_secs(8), async {
+        loop {
+            match request(&mut socket, Request::Status { id: 9299 }).await? {
+                Response::Success {
+                    id: 9299,
+                    result: ResponseResult::Status(status),
+                } if status.vulnerabilities_scanned => {
+                    assert_eq!(status.security_vulnerabilities, 3);
+                    break;
+                }
+                Response::Success {
+                    result: ResponseResult::Status(_),
+                    ..
+                } => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => anyhow::bail!("unexpected status while waiting for scan: {other:?}"),
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .context("background scan never published its complete findings")??;
     // Same real server dispatcher, scanner, HTTP client, pagination and scoring
     // as production. Only the installed inventory and remote server are fixtures.
     for id in [9300, 9301] {

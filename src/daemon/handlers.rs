@@ -97,6 +97,8 @@ pub struct DaemonState {
     pub(super) persistent: super::db::PersistentCache,
     pub(super) package_manager: Arc<dyn PackageManager>,
     vulnerability_scanner: Arc<crate::core::security::vulnerability::VulnerabilityScanner>,
+    security_scan_lock: tokio::sync::Mutex<()>,
+    pub(super) background_security_scans: bool,
     index: RwLock<PublishedIndex>,
     /// Locked because RefreshIndex must swap in a fresh AlpmWorker: libalpm
     /// caches loaded syncdbs in memory and never revalidates them on disk, so
@@ -349,6 +351,7 @@ impl DaemonState {
             }
         }
 
+        let background_security_scans = system_backends.is_production();
         Self {
             cache,
             persistent,
@@ -361,6 +364,8 @@ impl DaemonState {
             vulnerability_scanner: Arc::new(
                 crate::core::security::vulnerability::VulnerabilityScanner::new(),
             ),
+            security_scan_lock: tokio::sync::Mutex::new(()),
+            background_security_scans,
             system_backends: RwLock::new(system_backends),
             refresh_lock: tokio::sync::Mutex::new(()),
             refresh_debounce: RefreshDebounce::default(),
@@ -381,6 +386,19 @@ impl DaemonState {
     #[must_use]
     pub(super) fn background_worker_failures(&self) -> u64 {
         self.background_worker_failures.load(Ordering::Relaxed)
+    }
+
+    pub(super) async fn scan_security(
+        &self,
+    ) -> anyhow::Result<crate::core::security::scan::SecurityAuditResult> {
+        // Serialize background and on-demand scans so warmed package results
+        // are available before another scan starts fetching the same inventory.
+        let _guard = self.security_scan_lock.lock().await;
+        crate::core::security::scan::scan_installed(
+            self.package_manager.as_ref(),
+            self.vulnerability_scanner.as_ref(),
+        )
+        .await
     }
 }
 
@@ -987,12 +1005,7 @@ fn vulnerability_score(score: &str) -> Option<f64> {
 
 async fn handle_security_audit(state: Arc<DaemonState>, id: RequestId) -> Response {
     GLOBAL_METRICS.inc_security_audit_requests();
-    match crate::core::security::scan::scan_installed(
-        state.package_manager.as_ref(),
-        state.vulnerability_scanner.as_ref(),
-    )
-    .await
-    {
+    match state.scan_security().await {
         Ok(result) => Response::Success {
             id,
             result: ResponseResult::SecurityAudit(result),
