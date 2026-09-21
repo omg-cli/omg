@@ -14504,7 +14504,7 @@
         }
       ]
     },
-    "07efd708f1e595c60cd8ab4ff1fd2c15fe10e83ef22a028df62151ed88681cc5": {
+    "74d4998615fe6d357085d20d6915f12c8cae59b40397c751d8604bfa482da0ad": {
       "releases": [],
       "cases": [
         {
@@ -16094,6 +16094,22 @@
         },
         {
           "id": "update-aur-only",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "env-export-missing-lock",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "env-plan-missing-manifest",
           "tiers": [
             "hermetic"
           ],
