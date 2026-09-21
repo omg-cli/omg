@@ -135,6 +135,7 @@ pub async fn run(force: bool, version: Option<String>) -> Result<()> {
     // Perform blocking extraction and binary replacement in a separate thread
     // to avoid blocking the tokio async runtime
     let attestation_tag = format!("v{target_version}");
+    let probe_version = target_version.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         // Provenance gate: `gh attestation verify` requires a file on disk, so
         // stage the digest-verified bytes for both the verification and the
@@ -151,7 +152,14 @@ pub async fn run(force: bool, version: Option<String>) -> Result<()> {
         let (new_binary, new_daemon) = extract_update_pair(&bytes, temp_dir.path(), &archive_name)?;
 
         let current_exe = env::current_exe().context("Failed to find current executable path")?;
-        install_update_pair(&new_binary, &new_daemon, &current_exe)
+        tokio::runtime::Handle::current()
+            .block_on(install_checked_update_pair(
+                &new_binary,
+                &new_daemon,
+                &current_exe,
+                &probe_version,
+                std::time::Duration::from_secs(10),
+            ))
             .context("Failed to install updated OMG binaries")
     })
     .await??;
@@ -239,6 +247,134 @@ fn install_update_pair(
     destination: &std::path::Path,
 ) -> Result<()> {
     install_update_pair_with(cli, daemon, destination, persist_update_binary)
+}
+
+async fn install_checked_update_pair(
+    cli: &std::path::Path,
+    daemon: &std::path::Path,
+    destination: &std::path::Path,
+    version: &Version,
+    probe_timeout: std::time::Duration,
+) -> Result<()> {
+    probe_update_binary(cli, "omg", version, probe_timeout).await?;
+    probe_update_binary(daemon, "omgd", version, probe_timeout).await?;
+    install_update_pair(cli, daemon, destination)
+}
+
+async fn probe_update_binary(
+    binary: &std::path::Path,
+    name: &str,
+    version: &Version,
+    deadline: std::time::Duration,
+) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    const OUTPUT_LIMIT: u64 = 4096;
+    anyhow::ensure!(
+        fs::symlink_metadata(binary)
+            .with_context(|| format!("Missing {name} update candidate"))?
+            .file_type()
+            .is_file(),
+        "{name} update candidate is not a regular file"
+    );
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("Failed to execute {name} version probe"))?;
+    #[cfg(unix)]
+    let probe_group = child.id().context("Version probe has no process ID")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Missing version probe stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Missing version probe stderr")?;
+    let read_output = |stream: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>| async move {
+        let mut bytes = Vec::new();
+        stream
+            .take(OUTPUT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() <= OUTPUT_LIMIT as usize,
+            "version probe output exceeds {OUTPUT_LIMIT} bytes"
+        );
+        Ok::<_, anyhow::Error>(bytes)
+    };
+    let probe = tokio::time::timeout(deadline, async {
+        tokio::try_join!(
+            read_output(Box::pin(stdout)),
+            read_output(Box::pin(stderr)),
+            async { child.wait().await.map_err(anyhow::Error::from) },
+        )
+    })
+    .await
+    .with_context(|| format!("{name} version probe timed out"))
+    .and_then(std::convert::identity);
+    let (stdout, stderr, status) = match probe {
+        Ok(result) => result,
+        Err(error) => {
+            // Kill the isolated group before reaping the leader. A candidate
+            // may fork a helper which inherits the output pipes and otherwise
+            // keeps the timed-out probe alive after its direct child exits.
+            #[cfg(unix)]
+            terminate_probe_group(probe_group)?;
+            if child.try_wait()?.is_none() {
+                child.kill().await.with_context(|| {
+                    format!("Failed to reap {name} version probe after {error:#}")
+                })?;
+            }
+            return Err(error);
+        }
+    };
+    #[cfg(unix)]
+    anyhow::ensure!(
+        !terminate_probe_group(probe_group)?,
+        "{name} version probe left descendant processes running"
+    );
+    anyhow::ensure!(
+        status.success(),
+        "{name} version probe failed ({status}): {}",
+        style::sanitize_terminal_text(&String::from_utf8_lossy(&stderr))
+    );
+    let expected = format!("{name} {version}");
+    anyhow::ensure!(
+        std::str::from_utf8(&stdout)?.trim() == expected,
+        "Update candidate does not report {expected}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate_probe_group(group: u32) -> Result<bool> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::Pid;
+
+    let group = i32::try_from(group).context("Version probe process ID exceeded i32")?;
+    let group_pid = Pid::from_raw(group);
+    match kill(Pid::from_raw(-group), None) {
+        Ok(()) => {
+            match killpg(group_pid, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => return Err(error).context("Failed to kill version probe group"),
+            }
+            Ok(true)
+        }
+        Err(Errno::ESRCH) => Ok(false),
+        Err(error) => Err(error).context("Failed to inspect version probe group"),
+    }
 }
 
 fn extract_update_pair(
@@ -556,24 +692,57 @@ async fn send_get(url: &str, safe_url: &str) -> Result<reqwest::Response> {
     Ok(response)
 }
 
-fn release_target(distro: Distro) -> Option<(&'static str, &'static str)> {
-    let arch = match std::env::consts::ARCH {
+fn apt_release_target(distro: Distro, arch: &str, root: &std::path::Path) -> Option<&'static str> {
+    if arch != "x86_64" || !matches!(distro, Distro::Debian | Distro::Ubuntu) {
+        return None;
+    }
+    for major in ["7.0", "6.0"] {
+        for directory in ["usr/lib/x86_64-linux-gnu", "lib/x86_64-linux-gnu"] {
+            if root
+                .join(directory)
+                .join(format!("libapt-pkg.so.{major}"))
+                .is_file()
+            {
+                return Some(match (major, distro) {
+                    ("7.0", _) => "linux-debian-trixie",
+                    (_, Distro::Debian) => "linux-debian",
+                    _ => "linux-ubuntu",
+                });
+            }
+        }
+    }
+    None
+}
+
+fn release_target(
+    distro: Distro,
+    arch: &str,
+    root: &std::path::Path,
+) -> Option<(&'static str, &'static str)> {
+    let arch = match arch {
         "x86_64" => "x86_64",
         "aarch64" => "aarch64",
         _ => return None,
     };
     match distro {
-        Distro::Arch => Some((arch, "linux-arch")),
-        Distro::Debian => Some((arch, "linux-debian")),
-        Distro::Ubuntu => Some((arch, "linux-ubuntu")),
-        Distro::Fedora => Some((arch, "linux-fedora")),
+        Distro::Arch if arch == "x86_64" => Some((arch, "linux-arch")),
+        Distro::Debian | Distro::Ubuntu => Some((arch, apt_release_target(distro, arch, root)?)),
+        Distro::Fedora if arch == "x86_64" => Some((arch, "linux-fedora")),
         Distro::MacOS => Some(("aarch64", "darwin")),
-        Distro::Unknown => None,
+        Distro::Arch | Distro::Fedora | Distro::Unknown => None,
     }
 }
 
 fn release_artifact(version: &Version) -> Result<ReleaseArtifact> {
-    let Some((release_arch, target)) = release_target(detect_distro()) else {
+    let distro = detect_distro();
+    let Some((release_arch, target)) =
+        release_target(distro, std::env::consts::ARCH, std::path::Path::new("/"))
+    else {
+        if matches!(distro, Distro::Debian | Distro::Ubuntu) {
+            anyhow::bail!(
+                "No compatible native APT release: require a published architecture and libapt-pkg.so.6.0 or .7.0"
+            );
+        }
         anyhow::bail!(
             "self-update has no release artifact for this platform; \
              download the archive manually from {GITHUB_RELEASES_PAGE}"
@@ -860,6 +1029,318 @@ fn parse_allow_unverified(value: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn apt_release_selection_matches_installer_filesystem_cases() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            arch: String,
+            libraries: std::collections::BTreeMap<String, String>,
+            suffix: Option<String>,
+        }
+        let cases: Vec<Case> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/apt-release-selection.json"
+        ))
+        .unwrap();
+        for distro in [Distro::Debian, Distro::Ubuntu] {
+            for case in &cases {
+                let root = tempfile::tempdir().unwrap();
+                let library_dir = root.path().join("usr/lib/x86_64-linux-gnu");
+                fs::create_dir_all(&library_dir).unwrap();
+                for (major, kind) in &case.libraries {
+                    let library = library_dir.join(format!("libapt-pkg.so.{major}"));
+                    match kind.as_str() {
+                        "file" => fs::write(&library, b"library fixture").unwrap(),
+                        "directory" => fs::create_dir(&library).unwrap(),
+                        "symlink" | "dangling" => {
+                            let target = format!("libapt-pkg.so.{major}.0");
+                            if kind == "symlink" {
+                                fs::write(library_dir.join(&target), b"library fixture").unwrap();
+                            }
+                            std::os::unix::fs::symlink(target, &library).unwrap();
+                        }
+                        _ => panic!("unknown fixture kind {kind}"),
+                    }
+                }
+                let expected = match case.suffix.as_deref() {
+                    Some("legacy") if distro == Distro::Debian => Some("linux-debian"),
+                    Some("legacy") => Some("linux-ubuntu"),
+                    Some("debian-trixie") => Some("linux-debian-trixie"),
+                    None => None,
+                    Some(other) => panic!("unknown expected suffix {other}"),
+                };
+                assert_eq!(
+                    release_target(distro, &case.arch, root.path()).map(|(_, target)| target),
+                    expected,
+                    "{} on {distro:?}",
+                    case.name
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_version_probe(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_preflight_preserves_pair_on_candidate_failure() {
+        for (cli_body, daemon_body, expected) in [
+            (
+                "echo 'missing libapt-pkg.so.6.0' >&2; exit 127",
+                "echo 'omgd 1.2.3'",
+                "missing libapt-pkg.so.6.0",
+            ),
+            (
+                "echo 'omg 1.2.3'",
+                "echo 'daemon loader failure' >&2; exit 127",
+                "daemon loader failure",
+            ),
+            (
+                "echo 'omg 1.2.2'",
+                "echo 'omgd 1.2.3'",
+                "does not report omg 1.2.3",
+            ),
+            (
+                "echo 'omg 1.2.3'",
+                "echo 'omgd 1.2.2'",
+                "does not report omgd 1.2.3",
+            ),
+            (
+                "printf '%5000s' x",
+                "echo 'omgd 1.2.3'",
+                "version probe output exceeds",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let candidates = root.path().join("candidates");
+            let installed = root.path().join("installed");
+            fs::create_dir(&candidates).unwrap();
+            fs::create_dir(&installed).unwrap();
+            let cli = candidates.join("omg");
+            let daemon = candidates.join("omgd");
+            write_version_probe(&cli, cli_body);
+            write_version_probe(&daemon, daemon_body);
+            fs::write(installed.join("omg"), b"previous cli").unwrap();
+            fs::write(installed.join("omgd"), b"previous daemon").unwrap();
+            let error = install_checked_update_pair(
+                &cli,
+                &daemon,
+                &installed.join("omg"),
+                &Version::new(1, 2, 3),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect_err("unusable pair must not be installed");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(fs::read(installed.join("omg")).unwrap(), b"previous cli");
+            assert_eq!(
+                fs::read(installed.join("omgd")).unwrap(),
+                b"previous daemon"
+            );
+            assert!(!installed.join(".omg-self-update.lock").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_preflight_installs_matching_pair() {
+        let root = tempfile::tempdir().unwrap();
+        let cli = root.path().join("candidate-cli");
+        let daemon = root.path().join("candidate-daemon");
+        write_version_probe(&cli, "echo 'omg 1.2.3'");
+        write_version_probe(&daemon, "echo 'omgd 1.2.3'");
+        let installed = root.path().join("omg");
+        fs::write(&installed, b"previous cli").unwrap();
+        fs::write(root.path().join("omgd"), b"previous daemon").unwrap();
+        // Match production: extraction/replacement runs on a blocking worker
+        // while the active runtime drives the bounded asynchronous probes.
+        let (candidate_cli, candidate_daemon, destination) =
+            (cli.clone(), daemon.clone(), installed.clone());
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(install_checked_update_pair(
+                &candidate_cli,
+                &candidate_daemon,
+                &destination,
+                &Version::new(1, 2, 3),
+                std::time::Duration::from_secs(2),
+            ))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fs::read(&installed).unwrap(), fs::read(&cli).unwrap());
+        assert_eq!(
+            fs::read(root.path().join("omgd")).unwrap(),
+            fs::read(&daemon).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_preflight_rejects_missing_linked_and_unexecutable_candidates() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for case in [
+            "missing",
+            "directory",
+            "symlink",
+            "permission",
+            "invalid-format",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let cli = root.path().join("candidate-cli");
+            let daemon = root.path().join("candidate-daemon");
+            write_version_probe(&cli, "echo 'omg 1.2.3'");
+            let expected = match case {
+                "missing" => "Missing omgd update candidate",
+                "directory" => {
+                    fs::create_dir(&daemon).unwrap();
+                    "omgd update candidate is not a regular file"
+                }
+                "symlink" => {
+                    symlink(&cli, &daemon).unwrap();
+                    "omgd update candidate is not a regular file"
+                }
+                "permission" => {
+                    write_version_probe(&daemon, "echo 'omgd 1.2.3'");
+                    fs::set_permissions(&daemon, fs::Permissions::from_mode(0o644)).unwrap();
+                    "Failed to execute omgd version probe"
+                }
+                "invalid-format" => {
+                    fs::write(&daemon, b"not an executable format").unwrap();
+                    fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+                    "Failed to execute omgd version probe"
+                }
+                _ => unreachable!(),
+            };
+            let installed = root.path().join("omg");
+            fs::write(&installed, b"previous cli").unwrap();
+            fs::write(root.path().join("omgd"), b"previous daemon").unwrap();
+            let error = install_checked_update_pair(
+                &cli,
+                &daemon,
+                &installed,
+                &Version::new(1, 2, 3),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect_err("invalid candidate must preserve the installed pair");
+            assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");
+            assert_eq!(fs::read(&installed).unwrap(), b"previous cli");
+            assert_eq!(
+                fs::read(root.path().join("omgd")).unwrap(),
+                b"previous daemon"
+            );
+            assert!(!root.path().join(".omg-self-update.lock").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_preflight_timeout_reaps_child_before_returning() {
+        let root = tempfile::tempdir().unwrap();
+        let cli = root.path().join("candidate-cli");
+        let daemon = root.path().join("candidate-daemon");
+        let pid_file = root.path().join("probe.pid");
+        write_version_probe(
+            &cli,
+            &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
+        );
+        write_version_probe(&daemon, "echo 'omgd 1.2.3'");
+        let installed = root.path().join("omg");
+        fs::write(&installed, b"previous cli").unwrap();
+        fs::write(root.path().join("omgd"), b"previous daemon").unwrap();
+        let error = install_checked_update_pair(
+            &cli,
+            &daemon,
+            &installed,
+            &Version::new(1, 2, 3),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("hung probe must refuse installation");
+        assert!(
+            format!("{error:#}").contains("omg version probe timed out"),
+            "{error:#}"
+        );
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        assert_eq!(fs::read(&installed).unwrap(), b"previous cli");
+        assert_eq!(
+            fs::read(root.path().join("omgd")).unwrap(),
+            b"previous daemon"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_preflight_rejects_and_reaps_forked_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let cli = root.path().join("candidate-cli");
+        let daemon = root.path().join("candidate-daemon");
+        let pid_file = root.path().join("descendant.pid");
+        write_version_probe(
+            &cli,
+            &format!(
+                "sleep 30 >/dev/null 2>&1 & echo $! > '{}'; echo 'omg 1.2.3'",
+                pid_file.display()
+            ),
+        );
+        write_version_probe(&daemon, "echo 'omgd 1.2.3'");
+        let installed = root.path().join("omg");
+        fs::write(&installed, b"previous cli").unwrap();
+        fs::write(root.path().join("omgd"), b"previous daemon").unwrap();
+
+        let error = install_checked_update_pair(
+            &cli,
+            &daemon,
+            &installed,
+            &Version::new(1, 2, 3),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect_err("a probe that leaves descendants must refuse installation");
+        assert!(
+            format!("{error:#}").contains("omg version probe left descendant processes running"),
+            "{error:#}"
+        );
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        for _ in 0..50 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                == Err(nix::errno::Errno::ESRCH)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        assert_eq!(fs::read(&installed).unwrap(), b"previous cli");
+        assert_eq!(
+            fs::read(root.path().join("omgd")).unwrap(),
+            b"previous daemon"
+        );
+    }
+
     #[test]
     fn release_signer_cutover_has_no_cross_namespace_fallback() {
         for tag in ["v0.1.220", "v0.1.221"] {
@@ -903,6 +1384,7 @@ mod tests {
     #[test]
     fn elevated_verifier_rejects_another_users_helper() {
         if !crate::core::is_root() {
+            eprintln!("[omg-skip] elevated verifier ownership test requires root");
             return;
         }
         use std::os::unix::fs::PermissionsExt;
@@ -1094,25 +1576,20 @@ mod tests {
 
     #[test]
     fn release_target_matches_ci_artifact_names() {
-        let linux_arch = std::env::consts::ARCH;
-        assert_eq!(
-            release_target(Distro::Arch),
-            Some((linux_arch, "linux-arch"))
-        );
-        assert_eq!(
-            release_target(Distro::Debian),
-            Some((linux_arch, "linux-debian"))
-        );
-        assert_eq!(
-            release_target(Distro::Ubuntu),
-            Some((linux_arch, "linux-ubuntu"))
-        );
-        assert_eq!(
-            release_target(Distro::Fedora),
-            Some((linux_arch, "linux-fedora"))
-        );
-        assert_eq!(release_target(Distro::MacOS), Some(("aarch64", "darwin")));
-        assert_eq!(release_target(Distro::Unknown), None);
+        let linux_arch = "x86_64";
+        let root = tempfile::tempdir().unwrap();
+        let library_dir = root.path().join("usr/lib/x86_64-linux-gnu");
+        fs::create_dir_all(&library_dir).unwrap();
+        fs::write(library_dir.join("libapt-pkg.so.6.0"), b"library fixture").unwrap();
+        let select = |distro| release_target(distro, linux_arch, root.path());
+        assert_eq!(select(Distro::Arch), Some((linux_arch, "linux-arch")));
+        assert_eq!(select(Distro::Debian), Some((linux_arch, "linux-debian")));
+        assert_eq!(select(Distro::Ubuntu), Some((linux_arch, "linux-ubuntu")));
+        assert_eq!(select(Distro::Fedora), Some((linux_arch, "linux-fedora")));
+        assert_eq!(select(Distro::MacOS), Some(("aarch64", "darwin")));
+        assert_eq!(select(Distro::Unknown), None);
+        assert_eq!(release_target(Distro::Arch, "aarch64", root.path()), None);
+        assert_eq!(release_target(Distro::Fedora, "aarch64", root.path()), None);
     }
 
     #[test]
@@ -1472,6 +1949,7 @@ mod tests {
             // this environment; running the impostor scenario would invoke
             // it against a synthetic archive. The impostor-ignoring behavior
             // is still covered on environments without a system `gh`.
+            eprintln!("[omg-skip] PATH impostor test requires a host without a trusted gh binary");
             return;
         }
         let impostor_dir = tempfile::tempdir().expect("impostor directory");

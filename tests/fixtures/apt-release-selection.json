@@ -1,0 +1,12 @@
+[
+  {"name":"legacy", "arch":"x86_64", "libraries":{"6.0":"file"}, "suffix":"legacy"},
+  {"name":"apt7", "arch":"x86_64", "libraries":{"7.0":"file"}, "suffix":"debian-trixie"},
+  {"name":"both", "arch":"x86_64", "libraries":{"6.0":"file", "7.0":"file"}, "suffix":"debian-trixie"},
+  {"name":"versioned-symlink", "arch":"x86_64", "libraries":{"7.0":"symlink"}, "suffix":"debian-trixie"},
+  {"name":"absent", "arch":"x86_64", "libraries":{}, "suffix":null},
+  {"name":"dangling", "arch":"x86_64", "libraries":{"7.0":"dangling"}, "suffix":null},
+  {"name":"directory", "arch":"x86_64", "libraries":{"7.0":"directory"}, "suffix":null},
+  {"name":"dangling-new-with-legacy", "arch":"x86_64", "libraries":{"6.0":"file", "7.0":"dangling"}, "suffix":"legacy"},
+  {"name":"unpublished-arm", "arch":"aarch64", "libraries":{"7.0":"file"}, "suffix":null},
+  {"name":"unsupported-arch", "arch":"riscv64", "libraries":{"7.0":"file"}, "suffix":null}
+]
