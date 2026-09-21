@@ -1,6 +1,64 @@
 pub mod common;
 
 #[test]
+fn audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_it()
+-> anyhow::Result<()> {
+    use omg_lib::core::security::{SecurityGrade, SecurityPolicy};
+    let project = common::TestProject::new();
+    let path = project.config_dir.path().join("policy.toml");
+    let defaults = project.run(&["audit", "policy"]);
+    defaults.assert_success();
+    assert!(defaults.stdout.contains("COMMUNITY (AUR/Unsigned)"));
+    assert!(
+        !path.exists(),
+        "A read-only policy query must not create a policy"
+    );
+
+    let policy = SecurityPolicy {
+        minimum_grade: SecurityGrade::Verified,
+        allow_aur: false,
+        require_pgp: true,
+        allowed_licenses: vec!["MIT".to_owned()],
+        banned_packages: vec!["fixture-banned-package".to_owned()],
+    };
+    let original = toml::to_string(&policy)?;
+    std::fs::write(&path, &original)?;
+    let configured = project.run(&["audit", "policy"]);
+    configured.assert_success();
+    for expected in [
+        "VERIFIED (PGP/Checksum)",
+        "AUR Allowed: No",
+        "PGP Required: Yes",
+        "fixture-banned-package",
+        "MIT",
+    ] {
+        assert!(
+            configured.stdout.contains(expected),
+            "missing {expected:?}: {}",
+            configured.stdout
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&path)?, original);
+    for corrupt in [b"minimum_grade = [".as_slice(), b"\xff\n".as_slice()] {
+        std::fs::write(&path, corrupt)?;
+        let refused = project.run(&["audit", "policy"]);
+        refused.assert_failure();
+        assert!(
+            refused.stderr.to_lowercase().contains("policy"),
+            "{}",
+            refused.stderr
+        );
+        assert!(!refused.stdout.contains("Minimum Grade:"));
+        assert_eq!(std::fs::read(&path)?, corrupt);
+    }
+    std::fs::write(&path, &original)?;
+    project.run(&["audit", "policy"]).assert_success();
+    assert_eq!(std::fs::read_to_string(&path)?, original);
+    project.close_checked();
+    Ok(())
+}
+
+#[test]
 fn audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_history()
 -> anyhow::Result<()> {
     use omg_lib::core::security::audit::{AuditEventType, AuditLogger, AuditSeverity};
