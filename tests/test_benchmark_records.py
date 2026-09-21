@@ -465,6 +465,13 @@ class QemuCloudInitTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("\npreserve_hostname: true\n", (root / "user-data").read_text())
+            seed_text = (root / "user-data").read_text()
+            self.assertIn("path: /etc/systemd/system/omg-boot-network.service", seed_text)
+            self.assertIn("TTYPath=/dev/ttyS0", seed_text)
+            self.assertIn("TimeoutStartSec=15", seed_text)
+            self.assertIn("--unit=systemd-networkd --unit=NetworkManager --lines=80", seed_text)
+            self.assertIn("OnBootSec=45", seed_text)
+            self.assertIn("Unit=omg-boot-network.service", seed_text)
             self.assertNotIn("local-hostname", (root / "meta-data").read_text())
             self.assertEqual(
                 (root / "known_hosts").read_text(),
