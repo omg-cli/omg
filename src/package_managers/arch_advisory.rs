@@ -66,10 +66,10 @@ pub(crate) fn audit_result(
         {
             let version =
                 parse_version(&package.version).context("Invalid installed Arch version")?;
-            if let Some(fixed) = &fixed {
-                if &version >= fixed {
-                    continue;
-                }
+            if let Some(fixed) = &fixed
+                && &version >= fixed
+            {
+                continue;
             }
             let references = advisory
                 .issues

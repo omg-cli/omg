@@ -110,6 +110,30 @@ grep -q "APT commit error" "$CALL_LOG" || fail "progress-excerpt buried the real
 grep -q "Could not open partial file" "$CALL_LOG" || fail "progress-excerpt dropped error context"
 if grep -q "Working" "$CALL_LOG"; then fail "progress-excerpt leaked progress spam"; fi
 
+# 7c. Redact complete multiline keys before truncation can remove the header.
+{
+  printf -- '-----BEGIN %s KEY-----\n' PRIVATE
+  for index in $(seq 1 50); do printf 'synthetic-private-material-%s\n' "$index"; done
+  printf -- '-----END %s KEY-----\n' PRIVATE
+  printf 'root cause remains visible\n'
+} > "$scratch/ev/debian-install-tree/transcript.txt"
+: > "$CALL_LOG"; export FAKE_ISSUES_JSON='[]'
+out=$(bash "$runner" "$results" --run-url https://run/7c --source qemu --evidence-dir "$scratch/ev"); assert_rc 0 "$?" "private-key-excerpt"
+grep -q 'synthetic-private-material' "$CALL_LOG" && fail "excerpt leaked multiline private-key body"
+grep -q '\[redacted-private-key\]' "$CALL_LOG" || fail "excerpt lost redaction marker before truncation"
+grep -q 'root cause remains visible' "$CALL_LOG" || fail "redaction lost the following failure cause"
+
+# 7d. Interrupted output must not expose an unterminated private key.
+{
+  printf 'failure before key remains visible\n'
+  printf -- '-----BEGIN RSA %s KEY-----\n' PRIVATE
+  printf 'synthetic-unclosed-private-material\n'
+} > "$scratch/ev/debian-install-tree/transcript.txt"
+: > "$CALL_LOG"; export FAKE_ISSUES_JSON='[]'
+out=$(bash "$runner" "$results" --run-url https://run/7d --source qemu --evidence-dir "$scratch/ev"); assert_rc 0 "$?" "unclosed-private-key-excerpt"
+grep -q 'synthetic-unclosed-private-material' "$CALL_LOG" && fail "excerpt leaked unterminated private key"
+grep -q 'failure before key remains visible' "$CALL_LOG" || fail "redaction lost earlier failure cause"
+
 # 8. A passing case resolves its open issue (comment + close).
 printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":2}]' > "$results"
 export FAKE_ISSUES_JSON='[{"number":7,"state":"open","body":"<!-- omg-qa-fingerprint: qemu:arch:search-tree -->"}]'

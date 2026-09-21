@@ -38,8 +38,18 @@ scrub() {
     -e 's/github_pat_[A-Za-z0-9_]+/[redacted-token]/g' \
     -e 's/gho_[A-Za-z0-9_]+/[redacted-token]/g' \
     -e 's/ghs_[A-Za-z0-9_]+/[redacted-token]/g' \
-    -e 's/Bearer [A-Za-z0-9._~+\/-]+/[redacted-bearer]/g' \
-    -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----/[redacted-private-key]/g'
+    -e 's/Bearer [A-Za-z0-9._~+\/-]+/[redacted-bearer]/g' |
+  awk '
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/ {
+      print "[redacted-private-key]"
+      private_key = 1
+    }
+    private_key {
+      if ($0 ~ /-----END [A-Z ]*PRIVATE KEY-----/) private_key = 0
+      next
+    }
+    { print }
+  '
 }
 
 # Locate the richest per-case log near $evidence_dir. On success prints
@@ -73,5 +83,5 @@ excerpt_for() {
   # pipeline under pipefail); everything else is preserved verbatim.
   tr '\r' '\n' < "$candidate" |
     sed -E '/^[[:space:]]*([0-9]+% )?\[Working\][[:space:]]*$/d' |
-    tail -n 40 | scrub | tail -c 3000
+    scrub | tail -n 40 | tail -c 3000
 }

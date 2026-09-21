@@ -264,3 +264,10 @@ reset, all value boundaries, privileged configuration inheritance, disk exhausti
 crash recovery and the remaining settings fields. Existing provisional gaps stay
 open. Contract bindings admit only the assertions above; no global inventory review
 flag or 95% claim is changed.
+
+
+## QEMU issue recovery race checks (2026-09-21)
+
+Added reporter-main fixtures that follow API identity checks, archive parsing, result projection and the actual issue-helper invocation boundary. Current-main success must deliver both the case PASS and workflow recovery; stale-main success delivers neither. Advancing main during download preserves an observed failure but removes all recovery claims. Changing the run attempt during download aborts before any helper mutation.
+
+All 31 reporting tests pass. In-memory negative controls disabled the main-SHA guards, the post-download SHA guard, and the post-download attempt validation separately; the corresponding three behavioral assertions failed (not fixture errors). Production reporting semantics are unchanged, including PASS with a nonzero observed exit for a verified expected-rejection case. These checks protect failure history but are not additional OMG CLI behavioral coverage.

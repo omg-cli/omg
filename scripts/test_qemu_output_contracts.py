@@ -62,12 +62,18 @@ class OutputContracts(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_python_install_requires_active_executable_and_exact_version(self):
         rows = ['runtime-python-install\t["use","python","3.12.14"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
-        for fault in ('missing', 'inactive', 'wrong-version', 'broken', 'escaped', 'version-escaped', 'none'):
+        for fault in ('missing', 'inactive', 'wrong-version', 'broken', 'escaped', 'version-escaped', 'version-only', 'program-noop', 'program-failure', 'none'):
             with self.subTest(fault=fault):
                 product = 'printf "Installed Python 3.12.14\\n"\n'
                 if fault != 'missing':
                     version = '3.12.13' if fault == 'wrong-version' else '3.12.14'
                     script = '#!/bin/sh\n' + ('exit 1\n' if fault == 'broken' else f'printf "Python {version}\\n"\n')
+                    if fault in ('program-noop', 'program-failure', 'none'):
+                        # This models runner admission, not a real Python install.
+                        behavior = {'program-noop': 'exit 0\n',
+                                    'program-failure': 'echo missing-stdlib >&2\nexit 17\n',
+                                    'none': 'printf "OMG_PYTHON_RUNTIME_OK:3.12.14\\n"\n'}[fault]
+                        script = '#!/bin/sh\nif [ "$1" = --version ]; then printf "Python 3.12.14\\n"; exit 0; fi\ncat >/dev/null\n' + behavior
                     product += ': "${OMG_DATA_DIR:?isolated runtime state missing}"\nbase="$OMG_DATA_DIR/versions/python"\nmkdir -p "$base/3.12.14/bin"\n'
                     product += f'printf %s {shlex.quote(script)} > "$base/3.12.14/bin/python3"\nchmod 755 "$base/3.12.14/bin/python3"\n'
                     if fault != 'inactive':
@@ -81,6 +87,9 @@ class OutputContracts(unittest.TestCase):
                 self.assertEqual(evidence[0]['result'], 'PASS' if fault == 'none' else 'FAIL')
                 if fault != 'none':
                     self.assertIn('assertion failed: Python', logs['runtime-python-install.log'])
+                if fault == 'program-failure':
+                    self.assertIn('missing-stdlib', logs['runtime-python-install.log'])
+                    self.assertIn('exit=17', logs['runtime-python-install.log'])
 
     def generated_hooks(self):
         source = (ROOT / 'src/cli/git_hooks.rs').read_text(encoding='utf-8')

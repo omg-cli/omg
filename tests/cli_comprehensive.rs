@@ -1885,7 +1885,7 @@ mod system_tests {
         let original = std::fs::read(&config).unwrap();
         std::fs::set_permissions(
             project.config_dir.path(),
-            std::fs::Permissions::from_mode(0),
+            std::fs::Permissions::from_mode(0o0),
         )
         .unwrap();
         let validate = project.run(&["config", "validate"]);

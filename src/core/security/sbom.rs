@@ -306,5 +306,4 @@ mod tests {
             .expect_err("writing an SBOM over a directory must fail");
         assert!(matches!(error, SbomError::Write { .. }), "got: {error}");
     }
-
 }
