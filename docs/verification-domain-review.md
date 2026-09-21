@@ -115,3 +115,34 @@ This is an inventory admission/refusal contract, not vulnerability scanner
 coverage. No installed packages are scanned here, so advisory networking,
 positive findings, severity scores, scanner errors and cancellation remain open.
 The generic SecurityAudit gap is retained.
+
+## Beta advisory fetching: pagination repair design
+
+The beta requirement includes real advisory fetching and vulnerability scoring,
+not just inventory admission. Source review found that OsvResponse ignored
+next_page_token, and scan_package cached the first response as complete. OSV's
+query specification explicitly allows pages with only a continuation token.
+This can lose findings or cache a false empty result.
+
+The repair will keep package/ecosystem/version fixed while following page_token,
+accumulate findings until completion, and only then publish the cache entry.
+Continuation cycles or a bounded page-budget exhaustion must be errors, never
+successful partial scans. Regression fixtures must include an empty intermediate
+page, multiple findings with numeric/CVSS scores, exact outgoing continuation
+requests, and no cache entry after a later-page error. Full OMGD/CLI fetching and
+scoring verification remains required after the scanner-level repair.
+
+Primary source: https://google.github.io/osv.dev/post-v1-query/
+
+Pagination regression evidence: the original scanner returned zero findings
+instead of two from a three-page fixture. The repaired scanner passes that test
+and later-page HTTP503, malformed JSON, and repeated-token cases. Each failure
+must return its typed error; a subsequent scan must fetch a fresh complete
+finding instead of returning the earlier partial page. Numeric 7.5/8.1 and CVSS
+3.1 vector9.8 are verified from HTTP responses. The final cache check runs after
+the fixture listener closes, proving complete results are reused.
+
+This repair follows tokens with a100-page budget and rejects token cycles.
+The page-budget failure branch still needs explicit exercise. It does not yet
+establish full daemon/CLI fetching or scoring coverage; those integrations remain
+beta requirements, not optional follow-ups.
