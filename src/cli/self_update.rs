@@ -316,33 +316,34 @@ async fn probe_update_binary(
         tokio::try_join!(
             read_output(Box::pin(stdout)),
             read_output(Box::pin(stderr)),
-            async { child.wait().await.map_err(anyhow::Error::from) },
+            wait_for_probe_exit_without_reaping(probe_group),
         )
     })
     .await
     .with_context(|| format!("{name} version probe timed out"))
     .and_then(std::convert::identity);
-    let (stdout, stderr, status) = match probe {
+    let (stdout, stderr, ()) = match probe {
         Ok(result) => result,
         Err(error) => {
             // Kill the isolated group before reaping the leader. A candidate
             // may fork a helper which inherits the output pipes and otherwise
             // keeps the timed-out probe alive after its direct child exits.
             #[cfg(unix)]
-            terminate_probe_group(probe_group)?;
-            if child.try_wait()?.is_none() {
-                child.kill().await.with_context(|| {
-                    format!("Failed to reap {name} version probe after {error:#}")
-                })?;
-            }
+            kill_probe_group(probe_group)?;
+            child
+                .wait()
+                .await
+                .with_context(|| format!("Failed to reap {name} version probe after {error:#}"))?;
             return Err(error);
         }
     };
     #[cfg(unix)]
-    anyhow::ensure!(
-        !terminate_probe_group(probe_group)?,
-        "{name} version probe left descendant processes running"
-    );
+    if probe_group_has_descendants(probe_group)? {
+        kill_probe_group(probe_group)?;
+        child.wait().await.context("Failed to reap version probe")?;
+        anyhow::bail!("{name} version probe left descendant processes running");
+    }
+    let status = child.wait().await.context("Failed to reap version probe")?;
     anyhow::ensure!(
         status.success(),
         "{name} version probe failed ({status}): {}",
@@ -357,23 +358,68 @@ async fn probe_update_binary(
 }
 
 #[cfg(unix)]
-fn terminate_probe_group(group: u32) -> Result<bool> {
+async fn wait_for_probe_exit_without_reaping(group: u32) -> Result<()> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+    let pid = i32::try_from(group)
+        .ok()
+        .and_then(Pid::from_raw)
+        .context("Version probe process ID was invalid")?;
+    tokio::task::spawn_blocking(move || {
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        )
+        .context("Failed to observe version probe exit without reaping")?
+        .context("Version probe exit was not reported")?;
+        Ok(())
+    })
+    .await
+    .context("Version probe exit observer panicked")?
+}
+
+#[cfg(unix)]
+fn probe_group_has_descendants(group: u32) -> Result<bool> {
+    let ps = if cfg!(target_os = "macos") {
+        "/bin/ps"
+    } else {
+        "/usr/bin/ps"
+    };
+    let output = std::process::Command::new(ps)
+        .args(["-eo", "pid=,pgid="])
+        .output()
+        .context("Failed to inspect version probe process group")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Process-group inspection failed with {}",
+        output.status
+    );
+    for line in String::from_utf8(output.stdout)?.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next() else { continue };
+        let Some(pgid) = fields.next() else {
+            continue;
+        };
+        let pid = pid.parse::<u32>().context("Invalid PID from ps")?;
+        let pgid = pgid.parse::<u32>().context("Invalid PGID from ps")?;
+        if pgid == group && pid != group {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn kill_probe_group(group: u32) -> Result<()> {
     use nix::errno::Errno;
-    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
 
     let group = i32::try_from(group).context("Version probe process ID exceeded i32")?;
     let group_pid = Pid::from_raw(group);
-    match kill(Pid::from_raw(-group), None) {
-        Ok(()) => {
-            match killpg(group_pid, Signal::SIGKILL) {
-                Ok(()) | Err(Errno::ESRCH) => {}
-                Err(error) => return Err(error).context("Failed to kill version probe group"),
-            }
-            Ok(true)
-        }
-        Err(Errno::ESRCH) => Ok(false),
-        Err(error) => Err(error).context("Failed to inspect version probe group"),
+    match killpg(group_pid, Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error).context("Failed to kill version probe group"),
     }
 }
 
@@ -1215,7 +1261,9 @@ mod tests {
                 "invalid-format" => {
                     fs::write(&daemon, b"not an executable format").unwrap();
                     fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
-                    "Failed to execute omgd version probe"
+                    // Linux rejects the spawn with ENOEXEC; macOS may invoke
+                    // the text through /bin/sh and return exit 127 instead.
+                    "omgd version probe"
                 }
                 _ => unreachable!(),
             };
