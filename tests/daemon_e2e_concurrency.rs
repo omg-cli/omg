@@ -443,7 +443,9 @@ async fn test_shared_state_thread_safety() -> Result<()> {
                     (_, other) => panic!("mixed request {expected_id} returned {other:?}"),
                 }
             }
-            other => panic!("mixed request {expected_id} returned {other:?}"),
+            other @ Response::Error { .. } => {
+                panic!("mixed request {expected_id} returned {other:?}")
+            }
         }
     }
 
