@@ -52,6 +52,11 @@ fn invalid_inputs_fail_without_leaking_manifest_contents() {
     let exported = project.run(&["env", "export", "--source-target", "arch-x86_64"]);
     assert!(!exported.success);
     assert!(exported.stdout.is_empty());
+    assert!(
+        exported
+            .combined_output()
+            .contains("Failed to inspect lockfile omg.lock")
+    );
 }
 
 #[cfg(unix)]
@@ -63,4 +68,24 @@ fn planner_refuses_symlinked_manifest() {
     let result = project.run(&["env", "plan", "--target", "ubuntu-x86_64"]);
     assert!(!result.success);
     assert!(result.stdout.is_empty());
+    assert!(
+        result
+            .combined_output()
+            .contains("Cannot read .omg.toml for environment planning")
+    );
+    assert!(
+        result
+            .combined_output()
+            .contains("Refusing to read lockfile that is not a regular file: .omg.toml")
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("other.toml")).unwrap(),
+        "[environment]\nschema_version = 1\n"
+    );
+    assert!(
+        std::fs::symlink_metadata(project.path().join(".omg.toml"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
