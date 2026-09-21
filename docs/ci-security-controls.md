@@ -1,5 +1,9 @@
 # CI security controls
 
+> **Who this page is for:** OMG maintainers and contributors. It documents continuous-integration controls.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 OMG treats a successful PR, a successful main commit, and a verified published
 archive as separate evidence. Publication waits for the latest successful push
 runs of CI, Benchmark, Security Audit, Secret Scanning, CodeQL, Coverage, Docker

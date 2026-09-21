@@ -1,5 +1,10 @@
 # AUR Support
 
+**In plain words:** The AUR is a collection of build instructions written by Arch Linux users rather than by the distribution. This page explains how OMG reviews and builds those packages, and which safety choices you are making.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 OMG supports the Arch User Repository (AUR) with the same install, search, and update commands used for official packages.
 
 ## Overview

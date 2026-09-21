@@ -6,6 +6,11 @@ description: Inspect OMG state in a terminal
 
 # Terminal dashboard
 
+**In plain words:** OMG includes a text-based dashboard for looking at your system instead of typing commands. This page explains how to open it, how to move around, and how to leave it.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 ```bash
 omg dash
 ```

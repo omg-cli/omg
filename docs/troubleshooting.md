@@ -6,9 +6,25 @@ description: Diagnose failures without discarding configuration or evidence
 
 # Troubleshooting
 
-Diagnose the failing operation before changing package state, configuration, or persisted data. Keep your native package manager available.
+**In plain words:** What to do when a command does not work, in an order that keeps your computer and your records safe. Start with the first section and work downwards.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
+OMG is approaching beta. Diagnose the failing operation before changing package state, configuration, or persisted data. Keep your native package manager available.
 
 ## Collect a baseline
+
+```mermaid
+flowchart TD
+    A[One command failed] --> B[omg doctor]
+    B -->|command not found| C[Fix PATH]
+    B -->|socket error| D[omg daemon-status]
+    B -->|policy rejected| E[omg audit policy]
+    C --> F[Keep the evidence before changing anything]
+    D --> F
+    E --> F
+```
 
 ```bash
 omg --version
@@ -21,7 +37,7 @@ Record the backend, operating system, exact command, exit status, and whether th
 
 ## Daemon or socket failures
 
-Only use the daemon on platforms whose release includes it; non-Arch release archives do not include `omgd`. See [installation](./installation.md) and [daemon socket resolution](./daemon.md).
+Current Linux and macOS release archives include a matching `omgd`. Archives from v0.1.222 and earlier omit it on non-Arch targets. See [installation](./installation.md) and [daemon socket resolution](./daemon.md).
 
 If no daemon is running, start the matching executable in a separate terminal:
 

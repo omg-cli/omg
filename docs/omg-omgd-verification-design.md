@@ -1,5 +1,9 @@
 # OMG and OMGD verification design
 
+> **Who this page is for:** OMG maintainers and contributors. It documents the verification design.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 Status: user-approved design (2026-09-20), not a claim of implemented coverage.
 CI optimization PR #440 must pass its final revision. Its initial portable baseline
 found inherited NVM state leaking into hermetic fixtures; that fixture repair was

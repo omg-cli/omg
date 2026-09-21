@@ -6,13 +6,18 @@ description: Hooks, completions, and PATH management
 
 # Shell Integration
 
+**In plain words:** One small addition to your shell start-up file lets OMG select the right language version automatically when you enter a project folder. This page has the exact line for each shell, how to check it works, and how to remove it.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 **Hooks, Completions, and PATH Management**
 
 This guide covers OMG's shell integration features including the shell hook, completions, and ultra-fast shell functions.
 
 ---
 
-## 🎯 Overview
+## Overview
 
 OMG provides deep shell integration that:
 
@@ -23,7 +28,7 @@ OMG provides deep shell integration that:
 
 ---
 
-## 🔧 Shell Hook Installation
+## Shell Hook Installation
 
 ### What the Hook Does
 
@@ -101,7 +106,7 @@ echo $PATH | grep omg
 
 ---
 
-## 📝 How Version Detection Works
+## How Version Detection Works
 
 ### Detection Order
 
@@ -204,31 +209,24 @@ Priority: `engines` > `volta`
 
 ---
 
-## 🚀 Ultra-Fast Shell Functions
+## Prompt counters
 
-The hook provides cached package count functions for shell prompts.
+Bash and Zsh hooks define package-count helpers. They read `omg.status` beside the daemon socket after checking size, magic, version, ownership, and a five-minute timestamp. Fish's generated hook does not define these helpers. Use `omg ec` there, or call the CLI from the prompt.
 
-### Cached Functions (Sub-Microsecond)
+### Shell helpers
 
-These read from a cached status file updated by the daemon:
+Zsh keeps `omg-ec`, `omg-tc`, `omg-oc`, and `omg-uc` in shell variables and refreshes them at most every 60 seconds. Until the first successful read, those variables are `0`. Bash defines the same short names as aliases of the file readers below, so each prompt call reads the file.
 
 | Function | Returns |
-|----------|---------|
+| --- | --- |
 | `omg-ec` | Explicit package count |
 | `omg-tc` | Total package count |
 | `omg-oc` | Orphan count |
 | `omg-uc` | Updates count |
-
-### Fresh Functions
-
-These read the status file directly:
-
-| Function | Returns |
-| ---------- | --------- |
-| `omg-explicit-count` | Explicit package count |
-| `omg-total-count` | Total package count |
-| `omg-orphan-count` | Orphan count |
-| `omg-updates-count` | Updates count |
+| `omg-explicit-count` | Explicit count read from `omg.status`, or `omg explicit --count` when the file is rejected |
+| `omg-total-count` | Total count read from `omg.status`, or `0` when the file is rejected |
+| `omg-orphan-count` | Orphan count read from `omg.status`, or `0` when the file is rejected |
+| `omg-updates-count` | Update count read from `omg.status`, or `0` when the file is rejected |
 
 ### Using in Prompts
 
@@ -255,12 +253,13 @@ export PS1='[\w] $(omg-ec) pkgs$ '
 export PS1='\[\e[36m\][$(omg-ec) pkgs]\[\e[0m\] \w$ '
 ```
 
-#### Fish Prompt
+#### Fish prompt
+
+The generated Fish hook does not define `omg-ec`. Read the count from the CLI:
 
 ```fish
-# In ~/.config/fish/functions/fish_prompt.fish
 function fish_prompt
-    echo -n (omg-ec)" pkgs "
+    echo -n (omg ec)" pkgs "
     set_color blue
     echo -n (prompt_pwd)
     set_color normal
@@ -274,7 +273,7 @@ Cached prompt values avoid a fresh query but can be stale. Compare fresh queries
 
 ---
 
-## 🔤 Shell Completions
+## Shell Completions
 
 ### Installation
 
@@ -324,7 +323,7 @@ omg completions fish --stdout | sudo tee /usr/share/fish/vendor_completions.d/om
 OMG provides intelligent completions for:
 
 - **Commands**: All subcommands with descriptions
-- **Package names**: From daemon cache (80k+ AUR packages)
+- **Package names**: From the daemon index when that index is available
 - **Runtime versions**: Installed and available versions
 - **Options**: All flags with descriptions
 
@@ -339,77 +338,17 @@ omg i frfx<TAB>
 
 ---
 
-## 🔄 Hook Behavior Deep Dive
+## Hook behavior
 
-### Zsh Hook Internals
+`omg hook bash`, `omg hook zsh`, and `omg hook fish` print the scripts below. The printed script is the source of truth. Each hook saves the original `PATH`, restores environment changes from the previous directory, and calls `command omg hook-env` so a shell function named `omg` cannot shadow the binary. An interactive shell can also start the daily update-notice check.
 
-The Zsh hook uses `precmd` and `chpwd` functions:
+Zsh registers `_omg_hook` on `precmd_functions` and `chpwd_functions`, then refreshes its in-shell counter cache at most every 60 seconds. Bash registers `_omg_hook` on `PROMPT_COMMAND`, including when that variable is an array. Bash counter helpers read the status file on each call. Fish registers `_omg_hook` on `PWD` and `fish_prompt`.
 
-```bash
-_omg_hook() {
-  trap -- '' SIGINT
-  eval "$(omg hook-env -s zsh)"
-  trap - SIGINT
-}
-
-typeset -ag precmd_functions
-if [[ -z "${precmd_functions[(r)_omg_hook]+1}" ]]; then
-  precmd_functions=(_omg_hook ${precmd_functions[@]})
-fi
-
-typeset -ag chpwd_functions  
-if [[ -z "${chpwd_functions[(r)_omg_hook]+1}" ]]; then
-  chpwd_functions=(_omg_hook ${chpwd_functions[@]})
-fi
-```
-
-### Bash Hook Internals
-
-Bash uses `PROMPT_COMMAND`:
-
-```bash
-_omg_hook() {
-  local previous_exit_status=$?
-  trap -- '' SIGINT
-  eval "$(omg hook-env -s bash)"
-  trap - SIGINT
-  return $previous_exit_status
-}
-
-if [[ ! "${PROMPT_COMMAND:-}" =~ _omg_hook ]]; then
-  PROMPT_COMMAND="_omg_hook${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-fi
-```
-
-### Fish Hook Internals
-
-Fish uses event handlers:
-
-```fish
-function _omg_hook --on-variable PWD --on-event fish_prompt
-  omg hook-env -s fish | source
-end
-```
-
-### Cache Refresh
-
-The hook includes automatic cache refresh every 60 seconds:
-
-```bash
-_omg_refresh_cache() {
-  local f="${XDG_RUNTIME_DIR:-/tmp}/omg.status"
-  [[ -f "$f" ]] || return
-  local now=$EPOCHSECONDS
-  (( now - _OMG_CACHE_TIME < 60 )) && return
-  _OMG_CACHE_TIME=$now
-  local data=$(od -An -j8 -N16 -tu4 "$f" 2>/dev/null)
-  read _OMG_TOTAL _OMG_EXPLICIT _OMG_ORPHANS _OMG_UPDATES <<< "$data"
-}
-```
+The generated hook fills in the status path as the daemon socket's sibling, `omg.status`. Zsh and Bash accept the file only when it is a regular, user-owned, 32-byte snapshot with magic `OMGS`, version 1, and a timestamp no older than five minutes.
 
 ---
 
-## 🛠️ Manual PATH Management
+## Manual PATH Management
 
 If you prefer manual control over PATH:
 
@@ -442,7 +381,7 @@ ls -la ~/.local/share/omg/versions/node/current
 
 ---
 
-## ⚙️ Configuration Options
+## Configuration Options
 
 ### PATH Hooks
 
@@ -458,7 +397,7 @@ Shell hooks resolve only OMG's native runtime installations. Unknown pins do not
 
 ---
 
-## 🔍 Troubleshooting
+## Troubleshooting
 
 ### Hook Not Running
 
@@ -521,7 +460,7 @@ echo $fpath | tr ' ' '\n' | grep completions
 
 ---
 
-## 📊 Performance Tips
+## Performance Tips
 
 ### 1. Keep Daemon Running
 
@@ -559,7 +498,7 @@ eval "$(starship init zsh)"
 
 ---
 
-## 📚 See Also
+## See Also
 
 - [Quick Start](./quickstart.md) — Initial setup
 - [Configuration](./configuration.md) — Shell and runtime settings

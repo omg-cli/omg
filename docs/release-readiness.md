@@ -1,5 +1,9 @@
 # Release Readiness Checklist
 
+> **Who this page is for:** OMG maintainers and contributors. It documents the release checklist.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 Use this checklist before tagging a release. A successful build does not establish runtime coverage, reproducibility of every binary byte, or platform parity.
 
 ## 1) Local Quality Gates

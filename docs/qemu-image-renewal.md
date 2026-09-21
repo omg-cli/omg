@@ -1,5 +1,9 @@
 # Reviewing QEMU images
 
+> **Who this page is for:** OMG maintainers and contributors. It documents refreshing the virtual-machine images.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 Image provenance expires after at most 31 days. The daily **QEMU Pin Review** workflow opens one maintenance issue seven days before expiry. It does not renew dates, download executable code, replace keys or merge changes. Scheduled workflows become active when this workflow reaches main.
 
 Prepare a review PR before the deadline:

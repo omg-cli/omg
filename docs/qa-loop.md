@@ -1,5 +1,9 @@
 # QA repeat loop: pipeline files it, agents fix it, pipeline verifies it
 
+> **Who this page is for:** OMG maintainers and contributors. It documents release checks and evidence.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 Three scheduled pipelines test every supported platform; one script turns
 failures into agent-actionable issues and green runs into auto-closes.
 

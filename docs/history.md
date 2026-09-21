@@ -6,6 +6,11 @@ description: Inspect recorded transactions and understand recovery limits
 
 # History & Rollback
 
+**In plain words:** OMG can record what it changed on your computer. This page explains what the record contains, how to read it, and why a rollback is not the same as restoring a backup.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 History records supported OMG operations. It is not a complete audit of all native package-manager activity, a filesystem backup, or proof of who performed an operation.
 
 ## View records

@@ -6,6 +6,11 @@ description: Docker and Podman command wrappers
 
 # Containers
 
+**In plain words:** A container is a small, disposable copy of a system that you can throw away. This page shows how OMG starts one for testing a project.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 OMG wraps selected Docker and Podman operations. The engine, images, project code, and host mounts remain trust boundaries. Container execution is not a guarantee of safe execution of untrusted code.
 
 ## Inspect the engine

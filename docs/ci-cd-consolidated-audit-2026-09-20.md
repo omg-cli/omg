@@ -1,5 +1,9 @@
 # Consolidated CI/CD audit and QEMU verification roadmap
 
+> **Who this page is for:** OMG maintainers and contributors. It documents a dated continuous-integration audit.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 All remaining changes from this audit are collected in PR #440. PR #439 already
 merged the fast initial gate; that was one bottleneck, not the whole optimization.
 The final combined revision must pass hosted checks before integration.

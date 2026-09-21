@@ -1,5 +1,9 @@
 # Rust CI/CD Best Practices 2025-2026
 
+> **Who this page is for:** OMG maintainers and contributors. It documents a research note on continuous integration.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 Historical research examples, not this repository's active CI configuration. Package versions, speed claims, Rust APIs, and workflow snippets below have not been revalidated as current recommendations. In particular, do not copy `--all-features` examples into OMG: its native backend features are not universally compatible. Use [CONTRIBUTING.md](../CONTRIBUTING.md), the checked-in workflows, and current toolchain pins. This documentation audit classifies the archive; it does not certify every historical snippet.
 
 ## Table of Contents

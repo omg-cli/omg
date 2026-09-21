@@ -1,137 +1,206 @@
+<div align="center">
+
 # OMG
 
-<div align="center">
+**Packages, language runtimes, and project tasks in one command line — with the checks you would otherwise have to assemble yourself.**
 
 [![CI](https://github.com/omg-cli/omg/actions/workflows/ci.yml/badge.svg)](https://github.com/omg-cli/omg/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/omg-cli/omg)](https://github.com/omg-cli/omg/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Website](https://img.shields.io/badge/website-getomg.xyz-blue)](https://getomg.xyz)
-[![Docs](https://img.shields.io/badge/docs-getomg.xyz%2Fdocs-purple)](https://getomg.xyz/docs)
 [![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](rust-toolchain.toml)
+[![Docs](https://img.shields.io/badge/docs-getomg.xyz%2Fdocs-purple)](https://getomg.xyz/docs)
+[![Website](https://img.shields.io/badge/website-getomg.xyz-blue)](https://getomg.xyz)
 
-**Your development environment, in one command.**
-
-*Packages, runtimes, project tasks, and environment records with one workflow.*
-
-[Try OMG](https://getomg.xyz) · [Read the docs](https://getomg.xyz/docs) · [Start the quickstart](docs/quickstart.md) · [Install](docs/installation.md)
+[Install](#install) · [First five commands](#first-five-commands) · [What it does](#what-it-does) · [Security](#security-built-into-installation) · [Limits](#what-omg-does-not-do) · [Docs](https://getomg.xyz/docs) · [Issues](https://github.com/omg-cli/omg/issues)
 
 </div>
 
----
-
 > [!IMPORTANT]
-> **Beta preview:** the core workflows are ready to evaluate and the beta release is next. Command surfaces and configuration details may still evolve as we finish the release.
+> **Beta.** Command surfaces, configuration keys, and on-disk formats can still change. Keep `pacman`, `apt`, `dnf`, or `brew` installed, and validate package changes on a machine you can reinstall.
 
-## What OMG does
+## Why OMG
 
-OMG gives a project one place to answer four everyday questions: which tools should I use, where do I get them, how do I run this project, and what changed between machines?
+- **One workflow instead of four.** Search, install, update, and remove packages; choose a language version per project; run the project's own build and test tasks — without switching tools or remembering which one a repository uses.
+- **Your system's package manager still does the work.** OMG drives ALPM, APT, DNF, or Homebrew rather than replacing it, so the packages you install stay maintainable by the tools you already trust.
+- **Checks at the moments that matter.** Downloads are verified, managed tools install with scripts disabled by default, AUR recipes are reviewed and built in an offline sandbox, and every mutation can be inspected in history afterwards.
 
-It brings system packages, language runtimes, developer tools, and project tasks into a single Rust CLI. You keep the native tools underneath, but you get one consistent workflow on every supported machine.
+*New to the terminal?* Start with [Getting started](docs/getting-started.md) and keep [the glossary](docs/glossary.md) nearby.
 
-## See it in a minute
+## Install
 
-From a project you already know:
+You need `curl`, a supported system, and the GitHub CLI (`gh`) for the build-provenance check. The installer verifies the archive before anything is copied, and stops if verification fails.
 
 ```bash
-# Choose the runtime for this project
-omg use node 22
-omg which node
-
-# Run the task the project already defines
-omg run build
-
-# Record the working environment when you want to share or compare it
-omg env capture
-omg env check
+curl --proto '=https' --tlsv1.2 -fsSL https://getomg.xyz/install.sh -o omg-install.sh
+less omg-install.sh                                      # read it first
+OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 bash omg-install.sh  # no telemetry, no shell edits
+export PATH="$HOME/.local/bin:$PATH"                     # this window only
+omg --version
 ```
 
-The commands follow the project instead of asking you to learn a different tool for every ecosystem. OMG reads the project metadata that is already there, so a `package.json`, `Cargo.toml`, Makefile, or supported mise configuration can stay the source of truth.
+Then, once, to finish the setup on your terms:
+
+```bash
+omg init          # asks before it changes anything: shell hook, daemon, first capture
+```
+
+| Your system | Backend | Notes |
+| :--- | :--- | :--- |
+| Arch Linux, x86_64 | ALPM + AUR | Widest coverage: AUR review, offline builds, policy, rollback |
+| Debian or Ubuntu, x86_64 | APT | Native APT operations; no AUR |
+| Fedora, x86_64 | DNF / RPM | Experimental backend, exercised in QEMU |
+| Apple silicon macOS | Homebrew | Published as ARM64; Intel macOS is not supported |
+| Windows | via WSL | Install a supported Linux distribution in WSL; there is no native Windows build |
+
+<details>
+<summary><strong>Other install paths</strong> (AUR, source build, updating, uninstalling)</summary>
+
+```bash
+# Arch, from a source checkout with the matching recipe (third-party packaging: check it first)
+yay -S omg-bin
+
+# Any supported system: build from a reviewed checkout, one backend at a time
+cargo build --release --locked --no-default-features --features arch,pgp,license   # also: debian, fedora, macos
+bash ./install.sh --from-source
+
+# Update an existing installation (both binaries, from one verified archive)
+omg self-update
+```
+
+- Coming from **v0.1.222**? Run `omg self-update`, then `omg self-update --force` once so the daemon is replaced too.
+- Coming from **v0.1.221 or earlier**, follow the [signing-repository migration](docs/releases/v0.1.222.md) first.
+- A package-managed installation (for example an AUR package someone else maintains) updates and uninstalls through that package manager, not through `omg self-update`. This repository does not guarantee that such a package exists or matches a release; check what you install.
+- Uninstall a script installation with the installer's `--uninstall` mode. It backs up each shell file it edits and leaves your data in `~/.local/share/omg` alone.
+- `OMG_VERSION=v0.1.223`, `INSTALL_DIR="$HOME/.omg/bin"`, `OMG_NO_TELEMETRY=1`, and `OMG_SKIP_SHELL=1` are read from the environment when the installer runs. Full procedure: [installation](docs/installation.md).
+
+</details>
+
+## First five commands
+
+Nothing here changes your system until the fourth line, and that one asks you to confirm first.
+
+```bash
+omg --help                      # what exists (--all-commands adds the advanced surface)
+omg search ripgrep              # find a package; on Arch this includes the AUR
+omg install --dry-run ripgrep   # read the plan, change nothing
+omg install ripgrep             # install it
+omg doctor                      # confirm the machine is healthy (exit 0 healthy, exit 1 issues)
+```
+
+Then, in a project you trust:
+
+```bash
+omg use node 22                 # select a runtime version for this project
+omg run build                   # run the task the project already defines
+omg env capture                 # record the environment in omg.lock
+omg env check                   # report drift against that record
+```
+
+## What it does
 
 ```mermaid
 flowchart LR
-    Project[Project files] --> Runtime[Select a runtime]
-    Runtime --> Task[Run a project task]
-    Task --> Record[Capture the environment]
-    Record --> Team[Share a repeatable setup]
+    You[You, in a terminal] --> CLI[omg]
+    CLI --> Packages[Packages: search, install, update, remove]
+    CLI --> Runtimes[Runtime versions: 14 languages]
+    CLI --> Tasks[Project tasks: build, test, lint]
+    CLI --> Env[Environment records: capture, check, share]
+    Packages --> Native[Your system tool: ALPM, APT, DNF, Homebrew]
+    Runtimes --> Data[Your data directory, no password needed]
+    CLI <--> Daemon[Optional omgd daemon: warm indexes]
 ```
 
-## Why developers use it
+| You want to | Run | Notes |
+| :--- | :--- | :--- |
+| Find and inspect a package | `omg search`, `omg info`, `omg why` | AUR results on Arch unless `--no-aur` |
+| Change packages safely | `omg install`, `omg remove`, `omg update`, `omg clean` | Every one accepts a preview flag |
+| Choose a runtime version | `omg use`, `omg list`, `omg which` | Installs inside your home folder |
+| Run the project's tasks | `omg run build`, `omg run test` | Detects `package.json`, `Cargo.toml`, `Makefile`, more |
+| Install developer tools | `omg tool install prettier` | Managed policies: scripts off, signatures checked |
+| Record an environment | `omg env capture`, `omg env check` | Writes `omg.lock`; needs an Arch or Debian backend |
+| Watch the system | `omg dash`, `omg status`, `omg metrics` | `dash` is a full-screen terminal dashboard |
+| Keep indexes warm | `omg daemon`, `omg daemon-status` | Optional; every package command works without it |
+| Audit what happened | `omg history`, `omg rollback`, `omg audit` | Limits are documented, not glossed over |
 
-| Need | OMG gives you |
+**Runtime managers (14):** Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, Swift — plus 54 registry developer tools. Shell hooks for Bash, Zsh, and Fish read project pins such as `.nvmrc` automatically; the hook is optional.
+
+**Already using mise?** Supported version pins, environment layers, task dependencies, and project environments are reused. See [mise compatibility](docs/mise-compatibility.md) for the exact boundaries.
+
+## Security built into installation
+
+OMG puts checks where the risk is, and says plainly where they stop.
+
+| Boundary | What happens |
 | :--- | :--- |
-| **Stop switching between tools** | One command shape for packages, runtimes, tools, and tasks. |
-| **Keep projects on the right runtime** | Select a version per project and inspect the binary that will run. |
-| **Start a new project quickly** | Discover, install, and run the tools the project expects. |
-| **Make “works on my machine” easier to debug** | Capture an environment record and check it for drift. |
-| **Keep control at install boundaries** | Verification and review steps are built into managed downloads and builds. |
+| **Downloads** | Runtime installers verify the checksum or signature they expect, and refuse a download that lacks required integrity evidence. Release archives are checked against a published digest and a GitHub build attestation. |
+| **Managed npm tools** | `omg tool install` stages the package with lifecycle scripts disabled and runs npm signature verification before activation. Running scripts, or installing in an environment without signing support, needs an explicit package-scoped exception. |
+| **Managed Python, Cargo, and Go tools** | Python tools get a dedicated virtual environment and wheels by default. Cargo installs request `--locked`. Go installs disable CGO and automatic toolchain downloads and set checksum and proxy policy. |
+| **AUR recipes** | Source review is on by default, the source manifest is rechecked before execution, and builds run in Bubblewrap with an isolated home, a cleared environment, and no build network. |
+| **AUR output** | Bounded archive inspection checks paths, metadata, links, and privileged contents before installation. Install hooks, capabilities, and setuid/setgid files need your explicit, attended approval. |
+| **High-risk AUR packages** | Selected packages with privileged or system-integration contents require matching output from a second, private build, and approval is bound to the inspected archive hashes. |
+| **Privilege and file handoffs** | Privileged subprocesses use trusted executable paths with dangerous environment settings scrubbed. Sealed AUR archives, ownership checks, anchored file operations, and exact-destination replacement protect the last step. |
 
-### Packages and developer tools
+Run OMG as your regular user: it asks for elevation when a package mutation needs it, refuses root for AUR builds, and never asks you to run the whole tool as root to work around a failure.
 
-Use the same vocabulary whether you are looking for a system package or a registry tool:
+These controls reduce specific risks. They do not make community code benign, and they do not cover a separately invoked `npm install` or an unsandboxed project task. Read [AUR policy](docs/aur.md) and the [security model](docs/security.md) for the exact scope and opt-ins.
 
-```bash
-omg search ripgrep
-omg info ripgrep
-omg install ripgrep
-omg tool install <tool>
+## What OMG does not do
+
+The point of a tool like this is knowing where it stops.
+
+- **It is not a compliance product.** No SOC 2, ISO 27001, HIPAA, PCI DSS, or FedRAMP certification is implied. `omg audit export` writes plaintext evidence for a human reviewer; the HIPAA export is not implemented.
+- **Its audit evidence has stated limits.** `omg audit sbom` matches Arch Linux advisories and does not build full transitive application graphs for Debian or macOS. `omg audit slsa` verifies a supported artifact signature, not a SLSA build level. `omg audit verify` proves the local hash chain was not edited, not who wrote it.
+- **It does not promise speedups.** Some repeated queries get faster from warm caches. Nothing more is claimed, and the recorded runs, hosts, and cache states are published in [the benchmark methodology](benchmarks/README.md).
+- **It does not rebuild machines.** `omg env capture` records inventory, `omg env share` uploads that record, and `omg env sync` downloads one and reports drift. None of them installs software or recreates an identical machine. Environment capture needs an Arch or Debian backend; Fedora refuses it explicitly.
+- **Rollback is not a snapshot.** `omg rollback` returns to a recorded transaction when the backend, the retained package versions, and your current dependencies allow it.
+- **It does not run everywhere.** Release targets are Linux x86_64 (Arch, Debian, Ubuntu, Fedora) and Apple silicon macOS. Intel macOS, Linux ARM64, and native Windows have no published release; Windows use goes through WSL. Fedora support does not imply RHEL support.
+
+## How releases are produced
+
+```mermaid
+flowchart LR
+    A[Push or release tag] --> B[CI: build, test, lint, audit]
+    B --> C[QEMU guests: Arch, Debian, Ubuntu, Fedora]
+    C --> D[Sign and attest the archives]
+    D --> E[Publish to the release channel]
+    E --> F[Release smoke: verify provenance, then run]
+    F --> G[Evidence kept with the run]
 ```
 
-`omg install --dry-run` lets you preview a package change before applying it. Backend-specific behavior, AUR review, and managed-tool policies are documented in the [package](docs/packages.md), [AUR](docs/aur.md), and [CLI](docs/cli.md) references.
+Every published archive is built by the release workflow from the tagged commit and carries an attestation bound to that tag and workflow. Before publication, the exact commit must pass CI, benchmarks, security audit, secret scanning, CodeQL, coverage, Docker end-to-end tests, and staged QEMU runs. After publication, published-archive QEMU re-verifies provenance and runs the binaries users download — including daemon startup, IPC, singleton protection, shutdown, and restart in all four Linux guests. [v0.1.223 passed all four](https://github.com/omg-cli/omg/actions/runs/35096706309). Details: [CI security controls](docs/ci-security-controls.md) and [QEMU usage and evidence](docs/qemu-local.md).
 
-### Runtime versions that follow the project
+A green run is evidence for what it tested, not proof of every command path on every system.
 
-Switch Node.js, Python, Rust, Go, Ruby, Java, Bun, Deno, and other supported runtimes without rebuilding your workflow around a different version manager:
+## Recent changes
 
-```bash
-omg use python 3.12
-omg which python
-```
+**[v0.1.223](https://github.com/omg-cli/omg/releases/tag/v0.1.223)** tightens the daemon and update paths:
 
-Shell integration can select supported project versions when you change directories. Existing mise projects can reuse supported runtime pins and task definitions; see the [compatibility guide](docs/mise-compatibility.md) for the supported boundaries.
+- The CLI and daemon ship as one unit: every Linux and macOS archive contains `omg` and `omgd`, and the self-updater installs both from the same verified archive with staging and recovery.
+- Daemon lifecycle is verified in Arch, Debian, Ubuntu, and Fedora QEMU guests, with native APT access serialized.
+- Update notices appear after successful interactive commands at most once a day, and never install anything. `OMG_NO_UPDATE_CHECK=1` turns them off.
+- mise projects reuse supported pins, environment layers, and task dependencies.
 
-### Tasks that feel native to the repository
+[Release notes](docs/releases/v0.1.223.md) · [Full changelog](docs/changelog.md)
 
-Run the task the project already describes:
+## Documentation
 
-```bash
-omg run dev
-omg run test
-omg run build
-```
+| Start here | Go deeper |
+| :--- | :--- |
+| [Getting started](docs/getting-started.md) — assumes no terminal experience | [CLI reference](docs/cli.md) — every command and option |
+| [Installation](docs/installation.md) — downloads, attestation, removal | [Architecture](docs/architecture.md) — CLI, daemon, IPC, caches |
+| [Quickstart](docs/quickstart.md) — a project in four commands | [Security](docs/security.md) — evidence and its limits |
+| [Cheat sheet](docs/cheatsheet.md) — one page of everyday commands | [Troubleshooting](docs/troubleshooting.md) — safe diagnosis |
+| [Glossary](docs/glossary.md) — every term in plain words | [Task runner](docs/task-runner.md) · [Runtimes](docs/runtimes.md) · [AUR](docs/aur.md) |
 
-OMG detects the project runner and passes through the task output. See the [task runner guide](docs/task-runner.md) for supported project types and task behavior.
+The same topics are curated for the web at **[getomg.xyz/docs](https://getomg.xyz/docs)**.
 
-## Built for trust and visibility
+## Contributing
 
-OMG verifies managed downloads and applies review and isolation controls at the boundaries where packages and tools are fetched, built, or activated. It also leaves an inspectable record of the environment it manages.
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers code standards, the QEMU multi-distribution test environments, and how to run the checks locally.
 
-Those controls are deliberately specific: they help you see what OMG verified without pretending that community code is automatically safe or that every backend behaves identically. Read the [security model](docs/security.md), [AUR workflow](docs/aur.md), and [public security updates](https://getomg.xyz/security/) when you need the details.
+- **Bugs and ideas:** [GitHub Issues](https://github.com/omg-cli/omg/issues) — include `omg --version`, your distribution, and the command output.
+- **Security reports:** privately, as described in [SECURITY.md](SECURITY.md).
 
-## Install once, use everywhere
+## License
 
-The recommended install path is documented for each platform:
-
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://getomg.xyz/install.sh | bash
-```
-
-Then verify the binary:
-
-```bash
-omg --version
-omg doctor
-```
-
-OMG currently targets Linux x86_64 on Arch, Debian, Ubuntu, and Fedora, plus macOS ARM64. Windows users can run it inside [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install). See the [installation guide](docs/installation.md) for package-managed installs, source builds, verification, and updates.
-
-## Find your next step
-
-- **New to OMG?** Start with the [quickstart](docs/quickstart.md).
-- **Moving an existing setup?** Read [runtime detection](docs/runtimes.md) and [mise compatibility](docs/mise-compatibility.md).
-- **Building a team workflow?** Use [environment records](docs/team.md) and [workflow patterns](docs/workflows.md).
-- **Looking for one command?** Open the [CLI reference](docs/cli.md) or [cheatsheet](docs/cheatsheet.md).
-- **Something went wrong?** Check [troubleshooting](docs/troubleshooting.md) or [open an issue](https://github.com/omg-cli/omg/issues).
-
-## Contribute
-
-OMG is open source and built in Rust. Read [CONTRIBUTING.md](CONTRIBUTING.md) to set up a development environment, run checks, and propose a change. The project is released under the [MIT License](LICENSE).
+MIT — see [LICENSE](LICENSE). Copyright © 2024–2026 Olen Latham.

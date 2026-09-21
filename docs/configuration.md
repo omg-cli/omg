@@ -6,7 +6,21 @@ description: Configure OMG without weakening safety defaults
 
 # Configuration
 
+**In plain words:** OMG reads its settings from one small text file, and most people never need to change it. This page shows the file, the settings that really exist, and the ones to leave alone.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 ## Locate and inspect
+
+```mermaid
+flowchart TD
+    H[Your home folder] --> C[~/.config/omg/config.toml]
+    H --> P[~/.config/omg/policy.toml]
+    H --> D[~/.local/share/omg]
+    R[XDG_RUNTIME_DIR] --> S[omg.sock]
+    R --> T[omg.status]
+```
 
 ```bash
 omg config path

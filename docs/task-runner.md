@@ -6,13 +6,21 @@ description: Unified task execution across ecosystems
 
 # Task Runner
 
+**In plain words:** a project usually defines its own commands, such as `build` or `test`.
+`omg run` finds the right one for the project you are in and runs it, so you do not have to
+remember which tool this particular project uses.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and
+> [the glossary](./glossary.md) first. `omg run` executes code that lives in the project
+> folder, so only run tasks in projects you trust.
+
 **Unified Task Execution Across All Ecosystems**
 
 OMG's task runner (`omg run`) detects supported project files and resolves a named task. It executes project-controlled code, not a sandboxed command. Review untrusted repositories before running tasks or accepting setup prompts. Missing tools or malformed configuration can cause explicit failures; detection does not guarantee dependency installation or a successful build.
 
 ---
 
-## 🎯 Overview
+## Overview
 
 Instead of remembering:
 
@@ -37,7 +45,7 @@ OMG automatically:
 
 ---
 
-## 📋 Supported Project Types
+## Supported Project Types
 
 | Config File | Detected Runtime | Task Execution |
 | ------------- | ------------------ | ---------------- |
@@ -54,7 +62,7 @@ OMG automatically:
 
 ---
 
-## 🚀 Basic Usage
+## Basic Usage
 
 ### Running Tasks
 
@@ -77,6 +85,7 @@ The system uses a sophisticated 11-tier discovery engine to determine the correc
     - **Ruby (Rake)**: 70
     - **Java (Maven/Gradle)**: 60
     - **PHP (Composer)**: 50
+    - **mise tasks** (`mise.toml` / `.mise.toml` `[tasks]`): 45
     - **Make**: 40
 3. **Ambiguity Resolution**: If priorities are equal or user preferences are not defined, OMG will:
     - **Interactive Prompt**: Ask you which ecosystem you intended to use.
@@ -97,7 +106,7 @@ The system uses a sophisticated 11-tier discovery engine to determine the correc
     - System default (falling back to standard managers if no preference is found).
 7. **Task Matching**: Discovered scripts or targets are matched against the user request and executed within the optimized environment.
 
-### 🔄 Resolution Flow
+### Resolution Flow
 
 ```mermaid
 flowchart TD
@@ -105,26 +114,26 @@ flowchart TD
     Detect --> Match{Task Matches?}
     Match -- No --> Fallback[Smart Guessing]
     Match -- Yes --> Config{Config in .omg.toml?}
-    
+
     Config -- Yes --> Exec[Execute with Configured Ecosystem]
     Config -- No --> Multi{Multiple Matches?}
-    
+
     Multi -- No --> Exec
     Multi -- Yes --> Priority{Priority Difference?}
-    
+
     Priority -- Yes --> High[Pick Highest Priority] --> Exec
     Priority -- No --> All{--all flag?}
-    
+
     All -- Yes --> ExecAll[Run in All Ecosystems]
     All -- No --> Using{--using flag?}
-    
+
     Using -- Yes --> ExecUsing[Run Specific Ecosystem]
     Using -- No --> Prompt[Interactive Selection] --> Exec
 ```
 
 ---
 
-## 🛠️ Advanced Options
+## Advanced Options
 
 | Flag | Description | Example |
 | ------ | ------------- | --------- |
@@ -135,7 +144,7 @@ flowchart TD
 
 ---
 
-## 📦 JavaScript/TypeScript Projects
+## JavaScript/TypeScript Projects
 
 ### Package Manager Detection
 
@@ -205,7 +214,7 @@ OMG checks for Node/Bun version files:
 
 ---
 
-## 🦀 Rust Projects
+## Rust Projects
 
 ### Detection
 
@@ -251,7 +260,7 @@ The correct toolchain is activated before running tasks.
 
 ---
 
-## 🐍 Python Projects
+## Python Projects
 
 ### Poetry Projects (pyproject.toml)
 
@@ -284,7 +293,7 @@ omg run test
 
 ---
 
-## 🔨 Makefile Projects
+## Makefile Projects
 
 ### Detection
 
@@ -320,7 +329,7 @@ file directly (`make help`, or read the Makefile), then run them via
 
 ---
 
-## 📋 Taskfile Projects
+## Taskfile Projects
 
 ### Detection
 
@@ -353,7 +362,7 @@ omg run test    # → task test
 
 ---
 
-## ☕ Java Projects
+## Java Projects
 
 ### Maven (pom.xml)
 
@@ -374,7 +383,7 @@ omg run run      # → gradle run
 
 ---
 
-## 🦕 Deno Projects
+## Deno Projects
 
 ### Detection
 
@@ -398,7 +407,7 @@ omg run test   # → deno task test
 
 ---
 
-## 🐘 PHP Projects
+## PHP Projects
 
 ### Composer (composer.json)
 
@@ -418,13 +427,13 @@ omg run lint   # → composer run-script lint
 
 ---
 
-## ⚙️ Runtime Resolution
+## Runtime Resolution
 
 `omg run` resolves project pins through OMG's native runtime managers. There is no backend override or implicit fallback manager.
 
 ---
 
-## 🔄 Auto-Install Prompts
+## Auto-Install Prompts
 
 When required tools are missing, OMG prompts to install:
 
@@ -454,7 +463,7 @@ $ omg run dev
 
 ---
 
-## 📊 Task Discovery
+## Task Discovery
 
 There is no `omg run --list` flag today — discovery happens by inspecting your
 project files:
@@ -470,7 +479,7 @@ Any script/target you find can be executed with `omg run <task>`.
 
 ---
 
-## 🎯 Best Practices
+## Best Practices
 
 ### 1. Use Version Files
 
@@ -528,7 +537,7 @@ git commit -m "chore: update environment lockfile"
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 ### Wrong Runtime Version
 
@@ -572,7 +581,7 @@ omg run dev        # Output shows "via npm" / "via bun" / "via pnpm" etc.
 
 ---
 
-## 📚 See Also
+## See Also
 
 - [Runtime Management](./runtimes.md) — Version file formats and runtime setup
 - [Shell Integration](./shell-integration.md) — PATH management

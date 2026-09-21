@@ -6,6 +6,11 @@ description: Observed reports, inventory exports, and unsupported compliance con
 
 # Enterprise reports and export limits
 
+**In plain words:** Reports and policies aimed at organisations, with the limit of each report stated plainly.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 The `enterprise` commands expose reports, dashboard policy views, and local inventory exports. They do not certify regulatory compliance, implement HIPAA controls, or provide an encrypted evidence archive. Local CLI features are not a paid-tier security boundary. Dashboard operations still require working account access and a reachable service.
 
 ## Reports

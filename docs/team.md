@@ -6,6 +6,11 @@ description: Share environment records and inspect drift
 
 # Team environments
 
+**In plain words:** This page explains how to share a record of a project environment with other people, what that record contains, and what it exposes.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 OMG can capture and share environment records. It does not ensure identical machines, install all dependencies during synchronization, or replace your source-control and access-management policies.
 
 ## Capture and review

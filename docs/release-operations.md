@@ -1,5 +1,9 @@
 # Release Operations
 
+> **Who this page is for:** OMG maintainers and contributors. It documents publishing a release.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 How releases are built, published, verified, and rolled back.
 
 ## Pipeline overview

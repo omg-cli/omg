@@ -6,9 +6,14 @@ description: Managing Node.js, Python, Go, Rust, Ruby, Java, Bun, Deno, Pi, Zig,
 
 # Runtime Management
 
+**In plain words:** A runtime is the program that runs code written in a language such as Node.js, Python, or Rust. This page shows how to install and switch versions inside your own home folder, without an administrator password.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 OMG provides one interface for selecting supported language runtimes. Setup requirements and switching costs depend on the provider, installed versions, shell, and filesystem; no universal latency or reliability comparison is established.
 
-## 🚀 Supported Runtimes
+## Supported Runtimes
 
 ### Native Runtimes
 
@@ -37,7 +42,7 @@ OMG exposes each selected runtime's vendor directory on `PATH`. It does not reim
 
 ---
 
-## 📚 Quick Examples
+## Quick Examples
 
 ### Node.js
 
@@ -186,7 +191,7 @@ omg env check
 
 ---
 
-## 🛠️ How Runtime Switching Works
+## How Runtime Switching Works
 
 ### 1. Shell Hook Detects Directory Change
 
@@ -238,7 +243,19 @@ tmux new-session "node server.js"
 
 ---
 
-## 🎯 Auto-Detection Priority
+## Auto-Detection Priority
+
+```mermaid
+flowchart TD
+    A[Project folder, then each parent folder] --> B[Runtime-specific pin file]
+    A --> M[mise.toml pins]
+    B -->|not set| C[package.json engines]
+    C -->|not set| D[.tool-versions]
+    B --> E[Version on PATH]
+    M --> E
+    C --> E
+    D --> E
+```
 
 When multiple version files exist in the same directory:
 
@@ -267,7 +284,7 @@ omg which node
 
 ---
 
-## 🚀 Migration from Other Tools
+## Migration from Other Tools
 
 > **Note:** There are no automatic migration subcommands (`omg migrate from-nvm`
 > and similar do not exist — `omg migrate` only supports `export`/`import` of a
@@ -306,13 +323,13 @@ omg use rust nightly
 
 ---
 
-## 📊 Performance Comparison
+## Performance Comparison
 
 Compare installed-version activation separately from downloads, builds, and shell startup. Record the exact runtime, artifact, shell, filesystem, and warm/cold conditions. [Package-query benchmarks](../benchmarks/README.md) do not establish runtime-manager speedups.
 
 ---
 
-## 🔒 Security and Integrity
+## Security and Integrity
 
 Safety is a first-class citizen in OMG's runtime management:
 
@@ -364,7 +381,7 @@ OMG extracts each runtime into a temporary directory on the same filesystem. It 
 
 ---
 
-## 🛠️ Troubleshooting
+## Troubleshooting
 
 ### Version Not Switching
 
@@ -481,7 +498,7 @@ npx tsc  # Run without global install
 
 ---
 
-## 🔗 See Also
+## See Also
 
 - [Shell Integration](shell-integration.md) - Shell hook setup and configuration
 - [Configuration](configuration.md) - Runtime-specific settings

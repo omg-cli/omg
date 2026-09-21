@@ -1,5 +1,10 @@
 # Organization transfer and verified updates
 
+**In plain words:** This page is for anyone following an old link or an old instruction that points at a previous location of the project.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 OMG moved from `PyRo1121/omg` to `omg-cli/omg`. Download links redirect, but
 cryptographic signer identities do not. Releases through v0.1.221 were signed
 by the old repository; subsequent releases must verify against the organization.

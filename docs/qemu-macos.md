@@ -1,5 +1,9 @@
 # macOS guests: verdict and path
 
+> **Who this page is for:** OMG maintainers and contributors. It documents the macOS virtual-machine notes.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 ## Verdict
 
 No macOS-on-QEMU in CI. Apple's EULA permits macOS virtualization only on

@@ -1,5 +1,10 @@
 # Investigate OMG performance
 
+**In plain words:** Small changes that make repeated commands faster, and how to measure the difference honestly.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 Measure the operation you need before changing configuration. A warm official-repository query is not equivalent to an AUR search over the network or a package installation.
 
 ## Start with recorded evidence
