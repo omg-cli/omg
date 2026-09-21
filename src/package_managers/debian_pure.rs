@@ -60,6 +60,21 @@ fn validate_pure_mutation(packages: &[String]) -> Result<()> {
 }
 
 impl PackageManager for PureDebianPackageManager {
+    fn security_inventory(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<crate::package_managers::types::SecurityPackage>>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            tokio::task::spawn_blocking(crate::package_managers::debian_db::db::security_inventory)
+                .await?
+        })
+    }
+
     fn name(&self) -> &'static str {
         "apt-pure"
     }

@@ -1,5 +1,16 @@
 //! Shared package manager types
 
+/// Installed identity for security exports. Native versions are opaque strings;
+/// absent metadata remains absent rather than being inferred from the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityPackage {
+    pub name: String,
+    pub version: String,
+    pub architecture: Option<String>,
+    pub description: String,
+    pub licenses: Vec<String>,
+}
+
 /// Canonical orphan rule for pacman-based systems (`pacman -Qdt` semantics).
 ///
 /// A package is an orphan when it was **not** installed explicitly and no
