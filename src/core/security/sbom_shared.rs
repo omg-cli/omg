@@ -9,144 +9,6 @@ use crate::core::env::distro::Distro;
 use crate::package_managers::types::SecurityPackage;
 use anyhow::Context;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::security::scan::{InstalledIdentity, Vulnerability};
-
-    #[test]
-    fn exports_preserve_each_distribution_identity_and_native_version() {
-        let package = SecurityPackage {
-            name: "fixture+tools".into(),
-            version: "2:1.0-3".into(),
-            architecture: Some("amd64".into()),
-            description: "Installed component".into(),
-            licenses: vec!["custom license".into()],
-        };
-        for (distro, name, prefix) in [
-            (Distro::Arch, "Arch Linux", "pkg:pacman/archlinux/"),
-            (Distro::Debian, "Debian", "pkg:deb/debian/"),
-            (Distro::Ubuntu, "Ubuntu", "pkg:deb/ubuntu/"),
-            (Distro::Fedora, "Fedora", "pkg:rpm/fedora/"),
-        ] {
-            let report = compose(std::slice::from_ref(&package), None, distro).unwrap();
-            assert_eq!(report.metadata.component.as_ref().unwrap().name, name);
-            assert_eq!(report.components[0].version, "2:1.0-3");
-            assert!(
-                report.components[0]
-                    .purl
-                    .as_ref()
-                    .unwrap()
-                    .starts_with(prefix)
-            );
-            assert!(
-                report.components[0]
-                    .purl
-                    .as_ref()
-                    .unwrap()
-                    .contains("fixture%2Btools")
-            );
-            assert_eq!(
-                report.components[0].licenses[0]
-                    .license
-                    .as_ref()
-                    .unwrap()
-                    .name
-                    .as_deref(),
-                Some("custom license")
-            );
-            assert!(
-                report.components[0].licenses[0]
-                    .license
-                    .as_ref()
-                    .unwrap()
-                    .id
-                    .is_none()
-            );
-            assert!(report.dependencies.is_empty());
-        }
-        assert!(compose(&[], None, Distro::Unknown).is_err());
-        assert!(compose(&[package.clone(), package], None, Distro::Debian).is_err());
-    }
-
-    #[test]
-    fn findings_bind_to_exact_components_and_missing_identity_is_an_error() {
-        let old = SecurityPackage {
-            name: "fixture".into(),
-            version: "1:1.0-1".into(),
-            architecture: Some("x86_64".into()),
-            description: String::new(),
-            licenses: vec![],
-        };
-        let mut patched = old.clone();
-        patched.version = "1:1.0-2".into();
-        let mut other_arch = old.clone();
-        other_arch.architecture = Some("i686".into());
-        let installed = vec![old.clone(), patched.clone(), other_arch];
-        let audit = SecurityAuditResult {
-            total_vulnerabilities: 1,
-            high_severity: 0,
-            vulnerabilities: vec![(
-                old.name.clone(),
-                vec![Vulnerability {
-                    id: "fixture-advisory".into(),
-                    summary: "fixture".into(),
-                    score: None,
-                    advisory_severity: None,
-                    native_advisory: None,
-                    affected_installed: vec![InstalledIdentity::from(&old)],
-                }],
-            )],
-        };
-        let sbom = compose(&installed, Some(&audit), Distro::Fedora).unwrap();
-        assert_eq!(sbom.components.len(), 3);
-        assert_eq!(sbom.vulnerabilities[0].affects.len(), 1);
-        assert_eq!(
-            sbom.vulnerabilities[0].affects[0].affects_ref,
-            "pkg:rpm/fedora/fixture@1.0-1?arch=x86_64&epoch=1"
-        );
-        assert!(sbom.vulnerabilities[0].ratings.is_empty());
-        assert_eq!(sbom.metadata.component.as_ref().unwrap().name, "Fedora");
-        let mut native_audit = audit.clone();
-        let finding = &mut native_audit.vulnerabilities[0].1[0];
-        finding.advisory_severity = Some(AdvisorySeverity::Important);
-        finding.native_advisory = Some(crate::core::security::scan::NativeAdvisory {
-            source: "dnf5".into(),
-            advisory_nevra: "fixture-1:1.0-2.x86_64".into(),
-            published_severity: "Important".into(),
-            description: "Upstream details".into(),
-            references: vec![crate::core::security::scan::AdvisoryReference {
-                id: "CVE-fixture".into(),
-                kind: "cve".into(),
-                url: "https://example.test/advisory".into(),
-            }],
-        });
-        let native = compose(&installed, Some(&native_audit), Distro::Fedora).unwrap();
-        let evidence = &native.vulnerabilities[0];
-        assert_eq!(evidence.ratings[0].score, None);
-        assert_eq!(evidence.ratings[0].severity.as_deref(), Some("high"));
-        assert_eq!(evidence.description.as_deref(), Some("Upstream details"));
-        assert!(
-            evidence.properties.iter().any(
-                |property| property.name == "omg:advisory:title" && property.value == "fixture"
-            )
-        );
-        assert_eq!(
-            evidence.references[0].source.url.as_deref(),
-            Some("https://example.test/advisory")
-        );
-        assert!(evidence.properties.iter().any(|property| property.name
-            == "omg:advisory:published-severity"
-            && property.value == "Important"));
-        assert!(compose(&[patched], Some(&audit), Distro::Fedora).is_err());
-        assert!(
-            purl(&old, Distro::Ubuntu)
-                .unwrap()
-                .starts_with("pkg:deb/ubuntu/fixture@1%3A1.0-1")
-        );
-    }
-}
-
 pub(super) async fn generate(include_vulns: bool) -> Result<Sbom, SbomError> {
     let result = async {
         let manager = crate::package_managers::get_package_manager()?;
@@ -440,4 +302,142 @@ pub(super) fn compose(
         dependencies: vec![],
         vulnerabilities,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::security::scan::{InstalledIdentity, Vulnerability};
+
+    #[test]
+    fn exports_preserve_each_distribution_identity_and_native_version() {
+        let package = SecurityPackage {
+            name: "fixture+tools".into(),
+            version: "2:1.0-3".into(),
+            architecture: Some("amd64".into()),
+            description: "Installed component".into(),
+            licenses: vec!["custom license".into()],
+        };
+        for (distro, name, prefix) in [
+            (Distro::Arch, "Arch Linux", "pkg:pacman/archlinux/"),
+            (Distro::Debian, "Debian", "pkg:deb/debian/"),
+            (Distro::Ubuntu, "Ubuntu", "pkg:deb/ubuntu/"),
+            (Distro::Fedora, "Fedora", "pkg:rpm/fedora/"),
+        ] {
+            let report = compose(std::slice::from_ref(&package), None, distro).unwrap();
+            assert_eq!(report.metadata.component.as_ref().unwrap().name, name);
+            assert_eq!(report.components[0].version, "2:1.0-3");
+            assert!(
+                report.components[0]
+                    .purl
+                    .as_ref()
+                    .unwrap()
+                    .starts_with(prefix)
+            );
+            assert!(
+                report.components[0]
+                    .purl
+                    .as_ref()
+                    .unwrap()
+                    .contains("fixture%2Btools")
+            );
+            assert_eq!(
+                report.components[0].licenses[0]
+                    .license
+                    .as_ref()
+                    .unwrap()
+                    .name
+                    .as_deref(),
+                Some("custom license")
+            );
+            assert!(
+                report.components[0].licenses[0]
+                    .license
+                    .as_ref()
+                    .unwrap()
+                    .id
+                    .is_none()
+            );
+            assert!(report.dependencies.is_empty());
+        }
+        assert!(compose(&[], None, Distro::Unknown).is_err());
+        assert!(compose(&[package.clone(), package], None, Distro::Debian).is_err());
+    }
+
+    #[test]
+    fn findings_bind_to_exact_components_and_missing_identity_is_an_error() {
+        let old = SecurityPackage {
+            name: "fixture".into(),
+            version: "1:1.0-1".into(),
+            architecture: Some("x86_64".into()),
+            description: String::new(),
+            licenses: vec![],
+        };
+        let mut patched = old.clone();
+        patched.version = "1:1.0-2".into();
+        let mut other_arch = old.clone();
+        other_arch.architecture = Some("i686".into());
+        let installed = vec![old.clone(), patched.clone(), other_arch];
+        let audit = SecurityAuditResult {
+            total_vulnerabilities: 1,
+            high_severity: 0,
+            vulnerabilities: vec![(
+                old.name.clone(),
+                vec![Vulnerability {
+                    id: "fixture-advisory".into(),
+                    summary: "fixture".into(),
+                    score: None,
+                    advisory_severity: None,
+                    native_advisory: None,
+                    affected_installed: vec![InstalledIdentity::from(&old)],
+                }],
+            )],
+        };
+        let sbom = compose(&installed, Some(&audit), Distro::Fedora).unwrap();
+        assert_eq!(sbom.components.len(), 3);
+        assert_eq!(sbom.vulnerabilities[0].affects.len(), 1);
+        assert_eq!(
+            sbom.vulnerabilities[0].affects[0].affects_ref,
+            "pkg:rpm/fedora/fixture@1.0-1?arch=x86_64&epoch=1"
+        );
+        assert!(sbom.vulnerabilities[0].ratings.is_empty());
+        assert_eq!(sbom.metadata.component.as_ref().unwrap().name, "Fedora");
+        let mut native_audit = audit.clone();
+        let finding = &mut native_audit.vulnerabilities[0].1[0];
+        finding.advisory_severity = Some(AdvisorySeverity::Important);
+        finding.native_advisory = Some(crate::core::security::scan::NativeAdvisory {
+            source: "dnf5".into(),
+            advisory_nevra: "fixture-1:1.0-2.x86_64".into(),
+            published_severity: "Important".into(),
+            description: "Upstream details".into(),
+            references: vec![crate::core::security::scan::AdvisoryReference {
+                id: "CVE-fixture".into(),
+                kind: "cve".into(),
+                url: "https://example.test/advisory".into(),
+            }],
+        });
+        let native = compose(&installed, Some(&native_audit), Distro::Fedora).unwrap();
+        let evidence = &native.vulnerabilities[0];
+        assert_eq!(evidence.ratings[0].score, None);
+        assert_eq!(evidence.ratings[0].severity.as_deref(), Some("high"));
+        assert_eq!(evidence.description.as_deref(), Some("Upstream details"));
+        assert!(
+            evidence.properties.iter().any(
+                |property| property.name == "omg:advisory:title" && property.value == "fixture"
+            )
+        );
+        assert_eq!(
+            evidence.references[0].source.url.as_deref(),
+            Some("https://example.test/advisory")
+        );
+        assert!(evidence.properties.iter().any(|property| property.name
+            == "omg:advisory:published-severity"
+            && property.value == "Important"));
+        assert!(compose(&[patched], Some(&audit), Distro::Fedora).is_err());
+        assert!(
+            purl(&old, Distro::Ubuntu)
+                .unwrap()
+                .starts_with("pkg:deb/ubuntu/fixture@1%3A1.0-1")
+        );
+    }
 }
