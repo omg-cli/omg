@@ -164,6 +164,14 @@ mod tests {
             licenses: vec![],
         };
         let installed = vec![package("1:1.0-1"), package("2.0-2"), package("1.0-1")];
+        assert!(
+            audit_result(
+                &[package("invalid version")],
+                std::slice::from_ref(&advisory)
+            )
+            .is_err(),
+            "malformed installed versions must fail the audit, not silently skip a finding"
+        );
         let result = audit_result(&installed, std::slice::from_ref(&advisory)).unwrap();
         assert_eq!(result.total_vulnerabilities, 1);
         assert_eq!(result.high_severity, 1);
