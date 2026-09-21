@@ -2987,6 +2987,67 @@
         "omgd",
         "omgd --socket"
       ]
+    },
+    {
+      "owner": "src/cli/env.rs",
+      "reason": "Portable environment commands have execution tests but their behavioral assertions are not yet bound to reviewed receipts; no coverage credit is assigned",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "fedora",
+        "macos",
+        "portable",
+        "ubuntu"
+      ],
+      "missing": [
+        "success",
+        "state",
+        "fault",
+        "refusal"
+      ],
+      "surfaces": [
+        "omg env export",
+        "omg env export --all-commands",
+        "omg env export --json",
+        "omg env export --quiet",
+        "omg env export --source-target",
+        "omg env export --verbose",
+        "omg env plan",
+        "omg env plan --all-commands",
+        "omg env plan --json",
+        "omg env plan --quiet",
+        "omg env plan --target",
+        "omg env plan --verbose"
+      ]
+    },
+    {
+      "owner": "src/cli/env.rs",
+      "reason": "Portable environment commands have execution tests but their behavioral assertions are not yet bound to reviewed receipts; no coverage credit is assigned",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "fedora",
+        "macos",
+        "portable",
+        "ubuntu"
+      ],
+      "missing": [
+        "help"
+      ],
+      "surfaces": [
+        "omg env export --help",
+        "omg env export --version",
+        "omg env help export",
+        "omg env help plan",
+        "omg env plan --help",
+        "omg env plan --version",
+        "omg help env export",
+        "omg help env plan"
+      ]
     }
   ]
 }

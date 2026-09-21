@@ -276,8 +276,8 @@ see [CI security controls](docs/ci-security-controls.md) and [QEMU evidence](doc
 | [Getting started](docs/getting-started.md) — assumes no terminal experience | [Under the hood](docs/under-the-hood.md) — caches, IPC, AUR gates, audit chain |
 | [Installation](docs/installation.md) — downloads, attestation, removal | [Architecture](docs/architecture.md) — components and data flow |
 | [Quickstart](docs/quickstart.md) — a project in four commands | [Security](docs/security.md) — evidence and its limits |
-| [Cheat sheet](docs/cheatsheet.md) — everyday commands | [Troubleshooting](docs/troubleshooting.md) — safe diagnosis |
-| [Glossary](docs/glossary.md) — every term in plain words | [Performance](docs/performance-tips.md) · [Task runner](docs/task-runner.md) · [AUR](docs/aur.md) |
+| [Cheat sheet](docs/cheatsheet.md) — one page of everyday commands | [Troubleshooting](docs/troubleshooting.md) — safe diagnosis |
+| [Glossary](docs/glossary.md) — every term in plain words | [Task runner](docs/task-runner.md) · [Runtimes](docs/runtimes.md) · [Portable environments](docs/environment-portability.md) · [AUR](docs/aur.md) |
 
 The same topics are curated for the web at **[getomg.xyz/docs](https://getomg.xyz/docs)**.
 
