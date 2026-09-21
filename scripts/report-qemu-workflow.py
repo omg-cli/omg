@@ -26,12 +26,17 @@ def api(path, limit=1024 * 1024):
 
 def identity(event, live, repository):
     run = event["workflow_run"]
+    trusted_workflow = (
+        live.get("path") == ".github/workflows/qemu-matrix.yml"
+        or (live.get("path") == ".github/workflows/ci.yml"
+            and live.get("event") == "push" and live.get("head_branch") == "main")
+    )
     if (event["repository"]["full_name"] != repository
             or live["repository"]["full_name"] != repository
             or live["id"] != run["id"] or live["run_attempt"] != run["run_attempt"]
             or live["head_sha"] != run["head_sha"]
             or live["workflow_id"] != run["workflow_id"]
-            or live["path"] != ".github/workflows/qemu-matrix.yml"
+            or not trusted_workflow
             or live["status"] != "completed"
             or live["event"] not in ("push", "workflow_dispatch", "schedule")
             or not re.fullmatch(r"[0-9a-f]{40}", live["head_sha"])):
@@ -238,6 +243,7 @@ def main():
         listing = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100"))
         if listing["total_count"] > 100:
             raise ValueError("too many artifacts")
+        guest_artifacts = set()
         for artifact in listing["artifacts"]:
             if not re.fullmatch(r"qemu-(?:arm-)?evidence-(?:arch|debian|ubuntu|fedora)|qemu-workflow-report", artifact["name"]):
                 continue
@@ -251,6 +257,11 @@ def main():
                 api(f"repos/{repository}/actions/artifacts/{artifact['id']}/zip", MAX_DOWNLOAD),
                 allowed_cases, diagnostics,
             ))
+            guest_artifacts.add(artifact["name"])
+        if run["path"] == ".github/workflows/ci.yml" and run["conclusion"] == "success":
+            if (not {f"qemu-evidence-{distro}" for distro in DISTROS} <= guest_artifacts
+                    or not set(DISTROS) <= {row["distro"] for row in rows}):
+                raise ValueError("successful CI is missing required Linux guest evidence")
         selected = projection(rows, successful_main)
     except (ValueError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError):
         selected = []

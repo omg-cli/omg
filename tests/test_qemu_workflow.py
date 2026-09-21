@@ -35,8 +35,9 @@ class QemuWorkflowTests(unittest.TestCase):
         reporting = step('Verify harness and reporting fixtures before guest builds')
         for name in ('qa-file-issue', 'qa-audit', 'qa-open-pr'):
             self.assertIn(f'./scripts/test-{name}.sh', reporting)
-            self.assertIn(f'"scripts/test-{name}.sh"', PARENT)
-            self.assertIn(f'"scripts/{name}.sh"', PARENT)
+        ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
+        self.assertIn('  pull_request:\n  merge_group:', ci)
+        self.assertIn('uses: ./.github/workflows/qemu-matrix.yml', ci)
         self.assertLess(PARENT.index(reporting), PARENT.index('      - name: Resolve selection'))
 
     @classmethod
@@ -190,12 +191,15 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertIn("OMG_SMOKE_SENTRY_DSN: ${{ github.event_name != 'pull_request' && secrets.OMG_SMOKE_SENTRY_DSN || '' }}", PARENT)
         self.assertNotIn('secrets: inherit', PARENT)
 
-    def test_manual_distro_builds_are_independent_and_automatic_guests_wait_once(self):
+    def test_manual_builds_are_independent_and_automatic_guests_follow_producers(self):
         caller = PARENT.split('\n  guest:\n', 1)[1].split('\n  arm-runner-health:', 1)[0]
         self.assertIn('needs: prepare', caller)
         self.assertIn('uses: ./.github/workflows/qemu-lane.yml', caller)
         self.assertNotIn('needs: [prepare, build', caller)
-        self.assertIn('native-build-artifact.py ready', PARENT)
+        self.assertNotIn('native-build-artifact.py ready', PARENT)
+        ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
+        automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  ci-success:', 1)[0]
+        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu]', automatic)
         self.assertIn('inputs.staged && inputs.reuse-ci', LANE)
         self.assertIn('needs: [build-staged, build-staged-ubuntu]', LANE)
         self.assertIn("inputs.distro != 'ubuntu' && needs.build-staged.result == 'success'", LANE)

@@ -119,7 +119,8 @@ class NativeBuildAdmission(unittest.TestCase):
         ci = (root / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         lane = (root / '.github/workflows/qemu-lane.yml').read_text(encoding='utf-8')
         matrix = (root / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')
-        self.assertIn('native-build-artifact.py ready', job_block(matrix, 'prepare'))
+        self.assertNotIn('native-build-artifact.py ready', job_block(matrix, 'prepare'))
+        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu]', job_block(ci, 'qemu'))
         for owner in ('linux-matrix', 'ubuntu'):
             block = job_block(ci, owner)
             self.assertIn('native-build-artifact.py build', block)
@@ -137,8 +138,8 @@ class NativeBuildAdmission(unittest.TestCase):
         self.assertIn('inputs.staged && inputs.reuse-ci', guest)
         self.assertIn('if: inputs.staged && !inputs.reuse-ci', guest)
         self.assertIn("reuse-ci: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}", matrix)
-        for path in ('scripts/native-build-artifact.py', '.github/workflows/ci.yml'):
-            self.assertIn('      - "' + path + '"', matrix)
+        self.assertIn('  pull_request:\n  merge_group:', ci)
+        self.assertIn('python3 scripts/ci-change-scope.py', ci)
 
     def test_cli_dispatches_build_and_reuse_with_exact_inputs(self):
         with tempfile.TemporaryDirectory() as directory:

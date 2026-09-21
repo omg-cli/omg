@@ -211,9 +211,10 @@ class ReportingBoundaryTests(unittest.TestCase):
 
     def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
                            corrupt=False, expired=False, helper_fails=False, case_log=None,
-                           log_case="search", main_shas=None, changed_attempt=False):
+                           log_case="search", main_shas=None, changed_attempt=False,
+                           workflow_path=".github/workflows/qemu-matrix.yml", all_distros=False):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
-                   head_sha="a" * 40, workflow_id=20, path=".github/workflows/qemu-matrix.yml",
+                   head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
                    head_branch="main", run_started_at="2026-09-20T00:00:00Z")
         event = dict(repository={"full_name": "owner/repo"}, workflow_run=run)
@@ -225,6 +226,18 @@ class ReportingBoundaryTests(unittest.TestCase):
             if case_log is not None:
                 archive.writestr(f"run/inventory/rows/{log_case}.stderr.log", case_log)
         payload = output.getvalue()
+        artifacts = [artifact]
+        payloads = {30: payload}
+        if all_distros:
+            artifacts, payloads = [], {}
+            for identifier, distro in enumerate(REPORT.DISTROS, 30):
+                output = io.BytesIO()
+                with zipfile.ZipFile(output, "w") as archive:
+                    archive.writestr("run/inventory/results.json",
+                        json.dumps([row for row in rows if row["distro"] == distro]))
+                payloads[identifier] = output.getvalue()
+                artifacts.append(dict(artifact, id=identifier, name=f"qemu-evidence-{distro}",
+                                      size_in_bytes=len(payloads[identifier])))
         calls = []
         main_refs = iter(main_shas or [run["head_sha"], run["head_sha"]])
         run_reads = 0
@@ -237,9 +250,9 @@ class ReportingBoundaryTests(unittest.TestCase):
                     current["run_attempt"] += 1
                 return json.dumps(current)
             if "/artifacts?" in path:
-                return json.dumps(dict(total_count=1, artifacts=[artifact]))
-            if path.endswith("/artifacts/30/zip"):
-                return payload
+                return json.dumps(dict(total_count=len(artifacts), artifacts=artifacts))
+            if "/artifacts/" in path and path.endswith("/zip"):
+                return payloads[int(path.split('/')[-2])]
             if path.endswith("/git/ref/heads/main"):
                 return json.dumps(dict(object=dict(sha=next(main_refs))))
             if "/jobs?" in path:
@@ -367,6 +380,41 @@ class ReportingBoundaryTests(unittest.TestCase):
                            ("event", "pull_request_target")):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 REPORT.identity(event, dict(live, **{key: value}), "owner/repo")
+
+    def test_integrated_ci_preserves_failure_reporting_and_rejects_untrusted_events(self):
+        calls, catalog = self.run_report_fixture([self.row()],
+            workflow_path=".github/workflows/ci.yml", case_log="retained guest failure")
+        self.assertTrue(calls)
+        self.assertIsNotNone(catalog)
+        live = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
+                    head_sha="a" * 40, workflow_id=20, path=".github/workflows/ci.yml",
+                    status="completed", event="push", head_branch="main")
+        event = dict(repository={"full_name": "owner/repo"}, workflow_run=copy.deepcopy(live))
+        self.assertEqual(REPORT.identity(event, live, "owner/repo"), live)
+        for change in ({"event": "pull_request"}, {"event": "workflow_dispatch"},
+                       {"head_branch": "untrusted"}, {"workflow_id": 21}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                REPORT.identity(event, dict(live, **change), "owner/repo")
+
+    def test_successful_integrated_ci_requires_evidence_from_every_linux_distro(self):
+        calls, catalog = self.run_report_fixture([self.row("PASS")], conclusion="success",
+            workflow_path=".github/workflows/ci.yml")
+        self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+        reported = [row for call in calls for row in call[1]]
+        self.assertTrue(any(row["result"] == "HARNESS_ERROR" for row in reported))
+        self.assertFalse(any(row["result"] == "PASS" for row in reported))
+
+    def test_complete_integrated_ci_preserves_exact_case_closures(self):
+        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
+                for distro in REPORT.DISTROS]
+        calls, catalog = self.run_report_fixture(rows, conclusion="success",
+            workflow_path=".github/workflows/ci.yml", all_distros=True)
+        self.assertFalse(catalog["evidence_invalid_or_unavailable"])
+        reported = [row for call in calls for row in call[1]]
+        self.assertFalse(any(row["result"] in REPORT.FAILURES for row in reported))
+        self.assertEqual({(row["case_id"], row["distro"]) for row in reported
+                          if row["case_id"] != "qemu-matrix-workflow"},
+                         {(row["case_id"], row["distro"]) for row in rows})
 
     def test_privileged_report_job_excludes_pull_request_runs(self):
         text = (ROOT / ".github/workflows/qemu-report.yml").read_text()
