@@ -1797,6 +1797,17 @@ fn parse_security_inventory(
             fields[2] == "installed",
             "Incomplete dpkg package state: {status}"
         );
+        for field in ["Package", "Version", "Architecture"] {
+            let count = paragraph
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(key, _)| key.eq_ignore_ascii_case(field))
+                .count();
+            anyhow::ensure!(
+                count == 1,
+                "Installed dpkg entry must contain exactly one {field} field"
+            );
+        }
         let (name, version, description, architecture) = parse_status_paragraph(paragraph)
             .context("Installed dpkg entry lacks a package name")?;
         anyhow::ensure!(
@@ -1873,6 +1884,16 @@ mod security_inventory_tests {
     fn security_inventory_rejects_ambiguous_or_incomplete_package_states() {
         let entry =
             "Package: fixture\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n";
+        for duplicate in [
+            "Package: spoofed\n",
+            "Version: 999\n",
+            "Architecture: i386\n",
+        ] {
+            assert!(
+                parse_security_inventory(&format!("{entry}{duplicate}")).is_err(),
+                "duplicate identity accepted: {duplicate}"
+            );
+        }
         assert!(
             parse_security_inventory(&entry.replace("Status: install ok installed\n", "")).is_err()
         );

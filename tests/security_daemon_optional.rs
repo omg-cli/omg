@@ -1,6 +1,48 @@
 pub mod common;
 
 #[test]
+fn sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure()
+-> anyhow::Result<()> {
+    let project = common::TestProject::new();
+    let state = project.data_dir.path().join("mock_state_pacman.json");
+    let clean = br#"{"installed":{},"available":{}}"#;
+    std::fs::write(&state, clean)?;
+    let output = project.dir.path().join("security-sbom.json");
+    let output_arg = output.to_str().expect("fixture path is UTF-8");
+    let args = ["audit", "sbom", "--output", output_arg];
+    let result = project.run(&args);
+    result.assert_success();
+    let bytes = std::fs::read(&output)?;
+    let report: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(report["bomFormat"], "CycloneDX");
+    assert_eq!(report["specVersion"], "1.5");
+    assert_eq!(report["components"], serde_json::json!([]));
+    assert!(
+        report
+            .get("vulnerabilities")
+            .is_none_or(|value| value == &serde_json::json!([]))
+    );
+    std::fs::write(&state, b"{broken")?;
+    let failed = project.run(&args);
+    failed.assert_failure();
+    assert!(
+        failed.stderr.contains("Failed to list packages"),
+        "{}",
+        failed.stderr
+    );
+    assert_eq!(
+        std::fs::read(&output)?,
+        bytes,
+        "failed scan replaced the previous report"
+    );
+    assert_eq!(std::fs::read(&state)?, b"{broken");
+    std::fs::write(&state, clean)?;
+    project.run(&args).assert_success();
+    project.close_checked();
+    Ok(())
+}
+
+#[test]
 fn tui_security_scan_uses_shared_inventory_failures_without_a_daemon() -> anyhow::Result<()> {
     let project = common::TestProject::new();
     let path = project.data_dir.path().join("mock_state_pacman.json");

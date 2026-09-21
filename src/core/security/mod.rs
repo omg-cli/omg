@@ -7,6 +7,7 @@ pub mod keyserver;
 pub mod pgp;
 pub mod policy;
 pub mod sbom;
+mod sbom_shared;
 pub mod scan;
 pub mod secrets;
 pub mod slsa;

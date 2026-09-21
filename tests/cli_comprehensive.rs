@@ -502,6 +502,7 @@ impl TargetExpectations {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Assertion {
     AuditSourceFailure,
+    SbomSourceFailure,
     JsonStdout,
     Artifact(String),
     WorkspaceFilteredOutput,
@@ -514,6 +515,7 @@ impl Assertion {
     fn parse(raw: &str, line_number: usize) -> Self {
         match raw {
             "audit-source-failure" => Self::AuditSourceFailure,
+            "sbom-source-failure" => Self::SbomSourceFailure,
             "json-stdout" => Self::JsonStdout,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
@@ -1156,7 +1158,9 @@ fn behavior_inventory_runs_in_hermetic_state() {
         // Native offline guests have installed packages and must refuse an
         // unavailable advisory source. This fixture has an empty mock inventory,
         // so its distinct contract is a completed empty scan with exit zero.
-        let expected_exit = if case.assertions.contains(&Assertion::AuditSourceFailure) {
+        let expected_exit = if case.assertions.contains(&Assertion::AuditSourceFailure)
+            || case.assertions.contains(&Assertion::SbomSourceFailure)
+        {
             0
         } else {
             case.expected_exit
@@ -1211,6 +1215,22 @@ fn behavior_inventory_runs_in_hermetic_state() {
         }
         for assertion in &case.assertions {
             match assertion {
+                Assertion::SbomSourceFailure => {
+                    let report = std::fs::read_to_string(project.path().join("sbom.json"))
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+                    if !report.is_some_and(|report| {
+                        report["bomFormat"] == "CycloneDX"
+                            && report["components"].as_array().is_some_and(Vec::is_empty)
+                            && report
+                                .get("vulnerabilities")
+                                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+                    }) {
+                        issues.push(
+                            "empty-inventory SBOM was not a valid empty CycloneDX report".into(),
+                        );
+                    }
+                }
                 Assertion::AuditSourceFailure => {
                     assert!(
                         audit_success.is_some(),

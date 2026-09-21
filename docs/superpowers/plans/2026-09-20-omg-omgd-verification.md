@@ -262,3 +262,28 @@ Implementation requirements:
 
 Primary documentation:
 https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html
+
+### Security export parity follow-through
+
+Security is a core beta product promise. The current SBOM generator still uses
+ALSA directly, refuses Debian vulnerability matching, and excludes Fedora at
+compile time. Refactor it onto the shared scanner without losing package data:
+
+- Preserve native epoch/version/release and architecture in component identities;
+  do not substitute semver-normalized versions or merge multilib packages.
+- Keep Ubuntu and Debian distribution identity distinct. Validate PURLs against
+  the package-url definitions and CycloneDX 1.5 output against its schema.
+- Make findings reference actual exported installed components. Advisory NEVRA
+  describes the advisory package and must not replace the installed version.
+- Preserve advisory sources/references and distinguish qualitative ratings from
+  numeric CVSS. Never manufacture a score or silently drop unjoinable findings.
+- Make direct, daemon-backed and exported scanning agree; inventory changes or
+  source failures must not produce a partial successful report.
+- Preserve a previously written report when inventory/scanning fails. Add
+  empty-inventory success, corrupt-inventory refusal/recovery, populated fixture,
+  multiarch identity, schema and native distro verification. Empty mock exports
+  alone do not count as native advisory coverage.
+
+Primary references:
+https://cyclonedx.org/docs/1.5/json/
+https://github.com/package-url/purl-spec/blob/main/types/rpm-definition.json
