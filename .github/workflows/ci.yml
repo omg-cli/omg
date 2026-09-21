@@ -19,7 +19,6 @@ on:
   # Always report the required check on PRs. The job-level change filter
   # below skips platform builds for documentation/configuration-only changes.
   pull_request:
-    branches: [main]
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
