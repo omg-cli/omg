@@ -25,6 +25,7 @@ require = COVERAGE.require
 
 
 BEHAVIOR_TESTS = frozenset({
+    'omg::security_daemon_optional::audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_it',
     'omg::security_daemon_optional::audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_history',
     'omg::security_daemon_optional::sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure',
     'omg::security_daemon_optional::security_scan_without_daemon_preserves_inventory_errors_and_recovers',

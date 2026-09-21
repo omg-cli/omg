@@ -343,6 +343,7 @@ class NativeReceipts(unittest.TestCase):
         self.assertEqual({contract['id'] for contract in mapped}, {
             'omg.audit.sbom.empty-recovery.fixture',
             'omg.audit.verify.integrity.fixture',
+            'omg.audit.policy.configuration.fixture',
             'omg.audit.scan.empty-recovery.fixture',
             'omg.audit.fix.empty-recovery.fixture',
             'omg.status.fixture', 'omg.status.json.fixture', 'omg.install.consent.fixture',

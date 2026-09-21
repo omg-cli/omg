@@ -3346,6 +3346,64 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omg.audit.policy.configuration.fixture",
+      "source": "src/cli/security.rs",
+      "binary": "omg",
+      "surface": "omg audit policy",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "fault"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "default-policy-output",
+          "configured-policy-output",
+          "recovery-after-policy-repair"
+        ],
+        "state": [
+          "missing-policy-not-created",
+          "configured-policy-unchanged",
+          "corrupt-policy-bytes-unchanged"
+        ],
+        "fault": [
+          "malformed-toml-and-invalid-utf8-rejected",
+          "no-default-grade-on-corruption"
+        ]
+      },
+      "scope": "Daemon-disabled real CLI with isolated configuration. Covers default and configured policy output, malformed TOML and invalid UTF-8 refusal, unchanged policy bytes and recovery. This is not native package transactions evidence and does not prove inherited privileged policy, license decisions, or concurrent updates. Broader behavioral gaps remain.",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::security_daemon_optional::audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_it",
+          "evidence": [
+            "success",
+            "state",
+            "fault"
+          ],
+          "assertions": [
+            "default-policy-output",
+            "configured-policy-output",
+            "recovery-after-policy-repair",
+            "missing-policy-not-created",
+            "configured-policy-unchanged",
+            "corrupt-policy-bytes-unchanged",
+            "malformed-toml-and-invalid-utf8-rejected",
+            "no-default-grade-on-corruption",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [
