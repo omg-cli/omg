@@ -1,70 +1,133 @@
+---
+title: Performance investigation
+sidebar_position: 36
+description: Measure OMG honestly and tune the knobs that actually exist
+---
+
 # Investigate OMG performance
 
-**In plain words:** Small changes that make repeated commands faster, and how to measure the difference honestly.
+**In plain words:** a few settings make repeated commands faster, and a few habits make
+measurements trustworthy. This page lists the knobs that exist, what each one really changes,
+and where the trade-offs are.
 
 > New to the terminal? Read [Getting started](./getting-started.md) and keep
 > [the glossary](./glossary.md) open while you work.
 
-Measure the operation you need before changing configuration. A warm official-repository query is not equivalent to an AUR search over the network or a package installation.
+Measure the operation you actually need before changing anything. A warm official-repository
+query, an AUR search over the network, and a package installation have different costs, and a
+change that helps one can be irrelevant to another.
 
-## Start with recorded evidence
+## What each knob changes
 
-[Benchmark methodology](../benchmarks/README.md) defines the available measurements and links raw records. Record the OMG version, backend, query, cache state, enabled sources, and artifact hash when comparing runs. Verify that compared commands return equivalent results before publishing a speedup.
+| Setting | What it changes | Trade-off |
+| :--- | :--- | :--- |
+| `omg daemon` running | Repeated searches and status calls answer from memory | A background process holds memory and an open socket |
+| `omg status --fast` | Skips the slower dependency scan and reports counts | Fewer details in the output |
+| `omg ec`, `tc`, `oc`, `uc` | Read a 32-byte snapshot file instead of starting work | Values can be a few minutes stale |
+| `omg search --no-aur` | Removes the network-backed AUR lane from Arch searches | You lose AUR results for that query |
+| `omg update --check` | Reports what would change and changes nothing | One extra command before the real update |
+| `omg update --fast` | Sync and upgrade in one operation, no preview | You give up the review step |
+| `omg update --turbo` | Skips the database sync, uses cached data, parallel extraction | Metadata may be stale; run `omg sync` first if that matters |
+| `OMG_AUR_PARALLEL=<1-8>` | AUR build parallelism for one run, overriding the default | More concurrent `makepkg` processes need more memory |
+| `[aur] build_concurrency` | The configured AUR build default | 1 is the shipped default; raise it deliberately |
+| `[aur] cache_builds`, `enable_ccache`, `enable_sccache` | Reuse built packages and compiler output | Only helps when build inputs are genuinely reusable |
 
-Smoke tests establish whether selected operations passed for a particular artifact and image. Their durations include setup and assertions; they are not per-command latency measurements.
-
-## Compare daemon and direct queries
+## Where the time actually goes
 
 ```bash
+# Which path a query takes: daemon-served, or the direct backend path.
 omg daemon-status
+
+# The same query with both lanes, then without the network-backed AUR lane.
+omg search ripgrep
 omg search ripgrep --no-aur
 ```
 
-On Arch, `--no-aur` excludes the network-backed AUR search. Without it, OMG queries official repositories and AUR concurrently. Keep the query and sources unchanged across measurements.
+On Arch, official repositories and the AUR are queried concurrently and the AUR lane is
+bounded by its own timeout, so a slow AUR does not hold official results hostage. See
+[package search](./package-search.md) for the exact rules.
 
-The optional daemon keeps package indexes in memory. Start `omg daemon --foreground` in a separate terminal and repeat the same query. Separate cold startup from warm queries. Do not assume a fixed latency, speedup, or memory footprint.
+```bash
+# Isolate the daemon: run it in its own terminal, then repeat the same query.
+omg daemon --foreground
+```
 
-Use the optional [user service](./configuration.md) only after creating its unit. Service enablement instructions do not install a missing unit.
+Separate cold start-up from warm queries, and keep the query, the enabled sources, and the
+cache state identical between runs. The cache tiers and their freshness rules are in
+[cache](./cache.md).
 
-## Tune AUR build concurrency
+
+## AUR build parallelism, with bounds
+
+Builds are process-heavy, so the parallel count is clamped rather than trusted:
+
+```bash
+# One run with a specific parallelism; values outside 1-8 are clamped with a warning.
+OMG_AUR_PARALLEL=4 omg update --aur-only
+```
 
 ```toml
-# ~/.config/omg/config.toml
+# ~/.config/omg/config.toml — set the default once
 [aur]
 build_concurrency = 4
 cache_builds = true
-enable_ccache = true
-enable_sccache = true
 ```
 
-Choose concurrency based on both available memory and CPU cores. A compiler can use several cores within one build. Reduce concurrency if swapping or memory pressure increases. Compiler caches help only when the build and cache configuration permit reuse; no fixed percentage improvement is guaranteed.
+Choose the number from both available memory and CPU cores: a single compiler already uses
+several cores, and parallel builds add processes on top of that. Reduce it if swapping or
+memory pressure appears. Keep sandboxing and review enabled — an unsandboxed native build is
+not a performance recommendation, because it runs package code with broader host access.
 
-Keep sandboxing and package review enabled. Native builds are not a routine performance recommendation because they execute package code with broader host access.
-
-## Install packages in one transaction
+## Package transactions are serial
 
 ```bash
+# One transaction for several packages, not several background installs.
 omg install gcc clang rustup
 ```
 
-Use a disposable Arch machine for this example. Independent package-manager processes compete for the package database lock. Do not run several background `omg install` processes to parallelize system mutations. AUR build concurrency is separate from transaction concurrency.
+Independent package-manager processes compete for the same database lock, so running several
+`omg install` jobs in the background to "parallelize" system changes makes the work slower and
+harder to reason about. AUR build concurrency is a different setting from transaction
+concurrency. Use a disposable machine for experiments like the one above.
 
-## Diagnose downloads
+## Downloads and mirrors
 
 ```bash
-omg doctor --network
+omg doctor --network    # connectivity, mirror configuration, and tool checks
 ```
 
-Check repository availability, mirror configuration, and network conditions before attributing download time to CLI overhead. Use the selected backend's supported mirror tools. Do not lower signature or provenance checks to improve timing.
+During a sync, mirrors are probed with concurrent `HEAD` requests under a bounded timeout and
+the first success wins, rather than trying each mirror in turn. If downloads are slow, check
+repository and mirror state before attributing the time to OMG, and never relax signature,
+checksum, or provenance checks to improve timing.
 
-## Use caches deliberately in CI
+## Caches in CI
 
-Cache only data the job needs. Avoid uploading the entire OMG data directory without review; it can contain audit history, account state, telemetry queues, and environment inventory. Partition caches by platform, backend, toolchain, and dependency inputs. Do not restore untrusted caches into privileged jobs.
+Cache only what the job needs. Avoid uploading the whole OMG data directory without review: it
+can contain audit history, account state, telemetry queues, and environment inventory.
+Partition caches by platform, backend, toolchain, and dependency inputs, and never restore an
+untrusted cache into a privileged job. Do not benchmark storage by writing to `/tmp`, which
+may be memory-backed.
 
-## Keep scratch output off memory-backed temporary storage
+## Limits
 
-Do not benchmark storage by writing large files to `/tmp`; it may be RAM-backed. Use a dedicated directory on the filesystem being measured and remove only scratch files you created. Store build targets and large test output under `~/.cache/build-targets/`.
+- **No universal speedup.** Results depend on the backend, the query, the cache state, the
+  repository set, and the storage. Recorded runs are evidence for their recorded conditions;
+  see [benchmark methodology](../benchmarks/README.md).
+- **`--fast` and `--turbo` trade review for time.** They are deliberate shortcuts, not
+  defaults, and `--turbo` can act on metadata a sync would have refreshed.
+- **Concurrency is bounded for a reason.** AUR builds are clamped to 1-8; exceeding your memory
+  budget causes swapping, which is slower than a lower setting.
+- **Compiler caches are conditional.** ccache and sccache help only when build inputs and cache
+  configuration allow reuse; no fixed percentage improvement is promised.
+- **Smoke-test durations are not latency.** They include setup and assertions.
 
-## Report a regression
+When you report a regression, include the reproducible command, before-and-after artifact
+identifiers, sample counts, raw timings, and the environment differences. See
+[contributing](../CONTRIBUTING.md) and [daemon behaviour](./daemon.md).
 
-Include a reproducible command, before-and-after artifact identifiers, sample counts, raw timings, and relevant environment differences. Separate observed results from suspected causes. See [contributing](../CONTRIBUTING.md) for focused checks and [daemon behavior](./daemon.md) for fallback paths.
+## Where to go next
+
+- [Under the hood](./under-the-hood.md) for cache freshness, mirror racing, and the AUR gates.
+- [Cache](./cache.md) for what is stored and what is safe to remove.
+- [Package management](./packages.md) for the update and cleanup commands themselves.
