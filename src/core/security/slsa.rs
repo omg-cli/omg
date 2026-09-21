@@ -497,6 +497,20 @@ fn verify_x509_signature(
     }
 }
 
+/// Remove only complete RFC 7468 boundaries. BEGIN/END can also occur in
+/// perfectly valid base64 data and must never identify a boundary by substring.
+fn decode_pem_body(pem: &str, label: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine as _;
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let body: String = pem
+        .lines()
+        .map(str::trim)
+        .filter(|line| *line != begin && *line != end)
+        .collect();
+    base64::engine::general_purpose::STANDARD.decode(body)
+}
+
 /// Bind a Fulcio leaf certificate to a signer identity by validating its
 /// chain against the embedded Sigstore trust roots.
 ///
@@ -510,24 +524,9 @@ fn verify_fulcio_chain(
     roots: &[&str],
     intermediate_pem: &str,
 ) -> Option<String> {
-    use base64::Engine as _;
     use x509_parser::prelude::*;
 
-    let decode_pem_der = |pem: &str| -> Option<Vec<u8>> {
-        let b64: String = pem
-            .lines()
-            .filter(|l| !l.contains("BEGIN") && !l.contains("END"))
-            .map(str::trim)
-            .collect();
-        base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
-            .ok()
-            .or_else(|| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(pem.trim())
-                    .ok()
-            })
-    };
+    let decode_pem_der = |pem: &str| decode_pem_body(pem, "CERTIFICATE").ok();
 
     let (_, leaf) = X509Certificate::from_der(leaf_der).ok()?;
 
@@ -806,17 +805,8 @@ impl SlsaVerifier {
         // Fulcio certificate path: bind the signature to an OIDC identity by
         // validating the leaf chain against the embedded Sigstore roots.
         if pem.contains("BEGIN CERTIFICATE") {
-            let der = {
-                use base64::Engine as _;
-                let b64: String = pem
-                    .lines()
-                    .filter(|l| !l.contains("BEGIN") && !l.contains("END"))
-                    .map(str::trim)
-                    .collect();
-                base64_engine
-                    .decode(b64)
-                    .map_err(|source| SlsaError::RekorBodyDecode { source })?
-            };
+            let der = decode_pem_body(pem, "CERTIFICATE")
+                .map_err(|source| SlsaError::RekorBodyDecode { source })?;
             let Some(signer) = verify_fulcio_chain(
                 &der,
                 entry.integrated_time,
@@ -864,14 +854,7 @@ impl SlsaVerifier {
         artifact_hash: &str,
         artifact_bytes: &[u8],
     ) -> Result<(bool, Option<String>), SlsaError> {
-        use base64::Engine as _;
-        let der: Vec<u8> = base64::engine::general_purpose::STANDARD
-            .decode(
-                pem.lines()
-                    .filter(|line| !line.contains("BEGIN") && !line.contains("END"))
-                    .map(str::trim)
-                    .collect::<String>(),
-            )
+        let der = decode_pem_body(pem, "PUBLIC KEY")
             .map_err(|source| SlsaError::RekorBodyDecode { source })?;
         Ok((
             Self::verify_digest_with_bytes(&der, artifact_hash, artifact_bytes, signature),
@@ -1072,6 +1055,32 @@ mod tests {
 
     use std::collections::HashMap;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn pem_boundaries_never_strip_begin_or_end_from_encoded_data() {
+        use base64::Engine as _;
+        for label in ["CERTIFICATE", "PUBLIC KEY"] {
+            for newline in ["\n", "\r\n"] {
+                let encoded = "BEGINAAAENDx";
+                let pem = format!(
+                    "-----BEGIN {label}-----{newline}{encoded}{newline}-----END {label}-----{newline}"
+                );
+                let expected = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap();
+                assert_eq!(decode_pem_body(&pem, label).unwrap(), expected);
+                assert_eq!(decode_pem_body(encoded, label).unwrap(), expected);
+                assert!(decode_pem_body(&pem.replace("ENDx", "!NDx"), label).is_err());
+                assert!(
+                    decode_pem_body(
+                        &pem.replace(&format!("-----END {label}-----"), "-----END WRONG-----"),
+                        label
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_slsa_level_display() {
@@ -1519,7 +1528,22 @@ mod tests {
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(vec!["sigstore-test-root".to_string()]).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca = ca_params.self_signed(&ca_key).unwrap();
+        // A valid serial deliberately puts END in a base64 BODY line. PEM
+        // boundaries are whole delimiter lines, never arbitrary substrings.
+        let ca = (0..3)
+            .find_map(|padding| {
+                let mut params = ca_params.clone();
+                let mut serial = vec![1; padding];
+                serial.extend([0x10, 0xd0, 0xf1].repeat(6));
+                params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
+                let certificate = params.self_signed(&ca_key).unwrap();
+                certificate
+                    .pem()
+                    .lines()
+                    .any(|line| !line.starts_with("-----") && line.contains("END"))
+                    .then_some(certificate)
+            })
+            .expect("fixture must contain END in certificate data");
 
         // Leaf issued to an OIDC identity, valid now. Fulcio records keyless
         // identities as URI SANs, so build the SAN explicitly (rcgen's
@@ -1540,7 +1564,16 @@ mod tests {
         // Fulcio profile: non-CA leaf with codeSigning EKU.
         leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
         leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        leaf_params.serial_number = Some(rcgen::SerialNumber::from_slice(
+            &[0x10, 0xd0, 0xf1].repeat(6),
+        ));
         let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        assert!(
+            leaf.pem()
+                .lines()
+                .any(|line| !line.starts_with("-----") && line.contains("END")),
+            "leaf fixture must also put END in encoded data"
+        );
 
         let artifact_bytes = b"fulcio test artifact payload".to_vec();
         let mut fixture_hasher = sha2::Sha256::new();
@@ -1581,6 +1614,23 @@ mod tests {
         let ca_pem = ca.pem();
         let ca_roots: Vec<&str> = vec![ca_pem.as_str()];
         let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap();
+
+        assert_eq!(
+            verify_fulcio_chain(leaf.der(), now, &ca_roots, "").as_deref(),
+            Some("https://accounts.example.com/users/alice"),
+            "generated certificate chain must bind identity; root={ca_pem} leaf={cert_pem}"
+        );
+        assert!(
+            SlsaVerifier::verify_digest_with_bytes(
+                &leaf_key.public_key_der(),
+                &artifact_hash,
+                &artifact_bytes,
+                good_sig.to_der().as_bytes(),
+            ),
+            "generated artifact signature must verify; public_key={} signature={}",
+            b64(&leaf_key.public_key_der()),
+            b64(good_sig.to_der().as_bytes())
+        );
 
         // Valid chain + correct signature -> verified AND identity bound.
         let entry = make_entry(&cert_pem, good_sig.to_der().as_bytes(), now);
