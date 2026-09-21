@@ -65,6 +65,50 @@ check_python_install() {
       || [[ "$output" != "Python $version" ]]; then
     printf 'assertion failed: Python executable version expected=%s observed=%s\n' "$version" "$output" >&2; return 1
   fi
+  if ! output=$(timeout --kill-after=2s 60 "$executable" -I - "$version" "$expected" "$base" 2>&1 <<'PY'
+import bz2, ctypes, gzip, hashlib, json, lzma, pathlib, sqlite3, ssl, subprocess, sys, tempfile, venv
+
+version, expected, base = sys.argv[1:]
+assert sys.version.split()[0] == version, 'interpreter version mismatch'
+assert pathlib.Path(sys.executable).resolve().is_relative_to(pathlib.Path(expected)), 'interpreter escaped installation'
+payload = b'OMG installed Python behavior'
+for codec in (bz2, gzip, lzma):
+    assert codec.decompress(codec.compress(payload)) == payload, f'{codec.__name__} round trip failed'
+assert hashlib.sha256(b'abc').hexdigest() == 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', 'SHA-256 mismatch'
+with sqlite3.connect(':memory:') as database:
+    database.execute('create table probe(value integer)')
+    database.execute('insert into probe values (?)', (42,))
+    assert database.execute('select value from probe').fetchall() == [(42,)], 'SQLite query mismatch'
+libc = ctypes.CDLL(None)
+libc.abs.argtypes = [ctypes.c_int]
+libc.abs.restype = ctypes.c_int
+assert libc.abs(-42) == 42, 'ctypes foreign call failed'
+context = ssl.create_default_context()
+assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname, 'TLS verification defaults disabled'
+# ensurepip uses bundled wheels offline; no package index or second download.
+def run_probe(arguments, timeout=10):
+    result = subprocess.run(arguments, text=True, capture_output=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(f'Python child exited {result.returncode}: {result.stdout[:4096]} {result.stderr[:4096]}')
+    return result.stdout
+
+with tempfile.TemporaryDirectory(prefix='.qemu-python-', dir=base) as temporary:
+    environment = pathlib.Path(temporary) / 'venv'
+    venv.create(environment, with_pip=False)
+    child = environment / 'bin/python'
+    run_probe([str(child), '-I', '-m', 'ensurepip', '--upgrade', '--default-pip'], timeout=40)
+    observed = run_probe([str(child), '-I', '-c', 'import json,sys; print(json.dumps([sys.version.split()[0],sys.prefix,sys.base_prefix]))'])
+    child_version, prefix, base_prefix = json.loads(observed)
+    assert child_version == version and pathlib.Path(prefix) == environment, 'venv identity mismatch'
+    assert prefix != base_prefix, 'venv is not isolated from its base interpreter'
+    pip = run_probe([str(child), '-I', '-m', 'pip', '--isolated', '--disable-pip-version-check', '--version'])
+    assert pip.startswith('pip ') and str(environment) in pip, 'pip is outside its venv'
+assert not pathlib.Path(temporary).exists(), 'Python behavior fixture cleanup failed'
+print(f'OMG_PYTHON_RUNTIME_OK:{version}')
+PY
+  ) || [[ "$output" != "OMG_PYTHON_RUNTIME_OK:$version" ]]; then
+    printf 'assertion failed: Python runtime behavior expected=%s observed=%s\n' "$version" "$output" >&2; return 1
+  fi
 }
 check_hook_lifecycle() (
   # Execute the installed scripts unchanged in a disposable second repository.
@@ -487,6 +531,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   transport=0
   budget=$(( (row_timeout + 5) * (${#chain[@]} + 1) + 15 ))
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
+  if [[ "$case" == runtime-python-install ]]; then budget=$((budget + 74)); fi
   timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
   elapsed=$((SECONDS - start))
   verdict=HARNESS_ERROR; rc=$transport

@@ -176,6 +176,12 @@ signal-specific logs and query outputs remain separate exported artifacts.
 QEMU's `runtime-python-install` row requires a numeric requested version, uses
 private runtime state, checks the active link and executable stay inside the
 installed version, and runs that interpreter to verify its exact version.
+The interpreter must also execute isolated Python code: compression round trips,
+SHA-256, SQLite write/read, ctypes loading, TLS verification defaults, and an
+isolated venv with bundled pip. The probe requires an exact completion marker
+after successful assertions and cleanup, and has a 60-second deadline. A version
+string alone, a no-op program, or a failing interpreter cannot satisfy it. TLS
+defaults do not prove a successful remote TLS connection; the probe is offline.
 A missing, inactive, wrong-version, broken or escaped installation fails even
 when the CLI exits zero. Cleanup is checked before the row passes. This stronger
 oracle also applies to reviewed published inventories with that row identity;
