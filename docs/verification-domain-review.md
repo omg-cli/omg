@@ -146,3 +146,31 @@ This repair follows tokens with a100-page budget and rejects token cycles.
 The page-budget failure branch still needs explicit exercise. It does not yet
 establish full daemon/CLI fetching or scoring coverage; those integrations remain
 beta requirements, not optional follow-ups.
+
+## Optional daemon: shared scanning architecture
+
+The CLI's audit scan, fix and vulnerability export paths now call one helper:
+use a reachable daemon, otherwise use the package manager and shared security
+scanner directly. An actual error from a connected daemon remains an error;
+it is not hidden by a second scan. The package audit result models and aggregation
+live in core/security/scan.rs; the daemon protocol reexports the same models,
+preserving field layout. Both paths share concurrency, failure propagation,
+severity thresholding and audit completion logging.
+
+The real CLI regression first failed solely because OMG_DISABLE_DAEMON disabled
+OMGD. It now verifies empty inventory scanning and fix dry-run, corrupt inventory
+failure without false-clean output or state loss, and recovery after repair.
+The production daemon/Unix-socket/HTTP test verifies populated paginated scans,
+9.8 CVSS and6.9 numeric findings, unknown scores, warm-cache reuse, package-version
+change,503 refusal, recovery and the7.0 high-severity boundary. SIGTERM drain and
+fixture cleanup are asserted. Advisory endpoints are customizable only in cfg(test).
+
+Four-distro local batches pass these tests, scanner tests and coverage_18. This
+is still not native advisory-ecosystem certification. In particular, Fedora has
+no configured OSV ecosystem today. Native Fedora advisory fetching and scoring
+remain required for beta; DNF5's official advisory list/info JSON documentation
+is the next primary source: https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html
+
+The pagination page-budget branch is now explicitly exercised:100 unique
+continuations must fail, then a fresh complete scan succeeds without partial
+cache reuse.

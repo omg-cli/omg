@@ -336,21 +336,7 @@ pub struct DetailedPackageInfo {
     pub source: WirePackageSource,
 }
 
-/// Vulnerability info for IPC
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Vulnerability {
-    pub id: String,
-    pub summary: String,
-    pub score: Option<String>,
-}
-
-/// Security audit result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecurityAuditResult {
-    pub total_vulnerabilities: usize,
-    pub high_severity: usize,
-    pub vulnerabilities: Vec<(String, Vec<Vulnerability>)>,
-}
+pub use crate::core::security::scan::{SecurityAuditResult, Vulnerability};
 
 /// System metrics snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]

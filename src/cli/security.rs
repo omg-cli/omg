@@ -111,19 +111,27 @@ impl LocalCommandRunner for AuditCommands {
     }
 }
 
+/// Prefer the warm daemon, but keep scanning available without it.
+async fn security_audit_result() -> Result<crate::core::security::scan::SecurityAuditResult> {
+    #[cfg(unix)]
+    if let Ok(mut client) = DaemonClient::connect().await {
+        return client
+            .security_audit()
+            .await
+            .context("Failed to run security audit");
+    }
+    let manager = crate::package_managers::get_package_manager()?;
+    let scanner = crate::core::security::VulnerabilityScanner::new();
+    crate::core::security::scan::scan_installed(manager.as_ref(), &scanner).await
+}
+
 /// Perform security audit (vulnerability scan)
 pub async fn scan(_ctx: &CliContext) -> Result<()> {
     ui::print_header("Secure", "Vulnerability Scan");
 
     #[cfg(unix)]
     {
-        let mut client = DaemonClient::connect().await.context(
-            "Daemon not running. Security audit requires the daemon (start it with: omg daemon)",
-        )?;
-        let res = client
-            .security_audit()
-            .await
-            .context("Failed to run security audit")?;
+        let res = security_audit_result().await?;
         if res.total_vulnerabilities == 0 {
             ui::print_success("No vulnerabilities found in scanned packages.");
         } else {
@@ -1060,20 +1068,8 @@ pub async fn fix_vulnerabilities(
         style::runtime("OMG")
     );
 
-    // Get vulnerability data from daemon
     #[cfg(unix)]
-    let scan_result = {
-        let Ok(mut client) = DaemonClient::connect().await else {
-            anyhow::bail!("Daemon not running. Security audit requires the daemon.");
-        };
-
-        match client.security_audit().await {
-            Ok(res) => res,
-            Err(e) => {
-                anyhow::bail!("Audit failed: {e}");
-            }
-        }
-    };
+    let scan_result = security_audit_result().await?;
 
     #[cfg(not(unix))]
     {
@@ -1295,13 +1291,7 @@ pub async fn export_compliance(
             // 2. Export vulnerability scan
             #[cfg(unix)]
             {
-                let mut client = DaemonClient::connect().await.context(
-                    "Daemon not running. Compliance export requires the daemon (start it with: omg daemon)",
-                )?;
-                let scan = client
-                    .security_audit()
-                    .await
-                    .context("Failed to run security audit for compliance export")?;
+                let scan = security_audit_result().await?;
                 let json = serde_json::to_string_pretty(&scan)?;
                 let scan_path = output_dir.join(format!("vulnerability-scan-{timestamp}.json"));
                 write_private_export(&scan_path, json)?;
