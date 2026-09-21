@@ -96,6 +96,52 @@ omg env capture                 # record the environment in omg.lock
 omg env check                   # report drift against that record
 ```
 
+### What each flag actually does
+
+```bash
+# Search lanes. On Arch, official repositories and the AUR are queried concurrently.
+omg search ripgrep --no-aur         # skip the network-backed AUR lane entirely
+omg search ripgrep --detailed       # add source metadata such as votes and popularity
+omg search ripgrep --limit 50       # raise the result cap (default 15)
+
+# Mutations. Every one of these accepts a preview flag; none of them is a safety verdict.
+omg install ripgrep --dry-run       # print the planned transaction, change nothing
+omg remove ripgrep --recursive      # Arch only: also remove dependencies nothing else needs
+omg update --check                  # list what would be updated, change nothing
+omg update --aur-only               # Arch only: refresh AUR packages, leave official upgrades to pacman -Syu
+omg clean --cache --dry-run          # show what cache cleanup would delete
+
+# Runtimes. Versions install inside your home folder; no password is involved.
+omg use python 3.12                 # install if missing, then select it
+omg use python 3.11                 # switch between installed versions at any time
+omg use python 3.11 --uninstall     # remove a version (switch away from it first)
+omg list node --available           # include versions you could download, not just installed ones
+
+# Records and diagnosis.
+omg env check                       # exit status 1 means this machine drifted from omg.lock
+omg history --type update           # filter recorded transactions by kind
+omg rollback <transaction-id>       # return to an earlier recorded version, where supported
+omg daemon --foreground             # run the optional helper in this terminal to read its output
+```
+
+## How it works
+
+Two programs ship together. The CLI does the work; the daemon only keeps derived state
+warm, so a package operation never depends on it being up.
+
+| Component | Role | Without it |
+| :--- | :--- | :--- |
+| `omg` | Arguments, backend queries and mutations, policy, output, task runner, prompt counters | Nothing runs — this is the program you use |
+| `omgd` | Warm in-memory index, background status refresh, status snapshots | Package commands take direct backend paths; scans, Unix SOC 2 export, and metrics need it |
+| Backend | ALPM + AUR, APT, DNF/RPM, or Homebrew | No package operations; runtimes, tasks, and records still work |
+| `omg.status` | Fixed 32-byte snapshot read by `omg ec`, `tc`, `oc`, `uc` | Prompt counters fall back to the slower CLI path |
+
+**[Under the hood](docs/under-the-hood.md)** explains the rest with the details that matter
+when something goes wrong: socket resolution and message framing, the three cache tiers and
+their freshness rules, when a subprocess fallback is used instead of a native library, the
+five AUR gates and what each blocks, what a lockfile fingerprint actually hashes, how the
+audit chain is built, and why rollback is not a snapshot.
+
 ## What it does
 
 ```mermaid
@@ -125,6 +171,29 @@ flowchart LR
 **Runtime managers (14):** Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, Swift — plus 54 registry developer tools. Shell hooks for Bash, Zsh, and Fish read project pins such as `.nvmrc` automatically; the hook is optional.
 
 **Already using mise?** Supported version pins, environment layers, task dependencies, and project environments are reused. See [mise compatibility](docs/mise-compatibility.md) for the exact boundaries.
+
+## Backend coverage in detail
+
+| System | Backend | Covered | Not covered |
+| :--- | :--- | :--- | :--- |
+| Arch Linux | ALPM + AUR | Search, install, update, remove, policy, transaction history, rollback, AUR review and sandboxed builds | Nothing Arch-specific applies on other systems; AUR entries are community recipes, not publisher-verified packages |
+| Debian, Ubuntu | Native APT | Search, install, update, remove, history, environment capture | No AUR; audit and policy coverage differs from Arch |
+| Fedora | DNF / RPM | RPM database reads and DNF-backed operations | Experimental; Fedora evidence does not establish RHEL compatibility, and environment capture refuses explicitly |
+| Apple silicon macOS | Homebrew | Homebrew-backed package operations | No AUR, no Linux advisory matching; published as ARM64 only |
+| Windows | via WSL | Whatever the guest Linux distribution supports | No native backend; WSL is not a QEMU-tested guest |
+
+Building a specific backend from a reviewed checkout (one backend per build):
+
+```bash
+cargo build --release --locked --no-default-features --features arch,pgp,license
+cargo build --release --locked --no-default-features --features debian,pgp,license
+cargo build --release --locked --no-default-features --features fedora,pgp,license
+cargo build --release --locked --no-default-features --features macos,pgp,license
+```
+
+An available backend does not imply identical command, audit, or runtime coverage. Runtime
+managers have their own host limits, so a package backend working on a system does not
+promise that every runtime installs there.
 
 ## Security built into installation
 
@@ -170,6 +239,22 @@ flowchart LR
 Every published archive is built by the release workflow from the tagged commit and carries an attestation bound to that tag and workflow. Before publication, the exact commit must pass CI, benchmarks, security audit, secret scanning, CodeQL, coverage, Docker end-to-end tests, and staged QEMU runs. After publication, published-archive QEMU re-verifies provenance and runs the binaries users download — including daemon startup, IPC, singleton protection, shutdown, and restart in all four Linux guests. [v0.1.223 passed all four](https://github.com/omg-cli/omg/actions/runs/35096706309). Details: [CI security controls](docs/ci-security-controls.md) and [QEMU usage and evidence](docs/qemu-local.md).
 
 A green run is evidence for what it tested, not proof of every command path on every system.
+
+### What each gate proves
+
+| Gate | Proves | Does not prove |
+| :--- | :--- | :--- |
+| CI build, test, lint, coverage | The commit compiles and its test inventory passes on the runner | Behaviour on a distribution the runner is not | 
+| Benchmarks | No regression beyond the recorded tolerance for the measured operations | Speed on your hardware, your cache state, or your repository set |
+| Security audit, secret scan, CodeQL | The checked classes of defect were not found by these tools | Absence of every defect class |
+| Staged QEMU (Arch, Debian, Ubuntu, Fedora) | The reviewed CLI inventory and daemon lifecycle work in clean guests | Your configured machine, your repositories, your AUR recipes |
+| Signed and attested archives | The bytes came from this workflow at this tag | That installing a package afterwards is safe |
+| Published-archive smoke | The artifact users download runs and reports its provenance | Long-running stability or every command combination |
+
+Evidence for a run is retained with the run, and a failure on a trusted push, manual, or
+scheduled run can open an issue with the case, exit status, commit, job, and evidence link.
+A published release can be withdrawn with `scripts/r2-rollback.sh` if a problem is found
+after it ships. See [release operations](docs/release-operations.md) for the full sequence.
 
 ## Recent changes
 

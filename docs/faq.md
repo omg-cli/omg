@@ -78,6 +78,12 @@ The hook adds a few lines to your shell's start-up file. After that, when you en
 project folder, OMG puts the version that the project asks for at the front of your
 `PATH`.
 
+Technically, the generated hook saves the original `PATH`, restores it when you leave the
+folder, and calls `command omg hook-env` on each prompt so that a shell function named
+`omg` cannot shadow the real binary. Zsh caches the prompt counters for 60 seconds; Bash
+re-reads the snapshot file on each prompt; Fish registers on `PWD` and `fish_prompt` and
+does not define the counter helpers at all.
+
 It switches between versions you already installed; it does not install a missing version
 by itself. Use the hook from only one runtime manager to avoid conflicts. See
 [shell integration](./shell-integration.md).
@@ -85,11 +91,16 @@ by itself. Use the hook from only one runtime manager to avoid conflicts. See
 ## Does `omg.lock` reproduce an environment?
 
 No. It records what was there. The file lists runtime versions, the packages you installed
-yourself, and a fingerprint of the machine.
+yourself, and a SHA-256 fingerprint over the normalized lists, plus a schema version and a
+timestamp.
 
-`omg env check` reports the differences between the record and this machine. `omg env sync`
-downloads someone else's record and reports differences there too. Neither installs
-software, and neither rebuilds a machine.
+`omg env check` recomputes that fingerprint and reports the differences between the record
+and this machine. `omg env sync` downloads someone else's record and reports differences
+there too; it backs up a differing local file rather than overwriting it silently. Neither
+installs software, and neither rebuilds a machine.
+
+Capture requires a build with the Arch or Debian backend — a Fedora build refuses instead
+of writing a partial record, so a passing check on an unsupported backend is not possible.
 
 Review a lockfile before you share it: it can reveal what is on your computer. A secret
 GitHub Gist is unlisted, not encrypted.

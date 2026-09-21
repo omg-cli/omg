@@ -136,6 +136,38 @@ omg install --dry-run ripgrep
 
 To try a real installation, use a machine you can reinstall, and read [Package management](./packages.md) first. That page explains how removal works on each system and when AUR builds need your review.
 
+## What OMG actually resolved
+
+The steps above are short on purpose. Here is what each one did on your behalf, which is
+what you need when the result is not what you expected.
+
+```bash
+omg which node    # prints the concrete version directory that will be used, not a symlink name
+```
+
+- **Runtime selection.** `omg use node 22` resolves a version request against the versions
+  already installed; if the version is missing it downloads the official release, verifies
+  it, extracts it under `versions/node/<version>` in your data directory, and updates the
+  `current` link. `omg which node` then reports the resolved directory. When a project pin
+  exists (`.node-version`, `.nvmrc`, `package.json`, `.tool-versions`), the shell hook
+  prepends that concrete version directory to `PATH` when you enter the folder, which is why
+  the pin wins over whatever you selected globally.
+- **Task execution.** `omg run build` inspects the files in the current directory, decides
+  which ecosystem owns the task name, and executes that ecosystem's runner. When several
+  projects could own a name, the weighted priority decides (Rust 100, Node/Bun/Deno 90,
+  Python 80, Go 75, Ruby 70, Java 60, PHP 50, mise 45, Make 40); `--using <ecosystem>`
+  overrides it and `--all` runs every detected project. Arguments after `--` are passed to
+  the underlying tool untouched.
+- **Environment record.** `omg env capture` probes the registered runtimes and tools,
+  collects the explicitly installed packages from your backend, normalizes both lists, and
+  stores them with a schema version, a timestamp, and a SHA-256 fingerprint in `omg.lock`.
+  `omg env check` recomputes the fingerprint and reports the differences, exiting non-zero
+  when the machine no longer matches the record.
+
+For the mechanisms behind these steps, see [Under the hood](./under-the-hood.md): socket
+framing, cache freshness, backend query paths, the AUR gates, and what the audit chain does
+and does not prove.
+
 ## If something goes wrong
 
 | What you see | What it means | What to do |
