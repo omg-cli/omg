@@ -116,6 +116,13 @@ check_product_output() {
   if [[ "$code" != 0 ]] && ! grep -q '[^[:space:]]' "$stderr"; then
     printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
   fi
+  if [[ "$assertion" == audit-source-failure ]]; then
+    if [[ "$code" != 1 ]] \
+      || ! grep -Eq '^Error: (Failed to scan package .+ for vulnerabilities: Failed to query the OSV vulnerability database|Failed to query native security advisories)' "$stderr" \
+      || grep -Eq 'No vulnerabilities found|Security audit completed' "$stdout"; then
+      printf 'assertion failed: offline audit did not explicitly refuse an unavailable advisory source\n' >&2; return 1
+    fi
+  fi
   if [[ "$code" == 0 ]]; then
     case "$assertion" in
       hooks-installed|hooks-absent)
@@ -320,7 +327,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json) ;; *) exit 2 ;; esac
+  case "$a" in -|audit-source-failure|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
   row_exit["$id"]="$resolved"; row_targets["$id"]="$tg"; row_assertions["$id"]="$a"

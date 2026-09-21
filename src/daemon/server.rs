@@ -902,6 +902,8 @@ mod tests {
             id: "CVE-fixture".into(),
             summary: "x".repeat(16_000),
             score: Some("9.8".into()),
+            advisory_severity: None,
+            native_advisory: None,
         };
         let response = Response::Success {
             id: 91,
@@ -985,6 +987,8 @@ mod tests {
                         id: "CVE-fixture".into(),
                         summary: "fixture".into(),
                         score: Some("9.8".into()),
+                        advisory_severity: None,
+                        native_advisory: None,
                     }],
                 )],
             }),

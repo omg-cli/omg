@@ -214,3 +214,23 @@ output, with corrupt-inventory refusal retained in security_daemon_optional.
 The inventory digest is updated in the QEMU allowlist while retaining historical
 entries. Local inventory, paywall, QEMU/release harness and lint checks pass;
 the failed hosted runs remain recorded and need fresh revision validation.
+# Native Fedora advisory follow-through (work in progress)
+
+The real daemon-disabled Fedora CLI exposed a freshness defect: a fresh user's
+DNF cache could clone root's metadata and return 60 findings even in a network
+namespace with no connectivity, despite `--refresh`. The advisory path now uses
+the effective user's dedicated OMG cache for both DNF cache locations and
+explicitly disables silent repository omission. Repeating the native probe
+returned exit 1 with the advisory-source error offline and exit 0 with 60
+package/advisory findings (25 high severity) online. RPM inventory was unchanged
+and temporary user state was removed. These observations are local WSL evidence,
+not current-revision hosted coverage or a claim that all Fedora vulnerabilities
+are represented by its published advisories.
+
+DNF source: https://dnf5.readthedocs.io/en/latest/misc/caching.7.html
+
+The four QEMU audit inventory rows assert offline source refusal, while the
+isolated Rust fixture asserts successful scanning of its empty mock inventory.
+Neither is admitted as populated native scan coverage. Deterministic native
+repository fixtures, daemon parity, exports, and remaining scan surfaces still
+require verification before the beta feature is considered complete.

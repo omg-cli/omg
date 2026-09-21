@@ -270,6 +270,18 @@ esac
         self.assertNotEqual(self.run_oracle(code=1, stderr=' \n\t').returncode, 0)
         self.assertEqual(self.run_oracle(code=1, stderr='unknown runtime\n').returncode, 0)
 
+    def test_offline_audit_requires_source_failure_without_false_clean_output(self):
+        diagnostics = [
+            'Error: Failed to scan package pkg for vulnerabilities: Failed to query the OSV vulnerability database\n',
+            'Error: Failed to query native security advisories\n',
+        ]
+        for diagnostic in diagnostics:
+            self.assertEqual(self.run_oracle(assertion='audit-source-failure', code=1, stderr=diagnostic).returncode, 0)
+            self.assertNotEqual(self.run_oracle(assertion='audit-source-failure', code=0, stderr=diagnostic).returncode, 0)
+            self.assertNotEqual(self.run_oracle(assertion='audit-source-failure', code=1, stderr=diagnostic, stdout='No vulnerabilities found!').returncode, 0)
+        for diagnostic in ['unknown runtime', 'Daemon not running', 'Error: OSV has no configured ecosystem for the running package backend']:
+            self.assertNotEqual(self.run_oracle(assertion='audit-source-failure', code=1, stderr=diagnostic).returncode, 0)
+
     def test_panic_cannot_hide_behind_success_or_expected_failure(self):
         for code in (0, 1):
             for output in ('stdout', 'stderr'):
