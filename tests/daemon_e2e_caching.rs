@@ -247,7 +247,9 @@ async fn test_missing_package_returns_error_consistently() -> Result<()> {
                 );
                 assert_eq!(message, format!("Package not found: {nonexistent_package}"));
             }
-            other => panic!("missing package info returned {other:?}"),
+            other @ Response::Success { .. } => {
+                panic!("missing package info returned {other:?}")
+            }
         }
     }
 
