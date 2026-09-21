@@ -42,6 +42,23 @@ pub struct NativeAdvisory {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledIdentity {
+    pub name: String,
+    pub version: String,
+    pub architecture: Option<String>,
+}
+
+impl From<&crate::package_managers::types::SecurityPackage> for InstalledIdentity {
+    fn from(package: &crate::package_managers::types::SecurityPackage) -> Self {
+        Self {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            architecture: package.architecture.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vulnerability {
     pub id: String,
     pub summary: String,
@@ -50,6 +67,8 @@ pub struct Vulnerability {
     pub advisory_severity: Option<AdvisorySeverity>,
     #[serde(default)]
     pub native_advisory: Option<NativeAdvisory>,
+    #[serde(default)]
+    pub affected_installed: Vec<InstalledIdentity>,
 }
 
 impl Vulnerability {
@@ -98,7 +117,7 @@ pub async fn scan_installed(
         return Ok(result);
     }
     let installed = manager
-        .list_installed()
+        .security_inventory()
         .await
         .map_err(|error| anyhow::anyhow!("Failed to list packages: {error}"))?;
     let mut result = SecurityAuditResult {
@@ -108,11 +127,19 @@ pub async fn scan_installed(
     };
     let mut pending = stream::iter(installed)
         .map(|package| async move {
-            let findings = scanner.scan_package(&package.name, &package.version).await;
-            (package.name, findings)
+            let findings = async {
+                let version = crate::package_managers::types::parse_version(&package.version)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Unsupported installed version: {}", package.version)
+                    })?;
+                Ok::<_, anyhow::Error>(scanner.scan_package(&package.name, &version).await?)
+            }
+            .await;
+            (package, findings)
         })
         .buffer_unordered(32);
-    while let Some((name, findings)) = pending.next().await {
+    while let Some((package, findings)) = pending.next().await {
+        let name = package.name.clone();
         let findings = findings.map_err(|error| {
             anyhow::anyhow!("Failed to scan package {name} for vulnerabilities: {error}")
         })?;
@@ -136,6 +163,7 @@ pub async fn scan_installed(
                     score: finding.score,
                     advisory_severity: None,
                     native_advisory: None,
+                    affected_installed: vec![InstalledIdentity::from(&package)],
                 }
             })
             .collect();
@@ -181,6 +209,7 @@ mod tests {
                 score: None,
                 advisory_severity: Some(severity),
                 native_advisory: None,
+                affected_installed: Vec::new(),
             };
             for (minimum, expected) in [
                 MinimumSeverity::Low,
@@ -206,6 +235,7 @@ mod tests {
             score: None,
             advisory_severity: None,
             native_advisory: None,
+            affected_installed: Vec::new(),
         };
         assert!(!finding.meets_minimum(MinimumSeverity::Low));
         for (score, high, critical) in [

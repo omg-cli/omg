@@ -1354,8 +1354,16 @@ impl PackageManager for DnfPackageManager {
             async {
                 let installed = self.security_inventory().await?;
                 let rows = Self::native_advisories().await?;
+                let mut affected = std::collections::BTreeMap::new();
                 for (row, _) in &rows {
-                    Self::affected_installed_packages(row, &installed).await?;
+                    let packages = Self::affected_installed_packages(row, &installed).await?;
+                    affected.insert(
+                        row.nevra.clone(),
+                        packages
+                            .iter()
+                            .map(crate::core::security::scan::InstalledIdentity::from)
+                            .collect::<Vec<_>>(),
+                    );
                 }
                 let mut after = self.security_inventory().await?;
                 let mut before = installed;
@@ -1372,7 +1380,20 @@ impl PackageManager for DnfPackageManager {
                     before == after,
                     "Installed packages changed during native security audit"
                 );
-                super::dnf_advisory::audit_result(rows)
+                let mut result = super::dnf_advisory::audit_result(rows)?;
+                for (_, findings) in &mut result.vulnerabilities {
+                    for finding in findings {
+                        let native = finding
+                            .native_advisory
+                            .as_ref()
+                            .context("Native advisory evidence missing")?;
+                        finding.affected_installed = affected
+                            .get(&native.advisory_nevra)
+                            .context("Installed advisory identity missing")?
+                            .clone();
+                    }
+                }
+                Ok(result)
             }
             .await
             .context("Failed to query native security advisories")

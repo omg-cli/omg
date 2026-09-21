@@ -124,6 +124,7 @@ pub(super) fn audit_result(
             _ => AdvisorySeverity::Unspecified,
         };
         let finding = Vulnerability {
+            affected_installed: Vec::new(),
             id: row.name,
             summary: detail.title,
             score: None,
