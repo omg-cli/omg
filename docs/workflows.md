@@ -6,7 +6,7 @@ description: Small, reviewable package and project workflows
 
 # Workflows
 
-Examples assume a backend-compatible installation completed using the [verified installation procedure](./installation.md). They are not scripts to execute unattended on an existing machine. OMG is approaching beta; keep native recovery tools and backups while validating package changes.
+Examples assume a backend-compatible installation completed using the [verified installation procedure](./installation.md). They are not scripts to execute unattended on an existing machine. Keep native recovery tools and backups while validating package changes.
 
 The common path is deliberately staged: inspect first, preview changes, then approve the mutation.
 

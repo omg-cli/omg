@@ -1,6 +1,6 @@
 # Install OMG
 
-OMG is approaching beta. Use a recoverable development machine or disposable VM for package mutations, and keep your native package manager available while validating your workflows.
+Use a recoverable development machine or disposable VM for package mutations, and keep your native package manager available while validating your workflows.
 
 ## Choose a supported release target
 
