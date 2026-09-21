@@ -5,7 +5,7 @@ on:
     branches: [main]
     # Every main commit needs exact-commit evidence for the release gate.
   schedule:
-    - cron: "0 0 * * 0"
+    - cron: "17 1 * * 0"
   workflow_dispatch:
 
 concurrency:
@@ -82,24 +82,13 @@ jobs:
             echo "::warning::sccache unavailable, building without cache"
           fi
 
-      - name: Cache cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: bench-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: bench-registry-
-
-      - name: Cache target directory
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target
-          key: bench-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            bench-target-${{ hashFiles('**/Cargo.lock') }}-
-            bench-target-
+          prefix-key: v2-benchmark-dependencies
+          shared-key: arch-b0deabeb3d283da2c
+          cache-bin: false
+          cache-workspace-crates: false
 
       - name: Build Release
         run: cargo build --release --features arch --locked

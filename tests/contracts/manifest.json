@@ -1,0 +1,801 @@
+{
+  "schema_version": 1,
+  "status": "Parser mappings with native execution adapters; behavioral import remains incomplete",
+  "inventory_source": "Verified compiled artifacts from CI run 35500460442, checkout d2554cd7f1b22e3c706660c390867b9203c6c7aa",
+  "contracts": [
+    {
+      "id": "omg.search.command.parser",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "parser"
+      ],
+      "critical": true,
+      "assertions": {
+        "parser": [
+          "canonical-and-s-alias"
+        ]
+      },
+      "tests": [
+        {
+          "lane": "native-parser",
+          "id": "omg::cli_surface::omg_search_aliases_options_and_boundary_values_round_trip",
+          "evidence": [
+            "parser"
+          ],
+          "assertions": [
+            "canonical-and-s-alias"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.query.parser",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search <query>",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "parser"
+      ],
+      "critical": true,
+      "assertions": {
+        "parser": [
+          "option-shaped-literal"
+        ]
+      },
+      "tests": [
+        {
+          "lane": "native-parser",
+          "id": "omg::cli_surface::omg_search_aliases_options_and_boundary_values_round_trip",
+          "evidence": [
+            "parser"
+          ],
+          "assertions": [
+            "option-shaped-literal"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.limit.parser",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search --limit",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "parser"
+      ],
+      "critical": true,
+      "assertions": {
+        "parser": [
+          "short-and-long-limit",
+          "zero-one-max",
+          "invalid-and-overflow",
+          "duplicate-option-conflict"
+        ]
+      },
+      "tests": [
+        {
+          "lane": "native-parser",
+          "id": "omg::cli_surface::omg_search_aliases_options_and_boundary_values_round_trip",
+          "evidence": [
+            "parser"
+          ],
+          "assertions": [
+            "short-and-long-limit",
+            "zero-one-max",
+            "invalid-and-overflow",
+            "duplicate-option-conflict"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.verbose.parser",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search --verbose",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "parser"
+      ],
+      "critical": true,
+      "assertions": {
+        "parser": [
+          "inherited-count-two"
+        ]
+      },
+      "tests": [
+        {
+          "lane": "native-parser",
+          "id": "omg::cli_surface::omg_search_aliases_options_and_boundary_values_round_trip",
+          "evidence": [
+            "parser"
+          ],
+          "assertions": [
+            "inherited-count-two"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.json.parser",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search --json",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "parser"
+      ],
+      "critical": true,
+      "assertions": {
+        "parser": [
+          "inherited-json-true"
+        ]
+      },
+      "tests": [
+        {
+          "lane": "native-parser",
+          "id": "omg::cli_surface::omg_search_aliases_options_and_boundary_values_round_trip",
+          "evidence": [
+            "parser"
+          ],
+          "assertions": [
+            "inherited-json-true"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.run.forwarding.parser",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg run <args>",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "parser"
+      ],
+      "critical": true,
+      "assertions": {
+        "parser": [
+          "literal-forwarded-argv",
+          "watch-remains-false"
+        ]
+      },
+      "tests": [
+        {
+          "lane": "native-parser",
+          "id": "omg::cli_surface::omg_conflicts_and_forwarding_do_not_change_argument_meaning",
+          "evidence": [
+            "parser"
+          ],
+          "assertions": [
+            "literal-forwarded-argv",
+            "watch-remains-false"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.update.aur-only.parser",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg update --aur-only",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "parser"
+      ],
+      "critical": true,
+      "assertions": {
+        "parser": [
+          "fast-conflict",
+          "turbo-conflict"
+        ]
+      },
+      "tests": [
+        {
+          "lane": "native-parser",
+          "id": "omg::cli_surface::omg_conflicts_and_forwarding_do_not_change_argument_meaning",
+          "evidence": [
+            "parser"
+          ],
+          "assertions": [
+            "fast-conflict",
+            "turbo-conflict"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.socket.parser",
+      "source": "src/bin/omgd.rs",
+      "binary": "omgd",
+      "surface": "omgd --socket",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "parser"
+      ],
+      "critical": true,
+      "assertions": {
+        "parser": [
+          "short-and-long-socket",
+          "literal-space-path",
+          "missing-value",
+          "duplicate-option-conflict"
+        ]
+      },
+      "tests": [
+        {
+          "lane": "native-parser",
+          "id": "omg::bin/omgd::tests::socket_parser_preserves_literal_paths_and_rejects_conflicting_repeats",
+          "evidence": [
+            "parser"
+          ],
+          "assertions": [
+            "short-and-long-socket",
+            "literal-space-path",
+            "missing-value",
+            "duplicate-option-conflict"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.root.parser",
+      "source": "src/bin/omgd.rs",
+      "binary": "omgd",
+      "surface": "omgd",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "parser"
+      ],
+      "critical": true,
+      "assertions": {
+        "parser": [
+          "default-is-unspecified",
+          "removed-foreground-is-unknown"
+        ]
+      },
+      "tests": [
+        {
+          "lane": "native-parser",
+          "id": "omg::bin/omgd::tests::socket_parser_preserves_literal_paths_and_rejects_conflicting_repeats",
+          "evidence": [
+            "parser"
+          ],
+          "assertions": [
+            "default-is-unspecified",
+            "removed-foreground-is-unknown"
+          ]
+        }
+      ]
+    }
+  ],
+  "interfaces": [
+    {
+      "id": "ipc:Search",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:Info",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:Status",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:Explicit",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:ExplicitCount",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:SecurityAudit",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:Ping",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:CacheStats",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:CacheClear",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:RefreshIndex",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:Metrics",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:Suggest",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:DebianSearch",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:Health",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "ipc:ListUpdates",
+      "binary": "omgd",
+      "source": "src/daemon/protocol.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "lifecycle:omgd.start-stop",
+      "binary": "omgd",
+      "source": "src/bin/omgd.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "transport:omgd.frames",
+      "binary": "omgd",
+      "source": "src/daemon/server.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "transport:omgd.connection-cap",
+      "binary": "omgd",
+      "source": "src/daemon/server.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    },
+    {
+      "id": "cache:omgd.refresh",
+      "binary": "omgd",
+      "source": "src/daemon/handlers.rs",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ]
+    }
+  ],
+  "surface_digests": [
+    {
+      "binary": "omg",
+      "platform": "arch",
+      "features": [
+        "arch",
+        "license",
+        "pgp"
+      ],
+      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+    },
+    {
+      "binary": "omgd",
+      "platform": "arch",
+      "features": [
+        "arch",
+        "license",
+        "pgp"
+      ],
+      "sha256": "51707463b754389250aa22367ffcc0c2d460a52e0a270ea1017e86812ccfdd5d"
+    },
+    {
+      "binary": "omg",
+      "platform": "debian",
+      "features": [
+        "debian",
+        "license",
+        "pgp"
+      ],
+      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+    },
+    {
+      "binary": "omgd",
+      "platform": "debian",
+      "features": [
+        "debian",
+        "license",
+        "pgp"
+      ],
+      "sha256": "51707463b754389250aa22367ffcc0c2d460a52e0a270ea1017e86812ccfdd5d"
+    },
+    {
+      "binary": "omg",
+      "platform": "debian-trixie",
+      "features": [
+        "debian",
+        "license",
+        "pgp"
+      ],
+      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+    },
+    {
+      "binary": "omgd",
+      "platform": "debian-trixie",
+      "features": [
+        "debian",
+        "license",
+        "pgp"
+      ],
+      "sha256": "51707463b754389250aa22367ffcc0c2d460a52e0a270ea1017e86812ccfdd5d"
+    },
+    {
+      "binary": "omg",
+      "platform": "fedora",
+      "features": [
+        "fedora",
+        "license",
+        "pgp"
+      ],
+      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+    },
+    {
+      "binary": "omgd",
+      "platform": "fedora",
+      "features": [
+        "fedora",
+        "license",
+        "pgp"
+      ],
+      "sha256": "51707463b754389250aa22367ffcc0c2d460a52e0a270ea1017e86812ccfdd5d"
+    },
+    {
+      "binary": "omg",
+      "platform": "macos",
+      "features": [
+        "license",
+        "macos",
+        "pgp"
+      ],
+      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+    },
+    {
+      "binary": "omgd",
+      "platform": "macos",
+      "features": [
+        "license",
+        "macos",
+        "pgp"
+      ],
+      "sha256": "51707463b754389250aa22367ffcc0c2d460a52e0a270ea1017e86812ccfdd5d"
+    },
+    {
+      "binary": "omg",
+      "platform": "debian-pure",
+      "features": [
+        "debian-pure"
+      ],
+      "sha256": "516502ec6e7224b2d33cb90e00f23401c9de2fe8bdd68136225781596771e5be"
+    },
+    {
+      "binary": "omgd",
+      "platform": "debian-pure",
+      "features": [
+        "debian-pure"
+      ],
+      "sha256": "51707463b754389250aa22367ffcc0c2d460a52e0a270ea1017e86812ccfdd5d"
+    },
+    {
+      "binary": "omg",
+      "platform": "portable",
+      "features": [
+        "license",
+        "pgp"
+      ],
+      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+    },
+    {
+      "binary": "omgd",
+      "platform": "portable",
+      "features": [
+        "license",
+        "pgp"
+      ],
+      "sha256": "51707463b754389250aa22367ffcc0c2d460a52e0a270ea1017e86812ccfdd5d"
+    },
+    {
+      "binary": "omg",
+      "platform": "ubuntu",
+      "features": [
+        "debian",
+        "license",
+        "pgp"
+      ],
+      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+    },
+    {
+      "binary": "omgd",
+      "platform": "ubuntu",
+      "features": [
+        "debian",
+        "license",
+        "pgp"
+      ],
+      "sha256": "51707463b754389250aa22367ffcc0c2d460a52e0a270ea1017e86812ccfdd5d"
+    }
+  ]
+}

@@ -33,36 +33,28 @@ use tempfile::TempDir;
 // TEST UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "arch")]
-const fn known_system_package() -> &'static str {
-    "pacman"
+// Arch and Debian info use feature-gated fast paths. A portable build must
+// exercise the generic adapter with a non-Arch mock, not name a pacman backend
+// whose compiled lookup path is absent. Keep the fixture package and distro
+// together so they cannot accidentally refer to different mock databases.
+const fn backend_fixture() -> (&'static str, &'static str) {
+    if cfg!(feature = "arch") {
+        ("arch", "pacman")
+    } else if cfg!(any(feature = "debian", feature = "debian-pure")) {
+        ("debian", "apt")
+    } else if cfg!(feature = "macos") {
+        ("macos", "homebrew")
+    } else {
+        ("fedora", "dnf")
+    }
 }
 
-#[cfg(all(
-    not(feature = "arch"),
-    any(feature = "debian", feature = "debian-pure")
-))]
 const fn known_system_package() -> &'static str {
-    "apt"
-}
-
-#[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
-const fn known_system_package() -> &'static str {
-    "test-package"
+    backend_fixture().1
 }
 
 fn run_for_compiled_backend(args: &[&str]) -> CommandResult {
-    #[cfg(all(
-        not(feature = "arch"),
-        any(feature = "debian", feature = "debian-pure")
-    ))]
-    return run_omg_with_env(args, &[("OMG_TEST_DISTRO", "debian")]);
-
-    #[cfg(any(
-        feature = "arch",
-        not(any(feature = "debian", feature = "debian-pure"))
-    ))]
-    run_omg(args)
+    run_omg_with_env(args, &[("OMG_TEST_DISTRO", backend_fixture().0)])
 }
 
 /// Create a temporary project directory with common config files
@@ -597,6 +589,29 @@ mod environment_management {
     use super::*;
 
     #[test]
+    #[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
+    fn capture_without_backend_refuses_without_writing_or_replacing_lock() {
+        let project = TempDir::new().unwrap();
+        let lock = project.path().join("omg.lock");
+        for existing in [false, true] {
+            if existing {
+                fs::write(&lock, b"existing lock must survive").unwrap();
+            }
+            let result = run_omg_in_dir(&["env", "capture"], project.path());
+            result.assert_failure();
+            assert!(result.stderr.contains(
+                "Environment fingerprinting is not available without an Arch or Debian package backend"
+            ), "unexpected refusal: {}", result.combined_output());
+            if existing {
+                assert_eq!(fs::read(&lock).unwrap(), b"existing lock must survive");
+            } else {
+                assert!(!lock.exists(), "unsupported capture must not create a lock");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn test_env_capture() {
         let temp_dir = TempDir::new().unwrap();
         let result = run_omg_in_dir(&["env", "capture"], temp_dir.path());
@@ -616,6 +631,7 @@ mod environment_management {
     // Falsifiable contract: the lockfile schema is rendered on every capture
     // (observed: `schema_version`, content `hash`, and a `[runtimes]` table).
     #[test]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn test_env_capture_deterministic() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -638,6 +654,7 @@ mod environment_management {
     }
 
     #[test]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn test_env_check_no_drift() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -671,6 +688,7 @@ mod environment_management {
     // failure must name the gist upload it could not complete. (Note: an empty
     // GITHUB_TOKEN still reaches the GitHub API and fails there with 401.)
     #[test]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn test_env_share_without_token() {
         let temp_dir = TempDir::new().unwrap();
         run_omg_in_dir(&["env", "capture"], temp_dir.path()).assert_success();
@@ -1132,6 +1150,7 @@ mod integration_scenarios {
     use super::*;
 
     #[test]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn scenario_new_developer_onboarding() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -1230,6 +1249,7 @@ mod integration_scenarios {
     }
 
     #[test]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn scenario_team_environment_sync() {
         let dev1_dir = TempDir::new().unwrap();
         let dev2_dir = TempDir::new().unwrap();

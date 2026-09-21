@@ -4,6 +4,8 @@
 //! to verify real system integration without modifying the host.
 //!
 //! Run with: `OMG_RUN_DOCKER_TESTS=1 cargo test --locked --no-default-features --features pgp,license --test docker_e2e -- --ignored --test-threads=1`
+//! CI compiles this std-only driver directly with `rustc --edition=2024 --test`
+//! and supplies the immutable ID of the image built from the checkout.
 
 use std::process::Command;
 use std::sync::OnceLock;
@@ -42,12 +44,46 @@ fn build_docker_image() -> bool {
 
 /// Lazily build the Docker image exactly once, regardless of test ordering.
 /// Tests run alphabetically, so we can't rely on `test_docker_setup` running first.
-static DOCKER_IMAGE_READY: OnceLock<bool> = OnceLock::new();
+static DOCKER_IMAGE_READY: OnceLock<String> = OnceLock::new();
 
 fn ensure_docker_image() -> bool {
-    *DOCKER_IMAGE_READY.get_or_init(|| {
+    docker_image();
+    true
+}
+
+fn docker_image() -> &'static str {
+    DOCKER_IMAGE_READY.get_or_init(|| {
         assert!(docker_available(), "Docker not available");
-        build_docker_image()
+        let image = match std::env::var("OMG_DOCKER_IMAGE") {
+            Ok(image) => {
+                assert!(
+                    image.strip_prefix("sha256:").is_some_and(|digest| {
+                        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }),
+                    "OMG_DOCKER_IMAGE must be an immutable sha256 image ID"
+                );
+                image
+            }
+            Err(std::env::VarError::NotPresent) => {
+                assert!(build_docker_image(), "Failed to build Docker image");
+                "omg-arch-e2e".to_owned()
+            }
+            Err(error) => panic!("Invalid OMG_DOCKER_IMAGE: {error}"),
+        };
+        let output = Command::new("docker")
+            .args(["image", "inspect", "--format", "{{.Id}}", &image])
+            .output()
+            .expect("Failed to inspect Docker image");
+        assert!(output.status.success(), "Docker image must exist locally");
+        let id = String::from_utf8(output.stdout)
+            .expect("Docker image ID must be UTF-8")
+            .trim()
+            .to_owned();
+        assert!(!id.is_empty(), "Docker returned an empty image ID");
+        if image.starts_with("sha256:") {
+            assert_eq!(id, image, "Docker image ID differs from the build output");
+        }
+        id
     })
 }
 
@@ -60,7 +96,7 @@ fn run_in_docker_with_options(options: &[&str], cmd: &[&str]) -> (bool, String, 
     let output = Command::new("docker")
         .args(["run", "--rm"])
         .args(options)
-        .arg("omg-arch-e2e")
+        .arg(docker_image())
         .args(cmd)
         .output()
         .expect("Failed to run Docker command");

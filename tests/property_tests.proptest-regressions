@@ -14,3 +14,4 @@ cc 8e69ebc5f6a1cb1174d5f9d5d883747e0a2cbe938ba2bb301470b6ad8b871355 # shrinks to
 cc 5109fd2ebf08e0cebf821a171e7f8d49a8600cc8150da47196c00c0a8d60d10f # shrinks to alias = "lts"
 cc 11c70820de2a0715c468b6110dc5b657d497b7ea48dfa20297b8024fc139d792 # shrinks to parts = ["ijnnpuwftp", "owyd", "ydlzrlzwnv"]
 cc 01ea7af105ea72fe15b28aca818d848a3c56d6aa8965f5b88c8b53d2100dd8d1 # shrinks to s = "a"
+cc 28ab59edf9d4a58d86b8f050d9ea8cb51377baa88dc9946297420ad8882d09c1 # shrinks to query = "-V" (coverage run35497343455)

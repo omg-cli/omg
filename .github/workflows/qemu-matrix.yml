@@ -3,8 +3,8 @@
 # Boots disposable KVM guests per distro and runs the package-lifecycle
 # guest check via scripts/benchmark-qemu.sh.
 # - schedule/dispatch default: published release guests, x86_64 (no build).
-# - pull_request/main push: x86_64 per-distro builds packaged like the release
-#   recipe and tested via --staged-dir. ARM is excluded because its configurable
+# - pull_request/main push: verified native CI release pairs are reused per distro
+#   and tested via --staged-dir. ARM is excluded because its configurable
 #   runner must never execute untrusted pull-request code.
 # - aarch64 legs are staged workflow-dispatch only; guest runners use OMG_QEMU_ARM_RUNNER
 #   (default ubuntu-24.04-arm) and must pass a native ARM/KVM probe. The release
@@ -35,6 +35,8 @@ on:
       - "benchmark-hyperfine.sh"
       - "scripts/record-benchmark-run.py"
       - "scripts/benchmark-qemu.sh"
+      - "scripts/pull-qemu-controller.sh"
+      - "scripts/test_qemu_controller_pull.py"
       - "scripts/prepare-qemu-release.py"
       - "scripts/test_prepare_qemu_release.py"
       - "scripts/test_qemu_process_isolation.py"
@@ -65,6 +67,9 @@ on:
       - "scripts/report-smoke-sentry.sh"
       - ".github/workflows/qemu-matrix.yml"
       - ".github/workflows/qemu-lane.yml"
+      - ".github/workflows/ci.yml"
+      - "scripts/native-build-artifact.py"
+      - "scripts/test_native_build_artifact.py"
       - "scripts/qemu-daemon-check.sh"
       - "scripts/test_qemu_daemon_contract.py"
       - "scripts/qemu-image-cache.py"
@@ -115,7 +120,10 @@ jobs:
   prepare:
     name: "Resolve test selection and provenance"
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     outputs:
       staged: ${{ steps.selection.outputs.staged }}
       x64: ${{ steps.selection.outputs.x64 }}
@@ -234,8 +242,26 @@ jobs:
           printf 'Harness/build revision: `%s`\n\nArtifact source: staged=%s, tag=%s\n\nSelected: distro=%s, x64=%s, arm64=%s\n' \
             "$GITHUB_SHA" "$STAGED" "$tag" "$REQUESTED_DISTRO" "$x64" "$arm64" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Wait once for native release artifacts
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_LANES: ${{ steps.selection.outputs.lanes }}
+        run: |
+          python3 scripts/native-build-artifact.py ready --lanes "$NATIVE_LANES" \
+            2>&1 | tee "$RUNNER_TEMP/native-readiness.log"
+
+      - name: Preserve native readiness diagnostics
+        if: always() && (github.event_name == 'push' || github.event_name == 'pull_request')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-build-readiness
+          path: ${{ runner.temp }}/native-readiness.log
+          retention-days: 7
+          if-no-files-found: warn
+
   #########################################################################
-  # Each x64 distro advances to its guest without waiting for sibling builds.
+  # Automatic guests share one readiness wait; manual builds remain independent.
   #########################################################################
   guest:
     name: "Distro lane (${{ matrix.distro }})"
@@ -246,7 +272,11 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.prepare.outputs.lanes) }}
     uses: ./.github/workflows/qemu-lane.yml
+    permissions:
+      contents: read
+      actions: read
     with:
+      reuse-ci: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
       distro: ${{ matrix.distro }}
       staged: ${{ needs.prepare.outputs.staged == 'true' }}
       tag: ${{ needs.prepare.outputs.tag }}
@@ -354,6 +384,7 @@ jobs:
         with:
           name: staged-arm-${{ matrix.distro }}
           path: omg-v*.tar.gz*
+          compression-level: 0
           retention-days: 7
           if-no-files-found: error
 
@@ -422,6 +453,7 @@ jobs:
         with:
           name: staged-arm-ubuntu
           path: omg-v*.tar.gz*
+          compression-level: 0
           retention-days: 7
           if-no-files-found: error
 

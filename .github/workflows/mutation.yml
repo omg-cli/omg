@@ -2,9 +2,28 @@ name: Mutation Testing
 
 on:
   schedule:
-    # Run weekly on Sundays at 00:00 UTC
-    - cron: "0 0 * * 0"
+    # Separate the expensive weekly run from audit and benchmark schedules.
+    - cron: "43 3 * * 0"
+  pull_request:
+    paths:
+      - tests/exhaustive_cli_matrix.rs
+      - tests/integration_suite.rs
+      - tests/property_tests.rs
+      - tests/property_tests.proptest-regressions
+      - tests/metrics_tests.rs
+      - tests/security_tests.rs
+      - src/cli/tea/status_model.rs
+      - tests/coverage_15.rs
+      - tests/coverage_4.rs
+      - tests/coverage_5.rs
+      - tests/common/**
+      - .github/workflows/mutation.yml
   workflow_dispatch:
+    inputs:
+      baseline-only:
+        description: Validate the complete unmutated portable suite only
+        type: boolean
+        default: false
 
 concurrency:
   group: mutation-${{ github.ref }}
@@ -40,14 +59,25 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: "mutation"
+          # Mutants uses scratch build directories, not the root target.
+          cache-targets: ${{ github.event_name == 'pull_request' || inputs.baseline-only == true }}
+          cache-bin: false
+          # Failed baselines still compiled valid dependencies. Preserve that
+          # work while repairs are verified; GitHub isolates PR cache writes.
           cache-on-failure: true
 
+      - name: Validate portable mutation baseline
+        if: github.event_name == 'pull_request' || inputs.baseline-only == true
+        run: cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast
+
       - name: Install cargo-mutants
+        if: github.event_name != 'pull_request' && inputs.baseline-only != true
         uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
         with:
           tool: cargo-mutants@27.1.0
 
       - name: Run mutation testing
+        if: github.event_name != 'pull_request' && inputs.baseline-only != true
         run: |
           set +e
           cargo mutants \
@@ -76,13 +106,14 @@ jobs:
 
       - name: Upload mutation report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
+        if: always() && github.event_name != 'pull_request' && inputs.baseline-only != true
         with:
           name: mutation-report
           path: mutants-report/
           retention-days: 30
 
       - name: Check mutation score
+        if: github.event_name != 'pull_request' && inputs.baseline-only != true
         run: |
           result_dir="mutants-report/mutants.out"
           for report in caught.txt missed.txt timeout.txt; do

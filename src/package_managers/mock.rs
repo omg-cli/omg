@@ -114,7 +114,14 @@ pub fn backend_name_for_distro(distro: &str) -> &'static str {
 
 impl MockPackageManager {
     pub fn new(distro: &str) -> Self {
-        Self::build(distro, None)
+        // Root production paths deliberately ignore caller overrides. Mock
+        // fixtures must never share that production state: the explicit debug
+        // test adapter has its own directory, including in root-run containers.
+        let state_dir = crate::core::paths::test_mode()
+            .then(|| std::env::var_os("OMG_DATA_DIR").filter(|value| !value.is_empty()))
+            .flatten()
+            .map(PathBuf::from);
+        Self::build(distro, state_dir)
     }
 
     /// Create a mock whose persistent state is isolated to `data_dir`.

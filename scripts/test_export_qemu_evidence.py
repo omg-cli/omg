@@ -44,6 +44,7 @@ class AllowlistTests(unittest.TestCase):
         for path in ("provenance.json", "run-fixture/results.json", "run-fixture/guest-check.log",
                      "run-fixture/reporting-status.json",
                      "run-fixture/controller-security.log",
+                     "run-fixture/controller-pull.log",
                      "run-fixture/guest/evidence/rust-toolchain.txt",
                      "run-fixture/guest/serial.log", "run-fixture/guest/evidence/audit-directory-after.txt",
                      "run-fixture/guest/evidence/benchmarks/summary.json",

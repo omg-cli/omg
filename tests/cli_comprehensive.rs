@@ -919,7 +919,6 @@ fn behavior_inventory_runs_in_hermetic_state() {
 
     let project = TestProject::for_distro("arch");
     let (home, path) = prepare_behavior_fixture(&project);
-    let root = project.path().to_string_lossy().into_owned();
     let evidence_dir =
         std::env::var_os("OMG_CLI_BEHAVIOR_EVIDENCE_DIR").map(std::path::PathBuf::from);
     if let Some(dir) = &evidence_dir {
@@ -932,6 +931,15 @@ fn behavior_inventory_runs_in_hermetic_state() {
     let mut failures = Vec::new();
 
     for (number, case) in behavior_cases().into_iter().enumerate() {
+        // Missing-input probes must not inherit files written by earlier rows
+        // such as env-capture. Keep the shared fixture for dependent cases.
+        let empty_environment = matches!(
+            case.id.as_str(),
+            "env-export-missing-lock" | "env-plan-missing-manifest"
+        )
+        .then(|| TestProject::for_distro("arch"));
+        let project = empty_environment.as_ref().unwrap_or(&project);
+        let root = project.path().to_string_lossy().into_owned();
         let expanded_args: Vec<String> = case
             .args
             .iter()

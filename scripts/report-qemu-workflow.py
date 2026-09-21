@@ -59,10 +59,38 @@ def canonical_case_ids(policy):
     return identifiers
 
 
-def archive_rows(content, allowed_cases):
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def diagnostic_excerpt(raw):
+    # Redact before truncating: cutting a token's prefix first could prevent
+    # the issue helper from recognizing the remaining credential bytes.
+    text = raw.decode("utf-8", errors="replace")
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if token := os.environ.get(name):
+            text = text.replace(token, "[redacted-token]")
+    text = re.sub(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+", "[redacted-token]", text)
+    text = re.sub(r"Bearer [A-Za-z0-9._~+/=-]+", "Bearer [redacted]", text, flags=re.IGNORECASE)
+    text = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
+                  "[redacted-private-key]", text, flags=re.DOTALL)
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07", "", text)
+    text = text.replace("\r", "\n").replace("```", "[code fence]")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = "\n".join(text.splitlines()[-12:])
+    return text.encode("utf-8")[-1300:].decode("utf-8", errors="ignore")
+
+
+def archive_rows(content, allowed_cases, diagnostics=None):
     if len(content) > MAX_DOWNLOAD:
         raise ValueError("artifact download exceeds limit")
     rows = []
+    row_sources = []
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
         members = archive.infolist()
         if len(members) > 5000 or sum(member.file_size for member in members) > 256 * 1024 * 1024:
@@ -82,7 +110,7 @@ def archive_rows(content, allowed_cases):
                 continue
             if member.file_size > 1024 * 1024:
                 raise ValueError("result exceeds limit")
-            payload = json.loads(archive.read(member))
+            payload = json.loads(archive.read(member), object_pairs_hook=unique_object)
             if not isinstance(payload, list) or len(payload) > 1000:
                 raise ValueError("invalid result collection")
             for row in payload:
@@ -91,6 +119,8 @@ def archive_rows(content, allowed_cases):
                         or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", row["case_id"])
                         or row["case_id"] not in allowed_cases
                         or row.get("distro") not in ("arch", "debian", "ubuntu", "fedora")
+                        or (row["case_id"] != "qemu-matrix-workflow"
+                            and not row["case_id"].startswith(f"qemu-{row['distro']}-"))
                         or row.get("result") not in FAILURES | {"PASS", "SKIPPED"}
                         or type(row.get("exit_code")) is not int
                         or not -1 <= row["exit_code"] <= 255
@@ -98,6 +128,35 @@ def archive_rows(content, allowed_cases):
                         or not 0 <= row["elapsed_seconds"] <= 86400):
                     raise ValueError("invalid result row")
                 rows.append({key: row[key] for key in ("case_id", "distro", "result", "exit_code", "elapsed_seconds")})
+                row_sources.append((row, path.parent))
+        # Admission above validates every archive member before any diagnostic
+        # is consumed. Read only logs named by a validated failing case; never
+        # extract files or execute artifact content. The issue helper applies
+        # its existing secret scrubber before publication.
+        if diagnostics is not None:
+            members_by_name = {member.filename: member for member in members}
+            for row, parent in row_sources:
+                if row["result"] not in FAILURES or row["case_id"] == "qemu-matrix-workflow":
+                    continue
+                key = row["case_id"], row["distro"]
+                diagnostics.pop(key, None)
+                case = row["case_id"].removeprefix(f"qemu-{row['distro']}-")
+                if parent.name == "inventory":
+                    candidates = [parent / "rows" / f"{case}{suffix}.log"
+                                  for suffix in (".stderr", "", ".stdout")]
+                elif case in ("lifecycle", "aarch64-lifecycle"):
+                    candidates = [parent / "guest-check.log"]
+                else:
+                    candidates = []
+                for candidate in candidates:
+                    member = members_by_name.get(str(candidate))
+                    if member is None or member.file_size > 8 * 1024 * 1024:
+                        continue
+                    raw = archive.read(member)
+                    if not raw.strip():
+                        continue
+                    diagnostics[key] = diagnostic_excerpt(raw)
+                    break
     return rows
 
 
@@ -111,9 +170,34 @@ def projection(rows, successful_main):
             selected[key] = dict(row, result="HARNESS_ERROR" if row["result"] == "BLOCKED" else row["result"])
         elif successful_main and row["result"] == "PASS" and key not in selected:
             selected[key] = row
-    if sum(row["result"] in FAILURES for row in selected.values()) > 25:
-        raise ValueError("more than 25 failing cases; report workflow aggregate")
+    # The matrix job emits an aggregate receipt whenever a lane fails. Once
+    # detailed evidence identifies that failure, filing both adds no diagnosis.
+    # Keep the aggregate when it is the only failure (and keep PASS closures).
+    if any(row["case_id"] != "qemu-matrix-workflow" and row["result"] in FAILURES
+           for row in selected.values()):
+        selected = {key: row for key, row in selected.items()
+                    if row["case_id"] != "qemu-matrix-workflow" or row["result"] not in FAILURES}
     return list(selected.values())
+
+
+def bound_issue_updates(selected):
+    """Bound issue creation without dropping the validated diagnostic catalog."""
+    failures = [row for row in selected if row["result"] in FAILURES]
+    if len(failures) <= 25:
+        return selected, failures
+    aggregate = dict(case_id="qemu-matrix-workflow", distro="ubuntu",
+                     result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
+    passes = [row for row in selected
+              if row["result"] == "PASS" and row["case_id"] != "qemu-matrix-workflow"]
+    return [aggregate, *passes], failures
+
+
+def write_failure_catalog(directory, run, repository, failures, evidence_error):
+    directory.mkdir(parents=True, exist_ok=True)
+    catalog = dict(schema_version=1, repository=repository, run_id=run["id"],
+                   attempt=run["run_attempt"], source_sha=run["head_sha"],
+                   evidence_invalid_or_unavailable=evidence_error, failures=failures)
+    directory.joinpath("failures.json").write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
 
 
 def main():
@@ -137,6 +221,7 @@ def main():
         main_ref = json.loads(api(f"repos/{repository}/git/ref/heads/main"))
         successful_main = main_ref["object"]["sha"] == run["head_sha"]
     rows = []
+    diagnostics = {}
     evidence_error = False
     try:
         listing = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100"))
@@ -153,7 +238,7 @@ def main():
                 raise ValueError("invalid artifact identity or size")
             rows.extend(archive_rows(
                 api(f"repos/{repository}/actions/artifacts/{artifact['id']}/zip", MAX_DOWNLOAD),
-                allowed_cases,
+                allowed_cases, diagnostics,
             ))
         selected = projection(rows, successful_main)
     except (ValueError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError):
@@ -182,6 +267,20 @@ def main():
                 if step["conclusion"] not in ("success", "skipped"):
                     name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", step["name"])[:120]
                     details.append(f"  Step {step['number']}: {name} ({step['conclusion']})")
+    selected, failure_catalog = bound_issue_updates(selected)
+    report_directory = Path(os.environ["RUNNER_TEMP"]) / "qemu-issue-report"
+    write_failure_catalog(report_directory, run, repository, failure_catalog, evidence_error)
+    report_run = os.environ["GITHUB_RUN_ID"]
+    if not report_run.isdecimal():
+        raise ValueError("invalid reporter run ID")
+    catalog_note = (
+        f"Validated failing cases: {len(failure_catalog)}. "
+        "Complete identities and observations: qemu-issue-report/failures.json.\n"
+        f"Reporter artifacts: https://github.com/{repository}/actions/runs/{report_run}\n"
+        "Artifact retention requested: 30 days (repository retention limits apply).\n"
+    )
+    if len(failure_catalog) > 25:
+        catalog_note += "More than 25 cases failed; this aggregate bounds issue creation without discarding case evidence.\n"
     with tempfile.TemporaryDirectory() as directory:
         results = Path(directory) / "results.json"
         results.write_text(json.dumps(selected) + "\n")
@@ -194,7 +293,10 @@ def main():
                     f"Observed: {row['result']}, exit {row['exit_code']}, elapsed {row['elapsed_seconds']}s\n"
                     f"Evidence invalid/unavailable: {evidence_error}\n"
                     "Exit status alone does not establish the root cause. Inspect the linked run's logs and artifacts.\n"
-                    + "\n".join(details[:24]) + "\n")
+                    + "\n".join(details[:6]) + "\n"
+                    + "Case diagnostic (untrusted log excerpt, redacted by issue helper):\n"
+                    + diagnostics.get((row["case_id"], row["distro"]), "No case log available; inspect linked artifacts.")
+                    + "\n" + catalog_note)
         run_url = f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}"
         subprocess.run(["bash", "scripts/qa-file-issue.sh", str(results), "--repo", repository,
                         "--source", "qemu-matrix", "--run-url", run_url], check=True, timeout=180)

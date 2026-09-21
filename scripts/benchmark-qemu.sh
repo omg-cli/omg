@@ -339,8 +339,10 @@ read -r digest filename extra < "$work/release/$archive.sha256"
 [[ $(wc -l < "$work/release/$archive.sha256") -eq 1 ]]
 (cd "$work/release" && sha256sum -c "$archive.sha256") > "$work/release-checksum.txt"
 printf 'distro=%s\narch=%s\nrelease=%s\nartifact_source=%s\nimage_url=%s\nimage_digest=%s\nfirmware=%s\nqemu=%s -machine %s\ncontroller=%s\ncase_id=%s\n' "$distro" "$arch" "$tag" "$source_kind" "$image_url" "$image_hash" "$firmware" "$qemu_bin" "$qemu_machine" "$controller_image" "$case_id" > "$work/metadata.txt"
+bash "$here/pull-qemu-controller.sh" "$controller_image" "$work/controller-pull-attempt.log" \
+  > "$work/controller-pull.log" 2>&1 || exit 3
 started=true
-timeout 120 docker run -d --name "$controller" --cpus 2 --memory 3g --memory-swap 3g --pids-limit 512 --log-opt max-size=10m --log-opt max-file=2 --device /dev/kvm \
+timeout 120 docker run --pull=never -d --name "$controller" --cpus 2 --memory 3g --memory-swap 3g --pids-limit 512 --log-opt max-size=10m --log-opt max-file=2 --device /dev/kvm \
   --cap-drop NET_RAW --cap-drop NET_ADMIN --dns 1.1.1.1 --dns 9.9.9.9 \
   --mount "type=bind,src=$work,dst=/work" --workdir /work \
   "$controller_image" sleep infinity > "$work/controller-id.txt"

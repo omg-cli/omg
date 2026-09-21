@@ -30,6 +30,9 @@ impl StatusData {
             self.total_packages,
             self.explicit_packages,
         );
+        // Package counts do not establish vulnerability status. This view has
+        // no scan result, so both full and fast status must say so explicitly.
+        let _ = writeln!(output, "  {:<10} Not scanned", "Security");
         if self.fast_mode {
             let _ = writeln!(
                 output,
@@ -219,6 +222,20 @@ impl Model for StatusModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_without_scan_never_claims_security_health() {
+        for fast_mode in [false, true] {
+            let output = StatusData {
+                fast_mode,
+                ..StatusData::default()
+            }
+            .render();
+            assert!(output.contains("Not scanned"));
+            assert!(!output.contains("No known issues"));
+            assert!(!output.contains("Your system is healthy"));
+        }
+    }
 
     #[test]
     fn fast_status_does_not_recommend_unchecked_cleanup() {

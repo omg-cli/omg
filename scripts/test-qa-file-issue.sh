@@ -17,6 +17,7 @@ cat > "$scratch/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$CALL_LOG"
+if [[ "${FAKE_FAIL_OPERATION:-}" == "$1 $2" ]]; then exit 7; fi
 case "$1 $2" in
   "issue list") printf '%s' "${FAKE_ISSUES_JSON:-[]}";;
   "issue view") printf '%s' "${FAKE_COMMENTS_JSON:-[]}";;
@@ -46,7 +47,7 @@ grep -q "issue create" "$CALL_LOG" && fail "dedup-comment must not create"
 grep -q "filed=0 updated=1 closed=0 errors=0" <<< "$out" || fail "dedup-comment bad summary: $out"
 
 # 3. Run URL already recorded on the issue -> complete silence.
-export FAKE_COMMENTS_JSON='["earlier https://run/2 note"]'
+export FAKE_COMMENTS_JSON='Still failing on [https://run/2](https://run/2): PRODUCT_FAIL.'
 : > "$CALL_LOG"
 out=$(bash "$runner" "$results" --run-url https://run/2 --source qemu); assert_rc 0 "$?" "same-run-skip"
 grep -q "issue create\|issue comment" "$CALL_LOG" && fail "same-run-skip must stay silent"
@@ -139,6 +140,62 @@ export FAKE_ISSUES_JSON='[{"number":7,"state":"open","body":"<!-- omg-qa-fingerp
 out=$(bash "$runner" "$results" --run-url https://run/11 --source qemu --dry-run); assert_rc 0 "$?" "dry-run-close"
 grep -q "issue close" "$CALL_LOG" && fail "dry-run-close mutated"
 grep -q "would close #7" <<< "$out" || fail "dry-run-close printed no plan: $out"
+
+# 12. The original issue body already records its first run. Replaying that
+# reporting attempt must not add a redundant "still failing" comment.
+printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PRODUCT_FAIL","exit_code":1,"elapsed_seconds":2}]' > "$results"
+export FAKE_ISSUES_JSON='[{"number":7,"state":"open","body":"<!-- omg-qa-fingerprint: qemu:arch:search-tree -->\n- run: https://run/12"}]'
+export FAKE_COMMENTS_JSON='[]'
+: > "$CALL_LOG"
+out=$(bash "$runner" "$results" --run-url https://run/12 --source qemu); assert_rc 0 "$?" "original-run-skip"
+grep -q "issue create\|issue comment\|issue close" "$CALL_LOG" && fail "original-run-skip mutated"
+grep -q "filed=0 updated=0 closed=0 errors=0" <<< "$out" || fail "original-run-skip bad summary: $out"
+
+# 13. A run URL prefix is a different run and must retain its diagnosis.
+: > "$CALL_LOG"
+out=$(bash "$runner" "$results" --run-url https://run/1 --source qemu); assert_rc 0 "$?" "distinct-run-prefix"
+grep -q "issue comment 7" "$CALL_LOG" || fail "distinct-run-prefix lost a recurrence"
+grep -q "filed=0 updated=1 closed=0 errors=0" <<< "$out" || fail "distinct-run-prefix bad summary: $out"
+
+# 14. Recurrence comments must also match the full run link, not a prefix.
+export FAKE_COMMENTS_JSON='Still failing on [https://run/12](https://run/12): PRODUCT_FAIL.'
+: > "$CALL_LOG"
+out=$(bash "$runner" "$results" --run-url https://run/1 --source qemu); assert_rc 0 "$?" "comment-run-prefix"
+grep -q "issue comment 7" "$CALL_LOG" || fail "comment-run-prefix lost a recurrence"
+
+# 15. GitHub API failures must never be reported as successful delivery.
+export FAKE_COMMENTS_JSON='[]'
+for operation in create comment close view; do
+  export FAKE_FAIL_OPERATION="issue $operation"
+  export FAKE_ISSUES_JSON='[{"number":7,"state":"open","body":"<!-- omg-qa-fingerprint: qemu:arch:search-tree -->"}]'
+  verdict=PRODUCT_FAIL; code=1
+  if [[ "$operation" == create ]]; then export FAKE_ISSUES_JSON='[]'; fi
+  if [[ "$operation" == close ]]; then verdict=PASS; code=0; fi
+  printf '[{"case_id":"search-tree","distro":"arch","result":"%s","exit_code":%s,"elapsed_seconds":2}]' "$verdict" "$code" > "$results"
+  : > "$CALL_LOG"
+  if out=$(bash "$runner" "$results" --run-url https://run/15 --source qemu 2>"$scratch/error"); then
+    fail "API $operation failure was reported as success"
+  fi
+  if [[ "$operation" == view ]]; then
+    grep -q "issue create\|issue comment\|issue close" "$CALL_LOG" && fail "failed recurrence read must not mutate"
+  fi
+done
+unset FAKE_FAIL_OPERATION
+
+# 16. Contradictory evidence must not file and then close the same failure.
+printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PRODUCT_FAIL","exit_code":1,"elapsed_seconds":2},{"case_id":"search-tree","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":2}]' > "$results"
+: > "$CALL_LOG"
+if bash "$runner" "$results" --run-url https://run/16 --source qemu 2>"$scratch/error"; then
+  fail "contradictory results were accepted"
+fi
+[[ -s "$CALL_LOG" ]] && fail "contradictory results reached GitHub"
+
+# 17. A QEMU expected-refusal assertion can PASS with observed exit 1.
+# Its runner already checked the expected code; preserve that verdict.
+printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PASS","exit_code":1,"elapsed_seconds":2}]' > "$results"
+: > "$CALL_LOG"
+out=$(bash "$runner" "$results" --run-url https://run/17 --source qemu); assert_rc 0 "$?" "expected-refusal"
+grep -q "issue close 7" "$CALL_LOG" || fail "expected-refusal lost verified closure"
 
 if [[ "$failures" -ne 0 ]]; then printf '%s failure(s)\n' "$failures" >&2; exit 1; fi
 printf 'qa-file-issue harness: all green\n'

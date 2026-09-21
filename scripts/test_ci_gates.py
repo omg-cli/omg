@@ -147,7 +147,7 @@ class CiDeduplicationTests(unittest.TestCase):
         self.assertIn("CARGO_TARGET_DIR: ${{ github.workspace }}/target", portable)
         self.assertIn("cargo clippy --all-targets", portable)
         self.assertIn("--features debian-pure", portable)
-        self.assertIn("cargo nextest run --lib", portable)
+        self.assertIn("python3 scripts/run-native-contracts.py --features pgp,license", portable)
         makefile = (CI_YML.parents[2] / "Makefile").read_text(encoding="utf-8")
         self.assertIn(
             fuzz,
@@ -219,7 +219,7 @@ class CiDeduplicationTests(unittest.TestCase):
         intersections = job_block(text, "feature-intersections")
         self.assertIn("features: arch,pgp,license", linux)
         self.assertIn("cargo clippy --all-targets", linux)
-        self.assertIn("cargo nextest run --lib", linux)
+        self.assertIn("python3 scripts/run-native-contracts.py --features ${{ matrix.features }}", linux)
         self.assertNotIn("features: arch,pgp,license", intersections)
         self.assertIn("features: debian,pgp\n", intersections)
         self.assertIn("cargo check --all-targets", intersections)

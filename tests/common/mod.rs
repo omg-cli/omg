@@ -282,6 +282,7 @@ fn run_omg_with_home(
         ("OMG_DATA_DIR", ".local/share/omg"),
         ("OMG_CONFIG_DIR", ".config/omg"),
         ("OMG_CACHE_DIR", ".cache/omg"),
+        ("NVM_DIR", ".nvm"),
     ] {
         let path = home.join(relative_path);
         fs::create_dir_all(&path).expect("Failed to create isolated CLI directory");

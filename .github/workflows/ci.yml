@@ -8,7 +8,7 @@
 # - cargo-nextest: 10-35% faster test execution
 # - Artifact caching: Shared caches across jobs
 # - Timeout protection: Prevents runaway jobs
-# - Test reporting: nextest terminal output (JUnit profile removed as unused)
+# - Test reporting: exact nextest selection, JUnit attempts and parser receipts
 
 name: CI
 
@@ -92,6 +92,10 @@ jobs:
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
+      OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
+      OMG_CONTRACT_PLATFORM: portable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -148,7 +152,22 @@ jobs:
           tool: nextest
 
       - name: Run portable tests
-        run: cargo nextest run --lib --bins --no-default-features --features pgp,license --locked --profile ci
+        run: python3 scripts/run-native-contracts.py --features pgp,license
+
+      - name: Verify pure Debian parser and daemon contracts
+        env:
+          OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces/debian-pure
+          OMG_CONTRACT_PLATFORM: debian-pure
+        run: python3 scripts/run-native-contracts.py --features debian-pure
+
+      - name: Preserve compiled parser surfaces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-surfaces-portable
+          path: target/contract-surfaces/
+          retention-days: 14
+          if-no-files-found: error
 
   #############################################################################
   # STAGE 2: Platform Matrix (Linux containers)
@@ -160,6 +179,10 @@ jobs:
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
+      OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
+      OMG_CONTRACT_PLATFORM: ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
@@ -169,7 +192,7 @@ jobs:
             features: arch,pgp,license
             setup: |
               pacman -Syu --noconfirm
-              pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq
+              pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
                 -o /tmp/rustup-init
@@ -186,7 +209,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo \
+                ca-certificates curl git build-essential pkg-config sudo python3 \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
@@ -204,7 +227,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo \
+                ca-certificates curl git build-essential pkg-config sudo python3 \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
@@ -221,7 +244,7 @@ jobs:
             features: fedora,pgp,license
             setup: |
               dnf install -y --setopt=install_weak_deps=False \
-                git clang cmake openssl-devel pkgconfig findutils curl procps-ng \
+                git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 \
                 rpm dnf sqlite yum-utils fedora-release
               rpm --initdb
               dnf makecache --refresh
@@ -251,29 +274,55 @@ jobs:
 
       # sccache temporarily disabled due to service outage
 
-      - name: Cache cargo registry
-        if: inputs.skip-cache != true
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: v1-${{ matrix.platform }}-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: v1-${{ matrix.platform }}-registry-
+      - name: Compute native cache identity
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_PLATFORM: ${{ matrix.platform }}
+          CACHE_IMAGE: ${{ matrix.image }}
+          CACHE_FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          # GitHub cache keys reject commas. Hash the complete compatibility
+          # tuple instead of dropping features or making a lossy replacement.
+          key=$(printf '%s\0' "$CACHE_PLATFORM" "$CACHE_IMAGE" "$CACHE_FEATURES" | sha256sum)
+          printf 'key=%s\n' "${key%% *}" >> "$GITHUB_OUTPUT"
 
-      - name: Cache target
+      - name: Cache Rust dependencies
         if: inputs.skip-cache != true
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: target
-          key: v1-${{ matrix.platform }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            v1-${{ matrix.platform }}-target-${{ hashFiles('**/Cargo.lock') }}-
-            v1-${{ matrix.platform }}-target-
+          prefix-key: v2-platform-dependencies
+          cache-on-failure: true
+          # Never restore across distro ABI or feature contracts. The action
+          # additionally keys rustc, Cargo config, lockfiles and compiler flags.
+          shared-key: ${{ steps.cache-key.outputs.key }}
+          cache-bin: false
+          cache-workspace-crates: false
 
       - name: Build release
-        run: cargo build --release --no-default-features --features ${{ matrix.features }} --locked
+        shell: bash
+        env:
+          DISTRO: ${{ matrix.platform }}
+          BUILD_IMAGE: ${{ matrix.image }}
+          BUILD_FEATURES: ${{ matrix.features }}
+        run: |
+          if [[ "$DISTRO" == debian-trixie ]]; then
+            cargo build --release --no-default-features --features "$BUILD_FEATURES" --locked
+          else
+            python3 scripts/native-build-artifact.py build --distro "$DISTRO" \
+              --image "$BUILD_IMAGE" --features "$BUILD_FEATURES" --destination "$RUNNER_TEMP/native-release"
+          fi
+
+      - name: Upload native release pair
+        if: matrix.platform != 'debian-trixie'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-release-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-release/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Platform clippy
         run: |
@@ -288,9 +337,12 @@ jobs:
         run: cargo nextest --version
 
       - name: Run unit tests
-        run: |
-          cargo nextest run --lib --bins --no-default-features --features ${{ matrix.features }} \
-            --locked --profile ci --no-fail-fast
+        run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
+
+      - name: Run serial library and binary contracts
+        if: matrix.platform != 'debian-trixie'
+        # Preserve the former staged-QEMU libtest owner alongside nextest.
+        run: cargo test --lib --bins --no-default-features --features ${{ matrix.features }} --locked --no-fail-fast -- --test-threads=1
 
       - name: Prepare sandbox regression executable
         if: matrix.platform == 'arch'
@@ -311,13 +363,6 @@ jobs:
           path: target/sandbox-test/omg-lib-tests
           retention-days: 1
           if-no-files-found: error
-
-      - name: Run platform-specific integration tests
-        run: |
-          if [[ "${{ matrix.platform }}" == "fedora" ]]; then
-            cargo nextest run --test fedora_tests --no-default-features --features ${{ matrix.features }} \
-              --locked --profile ci --no-fail-fast
-          fi
 
       - name: Debian deterministic benchmark regression check
         if: matrix.platform == 'debian'
@@ -359,6 +404,15 @@ jobs:
           name: omg-${{ matrix.platform }}
           path: target/release/omg
           retention-days: 7
+          if-no-files-found: error
+
+      - name: Preserve compiled parser surfaces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-surfaces-${{ matrix.platform }}
+          path: target/contract-surfaces/
+          retention-days: 14
           if-no-files-found: error
 
   sandbox-cancellation:
@@ -551,23 +605,28 @@ jobs:
       - name: Fix git permissions
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Cache cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: v1-xsec-${{ matrix.platform }}-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: v1-xsec-${{ matrix.platform }}-registry-
+      - name: Compute native cache identity
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_PLATFORM: ${{ matrix.platform }}
+          CACHE_IMAGE: ${{ matrix.image }}
+          CACHE_FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          # GitHub cache keys reject commas. Hash the complete compatibility
+          # tuple instead of dropping features or making a lossy replacement.
+          key=$(printf '%s\0' "$CACHE_PLATFORM" "$CACHE_IMAGE" "$CACHE_FEATURES" | sha256sum)
+          printf 'key=%s\n' "${key%% *}" >> "$GITHUB_OUTPUT"
 
-      - name: Cache target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache Rust dependencies
+        if: inputs.skip-cache != true
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: target
-          key: v1-xsec-${{ matrix.platform }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            v1-xsec-${{ matrix.platform }}-target-
+          prefix-key: v2-intersection-dependencies
+          shared-key: ${{ steps.cache-key.outputs.key }}
+          cache-bin: false
+          cache-workspace-crates: false
 
       - name: Check all targets
         run: cargo check --all-targets --no-default-features --features ${{ matrix.features }} --locked
@@ -583,6 +642,10 @@ jobs:
     if: (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act
     runs-on: macos-14
     timeout-minutes: 30
+    env:
+      OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
+      OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
+      OMG_CONTRACT_PLATFORM: macos
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -618,7 +681,7 @@ jobs:
         run: cargo nextest --version
 
       - name: Run unit tests
-        run: cargo nextest run --lib --bins --no-default-features --features macos,pgp,license --locked --profile ci
+        run: python3 scripts/run-native-contracts.py --features macos,pgp,license
 
       - name: Install Homebrew test packages
         run: |
@@ -640,6 +703,15 @@ jobs:
           path: target/release/omg
           retention-days: 7
 
+      - name: Preserve compiled parser surfaces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-surfaces-macos
+          path: target/contract-surfaces/
+          retention-days: 14
+          if-no-files-found: error
+
   #############################################################################
   # STAGE 2c: Ubuntu (matches the Ubuntu release artifact)
   #############################################################################
@@ -649,6 +721,10 @@ jobs:
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
+      OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
+      OMG_CONTRACT_PLATFORM: ubuntu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -675,9 +751,19 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: "v1-ubuntu-debian"
+          cache-on-failure: true
 
       - name: Build release
-        run: cargo build --release --no-default-features --features debian,pgp,license --locked
+        run: python3 scripts/native-build-artifact.py build --distro ubuntu --image ubuntu-24.04 --features debian,pgp,license --destination "$RUNNER_TEMP/native-release"
+
+      - name: Upload native release pair
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-release-ubuntu-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-release/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Platform clippy
         run: |
@@ -692,7 +778,10 @@ jobs:
         run: cargo nextest --version
 
       - name: Run unit tests
-        run: cargo nextest run --lib --bins --no-default-features --features debian,pgp,license --locked --profile ci
+        run: python3 scripts/run-native-contracts.py --features debian,pgp,license
+
+      - name: Run serial library and binary contracts
+        run: cargo test --lib --bins --no-default-features --features debian,pgp,license --locked --no-fail-fast -- --test-threads=1
 
       - name: Verify binary
         run: |
@@ -705,6 +794,15 @@ jobs:
           name: omg-ubuntu
           path: target/release/omg
           retention-days: 7
+          if-no-files-found: error
+
+      - name: Preserve compiled parser surfaces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-surfaces-ubuntu
+          path: target/contract-surfaces/
+          retention-days: 14
           if-no-files-found: error
 
   #############################################################################

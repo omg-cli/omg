@@ -1115,20 +1115,69 @@ install_from_release
             "Dockerfile.ubuntu",
         ] {
             let source = std::fs::read_to_string(root.join(relative)).expect("Dockerfile");
-            for line in source.lines().filter(|line| line.starts_with("FROM ")) {
-                if !line.contains("${BASE_IMAGE}") {
-                    assert!(
-                        line.contains("@sha256:"),
-                        "{relative} has a mutable base image: {line}"
-                    );
-                }
-            }
+            assert_pinned_docker_bases(&source, relative);
             for line in source.lines().filter(|line| line.contains("cargo build")) {
                 assert!(
                     line.contains("--locked"),
                     "{relative} has an unlocked Cargo build: {line}"
                 );
             }
+        }
+    }
+
+    // Local stages inherit their already-checked base. A misspelled or forward
+    // stage reference must still be rejected as an unpinned external image.
+    fn assert_pinned_docker_bases(source: &str, relative: &str) {
+        let mut stages = std::collections::HashSet::new();
+        for line in source.lines() {
+            let mut words = line.split_whitespace();
+            if !words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("FROM"))
+            {
+                continue;
+            }
+            let base = words
+                .find(|word| !word.starts_with("--platform="))
+                .expect("FROM needs a base");
+            let pinned = base.split_once("@sha256:").is_some_and(|(_, digest)| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+            assert!(
+                pinned || base == "${BASE_IMAGE}" || stages.contains(base),
+                "{relative} has a mutable base image: {line}"
+            );
+            if words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("AS"))
+            {
+                stages.insert(words.next().expect("AS needs a stage name").to_owned());
+            }
+        }
+    }
+
+    #[test]
+    fn docker_base_policy_accepts_pinned_stage_reuse() {
+        let digest = "a".repeat(64);
+        assert_pinned_docker_bases(
+            &format!("FROM alpine@sha256:{digest} AS native\nFROM native AS build\nFROM build"),
+            "fixture",
+        );
+    }
+
+    #[test]
+    fn docker_base_policy_rejects_mutable_or_unknown_bases() {
+        for source in [
+            "FROM alpine:latest AS native\nFROM native",
+            "FROM missing AS build",
+            "FROM future\nFROM alpine:latest AS future",
+            "FROM alpine@sha256:short",
+            "FROM alpine:latest # @sha256:not-a-pin",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| assert_pinned_docker_bases(source, "fixture")).is_err(),
+                "policy accepted {source}"
+            );
         }
     }
 

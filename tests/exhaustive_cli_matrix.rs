@@ -231,6 +231,7 @@ mod runtime_matrix {
 
     #[test]
     #[serial]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn test_env_workflow() {
         let project = TestProject::new();
         let data_dir = TempDir::new().unwrap();

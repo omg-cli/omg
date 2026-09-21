@@ -223,6 +223,7 @@ mod filesystem_security {
     }
 
     #[test]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn test_file_permission_preservation() {
         let project = TestProject::new();
         let file_path = project.create_file("test.sh", "#!/bin/bash\necho hello");
@@ -821,6 +822,7 @@ mod privilege_tests {
     }
 
     #[test]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn test_no_suid_creation() {
         let project = TestProject::new();
         let result = project.run(&["env", "capture"]);
