@@ -4,6 +4,27 @@
   "inventory_source": "Baseline compiled artifacts CI 35540033061 at e689113c; reviewed additive counter grammar from local Arch compilation; unchanged grammar verified, other owner schemas must match on hosted compilation",
   "contracts": [
     {
+      "id": "omg.config.reset.backup.fixture",
+      "source": "src/cli/config.rs",
+      "binary": "omg",
+      "surface": "omg config reset",
+      "platforms": ["arch", "debian", "debian-trixie", "ubuntu", "fedora"],
+      "requires": ["success", "state", "fault"],
+      "critical": true,
+      "assertions": {
+        "success": ["reset-restores-default-concurrency", "reset-configuration-validates"],
+        "state": ["absent-config-reset-creates-nothing", "backup-preserves-original-bytes", "backup-directory-sentinel-preserved"],
+        "fault": ["backup-failure-refuses-without-success-message", "failed-reset-preserves-config", "reset-recovers-after-backup-obstruction-removal"]
+      },
+      "scope": "Unprivileged daemon-disabled real CLI with isolated configuration. Covers reset --yes, absent configuration, original-byte backup and refusal/recovery when a directory obstructs backup creation. This is not native package transactions evidence. Does not cover interactive confirmation, concurrent reset/write, backup symlinks, disk exhaustion or every default field; broader gaps remain.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::cli_comprehensive::system_tests::config_reset_preserves_backup_and_refuses_backup_failure",
+        "evidence": ["success", "state", "fault"],
+        "assertions": ["reset-restores-default-concurrency", "reset-configuration-validates", "absent-config-reset-creates-nothing", "backup-preserves-original-bytes", "backup-directory-sentinel-preserved", "backup-failure-refuses-without-success-message", "failed-reset-preserves-config", "reset-recovers-after-backup-obstruction-removal", "fixture-cleanup"]
+      }]
+    },
+    {
       "id": "omg.config.set.persistence.fixture",
       "source": "src/cli/config.rs",
       "binary": "omg",

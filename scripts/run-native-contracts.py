@@ -25,6 +25,7 @@ require = COVERAGE.require
 
 
 BEHAVIOR_TESTS = frozenset({
+    'omg::cli_comprehensive::system_tests::config_reset_preserves_backup_and_refuses_backup_failure',
     'omg::cli_comprehensive::system_tests::config_values_round_trip_and_rejected_writes_preserve_state',
     'omg::security_daemon_optional::audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_it',
     'omg::security_daemon_optional::audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_history',

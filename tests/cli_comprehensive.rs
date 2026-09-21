@@ -1839,6 +1839,36 @@ mod system_tests {
     use super::*;
 
     #[test]
+    fn config_reset_preserves_backup_and_refuses_backup_failure() {
+        let project = TestProject::new();
+        let config = project.config_dir.path().join("config.toml");
+        let backup = project.config_dir.path().join("config.toml.backup");
+        project.run(&["config", "reset", "--yes"]).assert_success();
+        assert!(!config.exists() && !backup.exists());
+        project
+            .run(&["config", "set", "aur.build_concurrency", "2"])
+            .assert_success();
+        let original = std::fs::read(&config).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("sentinel"), b"keep").unwrap();
+        let refused = project.run(&["config", "reset", "--yes"]);
+        refused.assert_failure();
+        assert!(!refused.stdout.contains("Configuration reset to defaults"));
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert_eq!(std::fs::read(backup.join("sentinel")).unwrap(), b"keep");
+        std::fs::remove_file(backup.join("sentinel")).unwrap();
+        std::fs::remove_dir(&backup).unwrap();
+        project.run(&["config", "reset", "--yes"]).assert_success();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let reset = std::fs::read_to_string(&config).unwrap();
+        let parsed: toml::Value = toml::from_str(&reset).unwrap();
+        assert_eq!(parsed["aur"]["build_concurrency"].as_integer(), Some(1));
+        project.run(&["config", "validate"]).assert_success();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        project.close_checked();
+    }
+
+    #[test]
     fn config_values_round_trip_and_rejected_writes_preserve_state() {
         let project = TestProject::new();
         let config = project.config_dir.path().join("config.toml");
