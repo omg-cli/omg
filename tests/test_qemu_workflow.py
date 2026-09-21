@@ -31,6 +31,14 @@ def step(name):
 
 
 class QemuWorkflowTests(unittest.TestCase):
+    def test_all_qa_reporting_harnesses_gate_guest_builds(self):
+        reporting = step('Verify harness and reporting fixtures before guest builds')
+        for name in ('qa-file-issue', 'qa-audit', 'qa-open-pr'):
+            self.assertIn(f'./scripts/test-{name}.sh', reporting)
+            self.assertIn(f'"scripts/test-{name}.sh"', PARENT)
+            self.assertIn(f'"scripts/{name}.sh"', PARENT)
+        self.assertLess(PARENT.index(reporting), PARENT.index('      - name: Resolve selection'))
+
     @classmethod
     def setUpClass(cls):
         cls.bash = os.environ.get('OMG_TEST_BASH') or shutil.which('bash')

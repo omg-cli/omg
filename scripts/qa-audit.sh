@@ -55,13 +55,12 @@ command_for() {
   printf 'command: omg %s\n' "$(jq -rj '.[] | tostring + " "' <<< "$args" 2>/dev/null || printf '%s' "$args")"
 }
 
-total_fail=0; total_files=${#files[@]}
+total_fail=0; invalid_files=0; total_files=${#files[@]}
 for results in "${files[@]}"; do
   evidence_dir="$(dirname "$results")"
-  if ! rows="$(jq -ce '
-    if type != "array" then error("not an array") else . end |
-    map({case_id, distro, result, exit_code, elapsed_seconds})' "$results" 2>/dev/null)"; then
-    printf '## %s\nnot a results.json array; skipped\n\n' "$results"
+  if ! rows="$(qa_result_rows "$results" 2>/dev/null)"; then
+    invalid_files=$((invalid_files + 1))
+    printf '## %s\ninvalid results.json; audit incomplete\n\n' "$results"
     continue
   fi
   counts="$(jq -r 'group_by(.result) | map("\(.[0].result)=\(length)") | join(" ")' <<< "$rows")"
@@ -81,7 +80,7 @@ for results in "${files[@]}"; do
     fi
     rm -f "$src_tmp"
   done <<< "$failing"
-  printf '\nfile with: ./scripts/qa-file-issue.sh "%s" --run-url <run-url> --source <qemu-matrix|release-smoke> [--dry-run]\n\n' "$results"
+  printf '\nfile with: ./scripts/qa-file-issue.sh "%s" --run-url <run-url> --source <qemu-matrix|release-smoke> --failures-only [--dry-run]\n\n' "$results"
 done
-printf 'files=%s failing-rows=%s\n' "$total_files" "$total_fail"
-[[ "$total_fail" -eq 0 ]]
+printf 'files=%s failing-rows=%s invalid-files=%s\n' "$total_files" "$total_fail" "$invalid_files"
+[[ "$total_fail" -eq 0 && "$invalid_files" -eq 0 ]]

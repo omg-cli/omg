@@ -9,7 +9,6 @@
 
 use omg_lib::core::security::slsa::SlsaVerifier;
 use omg_lib::core::security::vulnerability::VulnerabilityScanner;
-use omg_lib::package_managers::types::parse_version_or_zero;
 use std::time::Duration;
 
 #[cfg(feature = "arch")]
@@ -159,7 +158,8 @@ async fn test_vulnerability_scanner_osv_real() {
     // Test with a real package version
     // Using a deliberately old version that likely has known CVEs
     let package = "openssl";
-    let version = parse_version_or_zero("1.0.0");
+    let version = omg_lib::package_managers::types::parse_version("1.0.0")
+        .expect("The historical OpenSSL candidate must be a valid version");
 
     let result = tokio::time::timeout(
         Duration::from_secs(15),
@@ -178,8 +178,11 @@ async fn test_vulnerability_scanner_osv_real() {
 
     let vulns = vulns.unwrap();
 
-    // Old OpenSSL version should have vulnerabilities
-    // (This is a reasonable assumption for testing against real data)
+    // Transport success or an empty response is not detection evidence.
+    assert!(
+        !vulns.is_empty(),
+        "Historical OpenSSL candidate returned no findings; verify the backend, ecosystem, and advisory data"
+    );
     println!(
         "✓ Successfully queried OSV database, found {} vulnerabilities for {} {}",
         vulns.len(),
@@ -188,7 +191,7 @@ async fn test_vulnerability_scanner_osv_real() {
     );
 
     // Validate structure of returned vulnerabilities
-    for vuln in vulns.iter().take(3) {
+    for vuln in &vulns {
         // Should have an ID (CVE or similar)
         assert!(!vuln.id.is_empty(), "Vulnerability missing ID");
 

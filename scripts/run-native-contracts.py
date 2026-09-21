@@ -24,7 +24,16 @@ COVERAGE = SELECTION.COVERAGE
 require = COVERAGE.require
 
 
-BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
+BEHAVIOR_TESTS = frozenset({
+    'omg::cli_comprehensive::system_tests::config_access_errors_never_report_missing_or_valid_defaults',
+    'omg::cli_comprehensive::system_tests::config_reset_backup_never_overwrites_a_linked_external_file',
+    'omg::cli_comprehensive::system_tests::config_reset_preserves_backup_and_refuses_backup_failure',
+    'omg::cli_comprehensive::system_tests::config_values_round_trip_and_rejected_writes_preserve_state',
+    'omg::security_daemon_optional::audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_it',
+    'omg::security_daemon_optional::audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_history',
+    'omg::security_daemon_optional::sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure',
+    'omg::security_daemon_optional::security_scan_without_daemon_preserves_inventory_errors_and_recovers',
+}) | frozenset('omg::debian_e2e_tests::' + name for name in (
     'test_cli_status_shows_debian_info', 'test_cli_debian_respects_ci_mode')) | frozenset({
     'omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state',
     'omg::cli_comprehensive::explicit_shortcut_uses_the_same_isolated_state_as_explicit_count',
@@ -44,6 +53,17 @@ BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
         'snapshot_restores_installed_php_offline_without_replacing_its_payload',
         'snapshot_restores_all_registered_installed_runtimes_and_executes_selected_payloads',
         'capture_without_package_backend_refuses_without_creating_or_overwriting_lockfile'))
+
+
+CLI_FAULT_TESTS = frozenset({
+    'omg::cli_comprehensive::system_tests::config_access_errors_never_report_missing_or_valid_defaults',
+    'omg::cli_comprehensive::system_tests::config_reset_preserves_backup_and_refuses_backup_failure',
+    'omg::cli_comprehensive::system_tests::config_values_round_trip_and_rejected_writes_preserve_state',
+    'omg::security_daemon_optional::audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_it',
+    'omg::security_daemon_optional::audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_history',
+    'omg::security_daemon_optional::sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure',
+    'omg::security_daemon_optional::security_scan_without_daemon_preserves_inventory_errors_and_recovers',
+})
 
 
 DAEMON_TESTS = frozenset('omg::coverage_18::' + name for name in (
@@ -132,7 +152,12 @@ def mapped_behavior_subjects(manifest, provenance, listing, root):
             for binding in contract['tests']:
                 if binding['lane'] == 'native-cli-fixture':
                     require(binding['id'] in BEHAVIOR_TESTS, 'unreviewed behavior test')
-                    suites.add(binding['id'].rsplit('::', 1)[0])
+                    # Native CLI owners are integration binaries. Nextest's bare
+                    # package ID names its library, not all prefixed test suites.
+                    owners = [suite for suite in listing['rust-suites']
+                              if '::' in suite and binding['id'].startswith(suite + '::')]
+                    require(len(owners) == 1, 'missing owning behavior harness or ambiguous identity')
+                    suites.add(owners[0])
     combined = {}
     for suite in sorted(suites):
         require(suite in listing['rust-suites'], 'missing owning behavior harness')
@@ -166,6 +191,8 @@ def execution_receipts(manifest, provenance, report, *, behavior):
                 allowed = {'success', 'state', 'refusal'}
                 if provenance['lane'] == 'native-daemon-fixture':
                     allowed |= {'fault', 'concurrency'}
+                elif binding['id'] in CLI_FAULT_TESTS:
+                    allowed.add('fault')
                 require(set(binding['evidence']) <= allowed, 'unsupported fixture evidence')
             else:
                 require(binding['evidence'] == ['parser'], 'nonparser binding')
@@ -203,10 +230,12 @@ def sha256_file(path):
 
 def cargo_test_args(features):
     active = COVERAGE.strings(features.split(','))
-    suites = ['cli_surface', 'git_hooks_contract', 'coverage_18',
+    suites = ['cli_surface', 'git_hooks_contract', 'coverage_10', 'coverage_18',
               'e2e_runtime_management', 'env_lockfile_integrity']
     if active & {'arch', 'debian', 'debian-pure', 'fedora'}:
         suites.append('cli_comprehensive')
+    if active & {'arch', 'debian', 'fedora'}:
+        suites.append('security_daemon_optional')
     if active & {'debian', 'debian-pure'}:
         suites.extend(['debian_tests', 'debian_daemon_tests', 'debian_ipc_tests',
                        'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests'])

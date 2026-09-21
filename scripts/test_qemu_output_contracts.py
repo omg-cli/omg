@@ -275,6 +275,14 @@ esac
         self.assertIn('help', result.stderr)
         self.assertEqual(self.run_oracle(safety='help-boundary', stdout='Usage: omg search\n').returncode, 0)
 
+    def test_offline_sbom_requires_advisory_source_failure(self):
+        prefix = 'Error: Failed to generate system SBOM: Failed to generate a complete security SBOM: '
+        for message in ('Failed to query native security advisories', 'Failed to scan package pkg for vulnerabilities: Failed to query the OSV vulnerability database'):
+            self.assertEqual(self.run_oracle(assertion='sbom-source-failure', code=1, stderr=prefix + message).returncode, 0)
+        for message in ('unsupported backend', 'daemon is not running', 'failed to parse mock state'):
+            self.assertNotEqual(self.run_oracle(assertion='sbom-source-failure', code=1, stderr=prefix + message).returncode, 0)
+        self.assertNotEqual(self.run_oracle(assertion='sbom-source-failure', code=0).returncode, 0)
+
     def test_expected_refusal_requires_its_own_diagnostic(self):
         self.assertNotEqual(self.run_oracle(code=1, stderr=' \n\t').returncode, 0)
         self.assertEqual(self.run_oracle(code=1, stderr='unknown runtime\n').returncode, 0)

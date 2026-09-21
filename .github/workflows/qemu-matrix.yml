@@ -63,6 +63,10 @@ on:
       - "scripts/test-qa-file-issue.sh"
       - "scripts/qa-evidence-lib.sh"
       - "scripts/qa-file-issue.sh"
+      - "scripts/test-qa-audit.sh"
+      - "scripts/qa-audit.sh"
+      - "scripts/test-qa-open-pr.sh"
+      - "scripts/qa-open-pr.sh"
       - "scripts/export-qemu-evidence.py"
       - "scripts/test_export_qemu_evidence.py"
       - "scripts/ci-smoke-report.py"
@@ -156,6 +160,8 @@ jobs:
         run: |
           ./scripts/test-release-smoke.sh
           ./scripts/test-qa-file-issue.sh
+          ./scripts/test-qa-audit.sh
+          ./scripts/test-qa-open-pr.sh
           python3 -m unittest discover -s scripts -p test_ci_smoke_report.py
           sudo -n python3 -m unittest discover -s scripts -p test_qemu_health.py
           python3 -m unittest discover -s scripts -p test_qemu_network_scope.py

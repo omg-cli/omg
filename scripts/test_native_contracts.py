@@ -44,7 +44,7 @@ class NativeRunner(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             root.chmod(0o755)
-            for name in ('cli_comprehensive-fixture', 'e2e_runtime_management-fixture',
+            for name in ('cli_comprehensive-fixture', 'coverage_10-fixture', 'e2e_runtime_management-fixture',
                          'env_lockfile_integrity-fixture', 'other-fixture'):
                 binary = root / name
                 binary.write_text('#!/bin/sh\nid -u\nprintf "%s\\n" "$1"\nexit 23\n')
@@ -73,6 +73,25 @@ def parser_fixture():
 
 
 class NativeReceipts(unittest.TestCase):
+    def test_reviewed_cli_fault_contracts_are_admitted_without_general_fault_credit(self):
+        manifest, provenance, report, _ = parser_fixture()
+        actual = json.loads((Path(__file__).resolve().parents[1] / 'tests/contracts/manifest.json').read_text())
+        contracts = [c for c in actual['contracts'] if any(
+            b['lane'] == 'native-cli-fixture' and 'fault' in b['evidence'] for b in c['tests'])]
+        self.assertEqual(len(contracts), 8)
+        manifest['contracts'] = contracts
+        provenance.update(platform='arch', features=['arch', 'pgp', 'license'], lane='native-cli-fixture')
+        execution = report['tests']['install-dry-run-state']
+        report['tests'] = {b['id']: execution for c in contracts for b in c['tests']}
+        rows, required = NATIVE.behavior_receipts(manifest, provenance, report)
+        self.assertEqual(len(required), 8)
+        self.assertTrue(all('fault' in row['evidence'] for row in rows))
+        unrelated = 'omg::e2e_runtime_management::test_detect_nvmrc'
+        contracts[0]['tests'][0]['id'] = unrelated
+        report['tests'][unrelated] = execution
+        with self.assertRaisesRegex(ValueError, 'unsupported fixture evidence'):
+            NATIVE.behavior_receipts(manifest, provenance, report)
+
     def test_fault_and_concurrency_receipts_require_reviewed_daemon_owners(self):
         for name, kind in (
             ('concurrent_pings_preserve_boundary_ids_and_backend_state', 'concurrency'),
@@ -274,14 +293,27 @@ class NativeReceipts(unittest.TestCase):
             (target / 'debug/env-suite').write_bytes(b'environment harness')
             listing['rust-suites']['omg::env_lockfile_integrity'] = {
                 'package-id': 'owning-package', 'binary-path': str(target / 'debug/env-suite')}
+            (target / 'debug/security-suite').write_bytes(b'security harness')
+            listing['rust-suites']['omg::security_daemon_optional'] = {
+                'package-id': 'owning-package', 'binary-path': str(target / 'debug/security-suite')}
             manifest, _, _, provenance, _ = fixture()
             manifest['contracts'][0]['tests'] = [
                 {'lane': 'native-cli-fixture', 'id': name} for name in sorted(NATIVE.BEHAVIOR_TESTS)]
+            # Nextest includes the library suite under the bare package name.
+            # It is not the owner of every integration identity with that prefix.
+            listing['rust-suites']['omg'] = {
+                'package-id': 'owning-package', 'binary-path': str(target / 'debug/suite')}
             combined = NATIVE.mapped_behavior_subjects(manifest, provenance, listing, root)
             self.assertEqual(set(combined), {'omg', 'omgd',
                 'harness:omg::debian_e2e_tests', 'harness:omg::cli_comprehensive',
-                'harness:omg::e2e_runtime_management', 'harness:omg::env_lockfile_integrity'})
+                'harness:omg::e2e_runtime_management', 'harness:omg::env_lockfile_integrity',
+                'harness:omg::security_daemon_optional'})
             missing = copy.deepcopy(listing)
+            ambiguous = copy.deepcopy(listing)
+            ambiguous['rust-suites']['omg::cli_comprehensive::system_tests'] = dict(
+                listing['rust-suites']['omg::cli_comprehensive'])
+            with self.assertRaisesRegex(ValueError, 'ambiguous identity'):
+                NATIVE.mapped_behavior_subjects(manifest, provenance, ambiguous, root)
             del missing['rust-suites']['omg::cli_comprehensive']
             with self.assertRaisesRegex(ValueError, 'missing owning'):
                 NATIVE.mapped_behavior_subjects(manifest, provenance, missing, root)
@@ -355,6 +387,15 @@ class NativeReceipts(unittest.TestCase):
         mapped = [contract for contract in manifest['contracts']
                   if any(binding['lane'] == 'native-cli-fixture' for binding in contract['tests'])]
         self.assertEqual({contract['id'] for contract in mapped}, {
+            'omg.config.validate.access-error.fixture',
+            'omg.config.reset.linked-backup.fixture',
+            'omg.config.reset.backup.fixture',
+            'omg.config.set.persistence.fixture',
+            'omg.audit.sbom.empty-recovery.fixture',
+            'omg.audit.verify.integrity.fixture',
+            'omg.audit.policy.configuration.fixture',
+            'omg.audit.scan.empty-recovery.fixture',
+            'omg.audit.fix.empty-recovery.fixture',
             'omg.status.fixture', 'omg.status.json.fixture', 'omg.install.consent.fixture',
             'omg.search.records.fixture', 'omg.search.query.fixture',
             'omg.search.limit.fixture', 'omg.search.json.fixture',
@@ -393,15 +434,15 @@ class NativeReceipts(unittest.TestCase):
         common_debian = {'debian_tests', 'debian_daemon_tests', 'debian_ipc_tests',
                          'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests'}
         for features, expected in (
-            ('pgp,license', set()), ('arch,pgp,license', set()),
-            ('debian,pgp,license', common_debian),
+            ('pgp,license', set()), ('arch,pgp,license', {'security_daemon_optional'}),
+            ('debian,pgp,license', common_debian | {'security_daemon_optional'}),
             ('debian-pure', common_debian | {'debian_pure_integration'}),
-            ('fedora,pgp,license', {'fedora_tests'}),
+            ('fedora,pgp,license', {'fedora_tests', 'security_daemon_optional'}),
         ):
             with self.subTest(features=features):
                 args = NATIVE.cargo_test_args(features)
                 tests = {args[index + 1] for index, value in enumerate(args) if value == '--test'}
-                shared = {'cli_surface', 'git_hooks_contract', 'coverage_18',
+                shared = {'cli_surface', 'git_hooks_contract', 'coverage_10', 'coverage_18',
                           'e2e_runtime_management', 'env_lockfile_integrity'}
                 if set(features.split(',')) & {'arch', 'debian', 'debian-pure', 'fedora'}:
                     shared.add('cli_comprehensive')

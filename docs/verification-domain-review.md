@@ -234,3 +234,40 @@ isolated Rust fixture asserts successful scanning of its empty mock inventory.
 Neither is admitted as populated native scan coverage. Deterministic native
 repository fixtures, daemon parity, exports, and remaining scan surfaces still
 require verification before the beta feature is considered complete.
+
+## Configuration persistence, reset and inspection
+
+Four real CLI tests now exercise isolated configuration as an unprivileged user.
+They passed locally on Arch, Debian, Ubuntu and Fedora; this is not an exact-head
+hosted attestation or a complete review of the configuration surface.
+
+| Test in `cli_comprehensive::system_tests` | Observed assertions |
+| --- | --- |
+| `config_values_round_trip_and_rejected_writes_preserve_state` | Six writable keys persist and read back exactly; invalid boolean, zero concurrency, invalid number and unknown key fail without changing configuration bytes; validation remains read-only. |
+| `config_reset_preserves_backup_and_refuses_backup_failure` | Missing configuration creates nothing; an obstructing backup directory causes refusal without changing configuration or its sentinel; removing the obstruction permits reset, preserves original backup bytes and restores default concurrency. |
+| `config_reset_backup_never_overwrites_a_linked_external_file` | Pre-existing backup symlinks and hard links cannot redirect writes into unrelated files; the replacement is a regular file with original configuration bytes and mode 0600. |
+| `config_access_errors_never_report_missing_or_valid_defaults` | Inaccessible parent directories cause explicit permission errors in validate and reset; neither command claims missing/default success or changes stored state; validation recovers after permissions are restored. |
+
+The tests exposed two product defects. [Issue #456](https://github.com/omg-cli/omg/issues/456)
+records backup write-through caused by `std::fs::copy`; reset now uses the existing
+atomic private-file writer. [Issue #457](https://github.com/omg-cli/omg/issues/457)
+records inspection errors coerced to missing-file success by `Path::exists`;
+validate and reset now propagate `try_exists` errors. Both regressions failed
+against the original behavior before their fixes passed locally.
+
+Rust documents [copy's overwrite semantics](https://doc.rust-lang.org/std/fs/fn.copy.html)
+and [the distinction between exists and try_exists](https://doc.rust-lang.org/std/path/struct.Path.html#method.try_exists).
+The fixes do not claim parent-directory race resistance or solve every symlink policy.
+
+Open requirements include interactive consent/cancellation, concurrent writes and
+reset, all value boundaries, privileged configuration inheritance, disk exhaustion,
+crash recovery and the remaining settings fields. Existing provisional gaps stay
+open. Contract bindings admit only the assertions above; no global inventory review
+flag or 95% claim is changed.
+
+
+## QEMU issue recovery race checks (2026-09-21)
+
+Added reporter-main fixtures that follow API identity checks, archive parsing, result projection and the actual issue-helper invocation boundary. Current-main success must deliver both the case PASS and workflow recovery; stale-main success delivers neither. Advancing main during download preserves an observed failure but removes all recovery claims. Changing the run attempt during download aborts before any helper mutation.
+
+All 31 reporting tests pass. In-memory negative controls disabled the main-SHA guards, the post-download SHA guard, and the post-download attempt validation separately; the corresponding three behavioral assertions failed (not fixture errors). Production reporting semantics are unchanged, including PASS with a nonzero observed exit for a verified expected-rejection case. These checks protect failure history but are not additional OMG CLI behavioral coverage.

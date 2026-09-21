@@ -502,6 +502,7 @@ impl TargetExpectations {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Assertion {
     AuditSourceFailure,
+    SbomSourceFailure,
     JsonStdout,
     Artifact(String),
     WorkspaceFilteredOutput,
@@ -514,6 +515,7 @@ impl Assertion {
     fn parse(raw: &str, line_number: usize) -> Self {
         match raw {
             "audit-source-failure" => Self::AuditSourceFailure,
+            "sbom-source-failure" => Self::SbomSourceFailure,
             "json-stdout" => Self::JsonStdout,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
@@ -1151,12 +1153,50 @@ fn behavior_inventory_runs_in_hermetic_state() {
             .expect("write CLI behavior index row");
             continue;
         }
+        // Account behavior is unavailable without the license feature. Verify
+        // that refusal, but never label it as a successful account operation.
+        if !cfg!(feature = "license") && case.args.first().is_some_and(|arg| arg == "account") {
+            let args: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
+            let result = project.run(&args);
+            let refused = result.exit_code == 2
+                && result.stdout.is_empty()
+                && result.stderr.contains("unrecognized subcommand 'account'");
+            let verdict = if refused {
+                "unavailable-feature"
+            } else {
+                "fail"
+            };
+            if !refused {
+                failures.push(format!(
+                    "{}: license-disabled account was not explicitly refused",
+                    case.id
+                ));
+            }
+            writeln!(
+                index,
+                "{}\t{command}\t{}\t2\t{}\t{}\t{}\t-\tlicense-disabled\t{verdict}",
+                case.id,
+                case.safety.as_str(),
+                result.exit_code,
+                result.stdout.len(),
+                result.stderr.len()
+            )
+            .expect("write unavailable feature row");
+            if let Some(dir) = &evidence_dir {
+                std::fs::write(dir.join(format!("{:03}-{}.txt", number + 1, case.id)),
+                    format!("command: {command}\nux_verdict: {verdict}\n--- stdout ---\n{}\n--- stderr ---\n{}", result.stdout, result.stderr))
+                    .expect("write unavailable feature transcript");
+            }
+            continue;
+        }
         // The hermetic fixture always runs the arch mock backend, so the
         // arch expectation governs here; release lanes resolve their own.
         // Native offline guests have installed packages and must refuse an
         // unavailable advisory source. This fixture has an empty mock inventory,
         // so its distinct contract is a completed empty scan with exit zero.
-        let expected_exit = if case.assertions.contains(&Assertion::AuditSourceFailure) {
+        let expected_exit = if case.assertions.contains(&Assertion::AuditSourceFailure)
+            || case.assertions.contains(&Assertion::SbomSourceFailure)
+        {
             0
         } else {
             case.expected_exit
@@ -1211,6 +1251,22 @@ fn behavior_inventory_runs_in_hermetic_state() {
         }
         for assertion in &case.assertions {
             match assertion {
+                Assertion::SbomSourceFailure => {
+                    let report = std::fs::read_to_string(project.path().join("sbom.json"))
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+                    if !report.is_some_and(|report| {
+                        report["bomFormat"] == "CycloneDX"
+                            && report["components"].as_array().is_some_and(Vec::is_empty)
+                            && report
+                                .get("vulnerabilities")
+                                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+                    }) {
+                        issues.push(
+                            "empty-inventory SBOM was not a valid empty CycloneDX report".into(),
+                        );
+                    }
+                }
                 Assertion::AuditSourceFailure => {
                     assert!(
                         audit_success.is_some(),
@@ -1817,6 +1873,152 @@ mod security_tests {
 
 mod system_tests {
     use super::*;
+
+    #[test]
+    fn config_access_errors_never_report_missing_or_valid_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = TestProject::new();
+        project
+            .run(&["config", "set", "aur.build_concurrency", "2"])
+            .assert_success();
+        let config = project.config_dir.path().join("config.toml");
+        let original = std::fs::read(&config).unwrap();
+        std::fs::set_permissions(
+            project.config_dir.path(),
+            std::fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        let validate = project.run(&["config", "validate"]);
+        let reset = project.run(&["config", "reset", "--yes"]);
+        std::fs::set_permissions(
+            project.config_dir.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        for result in [validate, reset] {
+            result.assert_failure();
+            assert!(
+                result.stderr.to_lowercase().contains("permission denied"),
+                "{}",
+                result.stderr
+            );
+            assert!(!result.stdout.contains("using defaults"));
+            assert!(!result.stdout.contains("No config file"));
+        }
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(
+            !project
+                .config_dir
+                .path()
+                .join("config.toml.backup")
+                .exists()
+        );
+        project.run(&["config", "validate"]).assert_success();
+        project.close_checked();
+    }
+
+    #[test]
+    fn config_reset_backup_never_overwrites_a_linked_external_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for symbolic in [true, false] {
+            let project = TestProject::new();
+            let config = project.config_dir.path().join("config.toml");
+            let backup = project.config_dir.path().join("config.toml.backup");
+            let outside = tempfile::tempdir().unwrap();
+            let sentinel = outside.path().join("unrelated-file");
+            std::fs::write(&sentinel, b"unrelated data").unwrap();
+            project
+                .run(&["config", "set", "aur.build_concurrency", "2"])
+                .assert_success();
+            let original = std::fs::read(&config).unwrap();
+            if symbolic {
+                symlink(&sentinel, &backup).unwrap();
+            } else {
+                std::fs::hard_link(&sentinel, &backup).unwrap();
+            }
+            project.run(&["config", "reset", "--yes"]).assert_success();
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unrelated data");
+            assert_eq!(std::fs::read(&backup).unwrap(), original);
+            let metadata = std::fs::symlink_metadata(&backup).unwrap();
+            assert!(metadata.is_file());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            project.close_checked();
+            outside.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn config_reset_preserves_backup_and_refuses_backup_failure() {
+        let project = TestProject::new();
+        let config = project.config_dir.path().join("config.toml");
+        let backup = project.config_dir.path().join("config.toml.backup");
+        project.run(&["config", "reset", "--yes"]).assert_success();
+        assert!(!config.exists() && !backup.exists());
+        project
+            .run(&["config", "set", "aur.build_concurrency", "2"])
+            .assert_success();
+        let original = std::fs::read(&config).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("sentinel"), b"keep").unwrap();
+        let refused = project.run(&["config", "reset", "--yes"]);
+        refused.assert_failure();
+        assert!(!refused.stdout.contains("Configuration reset to defaults"));
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert_eq!(std::fs::read(backup.join("sentinel")).unwrap(), b"keep");
+        std::fs::remove_file(backup.join("sentinel")).unwrap();
+        std::fs::remove_dir(&backup).unwrap();
+        project.run(&["config", "reset", "--yes"]).assert_success();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let reset = std::fs::read_to_string(&config).unwrap();
+        let parsed: toml::Value = toml::from_str(&reset).unwrap();
+        assert_eq!(parsed["aur"]["build_concurrency"].as_integer(), Some(1));
+        project.run(&["config", "validate"]).assert_success();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        project.close_checked();
+    }
+
+    #[test]
+    fn config_values_round_trip_and_rejected_writes_preserve_state() {
+        let project = TestProject::new();
+        let config = project.config_dir.path().join("config.toml");
+        for (key, value) in [
+            ("telemetry.enabled", "false"),
+            ("aur.build_concurrency", "2"),
+            ("aur.enable_ccache", "true"),
+            ("aur.enable_sccache", "false"),
+            ("aur.secure_makepkg", "true"),
+            ("aur.makeflags", "-j2"),
+        ] {
+            project
+                .run(&["config", "set", key, "--", value])
+                .assert_success();
+            let read = project.run(&["config", "get", key]);
+            read.assert_success();
+            assert_eq!(read.stdout.trim(), value, "wrong stored value for {key}");
+        }
+        let before = std::fs::read(&config).expect("persisted configuration");
+        for (key, value, diagnostic) in [
+            ("telemetry.enabled", "perhaps", "Invalid boolean"),
+            ("aur.build_concurrency", "0", "concurrency"),
+            ("aur.build_concurrency", "many", "Invalid number"),
+            ("unknown.setting", "true", "Unknown config key"),
+        ] {
+            let rejected = project.run(&["config", "set", key, value]);
+            rejected.assert_failure();
+            assert!(rejected.stderr.contains(diagnostic), "{}", rejected.stderr);
+            assert_eq!(
+                std::fs::read(&config).unwrap(),
+                before,
+                "rejected {key} changed config"
+            );
+        }
+        let read = project.run(&["config", "get", "aur.build_concurrency"]);
+        read.assert_success();
+        assert_eq!(read.stdout.trim(), "2");
+        project.run(&["config", "validate"]).assert_success();
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        project.close_checked();
+    }
 
     #[test]
     fn test_doctor_help() {

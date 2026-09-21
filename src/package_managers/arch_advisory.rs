@@ -2,7 +2,7 @@
 //! introduced-version boundary; installed packages remain candidates until
 //! the published fix is installed (the arch-audit comparison model).
 use anyhow::{Context, Result, ensure};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use super::types::{SecurityPackage, parse_version};
 
@@ -18,7 +18,21 @@ pub(crate) fn audit_result(
 ) -> Result<SecurityAuditResult> {
     ensure!(!advisories.is_empty(), "Arch advisory feed is empty");
     let mut groups: BTreeMap<String, Vec<Vulnerability>> = BTreeMap::new();
+    let mut identities = HashSet::new();
     for advisory in advisories {
+        ensure!(
+            !advisory.name.trim().is_empty()
+                && !advisory.packages.is_empty()
+                && advisory.packages.iter().all(|name| !name.trim().is_empty())
+                && !advisory.issues.is_empty()
+                && advisory.issues.iter().all(|id| !id.trim().is_empty()),
+            "Incomplete Arch advisory identity"
+        );
+        ensure!(
+            identities.insert(&advisory.name),
+            "Duplicate Arch advisory identity: {}",
+            advisory.name
+        );
         ensure!(
             matches!(
                 advisory.status.as_str(),
@@ -38,23 +52,24 @@ pub(crate) fn audit_result(
             "Unknown" => AdvisorySeverity::Unspecified,
             _ => anyhow::bail!("Unknown Arch advisory severity for {}", advisory.name),
         };
-        ensure!(
-            !advisory.name.is_empty()
-                && !advisory.packages.is_empty()
-                && !advisory.issues.is_empty(),
-            "Incomplete Arch advisory identity"
-        );
+        // Validate independently of installed matches: candidate cache admission
+        // calls this with an empty inventory before retaining the whole feed.
+        let fixed = advisory
+            .fixed
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_version(value).context("Invalid Arch advisory fixed version"))
+            .transpose()?;
         for package in installed
             .iter()
             .filter(|package| advisory.packages.contains(&package.name))
         {
             let version =
                 parse_version(&package.version).context("Invalid installed Arch version")?;
-            if let Some(fixed) = advisory.fixed.as_deref().filter(|value| !value.is_empty()) {
-                let fixed = parse_version(fixed).context("Invalid Arch advisory fixed version")?;
-                if version >= fixed {
-                    continue;
-                }
+            if let Some(fixed) = &fixed
+                && &version >= fixed
+            {
+                continue;
             }
             let references = advisory
                 .issues
@@ -106,6 +121,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blank_advisory_identifiers_cannot_be_admitted_as_clean_evidence() {
+        let valid: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-test","packages":["fixture"],"status":"Vulnerable","severity":"High","affected":"1.0-1","fixed":null,"issues":["CVE-test"],"type":"code execution"}"#).unwrap();
+        for status in ["Vulnerable", "Not affected"] {
+            for field in ["name", "packages", "issues"] {
+                let mut invalid = valid.clone();
+                invalid.status = status.into();
+                match field {
+                    "name" => invalid.name = " ".into(),
+                    "packages" => invalid.packages.push(String::new()),
+                    "issues" => invalid.issues.push(" ".into()),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    audit_result(&[], &[invalid]).is_err(),
+                    "blank {field} in {status} feed must fail before cache admission"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_severity_and_unpublished_fix_do_not_invent_safety_or_scores() {
+        let mut advisory: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-test","packages":["fixture"],"status":"Unknown","severity":"Unknown","affected":"1.0-1","fixed":null,"issues":["CVE-test"]}"#).unwrap();
+        let installed = [SecurityPackage {
+            name: "fixture".into(),
+            version: "3.0-1".into(),
+            architecture: Some("x86_64".into()),
+            description: String::new(),
+            licenses: vec![],
+        }];
+        let result = audit_result(&installed, std::slice::from_ref(&advisory)).unwrap();
+        assert_eq!(result.total_vulnerabilities, 1);
+        assert_eq!(result.high_severity, 0);
+        let finding = &result.vulnerabilities[0].1[0];
+        assert!(finding.score.is_none());
+        assert_eq!(
+            finding.advisory_severity,
+            Some(AdvisorySeverity::Unspecified)
+        );
+        assert_eq!(finding.affected_installed[0].version, "3.0-1");
+        advisory.status = "Not affected".into();
+        assert_eq!(
+            audit_result(&installed, std::slice::from_ref(&advisory))
+                .unwrap()
+                .total_vulnerabilities,
+            0
+        );
+        advisory.status = "Vulnerable".into();
+        advisory.severity = "Unexpected".into();
+        assert!(audit_result(&installed, std::slice::from_ref(&advisory)).is_err());
+        advisory.severity = "Low".into();
+        advisory.packages = vec!["different-package".into()];
+        assert_eq!(
+            audit_result(&installed, std::slice::from_ref(&advisory))
+                .unwrap()
+                .total_vulnerabilities,
+            0
+        );
+        advisory.issues.clear();
+        assert!(audit_result(&installed, &[advisory]).is_err());
+    }
+
+    #[test]
     fn fixed_advisory_binds_only_older_installed_identity() {
         let advisory: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-test","packages":["fixture"],"status":"Fixed","severity":"High","affected":"2.0-1","fixed":"2.0-2","issues":["CVE-test"],"type":"code execution"}"#).unwrap();
         let package = |version: &str| SecurityPackage {
@@ -116,9 +194,21 @@ mod tests {
             licenses: vec![],
         };
         let installed = vec![package("1:1.0-1"), package("2.0-2"), package("1.0-1")];
+        assert!(
+            audit_result(
+                &[package("invalid version")],
+                std::slice::from_ref(&advisory)
+            )
+            .is_err(),
+            "malformed installed versions must fail the audit, not silently skip a finding"
+        );
         let result = audit_result(&installed, std::slice::from_ref(&advisory)).unwrap();
         assert_eq!(result.total_vulnerabilities, 1);
         assert_eq!(result.high_severity, 1);
+        assert!(
+            audit_result(&installed, &[advisory.clone(), advisory.clone()]).is_err(),
+            "duplicate advisory identities must not inflate findings"
+        );
         let finding = &result.vulnerabilities[0].1[0];
         assert_eq!(finding.affected_installed[0].version, "1.0-1");
         assert_eq!(
@@ -132,6 +222,10 @@ mod tests {
         );
         let mut invalid = advisory.clone();
         invalid.fixed = Some("invalid version".into());
+        assert!(
+            audit_result(&[], std::slice::from_ref(&invalid)).is_err(),
+            "cache admission must reject malformed fixed versions without installed matches"
+        );
         assert!(audit_result(&installed, &[invalid]).is_err());
         let mut unknown = advisory;
         unknown.status = "Unexpected".into();

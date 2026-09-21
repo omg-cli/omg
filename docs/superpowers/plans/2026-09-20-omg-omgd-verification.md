@@ -12,12 +12,15 @@
 
 ## Global constraints
 
-- One PR: all work remains on `codex/ci-qemu-reliability`, PR #440.
-- First finish #440's combined validation and record cold/warm costs.
+- The user subsequently approved splitting PR #440 into reviewable dependency-ordered PRs and merging each validated slice. Preserve prerequisite ancestry and require fresh checks before each merge.
+- Complete combined validation of the integrated result and record cold/warm costs; a passing intermediate slice does not establish completion of this plan.
+- Use focused Daybreak model reviews when useful; do not run a Daybreak or Codex Security scan (explicit user restriction).
+- During refactoring, remove verified dead code and duplicated paths, and require tests to assert observable behavior or a specific failure. Research meaningful alternatives with Exa; alpha/beta dependencies are acceptable when evidence supports their security, performance, and maintenance tradeoffs.
 - Unsupported behavior must have refusal tests; unimplemented tests remain visible debt and cannot be counted as success.
 - Preserve existing QEMU inventory hash, exact case reconciliation and harness/product failure distinctions.
 - Critical correctness and security checks are first-failure blocking.
 - Preserve automatic detailed QEMU failure issues, recurrence tracking and authoritative verified-fix closure throughout this work.
+- Record actionable local WSL/QEMU failures as well as hosted failures, preserving environment, revision, command, expected/observed behavior, and redacted diagnostics. Link the implementing PR without closing on merge alone; retain verified recovery evidence in the issue history. Local evidence must not masquerade as hosted or current-main evidence.
 - No production accounts or secrets needed for ordinary PRs.
 - Unknown paths or failed classification select full coverage.
 - Keep the core minimal: test helpers stay in tests/scripts; no new production CLI introspection command.
@@ -262,3 +265,28 @@ Implementation requirements:
 
 Primary documentation:
 https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html
+
+### Security export parity follow-through
+
+Security is a core beta product promise. The current SBOM generator still uses
+ALSA directly, refuses Debian vulnerability matching, and excludes Fedora at
+compile time. Refactor it onto the shared scanner without losing package data:
+
+- Preserve native epoch/version/release and architecture in component identities;
+  do not substitute semver-normalized versions or merge multilib packages.
+- Keep Ubuntu and Debian distribution identity distinct. Validate PURLs against
+  the package-url definitions and CycloneDX 1.5 output against its schema.
+- Make findings reference actual exported installed components. Advisory NEVRA
+  describes the advisory package and must not replace the installed version.
+- Preserve advisory sources/references and distinguish qualitative ratings from
+  numeric CVSS. Never manufacture a score or silently drop unjoinable findings.
+- Make direct, daemon-backed and exported scanning agree; inventory changes or
+  source failures must not produce a partial successful report.
+- Preserve a previously written report when inventory/scanning fails. Add
+  empty-inventory success, corrupt-inventory refusal/recovery, populated fixture,
+  multiarch identity, schema and native distro verification. Empty mock exports
+  alone do not count as native advisory coverage.
+
+Primary references:
+https://cyclonedx.org/docs/1.5/json/
+https://github.com/package-url/purl-spec/blob/main/types/rpm-definition.json

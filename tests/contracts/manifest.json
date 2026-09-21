@@ -4,6 +4,89 @@
   "inventory_source": "Baseline compiled artifacts CI 35540033061 at e689113c; reviewed additive counter grammar from local Arch compilation; unchanged grammar verified, other owner schemas must match on hosted compilation",
   "contracts": [
     {
+      "id": "omg.config.validate.access-error.fixture",
+      "source": "src/cli/config.rs",
+      "binary": "omg",
+      "surface": "omg config validate",
+      "platforms": ["arch", "debian", "debian-trixie", "ubuntu", "fedora"],
+      "requires": ["success", "state", "fault"],
+      "critical": true,
+      "assertions": {
+        "success": ["validation-recovers-after-access-restored"],
+        "state": ["config-bytes-preserved-after-inspection-refusal", "no-backup-created-on-inspection-refusal"],
+        "fault": ["validate-and-reset-report-permission-denied", "inaccessible-config-never-reported-missing-or-default"]
+      },
+      "scope": "Unprivileged real CLI with an inaccessible isolated configuration directory. Validates explicit access-error refusal in validate and reset, unchanged bytes and recovery. This is not native package transactions evidence. Does not establish all configuration error handling, symlink policy or concurrent access semantics; broader gaps remain.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::cli_comprehensive::system_tests::config_access_errors_never_report_missing_or_valid_defaults",
+        "evidence": ["success", "state", "fault"],
+        "assertions": ["validation-recovers-after-access-restored", "config-bytes-preserved-after-inspection-refusal", "no-backup-created-on-inspection-refusal", "validate-and-reset-report-permission-denied", "inaccessible-config-never-reported-missing-or-default", "fixture-cleanup"]
+      }]
+    },
+    {
+      "id": "omg.config.reset.linked-backup.fixture",
+      "source": "src/cli/config.rs",
+      "binary": "omg",
+      "surface": "omg config reset",
+      "platforms": ["arch", "debian", "debian-trixie", "ubuntu", "fedora"],
+      "requires": ["success", "state"],
+      "critical": true,
+      "assertions": {
+        "success": ["reset-succeeds-with-existing-linked-backup"],
+        "state": ["symlink-target-bytes-preserved", "hardlink-target-bytes-preserved", "backup-is-regular-owner-only-file", "backup-matches-original-configuration"]
+      },
+      "scope": "Unprivileged real CLI with isolated configuration and external sentinel files. Covers replacement of pre-existing backup symlinks and hard links without changing their targets, exact backup bytes and mode 0600. This is not native package transactions evidence. Does not claim parent-directory race safety, concurrent reset/write or crash recovery; broader gaps remain.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::cli_comprehensive::system_tests::config_reset_backup_never_overwrites_a_linked_external_file",
+        "evidence": ["success", "state"],
+        "assertions": ["reset-succeeds-with-existing-linked-backup", "symlink-target-bytes-preserved", "hardlink-target-bytes-preserved", "backup-is-regular-owner-only-file", "backup-matches-original-configuration", "fixture-cleanup"]
+      }]
+    },
+    {
+      "id": "omg.config.reset.backup.fixture",
+      "source": "src/cli/config.rs",
+      "binary": "omg",
+      "surface": "omg config reset",
+      "platforms": ["arch", "debian", "debian-trixie", "ubuntu", "fedora"],
+      "requires": ["success", "state", "fault"],
+      "critical": true,
+      "assertions": {
+        "success": ["reset-restores-default-concurrency", "reset-configuration-validates"],
+        "state": ["absent-config-reset-creates-nothing", "backup-preserves-original-bytes", "backup-directory-sentinel-preserved"],
+        "fault": ["backup-failure-refuses-without-success-message", "failed-reset-preserves-config", "reset-recovers-after-backup-obstruction-removal"]
+      },
+      "scope": "Unprivileged daemon-disabled real CLI with isolated configuration. Covers reset --yes, absent configuration, original-byte backup and refusal/recovery when a directory obstructs backup creation. This is not native package transactions evidence. Does not cover interactive confirmation, concurrent reset/write, backup symlinks, disk exhaustion or every default field; broader gaps remain.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::cli_comprehensive::system_tests::config_reset_preserves_backup_and_refuses_backup_failure",
+        "evidence": ["success", "state", "fault"],
+        "assertions": ["reset-restores-default-concurrency", "reset-configuration-validates", "absent-config-reset-creates-nothing", "backup-preserves-original-bytes", "backup-directory-sentinel-preserved", "backup-failure-refuses-without-success-message", "failed-reset-preserves-config", "reset-recovers-after-backup-obstruction-removal", "fixture-cleanup"]
+      }]
+    },
+    {
+      "id": "omg.config.set.persistence.fixture",
+      "source": "src/cli/config.rs",
+      "binary": "omg",
+      "surface": "omg config set",
+      "platforms": ["arch", "debian", "debian-trixie", "ubuntu", "fedora"],
+      "requires": ["success", "state", "fault"],
+      "critical": true,
+      "assertions": {
+        "success": ["six-writable-settings-round-trip", "stored-configuration-validates"],
+        "state": ["rejected-writes-preserve-config-bytes", "validation-preserves-config-bytes"],
+        "fault": ["invalid-boolean-number-zero-and-unknown-key-refused", "valid-read-after-rejections"]
+      },
+      "scope": "Real daemon-disabled CLI with isolated configuration and unprivileged execution. Covers six writable settings, exact read-back, invalid writes, unchanged bytes and subsequent validation. This is not native package transactions evidence. Does not cover concurrent writers, privileged configuration inheritance, reset backups, filesystem failures or all accepted and rejected value boundaries; broader gaps remain.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::cli_comprehensive::system_tests::config_values_round_trip_and_rejected_writes_preserve_state",
+        "evidence": ["success", "state", "fault"],
+        "assertions": ["six-writable-settings-round-trip", "stored-configuration-validates", "rejected-writes-preserve-config-bytes", "validation-preserves-config-bytes", "invalid-boolean-number-zero-and-unknown-key-refused", "valid-read-after-rejections", "fixture-cleanup"]
+      }]
+    },
+    {
       "id": "omg.search.command.parser",
       "source": "src/cli/args.rs",
       "binary": "omg",
@@ -3122,6 +3205,284 @@
             "corrupt-inventory-exact-internal-error-not-clean-scan",
             "corrupt-inventory-preserved-and-daemon-responds",
             "three-audit-requests-counted-and-repaired-state-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.audit.sbom.empty-recovery.fixture",
+      "source": "src/cli/security.rs",
+      "binary": "omg",
+      "surface": "omg audit sbom",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "fault"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "empty-inventory-cyclonedx-export",
+          "recovery-after-inventory-repair"
+        ],
+        "state": [
+          "failed-export-preserves-existing-report",
+          "corrupt-inventory-unchanged"
+        ],
+        "fault": [
+          "corrupt-inventory-explicit-failure"
+        ]
+      },
+      "scope": "Daemon-disabled debug CLI with isolated mock package inventory: empty export, corrupt inventory failure, previous report preservation and recovery. Does not certify populated native inventory, advisory fetching, score accuracy or daemon transport. This is not native package transactions evidence.",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::security_daemon_optional::sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure",
+          "evidence": [
+            "success",
+            "state",
+            "fault"
+          ],
+          "assertions": [
+            "empty-inventory-cyclonedx-export",
+            "recovery-after-inventory-repair",
+            "failed-export-preserves-existing-report",
+            "corrupt-inventory-unchanged",
+            "corrupt-inventory-explicit-failure",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.audit.scan.empty-recovery.fixture",
+      "source": "src/cli/security.rs",
+      "binary": "omg",
+      "surface": "omg audit scan",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "fault"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "empty-inventory-success",
+          "recovery-after-inventory-repair"
+        ],
+        "state": [
+          "corrupt-inventory-unchanged",
+          "repaired-inventory-unchanged"
+        ],
+        "fault": [
+          "corrupt-inventory-explicit-failure",
+          "failure-does-not-report-clean"
+        ]
+      },
+      "scope": "Daemon-disabled debug CLI with isolated empty mock package inventory; audit scan succeeds, rejects corrupt inventory without claiming a clean scan, preserves corrupt state, and recovers after repair. Does not certify populated native advisory matching, fetching, scoring, or actual remediation. This is not native package transactions evidence.",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::security_daemon_optional::security_scan_without_daemon_preserves_inventory_errors_and_recovers",
+          "evidence": [
+            "success",
+            "state",
+            "fault"
+          ],
+          "assertions": [
+            "empty-inventory-success",
+            "recovery-after-inventory-repair",
+            "corrupt-inventory-unchanged",
+            "repaired-inventory-unchanged",
+            "corrupt-inventory-explicit-failure",
+            "failure-does-not-report-clean",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.audit.fix.empty-recovery.fixture",
+      "source": "src/cli/security.rs",
+      "binary": "omg",
+      "surface": "omg audit fix",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "fault"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "empty-inventory-success",
+          "recovery-after-inventory-repair"
+        ],
+        "state": [
+          "corrupt-inventory-unchanged",
+          "repaired-inventory-unchanged"
+        ],
+        "fault": [
+          "corrupt-inventory-explicit-failure",
+          "failure-does-not-report-clean"
+        ]
+      },
+      "scope": "Daemon-disabled debug CLI with isolated empty mock package inventory; audit fix --dry-run succeeds, rejects corrupt inventory without claiming a clean scan, preserves corrupt state, and recovers after repair. Does not certify populated native advisory matching, fetching, scoring, or actual remediation. This is not native package transactions evidence.",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::security_daemon_optional::security_scan_without_daemon_preserves_inventory_errors_and_recovers",
+          "evidence": [
+            "success",
+            "state",
+            "fault"
+          ],
+          "assertions": [
+            "empty-inventory-success",
+            "recovery-after-inventory-repair",
+            "corrupt-inventory-unchanged",
+            "repaired-inventory-unchanged",
+            "corrupt-inventory-explicit-failure",
+            "failure-does-not-report-clean",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.audit.verify.integrity.fixture",
+      "source": "src/cli/security.rs",
+      "binary": "omg",
+      "surface": "omg audit verify",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "fault"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "valid-local-chain",
+          "recovery-after-marker-removal"
+        ],
+        "state": [
+          "valid-log-unchanged",
+          "tampered-log-unchanged",
+          "incomplete-marker-unchanged",
+          "malformed-log-bytes-unchanged"
+        ],
+        "fault": [
+          "tampered-chain-specific-rejection",
+          "incomplete-collection-specific-rejection",
+          "truncated-json-and-invalid-utf8-rejection"
+        ]
+      },
+      "scope": "Daemon-disabled CLI against an isolated real audit log generated by AuditLogger. Verifies local chain consistency, tampering and malformed-log rejection, incomplete collection refusal, unchanged bytes and recovery. Does not authenticate history, prove completeness without the marker, or cover rotated logs or concurrent writers. This is not native package transactions evidence.",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::security_daemon_optional::audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_history",
+          "evidence": [
+            "success",
+            "state",
+            "fault"
+          ],
+          "assertions": [
+            "valid-local-chain",
+            "recovery-after-marker-removal",
+            "valid-log-unchanged",
+            "tampered-log-unchanged",
+            "incomplete-marker-unchanged",
+            "tampered-chain-specific-rejection",
+            "incomplete-collection-specific-rejection",
+            "fixture-cleanup",
+            "malformed-log-bytes-unchanged",
+            "truncated-json-and-invalid-utf8-rejection"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.audit.policy.configuration.fixture",
+      "source": "src/cli/security.rs",
+      "binary": "omg",
+      "surface": "omg audit policy",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "fault"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "default-policy-output",
+          "configured-policy-output",
+          "recovery-after-policy-repair"
+        ],
+        "state": [
+          "missing-policy-not-created",
+          "configured-policy-unchanged",
+          "corrupt-policy-bytes-unchanged"
+        ],
+        "fault": [
+          "malformed-toml-and-invalid-utf8-rejected",
+          "no-default-grade-on-corruption"
+        ]
+      },
+      "scope": "Daemon-disabled real CLI with isolated configuration. Covers default and configured policy output, malformed TOML and invalid UTF-8 refusal, unchanged policy bytes and recovery. This is not native package transactions evidence and does not prove inherited privileged policy, license decisions, or concurrent updates. Broader behavioral gaps remain.",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::security_daemon_optional::audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_it",
+          "evidence": [
+            "success",
+            "state",
+            "fault"
+          ],
+          "assertions": [
+            "default-policy-output",
+            "configured-policy-output",
+            "recovery-after-policy-repair",
+            "missing-policy-not-created",
+            "configured-policy-unchanged",
+            "corrupt-policy-bytes-unchanged",
+            "malformed-toml-and-invalid-utf8-rejected",
+            "no-default-grade-on-corruption",
             "fixture-cleanup"
           ]
         }

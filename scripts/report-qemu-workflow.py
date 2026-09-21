@@ -145,9 +145,12 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                     candidates = [parent / "rows" / f"{case}{suffix}.log"
                                   for suffix in (".stderr", "", ".stdout")]
                 elif case in ("lifecycle", "aarch64-lifecycle"):
-                    candidates = [parent / "guest-check.log"]
+                    candidates = [parent / name for name in (
+                        "health-validation.log", "transactions.log",
+                        "transaction-validation.log", "guest-check.log", "boot.log")]
                 else:
                     candidates = []
+                excerpts = []
                 for candidate in candidates:
                     member = members_by_name.get(str(candidate))
                     if member is None or member.file_size > 8 * 1024 * 1024:
@@ -155,8 +158,16 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                     raw = archive.read(member)
                     if not raw.strip():
                         continue
-                    diagnostics[key] = diagnostic_excerpt(raw)
-                    break
+                    excerpts.append((candidate.name, diagnostic_excerpt(raw)))
+                    if parent.name == "inventory":
+                        break
+                if excerpts:
+                    # Keep every selected stage visible within the existing
+                    # issue budget. Redaction happens before truncation.
+                    budget = (1300 - sum(len(name) + 4 for name, _ in excerpts)) // len(excerpts)
+                    diagnostics[key] = "\n".join(
+                        f"[{name}]\n" + excerpt.encode("utf-8")[-budget:].decode("utf-8", errors="ignore")
+                        for name, excerpt in excerpts)
     return rows
 
 

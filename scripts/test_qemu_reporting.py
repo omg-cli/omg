@@ -88,6 +88,24 @@ class ReportingBoundaryTests(unittest.TestCase):
                             {row["case_id"]}, diagnostics)
         self.assertEqual(diagnostics, {})
 
+    def test_lifecycle_failure_includes_later_stage_errors_after_guest_pass(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/results.json", json.dumps([row]))
+            archive.writestr("run-a/guest-check.log", "PASS: package lifecycle")
+            archive.writestr("run-a/transactions.log", "clone failed to become ready")
+            archive.writestr("run-a/health-validation.log", "SSH connection refused")
+            archive.writestr("run-b/transactions.log", "unrelated private output")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        excerpt = diagnostics[(row["case_id"], "arch")]
+        self.assertIn("clone failed to become ready", excerpt)
+        self.assertIn("SSH connection refused", excerpt)
+        self.assertIn("transactions.log", excerpt)
+        self.assertNotIn("unrelated private output", excerpt)
+        self.assertLessEqual(len(excerpt.encode("utf-8")), 1400)
+
     def test_transaction_receipts_do_not_poison_case_reporting(self):
         output = io.BytesIO()
         case = self.row("PASS")
@@ -193,7 +211,7 @@ class ReportingBoundaryTests(unittest.TestCase):
 
     def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
                            corrupt=False, expired=False, helper_fails=False, case_log=None,
-                           log_case="search"):
+                           log_case="search", main_shas=None, changed_attempt=False):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=".github/workflows/qemu-matrix.yml",
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -208,15 +226,22 @@ class ReportingBoundaryTests(unittest.TestCase):
                 archive.writestr(f"run/inventory/rows/{log_case}.stderr.log", case_log)
         payload = output.getvalue()
         calls = []
+        main_refs = iter(main_shas or [run["head_sha"], run["head_sha"]])
+        run_reads = 0
         def api(path, *args):
+            nonlocal run_reads
             if path.endswith("/actions/runs/10"):
-                return json.dumps(run)
+                run_reads += 1
+                current = dict(run)
+                if changed_attempt and run_reads > 1:
+                    current["run_attempt"] += 1
+                return json.dumps(current)
             if "/artifacts?" in path:
                 return json.dumps(dict(total_count=1, artifacts=[artifact]))
             if path.endswith("/artifacts/30/zip"):
                 return payload
             if path.endswith("/git/ref/heads/main"):
-                return json.dumps(dict(object=dict(sha=run["head_sha"])))
+                return json.dumps(dict(object=dict(sha=next(main_refs))))
             if "/jobs?" in path:
                 return json.dumps(dict(jobs=[]))
             self.fail(f"unexpected API request: {path}")
@@ -235,13 +260,46 @@ class ReportingBoundaryTests(unittest.TestCase):
                  patch.object(REPORT, "api", side_effect=api), \
                  patch.object(REPORT, "canonical_case_ids", return_value={row["case_id"] for row in rows}), \
                  patch.object(REPORT.subprocess, "run", side_effect=subprocess_run):
-                if helper_fails:
+                if changed_attempt:
+                    with self.assertRaisesRegex(ValueError, "identity or attempt mismatch"):
+                        REPORT.main()
+                elif helper_fails:
                     with self.assertRaises(REPORT.subprocess.CalledProcessError):
                         REPORT.main()
                 else:
                     self.assertEqual(REPORT.main(), 0)
             catalog_path = path / "qemu-issue-report/failures.json"
             return calls, json.loads(catalog_path.read_text()) if catalog_path.exists() else None
+
+    def test_current_main_success_sends_case_and_workflow_recovery_to_helper(self):
+        row = self.row("PASS")
+        calls, catalog = self.run_report_fixture([row], conclusion="success")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "scripts/qa-file-issue.sh")
+        self.assertEqual(calls[0][1], [row, dict(
+            case_id="qemu-matrix-workflow", distro="ubuntu", result="PASS",
+            exit_code=0, elapsed_seconds=0)])
+        self.assertEqual(catalog["failures"], [])
+
+    def test_stale_main_success_never_reaches_issue_helper(self):
+        calls, catalog = self.run_report_fixture(
+            [self.row("PASS")], conclusion="success", main_shas=["b" * 40, "b" * 40])
+        self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
+
+    def test_main_advancing_during_download_keeps_failures_but_blocks_recovery(self):
+        failure = self.row()
+        passed = dict(self.row("PASS"), case_id="qemu-arch-other")
+        calls, catalog = self.run_report_fixture(
+            [passed, failure], conclusion="success", main_shas=["a" * 40, "b" * 40])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], [failure])
+        self.assertEqual(catalog["failures"], [failure])
+
+    def test_new_attempt_during_download_aborts_before_any_issue_mutation(self):
+        calls, catalog = self.run_report_fixture([self.row()], changed_attempt=True)
+        self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
 
     def test_reporter_overflow_reaches_helper_and_preserves_catalog_on_api_failure(self):
         failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(26)]

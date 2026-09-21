@@ -826,18 +826,30 @@ mod daemon_start_tests {
 
     #[test]
     fn foreground_child_failure_is_an_error_not_silent_success() {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        let status = std::process::ExitStatus::from_raw(1);
-        let result = foreground_exit_result(status);
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 23"]);
+        let result = run_daemon_foreground(&mut command);
         assert!(
             result.is_err(),
             "a foreground daemon that exits nonzero must fail the CLI"
         );
         let error = result.unwrap_err().to_string();
         assert!(
-            error.contains("daemon exited"),
+            error.contains("daemon exited") && error.contains("23"),
             "error must name the daemon exit: {error}"
+        );
+    }
+
+    #[test]
+    fn foreground_signal_termination_is_an_error() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "kill -TERM $$"]);
+        let error = run_daemon_foreground(&mut command)
+            .expect_err("a terminated child must not report success")
+            .to_string();
+        assert!(
+            error.contains("daemon exited") && error.contains("signal"),
+            "{error}"
         );
     }
 
