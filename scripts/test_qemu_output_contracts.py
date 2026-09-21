@@ -89,6 +89,7 @@ class OutputContracts(unittest.TestCase):
                     self.assertIn('assertion failed: Python', logs['runtime-python-install.log'])
                 if fault == 'program-failure':
                     self.assertIn('missing-stdlib', logs['runtime-python-install.log'])
+                    self.assertIn('exit=17', logs['runtime-python-install.log'])
 
     def generated_hooks(self):
         source = (ROOT / 'src/cli/git_hooks.rs').read_text(encoding='utf-8')

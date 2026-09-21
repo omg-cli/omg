@@ -52,7 +52,7 @@ check_native_counter() {
 }
 
 check_python_install() {
-  local version=$1 base expected active executable output
+  local version=$1 base expected active executable output status=0
   base="$OMG_DATA_DIR/versions/python"
   expected="$base/$version"
   active=$(readlink -f "$base/current") || active=""
@@ -61,11 +61,11 @@ check_python_install() {
         || "$executable" != "$expected/"* || ! -f "$executable" || ! -x "$executable" ]]; then
     printf 'assertion failed: Python %s lacks an active executable inside its installed version\n' "$version" >&2; return 1
   fi
-  if ! output=$(timeout --kill-after=2s 10 "$executable" --version 2>&1) \
-      || [[ "$output" != "Python $version" ]]; then
-    printf 'assertion failed: Python executable version expected=%s observed=%s\n' "$version" "$output" >&2; return 1
+  output=$(timeout --kill-after=2s 10 "$executable" --version 2>&1) || status=$?
+  if [[ "$status" != 0 || "$output" != "Python $version" ]]; then
+    printf 'assertion failed: Python executable version expected=%s exit=%s observed=%s\n' "$version" "$status" "$output" >&2; return 1
   fi
-  if ! output=$(timeout --kill-after=2s 60 "$executable" -I - "$version" "$expected" "$base" 2>&1 <<'PY'
+  output=$(timeout --kill-after=2s 60 "$executable" -I - "$version" "$expected" "$base" 2>&1 <<'PY'
 import bz2, ctypes, gzip, hashlib, json, lzma, pathlib, sqlite3, ssl, subprocess, sys, tempfile, venv
 
 version, expected, base = sys.argv[1:]
@@ -106,8 +106,9 @@ with tempfile.TemporaryDirectory(prefix='.qemu-python-', dir=base) as temporary:
 assert not pathlib.Path(temporary).exists(), 'Python behavior fixture cleanup failed'
 print(f'OMG_PYTHON_RUNTIME_OK:{version}')
 PY
-  ) || [[ "$output" != "OMG_PYTHON_RUNTIME_OK:$version" ]]; then
-    printf 'assertion failed: Python runtime behavior expected=%s observed=%s\n' "$version" "$output" >&2; return 1
+  ) || status=$?
+  if [[ "$status" != 0 || "$output" != "OMG_PYTHON_RUNTIME_OK:$version" ]]; then
+    printf 'assertion failed: Python runtime behavior expected=%s exit=%s observed=%s\n' "$version" "$status" "$output" >&2; return 1
   fi
 }
 check_hook_lifecycle() (
