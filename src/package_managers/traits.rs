@@ -15,6 +15,43 @@ pub trait PackageManager: Send + Sync {
     /// Get the name of this package manager
     fn name(&self) -> &'static str;
 
+    /// Preserve installed package identities for security exports. Backends
+    /// override this when their ordinary package view omits native identity.
+    fn security_inventory(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::SecurityPackage>>> + Send + '_>> {
+        Box::pin(async move {
+            Ok(self
+                .list_installed()
+                .await?
+                .into_iter()
+                .map(|package| super::types::SecurityPackage {
+                    name: package.name,
+                    version: package.version.to_string(),
+                    architecture: None,
+                    description: package.description,
+                    licenses: Vec::new(),
+                })
+                .collect())
+        })
+    }
+
+    /// Native advisory applicability, when supported. Failures are authoritative:
+    /// callers must not replace a failed native scan with a narrower source.
+    fn security_audit(
+        &self,
+    ) -> Option<
+        Pin<
+            Box<
+                dyn Future<Output = Result<crate::core::security::scan::SecurityAuditResult>>
+                    + Send
+                    + '_,
+            >,
+        >,
+    > {
+        None
+    }
+
     /// Search for packages
     fn search(
         &self,

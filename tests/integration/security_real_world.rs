@@ -12,6 +12,27 @@ use omg_lib::core::security::vulnerability::VulnerabilityScanner;
 use omg_lib::package_managers::types::parse_version_or_zero;
 use std::time::Duration;
 
+#[cfg(feature = "arch")]
+#[tokio::test]
+#[ignore = "Queries the live Arch tracker; run explicitly on Arch"]
+async fn arch_candidate_grading_uses_native_advisories() {
+    let scanner = VulnerabilityScanner::new();
+    // A historical installed candidate must still be detected after its
+    // advisory is marked Fixed. This also exercises the policy scanner path.
+    let version = omg_lib::package_managers::types::parse_version("1.1.1.o-1").unwrap();
+    let findings = scanner.scan_package("openssl", &version).await.unwrap();
+    assert!(
+        !findings.is_empty(),
+        "Historical OpenSSL candidate lost advisory evidence"
+    );
+    assert!(findings.iter().all(|finding| finding.score.is_none()));
+    let grade = omg_lib::core::security::SecurityPolicy::default()
+        .assign_grade(&scanner, "openssl", &version, true)
+        .await
+        .unwrap();
+    assert_eq!(grade, omg_lib::core::security::SecurityGrade::Risk);
+}
+
 /// Test SLSA verification against real Rekor transparency log
 ///
 /// This test queries the actual Sigstore Rekor instance to verify
@@ -76,8 +97,14 @@ async fn test_vulnerability_scanner_alsa_real() {
 
     let issues = issues.unwrap();
 
-    // Validate structure of real ALSA data
-    for issue in issues.iter().take(3) {
+    assert!(!issues.is_empty(), "Arch advisory feed unexpectedly empty");
+    assert!(
+        issues.iter().any(|issue| issue.status == "Fixed"),
+        "Fixed advisories must remain available for older installed packages"
+    );
+
+    // Check the entire feed, not only a sample that can miss schema drift.
+    for issue in &issues {
         // Every issue should have a name
         assert!(!issue.name.is_empty(), "Issue missing name");
 
@@ -88,9 +115,12 @@ async fn test_vulnerability_scanner_alsa_real() {
             issue.name
         );
 
-        // Status should be "Vulnerable" (we filter for this)
+        // Preserve upstream status rather than discarding fixed advisories.
         assert!(
-            issue.status.to_lowercase().contains("vulnerable"),
+            matches!(
+                issue.status.as_str(),
+                "Unknown" | "Not affected" | "Vulnerable" | "Fixed" | "Testing"
+            ),
             "Issue {} has unexpected status: {}",
             issue.name,
             issue.status

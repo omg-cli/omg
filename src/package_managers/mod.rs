@@ -18,6 +18,8 @@ pub mod apt;
 #[cfg(feature = "arch")]
 pub mod arch;
 #[cfg(feature = "arch")]
+pub(crate) mod arch_advisory;
+#[cfg(feature = "arch")]
 pub mod aur;
 #[cfg(feature = "arch")]
 pub mod aur_deps;
@@ -33,6 +35,8 @@ pub mod debian_db;
 pub mod debian_pure;
 #[cfg(feature = "fedora")]
 pub mod dnf;
+#[cfg(feature = "fedora")]
+mod dnf_advisory;
 // macOS Homebrew support - can be enabled via feature or auto-detected on macOS
 #[cfg(any(feature = "macos", target_os = "macos"))]
 pub mod homebrew;

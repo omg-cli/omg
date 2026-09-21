@@ -146,3 +146,91 @@ This repair follows tokens with a100-page budget and rejects token cycles.
 The page-budget failure branch still needs explicit exercise. It does not yet
 establish full daemon/CLI fetching or scoring coverage; those integrations remain
 beta requirements, not optional follow-ups.
+
+## Optional daemon: shared scanning architecture
+
+The CLI's audit scan, fix and vulnerability export paths now call one helper:
+use a reachable daemon, otherwise use the package manager and shared security
+scanner directly. An actual error from a connected daemon remains an error;
+it is not hidden by a second scan. The package audit result models and aggregation
+live in core/security/scan.rs; the daemon protocol reexports the same models,
+preserving field layout. Both paths share concurrency, failure propagation,
+severity thresholding and audit completion logging.
+
+The real CLI regression first failed solely because OMG_DISABLE_DAEMON disabled
+OMGD. It now verifies empty inventory scanning and fix dry-run, corrupt inventory
+failure without false-clean output or state loss, and recovery after repair.
+The production daemon/Unix-socket/HTTP test verifies populated paginated scans,
+9.8 CVSS and6.9 numeric findings, unknown scores, warm-cache reuse, package-version
+change,503 refusal, recovery and the7.0 high-severity boundary. SIGTERM drain and
+fixture cleanup are asserted. Advisory endpoints are customizable only in cfg(test).
+
+Four-distro local batches pass these tests, scanner tests and coverage_18. This
+is still not native advisory-ecosystem certification. In particular, Fedora has
+no configured OSV ecosystem today. Native Fedora advisory fetching and scoring
+remain required for beta; DNF5's official advisory list/info JSON documentation
+is the next primary source: https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html
+
+The pagination page-budget branch is now explicitly exercised:100 unique
+continuations must fail, then a fresh complete scan succeeds without partial
+cache reuse.
+
+TUI parity follow-through: `App::run_security_audit` now uses the same optional-
+daemon scan helper as CLI audit commands. A Fedora regression first failed
+because the old path required an Arch/Debian backend. It now passes on all four
+Linux test builds with the daemon disabled, proving empty-inventory success,
+corrupt-inventory refusal, repaired-state recovery and checked fixture cleanup.
+This does not certify populated native Fedora scans.
+
+One production legacy caller remains: `server.rs` background status refresh
+still calls `VulnerabilityScanner::scan_system`. Consolidation must verify cache
+publication and concurrent background/on-demand fetching; replacing it without
+those checks could introduce duplicate requests or stale status claims.
+
+Background scan consolidation: production status refresh now uses the same
+shared scan as requested audits, with a daemon-owned asynchronous scan lock.
+Isolated daemon construction disables unsolicited background advisory fetching;
+fixtures that test it must explicitly enable it and inject their HTTP endpoint.
+The real-server test requires status publication of all three paginated findings
+before requested audits, preserving the subsequent cache/error/recovery checks.
+Its previous implementation failed that publication deadline on Fedora.
+
+All production call sites of the older ALSA-only `scan_system` path have now
+been removed. The legacy public method and its tests remain; this change does
+not remove API compatibility. Explicit contention/cancellation coverage of the
+new scan lock and native advisory ecosystem coverage remain outstanding.
+
+Cancellation evidence now covers the shared daemon scan task: a real HTTP
+response is withheld, an explicitly polled waiting scan is dropped, the active
+task is aborted, its HTTP connection must close, and a new scan must obtain fresh
+findings. The fixture checks inventory preservation and cleanup. Removing the
+scan lock causes the test to fail. This proves task cancellation and lock release;
+it does not claim that an arbitrary IPC disconnect cancels an in-flight scan.
+
+Hosted revision7f068ff1 exposed stale integration expectations: cli_comprehensive
+still expected four empty-inventory audit commands to fail without a daemon, and
+coverage_2 expected the daemon gate. Those checks now require successful scan
+output, with corrupt-inventory refusal retained in security_daemon_optional.
+The inventory digest is updated in the QEMU allowlist while retaining historical
+entries. Local inventory, paywall, QEMU/release harness and lint checks pass;
+the failed hosted runs remain recorded and need fresh revision validation.
+# Native Fedora advisory follow-through (work in progress)
+
+The real daemon-disabled Fedora CLI exposed a freshness defect: a fresh user's
+DNF cache could clone root's metadata and return 60 findings even in a network
+namespace with no connectivity, despite `--refresh`. The advisory path now uses
+the effective user's dedicated OMG cache for both DNF cache locations and
+explicitly disables silent repository omission. Repeating the native probe
+returned exit 1 with the advisory-source error offline and exit 0 with 60
+package/advisory findings (25 high severity) online. RPM inventory was unchanged
+and temporary user state was removed. These observations are local WSL evidence,
+not current-revision hosted coverage or a claim that all Fedora vulnerabilities
+are represented by its published advisories.
+
+DNF source: https://dnf5.readthedocs.io/en/latest/misc/caching.7.html
+
+The four QEMU audit inventory rows assert offline source refusal, while the
+isolated Rust fixture asserts successful scanning of its empty mock inventory.
+Neither is admitted as populated native scan coverage. Deterministic native
+repository fixtures, daemon parity, exports, and remaining scan surfaces still
+require verification before the beta feature is considered complete.

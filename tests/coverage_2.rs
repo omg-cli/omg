@@ -93,14 +93,16 @@ fn certificate_identity_flag_is_accepted() {
     );
 }
 
-/// Contract: `audit fix` may require the daemon, but not a paid tier.
+/// Contract: an empty-inventory `audit fix` needs neither daemon nor paid tier.
 #[test]
 fn audit_fix_is_not_paywalled() {
     let project = TestProject::new();
     let result = project.run(&["audit", "fix"]);
+    result.assert_success();
     let out = result.combined_output();
     assert!(
-        out.contains("Daemon not running"),
-        "audit fix must reach the daemon gate, got:\n{out}"
+        out.contains("No vulnerabilities found!"),
+        "audit fix must complete the empty-inventory scan, got:\n{out}"
     );
+    project.close_checked();
 }

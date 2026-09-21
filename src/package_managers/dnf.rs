@@ -913,6 +913,83 @@ impl DnfPackageManager {
             .context("DNF query timed out after 60 seconds")?
     }
 
+    fn advisory_command() -> Result<tokio::process::Command> {
+        let cache = crate::core::paths::cache_dir().join("dnf-security");
+        let cache = cache
+            .to_str()
+            .context("DNF advisory cache path is not UTF-8")?;
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        // A fresh user's cache can otherwise be populated from root's stale
+        // cache even with --refresh. Use one audit-owned cache for both paths.
+        command.args([
+            format!("--setopt=cachedir={cache}"),
+            format!("--setopt=system_cachedir={cache}"),
+            "--setopt=cacheonly=none".into(),
+        ]);
+        Ok(command)
+    }
+
+    async fn affected_installed_packages(
+        row: &super::dnf_advisory::ApplicableAdvisory,
+        installed: &[super::types::SecurityPackage],
+    ) -> Result<Vec<super::types::SecurityPackage>> {
+        let (name, architecture) = super::dnf_advisory::package_identity(&row.nevra)?;
+        let evr = &row.nevra[name.len() + 1..row.nevra.len() - architecture.len() - 1];
+        let mut affected = Vec::new();
+        for package in installed.iter().filter(|package| {
+            package.name == name && package.architecture.as_deref() == Some(architecture)
+        }) {
+            let mut command =
+                tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
+            // Package values are data, never interpolated into RPM macros or Lua.
+            command
+                .env("OMG_LEFT_EVR", &package.version)
+                .env("OMG_RIGHT_EVR", evr);
+            command.args(["--eval", r#"%{lua:print(rpm.vercmp(os.getenv("OMG_LEFT_EVR"), os.getenv("OMG_RIGHT_EVR")))}"#]);
+            let output = Self::query_output(command).await?;
+            match std::str::from_utf8(&output)?.trim() {
+                "-1" => affected.push(package.clone()),
+                "0" | "1" => {}
+                _ => anyhow::bail!("Invalid native RPM version comparison result"),
+            }
+        }
+        anyhow::ensure!(
+            !affected.is_empty(),
+            "Advisory {} has no affected installed identity: {}",
+            row.name,
+            row.nevra
+        );
+        Ok(affected)
+    }
+
+    async fn native_advisories() -> Result<
+        Vec<(
+            super::dnf_advisory::ApplicableAdvisory,
+            super::dnf_advisory::AdvisoryDetails,
+        )>,
+    > {
+        let mut outputs = Vec::with_capacity(2);
+        for details in [false, true] {
+            let mut command = Self::advisory_command()?;
+            command.args(super::dnf_advisory::query_args(details));
+            outputs.push(Self::query_output(command).await?);
+        }
+        let mut repositories = Self::advisory_command()?;
+        repositories.args([
+            "--cacheonly",
+            "--setopt=*.skip_if_unavailable=false",
+            "repo",
+            "info",
+            "--enabled",
+            "--json",
+        ]);
+        super::dnf_advisory::require_enabled_repositories(
+            &Self::query_output(repositories).await?,
+        )?;
+        super::dnf_advisory::join_advisories(&outputs[0], &outputs[1])
+    }
+
     async fn native_history(since: Option<u64>) -> Result<Vec<NativeTransaction>> {
         let range = since.map_or_else(|| "last".to_owned(), |id| format!("{}..last", id.max(1)));
         let mut command =
@@ -1231,6 +1308,98 @@ impl DnfPackageManager {
 }
 
 impl PackageManager for DnfPackageManager {
+    fn security_inventory(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::SecurityPackage>>> + Send + '_>> {
+        Box::pin(async {
+            let mut command =
+                tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+            // Query every installed version and architecture, even excluded
+            // packages. Installed inventory needs no repository metadata.
+            command.args([
+                "--cacheonly",
+                "--disable-repo=*",
+                "--setopt=disable_excludes=*",
+                "repoquery",
+                "--installed",
+                "--queryformat",
+                "%{name}\t%{arch}\t%{epoch}:%{version}-%{release}\t%{repoid}\\n",
+            ]);
+            let output = Self::query_output(command).await?;
+            Ok(Self::parse_versioned_packages(&output)?
+                .into_iter()
+                .map(|package| super::types::SecurityPackage {
+                    name: package.name,
+                    version: package.version,
+                    architecture: Some(package.architecture),
+                    description: String::new(),
+                    licenses: Vec::new(),
+                })
+                .collect())
+        })
+    }
+
+    fn security_audit(
+        &self,
+    ) -> Option<
+        Pin<
+            Box<
+                dyn Future<Output = Result<crate::core::security::scan::SecurityAuditResult>>
+                    + Send
+                    + '_,
+            >,
+        >,
+    > {
+        Some(Box::pin(async move {
+            async {
+                let installed = self.security_inventory().await?;
+                let rows = Self::native_advisories().await?;
+                let mut affected = std::collections::BTreeMap::new();
+                for (row, _) in &rows {
+                    let packages = Self::affected_installed_packages(row, &installed).await?;
+                    affected.insert(
+                        row.nevra.clone(),
+                        packages
+                            .iter()
+                            .map(crate::core::security::scan::InstalledIdentity::from)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                let mut after = self.security_inventory().await?;
+                let mut before = installed;
+                let identity = |package: &super::types::SecurityPackage| {
+                    (
+                        package.name.clone(),
+                        package.version.clone(),
+                        package.architecture.clone(),
+                    )
+                };
+                before.sort_by_key(identity);
+                after.sort_by_key(identity);
+                anyhow::ensure!(
+                    before == after,
+                    "Installed packages changed during native security audit"
+                );
+                let mut result = super::dnf_advisory::audit_result(rows)?;
+                for (_, findings) in &mut result.vulnerabilities {
+                    for finding in findings {
+                        let native = finding
+                            .native_advisory
+                            .as_ref()
+                            .context("Native advisory evidence missing")?;
+                        finding.affected_installed = affected
+                            .get(&native.advisory_nevra)
+                            .context("Installed advisory identity missing")?
+                            .clone();
+                    }
+                }
+                Ok(result)
+            }
+            .await
+            .context("Failed to query native security advisories")
+        }))
+    }
+
     fn name(&self) -> &'static str {
         "dnf"
     }
@@ -1494,6 +1663,125 @@ fn reject_unsealed_local_rpm_targets(packages: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_advisory_identity_excludes_patched_versions_and_other_architectures() {
+        let package = |version: &str, architecture: &str| super::super::types::SecurityPackage {
+            name: "fixture".into(),
+            version: version.into(),
+            architecture: Some(architecture.into()),
+            description: String::new(),
+            licenses: Vec::new(),
+        };
+        let row = super::super::dnf_advisory::ApplicableAdvisory {
+            name: "FEDORA-fixture".into(),
+            kind: "security".into(),
+            severity: "Important".into(),
+            nevra: "fixture-1:1.0-2.x86_64".into(),
+        };
+        let installed = vec![
+            package("0:99.0-1", "x86_64"),
+            package("1:1.0-2", "x86_64"),
+            package("1:1.0-3", "x86_64"),
+            package("0:99.0-1", "i686"),
+        ];
+        let affected = DnfPackageManager::affected_installed_packages(&row, &installed)
+            .await
+            .unwrap();
+        assert_eq!(affected, vec![installed[0].clone()]);
+        assert!(
+            DnfPackageManager::affected_installed_packages(&row, &installed[1..])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn security_inventory_preserves_every_native_rpm_identity() {
+        let mut reference =
+            tokio::process::Command::from(crate::core::privilege::system_command("rpm").unwrap());
+        reference.args([
+            "-qa",
+            "--qf",
+            "%{NAME}\t%{ARCH}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\\n",
+        ]);
+        let bytes = DnfPackageManager::query_output(reference).await.unwrap();
+        // RPM stores imported keys as architecture-less synthetic gpg-pubkey
+        // headers. DNF excludes these trust records from software inventory.
+        let mut expected: Vec<_> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("gpg-pubkey\t(none)\t"))
+            .map(str::to_owned)
+            .collect();
+        let packages = DnfPackageManager::new().security_inventory().await.unwrap();
+        let mut actual: Vec<_> = packages
+            .into_iter()
+            .map(|package| {
+                format!(
+                    "{}\t{}\t{}",
+                    package.name,
+                    package.architecture.unwrap(),
+                    package.version
+                )
+            })
+            .collect();
+        expected.sort();
+        actual.sort();
+        assert!(
+            !expected.is_empty(),
+            "native RPM fixture must contain installed packages"
+        );
+        assert_eq!(
+            actual, expected,
+            "security inventory lost or changed native identities"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_advisory_command_refuses_unavailable_repository() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        std::fs::create_dir(root.join("repos")).unwrap();
+        let configure = || {
+            let mut command = DnfPackageManager::advisory_command().unwrap();
+            command.args([
+                format!("--setopt=reposdir={}", root.join("repos").display()),
+                format!("--setopt=cachedir={}", root.join("cache").display()),
+                format!("--setopt=system_cachedir={}", root.join("cache").display()),
+                format!("--setopt=persistdir={}", root.join("persist").display()),
+                format!("--setopt=logdir={}", root.join("logs").display()),
+                format!(
+                    "--repofrompath=omg-fault,file://{}",
+                    root.join("missing").display()
+                ),
+                "--setopt=omg-fault.skip_if_unavailable=true".into(),
+            ]);
+            command
+        };
+        // Establish the real DNF false-clean behavior before testing our policy.
+        let mut permissive = configure();
+        permissive.args([
+            "--refresh",
+            "advisory",
+            "list",
+            "--available",
+            "--security",
+            "--json",
+        ]);
+        let output = DnfPackageManager::query_output(permissive).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+            serde_json::json!([])
+        );
+        let mut strict = configure();
+        strict.args(super::super::dnf_advisory::query_args(false));
+        let error = DnfPackageManager::query_output(strict).await.unwrap_err();
+        assert!(error.to_string().contains("DNF query failed"), "{error:#}");
+        let path = root.to_owned();
+        fixture.close().unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn update_queries_never_refresh_repository_metadata() {

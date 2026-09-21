@@ -520,8 +520,9 @@ impl App {
     }
 
     pub async fn run_security_audit() -> Result<usize> {
-        let scanner = crate::core::security::vulnerability::VulnerabilityScanner::new();
-        Ok(scanner.scan_system().await?)
+        Ok(crate::cli::security::security_audit_result()
+            .await?
+            .total_vulnerabilities)
     }
 
     /// Whether pressing Enter should open the install-confirmation popup.

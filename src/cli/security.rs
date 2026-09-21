@@ -111,19 +111,28 @@ impl LocalCommandRunner for AuditCommands {
     }
 }
 
+/// Prefer the warm daemon, but keep scanning available without it.
+pub(super) async fn security_audit_result()
+-> Result<crate::core::security::scan::SecurityAuditResult> {
+    #[cfg(unix)]
+    if let Ok(mut client) = DaemonClient::connect().await {
+        return client
+            .security_audit()
+            .await
+            .context("Failed to run security audit");
+    }
+    let manager = crate::package_managers::get_package_manager()?;
+    let scanner = crate::core::security::VulnerabilityScanner::new();
+    crate::core::security::scan::scan_installed(manager.as_ref(), &scanner).await
+}
+
 /// Perform security audit (vulnerability scan)
 pub async fn scan(_ctx: &CliContext) -> Result<()> {
     ui::print_header("Secure", "Vulnerability Scan");
 
     #[cfg(unix)]
     {
-        let mut client = DaemonClient::connect().await.context(
-            "Daemon not running. Security audit requires the daemon (start it with: omg daemon)",
-        )?;
-        let res = client
-            .security_audit()
-            .await
-            .context("Failed to run security audit")?;
+        let res = security_audit_result().await?;
         if res.total_vulnerabilities == 0 {
             ui::print_success("No vulnerabilities found in scanned packages.");
         } else {
@@ -142,10 +151,14 @@ pub async fn scan(_ctx: &CliContext) -> Result<()> {
                     vulns.len()
                 );
                 for vuln in vulns {
-                    let score = vuln
-                        .score
-                        .map(|s| format!(" [Score: {}]", style::sanitize_terminal_text(&s)))
-                        .unwrap_or_default();
+                    let score = vuln.score.map_or_else(
+                        || {
+                            vuln.advisory_severity
+                                .map(|severity| format!(" [Advisory severity: {severity:?}]"))
+                                .unwrap_or_default()
+                        },
+                        |s| format!(" [Score: {}]", style::sanitize_terminal_text(&s)),
+                    );
                     println!(
                         "    {} {} - {}{}",
                         style::maybe_color("→", |t| t.red().to_string()),
@@ -1040,14 +1053,6 @@ fn package_has_available_update(package: &str) -> Result<bool> {
     }
 }
 
-/// Best-effort CVSS base score for a vulnerability; unparsable or missing
-/// scores count as 0.0 so they never cross a severity threshold by accident.
-fn vuln_score(score: Option<&str>) -> f64 {
-    score
-        .and_then(crate::core::security::vulnerability::parse_severity_score)
-        .unwrap_or(0.0)
-}
-
 /// Auto-fix vulnerabilities by upgrading packages
 pub async fn fix_vulnerabilities(
     dry_run: bool,
@@ -1060,20 +1065,8 @@ pub async fn fix_vulnerabilities(
         style::runtime("OMG")
     );
 
-    // Get vulnerability data from daemon
     #[cfg(unix)]
-    let scan_result = {
-        let Ok(mut client) = DaemonClient::connect().await else {
-            anyhow::bail!("Daemon not running. Security audit requires the daemon.");
-        };
-
-        match client.security_audit().await {
-            Ok(res) => res,
-            Err(e) => {
-                anyhow::bail!("Audit failed: {e}");
-            }
-        }
-    };
+    let scan_result = security_audit_result().await?;
 
     #[cfg(not(unix))]
     {
@@ -1093,10 +1086,10 @@ pub async fn fix_vulnerabilities(
         // qualitative scale: medium >= 4.0, high >= 7.0, critical >= 9.0.
         // https://www.first.org/data/specs/cvss-v3.1#CVSS-v3.1-Qualitative-Severity-Rating-Scale
         let min_sev = match min_severity.to_lowercase().as_str() {
-            "critical" => 9.0,
-            "high" => 7.0,
-            "low" => 0.0,
-            _ => 4.0, // Default to medium or unknown
+            "critical" => crate::core::security::scan::MinimumSeverity::Critical,
+            "high" => crate::core::security::scan::MinimumSeverity::High,
+            "low" => crate::core::security::scan::MinimumSeverity::Low,
+            _ => crate::core::security::scan::MinimumSeverity::Medium,
         };
 
         // Find packages with fixable vulnerabilities (single pass; each
@@ -1107,7 +1100,7 @@ pub async fn fix_vulnerabilities(
         for (pkg, vulns) in &scan_result.vulnerabilities {
             let severe_vulns: Vec<&str> = vulns
                 .iter()
-                .filter(|v| vuln_score(v.score.as_deref()) >= min_sev)
+                .filter(|v| v.meets_minimum(min_sev))
                 .map(|v| v.id.as_str())
                 .collect();
             if severe_vulns.is_empty() {
@@ -1295,13 +1288,7 @@ pub async fn export_compliance(
             // 2. Export vulnerability scan
             #[cfg(unix)]
             {
-                let mut client = DaemonClient::connect().await.context(
-                    "Daemon not running. Compliance export requires the daemon (start it with: omg daemon)",
-                )?;
-                let scan = client
-                    .security_audit()
-                    .await
-                    .context("Failed to run security audit for compliance export")?;
+                let scan = security_audit_result().await?;
                 let json = serde_json::to_string_pretty(&scan)?;
                 let scan_path = output_dir.join(format!("vulnerability-scan-{timestamp}.json"));
                 write_private_export(&scan_path, json)?;

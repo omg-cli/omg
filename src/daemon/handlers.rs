@@ -12,8 +12,7 @@ use super::cache::PackageCache;
 use super::index::PackageIndex;
 use super::protocol::{
     DetailedPackageInfo, ExplicitResult, HealthStatus, PackageInfo, Request, RequestId, Response,
-    ResponseResult, SearchResult, SecurityAuditResult, UpdateEntry, Vulnerability,
-    WirePackageSource, error_codes,
+    ResponseResult, SearchResult, UpdateEntry, WirePackageSource, error_codes,
 };
 use crate::core::metrics::GLOBAL_METRICS;
 use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
@@ -97,6 +96,9 @@ pub struct DaemonState {
     pub(super) cache: PackageCache,
     pub(super) persistent: super::db::PersistentCache,
     pub(super) package_manager: Arc<dyn PackageManager>,
+    vulnerability_scanner: Arc<crate::core::security::vulnerability::VulnerabilityScanner>,
+    security_scan_lock: tokio::sync::Mutex<()>,
+    pub(super) background_security_scans: bool,
     index: RwLock<PublishedIndex>,
     /// Locked because RefreshIndex must swap in a fresh AlpmWorker: libalpm
     /// caches loaded syncdbs in memory and never revalidates them on disk, so
@@ -349,6 +351,7 @@ impl DaemonState {
             }
         }
 
+        let background_security_scans = system_backends.is_production();
         Self {
             cache,
             persistent,
@@ -358,6 +361,11 @@ impl DaemonState {
                 #[cfg(feature = "arch")]
                 epoch: index_epoch,
             }),
+            vulnerability_scanner: Arc::new(
+                crate::core::security::vulnerability::VulnerabilityScanner::new(),
+            ),
+            security_scan_lock: tokio::sync::Mutex::new(()),
+            background_security_scans,
             system_backends: RwLock::new(system_backends),
             refresh_lock: tokio::sync::Mutex::new(()),
             refresh_debounce: RefreshDebounce::default(),
@@ -378,6 +386,19 @@ impl DaemonState {
     #[must_use]
     pub(super) fn background_worker_failures(&self) -> u64 {
         self.background_worker_failures.load(Ordering::Relaxed)
+    }
+
+    pub(super) async fn scan_security(
+        &self,
+    ) -> anyhow::Result<crate::core::security::scan::SecurityAuditResult> {
+        // Serialize background and on-demand scans so warmed package results
+        // are available before another scan starts fetching the same inventory.
+        let _guard = self.security_scan_lock.lock().await;
+        crate::core::security::scan::scan_installed(
+            self.package_manager.as_ref(),
+            self.vulnerability_scanner.as_ref(),
+        )
+        .await
     }
 }
 
@@ -599,8 +620,6 @@ pub(super) const MAX_SEARCH_LIMIT: usize = 1000;
 const DEFAULT_SUGGEST_LIMIT: usize = 10;
 /// Maximum number of suggestions returned
 const MAX_SUGGEST_LIMIT: usize = 50;
-/// Concurrency for vulnerability scanning
-const SCAN_CONCURRENCY: usize = 32;
 /// Cache size threshold for "degraded" health status
 const HEALTH_DEGRADED_CACHE_THRESHOLD: usize = 50_000;
 /// Cache size threshold for "unhealthy" health status
@@ -974,7 +993,8 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
 
 /// Handle security audit request
 /// Parse a vulnerability score string into its numeric CVSS score.
-pub(crate) fn vulnerability_score(score: &str) -> Option<f64> {
+#[cfg(test)]
+fn vulnerability_score(score: &str) -> Option<f64> {
     score.parse::<f64>().ok().or_else(|| {
         score
             .parse::<cvss::Cvss>()
@@ -985,91 +1005,12 @@ pub(crate) fn vulnerability_score(score: &str) -> Option<f64> {
 
 async fn handle_security_audit(state: Arc<DaemonState>, id: RequestId) -> Response {
     GLOBAL_METRICS.inc_security_audit_requests();
-    use crate::core::security::vulnerability::VulnerabilityScanner;
-
-    let scanner = Arc::new(VulnerabilityScanner::new());
-    let installed = match state.package_manager.list_installed().await {
-        Ok(packages) => packages,
-        Err(error) => {
-            return Response::Error {
-                id,
-                code: error_codes::INTERNAL_ERROR,
-                message: format!("Failed to list packages: {error}"),
-            };
-        }
-    };
-
-    let mut vulnerabilities = Vec::with_capacity(installed.len() / 10);
-    let mut total_vulns = 0;
-    let mut high_severity = 0;
-
-    use futures::stream::{self, StreamExt};
-
-    let mut stream = stream::iter(installed)
-        .map(|pkg| {
-            let scanner = Arc::clone(&scanner);
-            async move {
-                let name = pkg.name;
-                let version = pkg.version;
-                let result = scanner.scan_package(&name, &version).await;
-                (name, result)
-            }
-        })
-        .buffer_unordered(SCAN_CONCURRENCY);
-
-    while let Some((name, res)) = stream.next().await {
-        let vulns = match res {
-            Ok(vulns) => vulns,
-            Err(error) => {
-                return internal_error(
-                    id,
-                    format!("Failed to scan package {name} for vulnerabilities: {error}"),
-                );
-            }
-        };
-        if vulns.is_empty() {
-            continue;
-        }
-
-        let mapped: Vec<Vulnerability> = vulns
-            .into_iter()
-            .map(|v| {
-                if v.score
-                    .as_deref()
-                    .and_then(vulnerability_score)
-                    .is_some_and(|score| score >= 7.0)
-                {
-                    high_severity += 1;
-                }
-                Vulnerability {
-                    id: v.id,
-                    summary: v.summary,
-                    score: v.score,
-                }
-            })
-            .collect();
-        total_vulns += mapped.len();
-        vulnerabilities.push((name, mapped));
-    }
-
-    let result = SecurityAuditResult {
-        total_vulnerabilities: total_vulns,
-        high_severity,
-        vulnerabilities,
-    };
-
-    audit_log_nonblocking(
-        AuditEventType::SecurityAudit,
-        AuditSeverity::Info,
-        "daemon_handler",
-        &format!(
-            "Security audit completed: {total_vulns} vulnerabilities found ({high_severity} high severity)"
-        ),
-    );
-
-    Response::Success {
-        id,
-        result: ResponseResult::SecurityAudit(result),
+    match state.scan_security().await {
+        Ok(result) => Response::Success {
+            id,
+            result: ResponseResult::SecurityAudit(result),
+        },
+        Err(error) => internal_error(id, error.to_string()),
     }
 }
 
@@ -1848,3 +1789,7 @@ mod tests {
         assert!(rss_mb > 0, "a running test process has non-zero RSS");
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "audit_transport_tests.rs"]
+mod audit_transport_tests;

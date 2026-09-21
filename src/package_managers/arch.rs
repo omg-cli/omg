@@ -94,6 +94,60 @@ async fn after_privileged_alpm_write() -> AnyhowResult<()> {
 }
 
 impl PackageManager for ArchPackageManager {
+    fn security_audit(
+        &self,
+    ) -> Option<
+        Pin<
+            Box<
+                dyn Future<Output = AnyhowResult<crate::core::security::scan::SecurityAuditResult>>
+                    + Send
+                    + '_,
+            >,
+        >,
+    > {
+        Some(Box::pin(async move {
+            use anyhow::Context;
+            async {
+                let mut before = self.security_inventory().await?;
+                let advisories = crate::core::security::vulnerability::VulnerabilityScanner::new()
+                    .fetch_alsa_issues()
+                    .await?;
+                let result = super::arch_advisory::audit_result(&before, &advisories)?;
+                let mut after = self.security_inventory().await?;
+                let identity = |package: &super::types::SecurityPackage| {
+                    (
+                        package.name.clone(),
+                        package.version.clone(),
+                        package.architecture.clone(),
+                    )
+                };
+                before.sort_by_key(identity);
+                after.sort_by_key(identity);
+                anyhow::ensure!(
+                    before == after,
+                    "Installed packages changed during native security audit"
+                );
+                Ok(result)
+            }
+            .await
+            .context("Failed to query native security advisories")
+        }))
+    }
+
+    fn security_inventory(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = AnyhowResult<Vec<crate::package_managers::types::SecurityPackage>>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            tokio::task::spawn_blocking(super::alpm_direct::security_inventory).await?
+        })
+    }
+
     fn name(&self) -> &'static str {
         "pacman"
     }
