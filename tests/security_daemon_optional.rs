@@ -186,7 +186,27 @@ fn tui_security_scan_uses_shared_inventory_failures_without_a_daemon() -> anyhow
         || -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
-                assert_eq!(omg_lib::cli::tui::app::App::run_security_audit().await?, 0);
+                let audit_path = project.data_dir.path().join("audit/audit.jsonl");
+                let _logger = omg_lib::core::security::AuditLogger::new_in(&audit_path)?;
+                let lock = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(audit_path.with_extension("lock"))?;
+                lock.lock()?;
+                let scan = omg_lib::cli::tui::app::App::run_security_audit();
+                tokio::pin!(scan);
+                let early =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), scan.as_mut())
+                        .await;
+                lock.unlock()?;
+                assert!(
+                    early.is_err(),
+                    "scan reported completion while its audit record could not be written"
+                );
+                assert_eq!(scan.await?, 0);
+                assert_eq!(std::fs::read_to_string(&audit_path)?.lines().count(), 1);
                 std::fs::write(&path, b"{broken")?;
                 let error = omg_lib::cli::tui::app::App::run_security_audit()
                     .await
@@ -198,6 +218,22 @@ fn tui_security_scan_uses_shared_inventory_failures_without_a_daemon() -> anyhow
                 assert_eq!(std::fs::read(&path)?, b"{broken");
                 std::fs::write(&path, clean)?;
                 assert_eq!(omg_lib::cli::tui::app::App::run_security_audit().await?, 0);
+                let logger = omg_lib::core::security::AuditLogger::new_in(&audit_path)?;
+                let integrity = logger.verify_integrity()?;
+                assert!(integrity.is_valid());
+                assert_eq!(integrity.total_entries, 2);
+                let original_log = std::fs::read(&audit_path)?;
+                let lock_path = audit_path.with_extension("lock");
+                std::fs::remove_file(&lock_path)?;
+                std::fs::create_dir(&lock_path)?;
+                let error = omg_lib::cli::tui::app::App::run_security_audit()
+                    .await
+                    .expect_err("audit write refusal must fail scan completion");
+                assert!(
+                    format!("{error:#}").contains("Failed to persist completed security audit"),
+                    "{error:#}"
+                );
+                assert_eq!(std::fs::read(&audit_path)?, original_log);
                 anyhow::Ok(())
             })
         },
@@ -221,6 +257,12 @@ fn security_scan_without_daemon_preserves_inventory_errors_and_recovers() -> any
             .contains("No vulnerabilities found in scanned packages.")
     );
     assert_eq!(std::fs::read(&path)?, clean, "scan changed the inventory");
+    let audit_path = project.data_dir.path().join("audit/audit.jsonl");
+    assert_eq!(
+        std::fs::read_to_string(&audit_path)?.lines().count(),
+        1,
+        "successful CLI exit must include its persisted completion record"
+    );
     project.run(&["audit", "fix", "--dry-run"]).assert_success();
     assert_eq!(
         std::fs::read(&path)?,
@@ -247,6 +289,25 @@ fn security_scan_without_daemon_preserves_inventory_errors_and_recovers() -> any
         );
     }
     assert_eq!(std::fs::read(&path)?, clean);
+    let logger = omg_lib::core::security::AuditLogger::new_in(&audit_path)?;
+    let integrity = logger.verify_integrity()?;
+    assert!(integrity.is_valid());
+    assert_eq!(integrity.total_entries, 4);
+    let original_log = std::fs::read(&audit_path)?;
+    let lock_path = audit_path.with_extension("lock");
+    std::fs::remove_file(&lock_path)?;
+    std::fs::create_dir(&lock_path)?;
+    let refused = project.run(&["audit", "scan"]);
+    refused.assert_failure();
+    assert!(
+        refused
+            .stderr
+            .contains("Failed to persist completed security audit"),
+        "{}",
+        refused.stderr
+    );
+    assert!(!refused.stdout.contains("No vulnerabilities found"));
+    assert_eq!(std::fs::read(&audit_path)?, original_log);
     project.close_checked();
     Ok(())
 }
