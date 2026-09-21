@@ -128,7 +128,7 @@ class NativeReceipts(unittest.TestCase):
         manifest = json.loads((root / 'tests/contracts/manifest.json').read_text())
         mapped = [contract for contract in manifest['contracts']
                   if any(binding['lane'] == 'native-daemon-fixture' for binding in contract['tests'])]
-        self.assertEqual(len(mapped), 10)
+        self.assertEqual(len(mapped), 11)
         selected = set()
         for contract in mapped:
             self.assertEqual(contract['binary'], 'omgd')

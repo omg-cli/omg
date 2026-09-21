@@ -2488,6 +2488,59 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omgd.suggest.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Suggest",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "seeded-prefix-order-case-and-zero-one-default-maximum-limits",
+          "empty-unmatched-and-500-byte-query-results"
+        ],
+        "refusal": [
+          "501-byte-query-invalid-params-exact-envelope"
+        ],
+        "state": [
+          "post-refusal-pong-and-catalog-bytes-preserved"
+        ]
+      },
+      "scope": "Production server::run in coverage_18 with real Unix framing and a seeded injected package index; checked SIGTERM drain and cleanup; not native package transactions, exhaustive fuzzy ranking or concurrent catalog replacement",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::suggestions_preserve_catalog_order_limits_refusal_and_state_over_real_ipc",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "seeded-prefix-order-case-and-zero-one-default-maximum-limits",
+            "empty-unmatched-and-500-byte-query-results",
+            "501-byte-query-invalid-params-exact-envelope",
+            "post-refusal-pong-and-catalog-bytes-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

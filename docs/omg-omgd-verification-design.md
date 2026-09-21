@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used eighty searches (275 requested result slots),
+Exa research used eighty-one searches (276 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -822,3 +822,22 @@ contracts on the same surfaces, so complete surface credit still requires both.
 The local manifest check now verifies every binding's promised assertions before
 shipping. No assertions were added to a test's receipt unless that test checks
 them, and the admission rule was not relaxed. The failed hosted run is retained.
+
+### Suggest requests through the production transport
+
+The service fixture can now build an index through the existing portable DNF
+adapter using an explicitly seeded mock catalogue, without accessing host
+repositories or adding production test APIs. Sixty equal-length prefix matches
+have independently known lexical order. The wire regression checks exact names
+for limits 0, 1, default 10, 50 and usize::MAX (capped at 50), uppercase matching,
+empty/unmatched queries, a valid 500-byte query, and exact INVALID_PARAMS refusal
+for 501 bytes. A subsequent pong, unchanged catalogue bytes, real SIGTERM drain
+and checked cleanup are mandatory. Removing the cap in an isolated WSL source
+mutation caused the expected failure; the source was restored before final tests.
+This adds bounded Suggest evidence, not exhaustive fuzzy-ranking or concurrent
+index-replacement coverage.
+
+The same audit considered cache statistics. [Moka's documented entry count](https://docs.rs/moka/latest/moka/sync/struct.Cache.html#method.entry_count)
+is approximate under concurrent updates and pending maintenance; a naive exact
+cache-count assertion would impose an unsupported guarantee. No eventual-success
+poll was added to turn an arbitrary cache sample into coverage.

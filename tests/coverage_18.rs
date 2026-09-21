@@ -69,6 +69,14 @@ impl RealServerFixture {
     }
 
     async fn with_packages(installed: &[(&str, &str)], available: &[(&str, &str)]) -> Result<Self> {
+        Self::with_catalog(installed, available, false).await
+    }
+
+    async fn with_catalog(
+        installed: &[(&str, &str)],
+        available: &[(&str, &str)],
+        indexed: bool,
+    ) -> Result<Self> {
         init_test_env();
         let temp_dir = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
@@ -79,12 +87,27 @@ impl RealServerFixture {
         let installed: std::collections::BTreeMap<_, _> = installed.iter().copied().collect();
         let available: std::collections::BTreeMap<_, _> = available.iter().copied().collect();
         std::fs::write(
-            data_dir.join("mock_state_pacman.json"),
+            data_dir.join(if indexed {
+                "mock_state_dnf.json"
+            } else {
+                "mock_state_pacman.json"
+            }),
             serde_json::to_vec(&serde_json::json!({
                 "installed": installed,
                 "available": available,
             }))?,
         )?;
+        let manager = Arc::new(MockPackageManager::new_in(
+            if indexed { "fedora" } else { "arch" },
+            &data_dir,
+        ));
+        // The portable DNF index adapter consumes the explicitly seeded manager
+        // inventory. No host repositories or test-only production API are needed.
+        let index = if indexed {
+            PackageIndex::for_package_manager(manager.clone()).await?
+        } else {
+            PackageIndex::empty()
+        };
 
         // Scoped env: audit logger and persistent cache capture their data-dir
         // paths during construction (same isolation pattern as daemon_e2e_ipc).
@@ -95,11 +118,7 @@ impl RealServerFixture {
             ],
             || -> anyhow::Result<_> {
                 omg_lib::core::security::init_audit_logger()?;
-                DaemonState::new_isolated(
-                    &data_dir,
-                    PackageIndex::empty(),
-                    Arc::new(MockPackageManager::new_in("arch", &data_dir)),
-                )
+                DaemonState::new_isolated(&data_dir, index, manager)
             },
         )?);
 
@@ -911,4 +930,76 @@ async fn wait_for_active_connections(fixture: &RealServerFixture, expected: i64)
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn suggestions_preserve_catalog_order_limits_refusal_and_state_over_real_ipc() -> Result<()> {
+    let names: Vec<String> = (0..60)
+        .map(|index| format!("cov18suggestpkg{index:02}"))
+        .collect();
+    let records: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "1.0.0")).collect();
+    let fixture = RealServerFixture::with_catalog(&[], &records, true).await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_dnf.json");
+    let before = std::fs::read(&state_path)?;
+    let longest_valid_query = "a".repeat(500);
+    for (id, query, limit, count) in [
+        (801, "cov18suggestpkg", Some(0), 0),
+        (802, "cov18suggestpkg", Some(1), 1),
+        (803, "cov18suggestpkg", None, 10),
+        (804, "COV18SUGGESTPKG", Some(3), 3),
+        (805, "cov18suggestpkg", Some(50), 50),
+        (806, "cov18suggestpkg", Some(usize::MAX), 50),
+        (807, "", Some(50), 0),
+        (808, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", Some(50), 0),
+        (809, longest_valid_query.as_str(), None, 0),
+    ] {
+        match request_on_wire(
+            &fixture,
+            Request::Suggest {
+                id,
+                query: query.into(),
+                limit,
+            },
+        )
+        .await?
+        {
+            Response::Success {
+                id: response_id,
+                result: ResponseResult::Suggest(results),
+            } => {
+                assert_eq!(response_id, id);
+                assert_eq!(results, names[..count], "query={query}, limit={limit:?}");
+            }
+            other => panic!("suggest returned {other:?}"),
+        }
+    }
+    match request_on_wire(
+        &fixture,
+        Request::Suggest {
+            id: 810,
+            query: "a".repeat(501),
+            limit: None,
+        },
+    )
+    .await?
+    {
+        Response::Error { id, code, message } => {
+            assert_eq!(id, 810);
+            assert_eq!(code, error_codes::INVALID_PARAMS);
+            assert_eq!(message, "Query too long");
+        }
+        other @ Response::Success { .. } => panic!("oversized suggestion returned {other:?}"),
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 811 }).await?,
+        811,
+    );
+    assert_eq!(std::fs::read(&state_path)?, before);
+    fixture.shutdown().await
 }
