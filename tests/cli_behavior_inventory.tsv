@@ -191,3 +191,5 @@ install-review	["install","--review","--dry-run","pacman"]	read	0	pass	-	hermeti
 update-review	["update","--check","--review"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 update-no-sync	["update","--check","--no-sync"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 update-aur-only	["update","--check","--aur-only"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+runtime-node-install	["use","node","24.21.0"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	-	tempdir-drop
+runtime-go-install	["use","go","1.27.1"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	-	tempdir-drop

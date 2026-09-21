@@ -535,6 +535,7 @@ if [[ "$benchmark" == true ]]; then
   sha256sum "$work/benchmark-hyperfine.sh" "$work/record-benchmark-run.py" > "$work/benchmark-driver-sha256.txt"
 fi
 cp "$here/qemu-daemon-check.sh" "$work/qemu-daemon-check.sh"
+cp "$here/../tests/daemon_advisory_shutdown.sh" "$work/daemon-advisory-shutdown.sh"
 cat > "$work/guest-check.sh" <<'GUEST'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -608,6 +609,12 @@ case "$distro" in
   fedora) sudo -n dnf install -y "${guest_tools[@]}" || exit 120 ;;
 esac
 timeout --kill-after=5s 240s bash "$HOME/qemu-daemon-check.sh" "$bin" "$HOME/evidence"
+# BEGIN ADVISORY SHUTDOWN REGRESSION
+if [[ "$distro" == fedora ]]; then
+  sudo -n bash "$HOME/daemon-advisory-shutdown.sh" "${bin%/*}/omgd" "$(id -un)" \
+    2>&1 | tee "$HOME/evidence/daemon-advisory-shutdown.log"
+fi
+# END ADVISORY SHUTDOWN REGRESSION
 if [[ "$benchmark" == true ]]; then
   OMG_BENCH_BINARY="$bin" OMG_BENCH_EXPORT_DIR="$HOME/evidence/benchmarks" \
     bash "$HOME/benchmark-hyperfine.sh" --guest || exit 120
@@ -665,6 +672,7 @@ opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHo
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
+timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/daemon-advisory-shutdown.sh bench@127.0.0.1:daemon-advisory-shutdown.sh
 if [[ "$benchmark" == true ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/benchmark-hyperfine.sh bench@127.0.0.1:benchmark-hyperfine.sh
 fi
