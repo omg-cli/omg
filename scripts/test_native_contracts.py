@@ -19,6 +19,24 @@ NATIVE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(NATIVE)
 
 
+class WholeSuiteAdmission(unittest.TestCase):
+    def test_unmapped_first_failure_survives_a_successful_retry(self):
+        binary = 'omg::unmapped'
+        listing = {'test-count': 1, 'rust-suites': {binary: {
+            'binary-id': binary, 'status': 'listed', 'testcases': {
+                'behavior': {'ignored': False, 'filter-match': {'status': 'matches'}}}}}}
+        for history, expected in (('', 0), ('<flakyFailure time="0.1"/>', 1),
+                                  ('<failure/>', 1)):
+            with self.subTest(history=history):
+                xml = (f'<testsuites><testsuite name="{binary}"><testcase '
+                       f'classname="{binary}" name="behavior" time="0.2">'
+                       f'{history}</testcase></testsuite></testsuites>').encode()
+                execution = NATIVE.SELECTION.reconcile(listing, xml, [binary])
+                self.assertEqual(NATIVE.admission_exit_code(0, execution, True), expected)
+                self.assertEqual(NATIVE.admission_exit_code(17, execution, True), 1)
+                self.assertEqual(NATIVE.admission_exit_code(0, execution, False), 1)
+
+
 @unittest.skipUnless(os.name == 'posix' and shutil.which('runuser'), 'requires Linux runuser')
 class NativeRunner(unittest.TestCase):
     def test_cli_runner_drops_root_and_preserves_arguments_and_exit(self):
