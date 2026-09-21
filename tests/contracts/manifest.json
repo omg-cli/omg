@@ -4,6 +4,27 @@
   "inventory_source": "Baseline compiled artifacts CI 35540033061 at e689113c; reviewed additive counter grammar from local Arch compilation; unchanged grammar verified, other owner schemas must match on hosted compilation",
   "contracts": [
     {
+      "id": "omg.config.set.persistence.fixture",
+      "source": "src/cli/config.rs",
+      "binary": "omg",
+      "surface": "omg config set",
+      "platforms": ["arch", "debian", "debian-trixie", "ubuntu", "fedora"],
+      "requires": ["success", "state", "fault"],
+      "critical": true,
+      "assertions": {
+        "success": ["six-writable-settings-round-trip", "stored-configuration-validates"],
+        "state": ["rejected-writes-preserve-config-bytes", "validation-preserves-config-bytes"],
+        "fault": ["invalid-boolean-number-zero-and-unknown-key-refused", "valid-read-after-rejections"]
+      },
+      "scope": "Real daemon-disabled CLI with isolated configuration and unprivileged execution. Covers six writable settings, exact read-back, invalid writes, unchanged bytes and subsequent validation. This is not native package transactions evidence. Does not cover concurrent writers, privileged configuration inheritance, reset backups, filesystem failures or all accepted and rejected value boundaries; broader gaps remain.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::cli_comprehensive::system_tests::config_values_round_trip_and_rejected_writes_preserve_state",
+        "evidence": ["success", "state", "fault"],
+        "assertions": ["six-writable-settings-round-trip", "stored-configuration-validates", "rejected-writes-preserve-config-bytes", "validation-preserves-config-bytes", "invalid-boolean-number-zero-and-unknown-key-refused", "valid-read-after-rejections", "fixture-cleanup"]
+      }]
+    },
+    {
       "id": "omg.search.command.parser",
       "source": "src/cli/args.rs",
       "binary": "omg",

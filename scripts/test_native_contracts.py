@@ -286,6 +286,11 @@ class NativeReceipts(unittest.TestCase):
                 'harness:omg::e2e_runtime_management', 'harness:omg::env_lockfile_integrity',
                 'harness:omg::security_daemon_optional'})
             missing = copy.deepcopy(listing)
+            ambiguous = copy.deepcopy(listing)
+            ambiguous['rust-suites']['omg::cli_comprehensive::system_tests'] = dict(
+                listing['rust-suites']['omg::cli_comprehensive'])
+            with self.assertRaisesRegex(ValueError, 'ambiguous identity'):
+                NATIVE.mapped_behavior_subjects(manifest, provenance, ambiguous, root)
             del missing['rust-suites']['omg::cli_comprehensive']
             with self.assertRaisesRegex(ValueError, 'missing owning'):
                 NATIVE.mapped_behavior_subjects(manifest, provenance, missing, root)
@@ -359,6 +364,7 @@ class NativeReceipts(unittest.TestCase):
         mapped = [contract for contract in manifest['contracts']
                   if any(binding['lane'] == 'native-cli-fixture' for binding in contract['tests'])]
         self.assertEqual({contract['id'] for contract in mapped}, {
+            'omg.config.set.persistence.fixture',
             'omg.audit.sbom.empty-recovery.fixture',
             'omg.audit.verify.integrity.fixture',
             'omg.audit.policy.configuration.fixture',

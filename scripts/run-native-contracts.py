@@ -25,6 +25,7 @@ require = COVERAGE.require
 
 
 BEHAVIOR_TESTS = frozenset({
+    'omg::cli_comprehensive::system_tests::config_values_round_trip_and_rejected_writes_preserve_state',
     'omg::security_daemon_optional::audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_it',
     'omg::security_daemon_optional::audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_history',
     'omg::security_daemon_optional::sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure',
@@ -137,7 +138,10 @@ def mapped_behavior_subjects(manifest, provenance, listing, root):
             for binding in contract['tests']:
                 if binding['lane'] == 'native-cli-fixture':
                     require(binding['id'] in BEHAVIOR_TESTS, 'unreviewed behavior test')
-                    suites.add(binding['id'].rsplit('::', 1)[0])
+                    owners = [suite for suite in listing['rust-suites']
+                              if binding['id'].startswith(suite + '::')]
+                    require(len(owners) == 1, 'missing owning behavior harness or ambiguous identity')
+                    suites.add(owners[0])
     combined = {}
     for suite in sorted(suites):
         require(suite in listing['rust-suites'], 'missing owning behavior harness')
