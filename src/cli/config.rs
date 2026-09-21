@@ -276,7 +276,13 @@ pub fn reset(yes: bool) -> Result<()> {
 
     let _write_lock = Settings::write_lock()?;
     let backup_path = format!("{config_file}.backup");
-    std::fs::copy(&config_file, &backup_path)?;
+    // Replace the backup entry atomically; copying into an existing symlink or
+    // hard link would overwrite an unrelated file. Backups remain owner-only.
+    crate::core::safe_ops::atomic_write_file_sync_private(
+        &backup_path,
+        std::fs::read(&config_file).context("Failed to read configuration for backup")?,
+    )
+    .context("Failed to back up configuration")?;
     println!("  {} Created backup at {backup_path}", style::dim("•"));
 
     crate::core::safe_ops::atomic_write_file_sync(

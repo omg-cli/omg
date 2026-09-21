@@ -1839,6 +1839,36 @@ mod system_tests {
     use super::*;
 
     #[test]
+    fn config_reset_backup_never_overwrites_a_linked_external_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for symbolic in [true, false] {
+            let project = TestProject::new();
+            let config = project.config_dir.path().join("config.toml");
+            let backup = project.config_dir.path().join("config.toml.backup");
+            let outside = tempfile::tempdir().unwrap();
+            let sentinel = outside.path().join("unrelated-file");
+            std::fs::write(&sentinel, b"unrelated data").unwrap();
+            project
+                .run(&["config", "set", "aur.build_concurrency", "2"])
+                .assert_success();
+            let original = std::fs::read(&config).unwrap();
+            if symbolic {
+                symlink(&sentinel, &backup).unwrap();
+            } else {
+                std::fs::hard_link(&sentinel, &backup).unwrap();
+            }
+            project.run(&["config", "reset", "--yes"]).assert_success();
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unrelated data");
+            assert_eq!(std::fs::read(&backup).unwrap(), original);
+            let metadata = std::fs::symlink_metadata(&backup).unwrap();
+            assert!(metadata.is_file());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            project.close_checked();
+            outside.close().unwrap();
+        }
+    }
+
+    #[test]
     fn config_reset_preserves_backup_and_refuses_backup_failure() {
         let project = TestProject::new();
         let config = project.config_dir.path().join("config.toml");
