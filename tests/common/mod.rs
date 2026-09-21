@@ -434,6 +434,25 @@ pub struct TestProject {
 }
 
 impl TestProject {
+    /// Successful behavioral receipts require observed cleanup, not silent Drop.
+    pub fn close_checked(self) {
+        for directory in [
+            self.dir,
+            self.home_dir,
+            self.data_dir,
+            self.config_dir,
+            self.pacman_root,
+        ] {
+            let path = directory.path().to_path_buf();
+            directory.close().expect("Failed to clean contract fixture");
+            assert!(
+                !path.exists(),
+                "Contract fixture survived cleanup: {}",
+                path.display()
+            );
+        }
+    }
+
     pub fn new() -> Self {
         init_test_env();
         Self {

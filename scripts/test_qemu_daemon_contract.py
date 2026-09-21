@@ -13,6 +13,27 @@ BASH = os.environ.get('OMG_TEST_BASH') or ('C:/Program Files/Git/bin/bash.exe' i
 
 
 class DaemonContractTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'guest fault oracle requires POSIX bash')
+    def test_backend_refusal_requires_product_exit_cause_and_no_success_output(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        function = source.split('# BEGIN BACKEND FAULT ORACLE', 1)[-1].split('# END BACKEND FAULT ORACLE', 1)[0]
+        diagnostic = 'Error: Could not load DNF install reasons: dnf repoquery --userinstalled failed: omg-injected-dnf-reason-failure\n'
+        for code, stdout, stderr, passed in (
+            (1, '', diagnostic, True),
+            (0, '{"explicit_packages":0}\n', '', False),
+            (1, '{"explicit_packages":0}\n', diagnostic, False),
+            (1, '', 'permission denied\n', False),
+            (127, '', diagnostic, False),
+            (124, '', diagnostic, False),
+        ):
+            with self.subTest(code=code, stdout=stdout, stderr=stderr), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'stdout').write_text(stdout)
+                (root / 'stderr').write_text(stderr)
+                result = subprocess.run([BASH, '-c', function + '\ncheck_backend_refusal "$1" stdout stderr', '_', str(code)],
+                                        cwd=root, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
     @unittest.skipIf(os.name == 'nt', 'guest dependency setup requires POSIX bash')
     def test_guest_query_tools_are_installed_with_benchmarks_disabled(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
@@ -90,7 +111,8 @@ class DaemonContractTests(unittest.TestCase):
         gate = source.split('  daemon_receipt=', 1)[1].split('\nfi\n', 1)[0]
         gate = 'daemon_receipt=' + gate
         good = dict(schema_version=1, direct=True, foreground=True, ipc=True,
-                    singleton=True, shutdown=True, restart=True, query_parity=True, sigint=True)
+                    singleton=True, shutdown=True, restart=True, query_parity=True, sigint=True,
+                    cleanup=True, backend_faults=['dnf-reason-refusal'])
         cases = [(good, True), (None, False)]
         for key in good:
             missing = dict(good)
@@ -110,9 +132,28 @@ class DaemonContractTests(unittest.TestCase):
                 evidence.mkdir(parents=True)
                 if receipt is not None:
                     (evidence / 'daemon-lifecycle.json').write_text(receipt)
-                result = subprocess.run([BASH, '-euc', gate], env=dict(os.environ, work=root.as_posix()),
+                result = subprocess.run([BASH, '-euc', gate], env=dict(os.environ, work=root.as_posix(), distro='fedora'),
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, expected, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'guest cleanup requires POSIX bash')
+    def test_daemon_cleanup_removes_owned_state_and_rejects_incomplete_removal(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        cleanup = 'cleanup() {' + source.split('cleanup() {', 1)[1].split('\ntrap cleanup EXIT', 1)[0]
+        for fault in ('none', 'error', 'noop'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = root / 'state'
+                state.mkdir()
+                (state / 'fixture').write_text('owned state')
+                shadow = '' if fault == 'none' else 'rm() { return ' + ('17' if fault == 'error' else '0') + '; };\n'
+                result = subprocess.run([BASH, '-c', shadow + cleanup + '\ntrap cleanup EXIT\nexit 0'],
+                                        env=dict(os.environ, state=str(state), daemon_pid='', launcher_pid=''),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0 if fault == 'none' else 1, result.stderr)
+                self.assertEqual(state.exists(), fault != 'none')
+                if fault != 'none':
+                    self.assertIn('daemon fixture cleanup failed', result.stderr)
 
     def test_lifecycle_is_unconditional_and_receipt_is_exported(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')

@@ -25,7 +25,72 @@ require = COVERAGE.require
 
 
 BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
-    'test_cli_status_shows_debian_info', 'test_cli_debian_respects_ci_mode'))
+    'test_cli_status_shows_debian_info', 'test_cli_debian_respects_ci_mode')) | frozenset({
+    'omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state',
+    'omg::cli_comprehensive::explicit_shortcut_uses_the_same_isolated_state_as_explicit_count',
+    'omg::cli_comprehensive::prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments'}) | frozenset(
+    'omg::e2e_runtime_management::' + name for name in (
+        'test_detect_nvmrc', 'test_detect_python_version', 'test_detect_tool_versions',
+        'test_go_mod_version', 'test_multi_runtime_detection', 'test_conflicting_version_files',
+        'test_rust_toolchain_toml', 'rust_stable_pin_refuses_a_concurrent_mutation_without_activation',
+        'test_package_json_engines', 'test_which_shows_active_runtime',
+        'which_resolves_every_runtime_with_project_parent_global_precedence_without_mutation',
+        'list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomplete_state',
+        'list_rejects_duplicate_json_flags_and_reports_backend_errors_once',
+        'every_runtime_uninstall_preserves_active_siblings_and_external_state')) | frozenset(
+    'omg::env_lockfile_integrity::' + name for name in (
+        'snapshot_index_access_failures_never_report_empty_or_delete_saved_state',
+        'capture_records_every_registered_runtime_and_check_detects_its_drift',
+        'snapshot_restores_installed_php_offline_without_replacing_its_payload',
+        'snapshot_restores_all_registered_installed_runtimes_and_executes_selected_payloads',
+        'capture_without_package_backend_refuses_without_creating_or_overwriting_lockfile'))
+
+
+DAEMON_TESTS = frozenset('omg::coverage_18::' + name for name in (
+    'security_audit_backend_failure_cannot_report_a_clean_scan',
+    'debian_search_preserves_catalog_limits_cache_and_refusal_over_real_ipc',
+    'version_mismatch_gets_exact_parse_error_then_connection_closes',
+    'frame_too_short_for_header_gets_parse_error_then_connection_closes',
+    'undecodable_payload_gets_parse_error_validation_failure_then_close',
+    'oversized_frame_tears_down_silently_without_any_response_frame',
+    'exact_frame_size_boundaries_reach_protocol_validation',
+    'connection_capacity_refuses_overflow_and_recovers_released_permits',
+    'health_reports_live_uptime_rss_and_worker_state_without_mutating_packages',
+    'concurrent_pings_preserve_boundary_ids_and_backend_state',
+    'incomplete_frames_disconnect_without_breaking_a_fresh_client',
+    'rate_limited_burst_rejects_with_exact_envelope_and_keeps_connection_open',
+    'suggestions_preserve_catalog_order_limits_refusal_and_state_over_real_ipc',
+    'package_inventory_and_updates_survive_the_production_transport',
+    'clearing_search_cache_forces_a_new_lookup_over_real_ipc',
+    'package_info_cache_preserves_metadata_and_missing_package_identity',
+    'isolated_refresh_refusal_preserves_server_liveness',
+    'fragmented_then_coalesced_frames_preserve_response_order_and_ids',
+    'active_connection_metric_returns_to_baseline_after_disconnect'))
+
+
+def daemon_subject(listing, root):
+    """The production server runs inside coverage_18, not a child omgd binary."""
+    target = Path(listing['rust-build-meta']['target-directory']).resolve(strict=True)
+    require(target.is_relative_to(root.resolve()), 'target directory escapes checkout')
+    suite = listing['rust-suites']['omg::coverage_18']
+    require(suite['package-id'] == listing['rust-suites']['omg::bin/omgd']['package-id'],
+            'daemon harness package mismatch')
+    path = Path(suite['binary-path'])
+    require(path.is_file() and not path.is_symlink() and path.resolve(strict=True).is_relative_to(target),
+            'invalid daemon harness')
+    return path
+
+
+def daemon_provenance(provenance, recipe, path, before_hash):
+    require(sha256_file(path) == before_hash, 'daemon harness changed during execution')
+    result = dict(provenance, lane='native-daemon-fixture',
+        subject_kind='production-server-test-harness-injected-backend',
+        binaries=dict(provenance['binaries'], omgd=before_hash),
+        harnesses_sha256={'omg::coverage_18': before_hash})
+    result['recipe_sha256'] = hashlib.sha256(json.dumps(
+        {'recipe': recipe, 'daemon_harness': before_hash}, sort_keys=True,
+        separators=(',', ':')).encode()).hexdigest()
+    return result
 
 
 def parser_receipts(manifest, provenance, report):
@@ -36,12 +101,12 @@ def behavior_receipts(manifest, provenance, report):
     return execution_receipts(manifest, provenance, report, behavior=True)
 
 
-def behavior_subjects(listing, root):
+def behavior_subjects(listing, root, suite_name='omg::debian_e2e_tests'):
     """Resolve the same package's child executables, never its parser harness."""
     meta = listing['rust-build-meta']
     target = Path(meta['target-directory']).resolve(strict=True)
     require(target.is_relative_to(root.resolve()), 'target directory escapes checkout')
-    suite = listing['rust-suites']['omg::debian_e2e_tests']
+    suite = listing['rust-suites'][suite_name]
     subjects = {'harness': Path(suite['binary-path'])}
     for row in meta['non-test-binaries'][suite['package-id']]:
         if row['name'] not in ('omg', 'omgd'):
@@ -59,6 +124,27 @@ def behavior_subjects(listing, root):
     return subjects
 
 
+def mapped_behavior_subjects(manifest, provenance, listing, root):
+    """Bind every reviewed owning harness, refusing foreign product pairs."""
+    suites = set()
+    for contract in manifest['contracts']:
+        if COVERAGE.applies(contract, provenance):
+            for binding in contract['tests']:
+                if binding['lane'] == 'native-cli-fixture':
+                    require(binding['id'] in BEHAVIOR_TESTS, 'unreviewed behavior test')
+                    suites.add(binding['id'].rsplit('::', 1)[0])
+    combined = {}
+    for suite in sorted(suites):
+        require(suite in listing['rust-suites'], 'missing owning behavior harness')
+        subjects = behavior_subjects(listing, root, suite)
+        for name in ('omg', 'omgd'):
+            require(name not in combined or combined[name] == subjects[name],
+                    'behavior harnesses use different product executables')
+            combined[name] = subjects[name]
+        combined['harness:' + suite] = subjects['harness']
+    return combined
+
+
 def execution_receipts(manifest, provenance, report, *, behavior):
     receipts, required = [], []
     for contract in manifest['contracts']:
@@ -72,9 +158,15 @@ def execution_receipts(manifest, provenance, report, *, behavior):
         required.append(contract['id'])
         for binding in bindings:
             if behavior:
-                require(binding['id'] in BEHAVIOR_TESTS and 'fixture-cleanup' in binding['assertions'],
+                reviewed = DAEMON_TESTS if provenance['lane'] == 'native-daemon-fixture' else BEHAVIOR_TESTS
+                if provenance['lane'] == 'native-daemon-fixture':
+                    require(contract['binary'] == 'omgd', 'daemon fixture cannot certify a CLI binary')
+                require(binding['id'] in reviewed and 'fixture-cleanup' in binding['assertions'],
                         'behavior test or cleanup assertion has not been reviewed')
-                require(set(binding['evidence']) <= {'success', 'state', 'refusal'}, 'unsupported fixture evidence')
+                allowed = {'success', 'state', 'refusal'}
+                if provenance['lane'] == 'native-daemon-fixture':
+                    allowed |= {'fault', 'concurrency'}
+                require(set(binding['evidence']) <= allowed, 'unsupported fixture evidence')
             else:
                 require(binding['evidence'] == ['parser'], 'nonparser binding')
             require(binding['id'] in report['tests'], 'missing mapped execution')
@@ -111,7 +203,8 @@ def sha256_file(path):
 
 def cargo_test_args(features):
     active = COVERAGE.strings(features.split(','))
-    suites = ['cli_surface', 'git_hooks_contract', 'coverage_18']
+    suites = ['cli_surface', 'git_hooks_contract', 'coverage_18',
+              'e2e_runtime_management', 'env_lockfile_integrity']
     if active & {'arch', 'debian', 'debian-pure', 'fedora'}:
         suites.append('cli_comprehensive')
     if active & {'debian', 'debian-pure'}:
@@ -129,6 +222,12 @@ def cargo_test_args(features):
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+
+
+def admission_exit_code(process_status, execution, contracts_passed):
+    # Nextest may accept a later attempt, but every selected test's first
+    # failure remains fatal, even before that test owns a reviewed contract.
+    return int(bool(process_status or execution['counts']['failed'] or not contracts_passed))
 
 
 def command_output(argv):
@@ -150,6 +249,8 @@ def main():
             (evidence / name).unlink(missing_ok=True)
         source = command_output(['git', 'rev-parse', 'HEAD'])
         require(source == os.environ['OMG_CONTRACT_SOURCE_SHA'], 'checkout source mismatch')
+        manifest = COVERAGE.read_json('tests/contracts/manifest.json')
+        manifest['gaps'] = COVERAGE.read_json('tests/contracts/gaps.json')['gaps']
         features = args.features.split(',')
         # Cargo/nextest target runners apply to the host platform too. Preserve
         # all other suites' privilege model; only the isolated CLI harness drops root.
@@ -199,13 +300,17 @@ def main():
             'features': sorted(features), 'lane': 'native-parser',
         }
         write_json(evidence / 'provenance.json', provenance)
-        behavior_paths = (behavior_subjects(listing, Path.cwd())
-                          if 'omg::debian_e2e_tests' in listing['rust-suites'] else {})
+        behavior_paths = mapped_behavior_subjects(manifest, provenance, listing, Path.cwd())
         behavior_hashes = {name: sha256_file(path) for name, path in behavior_paths.items()}
+        daemon_path = daemon_subject(listing, Path.cwd())
+        daemon_hash = sha256_file(daemon_path)
         behavior_directory = evidence / 'behavior'
         behavior_directory.mkdir(exist_ok=True)
+        daemon_directory = evidence / 'daemon'
+        daemon_directory.mkdir(exist_ok=True)
         for name in ('provenance.json', 'receipts.json', 'required.json', 'coverage.json'):
             (behavior_directory / name).unlink(missing_ok=True)
+            (daemon_directory / name).unlink(missing_ok=True)
         junit = Path('target/nextest/ci/junit.xml')
         # Clear only this invocation's outputs so restored/stale artifacts cannot pass.
         for path in (junit, directory / 'omg.json', directory / 'omgd.json'):
@@ -223,8 +328,6 @@ def main():
         execution = SELECTION.reconcile(listing, junit.read_bytes(), required_binaries)
         write_json(evidence / 'selection.json', execution)
         require(execution['executed_required_binaries'], 'required test binary had no executed tests')
-        manifest = COVERAGE.read_json('tests/contracts/manifest.json')
-        manifest['gaps'] = COVERAGE.read_json('tests/contracts/gaps.json')['gaps']
         receipts, required = parser_receipts(manifest, provenance, execution)
         write_json(evidence / 'receipts.json', receipts)
         write_json(evidence / 'required.json', required)
@@ -238,7 +341,9 @@ def main():
                         for name, path in behavior_paths.items()), 'behavior executable changed during execution')
             behavior_provenance = dict(provenance, lane='native-cli-fixture', subject_kind='debug-cli-mock-backend',
                                        binaries={name: behavior_hashes[name] for name in ('omg', 'omgd')},
-                                       harness_sha256=behavior_hashes['harness'])
+                                       harnesses_sha256={name.removeprefix('harness:'): value
+                                                        for name, value in behavior_hashes.items()
+                                                        if name.startswith('harness:')})
             behavior_provenance['recipe_sha256'] = hashlib.sha256(json.dumps(
                 {'recipe': recipe, 'subjects': behavior_hashes}, sort_keys=True,
                 separators=(',', ':')).encode()).hexdigest()
@@ -252,11 +357,22 @@ def main():
             write_json(behavior_directory / 'coverage.json', behavior_report)
             summary += '\n' + COVERAGE.render_markdown(behavior_report)
             passed = passed and behavior_report['passed']
+        service_provenance = daemon_provenance(provenance, recipe, daemon_path, daemon_hash)
+        write_json(daemon_directory / 'provenance.json', service_provenance)
+        daemon_rows, daemon_required = behavior_receipts(manifest, service_provenance, execution)
+        write_json(daemon_directory / 'receipts.json', daemon_rows)
+        write_json(daemon_directory / 'required.json', daemon_required)
+        daemon_report = COVERAGE.admit(manifest, [COVERAGE.read_json(directory / (binary + '.json'))
+                                                for binary in subjects], daemon_rows,
+                                     service_provenance, daemon_required)
+        write_json(daemon_directory / 'coverage.json', daemon_report)
+        summary += '\n' + COVERAGE.render_markdown(daemon_report)
+        passed = passed and daemon_report['passed']
         print(summary)
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as stream:
                 stream.write(summary)
-        return 1 if result.returncode or not passed else 0
+        return admission_exit_code(result.returncode, execution, passed)
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
         write_json(evidence / 'admission-error.json', {'schema_version': 1, 'error': str(error)})
         print('Native contract admission failed: ' + str(error), file=sys.stderr)

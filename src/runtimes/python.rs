@@ -11,6 +11,8 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod catalog;
+
 use super::common::{
     GithubRelease, activate_version_with_linked_binary, begin_staged_install,
     complete_staged_install, download_with_progress, extract_tar_gz, fetch_github_releases,
@@ -25,8 +27,6 @@ const PBS_RELEASES_URL: &str =
 /// releases per page (~1.9MB per release with ~1000 assets each), so pages
 /// stay at 5 (~9.5MB worst case) and the install walk runs twice as many
 /// pages to keep the same 200-release history depth.
-const PBS_LIST_PER_PAGE: u32 = 5;
-const PBS_LIST_MAX_PAGES: u32 = 1;
 const PBS_INSTALL_PER_PAGE: u32 = 5;
 const PBS_INSTALL_MAX_PAGES: u32 = 40;
 
@@ -65,17 +65,20 @@ impl PythonManager {
             ]);
         }
         let target = python_target()?;
-        let releases = fetch_github_releases(
-            self.client,
-            PBS_RELEASES_URL,
-            PBS_LIST_PER_PAGE,
-            PBS_LIST_MAX_PAGES,
-            |_| false,
-        )
-        .await
-        .context("Failed to fetch Python releases from GitHub")?;
+        Ok(Self::catalog_versions(
+            &catalog::fetch(self.client, &target).await?,
+        ))
+    }
 
-        Ok(Self::parse_python_versions(&releases, &target))
+    fn catalog_versions(downloads: &[catalog::Download]) -> Vec<PythonVersion> {
+        downloads
+            .iter()
+            .map(|download| PythonVersion {
+                version: download.version.clone(),
+                prerelease: Self::parse_python_version(&download.version)
+                    .is_some_and(|(_, prerelease)| prerelease.is_some()),
+            })
+            .collect()
     }
 
     /// Build the newest-first version list from standard gzip assets for the
@@ -204,7 +207,17 @@ impl PythonManager {
     /// Install Python - PURE RUST, NO SUBPROCESS
     pub async fn install(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
-        let version = self.resolve_requested_version(&version).await?;
+        // A partial request needs the catalog for resolution. Keep that same
+        // response for installation so the selected version and artifact agree.
+        let mut downloads =
+            if super::common::is_partial_version(&version) && !crate::core::paths::test_mode() {
+                Some(catalog::fetch(self.client, &python_target()?).await?)
+            } else {
+                None
+            };
+        let version = self
+            .resolve_requested_version(&version, downloads.as_deref())
+            .await?;
         crate::core::security::validate_runtime_version(&version)?;
         let version_dir = self.versions_dir.join(&version);
 
@@ -249,6 +262,43 @@ impl PythonManager {
             version
         );
 
+        let downloads = match downloads.take() {
+            Some(downloads) => downloads,
+            None => catalog::fetch(self.client, &target).await?,
+        };
+        let download = match downloads.into_iter().find(|entry| entry.version == version) {
+            Some(download) => download,
+            None => self.historical_download(&version, &target).await?,
+        };
+        let asset_name = validate_download_filename(&download.filename)?;
+        fs::create_dir_all(&self.versions_dir)?;
+
+        println!("{} Downloading {}...", style::informative("→"), asset_name);
+        let download_path = self.versions_dir.join(asset_name);
+        download_with_progress(
+            self.client,
+            &download.url,
+            &download_path,
+            &download.checksum,
+        )
+        .await?;
+
+        println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let staging = begin_staged_install(&self.versions_dir)?;
+        extract_tar_gz(&download_path, staging.path(), 1).await?;
+        self.publish_install(&staging, &version)?;
+
+        remove_file_best_effort(&download_path, "runtime archive");
+
+        print_installed("Python", &version);
+        self.use_version(&version)?;
+
+        Ok(())
+    }
+
+    /// Exact historical versions absent from the supported catalog may still
+    /// exist in the bounded release history. Provider errors never reach here.
+    async fn historical_download(&self, version: &str, target: &str) -> Result<catalog::Download> {
         let releases = fetch_github_releases(
             self.client,
             PBS_RELEASES_URL,
@@ -258,16 +308,23 @@ impl PythonManager {
                 release
                     .assets
                     .iter()
-                    .any(|asset| Self::asset_matches_version(&asset.name, &version, &target))
+                    .any(|asset| Self::asset_matches_version(&asset.name, version, target))
             },
         )
         .await
         .context("Failed to fetch Python releases")?;
 
+        anyhow::ensure!(
+            Self::parse_python_versions(&releases, target)
+                .iter()
+                .any(|entry| entry.version == version),
+            "Python {version} not found. Try: omg list python --available"
+        );
+
         let asset = releases
             .iter()
             .flat_map(|release| &release.assets)
-            .find(|asset| Self::asset_matches_version(&asset.name, &version, &target))
+            .find(|asset| Self::asset_matches_version(&asset.name, version, target))
             .ok_or_else(|| {
                 anyhow::anyhow!("Python {version} not found. Try: omg list python --available")
             })?;
@@ -283,23 +340,12 @@ impl PythonManager {
             .ok_or_else(|| anyhow::anyhow!("Python release asset has no SHA-256 digest"))
             .and_then(|digest| parse_sha256_digest(digest, "GitHub Python release"))?;
 
-        fs::create_dir_all(&self.versions_dir)?;
-
-        println!("{} Downloading {}...", style::informative("→"), asset_name);
-        let download_path = self.versions_dir.join(asset_name);
-        download_with_progress(self.client, url, &download_path, &checksum).await?;
-
-        println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let staging = begin_staged_install(&self.versions_dir)?;
-        extract_tar_gz(&download_path, staging.path(), 1).await?;
-        self.publish_install(&staging, &version)?;
-
-        remove_file_best_effort(&download_path, "runtime archive");
-
-        print_installed("Python", &version);
-        self.use_version(&version)?;
-
-        Ok(())
+        Ok(catalog::Download {
+            version: version.to_owned(),
+            url: url.to_owned(),
+            filename: asset_name.to_owned(),
+            checksum,
+        })
     }
 
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
@@ -313,17 +359,29 @@ impl PythonManager {
     /// unresolved partial would never match an asset. Prerelease entries are
     /// ignored, exact and non-numeric requests pass through unchanged, and
     /// exact prerelease requests may install.
-    async fn resolve_requested_version(&self, version: &str) -> Result<String> {
+    async fn resolve_requested_version(
+        &self,
+        version: &str,
+        downloads: Option<&[catalog::Download]>,
+    ) -> Result<String> {
         if !crate::runtimes::common::is_partial_version(version) {
             return Ok(version.to_owned());
         }
-        let available = self.list_available().await?;
+        let available = match downloads {
+            Some(downloads) => Self::catalog_versions(downloads),
+            None => self.list_available().await?,
+        };
         let names: Vec<String> = available
             .into_iter()
             .filter(|entry| !entry.prerelease)
             .map(|entry| entry.version)
             .collect();
-        Ok(crate::runtimes::resolve_version_request(&names, version))
+        let resolved = crate::runtimes::resolve_version_request(&names, version);
+        anyhow::ensure!(
+            Self::is_python_version(&resolved),
+            "No stable Python version matches {version}. Try: omg list python --available"
+        );
+        Ok(resolved)
     }
 
     /// Switch to a specific version
@@ -363,6 +421,45 @@ fn python_target() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn catalog_resolution_reuses_entries_and_refuses_missing_partial_versions() -> Result<()>
+    {
+        let manager = PythonManager::new();
+        let downloads: Vec<_> = ["3.15.0rc2", "3.14.7", "3.12.14", "3.12.13"]
+            .into_iter()
+            .map(|version| catalog::Download {
+                version: version.to_owned(),
+                url: String::new(),
+                filename: String::new(),
+                checksum: String::new(),
+            })
+            .collect();
+        assert_eq!(
+            manager
+                .resolve_requested_version("3", Some(&downloads))
+                .await?,
+            "3.14.7"
+        );
+        assert_eq!(
+            manager
+                .resolve_requested_version("3.12", Some(&downloads))
+                .await?,
+            "3.12.14"
+        );
+        assert_eq!(
+            manager.resolve_requested_version("3.15.0rc2", None).await?,
+            "3.15.0rc2"
+        );
+        assert!(
+            manager
+                .resolve_requested_version("3.99", Some(&downloads))
+                .await
+                .is_err(),
+            "an unresolved partial request must not start the exact-version GitHub history fallback"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn install_discovery_uses_small_pages_without_shortening_history() -> Result<()> {

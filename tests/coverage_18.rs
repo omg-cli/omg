@@ -69,6 +69,14 @@ impl RealServerFixture {
     }
 
     async fn with_packages(installed: &[(&str, &str)], available: &[(&str, &str)]) -> Result<Self> {
+        Self::with_catalog(installed, available, false).await
+    }
+
+    async fn with_catalog(
+        installed: &[(&str, &str)],
+        available: &[(&str, &str)],
+        indexed: bool,
+    ) -> Result<Self> {
         init_test_env();
         let temp_dir = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
@@ -79,12 +87,27 @@ impl RealServerFixture {
         let installed: std::collections::BTreeMap<_, _> = installed.iter().copied().collect();
         let available: std::collections::BTreeMap<_, _> = available.iter().copied().collect();
         std::fs::write(
-            data_dir.join("mock_state_pacman.json"),
+            data_dir.join(if indexed {
+                "mock_state_dnf.json"
+            } else {
+                "mock_state_pacman.json"
+            }),
             serde_json::to_vec(&serde_json::json!({
                 "installed": installed,
                 "available": available,
             }))?,
         )?;
+        let manager = Arc::new(MockPackageManager::new_in(
+            if indexed { "fedora" } else { "arch" },
+            &data_dir,
+        ));
+        // The portable DNF index adapter consumes the explicitly seeded manager
+        // inventory. No host repositories or test-only production API are needed.
+        let index = if indexed {
+            PackageIndex::for_package_manager(manager.clone()).await?
+        } else {
+            PackageIndex::empty()
+        };
 
         // Scoped env: audit logger and persistent cache capture their data-dir
         // paths during construction (same isolation pattern as daemon_e2e_ipc).
@@ -95,11 +118,7 @@ impl RealServerFixture {
             ],
             || -> anyhow::Result<_> {
                 omg_lib::core::security::init_audit_logger()?;
-                DaemonState::new_isolated(
-                    &data_dir,
-                    PackageIndex::empty(),
-                    Arc::new(MockPackageManager::new_in("arch", &data_dir)),
-                )
+                DaemonState::new_isolated(&data_dir, index, manager)
             },
         )?);
 
@@ -239,9 +258,13 @@ async fn expect_eof(stream: &mut UnixStream, ctx: &str) {
 
 async fn metrics_probe(fixture: &RealServerFixture) -> Result<MetricsSnapshot> {
     let mut stream = fixture.connect().await?;
+    metrics_on_connection(&mut stream).await
+}
+
+async fn metrics_on_connection(stream: &mut UnixStream) -> Result<MetricsSnapshot> {
     let bytes = omg_lib::daemon::protocol::encode_frame(&Request::Metrics { id: 0xBEEF })?;
-    send_raw_frame(&mut stream, &bytes).await?;
-    match read_response(&mut stream).await? {
+    send_raw_frame(stream, &bytes).await?;
+    match read_response(stream).await? {
         Response::Success {
             id: 0xBEEF,
             result: ResponseResult::Metrics(snapshot),
@@ -528,6 +551,7 @@ async fn incomplete_frames_disconnect_without_breaking_a_fresh_client() -> Resul
         let mut interrupted = fixture.connect().await?;
         interrupted.write_all(&wire[..length]).await?;
         interrupted.shutdown().await?;
+        expect_eof(&mut interrupted, "half-closed incomplete Ping frame").await;
         drop(interrupted);
         let mut fresh = fixture.connect().await?;
         fresh.write_all(&ping_wire(911 + length as u64)?).await?;
@@ -689,6 +713,55 @@ async fn four_kib_frame_reaches_protocol_parser_before_rejection() -> Result<()>
 
     let after = requests_failed_probe(&fixture).await?;
     assert_eq!(after, baseline + 1);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn exact_frame_size_boundaries_reach_protocol_validation() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let baseline = requests_failed_probe(&fixture).await?;
+    for (index, size) in [0, 1, 2, 3, 4, REQUEST_WIRE_CAP - 1, REQUEST_WIRE_CAP]
+        .into_iter()
+        .enumerate()
+    {
+        let mut stream = fixture.connect().await?;
+        let mut frame = vec![0; size];
+        if size >= 4 {
+            frame[..4].copy_from_slice(&999_001u32.to_le_bytes());
+        }
+        send_raw_frame(&mut stream, &frame).await?;
+        let expected = if size < 4 {
+            "malformed frame header: frame too short to contain the protocol version header"
+                .to_string()
+        } else {
+            format!(
+                "unsupported peer protocol version 999001 (this daemon speaks {PROTOCOL_VERSION}); update omg"
+            )
+        };
+        match read_response(&mut stream)
+            .await
+            .with_context(|| format!("frame size {size}"))?
+        {
+            Response::Error { id, code, message } => {
+                assert_eq!(id, 0, "frame size {size}");
+                assert_eq!(code, error_codes::PARSE_ERROR, "frame size {size}");
+                assert_eq!(message, expected, "frame size {size}");
+            }
+            other @ Response::Success { .. } => {
+                anyhow::bail!("frame size {size}: expected protocol error, got {other:?}")
+            }
+        }
+        expect_eof(&mut stream, "after boundary frame rejection").await;
+        assert_eq!(
+            requests_failed_probe(&fixture).await?,
+            baseline + u64::try_from(index)? + 1
+        );
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 9020 }).await?,
+        9020,
+    );
     fixture.shutdown().await
 }
 
@@ -855,8 +928,9 @@ async fn rate_limited_burst_rejects_with_exact_envelope_and_keeps_connection_ope
             continue;
         }
         match response {
-            Response::Success { id, .. } => {
+            Response::Success { id, result } => {
                 assert_eq!(*id, i as u64, "served response must echo its request id");
+                assert!(matches!(result, ResponseResult::Ping(message) if message == "pong"));
             }
             other @ Response::Error { .. } => {
                 panic!("request {i} was neither served nor rate-limited, got {other:?}")
@@ -869,12 +943,7 @@ async fn rate_limited_burst_rejects_with_exact_envelope_and_keeps_connection_ope
     tokio::time::sleep(Duration::from_millis(300)).await;
     let follow_up = omg_lib::daemon::protocol::encode_frame(&Request::Ping { id: 4242 })?;
     send_raw_frame(&mut stream, &follow_up).await?;
-    match read_response(&mut stream).await? {
-        Response::Success { id, .. } => assert_eq!(id, 4242),
-        other @ Response::Error { .. } => {
-            panic!("connection must stay usable after a rate-limit rejection, got {other:?}")
-        }
-    }
+    assert_pong(read_response(&mut stream).await?, 4242);
     fixture.shutdown().await
 }
 
@@ -911,4 +980,429 @@ async fn wait_for_active_connections(fixture: &RealServerFixture, expected: i64)
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn connection_capacity_refuses_overflow_and_recovers_released_permits() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let mut control = fixture.connect().await?;
+    wait_for_connection_count(&mut control, 1).await?;
+    // Independent contract boundary: do not import the product constant, since
+    // changing or removing its limit must make this test fail.
+    let mut held = Vec::new();
+    for id in 1..128 {
+        let mut client = fixture.connect().await?;
+        client.write_all(&ping_wire(id)?).await?;
+        assert_pong(read_response(&mut client).await?, id);
+        held.push(client);
+    }
+    wait_for_connection_count(&mut control, 128).await?;
+    let mut overflow = fixture.connect().await?;
+    expect_eof(&mut overflow, "129th connection at capacity").await;
+    assert_eq!(
+        metrics_on_connection(&mut control)
+            .await?
+            .active_connections,
+        128
+    );
+
+    drop(held.pop().context("missing held connection")?);
+    wait_for_connection_count(&mut control, 127).await?;
+    let mut replacement = fixture.connect().await?;
+    replacement.write_all(&ping_wire(9001)?).await?;
+    assert_pong(read_response(&mut replacement).await?, 9001);
+    wait_for_connection_count(&mut control, 128).await?;
+    let mut overflow_again = fixture.connect().await?;
+    expect_eof(&mut overflow_again, "capacity after permit reuse").await;
+
+    drop(replacement);
+    drop(held);
+    wait_for_connection_count(&mut control, 1).await?;
+    control.write_all(&ping_wire(9002)?).await?;
+    assert_pong(read_response(&mut control).await?, 9002);
+    drop(control);
+    fixture.shutdown().await
+}
+
+async fn wait_for_connection_count(stream: &mut UnixStream, expected: i64) -> Result<()> {
+    let deadline = Instant::now() + READ_TIMEOUT;
+    loop {
+        let active = metrics_on_connection(stream).await?.active_connections;
+        if active == expected {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "active connections never reached {expected}; last value was {active}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn suggestions_preserve_catalog_order_limits_refusal_and_state_over_real_ipc() -> Result<()> {
+    let names: Vec<String> = (0..60)
+        .map(|index| format!("cov18suggestpkg{index:02}"))
+        .collect();
+    let records: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "1.0.0")).collect();
+    let fixture = RealServerFixture::with_catalog(&[], &records, true).await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_dnf.json");
+    let before = std::fs::read(&state_path)?;
+    let longest_valid_query = "a".repeat(500);
+    for (id, query, limit, count) in [
+        (801, "cov18suggestpkg", Some(0), 0),
+        (802, "cov18suggestpkg", Some(1), 1),
+        (803, "cov18suggestpkg", None, 10),
+        (804, "COV18SUGGESTPKG", Some(3), 3),
+        (805, "cov18suggestpkg", Some(50), 50),
+        (806, "cov18suggestpkg", Some(usize::MAX), 50),
+        (807, "", Some(50), 0),
+        (808, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", Some(50), 0),
+        (809, longest_valid_query.as_str(), None, 0),
+    ] {
+        match request_on_wire(
+            &fixture,
+            Request::Suggest {
+                id,
+                query: query.into(),
+                limit,
+            },
+        )
+        .await?
+        {
+            Response::Success {
+                id: response_id,
+                result: ResponseResult::Suggest(results),
+            } => {
+                assert_eq!(response_id, id);
+                assert_eq!(results, names[..count], "query={query}, limit={limit:?}");
+            }
+            other => panic!("suggest returned {other:?}"),
+        }
+    }
+    match request_on_wire(
+        &fixture,
+        Request::Suggest {
+            id: 810,
+            query: "a".repeat(501),
+            limit: None,
+        },
+    )
+    .await?
+    {
+        Response::Error { id, code, message } => {
+            assert_eq!(id, 810);
+            assert_eq!(code, error_codes::INVALID_PARAMS);
+            assert_eq!(message, "Query too long");
+        }
+        other @ Response::Success { .. } => panic!("oversized suggestion returned {other:?}"),
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 811 }).await?,
+        811,
+    );
+    assert_eq!(std::fs::read(&state_path)?, before);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn concurrent_pings_preserve_boundary_ids_and_backend_state() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_pacman.json");
+    let before = std::fs::read(&state_path)?;
+    let mut ids = vec![0, 1, u64::MAX - 1, u64::MAX];
+    ids.extend(2..14);
+    let barrier = Arc::new(tokio::sync::Barrier::new(ids.len() + 1));
+    let mut clients = tokio::task::JoinSet::new();
+    for id in ids {
+        let socket = fixture.socket_path.clone();
+        let barrier = Arc::clone(&barrier);
+        clients.spawn(async move {
+            let mut stream = UnixStream::connect(socket).await?;
+            barrier.wait().await;
+            stream.write_all(&ping_wire(id)?).await?;
+            assert_pong(read_response(&mut stream).await?, id);
+            Ok::<(), anyhow::Error>(())
+        });
+    }
+    timeout(READ_TIMEOUT, barrier.wait())
+        .await
+        .context("Ping clients failed to connect together")?;
+    while let Some(result) = timeout(READ_TIMEOUT, clients.join_next()).await? {
+        result.context("Ping client panicked")??;
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 77 }).await?,
+        77,
+    );
+    assert_eq!(std::fs::read(&state_path)?, before);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn debian_search_preserves_catalog_limits_cache_and_refusal_over_real_ipc() -> Result<()> {
+    let names: Vec<String> = (0..1005).map(|i| format!("cov18debsearch{i:04}")).collect();
+    let records: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "1.0.0")).collect();
+    let fixture = RealServerFixture::with_catalog(&[], &records, true).await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_dnf.json");
+    let before = std::fs::read(&state_path)?;
+    let baseline = metrics_probe(&fixture).await?;
+    // A zero-result first request must not poison subsequent wider cache hits.
+    for (id, limit, count) in [
+        (9100, Some(0), 0),
+        (9101, Some(1), 1),
+        (9102, None, 50),
+        (9103, Some(1000), 1000),
+        (9104, Some(usize::MAX), 1000),
+    ] {
+        match request_on_wire(
+            &fixture,
+            Request::DebianSearch {
+                id,
+                query: "cov18debsearch".into(),
+                limit,
+            },
+        )
+        .await?
+        {
+            Response::Success {
+                id: actual,
+                result: ResponseResult::DebianSearch(packages),
+            } => {
+                assert_eq!(actual, id);
+                assert_eq!(packages.len(), count);
+                for (package, name) in packages.iter().zip(&names) {
+                    assert_eq!(&package.name, name);
+                    assert_eq!(package.version, "1.0.0");
+                    assert_eq!(package.description, "");
+                    assert_eq!(
+                        package.source,
+                        omg_lib::daemon::protocol::WirePackageSource::Apt
+                    );
+                }
+            }
+            other => anyhow::bail!("Debian search returned {other:?}"),
+        }
+    }
+    let after = metrics_probe(&fixture).await?;
+    assert_eq!(after.cache_misses - baseline.cache_misses, 1);
+    assert_eq!(after.cache_hits - baseline.cache_hits, 4);
+    for (id, query) in [(9105, String::new()), (9106, "z".repeat(500))] {
+        match request_on_wire(
+            &fixture,
+            Request::DebianSearch {
+                id,
+                query,
+                limit: None,
+            },
+        )
+        .await?
+        {
+            Response::Success {
+                id: actual,
+                result: ResponseResult::DebianSearch(packages),
+            } => {
+                assert_eq!(actual, id);
+                assert!(packages.is_empty());
+            }
+            other => anyhow::bail!("empty/unmatched Debian search returned {other:?}"),
+        }
+    }
+    match request_on_wire(
+        &fixture,
+        Request::DebianSearch {
+            id: 9107,
+            query: "z".repeat(501),
+            limit: None,
+        },
+    )
+    .await?
+    {
+        Response::Error { id, code, message } => {
+            assert_eq!(id, 9107);
+            assert_eq!(code, error_codes::INVALID_PARAMS);
+            assert_eq!(message, "Query too long (max 500 characters)");
+        }
+        other @ Response::Success { .. } => anyhow::bail!("overlong query succeeded: {other:?}"),
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 9108 }).await?,
+        9108,
+    );
+    assert_eq!(std::fs::read(state_path)?, before);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn security_audit_backend_failure_cannot_report_a_clean_scan() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_pacman.json");
+    let original = std::fs::read(&state_path)?;
+    let baseline = metrics_probe(&fixture).await?;
+    for id in [9200, 9202] {
+        if id == 9202 {
+            std::fs::write(&state_path, &original)?;
+        }
+        match request_on_wire(&fixture, Request::SecurityAudit { id }).await? {
+            Response::Success {
+                id: actual,
+                result: ResponseResult::SecurityAudit(result),
+            } => {
+                assert_eq!(actual, id);
+                assert_eq!(result.total_vulnerabilities, 0);
+                assert_eq!(result.high_severity, 0);
+                assert!(result.vulnerabilities.is_empty());
+            }
+            other => anyhow::bail!("empty-inventory audit returned {other:?}"),
+        }
+        if id == 9200 {
+            std::fs::write(&state_path, b"{broken-json")?;
+            match request_on_wire(&fixture, Request::SecurityAudit { id: 9201 }).await? {
+                Response::Error { id, code, message } => {
+                    assert_eq!(id, 9201);
+                    assert_eq!(code, error_codes::INTERNAL_ERROR);
+                    assert_eq!(
+                        message,
+                        format!(
+                            "Failed to list packages: failed to parse mock state at {}",
+                            state_path.display()
+                        )
+                    );
+                }
+                other @ Response::Success { .. } => {
+                    anyhow::bail!("unreadable inventory reported clean: {other:?}")
+                }
+            }
+            assert_eq!(std::fs::read(&state_path)?, b"{broken-json");
+            assert_pong(
+                request_on_wire(&fixture, Request::Ping { id: 9203 }).await?,
+                9203,
+            );
+        }
+    }
+    assert_eq!(
+        metrics_probe(&fixture).await?.security_audit_requests - baseline.security_audit_requests,
+        3
+    );
+    assert_eq!(std::fs::read(&state_path)?, original);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+#[cfg(target_os = "linux")]
+async fn health_reports_live_uptime_rss_and_worker_state_without_mutating_packages() -> Result<()> {
+    let before_start = Instant::now();
+    let fixture = RealServerFixture::new().await?;
+    let after_start = Instant::now();
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_pacman.json");
+    let before = std::fs::read(&state_path)?;
+    // Elapsed time is part of this contract: a constant zero uptime must fail.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut resident_pages = None;
+    let mut baseline_rss = 0;
+    let mut peak_rss = 0;
+    let mut baseline_uptime = 0;
+    for id in [0, u64::MAX] {
+        if id != 0 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let minimum_uptime = after_start.elapsed().as_secs();
+        let response = request_on_wire(&fixture, Request::Health { id }).await?;
+        let maximum_uptime = before_start.elapsed().as_secs();
+        match response {
+            Response::Success {
+                id: response_id,
+                result: ResponseResult::Health(health),
+            } => {
+                assert_eq!(response_id, id);
+                assert_eq!(health.status, "healthy");
+                assert!(
+                    (minimum_uptime..=maximum_uptime).contains(&health.uptime_seconds),
+                    "uptime {} outside independently measured {minimum_uptime}..={maximum_uptime}",
+                    health.uptime_seconds
+                );
+                // VmRSS is approximate and can change while the process runs.
+                // A loaded Rust test process must nevertheless have resident memory.
+                assert!(
+                    health.memory_usage_mb > 0,
+                    "Linux Health reported no resident memory"
+                );
+                assert_eq!(health.background_worker_failures, 0);
+                assert!(
+                    health.active_connections >= 1,
+                    "the health connection must be active"
+                );
+                if id == 0 {
+                    baseline_uptime = health.uptime_seconds;
+                    baseline_rss = health.memory_usage_mb;
+                    let mut mapping = memmap2::MmapMut::map_anon(64 * 1024 * 1024)?;
+                    mapping.fill(0x5a);
+                    std::hint::black_box(&mapping);
+                    resident_pages = Some(mapping);
+                } else {
+                    assert!(
+                        health.uptime_seconds > baseline_uptime,
+                        "uptime did not advance"
+                    );
+                    peak_rss = health.memory_usage_mb;
+                    assert!(
+                        peak_rss >= baseline_rss + 32,
+                        "resident memory did not reflect 64 MiB touched mapping: {baseline_rss} -> {peak_rss}"
+                    );
+                }
+            }
+            other => panic!("health returned {other:?}"),
+        }
+    }
+    drop(resident_pages);
+    match request_on_wire(&fixture, Request::Health { id: 813 }).await? {
+        Response::Success {
+            id: 813,
+            result: ResponseResult::Health(health),
+        } => {
+            assert!(
+                health.memory_usage_mb + 32 <= peak_rss,
+                "resident memory did not fall after unmapping: {peak_rss} -> {}",
+                health.memory_usage_mb
+            );
+        }
+        other => panic!("post-unmap health returned {other:?}"),
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 812 }).await?,
+        812,
+    );
+    assert_eq!(std::fs::read(&state_path)?, before);
+    fixture.shutdown().await
 }

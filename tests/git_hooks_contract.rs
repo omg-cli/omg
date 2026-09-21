@@ -6,6 +6,89 @@ use common::{CommandResult, TestProject};
 
 const HOOK_NAMES: &[&str] = &["pre-commit", "post-checkout", "post-merge"];
 
+#[test]
+fn hook_install_force_and_uninstall_preserve_user_owned_content() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    for directory in [".git/hooks", "custom hooks"] {
+        let project = TestProject::new();
+        git(&project, &["init", "-q"]);
+        git(&project, &["config", "core.hooksPath", directory]);
+        let env = [
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ];
+        project
+            .run_with_env(&["hooks", "install"], &env)
+            .assert_success();
+        let originals: Vec<_> = HOOK_NAMES
+            .iter()
+            .map(|name| {
+                let path = project.path().join(directory).join(name);
+                let metadata = std::fs::metadata(&path).unwrap();
+                (
+                    path.clone(),
+                    std::fs::read(&path).unwrap(),
+                    metadata.ino(),
+                    metadata.mode(),
+                )
+            })
+            .collect();
+        let repeated = project.run_with_env(&["hooks", "install"], &env);
+        repeated.assert_success();
+        assert_eq!(repeated.stdout.matches("already installed").count(), 3);
+        for (path, content, inode, mode) in &originals {
+            assert_eq!(std::fs::read(path).unwrap(), *content);
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), *inode);
+            assert_eq!(std::fs::metadata(path).unwrap().mode(), *mode);
+        }
+        let custom = b"#!/bin/sh\n# OMG user-owned integration\nexit 23\n";
+        for (path, _, _, _) in &originals {
+            std::fs::write(path, custom).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let preserve = project.run_with_env(&["hooks", "install"], &env);
+        preserve.assert_success();
+        assert_eq!(
+            preserve
+                .stdout
+                .matches("exists, use --force to overwrite")
+                .count(),
+            3
+        );
+        let status = project.run_with_env(&["hooks", "status"], &env);
+        status.assert_success();
+        assert_eq!(status.stdout.matches("unrecognized or modified").count(), 3);
+        project
+            .run_with_env(&["hooks", "uninstall"], &env)
+            .assert_success();
+        for (path, _, inode, _) in &originals {
+            assert_eq!(std::fs::read(path).unwrap(), custom);
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), *inode);
+            assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o640);
+        }
+        project
+            .run_with_env(&["hooks", "install", "--force"], &env)
+            .assert_success();
+        for (path, content, _, _) in &originals {
+            assert_eq!(std::fs::read(path).unwrap(), *content);
+            assert_ne!(std::fs::metadata(path).unwrap().mode() & 0o111, 0);
+        }
+        let status = project.run_with_env(&["hooks", "status"], &env);
+        status.assert_success();
+        assert_eq!(status.stdout.matches("installed (OMG)").count(), 3);
+        project
+            .run_with_env(&["hooks", "uninstall"], &env)
+            .assert_success();
+        for (path, _, _, _) in &originals {
+            assert!(!path.exists());
+        }
+        let repeated = project.run_with_env(&["hooks", "uninstall"], &env);
+        repeated.assert_success();
+        repeated.assert_stdout_contains("No OMG hooks to remove");
+        project.close_checked();
+    }
+}
+
 fn git(project: &TestProject, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args([

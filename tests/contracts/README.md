@@ -4,6 +4,19 @@ The manifest is an incremental assertion inventory, not a coverage claim.
 Parser tests establish grammar only. `gaps.json` retains missing behavioral
 evidence even for interfaces with passing parser contracts.
 
+`behavioral_progress` is a conservative per-lane evidence summary. Its
+denominator is the distinct supported surfaces with behavioral requirements or
+explicit behavioral gaps, including non-CLI interfaces. A surface earns credit
+only if all its reviewed behavioral contracts passed and no behavioral gap
+remains. Parser/help-only results, failed cleanup, missing owners and partial
+assertions earn no credit. The 95% target uses integer arithmetic; displayed
+rounding cannot pass it. An empty denominator is unavailable, never 100%.
+The current inventory still contains provisional gap classifications. Until
+`behavioral_inventory_reviewed` is explicitly true after their domain review,
+the report cannot certify the target even if its displayed percentage is high.
+This is not a test pass percentage, source-code coverage, or a claim about
+other lanes/platforms. Broader gaps remain until reviewed evidence closes them.
+
 Native CI invokes `scripts/run-native-contracts.py` around the existing nextest
 run. It lists the exact feature selection, requires nonempty owned suites,
 captures JUnit output, and hashes the actual parser test harnesses before and
@@ -32,6 +45,15 @@ The status fixture asserts exact seeded counts, unchanged state and independent
 empty state. Consent asserts refusal without `--yes`, unchanged refused state,
 and exact installed versions after consent. These use a mock Debian backend;
 they do not certify native transactions or daemon behavior. Wider gaps remain.
+
+Linux native-backend owners additionally bind four reviewed exact-search
+contracts to the comprehensive CLI harness and the debug product pair. They
+check canonical/alias records, case-insensitive ranking, limit boundaries,
+machine output and unchanged mock package state, then explicitly close all
+fixture directories. All owning harnesses are hashed before and after execution;
+different product pairs or omitted harnesses fail admission. No AUR filtering,
+native repository behavior, human detailed output or quiet-mode coverage is
+inferred from these JSON fixtures, and their wider gap records remain intact.
 
 Only explicitly reviewed mappings are translated. A generic JUnit pass
 cannot automatically certify state changes, cleanup or successful transactions.
@@ -69,10 +91,36 @@ the expanded checkout inventory, so old release evidence is not reinterpreted.
 Linux backend owners also execute the backend-independent CLI comprehensive
 cases; Arch-specific package fixtures retain their Arch owner. All native owners
 require nonempty hook and production daemon transport targets. In root Linux CI
-containers, a recorded target runner drops only the comprehensive CLI harness to
+containers, a recorded target runner drops the isolated CLI fixture harnesses to
 an unprivileged identity, keeping fixture paths separate from real root state.
 These additional JUnit results are execution evidence, not automatic behavioral
 coverage credit in the contract manifest.
+
+Runtime management and lockfile integrity are also explicit, nonempty native
+owners on every platform. Root Linux runners drop these CLI fixture harnesses
+to an unprivileged identity, and failures are not retried. The runtime suite has
+five opt-in network cases: when disabled, their `[omg-skip]` output is reported
+as unexecuted even though libtest itself prints `ok`. A green target does not
+prove those network behaviors. Six Node/Python/Go pin scenarios now require
+successful activation, exact current executable paths, executable identity and
+checked fixture cleanup. A pinned Rust toolchain has the same activation checks;
+a locked stable-channel selection must refuse with the concurrency error and
+leave no active toolchain. These installed fixtures do not prove downloading or
+extraction. Opt-in downloads now disable synthetic runtime mode, require success
+and execute the installed binary with the exact resolved version. Latest/LTS
+expectations come from Node's separate published TSV release table, selecting
+the highest eligible stable semantic version independently of OMG's JSON
+resolver. Upstream changes during execution fail visibly; there is no retry to
+hide them. Download failure is never accepted as successful installation.
+Eleven offline runtime fixture contracts are bound to their actual owning harness
+and product pair. Their named selection/refusal/state assertions and cleanup
+are admitted separately; broad runtime gaps and opt-in downloads remain outside
+that credit.
+The uninstall lifecycle runs every one of the 68 registered dispatches against
+real temporary directories and links: active-version refusal, inactive removal,
+missing/symlinked-version refusal, and preservation of sibling and external bytes.
+A registry-size change requires explicit fixture review. These fixtures do not
+prove concurrent filesystem race handling or successful installation of all tools.
 
 JUnit's skipped-test reporting varies by nextest version. The independent list
 supplies ignored/filtered counts even when no XML row exists. A selected test
@@ -124,3 +172,29 @@ The probe also sends SIGINT to both direct and foreground-launched daemon
 processes, verifies successful termination and socket removal, and starts the
 next lifecycle against the same private state. Admission requires `sigint: true`;
 signal-specific logs and query outputs remain separate exported artifacts.
+
+QEMU's `runtime-python-install` row requires a numeric requested version, uses
+private runtime state, checks the active link and executable stay inside the
+installed version, and runs that interpreter to verify its exact version.
+The interpreter must also execute isolated Python code: compression round trips,
+SHA-256, SQLite write/read, ctypes loading, TLS verification defaults, and an
+isolated venv with bundled pip. The probe requires an exact completion marker
+after successful assertions and cleanup, and has a 60-second deadline. A version
+string alone, a no-op program, or a failing interpreter cannot satisfy it. TLS
+defaults do not prove a successful remote TLS connection; the probe is offline.
+A missing, inactive, wrong-version, broken or escaped installation fails even
+when the CLI exits zero. Cleanup is checked before the row passes. This stronger
+oracle also applies to reviewed published inventories with that row identity;
+it does not change their recorded hashes or pretend they gained other tests.
+
+`execution/daemon/` contains a separate `native-daemon-fixture` report for
+reviewed production-server contracts. Its OMGD binary hash identifies the actual
+`coverage_18` integration harness containing `server::run`; it never identifies
+a standalone daemon executable that these tests did not launch. The OMG hash
+in this lane remains the parser harness used for compiled surface inventory;
+this lane admits no OMG CLI contracts. Harness ownership and pre/post execution
+hashes are checked. The same nextest run supplies the observations, so this
+reconciliation does not add another test run. Injected package state, real Unix
+transport, explicit SIGTERM drain and checked cleanup are the bounded scope.
+Native backend, executable lifecycle, security-audit and wider request/fault
+coverage remain separate gaps. Do not add percentages from separate lane reports.

@@ -60,6 +60,50 @@ def fixture():
 
 
 class ContractAdmission(unittest.TestCase):
+    def test_behavioral_progress_keeps_unmapped_and_partial_surfaces_uncovered(self):
+        report = COVERAGE.admit(*fixture())
+        progress = report['behavioral_progress']
+        self.assertEqual(progress['supported'], 2)
+        self.assertEqual(progress['covered'], 1)
+        self.assertEqual(progress['percent'], 50)
+        self.assertFalse(progress['target_met'])
+        self.assertEqual(progress['uncovered_surfaces'], ['omg install'])
+
+    def test_parser_passes_cannot_inflate_behavioral_progress(self):
+        contract = fixture()[0]['contracts'][0]
+        contracts = {'behavior': contract}
+        before = COVERAGE.behavioral_progress(contracts, [], {'behavior'})
+        for index in range(100):
+            contracts[str(index)] = dict(contract, surface=f'omg parser{index}', requires=['parser'])
+        self.assertEqual(COVERAGE.behavioral_progress(contracts, [], set(contracts)), before)
+        contracts['unexecuted'] = dict(contract)
+        self.assertEqual(COVERAGE.behavioral_progress(contracts, [], {'behavior'})['covered'], 0)
+        self.assertEqual(COVERAGE.behavioral_progress({'behavior': contract},
+            [{'surface': contract['surface'], 'missing': ['fault']}], {'behavior'})['covered'], 0)
+
+    def test_failed_blocked_or_bad_cleanup_cannot_earn_behavioral_credit(self):
+        for result, cleanup in [('FAIL', 'NOT_STARTED'), ('BLOCKED', 'NOT_STARTED'),
+                                ('HARNESS_ERROR', 'NOT_STARTED'), ('PASS', 'FAIL')]:
+            with self.subTest(result=result, cleanup=cleanup):
+                args = list(fixture())
+                args[2][0].update(result=result, cleanup=cleanup)
+                progress = COVERAGE.admit(*args)['behavioral_progress']
+                self.assertEqual(progress['covered'], 0)
+                self.assertFalse(progress['target_met'])
+
+    def test_behavioral_target_never_rounds_up_or_accepts_an_empty_inventory(self):
+        empty = COVERAGE.behavioral_progress({}, [], set())
+        self.assertIsNone(empty['percent'])
+        self.assertFalse(empty['target_met'])
+        contracts = {str(index): {'surface': f'omg command{index}', 'requires': ['success']}
+                     for index in range(2001)}
+        progress = COVERAGE.behavioral_progress(contracts, [], {str(index) for index in range(1900)}, inventory_reviewed=True)
+        self.assertEqual(progress['percent'], 94.95)
+        self.assertFalse(progress['target_met'])
+        progress = COVERAGE.behavioral_progress(contracts, [], {str(index) for index in range(1901)}, inventory_reviewed=True)
+        self.assertTrue(progress['target_met'])
+        self.assertFalse(COVERAGE.behavioral_progress(contracts, [], set(contracts))['target_met'])
+
     def test_valid_receipt_has_separate_evidence_totals_and_visible_debt(self):
         report = COVERAGE.admit(*fixture())
         self.assertTrue(report['passed'])

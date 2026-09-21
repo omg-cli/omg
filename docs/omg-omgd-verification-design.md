@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used fifty-eight searches (236 requested result slots),
+Exa research used eighty-three searches (278 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -422,3 +422,444 @@ A temporary isolated-checkout mutation returning accumulated releases after
 quota exhaustion failed this regression with the partial catalog exposed.
 Restoring the production source passed all 56 shared runtime-helper tests on
 Arch. No production runtime behavior was changed in this follow-up.
+
+### Evidence accuracy and hook force adequacy
+
+The user's 95% target remains an acceptance goal, not permission to manufacture
+passing cases or trim the inventory. Reporting tests never count as product
+coverage. Fully evidenced surfaces exclude parser/help-only results, partial
+contracts, failed cleanup and explicit gaps. The initial 866 behavioral surfaces
+per licensed Linux owner still include provisional gap classifications; their
+domain review must finish before any percentage can certify the goal. Current
+per-lane reports cannot claim coverage for other lanes or architectures.
+
+Four exact mock-search contracts are now bound to the CLI pair and their owning
+comprehensive harness, with explicit fixture cleanup. Multi-harness admission
+rejects missing owners and differing product pairs. Broader native, fault and
+interaction gaps remain intact. Research used the official
+[nextest machine-readable metadata](https://nexte.st/docs/machine-readable/list/).
+
+The old QEMU force-install row accepted a product that ignored `--force`: its
+prerequisite had already installed identical hooks. A failing negative control
+proved the blind spot. The row now replaces those hooks with different user
+content and non-executable permissions before invoking the product; the existing
+content, executable and actual Git lifecycle assertions then require replacement.
+All 17 QEMU output-oracle tests passed on all four WSL distros.
+
+A separate CLI lifecycle regression verifies non-force idempotency (bytes,
+inode and mode), preservation of user-owned hooks by install/uninstall, explicit
+force replacement, status classification and repeated uninstall, using both
+default and space-containing custom hook directories. All seven hook tests passed
+on all four WSL builds. A production mutation ignoring the force flag failed the
+new regression; restoring production behavior passed the full hook target.
+
+### Runtime outcome audit
+
+The runtime suite previously accepted a detected-version line even when the
+command timed out, and several network cases accepted either success or a
+broad error. Those are inadequate installation or activation oracles.
+Installed Node/Python/Go and pinned Rust fixtures now require successful exit,
+exact activation paths and executable identity; `which` checks both empty state
+and the exact selected version. The Rust stable-channel refusal holds an actual
+mutation lock and requires its specific error and unchanged state. The
+[official toolchain naming](https://rust-lang.github.io/rustup/concepts/toolchains.html)
+and [toolchain file documentation](https://rust-lang.github.io/rustup/overrides.html)
+inform the fixture; this is OMG's native manager, not a test of rustup.
+
+The strict Python network check exposed the old 3.11.0 fixture's `not found`
+response, which the former assertion accepted. The success fixture now matches
+QEMU's 3.12.14. The [official PBS 20260901 release](https://github.com/astral-sh/python-build-standalone/releases/tag/20260901)
+and GitHub release API confirmed the Linux install-only asset and SHA-256 digest.
+Opt-in downloads disable synthetic mode and must activate and execute the exact
+resolved runtime. A refused connection fails the Node test. All 32 selected tests
+(including one harness helper) passed with network enabled on each of the four
+WSL builds, with zero network skips. That is bounded local execution evidence,
+not 32 newly covered behavioral surfaces or exact hosted-revision provenance.
+Latest/LTS downloads still lack an independent upstream-selection oracle.
+
+QEMU's Python row had the same exit-only blind spot: a no-op product returned
+PASS. Its runner now isolates runtime state and requires the exact activated
+interpreter, contained paths, successful executable output and checked cleanup.
+Six defective states are rejected by the actual runner regression. All 18 output
+oracle tests passed on all four WSL distros. The SSH-shim runner also passed with
+each distro's real local OMG binary and a real Python download; those shim runs
+are not guest-boot evidence or admitted per-distro provenance. Existing trusted
+QEMU issue publication and diagnosis capture remain unchanged.
+
+### Independent Node alias expectations and runtime receipts
+
+Latest/LTS checks now read Node's [published tabular release index](https://nodejs.org/dist/index.tab)
+and select the highest stable semantic version, filtering by the named LTS
+column when requested. This uses neither OMG's JSON parser nor its resolver,
+and an unordered fixture verifies the oracle's selection and refusal behavior.
+A deliberate production mutation installed working Node 20.10.0 for `latest`;
+the new assertion failed against expected 26.9.0. Restoring production passed
+all 33 selected runtime tests with network enabled on all four WSL builds.
+Two of those tests validate harness helpers, not product behavior. The
+[official Node 26 announcement](https://nodejs.org/en/blog/release/v26.0.0)
+confirms its October 2026 LTS transition; expectations follow upstream metadata
+rather than pinning the current LTS major in the test.
+
+Eleven bounded offline runtime contracts now bind their exact assertions to the
+runtime integration harness and actual product executable hashes. They cover
+named pin selection/precedence, activation, locked Rust refusal, unsupported
+engine-range refusal and Node `which` state. `which` switches between two
+versions and verifies that querying preserves the active link. All corresponding
+native owners execute these tests without retries. No broad gap was removed,
+and opt-in network cases are not counted by this offline receipt mapping.
+
+The additional uninstall lifecycle visits all 68 registered runtime/tool
+managers. For each it verifies active-version refusal and byte preservation,
+inactive removal, preservation of a sibling active link and an external file
+referenced by an internal symlink, then missing and symlinked-version refusals.
+The [Rust removal documentation](https://doc.rust-lang.org/std/fs/fn.remove_dir_all.html)
+informs the external-file check; it does not justify a claim about all races.
+This scenario passed on all four WSL builds. Removing the shared active-version
+guard deliberately failed the test; restored production passed the full Arch
+runtime target. Runtime install coverage is not inferred from removal fixtures.
+
+### Complete managed-runtime capture and installed restoration
+
+An exact-map regression exposed that environment capture hardcoded only seven
+of the 68 registered runtime managers. Capture now probes the compiled registry
+in one awaited blocking filesystem pass. The Tokio documentation for
+[blocking tasks](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)
+and [join results](https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html)
+supports the bounded task and explicit error propagation; this is not a measured
+speedup or an injected task-panic test.
+
+The owning integration suite verifies all 68 captured entries, rejects each
+runtime's version drift, and follows the map through default setup, migration
+export, snapshot creation, CI validation and restore planning. Dry runs preserve
+saved bytes and active links. Actual snapshot restoration selects and executes
+all 68 installed fixture payloads and preserves the alternate installations.
+These fixtures prove installed selection, not vendor download correctness.
+
+Following restoration to its dispatcher exposed a second defect: restoring an
+installed PHP channel fetched GitHub releases and failed offline. Saved-state
+restoration now reuses that installed channel, while explicit `use` preserves
+PHP's rolling refresh behavior. The failing offline regression becomes green;
+removing the selected executable still fails with its specific diagnostic and
+preserves the previous active link. The distinction between installed reuse and
+explicit reinstallation is also described in the primary
+[mise use documentation](https://mise.jdx.dev/cli/use.html); OMG's own documented
+PHP behavior determines the implementation here.
+
+Final owning suites passed locally on Arch, Ubuntu and Debian (nine tests each),
+and Fedora (seven tests, including explicit unsupported fingerprinting refusal).
+Fedora/portable/macOS fingerprint capture remains unsupported by the existing
+package-backend contract. Four bounded environment receipts preserve those owner
+boundaries. Remote Gist publication, interactive migration application, rolling
+Rust refresh, real package transactions and broad behavioral inventory gaps are
+not certified by these fixture results.
+
+### Counter commands and independently specified package counts
+
+The explicit-count fixture previously used OMG's own returned package list as
+its count oracle. It now requires independently specified empty and populated
+records, sorted names, available-only exclusion, exact JSON/list/count forms,
+unchanged mock state and checked cleanup. Mock packages are all explicit; this
+does not certify native dependency-reason filtering described by
+[DNF5 repoquery](https://dnf5.readthedocs.io/en/latest/commands/repoquery.8.html).
+
+The stronger test exposed `omg --json ec` failing as an unrecognized command.
+All four prompt counters existed only in the pre-parser fast path and were
+absent from Clap's compiled inventory. They are now declared commands using the
+same counter renderer as the retained fast path. Global JSON/quiet/verbose
+positions follow [Clap's global argument contract](https://docs.rs/clap/latest/clap/struct.Arg.html#method.global).
+Non-explicit counters also respect isolated test state before consulting caches.
+Exact fixture counts, JSON output and extra-positional refusal are verified for
+all four commands. A mutation adding one to the total count fails the new test.
+
+The restored comprehensive CLI targets pass on Arch (84), Ubuntu/Debian (79
+each) and Fedora (78); these include parser/help tests, not that many behavioral
+contracts. The 23 binary unit tests and scoped Clippy also pass. Eight additive
+grammar entries expose 12 help surfaces and 20 behavioral surfaces previously
+missing from the inventory. Their gaps remain explicit. Reviewed schema updates
+apply the same unconditional command additions to the prior eight hosted owner
+artifacts; actual new local compiled schemas match on all four WSL owners.
+Hosted compilation must verify the remaining owners before those schema updates
+can be treated as confirmed. Revision `5032cab8` subsequently passed all nine
+hosted workflows, including native owner admission and all four QEMU guests.
+Native counters without a daemon/cache and native
+install-reason filtering require separate evidence.
+
+Native follow-through reproduced `tc`, `oc` and `uc` failing on Ubuntu when no
+daemon/status cache existed. Cache misses now reach the selected asynchronous
+backend through normal dispatch. Arch update-query errors propagate instead of
+becoming zero. Fedora's orphan query also lacked `--cacheonly`; the extended
+query-policy test failed before the repair. Its read-only path now follows
+[DNF5's documented cache-only semantics](https://dnf5.readthedocs.io/en/latest/misc/caching.7.html).
+The 50 DNF unit tests and its owning CLI target pass after the repair.
+
+Unprivileged native WSL checks with private HOME/data/cache and the daemon
+disabled compare all four counters with pacman, dpkg-query/apt-mark/APT, or
+RPM/DNF results. Plain output and both JSON flag positions match on all four
+distros. Observed total/explicit/orphan/update counts were Arch 188/9/0/0,
+Ubuntu 609/34/0/66, Debian 269/115/0/32 and Fedora 353/59/0/123. These local
+read-only observations do not prove transaction recovery or nonzero orphan
+fixtures; hosted QEMU remains required.
+
+The four QEMU counter rows now compare canonical scalar output against native
+package commands, rather than accepting exit zero. References use pacman,
+dpkg-query/APT, and RPM/cache-only DNF; APT orphan counting uses the documented
+`Remv` records from [read-only simulation](https://man.archlinux.org/man/apt-get.8.en).
+The [pacman query contract](https://man.archlinux.org/man/pacman.8.en) determines
+the explicit and orphan selections. Reference execution is bounded; a failed
+reference produces BLOCKED with its diagnostic, not a fabricated zero or a
+product failure. Expected and actual counts remain in the row's diagnostic log
+for existing QEMU reporting. Counter fixtures have checked cleanup.
+
+Full-runner fault injection reproduced two false passes: an exit-zero product
+returning the wrong count, and a failed native-output sorting stage becoming a
+zero count. Both now fail their respective gates. The 19 output-oracle tests
+pass on all four WSL distros, including native command failures, malformed
+scalars, and pacman's empty-query versus diagnostic-bearing exit-one cases.
+Real OMG binaries and native commands also pass all four counter rows on each
+WSL distro through a local SSH shim; those checks are not QEMU guest provenance.
+The release/QEMU fixture suite passes. Six bounded counter/explicit fixture
+contracts bind the existing owning tests on Linux backend builds; they do not
+close broader native, daemon, transaction, or nonzero-orphan gaps.
+The 26 reporter tests also verify these specific counter diagnostics reach the
+issue helper with source/attempt identity: exit-zero mismatches remain FAIL;
+BLOCKED native references use the existing HARNESS_ERROR issue projection while
+retaining the reference diagnostic. No synthetic issue is posted.
+
+Following the count path into Fedora's backend exposed another false success:
+installation-reason query errors were logged and discarded, leaving RPM's
+default dependency reasons. That is not an empty successful
+[DNF user-installed selection](https://dnf5.readthedocs.io/en/stable/commands/repoquery.8.html).
+The regression now requires error propagation without changing package records,
+and separately verifies successful empty and populated reason observations.
+Both status and explicit-list backend consumers propagate query/worker errors.
+
+A local Fedora private-mount-namespace probe made DNF fail while running the
+real CLI unprivileged against the real RPM inventory. Before the repair,
+`omg --json status --fast` exited zero with 353 total and zero explicit packages.
+Afterward it exits one, emits no JSON success payload, and retains the injected
+DNF diagnostic. The namespace isolates the replacement executable from the
+host; no packages are changed. Normal daemon-disabled counter queries still
+match native Fedora counts in plain and both JSON flag positions. All 50 DNF
+unit tests, scoped library Clippy and the quick workflow gate pass locally.
+This is local fault evidence, not a new hosted QEMU failure-injection contract.
+
+The Fedora reproduction is now part of the guest daemon/lifecycle check. It
+binds a failing DNF executable only inside a
+[private mount namespace](https://man7.org/linux/man-pages/man1/unshare.1.html),
+then [drops identity and capabilities](https://man7.org/linux/man-pages/man1/setpriv.1.html)
+before invoking the submitted OMG binary. It requires exit one, empty success
+output and the exact backend cause; a timeout, missing tool, permission error
+or a fabricated zero does not satisfy the refusal. The host requires Fedora's
+named fault receipt, while other distros explicitly declare no such probe.
+Fault stdout/stderr are retained through the bounded evidence allowlist and a
+diagnostic excerpt reaches the lifecycle log used by automatic issue reporting.
+
+The daemon fixture formerly left its temporary state behind. Cleanup now runs
+on reference-query failures too, and successful removal precedes the positive
+receipt. Tests reproduce the old leftover-state success and reject both a
+failed removal and a no-op removal. Nine daemon harness tests pass on all four
+WSL distros, and the exact new fault probe passes locally against the repaired
+Fedora binary as uid 1000. The quick gate and full release/QEMU fixture suite
+pass. Hosted execution of this new fault contract is still pending; no native
+or architecture coverage claim follows from the shell fixtures.
+
+### Registry-wide active-version reporting
+
+`which` previously had a behavioral fixture for Node only. The new contract
+checks all 68 compiled runtime names through both the fast and normal dispatch
+paths: no selection, a valid global link, parent pins, partial child overrides,
+return to the global selection, and dangling links. Eight aliases use the same
+canonical selection. Expected versions come from distinct fixture values;
+parent/child pin bytes, selected payload sentinel bytes, and current links are
+checked for preservation. Cleanup of both nested project directories is checked.
+The project-parent-global precedence is specified by OMG's CLI documentation;
+[mise's configuration hierarchy](https://mise.jdx.dev/configuration) was reviewed
+as a comparison, not substituted for OMG's own contract.
+
+A deliberate mutation removing registry-tool global selection fails on
+`actionlint` (expected `1.2.3`, observed no version). Production was restored
+and compared with the worktree. The owning runtime target passes on all four
+WSL builds: 35 selected tests, including five opt-in network tests that return
+explicitly unexecuted without network permission. Those five are not evidence
+of downloads, and the test count is not a behavioral coverage percentage.
+The added bounded receipt covers version reporting and preserved state; it
+does not certify executable activation, shell PATH, every pin format or JSON.
+Existing broader gaps remain open.
+
+### Installed-version inventory and inaccessible state
+
+The previous `list` tests mainly checked a header. Exact fixtures across all
+68 runtimes reproduced plain `omg list` omitting inactive installed versions,
+despite its documented all-installed-versions behavior. Plain aggregate output
+now uses the same installed inventory as per-runtime/JSON listing, with
+canonical runtime names and explicit active markers. Independent expected
+versions check numeric and prerelease ordering against
+[SemVer precedence](https://semver.org/spec/v2.0.0.html), plus exact empty and
+populated JSON, `ls`, and exclusion of staging, pending, synthetic, regular-file
+and external-symlink entries. Fixture bytes and links must remain unchanged.
+
+A denied-parent fixture exposed another false empty result: `Path::exists()`
+discarded permission errors before enumeration. Rust documents the
+[difference between absence and an indeterminate existence query](https://doc.rust-lang.org/stable/std/fs/fn.try_exists.html).
+The shared inventory now directly enumerates the directory, accepting only
+NotFound as empty and propagating access errors. Per-runtime and aggregate
+JSON queries must fail with the original permission cause and no success
+payload; the test restores its owned permissions before checking preserved
+state and cleanup. Broader remote catalogs and concurrency remain separate gaps.
+
+### Hosted probe ownership correction
+
+[QEMU run 35544001922](https://github.com/omg-cli/omg/actions/runs/35544001922)
+passed Arch, Ubuntu and Debian, but Fedora's new fault probe failed. OMG correctly
+refused the guest-user-owned injected DNF executable before executing it. The
+initial local driver had created that file as root, so it missed the ownership
+difference. The local reproduction now explicitly models guest ownership and
+reproduces the failure. Privileged namespace setup makes only the injected
+fixture executable root-owned before mounting it; OMG's trust checks remain
+unchanged. The exact probe then reaches the intended DNF failure and passes.
+Both diagnostics remain in the failed run's evidence. The other eight hosted
+workflows passed; this failed QEMU run is not reclassified or retried away.
+
+### List fast-path parity and single execution on errors
+
+The list shortcut accepted repeated `--json` flags, while the normal parser
+refused them under [Clap's default SetTrue conflict policy](https://docs.rs/clap/latest/clap/enum.ArgAction.html).
+The executable regression reproduced that false success for `list`/`ls`.
+Repeated flags now defer to the normal parser, preserving its specific usage
+error and empty stdout. A second regression then exposed a backend failure
+being retried through normal dispatch: one unknown-runtime request rendered
+two headers. Once the shortcut has parsed an invocation, its backend errors
+now reach the shared error reporter directly. Invalid directory state also
+fails once and retains its cause; JSON failures emit no success payload and
+preserve the original fixture bytes. Receipt bindings record those backend
+refusal/state assertions, not parser-only credit for duplicate flags.
+
+### Runtime download connection recovery
+
+[QEMU run 35541086222](https://github.com/omg-cli/omg/actions/runs/35541086222)
+failed Fedora's Python install because GitHub reset the connection before the
+archive response. The other eight workflows passed; the failed run is retained,
+not reclassified as successful. Both SHA-256 and SHA-512 runtime download paths
+now use the existing transport-error policy for at most three GET attempts with
+bounded backoff and warning logs. URL validation still precedes the request.
+This follows [HTTP idempotent request semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2).
+Only pre-response transport failure is retried: HTTP responses, streamed bodies,
+checksum validation and installation remain outside that loop. No test retry
+or QEMU verdict suppression was added.
+
+Loopback tests verify one timeout followed by success, HTTP 403/404 preservation,
+and exhaustion after three proxy connection failures. Those tests pass on all
+four WSL builds. Real Python 3.12.14 installation, exact executable identity and
+checked cleanup also pass on all four with synthetic mode disabled. A subsequent
+hosted revision must still validate the real guest path; local success cannot
+erase the original failure or guarantee upstream availability.
+
+### Read-only fast-path argument parity
+
+An actual Arch daemon exposed a dispatch-dependent grammar bug: repeated
+`search --no-aur` and `--limit` flags returned successful package results while
+those same arguments were rejected without the daemon. `info -q -q` and `-qq`
+also bypassed Clap and printed metadata. The handwritten fast parsers accepted
+repeated Set/SetTrue flags; the normal parser correctly rejects them under
+[Clap's argument-action contract](https://docs.rs/clap/latest/clap/enum.ArgAction.html).
+Fast search now defers duplicate options to Clap, and fast info tracks quiet
+flags across separate and bundled forms while retaining repeatable verbosity.
+
+The QEMU daemon lifecycle harness executes seven invalid invocations against
+the actual running daemon and requires exit 2, empty stdout, and the specific
+duplicate-argument diagnostic. Timeout, unrelated errors, and successful output
+fail the harness. Each command's stdout/stderr is exported from the existing
+bounded guest-evidence allowlist. These grammar checks receive no additional
+behavioral-coverage credit; they prevent a real backend from concealing invalid
+argument acceptance.
+
+### Snapshot index access errors
+
+The actual CLI reported successful empty snapshot listings for both an unreadable
+parent directory and a dangling index symlink. `load_index` used `Path::exists`,
+which [Rust documents](https://doc.rust-lang.org/stable/std/path/struct.Path.html#method.exists)
+as returning false for inaccessible paths and broken links. This also allowed
+snapshot mutations to proceed as if the existing index were empty. Index loading
+now uses non-following metadata: only confirmed NotFound permits an empty index;
+access errors propagate and existing symlinks reach the explicit refusal.
+
+The unprivileged CLI regression uses synthetic mode disabled and independently
+seeded snapshot/index bytes. It checks genuine absence, normal metadata listing,
+exact access/symlink refusal, unchanged saved bytes and link target, absence of
+external writes, successful deletion after restoring the valid index, empty final
+index, and checked cleanup. The two bounded list/delete contracts do not certify
+concurrent replacement, crash consistency, creation or restoration. Existing
+broader inventory gaps remain open.
+
+### Production-server execution receipts
+
+[Nextest listing](https://nexte.st/docs/listing/) provides machine-readable test
+and binary identities. The native adapter now uses the already-selected
+`coverage_18` harness as the subject of a separate `native-daemon-fixture` lane.
+It checks the owning package and target path, hashes the harness before and
+after the existing nextest run, and reconciles JUnit results without rerunning
+tests. Ten bounded contracts cover literal status/explicit/update responses,
+search-cache invalidation, positive/missing package info, isolated refresh
+refusal, fragmented/coalesced frame ordering and active-connection metrics.
+Every mapped test drains the production server through SIGTERM and explicitly
+checks fixture cleanup. These are production server-library tests over real
+Unix sockets with an injected backend, not native package transactions or
+standalone OMGD process attestations. Broader gaps remain unchanged.
+
+The adapter rejects foreign or changed harnesses, unreviewed tests and missing
+cleanup assertions; skips are BLOCKED and first failures survive later passes.
+An admission rehearsal using a prior hosted execution and a synthetic subject
+hash validates schema compatibility only and earns no coverage credit. Current
+hosted receipts must supply the real harness digest before this lane is admitted.
+One unsuccessful Exa query returned no results; it is included in the search
+count and contributes no supporting authority.
+
+The ac289b46 native CI run also exposed an incorrect list-contract mapping:
+two tests each implemented only part of the combined state/refusal assertion
+set. Admission correctly failed with `test lacks required assertion` after
+product tests passed. The installed-list and backend-error tests now own separate
+contracts on the same surfaces, so complete surface credit still requires both.
+The local manifest check now verifies every binding's promised assertions before
+shipping. No assertions were added to a test's receipt unless that test checks
+them, and the admission rule was not relaxed. The failed hosted run is retained.
+
+### Suggest requests through the production transport
+
+The service fixture can now build an index through the existing portable DNF
+adapter using an explicitly seeded mock catalogue, without accessing host
+repositories or adding production test APIs. Sixty equal-length prefix matches
+have independently known lexical order. The wire regression checks exact names
+for limits 0, 1, default 10, 50 and usize::MAX (capped at 50), uppercase matching,
+empty/unmatched queries, a valid 500-byte query, and exact INVALID_PARAMS refusal
+for 501 bytes. A subsequent pong, unchanged catalogue bytes, real SIGTERM drain
+and checked cleanup are mandatory. Removing the cap in an isolated WSL source
+mutation caused the expected failure; the source was restored before final tests.
+This adds bounded Suggest evidence, not exhaustive fuzzy-ranking or concurrent
+index-replacement coverage.
+
+The same audit considered cache statistics. [Moka's documented entry count](https://docs.rs/moka/latest/moka/sync/struct.Cache.html#method.entry_count)
+is approximate under concurrent updates and pending maintenance; a naive exact
+cache-count assertion would impose an unsupported guarantee. No eventual-success
+poll was added to turn an arbitrary cache sample into coverage.
+
+Ping is the first explicit per-surface review in
+[the domain ledger](verification-domain-review.md). Three required production-wire
+contracts replace its provisional blanket gap: exact concurrent responses/state,
+interrupted-request recovery, and rate-limit envelopes/recovery. Partial evidence
+still earns no surface credit, and global inventory review remains incomplete.
+
+### Linux Health process observations
+
+The production-wire healthy-state test brackets daemon construction with
+independent monotonic timestamps, requires advancing uptime across separated
+observations, and verifies boundary response IDs, zero worker failures, an active
+health connection and unchanged backend bytes. It also touches a 64 MiB anonymous
+mapping and requires resident memory to rise, then fall after unmapping, by at
+least 32 MiB. This catches a constant nonzero memory report without pretending
+that [procfs VmRSS](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html)
+is an exact snapshot. Constant-uptime and constant-RSS source mutations both
+failed the owning test; source restoration precedes final verification.
+
+This contract belongs only to Linux owners. It does not certify degraded or
+unhealthy transitions, worker-failure reporting, unavailable procfs, exact cache
+statistics or standalone OMGD process behavior. Health's broader gap stays open.

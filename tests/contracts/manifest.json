@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "status": "Parser mappings and three reviewed CLI fixture contracts; broader behavioral import remains incomplete",
-  "inventory_source": "Verified compiled artifacts from CI run 35500460442, checkout d2554cd7f1b22e3c706660c390867b9203c6c7aa",
+  "status": "Reviewed parser, Debian status/consent, exact mock search and bounded runtime fixture contracts; broader behavioral inventory remains incomplete",
+  "inventory_source": "Baseline compiled artifacts CI 35540033061 at e689113c; reviewed additive counter grammar from local Arch compilation; unchanged grammar verified, other owner schemas must match on hosted compilation",
   "contracts": [
     {
       "id": "omg.search.command.parser",
@@ -488,6 +488,2644 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omg.search.records.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "canonical-and-s-alias-exact-records"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "debug CLI with isolated mock native-backend selection; not native package transactions; does not certify AUR filtering or human detailed/quiet output",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "canonical-and-s-alias-exact-records",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.query.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search <query>",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "case-insensitive-exact-prefix-word-ranking"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "debug CLI with isolated mock native-backend selection; not native package transactions; does not certify AUR filtering or human detailed/quiet output",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "case-insensitive-exact-prefix-word-ranking",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.limit.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search --limit",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "limits-zero-one-two-and-over-result-count"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "debug CLI with isolated mock native-backend selection; not native package transactions; does not certify AUR filtering or human detailed/quiet output",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "limits-zero-one-two-and-over-result-count",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.search.json.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg search --json",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "single-json-array-exact-names-versions-sources"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "debug CLI with isolated mock native-backend selection; not native package transactions; does not certify AUR filtering or human detailed/quiet output",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "single-json-array-exact-names-versions-sources",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.nvmrc.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "nvmrc-node-selection"
+        ],
+        "state": [
+          "exact-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_detect_nvmrc",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "nvmrc-node-selection",
+            "exact-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.python-pin.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "python-pin-selection"
+        ],
+        "state": [
+          "exact-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_detect_python_version",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "python-pin-selection",
+            "exact-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.tool-versions.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "tool-versions-node-selection"
+        ],
+        "state": [
+          "exact-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_detect_tool_versions",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "tool-versions-node-selection",
+            "exact-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.go-mod.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "go-mod-selection"
+        ],
+        "state": [
+          "exact-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_go_mod_version",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "go-mod-selection",
+            "exact-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.multi-runtime.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "three-runtime-pin-selection"
+        ],
+        "state": [
+          "each-exact-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_multi_runtime_detection",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "three-runtime-pin-selection",
+            "each-exact-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.pin-precedence.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "nvmrc-precedes-tool-versions"
+        ],
+        "state": [
+          "selected-executable-not-competing-pin"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_conflicting_version_files",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "nvmrc-precedes-tool-versions",
+            "selected-executable-not-competing-pin",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.rust-pin.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "rust-toolchain-pinned-selection"
+        ],
+        "state": [
+          "host-specific-active-executable"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_rust_toolchain_toml",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "rust-toolchain-pinned-selection",
+            "host-specific-active-executable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.rust-pin-locked.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "specific-concurrent-mutation-error"
+        ],
+        "state": [
+          "no-activation-or-new-runtime-state"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::rust_stable_pin_refuses_a_concurrent_mutation_without_activation",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "specific-concurrent-mutation-error",
+            "no-activation-or-new-runtime-state",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.engines-range.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg use",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "unsupported-range-validation-error"
+        ],
+        "state": [
+          "no-active-node-version"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_package_json_engines",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "unsupported-range-validation-error",
+            "no-active-node-version",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.which-node.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg which",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "empty-and-exact-selected-node-output"
+        ],
+        "state": [
+          "selection-preserved-by-which"
+        ]
+      },
+      "scope": "Debug CLI using isolated installed executable fixtures and checked cleanup; bounded named pin/which scenario only, not downloads, other runtimes or generic fault coverage; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::test_which_shows_active_runtime",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "empty-and-exact-selected-node-output",
+            "selection-preserved-by-which",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.uninstall-lifecycle.fixture",
+      "source": "src/runtimes/common.rs",
+      "binary": "omg",
+      "surface": "omg use --uninstall",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "inactive-version-removed-for-all-68-registered-tools"
+        ],
+        "refusal": [
+          "active-missing-and-symlinked-version-specific-refusals"
+        ],
+        "state": [
+          "active-link-sibling-and-external-bytes-preserved"
+        ]
+      },
+      "scope": "Debug CLI with isolated runtime directories, real symlinks and checked cleanup; covers all registered dispatches for the named removal/refusal cases, not downloads or concurrent filesystem races; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::every_runtime_uninstall_preserves_active_siblings_and_external_state",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "inactive-version-removed-for-all-68-registered-tools",
+            "active-missing-and-symlinked-version-specific-refusals",
+            "active-link-sibling-and-external-bytes-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.environment.capture-registry.fixture",
+      "source": "src/core/env/fingerprint.rs",
+      "binary": "omg",
+      "surface": "omg env capture",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "all-68-runtime-map-through-init-capture-export-snapshot"
+        ],
+        "state": [
+          "dry-run-artifacts-and-active-links-preserved"
+        ],
+        "refusal": [
+          "individual-runtime-drift-and-ci-validation-reject-changes"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-runtime fixtures and checked cleanup; not vendor downloads, remote Gist publication, native package transactions or rolling Rust refresh; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::capture_records_every_registered_runtime_and_check_detects_its_drift",
+          "evidence": [
+            "success",
+            "state",
+            "refusal"
+          ],
+          "assertions": [
+            "all-68-runtime-map-through-init-capture-export-snapshot",
+            "dry-run-artifacts-and-active-links-preserved",
+            "individual-runtime-drift-and-ci-validation-reject-changes",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.environment.php-restore.fixture",
+      "source": "src/core/env/fingerprint.rs",
+      "binary": "omg",
+      "surface": "omg snapshot restore",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "installed-php-restored-offline-with-exact-executable-output"
+        ],
+        "state": [
+          "installed-php-payload-preserved"
+        ],
+        "refusal": [
+          "missing-php-executable-fails-with-active-link-preserved"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-runtime fixtures and checked cleanup; not vendor downloads, remote Gist publication, native package transactions or rolling Rust refresh; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::snapshot_restores_installed_php_offline_without_replacing_its_payload",
+          "evidence": [
+            "success",
+            "state",
+            "refusal"
+          ],
+          "assertions": [
+            "installed-php-restored-offline-with-exact-executable-output",
+            "installed-php-payload-preserved",
+            "missing-php-executable-fails-with-active-link-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.environment.registry-restore.fixture",
+      "source": "src/core/env/fingerprint.rs",
+      "binary": "omg",
+      "surface": "omg snapshot restore",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "all-68-installed-runtimes-restored-and-executed"
+        ],
+        "state": [
+          "alternate-installed-payloads-preserved-and-ci-matches"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-runtime fixtures and checked cleanup; not vendor downloads, remote Gist publication, native package transactions or rolling Rust refresh; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::snapshot_restores_all_registered_installed_runtimes_and_executes_selected_payloads",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "all-68-installed-runtimes-restored-and-executed",
+            "alternate-installed-payloads-preserved-and-ci-matches",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.environment.unsupported-capture.fixture",
+      "source": "src/core/env/fingerprint.rs",
+      "binary": "omg",
+      "surface": "omg env capture",
+      "platforms": [
+        "portable",
+        "fedora",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "unsupported-package-backend-specific-error"
+        ],
+        "state": [
+          "absent-and-existing-lockfile-preserved"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-runtime fixtures and checked cleanup; not vendor downloads, remote Gist publication, native package transactions or rolling Rust refresh; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::capture_without_package_backend_refuses_without_creating_or_overwriting_lockfile",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "unsupported-package-backend-specific-error",
+            "absent-and-existing-lockfile-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.counter.ec.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg ec",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-fixture-count",
+          "plain-and-json-global-flag-positions"
+        ],
+        "refusal": [
+          "extra-positional-rejected-with-diagnostic-and-empty-stdout"
+        ]
+      },
+      "scope": "isolated mock package counts; not native package transactions; does not certify native dependency reasons, nonzero orphans, cache freshness or daemon counters",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments",
+          "evidence": [
+            "success",
+            "refusal"
+          ],
+          "assertions": [
+            "independently-specified-fixture-count",
+            "plain-and-json-global-flag-positions",
+            "extra-positional-rejected-with-diagnostic-and-empty-stdout",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.counter.tc.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg tc",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-fixture-count",
+          "plain-and-json-global-flag-positions"
+        ],
+        "refusal": [
+          "extra-positional-rejected-with-diagnostic-and-empty-stdout"
+        ]
+      },
+      "scope": "isolated mock package counts; not native package transactions; does not certify native dependency reasons, nonzero orphans, cache freshness or daemon counters",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments",
+          "evidence": [
+            "success",
+            "refusal"
+          ],
+          "assertions": [
+            "independently-specified-fixture-count",
+            "plain-and-json-global-flag-positions",
+            "extra-positional-rejected-with-diagnostic-and-empty-stdout",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.counter.oc.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg oc",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-fixture-count",
+          "plain-and-json-global-flag-positions"
+        ],
+        "refusal": [
+          "extra-positional-rejected-with-diagnostic-and-empty-stdout"
+        ]
+      },
+      "scope": "isolated mock package counts; not native package transactions; does not certify native dependency reasons, nonzero orphans, cache freshness or daemon counters",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments",
+          "evidence": [
+            "success",
+            "refusal"
+          ],
+          "assertions": [
+            "independently-specified-fixture-count",
+            "plain-and-json-global-flag-positions",
+            "extra-positional-rejected-with-diagnostic-and-empty-stdout",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.counter.uc.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg uc",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-fixture-count",
+          "plain-and-json-global-flag-positions"
+        ],
+        "refusal": [
+          "extra-positional-rejected-with-diagnostic-and-empty-stdout"
+        ]
+      },
+      "scope": "isolated mock package counts; not native package transactions; does not certify native dependency reasons, nonzero orphans, cache freshness or daemon counters",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments",
+          "evidence": [
+            "success",
+            "refusal"
+          ],
+          "assertions": [
+            "independently-specified-fixture-count",
+            "plain-and-json-global-flag-positions",
+            "extra-positional-rejected-with-diagnostic-and-empty-stdout",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.explicit.records.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg explicit",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-empty-and-sorted-populated-json-records",
+          "available-only-packages-excluded"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "isolated all-explicit mock package records; not native package transactions; does not certify native dependency-reason filtering or daemon queries",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::explicit_shortcut_uses_the_same_isolated_state_as_explicit_count",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "independently-specified-empty-and-sorted-populated-json-records",
+            "available-only-packages-excluded",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.explicit.count.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg explicit --count",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "independently-specified-empty-and-populated-plain-and-json-counts",
+          "available-only-packages-excluded"
+        ],
+        "state": [
+          "package-state-byte-identical"
+        ]
+      },
+      "scope": "isolated all-explicit mock package records; not native package transactions; does not certify native dependency-reason filtering or daemon queries",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::cli_comprehensive::explicit_shortcut_uses_the_same_isolated_state_as_explicit_count",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "independently-specified-empty-and-populated-plain-and-json-counts",
+            "available-only-packages-excluded",
+            "package-state-byte-identical",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.which-registry.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg which",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "all-68-runtime-empty-global-parent-and-project-selection",
+          "child-pins-merge-with-inherited-parent-pins",
+          "eight-runtime-aliases-and-fast-versus-normal-dispatch",
+          "dangling-global-links-not-reported-as-active"
+        ],
+        "state": [
+          "pin-file-bytes-global-links-and-selected-sentinel-preserved"
+        ]
+      },
+      "scope": "Debug CLI version reporting with isolated directories and real symlinks; not native package transactions; does not certify executable selection, installation, shell PATH, JSON output, every pin-file format or concurrent filesystem mutation",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::which_resolves_every_runtime_with_project_parent_global_precedence_without_mutation",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "all-68-runtime-empty-global-parent-and-project-selection",
+            "child-pins-merge-with-inherited-parent-pins",
+            "eight-runtime-aliases-and-fast-versus-normal-dispatch",
+            "dangling-global-links-not-reported-as-active",
+            "pin-file-bytes-global-links-and-selected-sentinel-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.list-installed.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg list",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "all-68-runtimes-active-and-inactive-versions-in-plain-and-json-output",
+          "independent-numeric-and-prerelease-order",
+          "staging-pending-synthetic-file-and-symlink-entries-excluded"
+        ],
+        "state": [
+          "runtime-current-links-payload-markers-and-external-bytes-preserved"
+        ],
+        "refusal": [
+          "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-version directories; not native package transactions; does not certify downloaded payload validity, remote catalogs, vendor-specific version formats or concurrent mutation; permission probe covers a denied versions parent",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomplete_state",
+          "evidence": [
+            "success",
+            "state",
+            "refusal"
+          ],
+          "assertions": [
+            "all-68-runtimes-active-and-inactive-versions-in-plain-and-json-output",
+            "independent-numeric-and-prerelease-order",
+            "staging-pending-synthetic-file-and-symlink-entries-excluded",
+            "runtime-current-links-payload-markers-and-external-bytes-preserved",
+            "fixture-cleanup",
+            "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.list-runtime.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg list <runtime>",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "per-runtime-exact-plain-and-json-lists-and-active-markers",
+          "independent-numeric-and-prerelease-order",
+          "staging-pending-synthetic-file-and-symlink-entries-excluded"
+        ],
+        "state": [
+          "runtime-current-links-payload-markers-and-external-bytes-preserved"
+        ],
+        "refusal": [
+          "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-version directories; not native package transactions; does not certify downloaded payload validity, remote catalogs, vendor-specific version formats or concurrent mutation; permission probe covers a denied versions parent",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomplete_state",
+          "evidence": [
+            "success",
+            "state",
+            "refusal"
+          ],
+          "assertions": [
+            "per-runtime-exact-plain-and-json-lists-and-active-markers",
+            "independent-numeric-and-prerelease-order",
+            "staging-pending-synthetic-file-and-symlink-entries-excluded",
+            "runtime-current-links-payload-markers-and-external-bytes-preserved",
+            "fixture-cleanup",
+            "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.list-json.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg list --json",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "refusal"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-empty-and-populated-json-arrays-and-ls-alias",
+          "independent-numeric-and-prerelease-order",
+          "staging-pending-synthetic-file-and-symlink-entries-excluded"
+        ],
+        "state": [
+          "runtime-current-links-payload-markers-and-external-bytes-preserved"
+        ],
+        "refusal": [
+          "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+        ]
+      },
+      "scope": "Debug CLI with isolated installed-version directories; not native package transactions; does not certify downloaded payload validity, remote catalogs, vendor-specific version formats or concurrent mutation; permission probe covers a denied versions parent",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomplete_state",
+          "evidence": [
+            "success",
+            "state",
+            "refusal"
+          ],
+          "assertions": [
+            "exact-empty-and-populated-json-arrays-and-ls-alias",
+            "independent-numeric-and-prerelease-order",
+            "staging-pending-synthetic-file-and-symlink-entries-excluded",
+            "runtime-current-links-payload-markers-and-external-bytes-preserved",
+            "fixture-cleanup",
+            "unreadable-parent-refuses-with-cause-and-no-json-success-payload"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.snapshot.list-index-failures.fixture",
+      "source": "src/cli/snapshot.rs",
+      "binary": "omg",
+      "surface": "omg snapshot list",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "missing-index-empty-and-valid-index-saved-metadata"
+        ],
+        "refusal": [
+          "unreadable-index-and-dangling-link-specific-errors"
+        ],
+        "state": [
+          "failed-delete-preserves-snapshot-index-link-and-external-absence"
+        ]
+      },
+      "scope": "Unprivileged debug CLI with synthetic mode disabled and isolated snapshot files; not native package transactions, concurrent symlink replacement, crash consistency or snapshot creation/restoration",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::snapshot_index_access_failures_never_report_empty_or_delete_saved_state",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "missing-index-empty-and-valid-index-saved-metadata",
+            "unreadable-index-and-dangling-link-specific-errors",
+            "failed-delete-preserves-snapshot-index-link-and-external-absence",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.snapshot.delete-index-failures.fixture",
+      "source": "src/cli/snapshot.rs",
+      "binary": "omg",
+      "surface": "omg snapshot delete",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "restored-index-deletion-removes-only-saved-entry"
+        ],
+        "refusal": [
+          "unreadable-index-and-dangling-link-specific-errors"
+        ],
+        "state": [
+          "failed-delete-preserves-snapshot-index-link-and-external-absence"
+        ]
+      },
+      "scope": "Unprivileged debug CLI with synthetic mode disabled and isolated snapshot files; not native package transactions, concurrent symlink replacement, crash consistency or snapshot creation/restoration",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::snapshot_index_access_failures_never_report_empty_or_delete_saved_state",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "restored-index-deletion-removes-only-saved-entry",
+            "unreadable-index-and-dangling-link-specific-errors",
+            "failed-delete-preserves-snapshot-index-link-and-external-absence",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.status.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Status",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "seeded-status-exact-total-explicit-orphan-update-counts"
+        ]
+      },
+      "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::package_inventory_and_updates_survive_the_production_transport",
+          "evidence": [
+            "success"
+          ],
+          "assertions": [
+            "seeded-status-exact-total-explicit-orphan-update-counts",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.explicit.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Explicit",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "seeded-explicit-exact-package-names"
+        ]
+      },
+      "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::package_inventory_and_updates_survive_the_production_transport",
+          "evidence": [
+            "success"
+          ],
+          "assertions": [
+            "seeded-explicit-exact-package-names",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.explicit-count.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:ExplicitCount",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "seeded-explicit-count-exact-two"
+        ]
+      },
+      "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::package_inventory_and_updates_survive_the_production_transport",
+          "evidence": [
+            "success"
+          ],
+          "assertions": [
+            "seeded-explicit-count-exact-two",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.updates.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:ListUpdates",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "only-outdated-package-with-exact-old-new-version-and-repository"
+        ]
+      },
+      "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::package_inventory_and_updates_survive_the_production_transport",
+          "evidence": [
+            "success"
+          ],
+          "assertions": [
+            "only-outdated-package-with-exact-old-new-version-and-repository",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.search-cache.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Search",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-empty-search-and-total"
+        ],
+        "state": [
+          "miss-hit-clear-miss-metric-deltas"
+        ]
+      },
+      "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::clearing_search_cache_forces_a_new_lookup_over_real_ipc",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "exact-empty-search-and-total",
+            "miss-hit-clear-miss-metric-deltas",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.cache-clear.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:CacheClear",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-cleared-response-and-request-id"
+        ],
+        "state": [
+          "subsequent-search-misses-cleared-cache"
+        ]
+      },
+      "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::clearing_search_cache_forces_a_new_lookup_over_real_ipc",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "exact-cleared-response-and-request-id",
+            "subsequent-search-misses-cleared-cache",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.info.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Info",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-git-metadata-and-request-identity"
+        ],
+        "refusal": [
+          "missing-package-not-found-envelope-and-identity"
+        ],
+        "state": [
+          "info-positive-hit-and-negative-cache-metric-deltas"
+        ]
+      },
+      "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::package_info_cache_preserves_metadata_and_missing_package_identity",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "exact-git-metadata-and-request-identity",
+            "missing-package-not-found-envelope-and-identity",
+            "info-positive-hit-and-negative-cache-metric-deltas",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.refresh-refusal.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:RefreshIndex",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "isolated-refresh-invalid-params-exact-message-and-id"
+        ],
+        "state": [
+          "post-refusal-ping-and-drain"
+        ]
+      },
+      "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::isolated_refresh_refusal_preserves_server_liveness",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "isolated-refresh-invalid-params-exact-message-and-id",
+            "post-refusal-ping-and-drain",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "byte-fragmented-and-coalesced-pings-preserve-response-order-and-ids"
+        ]
+      },
+      "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::fragmented_then_coalesced_frames_preserve_response_order_and_ids",
+          "evidence": [
+            "success"
+          ],
+          "assertions": [
+            "byte-fragmented-and-coalesced-pings-preserve-response-order-and-ids",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.connection-metrics.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Metrics",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "state": [
+          "active-connections-one-two-one-after-disconnect"
+        ]
+      },
+      "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::active_connection_metric_returns_to_baseline_after_disconnect",
+          "evidence": [
+            "state"
+          ],
+          "assertions": [
+            "active-connections-one-two-one-after-disconnect",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.list-installed-backend-errors.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg list",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "backend-error-reported-without-reexecuting-renderer",
+          "failed-json-emits-no-success-payload"
+        ],
+        "state": [
+          "invalid-versions-parent-bytes-preserved"
+        ]
+      },
+      "scope": "Debug CLI with isolated invalid runtime paths; one backend error without duplicate execution, no JSON success payload and unchanged path bytes; not native package transactions or exhaustive filesystem faults",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_rejects_duplicate_json_flags_and_reports_backend_errors_once",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "backend-error-reported-without-reexecuting-renderer",
+            "failed-json-emits-no-success-payload",
+            "invalid-versions-parent-bytes-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.list-runtime-backend-errors.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg list <runtime>",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "backend-error-reported-without-reexecuting-renderer",
+          "failed-json-emits-no-success-payload"
+        ],
+        "state": [
+          "invalid-versions-parent-bytes-preserved"
+        ]
+      },
+      "scope": "Debug CLI with isolated invalid runtime paths; one backend error without duplicate execution, no JSON success payload and unchanged path bytes; not native package transactions or exhaustive filesystem faults",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_rejects_duplicate_json_flags_and_reports_backend_errors_once",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "backend-error-reported-without-reexecuting-renderer",
+            "failed-json-emits-no-success-payload",
+            "invalid-versions-parent-bytes-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.runtime.list-json-backend-errors.fixture",
+      "source": "src/cli/runtimes.rs",
+      "binary": "omg",
+      "surface": "omg list --json",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "backend-error-reported-without-reexecuting-renderer",
+          "failed-json-emits-no-success-payload"
+        ],
+        "state": [
+          "invalid-versions-parent-bytes-preserved"
+        ]
+      },
+      "scope": "Debug CLI with isolated invalid runtime paths; one backend error without duplicate execution, no JSON success payload and unchanged path bytes; not native package transactions or exhaustive filesystem faults",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::e2e_runtime_management::list_rejects_duplicate_json_flags_and_reports_backend_errors_once",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "backend-error-reported-without-reexecuting-renderer",
+            "failed-json-emits-no-success-payload",
+            "invalid-versions-parent-bytes-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.suggest.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Suggest",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "seeded-prefix-order-case-and-zero-one-default-maximum-limits",
+          "empty-unmatched-and-500-byte-query-results"
+        ],
+        "refusal": [
+          "501-byte-query-invalid-params-exact-envelope"
+        ],
+        "state": [
+          "post-refusal-pong-and-catalog-bytes-preserved"
+        ]
+      },
+      "scope": "Production server::run in coverage_18 with real Unix framing and a seeded injected package index; checked SIGTERM drain and cleanup; not native package transactions, exhaustive fuzzy ranking or concurrent catalog replacement",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::suggestions_preserve_catalog_order_limits_refusal_and_state_over_real_ipc",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "seeded-prefix-order-case-and-zero-one-default-maximum-limits",
+            "empty-unmatched-and-500-byte-query-results",
+            "501-byte-query-invalid-params-exact-envelope",
+            "post-refusal-pong-and-catalog-bytes-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.ping-responses.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Ping",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "concurrency",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-pong-and-u64-boundary-request-ids"
+        ],
+        "concurrency": [
+          "sixteen-connected-clients-released-through-barrier"
+        ],
+        "state": [
+          "package-state-bytes-preserved-and-follow-up-pong"
+        ]
+      },
+      "scope": "Reviewed Ping request semantics and representative interruption/rate-limit recovery over production Unix sockets; checked SIGTERM drain and cleanup; not native package transactions or standalone process lifecycle; general protocol framing, socket authorization and connection capacity retain separate open contracts",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::concurrent_pings_preserve_boundary_ids_and_backend_state",
+          "evidence": [
+            "success",
+            "concurrency",
+            "state"
+          ],
+          "assertions": [
+            "exact-pong-and-u64-boundary-request-ids",
+            "sixteen-connected-clients-released-through-barrier",
+            "package-state-bytes-preserved-and-follow-up-pong",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.ping-interrupted.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Ping",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "fault",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "fault": [
+          "half-closed-partial-header-and-body-produce-eof"
+        ],
+        "state": [
+          "fresh-client-exact-pong-after-each-interruption"
+        ]
+      },
+      "scope": "Reviewed Ping request semantics and representative interruption/rate-limit recovery over production Unix sockets; checked SIGTERM drain and cleanup; not native package transactions or standalone process lifecycle; general protocol framing, socket authorization and connection capacity retain separate open contracts",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::incomplete_frames_disconnect_without_breaking_a_fresh_client",
+          "evidence": [
+            "fault",
+            "state"
+          ],
+          "assertions": [
+            "half-closed-partial-header-and-body-produce-eof",
+            "fresh-client-exact-pong-after-each-interruption",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.ping-rate-limit.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Ping",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "served-burst-responses-have-exact-pong-and-id"
+        ],
+        "refusal": [
+          "rate-limited-burst-exact-code-message-and-id"
+        ],
+        "state": [
+          "same-connection-pong-after-token-refill"
+        ]
+      },
+      "scope": "Reviewed Ping request semantics and representative interruption/rate-limit recovery over production Unix sockets; checked SIGTERM drain and cleanup; not native package transactions or standalone process lifecycle; general protocol framing, socket authorization and connection capacity retain separate open contracts",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::rate_limited_burst_rejects_with_exact_envelope_and_keeps_connection_open",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "served-burst-responses-have-exact-pong-and-id",
+            "rate-limited-burst-exact-code-message-and-id",
+            "same-connection-pong-after-token-refill",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.health-live-process.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Health",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "healthy-status-and-boundary-request-ids",
+          "uptime-within-independent-monotonic-start-bracket",
+          "rss-rises-and-falls-with-touched-64-mib-anonymous-mapping",
+          "zero-worker-failures-and-active-health-connection"
+        ],
+        "state": [
+          "package-state-bytes-preserved-and-follow-up-pong"
+        ]
+      },
+      "scope": "Linux production server::run over real Unix IPC in an isolated healthy fixture; controlled resident-memory mapping and checked SIGTERM drain/cleanup; not native package transactions, degraded/unhealthy transitions, exact approximate-cache statistics, missing procfs or standalone process health",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::health_reports_live_uptime_rss_and_worker_state_without_mutating_packages",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "healthy-status-and-boundary-request-ids",
+            "uptime-within-independent-monotonic-start-bracket",
+            "rss-rises-and-falls-with-touched-64-mib-anonymous-mapping",
+            "zero-worker-failures-and-active-health-connection",
+            "package-state-bytes-preserved-and-follow-up-pong",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.connection-capacity.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.connection-cap",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "concurrency",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "concurrency": [
+          "128-connected-clients-serve-exact-pong",
+          "129th-connection-clean-eof-before-and-after-permit-reuse"
+        ],
+        "state": [
+          "released-connection-count-decreases-and-replacement-serves-pong",
+          "all-held-clients-release-and-control-remains-usable"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets, exact connection capacity and disconnect permit reuse with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone daemon process lifecycle, all socket faults or concurrent connection churn",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::connection_capacity_refuses_overflow_and_recovers_released_permits",
+          "evidence": [
+            "concurrency",
+            "state"
+          ],
+          "assertions": [
+            "128-connected-clients-serve-exact-pong",
+            "129th-connection-clean-eof-before-and-after-permit-reuse",
+            "released-connection-count-decreases-and-replacement-serves-pong",
+            "all-held-clients-release-and-control-remains-usable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames-version-refusal.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "future-version-exact-error-id-code-message-and-eof"
+        ],
+        "state": [
+          "exactly-one-failed-request-metric-increment-per-rejection"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone process lifecycle, all malformed payloads, cancellation or backpressure",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::version_mismatch_gets_exact_parse_error_then_connection_closes",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "future-version-exact-error-id-code-message-and-eof",
+            "exactly-one-failed-request-metric-increment-per-rejection",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames-short-header-refusal.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "short-header-exact-error-id-code-message-and-eof"
+        ],
+        "state": [
+          "exactly-one-failed-request-metric-increment-per-rejection"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone process lifecycle, all malformed payloads, cancellation or backpressure",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::frame_too_short_for_header_gets_parse_error_then_connection_closes",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "short-header-exact-error-id-code-message-and-eof",
+            "exactly-one-failed-request-metric-increment-per-rejection",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames-payload-refusal.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "undecodable-body-error-id-code-cause-prefix-and-eof"
+        ],
+        "state": [
+          "exactly-one-failed-request-metric-increment-per-rejection"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone process lifecycle, all malformed payloads, cancellation or backpressure",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::undecodable_payload_gets_parse_error_validation_failure_then_close",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "undecodable-body-error-id-code-cause-prefix-and-eof",
+            "exactly-one-failed-request-metric-increment-per-rejection",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames-oversize-refusal.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "cap-plus-one-silent-eof-or-connection-reset"
+        ],
+        "state": [
+          "exactly-one-failed-request-metric-increment-per-rejection"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone process lifecycle, all malformed payloads, cancellation or backpressure",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::oversized_frame_tears_down_silently_without_any_response_frame",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "cap-plus-one-silent-eof-or-connection-reset",
+            "exactly-one-failed-request-metric-increment-per-rejection",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames-size-boundaries.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "zero-through-four-byte-and-cap-minus-one-and-cap-reach-protocol-validation",
+          "exact-protocol-error-envelope-and-eof-per-size",
+          "fresh-pong-after-boundary-rejections"
+        ],
+        "state": [
+          "exactly-one-failed-request-metric-increment-per-rejection"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone process lifecycle, all malformed payloads, cancellation or backpressure",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::exact_frame_size_boundaries_reach_protocol_validation",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "zero-through-four-byte-and-cap-minus-one-and-cap-reach-protocol-validation",
+            "exact-protocol-error-envelope-and-eof-per-size",
+            "fresh-pong-after-boundary-rejections",
+            "exactly-one-failed-request-metric-increment-per-rejection",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.debian-search.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:DebianSearch",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-catalog-names-versions-descriptions-and-apt-source",
+          "zero-one-default-50-and-maximum-1000-result-limits",
+          "empty-and-500-byte-unmatched-query-return-no-results"
+        ],
+        "refusal": [
+          "501-byte-query-exact-invalid-params-envelope"
+        ],
+        "state": [
+          "zero-limit-cache-preserves-wider-responses-with-one-miss-four-hits",
+          "unchanged-backend-state-and-post-refusal-pong"
+        ]
+      },
+      "scope": "Production server::run over real Unix IPC with literal injected catalog, cache limit widening and checked SIGTERM drain/cleanup; not native package transactions, APT database integration, refresh races, exhaustive text matching or standalone process lifecycle",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::debian_search_preserves_catalog_limits_cache_and_refusal_over_real_ipc",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "exact-catalog-names-versions-descriptions-and-apt-source",
+            "zero-one-default-50-and-maximum-1000-result-limits",
+            "empty-and-500-byte-unmatched-query-return-no-results",
+            "501-byte-query-exact-invalid-params-envelope",
+            "zero-limit-cache-preserves-wider-responses-with-one-miss-four-hits",
+            "unchanged-backend-state-and-post-refusal-pong",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.security-audit-inventory.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:SecurityAudit",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "empty-inventory-zero-counts-and-empty-findings-before-and-after-repair"
+        ],
+        "refusal": [
+          "corrupt-inventory-exact-internal-error-not-clean-scan"
+        ],
+        "state": [
+          "corrupt-inventory-preserved-and-daemon-responds",
+          "three-audit-requests-counted-and-repaired-state-preserved"
+        ]
+      },
+      "scope": "Production server::run over real Unix IPC, empty injected inventory and corrupt inventory refusal with checked SIGTERM drain/cleanup; not native package transactions, vulnerability scanning of installed packages, advisory fetching, scoring, partial scanner failures or standalone process lifecycle",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::security_audit_backend_failure_cannot_report_a_clean_scan",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "empty-inventory-zero-counts-and-empty-findings-before-and-after-repair",
+            "corrupt-inventory-exact-internal-error-not-clean-scan",
+            "corrupt-inventory-preserved-and-daemon-responds",
+            "three-audit-requests-counted-and-repaired-state-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [
@@ -786,7 +3424,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+      "sha256": "9ca1b50c9de3e09f21e73fb1b36fbccab684ef973bb0f36442285fd56cd4a4e6"
     },
     {
       "binary": "omgd",
@@ -806,7 +3444,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+      "sha256": "9ca1b50c9de3e09f21e73fb1b36fbccab684ef973bb0f36442285fd56cd4a4e6"
     },
     {
       "binary": "omgd",
@@ -826,7 +3464,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+      "sha256": "9ca1b50c9de3e09f21e73fb1b36fbccab684ef973bb0f36442285fd56cd4a4e6"
     },
     {
       "binary": "omgd",
@@ -846,7 +3484,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+      "sha256": "9ca1b50c9de3e09f21e73fb1b36fbccab684ef973bb0f36442285fd56cd4a4e6"
     },
     {
       "binary": "omgd",
@@ -866,7 +3504,7 @@
         "macos",
         "pgp"
       ],
-      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+      "sha256": "9ca1b50c9de3e09f21e73fb1b36fbccab684ef973bb0f36442285fd56cd4a4e6"
     },
     {
       "binary": "omgd",
@@ -884,7 +3522,7 @@
       "features": [
         "debian-pure"
       ],
-      "sha256": "516502ec6e7224b2d33cb90e00f23401c9de2fe8bdd68136225781596771e5be"
+      "sha256": "12393b3cceb9a96f46689ab8afcdc6043c9ff48c57d77c7dff66e297428e3828"
     },
     {
       "binary": "omgd",
@@ -901,7 +3539,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+      "sha256": "9ca1b50c9de3e09f21e73fb1b36fbccab684ef973bb0f36442285fd56cd4a4e6"
     },
     {
       "binary": "omgd",
@@ -920,7 +3558,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e72206a9d4d9ed002fa69fc3d4ec4792a2d225a932e0d35d9c6613be12eb1642"
+      "sha256": "9ca1b50c9de3e09f21e73fb1b36fbccab684ef973bb0f36442285fd56cd4a4e6"
     },
     {
       "binary": "omgd",

@@ -213,3 +213,17 @@ assert_eq!(read_response(&mut stream).await?.id, 901);
 ## Plan self-review
 
 The design's scope maps to tasks 2–3 (inventory/evidence), 4 (feature and platform owners), 5 (all CLI domains), 6 (OMGD), 7 (native mutation, distribution and recovery), 8 (interaction/fault adequacy and completion), and 9 (automatic issues). Task 1 is the prerequisite; task 9 is a continuing regression gate, not work postponed until after final acceptance. The five review risks have explicit owning tests. Test artifacts are observations, never an alternate source of product semantics. New production fixes remain driven by reproduced failures.
+
+### Production-server receipt reconciliation follow-up
+
+The production Unix-socket tests in `tests/coverage_18.rs` already execute in the
+native lane, but currently have no admitted behavioral receipts. Reconcile only
+reviewed assertions, using a separate `native-daemon-fixture` lane whose OMGD
+subject hash is the actual integration harness containing `server::run`, not the
+standalone daemon executable. Preserve the injected-backend limitation, checked
+SIGTERM drain and directory cleanup. Hash the owning harness before/after the
+existing nextest execution; reject missing/foreign subjects, unmapped assertions,
+skips and failed first attempts. Do not rerun the suite or close broader native
+backend, process-lifecycle, fault or concurrency gaps through this reconciliation.
+Verify the adapter with adversarial unit fixtures, then rerun the owning real
+server suite on all four WSL distros and validate fresh hosted receipts.

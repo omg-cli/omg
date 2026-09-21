@@ -11,13 +11,10 @@ use std::fs;
 use std::path::Path;
 use tokio::task;
 
-use crate::runtimes::{
-    BunManager, GoManager, JavaManager, NodeManager, PythonManager, RubyManager, RustManager,
-};
+use crate::runtimes::{SUPPORTED_RUNTIMES, probe_version, tool_registry::REGISTRY_TOOLS};
 
 /// Represents the captured state of the environment
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
-#[expect(clippy::unsafe_derive_deserialize)] // Struct fields are all owned safe types (BTreeMap, Vec, String, i64); no unsafe in fields
 pub struct EnvironmentState {
     /// Lockfile schema version. Written on save; `load` rejects files written
     /// by a NEWER schema instead of guessing at unknown fields.
@@ -43,32 +40,21 @@ impl EnvironmentState {
 
     /// Capture the current environment state
     pub async fn capture() -> Result<Self> {
-        let mut runtimes = BTreeMap::new();
-
-        // Capture runtimes in parallel
-        let (node, python, rust, go, ruby, java, bun) = tokio::join!(
-            task::spawn_blocking(|| NodeManager::new().current_version()),
-            task::spawn_blocking(|| PythonManager::new().current_version()),
-            task::spawn_blocking(|| RustManager::new().current_version()),
-            task::spawn_blocking(|| GoManager::new().current_version()),
-            task::spawn_blocking(|| RubyManager::new().current_version()),
-            task::spawn_blocking(|| JavaManager::new().current_version()),
-            task::spawn_blocking(|| BunManager::new().current_version()),
-        );
-
-        for (runtime, result) in [
-            ("node", node),
-            ("python", python),
-            ("rust", rust),
-            ("go", go),
-            ("ruby", ruby),
-            ("java", java),
-            ("bun", bun),
-        ] {
-            if let Some(version) = join_probed_version(result, runtime)? {
-                runtimes.insert(runtime.to_string(), version.trim().to_string());
-            }
-        }
+        // One bounded filesystem pass covers the same registered names as the
+        // runtime CLI. A hand-maintained subset silently misses drift.
+        let runtimes = task::spawn_blocking(|| {
+            SUPPORTED_RUNTIMES
+                .iter()
+                .copied()
+                .chain(REGISTRY_TOOLS.iter().map(|tool| tool.name))
+                .filter_map(|runtime| {
+                    probe_version(runtime)
+                        .map(|version| (runtime.to_owned(), version.trim().to_owned()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .await
+        .context("Failed to probe managed runtime versions")?;
 
         let packages = explicit_packages_for_fingerprint().await?;
 
@@ -187,13 +173,6 @@ impl EnvironmentState {
 
         (runtimes, packages)
     }
-}
-
-fn join_probed_version(
-    result: std::result::Result<Option<String>, tokio::task::JoinError>,
-    runtime: &str,
-) -> Result<Option<String>> {
-    result.with_context(|| format!("Failed to probe {runtime} runtime"))
 }
 
 #[allow(

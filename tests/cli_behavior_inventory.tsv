@@ -21,6 +21,9 @@ migrate-import	["migrate","import","${ROOT}/manifest.json","--dry-run"]	read	arc
 clean	["clean","--all","--dry-run"]	read	arch:0,debian:1,ubuntu:1,fedora:0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 explicit	["explicit","--count"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 explicit-shortcut	["ec"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+total-shortcut	["tc"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+orphan-shortcut	["oc"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+updates-shortcut	["uc"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 sync	["sync","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 use	["use","invalid-runtime","1.0.0"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 list	["list"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop

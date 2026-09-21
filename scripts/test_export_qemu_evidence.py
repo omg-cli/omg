@@ -31,7 +31,10 @@ TRANSACTION_PRIVATE = (
 class AllowlistTests(unittest.TestCase):
     def test_native_query_diagnostics_are_confined_to_guest_evidence(self):
         names = ["native-explicit.txt", "native-explicit.json",
+                 "dnf-reason-fault.stdout.log", "dnf-reason-fault.stderr.log",
                  "daemon-direct-after-queries.txt", "daemon-foreground-after-queries.txt"]
+        names += [f"daemon-invalid-{index}.{stream}"
+                  for index in range(7) for stream in ("stdout", "stderr")]
         names += [f"{label}-{suffix}"
                   for label in ("daemon-direct", "daemon-foreground", "daemon-stopped")
                   for suffix in ("explicit.json", "count.txt", "shortcut.txt", "count.json")]

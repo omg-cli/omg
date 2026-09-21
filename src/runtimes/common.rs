@@ -350,6 +350,42 @@ pub(crate) fn validate_download_filename(filename: &str) -> Result<&str> {
     Ok(filename)
 }
 
+// Callers validate the vendor URL before entering this helper. Only the GET
+// before response headers is retried; no partial file or checksum is reused.
+async fn request_runtime_download(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let parsed_url = reqwest::Url::parse(url).ok();
+    let host = parsed_url
+        .as_ref()
+        .and_then(reqwest::Url::host_str)
+        .unwrap_or("unknown");
+    for attempt in 0..3 {
+        match client
+            .get(url)
+            .header("User-Agent", GITHUB_USER_AGENT)
+            .send()
+            .await
+        {
+            Err(error) if attempt < 2 && crate::core::http::is_retryable_error(&error) => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    host,
+                    "Runtime download connection failed; retrying bounded GET request"
+                );
+                tokio::time::sleep(crate::core::http::retry_backoff(
+                    std::time::Duration::from_millis(100),
+                    attempt,
+                ))
+                .await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("final request attempt always returns")
+}
+
 /// Download a file with progress bar and checksum verification.
 pub async fn download_with_progress(
     client: &reqwest::Client,
@@ -365,10 +401,7 @@ pub async fn download_with_progress(
     // network services.
     crate::core::http::validate_download_url(url)?;
 
-    let response = client
-        .get(url)
-        .header("User-Agent", GITHUB_USER_AGENT)
-        .send()
+    let response = request_runtime_download(client, url)
         .await
         .with_context(|| format!("Failed to connect to {}", extract_domain(url)))?;
 
@@ -471,10 +504,7 @@ pub async fn download_with_progress_sha512(
     // Same metadata-supplied-URL pinning as the SHA-256 hot path.
     crate::core::http::validate_download_url(url)?;
 
-    let response = client
-        .get(url)
-        .header("User-Agent", GITHUB_USER_AGENT)
-        .send()
+    let response = request_runtime_download(client, url)
         .await
         .with_context(|| format!("Failed to connect to {}", extract_domain(url)))?;
 
@@ -1507,12 +1537,16 @@ pub(crate) fn get_current_version(versions_dir: &Path) -> Option<String> {
 
 /// List installed versions in a directory
 pub(crate) fn list_installed_versions(versions_dir: &Path) -> Result<Vec<String>> {
-    if !versions_dir.exists() {
-        return Ok(Vec::new());
-    }
+    // Query once and preserve access errors: Path::exists() would turn an
+    // unreadable parent into a false, successful empty installation inventory.
+    let entries = match fs::read_dir(versions_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
 
     let mut versions = Vec::new();
-    for entry in fs::read_dir(versions_dir)? {
+    for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         // Skip the "current" symlink and dot-prefixed entries (e.g. staging
@@ -1735,6 +1769,89 @@ pub(crate) fn harden_untrusted_runtime_command(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
+    #[tokio::test]
+    async fn runtime_download_request_recovers_once_and_preserves_http_refusals()
+    -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        for (stall_first, status, expected_requests) in [
+            (true, "200 OK", 2),
+            (false, "404 Not Found", 1),
+            (false, "403 Forbidden", 1),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/archive", listener.local_addr()?);
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_millis(100))
+                .build()?;
+            let server = async {
+                let mut held = Vec::new();
+                for attempt in 1..=expected_requests {
+                    let (mut stream, _) = listener.accept().await?;
+                    let mut request = [0; 4096];
+                    let length = stream.read(&mut request).await?;
+                    anyhow::ensure!(request[..length].starts_with(b"GET /archive HTTP/1.1\r\n"));
+                    if stall_first && attempt == 1 {
+                        held.push(stream); // Keep the first request pending until its client deadline.
+                    } else {
+                        stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfixture").as_bytes()).await?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(held)
+            };
+            let request = async {
+                let response = super::request_runtime_download(&client, &url).await?;
+                assert_eq!(response.status().as_u16(), status[..3].parse::<u16>()?);
+                assert_eq!(response.text().await?, "fixture");
+                Ok::<_, anyhow::Error>(())
+            };
+            let (server, request) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(server, request)
+                })
+                .await?;
+            drop(server?);
+            request?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_download_request_stops_after_three_proxy_connect_failures()
+    -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy = reqwest::Proxy::all(format!("http://{}", listener.local_addr()?))?;
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(std::time::Duration::from_secs(1))
+            .build()?;
+        let server = async {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = [0; 4096];
+                let length = stream.read(&mut request).await?;
+                anyhow::ensure!(
+                    request[..length].starts_with(b"CONNECT example.com:443 HTTP/1.1\r\n")
+                );
+                // Close before the tunnel is established, matching a connect-stage failure.
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let request = async {
+            let error = super::request_runtime_download(&client, "https://example.com/archive")
+                .await
+                .expect_err("exhausted connection attempts must fail");
+            assert!(error.is_connect(), "{error:?}");
+        };
+        let (server, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(server, request)
+        })
+        .await?;
+        server?;
+        Ok(())
+    }
     use super::*;
     use tempfile::TempDir;
 

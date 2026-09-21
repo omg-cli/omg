@@ -7,13 +7,11 @@
 //! - `hook`: per-shell integration scripts, rejection of unknown shells
 //! - `which`: active-version reporting and required runtime argument
 //!
-//! Version-file *detection* is asserted offline on every run: the
-//! "Detected version <v> from file" line is printed before any network or
-//! install work begins (src/cli/runtimes.rs:126), so detection tests cap the
-//! command runtime right after detection and stay fast and hermetic.
+//! Node/Python/Go version-file tests seed executable installed fixtures and
+//! require successful activation, exact current paths and executable output.
+//! These prove selection, not download/extraction.
 //! Tests that genuinely download runtimes are gated behind
-//! `require_network_tests!` and assert concrete success output plus a
-//! named cause on the failure path.
+//! `require_network_tests!`; failures never count as successful downloads.
 
 #![expect(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
 
@@ -21,9 +19,7 @@ pub mod common;
 
 use common::*;
 
-/// Command cap for detection-only probes: startup + version-file parsing is
-/// milliseconds; anything longer is install work we deliberately do not wait
-/// for. The detected-version line has already been printed by then.
+/// Bound local selection and activation; a timeout is not a successful result.
 const DETECTION_TIMEOUT_SECS: &str = "15";
 
 /// Command cap for gated end-to-end installs (download + extract + switch).
@@ -31,6 +27,65 @@ const INSTALL_TIMEOUT_SECS: &str = "600";
 
 fn run_capped(args: &[&str], timeout_secs: &str) -> CommandResult {
     run_omg_with_env(args, &[("OMG_TEST_COMMAND_TIMEOUT_SECS", timeout_secs)])
+}
+
+#[test]
+fn node_alias_oracle_uses_release_versions_and_lts_column_not_row_order() {
+    let table = "version\tlts\nv20.10.0\tIron\nv27.0.0-rc.1\t-\nv26.9.0\t-\nv24.21.0\tKrypton\nv22.23.2\tJod\n";
+    assert_eq!(node_alias_from_table(table, false).unwrap(), "26.9.0");
+    assert_eq!(node_alias_from_table(table, true).unwrap(), "24.21.0");
+    assert!(node_alias_from_table("version\tlts\nv26.9.0\t-\n", true).is_err());
+    assert!(node_alias_from_table("version\n", false).is_err());
+}
+
+fn node_alias_from_table(table: &str, lts_only: bool) -> anyhow::Result<String> {
+    let mut lines = table.lines();
+    let header: Vec<_> = lines.next().unwrap_or_default().split('\t').collect();
+    let version_column = header
+        .iter()
+        .position(|value| *value == "version")
+        .ok_or_else(|| anyhow::anyhow!("Node release table lacks version column"))?;
+    let lts_column = header
+        .iter()
+        .position(|value| *value == "lts")
+        .ok_or_else(|| anyhow::anyhow!("Node release table lacks lts column"))?;
+    let mut candidates = Vec::new();
+    for line in lines {
+        let fields: Vec<_> = line.split('\t').collect();
+        anyhow::ensure!(
+            fields.len() == header.len(),
+            "Malformed Node release row: {line}"
+        );
+        let version = semver::Version::parse(fields[version_column].trim_start_matches('v'))?;
+        if version.pre.is_empty() && (!lts_only || !matches!(fields[lts_column], "" | "-")) {
+            candidates.push(version);
+        }
+    }
+    candidates
+        .into_iter()
+        .max()
+        .map(|version| version.to_string())
+        .ok_or_else(|| anyhow::anyhow!("No eligible Node release in independent table"))
+}
+
+fn expected_node_alias(lts_only: bool) -> String {
+    // Separate upstream representation and ordering rule from OMG's JSON resolver.
+    let table = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap()
+            .get("https://nodejs.org/dist/index.tab")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    });
+    node_alias_from_table(&table, lts_only).unwrap()
 }
 
 /// Assert the documented detection contract: `omg use <runtime>` without an
@@ -49,6 +104,86 @@ fn assert_detected(result: &CommandResult, version: &str) {
         output.contains("Detected version") && output.contains(version),
         "expected \"Detected version {version} from file\", got:\n{output}"
     );
+}
+
+fn seed_installed_runtime(project: &TestProject, runtime: &str, version: &str, executable: &str) {
+    let binary = project
+        .data_dir
+        .path()
+        .join(format!("versions/{runtime}/{version}/bin/{executable}"));
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::write(
+        &binary,
+        format!("#!/bin/sh\nprintf '%s\\n' 'fixture-{runtime}-{version}'\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn assert_active_runtime(
+    project: &TestProject,
+    result: &CommandResult,
+    runtime: &str,
+    version: &str,
+    executable: &str,
+) {
+    result.assert_success();
+    assert_detected(result, version);
+    let base = project.data_dir.path().join(format!("versions/{runtime}"));
+    let current = base.join(format!("current/bin/{executable}"));
+    assert_eq!(
+        std::fs::canonicalize(&current).unwrap(),
+        std::fs::canonicalize(base.join(format!("{version}/bin/{executable}"))).unwrap(),
+        "Detected version must become the active runtime"
+    );
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new(current).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            format!("fixture-{runtime}-{version}\n").as_bytes()
+        );
+    }
+}
+
+/// Require the exact independently expected version and its executable installation.
+fn assert_downloaded_runtime(
+    project: &TestProject,
+    runtime: &str,
+    requested: &str,
+    executable: &str,
+) {
+    let base = project.data_dir.path().join(format!("versions/{runtime}"));
+    let active = std::fs::canonicalize(base.join("current")).unwrap();
+    assert_eq!(
+        active.parent().unwrap(),
+        std::fs::canonicalize(&base).unwrap()
+    );
+    let resolved = active.file_name().unwrap().to_str().unwrap();
+    assert_eq!(resolved, requested);
+    assert!(resolved.split('.').count() >= 3 && resolved.chars().next().unwrap().is_ascii_digit());
+    let output = std::process::Command::new(active.join("bin").join(executable))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "installed executable failed: {output:?}"
+    );
+    let expected = if runtime == "node" {
+        format!("v{resolved}")
+    } else {
+        format!("Python {resolved}")
+    };
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+    let listed = project.run(&["list", runtime]);
+    listed.assert_success();
+    assert!(listed.stdout.contains(resolved));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -83,6 +218,108 @@ fn every_supported_runtime_has_uninstall_dispatch() {
             output.contains("not installed") && !output.contains("Unsupported runtime"),
             "{runtime} must reach its uninstall implementation, got:\n{output}"
         );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn every_runtime_uninstall_preserves_active_siblings_and_external_state() {
+    let runtimes = omg_lib::cli::runtimes::known_runtimes().unwrap();
+    assert_eq!(
+        runtimes.len(),
+        68,
+        "Review lifecycle fixtures when the supported registry changes"
+    );
+    for runtime in runtimes {
+        let project = TestProject::new();
+        let (version, sibling) = match runtime.as_str() {
+            "rust" => (
+                "1.93.1-x86_64-unknown-linux-gnu",
+                "1.94.0-x86_64-unknown-linux-gnu",
+            ),
+            "java" => ("17", "21"),
+            _ => ("1.2.3", "2.3.4"),
+        };
+        let versions = project.data_dir.path().join("versions").join(&runtime);
+        let selected = versions.join(version);
+        let retained = versions.join(sibling);
+        for path in [&selected, &retained] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("sentinel"), b"runtime fixture bytes").unwrap();
+        }
+        let external = project.create_dir("external-runtime");
+        std::fs::write(external.join("sentinel"), b"external bytes").unwrap();
+        std::os::unix::fs::symlink(&external, selected.join("external-link")).unwrap();
+        std::os::unix::fs::symlink(&selected, versions.join("current")).unwrap();
+        let arguments = ["use", runtime.as_str(), version, "--uninstall"];
+        let active = project.run(&arguments);
+        active.assert_failure();
+        assert!(
+            active
+                .combined_output()
+                .contains("is active; switch to another version"),
+            "{runtime}: {}",
+            active.combined_output()
+        );
+        assert_eq!(
+            std::fs::read_link(versions.join("current")).unwrap(),
+            selected
+        );
+        assert_eq!(
+            std::fs::read(selected.join("sentinel")).unwrap(),
+            b"runtime fixture bytes"
+        );
+
+        std::fs::remove_file(versions.join("current")).unwrap();
+        std::os::unix::fs::symlink(&retained, versions.join("current")).unwrap();
+        project.run(&arguments).assert_success();
+        assert!(
+            std::fs::symlink_metadata(&selected)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "{runtime}: removed version still exists"
+        );
+        assert_eq!(
+            std::fs::read_link(versions.join("current")).unwrap(),
+            retained
+        );
+        assert_eq!(
+            std::fs::read(retained.join("sentinel")).unwrap(),
+            b"runtime fixture bytes"
+        );
+        assert_eq!(
+            std::fs::read(external.join("sentinel")).unwrap(),
+            b"external bytes"
+        );
+
+        let missing = project.run(&arguments);
+        missing.assert_failure();
+        assert!(
+            missing
+                .combined_output()
+                .contains("not installed; nothing to remove"),
+            "{runtime}: {}",
+            missing.combined_output()
+        );
+        std::os::unix::fs::symlink(&external, &selected).unwrap();
+        let linked = project.run(&arguments);
+        linked.assert_failure();
+        assert!(
+            linked
+                .combined_output()
+                .contains("not installed; nothing to remove"),
+            "{runtime}: {}",
+            linked.combined_output()
+        );
+        assert_eq!(std::fs::read_link(&selected).unwrap(), external);
+        assert_eq!(
+            std::fs::read(external.join("sentinel")).unwrap(),
+            b"external bytes"
+        );
+        assert_eq!(
+            std::fs::read(retained.join("sentinel")).unwrap(),
+            b"runtime fixture bytes"
+        );
+        project.close_checked();
     }
 }
 
@@ -150,41 +387,17 @@ fn test_use_invalid_runtime() {
 fn test_use_node_with_version() {
     init_test_env();
     require_network_tests!();
-
     let project = TestProject::new();
     let result = project.run_with_env(
         &["use", "node", "20.10.0"],
-        &[("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS)],
+        &[
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS),
+            ("OMG_TEST_MODE", "0"),
+        ],
     );
-    let output = result.combined_output();
-    assert!(
-        !output.contains("panicked at"),
-        "`omg use node 20.10.0` must not panic:\n{output}"
-    );
-
-    if result.success {
-        // Success must show the concrete switch...
-        assert!(
-            output.contains("Switching node to version 20.10.0"),
-            "successful switch must name runtime and version:\n{output}"
-        );
-        // ...and persist: the version must be listed afterwards.
-        let list = project.run(&["list", "node"]);
-        list.assert_success();
-        assert!(
-            list.stdout.contains("20.10.0"),
-            "installed version must appear in `omg list node`:\n{}",
-            list.stdout
-        );
-    } else {
-        // Failure must name its cause.
-        assert!(
-            output.contains("internet connection")
-                || output.contains("not found")
-                || output.contains("Failed"),
-            "failed switch must name its cause:\n{output}"
-        );
-    }
+    result.assert_success();
+    assert_downloaded_runtime(&project, "node", "20.10.0", "node");
+    project.close_checked();
 }
 
 #[cfg(unix)]
@@ -212,95 +425,55 @@ fn successful_runtime_switch_is_visible_at_default_verbosity() {
 fn test_use_python_with_version() {
     init_test_env();
     require_network_tests!();
-
     let project = TestProject::new();
     let result = project.run_with_env(
-        &["use", "python", "3.11.0"],
-        &[("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS)],
+        // Match the published QEMU fixture; PBS 20260901 supplies this asset.
+        // The former 3.11.0 fixture returned "not found", which used to pass.
+        &["use", "python", "3.12.14"],
+        &[
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS),
+            ("OMG_TEST_MODE", "0"),
+        ],
     );
-    let output = result.combined_output();
-    assert!(
-        !output.contains("panicked at"),
-        "`omg use python 3.11.0` must not panic:\n{output}"
-    );
-
-    if result.success {
-        assert!(
-            output.contains("Switching python to version 3.11.0"),
-            "successful switch must name runtime and version:\n{output}"
-        );
-        let list = project.run(&["list", "python"]);
-        list.assert_success();
-        assert!(
-            list.stdout.contains("3.11.0"),
-            "installed version must appear in `omg list python`:\n{}",
-            list.stdout
-        );
-    } else {
-        // e.g. upstream python-build-standalone has no matching release:
-        // the error must echo the requested version ("Python 3.11.0 not
-        // found. Try: omg list python --available").
-        assert!(
-            output.contains("3.11.0"),
-            "failed switch must name the requested version:\n{output}"
-        );
-    }
+    result.assert_success();
+    assert_downloaded_runtime(&project, "python", "3.12.14", "python3");
+    project.close_checked();
 }
 
 #[test]
 fn test_use_node_latest() {
     init_test_env();
     require_network_tests!();
-
-    let result = run_capped(&["use", "node", "latest"], INSTALL_TIMEOUT_SECS);
-    let output = result.combined_output();
-    assert!(
-        !output.contains("panicked at"),
-        "'latest' alias handling must not panic:\n{output}"
+    let expected = expected_node_alias(false);
+    let project = TestProject::new();
+    let result = project.run_with_env(
+        &["use", "node", "latest"],
+        &[
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS),
+            ("OMG_TEST_MODE", "0"),
+        ],
     );
-
-    if result.success {
-        // The command acknowledges the alias request concretely before
-        // resolving it upstream.
-        assert!(
-            output.contains("Switching node to version latest"),
-            "successful alias use must acknowledge the request:\n{output}"
-        );
-    } else {
-        assert!(
-            output.to_lowercase().contains("failed")
-                || output.contains("internet connection")
-                || output.contains("No Node.js versions found upstream"),
-            "failed 'latest' resolution must name its cause:\n{output}"
-        );
-    }
+    result.assert_success();
+    assert_downloaded_runtime(&project, "node", &expected, "node");
+    project.close_checked();
 }
 
 #[test]
 fn test_use_node_lts() {
     init_test_env();
     require_network_tests!();
-
-    let result = run_capped(&["use", "node", "lts"], INSTALL_TIMEOUT_SECS);
-    let output = result.combined_output();
-    assert!(
-        !output.contains("panicked at"),
-        "'lts' handling must not panic:\n{output}"
+    let expected = expected_node_alias(true);
+    let project = TestProject::new();
+    let result = project.run_with_env(
+        &["use", "node", "lts"],
+        &[
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS),
+            ("OMG_TEST_MODE", "0"),
+        ],
     );
-
-    if result.success {
-        assert!(
-            output.contains("Switching node to version lts"),
-            "successful alias use must acknowledge the request:\n{output}"
-        );
-    } else {
-        assert!(
-            output.to_lowercase().contains("failed")
-                || output.contains("internet connection")
-                || output.contains("No LTS"),
-            "failed 'lts' resolution must name its cause:\n{output}"
-        );
-    }
+    result.assert_success();
+    assert_downloaded_runtime(&project, "node", &expected, "node");
+    project.close_checked();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -331,6 +504,182 @@ fn test_list_specific_runtime() {
 }
 
 #[test]
+#[cfg(unix)]
+fn list_reports_exact_installed_versions_for_every_runtime_and_excludes_incomplete_state() {
+    let project = TestProject::new();
+    let names = omg_lib::cli::runtimes::known_runtimes().unwrap();
+    assert_eq!(
+        names.len(),
+        68,
+        "Review installed-list fixtures when the registry changes"
+    );
+    let empty = project.run(&["list", "--json"]);
+    empty.assert_success();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&empty.stdout).unwrap(),
+        serde_json::json!(
+            names
+                .iter()
+                .map(|name| serde_json::json!({"runtime":name,"current":null,"installed":[]}))
+                .collect::<Vec<_>>()
+        )
+    );
+    let external = project.create_dir("external-version");
+    std::fs::write(external.join("sentinel"), b"external bytes").unwrap();
+    let installed = ["1.10.0", "1.10.0-rc.1", "1.9.0"];
+    for runtime in &names {
+        let versions = project.data_dir.path().join("versions").join(runtime);
+        for version in [
+            "1.9.0",
+            "1.10.0-rc.1",
+            "1.10.0",
+            ".staging",
+            "9.0.0",
+            "8.0.0",
+        ] {
+            std::fs::create_dir_all(versions.join(version)).unwrap();
+            std::fs::write(versions.join(version).join("sentinel"), b"fixture bytes").unwrap();
+        }
+        std::fs::write(versions.join("9.0.0/.omg-installing"), b"pending").unwrap();
+        std::fs::write(versions.join("8.0.0/.omg-test-mock"), b"synthetic").unwrap();
+        std::fs::write(versions.join("7.0.0"), b"not a directory").unwrap();
+        std::os::unix::fs::symlink(&external, versions.join("6.0.0")).unwrap();
+        std::os::unix::fs::symlink(versions.join("1.9.0"), versions.join("current")).unwrap();
+        for args in [
+            vec!["list", runtime, "--json"],
+            vec!["--json", "ls", runtime],
+        ] {
+            let result = project.run(&args);
+            result.assert_success();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap(),
+                serde_json::json!({"runtime":runtime,"current":"1.9.0","installed":installed}),
+                "{args:?}"
+            );
+        }
+        let plain = project.run(&["list", runtime]);
+        plain.assert_success();
+        let rows: Vec<_> = plain
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('•'))
+            .collect();
+        assert_eq!(
+            rows,
+            ["• 1.10.0", "• 1.10.0-rc.1", "• 1.9.0 (active)"],
+            "{runtime}"
+        );
+    }
+    let expected: Vec<_> = names
+        .iter()
+        .map(|name| serde_json::json!({"runtime":name,"current":"1.9.0","installed":installed}))
+        .collect();
+    for args in [&["list", "--json"][..], &["--json", "ls"][..]] {
+        let result = project.run(args);
+        result.assert_success();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap(),
+            serde_json::json!(expected)
+        );
+    }
+    let plain = project.run(&["list"]);
+    plain.assert_success();
+    let rows: Vec<_> = plain
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('•'))
+        .collect();
+    let expected: Vec<_> = names
+        .iter()
+        .flat_map(|name| {
+            [
+                format!("• {name} 1.10.0"),
+                format!("• {name} 1.10.0-rc.1"),
+                format!("• {name} 1.9.0 (active)"),
+            ]
+        })
+        .collect();
+    assert_eq!(
+        rows, expected,
+        "all-runtime listing must include inactive installed versions"
+    );
+    for runtime in &names {
+        let versions = project.data_dir.path().join("versions").join(runtime);
+        assert_eq!(
+            std::fs::read_link(versions.join("current")).unwrap(),
+            versions.join("1.9.0")
+        );
+        assert_eq!(
+            std::fs::read_link(versions.join("6.0.0")).unwrap(),
+            external
+        );
+        for version in [
+            "1.9.0",
+            "1.10.0-rc.1",
+            "1.10.0",
+            ".staging",
+            "9.0.0",
+            "8.0.0",
+        ] {
+            assert_eq!(
+                std::fs::read(versions.join(version).join("sentinel")).unwrap(),
+                b"fixture bytes"
+            );
+        }
+        assert_eq!(
+            std::fs::read(versions.join("9.0.0/.omg-installing")).unwrap(),
+            b"pending"
+        );
+        assert_eq!(
+            std::fs::read(versions.join("8.0.0/.omg-test-mock")).unwrap(),
+            b"synthetic"
+        );
+        assert_eq!(
+            std::fs::read(versions.join("7.0.0")).unwrap(),
+            b"not a directory"
+        );
+    }
+    assert_eq!(
+        std::fs::read(external.join("sentinel")).unwrap(),
+        b"external bytes"
+    );
+    // A denied parent prevents even stat() of the runtime directory. Treating
+    // Path::exists() == false as absence would invent a successful empty list.
+    use std::os::unix::fs::PermissionsExt as _;
+    let versions = project.data_dir.path().join("versions");
+    let permissions = std::fs::metadata(&versions).unwrap().permissions();
+    std::fs::set_permissions(&versions, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let denied_runtime = project.run(&["list", "node", "--json"]);
+    let denied_all = project.run(&["--json", "list"]);
+    std::fs::set_permissions(&versions, permissions).unwrap();
+    for denied in [denied_runtime, denied_all] {
+        denied.assert_failure();
+        denied.assert_stderr_contains("Failed to list installed");
+        denied.assert_stderr_contains("Permission denied");
+        assert!(
+            denied.stdout.is_empty(),
+            "failed JSON listing emitted a success payload"
+        );
+    }
+    for runtime in &names {
+        let versions = versions.join(runtime);
+        assert_eq!(
+            std::fs::read_link(versions.join("current")).unwrap(),
+            versions.join("1.9.0")
+        );
+        for version in installed {
+            assert_eq!(
+                std::fs::read(versions.join(version).join("sentinel")).unwrap(),
+                b"fixture bytes"
+            );
+        }
+    }
+    project.close_checked();
+}
+
+#[test]
 fn test_list_available_versions() {
     init_test_env();
     require_network_tests!();
@@ -355,6 +704,61 @@ fn test_list_invalid_runtime() {
     );
 }
 
+#[test]
+fn list_rejects_duplicate_json_flags_and_reports_backend_errors_once() {
+    let project = TestProject::new();
+    for command in ["list", "ls"] {
+        for args in [
+            vec![command, "node", "--json", "--json"],
+            vec![command, "--json", "node", "--json"],
+            vec!["--quiet", command, "node", "--json", "--json"],
+        ] {
+            let result = project.run(&args);
+            result.assert_failure();
+            result.assert_stderr_contains("cannot be used multiple times");
+            assert_eq!(result.exit_code, 2);
+            assert!(
+                result.stdout.is_empty(),
+                "invalid flags must not emit a list"
+            );
+        }
+        let unknown = project.run(&[command, "invalid-runtime-xyz"]);
+        unknown.assert_failure();
+        assert_eq!(unknown.exit_code, 1);
+        unknown.assert_stderr_contains("Unsupported runtime 'invalid-runtime-xyz'");
+        assert_eq!(
+            unknown
+                .stdout
+                .matches("invalid-runtime-xyz versions")
+                .count(),
+            1,
+            "fast-path refusal must not execute the normal renderer again"
+        );
+    }
+    let versions = project.data_dir.path().join("versions");
+    std::fs::write(&versions, b"not a versions directory").unwrap();
+    for args in [&["list", "node"][..], &["list"][..]] {
+        let result = project.run(args);
+        result.assert_failure();
+        result.assert_stderr_contains("Failed to list installed");
+        result.assert_stderr_contains("Not a directory");
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(
+            result.stdout.matches("versions").count(),
+            1,
+            "backend error must not render the command twice"
+        );
+    }
+    let json = project.run(&["list", "node", "--json"]);
+    json.assert_failure();
+    assert!(json.stdout.is_empty());
+    assert_eq!(
+        std::fs::read(versions).unwrap(),
+        b"not a versions directory"
+    );
+    project.close_checked();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // VERSION FILE DETECTION E2E TESTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -365,12 +769,14 @@ fn test_detect_nvmrc() {
 
     let project = TestProject::new();
     project.create_file(".nvmrc", "20.10.0");
+    seed_installed_runtime(&project, "node", "20.10.0", "node");
 
     let result = project.run_with_env(
         &["use", "node"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
-    assert_detected(&result, "20.10.0");
+    assert_active_runtime(&project, &result, "node", "20.10.0", "node");
+    project.close_checked();
 }
 
 #[test]
@@ -379,12 +785,14 @@ fn test_detect_python_version() {
 
     let project = TestProject::new();
     project.create_file(".python-version", "3.11.0");
+    seed_installed_runtime(&project, "python", "3.11.0", "python3");
 
     let result = project.run_with_env(
         &["use", "python"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
-    assert_detected(&result, "3.11.0");
+    assert_active_runtime(&project, &result, "python", "3.11.0", "python3");
+    project.close_checked();
 }
 
 #[test]
@@ -393,12 +801,14 @@ fn test_detect_tool_versions() {
 
     let project = TestProject::new();
     project.with_tool_versions(&[("node", "20.10.0"), ("python", "3.11.0")]);
+    seed_installed_runtime(&project, "node", "20.10.0", "node");
 
     let result = project.run_with_env(
         &["use", "node"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
-    assert_detected(&result, "20.10.0");
+    assert_active_runtime(&project, &result, "node", "20.10.0", "node");
+    project.close_checked();
 }
 
 #[test]
@@ -419,6 +829,17 @@ fn test_package_json_engines() {
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
     assert_detected(&result, ">=18.0.0");
+    result.assert_failure();
+    assert!(
+        result
+            .combined_output()
+            .contains("Invalid character '>' in version string")
+    );
+    assert!(
+        std::fs::symlink_metadata(project.data_dir.path().join("versions/node/current"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    );
+    project.close_checked();
 }
 
 #[test]
@@ -426,13 +847,65 @@ fn test_rust_toolchain_toml() {
     init_test_env();
 
     let project = TestProject::new();
-    project.create_file("rust-toolchain.toml", "[toolchain]\nchannel = \"stable\"");
+    let host_os = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        other => panic!("missing Rust fixture host for {other}"),
+    };
+    let toolchain = format!("1.93.1-{}-{host_os}", std::env::consts::ARCH);
+    project.create_file("rust-toolchain.toml", "[toolchain]\nchannel = \"1.93.1\"");
+    seed_installed_runtime(&project, "rust", &toolchain, "rustc");
 
     let result = project.run_with_env(
         &["use", "rust"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
+    result.assert_success();
+    assert_detected(&result, "1.93.1");
+    let current = project
+        .data_dir
+        .path()
+        .join("versions/rust/current/bin/rustc");
+    assert_eq!(
+        std::fs::canonicalize(&current).unwrap(),
+        std::fs::canonicalize(
+            project
+                .data_dir
+                .path()
+                .join(format!("versions/rust/{toolchain}/bin/rustc"))
+        )
+        .unwrap()
+    );
+    let output = std::process::Command::new(current).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        format!("fixture-rust-{toolchain}\n").as_bytes()
+    );
+    project.close_checked();
+}
+
+#[test]
+#[cfg(unix)]
+fn rust_stable_pin_refuses_a_concurrent_mutation_without_activation() {
+    let project = TestProject::new();
+    project.create_file("rust-toolchain.toml", "[toolchain]\nchannel = \"stable\"");
+    let versions = project.data_dir.path().join("versions/rust");
+    std::fs::create_dir_all(&versions).unwrap();
+    let lock = std::fs::File::create(versions.join(".mutation.lock")).unwrap();
+    lock.lock().unwrap();
+    let result = project.run_with_env(&["use", "rust"], &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "5")]);
+    result.assert_failure();
     assert_detected(&result, "stable");
+    assert!(
+        result
+            .combined_output()
+            .contains("Another Rust toolchain operation is running")
+    );
+    assert!(std::fs::symlink_metadata(versions.join("current")).is_err());
+    assert_eq!(std::fs::read_dir(&versions).unwrap().count(), 1);
+    drop(lock);
+    project.close_checked();
 }
 
 #[test]
@@ -441,12 +914,14 @@ fn test_go_mod_version() {
 
     let project = TestProject::new();
     project.create_file("go.mod", "module test\n\ngo 1.21");
+    seed_installed_runtime(&project, "go", "1.21", "go");
 
     let result = project.run_with_env(
         &["use", "go"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
-    assert_detected(&result, "1.21");
+    assert_active_runtime(&project, &result, "go", "1.21", "go");
+    project.close_checked();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -459,16 +934,24 @@ fn test_multi_runtime_detection() {
 
     let project = TestProject::new();
     project.with_tool_versions(&[("node", "20.10.0"), ("python", "3.11.0"), ("go", "1.21")]);
+    for (runtime, version, executable) in [
+        ("node", "20.10.0", "node"),
+        ("python", "3.11.0", "python3"),
+        ("go", "1.21", "go"),
+    ] {
+        seed_installed_runtime(&project, runtime, version, executable);
+    }
 
     let env = [("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)];
     let node_result = project.run_with_env(&["use", "node"], &env);
-    assert_detected(&node_result, "20.10.0");
+    assert_active_runtime(&project, &node_result, "node", "20.10.0", "node");
 
     let python_result = project.run_with_env(&["use", "python"], &env);
-    assert_detected(&python_result, "3.11.0");
+    assert_active_runtime(&project, &python_result, "python", "3.11.0", "python3");
 
     let go_result = project.run_with_env(&["use", "go"], &env);
-    assert_detected(&go_result, "1.21");
+    assert_active_runtime(&project, &go_result, "go", "1.21", "go");
+    project.close_checked();
 }
 
 #[test]
@@ -478,6 +961,8 @@ fn test_conflicting_version_files() {
     let project = TestProject::new();
     project.create_file(".nvmrc", "18.0.0");
     project.with_tool_versions(&[("node", "20.10.0")]);
+    seed_installed_runtime(&project, "node", "18.0.0", "node");
+    seed_installed_runtime(&project, "node", "20.10.0", "node");
 
     // Precedence contract: within a directory, VERSION_FILES order wins —
     // .nvmrc is listed before .tool-versions and detect_versions keeps the
@@ -487,13 +972,14 @@ fn test_conflicting_version_files() {
         &["use", "node"],
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", DETECTION_TIMEOUT_SECS)],
     );
-    assert_detected(&result, "18.0.0");
+    assert_active_runtime(&project, &result, "node", "18.0.0", "node");
 
     let output = result.combined_output();
     assert!(
         !output.contains("20.10.0"),
         ".nvmrc must take precedence over .tool-versions, got:\n{output}"
     );
+    project.close_checked();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -619,38 +1105,26 @@ fn test_hook_invalid_shell() {
 
 #[test]
 fn test_which_shows_active_runtime() {
-    init_test_env();
-
-    let result = run_omg(&["which", "node"]);
-
-    let output = result.combined_output();
-    assert!(
-        !output.contains("panicked at"),
-        "`omg which node` must not panic:\n{output}"
-    );
-
-    if result.success {
-        // Exactly one of the two documented outcomes
-        // (handle_which_command in src/bin/omg.rs):
-        //   "<runtime> <version>"  when a version is set
-        //   "<runtime>: no version set (...)" otherwise
-        let has_no_version = output.contains("no version set");
-        let has_version_line = output.lines().any(|line| {
-            line.split_whitespace()
-                .nth(1)
-                .is_some_and(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        });
-        assert!(
-            has_no_version || has_version_line,
-            "`omg which node` must print either a version or the explicit \
-             'no version set' notice:\n{output}"
+    let project = TestProject::new();
+    let empty = project.run(&["which", "node"]);
+    empty.assert_success();
+    empty.assert_stdout_contains("node: no version set");
+    for version in ["20.10.0", "18.0.0"] {
+        seed_installed_runtime(&project, "node", version, "node");
+        project.run(&["use", "node", version]).assert_success();
+        let base = project.data_dir.path().join("versions/node");
+        let active = base.join("current");
+        let before = std::fs::read_link(&active).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&active).unwrap(),
+            std::fs::canonicalize(base.join(version)).unwrap()
         );
-    } else {
-        assert!(
-            output.contains("failed to resolve active version for node"),
-            "resolution errors must name the runtime:\n{output}"
-        );
+        let selected = project.run(&["which", "node"]);
+        selected.assert_success();
+        assert_eq!(selected.stdout.trim(), format!("node {version}"));
+        assert_eq!(std::fs::read_link(&active).unwrap(), before);
     }
+    project.close_checked();
 }
 
 #[test]
@@ -663,4 +1137,95 @@ fn test_which_requires_runtime_argument() {
 
     result.assert_failure();
     result.assert_stderr_contains("required arguments were not provided");
+}
+
+#[test]
+#[cfg(unix)]
+fn which_resolves_every_runtime_with_project_parent_global_precedence_without_mutation() {
+    let mut project = TestProject::new();
+    let parent = project.dir;
+    project.dir = tempfile::tempdir_in(parent.path()).unwrap();
+    let names = omg_lib::cli::runtimes::known_runtimes().unwrap();
+    assert_eq!(
+        names.len(),
+        68,
+        "Review selection fixtures when the registry changes"
+    );
+    let check = |runtime: &str, expected: Option<&str>| {
+        for args in [vec!["which", runtime], vec!["--quiet", "which", runtime]] {
+            let output = project.run(&args);
+            output.assert_success();
+            let expected = expected.map_or_else(
+                || format!("{runtime}: no version set (check .tool-versions, .nvmrc, etc.)"),
+                |version| format!("{runtime} {version}"),
+            );
+            assert_eq!(output.stdout.trim(), expected, "{args:?}");
+        }
+    };
+    for runtime in &names {
+        check(runtime, None);
+        let versions = project.data_dir.path().join("versions").join(runtime);
+        std::fs::create_dir_all(versions.join("1.2.3")).unwrap();
+        std::fs::write(versions.join("1.2.3/sentinel"), b"selected fixture bytes").unwrap();
+        std::os::unix::fs::symlink(versions.join("1.2.3"), versions.join("current")).unwrap();
+        check(runtime, Some("1.2.3"));
+    }
+    let parent_pins: String = names.iter().map(|name| format!("{name} 2.3.4\n")).collect();
+    let parent_path = parent.path().join(".tool-versions");
+    std::fs::write(&parent_path, &parent_pins).unwrap();
+    for runtime in &names {
+        check(runtime, Some("2.3.4"));
+    }
+    let child_pins: String = names
+        .iter()
+        .step_by(2)
+        .map(|name| format!("{name} 4.5.6\n"))
+        .collect();
+    let child_path = project.create_file(".tool-versions", &child_pins);
+    for (index, runtime) in names.iter().enumerate() {
+        check(
+            runtime,
+            Some(if index % 2 == 0 { "4.5.6" } else { "2.3.4" }),
+        );
+    }
+    for (alias, canonical) in [
+        ("NodeJS", "node"),
+        ("python3", "python"),
+        ("GOLANG", "go"),
+        ("rustlang", "rust"),
+        ("jdk", "java"),
+        ("openjdk", "java"),
+        ("bunjs", "bun"),
+        ("ziglang", "zig"),
+    ] {
+        let index = names.iter().position(|name| name == canonical).unwrap();
+        check(alias, Some(if index % 2 == 0 { "4.5.6" } else { "2.3.4" }));
+    }
+    assert_eq!(std::fs::read_to_string(&parent_path).unwrap(), parent_pins);
+    assert_eq!(std::fs::read_to_string(&child_path).unwrap(), child_pins);
+    std::fs::remove_file(&child_path).unwrap();
+    std::fs::remove_file(&parent_path).unwrap();
+    for runtime in &names {
+        check(runtime, Some("1.2.3"));
+        let versions = project.data_dir.path().join("versions").join(runtime);
+        assert_eq!(
+            std::fs::read_link(versions.join("current")).unwrap(),
+            versions.join("1.2.3")
+        );
+        assert_eq!(
+            std::fs::read(versions.join("1.2.3/sentinel")).unwrap(),
+            b"selected fixture bytes"
+        );
+        std::fs::remove_file(versions.join("current")).unwrap();
+        std::os::unix::fs::symlink(versions.join("missing"), versions.join("current")).unwrap();
+        check(runtime, None);
+        assert_eq!(
+            std::fs::read_link(versions.join("current")).unwrap(),
+            versions.join("missing")
+        );
+    }
+    project.close_checked();
+    let parent_path = parent.path().to_owned();
+    parent.close().unwrap();
+    assert!(!parent_path.exists());
 }

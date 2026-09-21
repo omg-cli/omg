@@ -9,6 +9,108 @@
 set -euo pipefail
 # BEGIN PRODUCT OUTPUT ORACLE
 # This exact function is sent to the guest and exercised by fault-injection tests.
+check_native_counter() {
+  local distro=$1 counter=$2 output=$3 status=0 expected actual
+  local -a native=()
+  case "$distro:$counter" in
+    arch:ec) native=(pacman -Qqe) ;;
+    arch:tc) native=(pacman -Qq) ;;
+    arch:oc) native=(pacman -Qdtq) ;;
+    arch:uc) native=(pacman -Quq) ;;
+    debian:tc|ubuntu:tc) native=(dpkg-query -W '-f=${db:Status-Status}\n') ;;
+    debian:ec|ubuntu:ec) native=(apt-mark showmanual) ;;
+    debian:oc|ubuntu:oc) native=(apt-get -s autoremove) ;;
+    debian:uc|ubuntu:uc) native=(apt list --upgradable) ;;
+    fedora:tc) native=(rpm -qa --qf '%{NAME}.%{ARCH}\n') ;;
+    fedora:ec) native=(dnf --cacheonly repoquery --userinstalled --qf '%{name}\n') ;;
+    fedora:oc) native=(dnf --cacheonly repoquery --unneeded --qf '%{name}.%{arch}\n') ;;
+    fedora:uc) native=(dnf --cacheonly repoquery --upgrades --latest-limit=1 --qf '%{name}.%{arch}\n') ;;
+    *) return 2 ;;
+  esac
+  timeout --kill-after=2s 30 "${native[@]}" > native-counter.raw 2> native-counter.stderr || status=$?
+  # pacman uses 1 for an empty query; never accept a diagnostic-bearing error.
+  if [[ "$distro" == arch && "$status" == 1 && ! -s native-counter.raw && ! -s native-counter.stderr ]]; then status=0; fi
+  if [[ "$status" != 0 ]]; then
+    printf 'native counter reference failed: %s %s exit=%s\n' "$distro" "$counter" "$status" >&2
+    head -c 4096 native-counter.stderr >&2
+    return 2
+  fi
+  expected=$(
+    set -o pipefail
+    case "$distro:$counter" in
+      debian:tc|ubuntu:tc) awk '$0 == "installed" {n++} END {print n+0}' native-counter.raw ;;
+      debian:oc|ubuntu:oc) awk '/^Remv / {n++} END {print n+0}' native-counter.raw ;;
+      debian:uc|ubuntu:uc) awk '$1 ~ /\// {n++} END {print n+0}' native-counter.raw ;;
+      *:ec|fedora:oc|fedora:uc) sort -u native-counter.raw | awk 'NF {n++} END {print n+0}' ;;
+      *) awk 'NF {n++} END {print n+0}' native-counter.raw ;;
+    esac
+  ) || { printf 'native counter reference processing failed\n' >&2; return 2; }
+  [[ $(wc -c < "$output") -le 32 ]] || { printf 'assertion failed: counter output exceeds scalar size\n' >&2; return 1; }
+  actual=$(cat "$output")
+  printf 'native counter %s expected=%s actual=%s\n' "$counter" "$expected" "$actual" >&2
+  [[ "$actual" =~ ^[0-9]+$ && "$actual" == "$expected" ]]
+}
+
+check_python_install() {
+  local version=$1 base expected active executable output status=0
+  base="$OMG_DATA_DIR/versions/python"
+  expected="$base/$version"
+  active=$(readlink -f "$base/current") || active=""
+  executable=$(readlink -f "$base/current/bin/python3") || executable=""
+  if [[ "$active" != "$expected" || ! -L "$base/current" || -L "$expected" \
+        || "$executable" != "$expected/"* || ! -f "$executable" || ! -x "$executable" ]]; then
+    printf 'assertion failed: Python %s lacks an active executable inside its installed version\n' "$version" >&2; return 1
+  fi
+  output=$(timeout --kill-after=2s 10 "$executable" --version 2>&1) || status=$?
+  if [[ "$status" != 0 || "$output" != "Python $version" ]]; then
+    printf 'assertion failed: Python executable version expected=%s exit=%s observed=%s\n' "$version" "$status" "$output" >&2; return 1
+  fi
+  output=$(timeout --kill-after=2s 60 "$executable" -I - "$version" "$expected" "$base" 2>&1 <<'PY'
+import bz2, ctypes, gzip, hashlib, json, lzma, pathlib, sqlite3, ssl, subprocess, sys, tempfile, venv
+
+version, expected, base = sys.argv[1:]
+assert sys.version.split()[0] == version, 'interpreter version mismatch'
+assert pathlib.Path(sys.executable).resolve().is_relative_to(pathlib.Path(expected)), 'interpreter escaped installation'
+payload = b'OMG installed Python behavior'
+for codec in (bz2, gzip, lzma):
+    assert codec.decompress(codec.compress(payload)) == payload, f'{codec.__name__} round trip failed'
+assert hashlib.sha256(b'abc').hexdigest() == 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', 'SHA-256 mismatch'
+with sqlite3.connect(':memory:') as database:
+    database.execute('create table probe(value integer)')
+    database.execute('insert into probe values (?)', (42,))
+    assert database.execute('select value from probe').fetchall() == [(42,)], 'SQLite query mismatch'
+libc = ctypes.CDLL(None)
+libc.abs.argtypes = [ctypes.c_int]
+libc.abs.restype = ctypes.c_int
+assert libc.abs(-42) == 42, 'ctypes foreign call failed'
+context = ssl.create_default_context()
+assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname, 'TLS verification defaults disabled'
+# ensurepip uses bundled wheels offline; no package index or second download.
+def run_probe(arguments, timeout=10):
+    result = subprocess.run(arguments, text=True, capture_output=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(f'Python child exited {result.returncode}: {result.stdout[:4096]} {result.stderr[:4096]}')
+    return result.stdout
+
+with tempfile.TemporaryDirectory(prefix='.qemu-python-', dir=base) as temporary:
+    environment = pathlib.Path(temporary) / 'venv'
+    venv.create(environment, with_pip=False)
+    child = environment / 'bin/python'
+    run_probe([str(child), '-I', '-m', 'ensurepip', '--upgrade', '--default-pip'], timeout=40)
+    observed = run_probe([str(child), '-I', '-c', 'import json,sys; print(json.dumps([sys.version.split()[0],sys.prefix,sys.base_prefix]))'])
+    child_version, prefix, base_prefix = json.loads(observed)
+    assert child_version == version and pathlib.Path(prefix) == environment, 'venv identity mismatch'
+    assert prefix != base_prefix, 'venv is not isolated from its base interpreter'
+    pip = run_probe([str(child), '-I', '-m', 'pip', '--isolated', '--disable-pip-version-check', '--version'])
+    assert pip.startswith('pip ') and str(environment) in pip, 'pip is outside its venv'
+assert not pathlib.Path(temporary).exists(), 'Python behavior fixture cleanup failed'
+print(f'OMG_PYTHON_RUNTIME_OK:{version}')
+PY
+  ) || status=$?
+  if [[ "$status" != 0 || "$output" != "OMG_PYTHON_RUNTIME_OK:$version" ]]; then
+    printf 'assertion failed: Python runtime behavior expected=%s exit=%s observed=%s\n' "$version" "$status" "$output" >&2; return 1
+  fi
+}
 check_hook_lifecycle() (
   # Execute the installed scripts unchanged in a disposable second repository.
   local hooks=$1 fixture output
@@ -228,11 +330,21 @@ IFS= read -r header < "$tsv"
 [[ "$header" == $'case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup' ]] || exit 2
 awk -F '\t' 'NR > 1 { if (NF != 10) exit 1; for (i = 1; i <= NF; i++) if ($i == "") exit 1 }' "$tsv" || exit 2
 declare -A row_args=() row_requires=() row_tier=() row_safety=() row_ux=() row_exit=() row_targets=() row_assertions=()
+counter_for_case() {
+  case "$1" in
+    explicit-shortcut) printf ec ;; total-shortcut) printf tc ;;
+    orphan-shortcut) printf oc ;; updates-shortcut) printf uc ;;
+  esac
+}
 while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
   [[ "$id" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && -z "${row_args[$id]:-}" ]] || exit 2
   [[ "$r" == - || "$r" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || exit 2
   [[ "$r" == - || -n "${row_args[$r]:-}" ]] || exit 2
   jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and (explode | index(0) == null))' <<< "$aj" >/dev/null || exit 2
+  counter=$(counter_for_case "$id")
+  if [[ -n "$counter" ]]; then
+    jq -e --arg counter "$counter" 'length == 1 and .[0] == $counter' <<< "$aj" >/dev/null || exit 2
+  fi
   case "$s" in read|isolated-write|controlled-error|help-boundary|interactive|package-mutation|service-mutation) ;; *) exit 2 ;; esac
   case "$u" in pass|declared) ;; *) exit 2 ;; esac
   [[ "$t" != *, && "$t" != ,* && "$t" != *,,* ]] || exit 2
@@ -257,6 +369,9 @@ while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
   row_exit["$id"]="$resolved"; row_targets["$id"]="$tg"; row_assertions["$id"]="$a"
+  if [[ "$id" == runtime-python-install ]]; then
+    jq -e 'length == 3 and .[0] == "use" and .[1] == "python" and (.[2] | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$aj" >/dev/null || exit 2
+  fi
 done < <(tail -n +2 "$tsv")
 
 # Replay only prerequisites permitted by the same target and safety gates.
@@ -377,10 +492,32 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
     remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
   done
+  if [[ "$case" == hooks-install-force ]]; then
+    # An identical reinstall cannot prove --force is honored. Replace each
+    # generated prerequisite hook with user content and non-executable mode;
+    # the normal installed-hook oracle must observe real replacement.
+    remote+="; for hook in pre-commit post-checkout post-merge; do printf '#!/bin/sh\\n# user-owned hook fixture\\nexit 23\\n' > \".git/hooks/\$hook\"; chmod 640 \".git/hooks/\$hook\"; done"
+  fi
   arg_string=$(quote_args "$args_json")
+  counter=$(counter_for_case "$case")
+  if [[ -n "$counter" ]]; then
+    remote+="; $(declare -f check_native_counter)"
+  fi
+  if [[ "$case" == runtime-python-install ]]; then
+    runtime_version=$(jq -r '.[2]' <<< "$args_json")
+    remote+="; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f check_python_install)"
+  fi
   remote+="; run_omg $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log; then assertion=1; fi"
+  if [[ -n "$counter" ]]; then
+    remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_native_counter '$distro' '$counter' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+    remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: counter fixture cleanup failed\\n' >&2; assertion=1; fi"
+  fi
+  if [[ "$case" == runtime-python-install ]]; then
+    remote+="; if [ \"\$rc\" = 0 ] && ! check_python_install '$runtime_version'; then assertion=1; fi"
+    remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: Python fixture cleanup failed\\n' >&2; assertion=1; fi"
+  fi
   # A receipt is emitted only after setup and the command complete. SSH
   # transport/tool failures cannot satisfy an expected product refusal.
   remote+="; printf '\nOMG_QEMU_RECEIPT:%s:%s:%s\n' \"\$execution_phase\" \"\$rc\" \"\$assertion\""
@@ -394,6 +531,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   start=$SECONDS
   transport=0
   budget=$(( (row_timeout + 5) * (${#chain[@]} + 1) + 15 ))
+  if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
+  if [[ "$case" == runtime-python-install ]]; then budget=$((budget + 74)); fi
   timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
   elapsed=$((SECONDS - start))
   verdict=HARNESS_ERROR; rc=$transport

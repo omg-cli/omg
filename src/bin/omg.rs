@@ -316,14 +316,25 @@ fn parse_fast_counter_cmd(args: &[String]) -> Option<FastCounter> {
     }
 }
 
-fn print_fast_counter(counter: FastCounter, total: u32, explicit: u32, orphans: u32, updates: u32) {
+fn print_fast_counter(
+    counter: FastCounter,
+    total: u32,
+    explicit: u32,
+    orphans: u32,
+    updates: u32,
+    json: bool,
+) {
     let value = match counter {
         FastCounter::Total => total,
         FastCounter::Explicit => explicit,
         FastCounter::Orphan => orphans,
         FastCounter::Updates => updates,
     };
-    println!("{value}");
+    if json {
+        println!("{}", serde_json::json!({"count": value}));
+    } else {
+        println!("{value}");
+    }
 }
 
 #[cfg(unix)]
@@ -348,9 +359,42 @@ fn try_fast_counter(args: &[String]) -> Result<bool> {
     let Some(counter) = parse_fast_counter_cmd(args) else {
         return Ok(false);
     };
+    try_print_counter(counter, false)
+}
 
+async fn run_counter(counter: FastCounter, json: bool) -> Result<()> {
+    if try_print_counter(counter, json)? {
+        return Ok(());
+    }
+    let manager = omg_lib::package_managers::get_package_manager()?;
+    let (total, explicit, orphans, updates) = manager.get_status(false).await?;
+    print_fast_counter(
+        counter,
+        total.try_into()?,
+        explicit.try_into()?,
+        orphans.try_into()?,
+        updates.try_into()?,
+        json,
+    );
+    Ok(())
+}
+
+fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
     if counter == FastCounter::Explicit {
-        packages::explicit_sync(true)?;
+        packages::explicit_sync_with_json(true, json)?;
+        return Ok(true);
+    }
+
+    if omg_lib::core::paths::test_mode() {
+        let (total, explicit, orphans, updates) = omg_lib::package_managers::get_system_status()?;
+        print_fast_counter(
+            counter,
+            total.try_into()?,
+            explicit.try_into()?,
+            orphans.try_into()?,
+            updates.try_into()?,
+            json,
+        );
         return Ok(true);
     }
 
@@ -361,34 +405,41 @@ fn try_fast_counter(args: &[String]) -> Result<bool> {
             status.explicit_packages,
             status.orphan_packages,
             status.updates_available,
+            json,
         );
         return Ok(true);
     }
 
     #[cfg(unix)]
     if let Ok((total, explicit, orphans, updates)) = fast_status_from_daemon() {
-        print_fast_counter(counter, total, explicit, orphans, updates);
+        print_fast_counter(counter, total, explicit, orphans, updates, json);
         return Ok(true);
     }
 
     #[cfg(feature = "arch")]
     if let Ok((total, explicit, orphans)) = omg_lib::package_managers::pacman_db::get_counts_fast()
     {
-        let updates = omg_lib::package_managers::pacman_db::check_updates_cached()
-            .map_or(0, |updates| updates.len() as u32);
+        let updates = if counter == FastCounter::Updates {
+            omg_lib::package_managers::pacman_db::check_updates_cached()?
+                .len()
+                .try_into()?
+        } else {
+            0 // Other counter selections do not consume the updates field.
+        };
         print_fast_counter(
             counter,
             total as u32,
             explicit as u32,
             orphans as u32,
             updates,
+            json,
         );
         return Ok(true);
     }
 
-    anyhow::bail!(
-        "could not retrieve package status (try 'omg status' or start daemon with 'omg daemon')"
-    );
+    // A cache/daemon miss must reach the selected backend through the normal
+    // async dispatcher, including Debian and Fedora. Do not invent zero counts.
+    Ok(false)
 }
 
 /// Ultra-fast path for explicit --count (bypasses tokio entirely)
@@ -435,12 +486,14 @@ fn try_fast_search(args: &[String]) -> bool {
     let mut query: Option<&str> = None;
     let mut no_aur = false;
     let mut limit: usize = 15;
+    let mut saw_limit = false;
     let mut i = 2usize;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "--no-aur" => no_aur = true,
-            "--limit" => {
+            "--no-aur" if !no_aur => no_aur = true,
+            "--limit" if !saw_limit => {
+                saw_limit = true;
                 i += 1;
                 if i >= args.len() {
                     return false;
@@ -450,7 +503,8 @@ fn try_fast_search(args: &[String]) -> bool {
                 };
                 limit = parsed;
             }
-            s if s.starts_with("--limit=") => {
+            s if s.starts_with("--limit=") && !saw_limit => {
+                saw_limit = true;
                 let Some(parsed) = parse_fast_limit(&s["--limit=".len()..]) else {
                     return false;
                 };
@@ -498,19 +552,24 @@ fn try_fast_info(args: &[String]) -> bool {
 fn info_package_from_fast_args(args: &[String]) -> Option<&str> {
     let mut package = None;
     let mut saw_info = false;
+    let mut saw_quiet = false;
     for token in args.iter().skip(1) {
         if token == "--" {
             return None;
         }
         match token.as_str() {
             "info" if !saw_info => saw_info = true,
-            "-v" | "-q" | "--verbose" | "--quiet" => {}
+            "-v" | "--verbose" => {}
+            "--quiet" if !saw_quiet => saw_quiet = true,
             s if s.starts_with("--") => return None,
             s if s.starts_with('-') => {
-                if s.chars().skip(1).all(|flag| matches!(flag, 'v' | 'q')) {
-                    continue;
+                for flag in s.chars().skip(1) {
+                    match flag {
+                        'v' => {}
+                        'q' if !saw_quiet => saw_quiet = true,
+                        _ => return None,
+                    }
                 }
-                return None;
             }
             s => {
                 if !saw_info || package.is_some() || s.is_empty() {
@@ -580,7 +639,7 @@ fn parse_fast_list_tail(tail: &[String]) -> Option<(Option<&str>, bool)> {
     let mut json = false;
     for arg in tail {
         match arg.as_str() {
-            "--json" => json = true,
+            "--json" if !json => json = true,
             s if s.starts_with('-') => return None,
             s => {
                 if runtime.is_some() {
@@ -594,9 +653,9 @@ fn parse_fast_list_tail(tail: &[String]) -> Option<(Option<&str>, bool)> {
 }
 
 /// Ultra-fast path for list command
-fn try_fast_list(args: &[String]) -> bool {
+fn try_fast_list(args: &[String]) -> Result<bool> {
     if has_help_flag(args) {
-        return false;
+        return Ok(false);
     }
 
     if args.len() >= 2 && matches!(args[1].as_str(), "list" | "ls") {
@@ -604,18 +663,19 @@ fn try_fast_list(args: &[String]) -> bool {
             .iter()
             .any(|a| matches!(a.as_str(), "--available" | "-a"))
         {
-            return false;
+            return Ok(false);
         }
 
         let Some((runtime, json)) = parse_fast_list_tail(&args[2..]) else {
-            return false;
+            return Ok(false);
         };
 
-        if runtimes::list_versions_sync(runtime, json).is_ok() {
-            return true;
-        }
+        // The invocation is fully parsed. A backend failure belongs to the
+        // standard error reporter, not a second execution through clap.
+        runtimes::list_versions_sync(runtime, json)?;
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
 /// Ultra-fast path for status command
@@ -663,7 +723,7 @@ fn try_fast_paths(args: &[String]) -> Result<bool> {
         || try_fast_search(args)
         || try_fast_info(args)
         || try_fast_which(args)
-        || try_fast_list(args)
+        || try_fast_list(args)?
         || try_fast_status(args)
         || try_fast_hooks(args)
     {
@@ -995,6 +1055,10 @@ const fn command_name(command: &Commands) -> &'static str {
         Commands::Migrate { .. } => "migrate",
         Commands::Clean { .. } => "clean",
         Commands::Explicit { .. } => "explicit",
+        Commands::ExplicitCount => "ec",
+        Commands::TotalCount => "tc",
+        Commands::OrphanCount => "oc",
+        Commands::UpdateCount => "uc",
         Commands::Sync => "sync",
         Commands::Use { .. } => "use",
         Commands::List { .. } => "list",
@@ -1331,6 +1395,10 @@ async fn dispatch_command(command: &Commands, ctx: &omg_lib::cli::CliContext) ->
             Commands::Search { .. }
                 | Commands::Info { .. }
                 | Commands::Explicit { .. }
+                | Commands::ExplicitCount
+                | Commands::TotalCount
+                | Commands::OrphanCount
+                | Commands::UpdateCount
                 | Commands::List { .. }
                 | Commands::Status { .. }
                 | Commands::History { .. }
@@ -1429,6 +1497,10 @@ async fn dispatch_command(command: &Commands, ctx: &omg_lib::cli::CliContext) ->
         Commands::Explicit { count } => {
             packages::explicit_sync_with_json(*count, ctx.json)?;
         }
+        Commands::ExplicitCount => run_counter(FastCounter::Explicit, ctx.json).await?,
+        Commands::TotalCount => run_counter(FastCounter::Total, ctx.json).await?,
+        Commands::OrphanCount => run_counter(FastCounter::Orphan, ctx.json).await?,
+        Commands::UpdateCount => run_counter(FastCounter::Updates, ctx.json).await?,
         Commands::Sync => {
             packages::sync().await?;
         }
@@ -1616,6 +1688,30 @@ mod fast_path_tests {
             info_package_from_fast_args(&args(&["omg", "info", "-v"])),
             None
         );
+    }
+
+    #[test]
+    fn info_fast_path_defers_duplicate_quiet_flags_to_clap() {
+        for flags in [
+            vec!["-q", "-q"],
+            vec!["-qq"],
+            vec!["--quiet", "-q"],
+            vec!["-vqvq"],
+        ] {
+            let mut invocation = args(&["omg", "info", "bash"]);
+            invocation.extend(args(&flags));
+            assert_eq!(
+                info_package_from_fast_args(&invocation),
+                None,
+                "{invocation:?}"
+            );
+        }
+        for flag in ["-q", "--quiet", "-vvq", "-qvv"] {
+            assert_eq!(
+                info_package_from_fast_args(&args(&["omg", "info", "bash", flag])),
+                Some("bash")
+            );
+        }
     }
 
     #[test]
@@ -1872,6 +1968,13 @@ mod fast_path_tests {
             parse_fast_list_tail(&args_or_panic(&["node", "python"])),
             None
         );
+        for tail in [
+            vec!["--json", "--json"],
+            vec!["--json", "node", "--json"],
+            vec!["node", "--json", "--json"],
+        ] {
+            assert_eq!(parse_fast_list_tail(&args_or_panic(&tail)), None);
+        }
     }
 
     #[test]

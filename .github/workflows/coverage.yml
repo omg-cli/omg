@@ -102,12 +102,14 @@ jobs:
         run: |
           # Production root execution intentionally ignores fixture overrides.
           # Run the complete suite with the normal user configuration contract.
+          # Override profile and per-test retries: the first failure stays fatal.
           runuser -u omg-coverage -- env \
             HOME=/home/omg-coverage \
             CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" PATH="$PATH" \
             cargo llvm-cov nextest \
             --features arch,pgp,license \
             --locked \
+            --retries 0 \
             --no-fail-fast \
             --no-report
 

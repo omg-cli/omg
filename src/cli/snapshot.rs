@@ -40,14 +40,20 @@ fn index_path() -> PathBuf {
 
 fn load_index() -> Result<SnapshotIndex> {
     let path = index_path();
-    if path.exists() {
-        let content = read_snapshot_file(&path)
-            .with_context(|| format!("Failed to read snapshot index: {}", path.display()))?;
-        Ok(serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse snapshot index: {}", path.display()))?)
-    } else {
-        Ok(SnapshotIndex::default())
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SnapshotIndex::default());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect snapshot index: {}", path.display()));
+        }
     }
+    let content = read_snapshot_file(&path)
+        .with_context(|| format!("Failed to read snapshot index: {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse snapshot index: {}", path.display()))
 }
 
 /// Read a snapshot-sidecar file, refusing symlinks so a planted link
@@ -376,7 +382,7 @@ pub async fn restore(id: &str, dry_run: bool, yes: bool) -> Result<()> {
 
     for (runtime, _, target_ver) in &runtime_changes {
         println!("    Switching {runtime} to {target_ver}...");
-        crate::cli::runtimes::use_version(runtime, Some(target_ver)).await?;
+        crate::cli::runtimes::restore_version(runtime, target_ver).await?;
     }
 
     if has_package_changes {

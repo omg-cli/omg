@@ -212,6 +212,19 @@ pub enum Commands {
         count: bool,
     },
 
+    /// Print the explicitly installed package count
+    #[command(name = "ec")]
+    ExplicitCount,
+    /// Print the total installed package count
+    #[command(name = "tc")]
+    TotalCount,
+    /// Print the orphan package count
+    #[command(name = "oc")]
+    OrphanCount,
+    /// Print the available update count
+    #[command(name = "uc")]
+    UpdateCount,
+
     /// Sync package databases from mirrors (parallel, fast)
     #[command(visible_alias = "sy")]
     Sync,

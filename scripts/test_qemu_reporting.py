@@ -192,7 +192,8 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(REPORT.projection([aggregate], False), [])
 
     def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
-                           corrupt=False, expired=False, helper_fails=False, case_log=None):
+                           corrupt=False, expired=False, helper_fails=False, case_log=None,
+                           log_case="search"):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=".github/workflows/qemu-matrix.yml",
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -204,7 +205,7 @@ class ReportingBoundaryTests(unittest.TestCase):
         with zipfile.ZipFile(output, "w") as archive:
             archive.writestr("run/inventory/results.json", "{" if corrupt else json.dumps(rows))
             if case_log is not None:
-                archive.writestr("run/inventory/rows/search.stderr.log", case_log)
+                archive.writestr(f"run/inventory/rows/{log_case}.stderr.log", case_log)
         payload = output.getvalue()
         calls = []
         def api(path, *args):
@@ -263,6 +264,26 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertIn("Attempt: 2", transcript)
         self.assertNotIn("private-token", transcript)
         self.assertIn("actions/runs/50", transcript)
+
+    def test_counter_mismatch_and_reference_failure_reach_issue_helper_distinctly(self):
+        for result, code, diagnostic in (
+            ('FAIL', 0, 'native counter tc expected=188 actual=0'),
+            ('BLOCKED', 2, 'native counter reference failed: arch tc exit=17\ndatabase-unavailable'),
+        ):
+            with self.subTest(result=result):
+                row = dict(self.row(), case_id='qemu-arch-total-shortcut',
+                           result=result, exit_code=code)
+                calls, _ = self.run_report_fixture([row], case_log=diagnostic,
+                                                   log_case='total-shortcut')
+                # The issue helper excludes contextual BLOCKED rows, so the
+                # trusted reporter intentionally projects them to HARNESS_ERROR.
+                # Product mismatches must remain FAIL, including exit-zero ones.
+                expected = dict(row, result='HARNESS_ERROR' if result == 'BLOCKED' else result)
+                self.assertEqual(calls[0][1], [expected])
+                transcript = calls[0][2]['arch-qemu-arch-total-shortcut']
+                self.assertIn(diagnostic, transcript)
+                self.assertIn('Commit: ' + 'a' * 40, transcript)
+                self.assertIn('Attempt: 2', transcript)
 
     def test_unavailable_evidence_keeps_visible_aggregate(self):
         for options in (dict(corrupt=True), dict(expired=True)):

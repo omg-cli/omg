@@ -32,6 +32,7 @@ HOST_FILES = {
     "benchmark-driver-sha256.txt", "cases.tsv", "controller-id.txt", "release-checksum.txt",
 }
 GUEST_FILES = {
+    "dnf-reason-fault.stdout.log", "dnf-reason-fault.stderr.log",
     "native-explicit.txt", "native-explicit.json",
     "daemon-direct-after-queries.txt", "daemon-foreground-after-queries.txt",
     "qemu-startup.log", "daemon-lifecycle.json",
@@ -45,6 +46,11 @@ GUEST_FILES = {
     "installed-after.txt", "repository-hashes.txt", "guest-metadata.txt",
     "inventory-setup.txt", "container-engine.txt", "rust-toolchain.txt",
 }
+GUEST_FILES.update(
+    f"daemon-invalid-{index}.{stream}"
+    for index in range(7)
+    for stream in ("stdout", "stderr")
+)
 GUEST_FILES.update(
     f"{label}-{suffix}"
     for label in ("daemon-direct", "daemon-foreground", "daemon-stopped")

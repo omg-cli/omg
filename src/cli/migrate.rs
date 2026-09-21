@@ -397,7 +397,7 @@ async fn install_import_runtime(runtime: &str, version: &str) -> Result<()> {
         return Ok(());
     }
 
-    crate::cli::runtimes::use_version(runtime, Some(version)).await
+    crate::cli::runtimes::restore_version(runtime, version).await
 }
 
 async fn install_import_packages(packages: &[String]) -> Result<()> {

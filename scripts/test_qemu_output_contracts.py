@@ -13,6 +13,84 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_counter_rows_require_native_counts_and_block_failed_references(self):
+        cases = {'ec': 'explicit-shortcut', 'tc': 'total-shortcut',
+                 'oc': 'orphan-shortcut', 'uc': 'updates-shortcut'}
+        native = {
+            'pacman': "printf 'alpha\\nbeta\\n'\n",
+            'rpm': "printf 'alpha.x86_64\\nbeta.x86_64\\n'\n",
+            'dnf': "[[ \"$1\" == --cacheonly ]] || exit 19\nprintf 'alpha.x86_64\\nbeta.x86_64\\n'\n",
+            'dpkg-query': "printf 'installed\\nconfig-files\\ninstalled\\n'\n",
+            'apt-mark': "printf 'alpha\\nbeta\\n'\n",
+            'apt-get': "[[ \"$1\" == -s && \"$2\" == autoremove ]] || exit 19\nprintf 'Reading lists...\\nRemv alpha [1.0]\\nRemv beta [2.0]\\n'\n",
+            'apt': "printf 'Listing...\\nalpha/stable 2 amd64 [upgradable from: 1]\\nbeta/stable 3 amd64 [upgradable from: 2]\\n'\n",
+        }
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            for command, case in cases.items():
+                rows = [f'{case}\t["{command}"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+                for value, verdict in [('2', 'PASS'), ('0', 'FAIL')]:
+                    with self.subTest(distro=distro, command=command, value=value):
+                        result, evidence, logs = self.run_inventory(
+                            f'printf "{value}\\n"\n', rows, native_commands=native, distro=distro)
+                        self.assertEqual(evidence[0]['result'], verdict, logs)
+                        self.assertEqual(result.returncode, int(verdict == 'FAIL'), result.stderr)
+                        self.assertIn(f'native counter {command} expected=2 actual={value}', logs[case + '.log'])
+            broken = {name: 'echo native-reference-failed >&2\nexit 17\n' for name in native}
+            result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
+                                                       native_commands=broken, distro=distro)
+            self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('native counter reference failed', logs[case + '.log'])
+        rows = ['explicit-shortcut\t["ec"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
+            native_commands=dict(native, sort='exit 17\n'))
+        self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+        self.assertNotEqual(result.returncode, 0)
+        for output in ('02', 'two', '2\n2', '9' * 40):
+            with self.subTest(malformed_output=output):
+                result, evidence, _ = self.run_inventory(
+                    'printf %s ' + shlex.quote(output) + '\n', rows, native_commands=native)
+                self.assertEqual(evidence[0]['result'], 'FAIL')
+                self.assertNotEqual(result.returncode, 0)
+        for diagnostic, verdict in [('', 'PASS'), ('echo database-unavailable >&2\n', 'BLOCKED')]:
+            result, evidence, _ = self.run_inventory('printf "0\\n"\n', rows,
+                native_commands={'pacman': diagnostic + 'exit 1\n'})
+            self.assertEqual(evidence[0]['result'], verdict)
+            self.assertEqual(result.returncode, int(verdict != 'PASS'))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_python_install_requires_active_executable_and_exact_version(self):
+        rows = ['runtime-python-install\t["use","python","3.12.14"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        for fault in ('missing', 'inactive', 'wrong-version', 'broken', 'escaped', 'version-escaped', 'version-only', 'program-noop', 'program-failure', 'none'):
+            with self.subTest(fault=fault):
+                product = 'printf "Installed Python 3.12.14\\n"\n'
+                if fault != 'missing':
+                    version = '3.12.13' if fault == 'wrong-version' else '3.12.14'
+                    script = '#!/bin/sh\n' + ('exit 1\n' if fault == 'broken' else f'printf "Python {version}\\n"\n')
+                    if fault in ('program-noop', 'program-failure', 'none'):
+                        # This models runner admission, not a real Python install.
+                        behavior = {'program-noop': 'exit 0\n',
+                                    'program-failure': 'echo missing-stdlib >&2\nexit 17\n',
+                                    'none': 'printf "OMG_PYTHON_RUNTIME_OK:3.12.14\\n"\n'}[fault]
+                        script = '#!/bin/sh\nif [ "$1" = --version ]; then printf "Python 3.12.14\\n"; exit 0; fi\ncat >/dev/null\n' + behavior
+                    product += ': "${OMG_DATA_DIR:?isolated runtime state missing}"\nbase="$OMG_DATA_DIR/versions/python"\nmkdir -p "$base/3.12.14/bin"\n'
+                    product += f'printf %s {shlex.quote(script)} > "$base/3.12.14/bin/python3"\nchmod 755 "$base/3.12.14/bin/python3"\n'
+                    if fault != 'inactive':
+                        product += 'ln -s 3.12.14 "$base/current"\n'
+                    if fault == 'escaped':
+                        product += 'mv "$base/3.12.14/bin/python3" "$OMG_DATA_DIR/external"\nln -s "$OMG_DATA_DIR/external" "$base/3.12.14/bin/python3"\n'
+                    if fault == 'version-escaped':
+                        product += 'mv "$base/3.12.14" "$OMG_DATA_DIR/external-version"\nln -s "$OMG_DATA_DIR/external-version" "$base/3.12.14"\n'
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual(result.returncode, 0 if fault == 'none' else 1, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'PASS' if fault == 'none' else 'FAIL')
+                if fault != 'none':
+                    self.assertIn('assertion failed: Python', logs['runtime-python-install.log'])
+                if fault == 'program-failure':
+                    self.assertIn('missing-stdlib', logs['runtime-python-install.log'])
+                    self.assertIn('exit=17', logs['runtime-python-install.log'])
+
     def generated_hooks(self):
         source = (ROOT / 'src/cli/git_hooks.rs').read_text(encoding='utf-8')
         return {name: (re.search(r'const ' + constant + r': &str = r#"(.*?)"#;', source, re.S).group(1), 0o755)
@@ -49,6 +127,25 @@ class OutputContracts(unittest.TestCase):
                 if disabled:
                     self.assertIn('hook notice', logs['hooks.log'])
 
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_force_row_requires_replacing_user_content_not_reinstalling_identical_hooks(self):
+        rows = [
+            'hooks-install\t["hooks","install"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\thooks-installed\ttempdir-drop',
+            'hooks-install-force\t["hooks","install","--force"]\tisolated-write\t0\tpass\thooks-install\thermetic\thermetic:pass\thooks-installed\ttempdir-drop',
+        ]
+        for ignored in (False, True):
+            with self.subTest(ignored=ignored):
+                product = 'mkdir -p .git/hooks\n'
+                if ignored:
+                    product += 'if [[ "${3:-}" == --force ]]; then exit 0; fi\n'
+                for name, (content, _) in self.generated_hooks().items():
+                    product += f'printf %s {shlex.quote(content)} > .git/hooks/{name}\nchmod 755 .git/hooks/{name}\n'
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual(result.returncode, int(ignored), result.stderr)
+                self.assertEqual([row['result'] for row in evidence], ['PASS', 'FAIL' if ignored else 'PASS'])
+                if ignored:
+                    self.assertIn('assertion failed: installed hook', logs['hooks-install-force.log'])
+
     def test_failure_diagnosis_precedes_long_product_output(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('# BEGIN ROW LOG')
@@ -67,7 +164,7 @@ class OutputContracts(unittest.TestCase):
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
-    def run_inventory(self, product, rows):
+    def run_inventory(self, product, rows, *, native_commands=None, distro='arch'):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -76,6 +173,10 @@ class OutputContracts(unittest.TestCase):
             root = Path(directory)
             for name in ('home', 'bin', 'guest'):
                 (root / name).mkdir()
+            for name, content in (native_commands or {}).items():
+                tool = root / 'bin' / name
+                tool.write_text('#!/usr/bin/env bash\n' + content, encoding='utf-8', newline='\n')
+                tool.chmod(0o755)
             binary = root / 'product'
             binary.write_text('#!/usr/bin/env bash\n' + product, encoding='utf-8', newline='\n')
             binary.chmod(0o755)
@@ -93,7 +194,7 @@ class OutputContracts(unittest.TestCase):
                 [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'),
                  str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
                  '--binary', shell_path(binary), '--tsv', str(inventory),
-                 '--distro', 'arch', '--tiers', 'hermetic', '--tag', 'fixture'],
+                 '--distro', distro, '--tiers', 'hermetic', '--tag', 'fixture'],
                 env=env, capture_output=True, text=True, timeout=30)
             evidence = root / 'inventory/results.json'
             self.assertTrue(evidence.exists(), result.stdout + result.stderr)

@@ -22,26 +22,105 @@ use omg_lib::cli::Cli;
 fn explicit_shortcut_uses_the_same_isolated_state_as_explicit_count() {
     for distro in ["arch", "debian", "fedora"] {
         let project = TestProject::for_distro(distro);
-        project
-            .mock_install("git", "2.43.0")
-            .expect("seed installed git");
-        let listing = project.run(&["--json", "explicit"]);
-        listing.assert_success();
-        let payload: serde_json::Value =
-            serde_json::from_str(&listing.stdout).expect("explicit package JSON");
-        let expected = payload["packages"].as_array().expect("package array").len();
-        assert!(expected > 0, "fixture must include installed git");
-        for command in [&["explicit", "--count"][..], &["ec"][..]] {
-            let result = project.run(command);
-            result.assert_success();
-            let actual = result
-                .stdout
-                .trim()
-                .parse::<usize>()
-                .expect("package count");
-            assert_eq!(actual, expected, "{distro}: {command:?}");
+        project.mock_available("available-only", "9.0.0").unwrap();
+        let backend = match distro {
+            "arch" => "pacman",
+            "fedora" => "dnf",
+            _ => "apt",
+        };
+        let state = project
+            .data_dir
+            .path()
+            .join(format!("mock_state_{backend}.json"));
+        for expected in [&[][..], &["alpha", "git", "zulu"][..]] {
+            // Deliberately insert out of order. Expected records come from the
+            // fixture, never another product query or its reported count.
+            if !expected.is_empty() {
+                for name in ["zulu", "git", "alpha"] {
+                    project.mock_install(name, "2.43.0").unwrap();
+                }
+            }
+            let before = std::fs::read(&state).unwrap();
+            for args in [
+                &["--json", "explicit"][..],
+                &["explicit", "--json", "--quiet"][..],
+            ] {
+                let listing = project.run(args);
+                listing.assert_success();
+                listing.assert_no_ansi();
+                let payload: serde_json::Value = serde_json::from_str(&listing.stdout).unwrap();
+                assert_eq!(
+                    payload,
+                    serde_json::json!({"packages": expected, "count": expected.len()})
+                );
+            }
+            for command in [&["explicit", "--count"][..], &["ec"][..]] {
+                let result = project.run(command);
+                result.assert_success();
+                assert_eq!(result.stdout.trim(), expected.len().to_string());
+                let mut json_args = vec!["--json"];
+                json_args.extend_from_slice(command);
+                let json = project.run(&json_args);
+                json.assert_success();
+                json.assert_no_ansi();
+                let actual: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+                assert_eq!(actual, serde_json::json!({"count": expected.len()}));
+            }
+            assert_eq!(
+                std::fs::read(&state).unwrap(),
+                before,
+                "{distro}: read-only query changed package state"
+            );
         }
+        project.close_checked();
     }
+}
+
+#[test]
+fn prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments() {
+    let project = TestProject::new();
+    project.mock_install("counter-installed", "1.0.0").unwrap();
+    project
+        .mock_available("counter-installed", "2.0.0")
+        .unwrap();
+    project
+        .mock_available("counter-available-only", "3.0.0")
+        .unwrap();
+    for (command, expected) in [("ec", 1), ("tc", 1), ("oc", 0), ("uc", 1)] {
+        for args in [
+            vec![command],
+            vec!["--quiet", command],
+            vec![command, "-q"],
+            vec!["-vv", command],
+        ] {
+            let result = project.run(&args);
+            result.assert_success();
+            assert_eq!(result.stdout.trim(), expected.to_string(), "{args:?}");
+        }
+        for args in [
+            vec!["--json", command],
+            vec![command, "--json"],
+            vec!["-q", command, "--json"],
+        ] {
+            let result = project.run(&args);
+            result.assert_success();
+            result.assert_no_ansi();
+            let actual: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+            assert_eq!(actual, serde_json::json!({"count": expected}), "{args:?}");
+        }
+        let invalid = project.run(&[command, "unexpected-positional"]);
+        invalid.assert_failure();
+        assert!(
+            invalid.stderr.contains("unexpected argument"),
+            "{}",
+            invalid.combined_output()
+        );
+        assert!(invalid.stdout.is_empty());
+        let help = project.run(&[command, "--help"]);
+        help.assert_success();
+        assert!(help.stdout.contains(&format!("omg {command}")));
+    }
+    project.close_checked();
 }
 
 #[test]
@@ -104,6 +183,7 @@ fn search_json_preserves_exact_records_ranking_limits_and_package_state() {
             }
         }
     }
+    project.close_checked();
 }
 
 fn command_paths() -> Vec<Vec<String>> {

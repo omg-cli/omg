@@ -17,6 +17,47 @@ check_explicit_query_outputs() {
   jq -e -s --argjson wanted "$wanted" 'length == 1 and (.[0] | type == "object") and .[0].count == $wanted' "$jsoncount" >/dev/null
 }
 # END EXPLICIT QUERY ORACLE
+# BEGIN BACKEND FAULT ORACLE
+check_backend_refusal() {
+  local status=$1 stdout=$2 stderr=$3
+  [[ "$status" == 1 && ! -s "$stdout" ]] &&
+    grep -Fq 'Could not load DNF install reasons: dnf repoquery --userinstalled failed: omg-injected-dnf-reason-failure' "$stderr"
+}
+# END BACKEND FAULT ORACLE
+# BEGIN BACKEND FAULT PROBE
+check_fedora_reason_refusal() {
+  local binary=$1 state=$2 evidence=$3 uid=$4 gid=$5 status=0
+  local fixture="$state/backend-fault"
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" != 0 && "$gid" =~ ^[0-9]+$ ]] || return 2
+  mkdir "$fixture"
+  printf '#!/bin/sh\necho omg-injected-dnf-reason-failure >&2\nexit 17\n' > "$fixture/dnf"
+  chmod 755 "$fixture/dnf"
+  # The mount is private to this process tree. Drop all capabilities and return
+  # to the guest user's identity before running the actual submitted binary.
+  timeout --kill-after=5s 30s sudo -n unshare --mount --propagation private -- bash -euc '
+    chown 0:0 "$1/dnf"
+    chmod 755 "$1/dnf"
+    mount --bind "$1/dnf" /usr/bin/dnf
+    chown "$3:$4" "$1"
+    exec setpriv --reuid="$3" --regid="$4" --clear-groups --no-new-privs \
+      --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
+      env -i PATH=/usr/bin:/bin HOME="$1" LC_ALL=C NO_COLOR=1 \
+      OMG_DATA_DIR="$1/data" OMG_CACHE_DIR="$1/cache" OMG_CONFIG_DIR="$1/config" \
+      XDG_DATA_HOME="$1/data" XDG_CACHE_HOME="$1/cache" XDG_CONFIG_HOME="$1/config" \
+      OMG_TEST_MODE=0 OMG_DISABLE_DAEMON=1 OMG_DISABLE_TELEMETRY=1 \
+      "$2" --json status --fast
+  ' _ "$fixture" "$binary" "$uid" "$gid" \
+    > "$evidence/dnf-reason-fault.stdout.log" 2> "$evidence/dnf-reason-fault.stderr.log" || status=$?
+  printf 'DNF reason failure: product exit=%s\n' "$status"
+  head -c 4096 "$evidence/dnf-reason-fault.stderr.log"
+  if ! check_backend_refusal "$status" "$evidence/dnf-reason-fault.stdout.log" "$evidence/dnf-reason-fault.stderr.log"; then
+    printf 'assertion failed: DNF reason failure did not produce a specific product refusal\n' >&2
+    return 1
+  fi
+  rm -rf -- "$fixture"
+  [[ ! -e "$fixture" && ! -L "$fixture" ]]
+}
+# END BACKEND FAULT PROBE
 [[ $# == 2 && $(id -u) != 0 ]] || exit 2
 bin=$(realpath "$1")
 daemon="${bin%/*}/omgd"
@@ -29,16 +70,6 @@ chmod 700 "$state"
 export OMG_SOCKET_PATH="$state/omg.sock"
 export OMG_DATA_DIR="$state/data" OMG_DAEMON_DATA_DIR="$state/daemon"
 export OMG_CACHE_DIR="$state/cache" OMG_CONFIG_DIR="$state/config"
-# Independent native inventory, captured before starting either daemon mode.
-# These commands query package state; none installs or removes packages.
-source /etc/os-release
-case "$ID" in
-  arch) timeout 30 pacman -Qqe > "$evidence/native-explicit.txt" ;;
-  debian|ubuntu) timeout 30 apt-mark showmanual > "$evidence/native-explicit.txt" ;;
-  fedora) timeout 30 dnf --cacheonly repoquery --userinstalled --qf '%{name}\n' > "$evidence/native-explicit.txt" ;;
-  *) printf 'Unsupported native query fixture: %s\n' "$ID" >&2; exit 2 ;;
-esac
-jq -Rn '[inputs | select(length > 0)] | sort | unique' < "$evidence/native-explicit.txt" > "$evidence/native-explicit.json"
 query_cli() {
   local label=$1
   timeout 15 "$bin" --json explicit > "$evidence/$label-explicit.json"
@@ -66,11 +97,26 @@ cleanup() {
     kill -TERM "$launcher_pid" 2>/dev/null || true
     wait "$launcher_pid" 2>/dev/null || true
   fi
+  if ! rm -rf -- "$state" || [[ -e "$state" || -L "$state" ]]; then
+    printf 'assertion failed: daemon fixture cleanup failed\n' >&2
+    status=1
+  fi
   exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
+# Independent native inventory, captured before starting either daemon mode.
+# Register cleanup first, including failures while querying this reference.
+# These commands query package state; none installs or removes packages.
+source /etc/os-release
+case "$ID" in
+  arch) timeout 30 pacman -Qqe > "$evidence/native-explicit.txt" ;;
+  debian|ubuntu) timeout 30 apt-mark showmanual > "$evidence/native-explicit.txt" ;;
+  fedora) timeout 30 dnf --cacheonly repoquery --userinstalled --qf '%{name}\n' > "$evidence/native-explicit.txt" ;;
+  *) printf 'Unsupported native query fixture: %s\n' "$ID" >&2; exit 2 ;;
+esac
+jq -Rn '[inputs | select(length > 0)] | sort | unique' < "$evidence/native-explicit.txt" > "$evidence/native-explicit.json"
 for mode in direct foreground direct-sigint foreground-sigint; do
   if [[ "$mode" == direct* ]]; then
     "$daemon" > "$evidence/daemon-$mode.log" 2>&1 &
@@ -105,6 +151,32 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   [[ $(readlink "/proc/$daemon_pid/exe") == "$daemon" ]]
   [[ $(stat -c '%u' "$OMG_SOCKET_PATH") == "$(id -u)" ]]
   [[ $(stat -c '%a' "$OMG_SOCKET_PATH") == 600 ]]
+  # The pre-parser fast paths must reject duplicate Set/SetTrue flags even
+  # when an actual daemon can satisfy the query. Without a daemon, fallback
+  # to Clap can conceal a permissive fast parser.
+  if [[ "$mode" == direct ]]; then
+    invalid_invocations=(
+      'search bash --no-aur --no-aur'
+      'search bash --no-aur --limit 1 --limit 2'
+      's bash --no-aur --limit=1 --limit 2'
+      'info bash -q -q'
+      'info bash -qq'
+      'info bash --quiet -q'
+      'info bash -vqvq'
+    )
+    for index in "${!invalid_invocations[@]}"; do
+      read -r -a invalid_args <<< "${invalid_invocations[$index]}"
+      status=0
+      timeout 15 "$bin" "${invalid_args[@]}" > "$evidence/daemon-invalid-$index.stdout" \
+        2> "$evidence/daemon-invalid-$index.stderr" || status=$?
+      if [[ "$status" != 2 || -s "$evidence/daemon-invalid-$index.stdout" ]] \
+        || ! grep -Fq 'cannot be used multiple times' "$evidence/daemon-invalid-$index.stderr"; then
+        printf 'assertion failed: invalid CLI arguments accepted with daemon running: %s (exit %s)\n' \
+          "${invalid_invocations[$index]}" "$status" >&2
+        exit 1
+      fi
+    done
+  fi
   requests_before=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-status.txt")
   [[ "$requests_before" =~ ^[0-9]+$ ]]
   query_cli "daemon-$mode"
@@ -112,7 +184,15 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   requests_after=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
   failed_after=$(awk '/Requests failed:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
   [[ "$requests_after" =~ ^[0-9]+$ && "$failed_after" == 0 ]]
-  [[ "$requests_after" -ge $((requests_before + 4)) ]]
+  # daemon-status itself contributes three requests between snapshots: the
+  # preceding Status plus the following Ping and Metrics. The three explicit
+  # forms use IPC; ec can legitimately read the daemon's binary status cache.
+  # Do not count diagnostic traffic as query coverage or require ec to lose
+  # its zero-IPC fast path once the background worker publishes that cache.
+  if [[ "$requests_after" -lt $((requests_before + 6)) ]]; then
+    printf 'assertion failed: %s queries did not produce enough daemon requests (%s -> %s requests)\n' "$mode" "$requests_before" "$requests_after" >&2
+    exit 1
+  fi
   inode=$(stat -c '%i' "$OMG_SOCKET_PATH")
   # A second direct daemon must fail, not replace the live socket or hang.
   duplicate_status=0
@@ -138,4 +218,12 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   [[ ! -e "$OMG_SOCKET_PATH" && ! -L "$OMG_SOCKET_PATH" ]]
 done
 OMG_DISABLE_DAEMON=1 query_cli daemon-stopped
-printf '{"schema_version":1,"direct":true,"foreground":true,"ipc":true,"singleton":true,"shutdown":true,"restart":true,"query_parity":true,"sigint":true}\n' > "$evidence/daemon-lifecycle.json"
+backend_faults='[]'
+if [[ "$ID" == fedora ]]; then
+  check_fedora_reason_refusal "$bin" "$state" "$evidence" "$(id -u)" "$(id -g)"
+  backend_faults='["dnf-reason-refusal"]'
+fi
+# Cleanup is part of success, so it must precede the positive receipt.
+rm -rf -- "$state"
+[[ ! -e "$state" && ! -L "$state" ]]
+jq -n --argjson faults "$backend_faults" '{schema_version:1,direct:true,foreground:true,ipc:true,singleton:true,shutdown:true,restart:true,query_parity:true,sigint:true,cleanup:true,backend_faults:$faults}' > "$evidence/daemon-lifecycle.json"
