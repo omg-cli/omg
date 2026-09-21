@@ -73,6 +73,15 @@ def parser_fixture():
 
 
 class NativeReceipts(unittest.TestCase):
+    def test_every_native_owner_selects_daemon_cache_and_concurrency_suites(self):
+        for features in ('pgp,license', 'arch,pgp,license', 'debian,pgp,license',
+                         'debian-pure', 'fedora,pgp,license', 'macos,pgp,license'):
+            with self.subTest(features=features):
+                args = NATIVE.cargo_test_args(features)
+                suites = [args[index + 1] for index, value in enumerate(args) if value == '--test']
+                for suite in ('daemon_e2e_caching', 'daemon_e2e_concurrency'):
+                    self.assertEqual(suites.count(suite), 1)
+
     def test_reviewed_cli_fault_contracts_are_admitted_without_general_fault_credit(self):
         manifest, provenance, report, _ = parser_fixture()
         actual = json.loads((Path(__file__).resolve().parents[1] / 'tests/contracts/manifest.json').read_text())
@@ -443,7 +452,8 @@ class NativeReceipts(unittest.TestCase):
                 args = NATIVE.cargo_test_args(features)
                 tests = {args[index + 1] for index, value in enumerate(args) if value == '--test'}
                 shared = {'cli_surface', 'git_hooks_contract', 'coverage_10', 'coverage_18',
-                          'e2e_runtime_management', 'env_lockfile_integrity'}
+                          'e2e_runtime_management', 'env_lockfile_integrity',
+                          'daemon_e2e_caching', 'daemon_e2e_concurrency'}
                 if set(features.split(',')) & {'arch', 'debian', 'debian-pure', 'fedora'}:
                     shared.add('cli_comprehensive')
                 self.assertEqual(tests, expected | shared)
