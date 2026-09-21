@@ -106,6 +106,26 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertNotIn("unrelated private output", excerpt)
         self.assertLessEqual(len(excerpt.encode("utf-8")), 1400)
 
+    def test_lifecycle_failure_includes_nested_daemon_shutdown_diagnostics(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/results.json", json.dumps([row]))
+            archive.writestr("run-a/guest-check.log", "native package installed")
+            archive.writestr("run-a/guest/evidence/daemon-direct.log",
+                             "Bearer private-credential\nDaemon shutdown exceeded its deadline")
+            archive.writestr("run-a/guest/evidence/daemon-advisory-shutdown.log",
+                             "advisory cancellation failed")
+            archive.writestr("run-b/guest/evidence/daemon-direct.log", "unrelated run secret")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        excerpt = diagnostics[(row["case_id"], "arch")]
+        self.assertIn("Daemon shutdown exceeded its deadline", excerpt)
+        self.assertIn("advisory cancellation failed", excerpt)
+        self.assertNotIn("private-credential", excerpt)
+        self.assertNotIn("unrelated run secret", excerpt)
+        self.assertLessEqual(len(excerpt.encode("utf-8")), 1400)
+
     def test_transaction_receipts_do_not_poison_case_reporting(self):
         output = io.BytesIO()
         case = self.row("PASS")

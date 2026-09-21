@@ -152,7 +152,9 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                 elif case in ("lifecycle", "aarch64-lifecycle"):
                     candidates = [parent / name for name in (
                         "health-validation.log", "transactions.log",
-                        "transaction-validation.log", "guest-check.log", "boot.log")]
+                        "transaction-validation.log", "guest-check.log", "boot.log",
+                        "guest/evidence/daemon-direct.log",
+                        "guest/evidence/daemon-advisory-shutdown.log")]
                 else:
                     candidates = []
                 excerpts = []
