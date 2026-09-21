@@ -76,8 +76,14 @@ async fn test_vulnerability_scanner_alsa_real() {
 
     let issues = issues.unwrap();
 
-    // Validate structure of real ALSA data
-    for issue in issues.iter().take(3) {
+    assert!(!issues.is_empty(), "Arch advisory feed unexpectedly empty");
+    assert!(
+        issues.iter().any(|issue| issue.status == "Fixed"),
+        "Fixed advisories must remain available for older installed packages"
+    );
+
+    // Check the entire feed, not only a sample that can miss schema drift.
+    for issue in &issues {
         // Every issue should have a name
         assert!(!issue.name.is_empty(), "Issue missing name");
 
@@ -88,9 +94,12 @@ async fn test_vulnerability_scanner_alsa_real() {
             issue.name
         );
 
-        // Status should be "Vulnerable" (we filter for this)
+        // Preserve upstream status rather than discarding fixed advisories.
         assert!(
-            issue.status.to_lowercase().contains("vulnerable"),
+            matches!(
+                issue.status.as_str(),
+                "Unknown" | "Not affected" | "Vulnerable" | "Fixed" | "Testing"
+            ),
             "Issue {} has unexpected status: {}",
             issue.name,
             issue.status
