@@ -7,111 +7,113 @@ description: Command mapping and migration guide from yay to OMG
 
 # Migrating from yay
 
-**In plain words:** If you used the yay helper before, this page maps the commands you already know to their OMG equivalents and states plainly where the behaviour differs.
+**In plain words:** if you used the yay helper before, this page maps the commands you already
+know to their OMG equivalents and states plainly where the behaviour differs.
 
 > New to the terminal? Read [Getting started](../getting-started.md) and keep
 > [the glossary](../glossary.md) open while you work.
 
-This guide helps yay users transition to OMG with familiar command patterns and enhanced capabilities.
+OMG is not a drop-in replacement for every yay flag. It is a different program with a
+different security model, so the honest way to migrate is: map the commands you actually use,
+check the ones this page says do not map, and keep `pacman` and `yay` installed until your
+workflows are validated on your own machine.
 
-## Why Migrate?
+## Install OMG first
 
-| Feature | yay | OMG |
-| --------- | ----- | ----- |
-| Search behavior | Official repositories and AUR | Official repositories and AUR; use `--no-aur` for official-only results |
-| Runtime Management | ❌ | ✅ Node, Python, Go, Rust, Ruby, Java, Bun |
-| Security Scanning | ❌ | ✅ CVE scanning, SBOM generation |
-| Team Sync | ❌ | ✅ Environment lockfiles |
-| Language | Go | Rust, with native-tool subprocesses on some paths |
+Use the reviewed installer from [installation](../installation.md):
 
-OMG is approaching beta. Keep yay and pacman available while validating your required workflows. Comparisons above describe command intent, not complete feature equivalence. See [benchmark scope](../../benchmarks/README.md) and [security limits](../security.md).
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://getomg.xyz/install.sh -o omg-install.sh
+less omg-install.sh
+OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 bash omg-install.sh
+export PATH="$HOME/.local/bin:$PATH"
+omg --version
+```
 
-## Command Mapping
+Do **not** assume an `omg` or `omg-bin` package exists in the AUR, or that OMG publishes a
+crate: the project promises neither, and a similarly named package is not the same program.
+Check `command -v omg` afterwards to see which binary your shell actually finds.
 
-### Package Operations
+## Command mapping
 
 | yay | OMG | Notes |
-| ----- | ----- | ------- |
-| `yay -Ss <query>` | `omg search <query>` | Official and AUR results; output is not guaranteed identical |
-| `yay -S <pkg>` | `omg install <pkg>` | Security grading included |
-| `yay -R <pkg>` | `omg remove <pkg>` | Review the removal plan and OMG's flags |
-| `yay -Syu` | `omg update` | Updates official + AUR |
-| `yay -Si <pkg>` | `omg info <pkg>` | Richer metadata |
+| :--- | :--- | :--- |
+| `yay -Ss <query>` | `omg search <query>` | Official repositories and the AUR on Arch; `--no-aur` restricts it to official results |
+| `yay -Si <pkg>` | `omg info <pkg>` | Package details from the selected backend |
+| `yay -S <pkg>` | `omg install <pkg>` | AUR entries are detected; review applies before the build |
+| `yay -S --noconfirm` | `omg install -y` | `-y` skips confirmation prompts, not the attended approval for privileged AUR output |
+| `yay -R <pkg>` | `omg remove <pkg>` | Review the removal plan before confirming |
+| `yay -Rns <pkg>` | `omg remove --recursive <pkg>` | Arch only: also removes dependencies nothing else needs |
+| `yay -Syu` | `omg update` | Syncs and upgrades, official packages and AUR |
+| `yay -Sua` | `omg update --aur-only` | Refreshes AUR packages and leaves official upgrades to `pacman -Syu` |
+| `yay -Sy` | `omg sync` | Refreshes repository metadata only |
+| `yay -Qu` | `omg outdated` | Lists packages with a newer version available |
+| `yay -Qe` | `omg explicit` | Lists packages you asked for yourself |
+| `yay -Qtd` | `omg clean --orphans` | Removes dependencies nothing needs any more |
 | `yay -Sc` | `omg clean --cache` | Requests package-cache cleanup |
-| `yay -Qe` | `omg explicit` | List explicitly installed |
-| `yay -Sy` | `omg sync` | Sync databases |
 
-### Interactive Mode
+Preview first when a command changes state: `omg install --dry-run`, `omg remove --dry-run`,
+`omg update --check`, and `omg clean --dry-run --all`.
 
-```bash
-# yay interactive search
-yay <query>
+## What does not map
 
-# OMG equivalent (search includes AUR by default; add -d for details)
-omg search <query>
-```
+| yay behaviour | Status in OMG |
+| :--- | :--- |
+| `yay -G` (download a PKGBUILD without building) | Not provided. OMG fetches sources as the first step of a reviewed build; to read a recipe only, use the AUR web page or clone the AUR repository. |
+| `yay --editmenu`, `--cleanafter` and similar flags | Not provided. Review is a prompted step in the build path, not a configurable menu. |
+| yay's interactive number-key selection | Not provided. Bare `omg install` opens OMG's own package picker. |
+| `~/.config/yay/config.json` | Not read. OMG uses `~/.config/omg/config.toml`; migrate only the settings you recognise — see [configuration](../configuration.md). |
+| AUR comments, votes, and popularity as a workflow | Search can show source metadata such as votes, but OMG is not an AUR web client. |
 
-### AUR Operations
+If one of those is essential to your workflow, keep yay for that case rather than working
+around it.
 
-OMG handles AUR transparently:
 
-```bash
-# Search includes AUR automatically
-omg search spotify
+## What changes in how AUR builds run
 
-# Install from AUR (auto-detected)
-omg install spotify
+Run OMG as your regular account. Fetching, review, and building stay unprivileged, and OMG asks
+for elevation only for the validated package transaction. `sudo omg …` is deprecated, and AUR
+builds refuse to run at all when OMG starts as root.
 
-# Update AUR packages
-omg update
-```
+Once a recipe is accepted, OMG re-hashes the source tree, builds offline in Bubblewrap by
+default, inspects the resulting archive, and hands sealed bytes to the privileged step.
+Archives containing install hooks, setuid/setgid files, or file capabilities require a separate
+attended confirmation that `--yes` does not answer. These controls follow Arch's documented
+[PKGBUILD execution and install-script model](https://man.archlinux.org/man/PKGBUILD.5),
+Bubblewrap's [caller-defined sandbox model](https://github.com/containers/bubblewrap/blob/main/README.md#sandbox-security),
+and Linux's [`memfd_create(2)` sealing semantics](https://man7.org/linux/man-pages/man2/memfd_create.2.html).
+The full gate list is in [AUR support](../aur.md).
 
-Run these commands as your regular account. Unlike workflows that start the helper with sudo, OMG keeps fetching, review, and package building unprivileged and requests sudo only for its validated package transaction. `sudo omg ...` is deprecated; AUR builds already refuse to run when OMG starts as root.
+**Limit:** these controls reduce specific risks; they do not make community build code benign.
+AUR recipes still execute on your machine, and matching hashes are tamper evidence rather than a
+publisher signature.
 
-OMG reviews and re-hashes the recipe, builds offline in Bubblewrap by default, inspects the resulting archive, and passes sealed bytes to the privileged consumer. Packages containing install hooks, setuid/setgid files, or file capabilities require separate attended approval. These controls follow Arch's documented [PKGBUILD execution and install-script model](https://man.archlinux.org/man/PKGBUILD.5), Bubblewrap's [caller-defined sandbox model](https://github.com/containers/bubblewrap/blob/main/README.md#sandbox-security), and Linux's [`memfd_create(2)` sealing semantics](https://man7.org/linux/man-pages/man2/memfd_create.2.html).
-
-## Configuration Migration
-
-### yay config location
-
-```
-~/.config/yay/config.json
-```
-
-### OMG config location
-
-```
-~/.config/omg/config.toml
-```
-
-## New Capabilities
-
-After migrating, you gain access to:
-
-### Runtime Management
+## What you gain beyond package management
 
 ```bash
+# Runtime versions per project, installed inside your home folder
 omg use node 20
-omg use python 3.12
 omg list node --available
-```
+omg which node
 
-### Security Scanning
+# The task a project already defines
+omg run build
 
-```bash
-omg audit
-omg audit sbom --output sbom.json
-```
-
-### Team Sync
-
-```bash
+# A recorded environment, checked for drift
 omg env capture
-omg env share
+omg env check
 ```
 
-## Next Steps
+Environment capture needs the Arch or Debian backend, so it works on the same machines where
+yay did. `omg env check` reports drift and does not install anything.
 
-- [CLI Reference](../cli.md) — Full command documentation
-- [Configuration](../configuration.md) — All config options
-- [Security](../security.md) — Vulnerability scanning setup
+Security commands have their own scope: `omg audit scan` needs the daemon, and `omg audit sbom`
+needs the Arch backend plus advisory access. Neither is a compliance certification; see
+[security](../security.md).
+
+## Next steps
+
+- [Installation](../installation.md) for update and uninstall procedures.
+- [Package management](../packages.md) for the full package workflow and backend limits.
+- [AUR support](../aur.md) for the review, sandbox, and approval rules in detail.
+- [CLI reference](../cli.md) for every flag, including the ones this page does not use.
