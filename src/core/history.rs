@@ -86,7 +86,7 @@ impl HistoryManager {
         let parent = log_path
             .parent()
             .context("Package history path must have a parent directory")?;
-        fs::create_dir_all(parent).with_context(|| {
+        crate::core::paths::create_private_data_directory(parent).with_context(|| {
             format!(
                 "Failed to create package history directory: {}",
                 parent.display()
@@ -474,6 +474,20 @@ impl HistoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_history_store_creates_private_data_ancestors() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        let data = root.path().join("data");
+        let store = data.join("history");
+        let _manager = HistoryManager::new_in(store.join("history.json"))?;
+        for path in [&data, &store] {
+            assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o700);
+        }
+        Ok(())
+    }
 
     #[test]
     fn history_read_errors_do_not_quarantine_live_data() -> Result<()> {

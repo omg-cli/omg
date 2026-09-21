@@ -72,7 +72,8 @@ fn read_snapshot_file(path: &PathBuf) -> Result<String> {
 
 fn load_index_for_update() -> Result<(fs::File, SnapshotIndex)> {
     let directory = snapshots_dir();
-    fs::create_dir_all(&directory).context("Failed to create snapshots directory")?;
+    paths::create_private_data_directory(&directory)
+        .context("Failed to create snapshots directory")?;
     let path = directory.join(".index.lock");
     let mut options = fs::OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);

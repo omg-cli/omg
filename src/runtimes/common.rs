@@ -1011,7 +1011,7 @@ pub(crate) fn clear_dir_contents(dir: &Path) -> Result<()> {
 /// after a successful extraction. An interrupted install therefore never
 /// leaves a version directory that looks installed.
 pub(crate) fn begin_staged_install(versions_dir: &Path) -> Result<tempfile::TempDir> {
-    fs::create_dir_all(versions_dir).with_context(|| {
+    crate::core::paths::create_private_data_directory(versions_dir).with_context(|| {
         format!(
             "Failed to create runtime versions directory: {}",
             versions_dir.display()
@@ -1210,7 +1210,7 @@ pub(crate) fn try_lock_runtime_install(versions_dir: &Path, version: &str) -> Re
 
 fn try_lock_runtime_file(versions_dir: &Path, name: &str) -> Result<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    fs::create_dir_all(versions_dir)?;
+    crate::core::paths::create_private_data_directory(versions_dir)?;
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)

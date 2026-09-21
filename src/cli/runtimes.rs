@@ -156,6 +156,7 @@ async fn select_version(runtime: &str, version: Option<&str>, restoring: bool) -
         v.clone()
     };
     validate_requested_version(&runtime, &version)?;
+    crate::core::paths::ensure_data_dir().context("Failed to create runtime data directory")?;
 
     ui::print_header("OMG", &format!("Switching {runtime} to version {version}"));
     ui::print_spacer();
