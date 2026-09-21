@@ -215,7 +215,9 @@ class NativeReceipts(unittest.TestCase):
                     'pin-precedence', 'rust-pin', 'rust-pin-locked', 'engines-range', 'which-node',
                     'uninstall-lifecycle', 'which-registry', 'list-installed', 'list-runtime', 'list-json')} | {
                 'omg.environment.' + name + '.fixture' for name in (
-                    'capture-registry', 'php-restore', 'registry-restore', 'unsupported-capture')})
+                    'capture-registry', 'php-restore', 'registry-restore', 'unsupported-capture')} | {
+                'omg.snapshot.list-index-failures.fixture',
+                'omg.snapshot.delete-index-failures.fixture'})
         for contract in mapped:
             self.assertTrue(contract['critical'])
             self.assertIn('not native package transactions', contract['scope'])

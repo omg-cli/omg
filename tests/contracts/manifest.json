@@ -1876,6 +1876,108 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omg.snapshot.list-index-failures.fixture",
+      "source": "src/cli/snapshot.rs",
+      "binary": "omg",
+      "surface": "omg snapshot list",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "missing-index-empty-and-valid-index-saved-metadata"
+        ],
+        "refusal": [
+          "unreadable-index-and-dangling-link-specific-errors"
+        ],
+        "state": [
+          "failed-delete-preserves-snapshot-index-link-and-external-absence"
+        ]
+      },
+      "scope": "Unprivileged debug CLI with synthetic mode disabled and isolated snapshot files; not native package transactions, concurrent symlink replacement, crash consistency or snapshot creation/restoration",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::snapshot_index_access_failures_never_report_empty_or_delete_saved_state",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "missing-index-empty-and-valid-index-saved-metadata",
+            "unreadable-index-and-dangling-link-specific-errors",
+            "failed-delete-preserves-snapshot-index-link-and-external-absence",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.snapshot.delete-index-failures.fixture",
+      "source": "src/cli/snapshot.rs",
+      "binary": "omg",
+      "surface": "omg snapshot delete",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "restored-index-deletion-removes-only-saved-entry"
+        ],
+        "refusal": [
+          "unreadable-index-and-dangling-link-specific-errors"
+        ],
+        "state": [
+          "failed-delete-preserves-snapshot-index-link-and-external-absence"
+        ]
+      },
+      "scope": "Unprivileged debug CLI with synthetic mode disabled and isolated snapshot files; not native package transactions, concurrent symlink replacement, crash consistency or snapshot creation/restoration",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::env_lockfile_integrity::snapshot_index_access_failures_never_report_empty_or_delete_saved_state",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "restored-index-deletion-removes-only-saved-entry",
+            "unreadable-index-and-dangling-link-specific-errors",
+            "failed-delete-preserves-snapshot-index-link-and-external-absence",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

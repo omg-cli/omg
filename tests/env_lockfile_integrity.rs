@@ -481,3 +481,100 @@ fn snapshot_restores_all_registered_installed_runtimes_and_executes_selected_pay
     project.run(&["ci", "validate"]).assert_success();
     project.close_checked();
 }
+
+#[test]
+#[cfg(unix)]
+fn snapshot_index_access_failures_never_report_empty_or_delete_saved_state() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for fault in ["dangling-index", "denied-parent"] {
+        let project = TestProject::new();
+        let missing = project.run_with_env(&["snapshot", "list"], &[("OMG_TEST_MODE", "0")]);
+        missing.assert_success();
+        assert!(missing.stdout.contains("No snapshots found"));
+        let directory = project.data_dir.path().join("snapshots");
+        std::fs::create_dir_all(&directory).unwrap();
+        let index = directory.join("index.json");
+        let snapshot = directory.join("saved.json");
+        let snapshot_bytes = serde_json::to_vec(&omg_lib::cli::snapshot::Snapshot {
+            id: "saved".into(),
+            message: Some("preserve me".into()),
+            created_at: 1_700_000_000,
+            state: sample_state(),
+        })
+        .unwrap();
+        let index_bytes = serde_json::to_vec(&serde_json::json!({"snapshots":[{
+            "id":"saved", "message":"preserve me", "created_at":1_700_000_000,
+            "hash":sample_state().hash
+        }]}))
+        .unwrap();
+        std::fs::write(&snapshot, &snapshot_bytes).unwrap();
+        std::fs::write(&index, &index_bytes).unwrap();
+        let before = project.run_with_env(&["snapshot", "list"], &[("OMG_TEST_MODE", "0")]);
+        before.assert_success();
+        assert!(before.stdout.contains("saved") && before.stdout.contains("preserve me"));
+        let original_mode = std::fs::metadata(&directory).unwrap().permissions();
+        let outside = project.dir.path().join("absent-index.json");
+        if fault == "denied-parent" {
+            assert!(
+                !nix::unistd::Uid::effective().is_root(),
+                "permission contract requires unprivileged execution"
+            );
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o000)).unwrap();
+        } else {
+            std::fs::remove_file(&index).unwrap();
+            symlink(&outside, &index).unwrap();
+        }
+        let listing = project.run_with_env(&["snapshot", "list"], &[("OMG_TEST_MODE", "0")]);
+        let deletion =
+            project.run_with_env(&["snapshot", "delete", "saved"], &[("OMG_TEST_MODE", "0")]);
+        std::fs::set_permissions(&directory, original_mode).unwrap();
+        assert_eq!(
+            listing.exit_code,
+            1,
+            "{fault}: {}",
+            listing.combined_output()
+        );
+        assert!(!listing.stdout.contains("No snapshots found"));
+        let expected = if fault == "denied-parent" {
+            "Permission denied"
+        } else {
+            "symlink"
+        };
+        assert!(
+            listing.combined_output().contains(expected),
+            "{}",
+            listing.combined_output()
+        );
+        assert_eq!(
+            deletion.exit_code,
+            1,
+            "{fault}: {}",
+            deletion.combined_output()
+        );
+        assert!(
+            deletion.combined_output().contains(expected),
+            "{}",
+            deletion.combined_output()
+        );
+        assert_eq!(std::fs::read(&snapshot).unwrap(), snapshot_bytes);
+        assert!(!outside.exists());
+        if fault == "dangling-index" {
+            assert_eq!(std::fs::read_link(&index).unwrap(), outside);
+            std::fs::remove_file(&index).unwrap();
+            std::fs::write(&index, &index_bytes).unwrap();
+        } else {
+            assert_eq!(std::fs::read(&index).unwrap(), index_bytes);
+        }
+        project
+            .run_with_env(&["snapshot", "delete", "saved"], &[("OMG_TEST_MODE", "0")])
+            .assert_success();
+        assert!(!snapshot.exists());
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+        assert_eq!(after["snapshots"], serde_json::json!([]));
+        let empty = project.run_with_env(&["snapshot", "list"], &[("OMG_TEST_MODE", "0")]);
+        empty.assert_success();
+        assert!(empty.stdout.contains("No snapshots found"));
+        project.close_checked();
+    }
+}

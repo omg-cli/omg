@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used seventy-seven searches (272 requested result slots),
+Exa research used seventy-eight searches (273 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -772,3 +772,21 @@ fail the harness. Each command's stdout/stderr is exported from the existing
 bounded guest-evidence allowlist. These grammar checks receive no additional
 behavioral-coverage credit; they prevent a real backend from concealing invalid
 argument acceptance.
+
+### Snapshot index access errors
+
+The actual CLI reported successful empty snapshot listings for both an unreadable
+parent directory and a dangling index symlink. `load_index` used `Path::exists`,
+which [Rust documents](https://doc.rust-lang.org/stable/std/path/struct.Path.html#method.exists)
+as returning false for inaccessible paths and broken links. This also allowed
+snapshot mutations to proceed as if the existing index were empty. Index loading
+now uses non-following metadata: only confirmed NotFound permits an empty index;
+access errors propagate and existing symlinks reach the explicit refusal.
+
+The unprivileged CLI regression uses synthetic mode disabled and independently
+seeded snapshot/index bytes. It checks genuine absence, normal metadata listing,
+exact access/symlink refusal, unchanged saved bytes and link target, absence of
+external writes, successful deletion after restoring the valid index, empty final
+index, and checked cleanup. The two bounded list/delete contracts do not certify
+concurrent replacement, crash consistency, creation or restoration. Existing
+broader inventory gaps remain open.
