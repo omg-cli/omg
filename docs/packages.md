@@ -8,7 +8,7 @@ description: Search, install, update, and remove packages
 
 **Complete Guide to Searching, Installing, and Managing Packages**
 
-OMG has alpha backends for Arch, Debian/Ubuntu, Fedora, and macOS. AUR support is Arch-specific. Release availability and backend limitations are listed in [installation](./installation.md).
+OMG has supported backends for Arch, Debian/Ubuntu, Fedora, and macOS, with platform-specific coverage and limitations. AUR support is Arch-specific. Release availability and backend limitations are listed in [installation](./installation.md).
 
 ---
 
@@ -370,36 +370,31 @@ omg install pkg3
 
 ## 🐧 Platform Support
 
-### Arch Linux (Full Support)
+### Backend and release matrix
 
-- Official repositories via libalpm
-- AUR with full build support
-- ALPM and AUR workflows; security evidence and policy limits still apply
+| Host or backend | Build feature | Package source | Documented coverage and limits |
+| --- | --- | --- | --- |
+| Arch Linux | `arch` (the default) | libalpm plus the AUR | The broadest package surface, including AUR build, review, policy, and rollback workflows. |
+| Debian or Ubuntu | `debian` | Native APT database and packages | Native APT operations; no AUR. Build with `libapt-pkg-dev`, `clang`, `cmake`, `pkg-config`, and OpenSSL development headers. |
+| Fedora | `fedora` | DNF/RPM | RPM database reads and DNF-backed operations. Fedora release evidence does not establish compatibility with every RHEL derivative. |
+| Apple Silicon macOS | `macos` | Homebrew | Homebrew-backed package operations. The published macOS release is ARM64; Intel macOS is not a supported release target. |
+| Debian index/test build | `debian-pure` | Pure-Rust Debian index | Read/index fixtures only. It refuses live Debian/Ubuntu mutations; use the `debian` APT-backed build for a real machine. |
+| Windows | none | none | Native Windows has no backend or release. Use a supported Linux distribution inside WSL; WSL uses that guest's backend. |
 
-### Debian/Ubuntu (Experimental)
+Published Linux archives are x86_64 and backend-specific. The published macOS archive is Apple Silicon ARM64. Linux ARM64 builds are staged test artifacts rather than published release archives. Runtime managers also have provider-specific host limits, so a package backend being available does not guarantee identical runtime or audit coverage.
 
-Build with Debian feature:
+Build a backend explicitly from a reviewed checkout:
 
 ```bash
-cargo build --release --features debian
+cargo build --release --locked --no-default-features --features arch,pgp,license
+cargo build --release --locked --no-default-features --features debian,pgp,license
+cargo build --release --locked --no-default-features --features fedora,pgp,license
+cargo build --release --locked --no-default-features --features macos,pgp,license
+# Index/test fixtures only; this build refuses live Debian/Ubuntu mutations.
+cargo build --release --locked --no-default-features --features debian-pure,pgp,license
 ```
 
-Requires `libapt-pkg-dev`:
-
-```bash
-sudo apt install libapt-pkg-dev
-```
-
-Supported commands:
-
-- `omg search`
-- `omg info`
-- `omg install`
-- `omg remove`
-- `omg update`
-- `omg explicit`
-
-**Note:** No AUR equivalent on Debian.
+Cargo features are additive; `--features debian` does not remove the default Arch backend unless `--no-default-features` is also supplied. `debian-pure` is not a live package backend and must not be used as a release build. The optional `license` feature gates only the `omg account` subcommand. See [installation](./installation.md) for system prerequisites and release artifact provenance.
 
 ---
 

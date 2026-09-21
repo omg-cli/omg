@@ -8,7 +8,7 @@ description: Frequently asked questions
 
 ## What is OMG?
 
-OMG combines system-package commands, eight runtime managers, a task runner, and selected security tools. It is alpha software, not a replacement for every feature of pacman, APT, DNF, Homebrew, or existing runtime providers.
+OMG combines system-package commands, 14 native runtime managers, a task runner, and selected security tools. It is approaching beta, not a replacement for every feature of pacman, APT, DNF, Homebrew, or existing runtime providers.
 
 ## How do I install it?
 
@@ -28,7 +28,7 @@ Installer telemetry requires consent and defaults to no; runtime telemetry is op
 
 ## Which runtimes does it manage?
 
-Node, Python, Go, Rust, Ruby, Java, Bun, and Pi. Unsupported names fail explicitly. Installation and project builds have provider- and platform-specific prerequisites; check them before replacing existing tooling. See [runtime management](./runtimes.md).
+OMG has native managers for 14 runtimes: Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, and Swift. Unsupported names fail explicitly. Installation and project builds have provider- and platform-specific prerequisites; check them before replacing existing tooling. See [runtime management](./runtimes.md).
 
 ## Why use a shell hook?
 

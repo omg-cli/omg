@@ -14,6 +14,22 @@ This document provides a high-level overview of OMG's architecture, component in
 
 ## 🏗️ System Architecture
 
+The main request path is easier to read as a flow than as a component inventory:
+
+```mermaid
+flowchart LR
+    User[Developer] --> CLI[omg CLI]
+    User --> Fast[omg-fast prompt helper]
+    CLI -->|Unix socket IPC| Daemon[omgd daemon]
+    Fast -->|snapshot or IPC| Daemon
+    Daemon --> Cache[In-memory caches]
+    Daemon --> State[Atomic status and history files]
+    Daemon --> Backends[Native package backends and HTTPS registries]
+    Backends --> OS[Operating system and package databases]
+```
+
+The ASCII schematics below show the storage and backend boundaries in more detail.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                              USER                                        │
@@ -130,6 +146,25 @@ The "brain" of the system. It runs as a lightweight background service that main
 
 ### Search Request
 
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as omg CLI
+    participant D as omgd
+    participant S as Package sources
+    U->>C: omg search firefox
+    C->>D: Search request over Unix socket
+    alt cache hit
+        D-->>C: Cached result
+    else cache miss
+        D->>S: Query native index and remote sources
+        S-->>D: Matching packages
+        D->>D: Merge, rank, and cache
+        D-->>C: Search result
+    end
+    C-->>U: Format and display
+```
+
 ```
 
 User: omg search firefox
@@ -173,6 +208,17 @@ User: omg search firefox
 ```
 
 ### Runtime Switch
+
+```mermaid
+flowchart TD
+    A[omg use node 20.10.0] --> B{Version installed?}
+    B -->|Yes| D[Select existing version]
+    B -->|No| C[Download and verify from upstream]
+    C --> E[Extract into OMG version tree]
+    E --> D
+    D --> F[Update current selection]
+    F --> G[Shell hook updates PATH]
+```
 
 ```
 
@@ -276,7 +322,7 @@ OMG supports only its native runtime managers. Unknown runtime names fail explic
 
 There is no universal pipeline that runs PGP, SLSA, vulnerability scanning, and policy checks for every download. Package transactions use backend-specific verification. Runtime downloads use provider-specific integrity paths. Explicit policies are enforceable against ALPM's prepared transaction; native APT, DNF, and Homebrew install and upgrade paths refuse explicit policy instead of claiming equivalent enforcement.
 
-`omg audit slsa` is a separate supported-artifact-signature check with an exact expected identity. It returns no SLSA build level and does not verify in-toto provenance. Release archive attestations are verified separately by GitHub CLI. See [security architecture and limits](./security.md).
+`omg audit slsa` is a separate supported-artifact-signature check. `--certificate-identity` optionally binds the Fulcio signer identity; when omitted, a valid signature is reported as unbounded. It returns no SLSA build level and does not verify in-toto provenance. Release archive attestations are verified separately by GitHub CLI. See [security architecture and limits](./security.md).
 
 ### Audit Log
 
@@ -310,6 +356,18 @@ When enabled, periodically:
 ---
 
 ## 🔄 Graceful Shutdown
+
+```mermaid
+flowchart TD
+    A[SIGINT or SIGTERM] --> B[Broadcast shutdown signal]
+    B --> C[Finish active client requests]
+    B --> D[Stop background workers]
+    B --> E[Stop accepting IPC requests]
+    C --> F[Remove socket and flush state]
+    D --> F
+    E --> F
+    F --> G[Exit]
+```
 
 ```
 

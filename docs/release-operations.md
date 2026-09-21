@@ -4,6 +4,18 @@ How releases are built, published, verified, and rolled back.
 
 ## Pipeline overview
 
+```mermaid
+flowchart TD
+    A[Tag push v* or manual dispatch] --> B[gate-on-ci]
+    B --> C[Build Arch, Debian, Ubuntu, Fedora, and macOS archives]
+    C --> D[Generate SBOM and collect allowlisted artifacts]
+    D --> E[Verify checksums and attestations]
+    E --> F[Publish GitHub Release]
+    F --> G[Upload archives and sidecars to R2]
+    G --> H[Round-trip verify every object]
+    H --> I[Publish latest-version marker]
+```
+
 ```
 tag push (v*) or manual dispatch
         │
