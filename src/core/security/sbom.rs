@@ -90,16 +90,6 @@ pub enum SbomError {
         #[source]
         source: PackageSource,
     },
-    #[error("Failed to list installed packages")]
-    ListPackages {
-        #[source]
-        source: PackageSource,
-    },
-    #[error("Failed to fetch vulnerability data")]
-    FetchVulnerabilities {
-        #[source]
-        source: super::vulnerability::VulnerabilityError,
-    },
     #[error("Failed to serialize SBOM")]
     Serialize {
         #[source]
@@ -117,12 +107,6 @@ pub enum SbomError {
         #[source]
         source: io::Error,
     },
-    #[error("SBOM generation is not available without an Arch or Debian package backend")]
-    NoBackend,
-    #[error(
-        "Arch Linux Security Advisory data cannot be used to scan Debian packages; generate the SBOM without vulnerability matching"
-    )]
-    AlsaUnsupportedOnDebian,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -323,25 +307,4 @@ mod tests {
         assert!(matches!(error, SbomError::Write { .. }), "got: {error}");
     }
 
-    #[test]
-    fn sbom_without_backend_is_typed() {
-        let error = SbomError::NoBackend;
-        assert!(
-            error
-                .to_string()
-                .contains("not available without an Arch or Debian package backend"),
-            "got: {error}"
-        );
-    }
-
-    #[test]
-    fn alsa_unsupported_on_debian_is_typed() {
-        let error = SbomError::AlsaUnsupportedOnDebian;
-        assert!(
-            error
-                .to_string()
-                .contains("cannot be used to scan Debian packages"),
-            "got: {error}"
-        );
-    }
 }
