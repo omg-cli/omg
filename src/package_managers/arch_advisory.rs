@@ -116,7 +116,7 @@ mod tests {
             licenses: vec![],
         };
         let installed = vec![package("1:1.0-1"), package("2.0-2"), package("1.0-1")];
-        let result = audit_result(&installed, &[advisory.clone()]).unwrap();
+        let result = audit_result(&installed, std::slice::from_ref(&advisory)).unwrap();
         assert_eq!(result.total_vulnerabilities, 1);
         assert_eq!(result.high_severity, 1);
         let finding = &result.vulnerabilities[0].1[0];
