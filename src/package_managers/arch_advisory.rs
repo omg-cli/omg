@@ -106,6 +106,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unknown_severity_and_unpublished_fix_do_not_invent_safety_or_scores() {
+        let mut advisory: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-test","packages":["fixture"],"status":"Unknown","severity":"Unknown","affected":"1.0-1","fixed":null,"issues":["CVE-test"]}"#).unwrap();
+        let installed = [SecurityPackage {
+            name: "fixture".into(),
+            version: "3.0-1".into(),
+            architecture: Some("x86_64".into()),
+            description: String::new(),
+            licenses: vec![],
+        }];
+        let result = audit_result(&installed, std::slice::from_ref(&advisory)).unwrap();
+        assert_eq!(result.total_vulnerabilities, 1);
+        assert_eq!(result.high_severity, 0);
+        let finding = &result.vulnerabilities[0].1[0];
+        assert!(finding.score.is_none());
+        assert_eq!(
+            finding.advisory_severity,
+            Some(AdvisorySeverity::Unspecified)
+        );
+        assert_eq!(finding.affected_installed[0].version, "3.0-1");
+        advisory.status = "Not affected".into();
+        assert_eq!(
+            audit_result(&installed, std::slice::from_ref(&advisory))
+                .unwrap()
+                .total_vulnerabilities,
+            0
+        );
+        advisory.status = "Vulnerable".into();
+        advisory.severity = "Unexpected".into();
+        assert!(audit_result(&installed, std::slice::from_ref(&advisory)).is_err());
+        advisory.severity = "Low".into();
+        advisory.packages = vec!["different-package".into()];
+        assert_eq!(
+            audit_result(&installed, std::slice::from_ref(&advisory))
+                .unwrap()
+                .total_vulnerabilities,
+            0
+        );
+        advisory.issues.clear();
+        assert!(audit_result(&installed, &[advisory]).is_err());
+    }
+
+    #[test]
     fn fixed_advisory_binds_only_older_installed_identity() {
         let advisory: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-test","packages":["fixture"],"status":"Fixed","severity":"High","affected":"2.0-1","fixed":"2.0-2","issues":["CVE-test"],"type":"code execution"}"#).unwrap();
         let package = |version: &str| SecurityPackage {
