@@ -81,7 +81,7 @@ for results in "${files[@]}"; do
     fi
     rm -f "$src_tmp"
   done <<< "$failing"
-  printf '\nfile with: ./scripts/qa-file-issue.sh "%s" --run-url <run-url> --source <qemu-matrix|release-smoke> [--dry-run]\n\n' "$results"
+  printf '\nfile with: ./scripts/qa-file-issue.sh "%s" --run-url <run-url> --source <qemu-matrix|release-smoke> --failures-only [--dry-run]\n\n' "$results"
 done
 printf 'files=%s failing-rows=%s\n' "$total_files" "$total_fail"
 [[ "$total_fail" -eq 0 ]]

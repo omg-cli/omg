@@ -197,5 +197,16 @@ printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PASS","exit_cod
 out=$(bash "$runner" "$results" --run-url https://run/17 --source qemu); assert_rc 0 "$?" "expected-refusal"
 grep -q "issue close 7" "$CALL_LOG" || fail "expected-refusal lost verified closure"
 
+# Local evidence may report a regression but must not close a hosted issue.
+printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":2},{"case_id":"audit","distro":"arch","result":"PRODUCT_FAIL","exit_code":1,"elapsed_seconds":2}]' > "$results"
+: > "$CALL_LOG"
+if out=$(bash "$runner" "$results" --run-url https://run/local --source qemu --failures-only); then
+  grep -q "issue create" "$CALL_LOG" || fail "local failure was not reported"
+  grep -q "issue close" "$CALL_LOG" && fail "local pass closed a hosted issue"
+  grep -q "closed=0" <<< "$out" || fail "local report counted a closure"
+else
+  fail "failures-only reporting failed"
+fi
+
 if [[ "$failures" -ne 0 ]]; then printf '%s failure(s)\n' "$failures" >&2; exit 1; fi
 printf 'qa-file-issue harness: all green\n'

@@ -20,7 +20,7 @@
 set -euo pipefail
 
 results=""; run_url=""; source=""; label="qa-failure"; repo=""; dry_run=false
-evidence_dir=""
+evidence_dir=""; failures_only=false
 while (($#)); do
   case "$1" in
     --run-url|--source|--label|--repo|--evidence-dir)
@@ -31,7 +31,8 @@ while (($#)); do
       esac
       shift 2 ;;
     --dry-run) dry_run=true; shift ;;
-    --help) printf 'Usage: qa-file-issue.sh RESULTS_JSON --run-url URL --source NAME [--evidence-dir DIR] [--label L] [--repo R] [--dry-run]\nFiles or updates one issue per failing case, closes issues fixed in this run. Needs jq and gh (GH_TOKEN).\n'; exit 0 ;;
+    --failures-only) failures_only=true; shift ;;
+    --help) printf 'Usage: qa-file-issue.sh RESULTS_JSON --run-url URL --source NAME [--evidence-dir DIR] [--label L] [--repo R] [--failures-only] [--dry-run]\nFiles or updates one issue per failing case, closes issues fixed in this run. Use --failures-only for local evidence to prevent issue closure. Needs jq and gh (GH_TOKEN).\n'; exit 0 ;;
     -*) printf 'error: unknown argument %s\n' "$1" >&2; exit 2 ;;
     *) [[ -z "$results" ]] || exit 2; results=$1; shift ;;
   esac
@@ -67,6 +68,9 @@ passes="$(jq -ce '
   map(select(.result == "PASS" or .result == "EXPECTED_REJECTION") |
     {case_id, distro})
 ' "$results")"
+# Local or otherwise non-authoritative runs may report failures but cannot
+# establish recovery of an issue tracked by the hosted pipeline.
+if [[ "$failures_only" == true ]]; then passes='[]'; fi
 if [[ "$(jq 'length' <<< "$failures")" == 0 && "$(jq 'length' <<< "$passes")" == 0 ]]; then
   printf 'No failures to file and no fixes to resolve.\n'; exit 0
 fi
