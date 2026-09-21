@@ -164,6 +164,27 @@ class DaemonContractTests(unittest.TestCase):
         export = (ROOT / 'scripts/export-qemu-evidence.py').read_text(encoding='utf-8')
         self.assertIn('"daemon-lifecycle.json"', export)
 
+    @unittest.skipIf(os.name == 'nt', 'guest regression requires POSIX bash')
+    def test_fedora_advisory_shutdown_failure_blocks_guest(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        probe = source.split('# BEGIN ADVISORY SHUTDOWN REGRESSION\n', 1)[1].split(
+            '# END ADVISORY SHUTDOWN REGRESSION', 1)[0]
+        for distro, outcome in [('fedora', 0), ('fedora', 19), ('arch', 19)]:
+            with self.subTest(distro=distro, outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'evidence').mkdir()
+                script = 'sudo() { printf "advisory regression invoked\\n"; return "$OUTCOME"; };\n' + probe
+                result = subprocess.run([BASH, '-euo', 'pipefail', '-c', script],
+                                        env=dict(os.environ, HOME=str(root), distro=distro,
+                                                 bin='/fixture/omg', OUTCOME=str(outcome)),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, outcome if distro == 'fedora' else 0)
+                log = root / 'evidence/daemon-advisory-shutdown.log'
+                self.assertEqual(log.exists(), distro == 'fedora')
+                if log.exists():
+                    self.assertIn('advisory regression invoked', log.read_text())
+                    self.assertIn('advisory regression invoked', result.stdout)
+
 
 if __name__ == '__main__':
     unittest.main()
