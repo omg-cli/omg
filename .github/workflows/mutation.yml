@@ -5,7 +5,6 @@ on:
     # Separate the expensive weekly run from audit and benchmark schedules.
     - cron: "43 3 * * 0"
   pull_request:
-    branches: [main]
     paths:
       - tests/exhaustive_cli_matrix.rs
       - tests/integration_suite.rs
