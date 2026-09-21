@@ -444,7 +444,7 @@ class NativeReceipts(unittest.TestCase):
                          'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests'}
         for features, expected in (
             ('pgp,license', set()), ('arch,pgp,license', {'security_daemon_optional'}),
-            ('debian,pgp,license', common_debian | {'security_daemon_optional'}),
+            ('debian,pgp,license', common_debian | {'security_daemon_optional', 'apt_version_ordering'}),
             ('debian-pure', common_debian | {'debian_pure_integration'}),
             ('fedora,pgp,license', {'fedora_tests', 'security_daemon_optional'}),
         ):
