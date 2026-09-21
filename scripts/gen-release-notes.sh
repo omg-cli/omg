@@ -31,13 +31,13 @@ if [[ "$version" == 0.0.* ]] || {
 fi
 
 cat <<EOF_HEADER
-## Alpha
+## Beta preview
 
-OMG is alpha software: the CLI, flags, and on-disk formats can change without a compatibility guarantee.
+OMG is approaching its beta release. Core workflows are documented and exercised across supported targets, while CLI flags and on-disk formats may still change before beta.
 
 ## Breaking changes
 
-These CLI and release changes shipped in 0.1.215 and remain in later alphas.
+These CLI and release changes shipped in 0.1.215 and remain in later pre-beta releases.
 
 ### \`omg license\` removed
 

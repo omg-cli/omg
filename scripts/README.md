@@ -85,8 +85,8 @@ soft passes hide product failures.
 
 ```bash
 ./scripts/release-smoke.sh --release latest --distro arch
-./scripts/release-smoke.sh --release v0.1.217 --distro all --family package
-./scripts/release-smoke.sh --release v0.1.218 --staged-dir ./dist --distro all
+./scripts/release-smoke.sh --release v0.1.223 --distro all --family package
+./scripts/release-smoke.sh --release v0.1.223 --staged-dir ./dist --distro all
 ./scripts/release-smoke.sh --release latest --distro ubuntu \
   --case release-package-search-tree --tier container
 ```
@@ -159,7 +159,7 @@ changed failure set can create another issue. This follows Sentry's documented
 Replay a saved failure report explicitly with:
 
 ```bash
-OMG_SMOKE_RELEASE=v0.1.218 ./scripts/report-smoke-sentry.sh /path/to/run/results.json
+OMG_SMOKE_RELEASE=v0.1.223 ./scripts/report-smoke-sentry.sh /path/to/run/results.json
 ```
 
 Run the network-free coordinator fixtures with:
@@ -190,14 +190,15 @@ checksum. Image signatures are not independently verified by this script.
 
 ```bash
 ./scripts/benchmark-qemu.sh --distro all --staged-dir /path/to/artifacts --benchmark
-./scripts/benchmark-qemu.sh --distro ubuntu --release v0.1.218
+./scripts/benchmark-qemu.sh --distro ubuntu --release v0.1.223
 ```
 
 The staged directory must contain the selected distro archives and checksum
 sidecars using the canonical names below. Missing staged inputs fail rather than
 falling back to published files. Omit `--staged-dir` to download published archives.
-Published v0.1.218 still has known Fedora defects. The passing four-guest record
-uses fixed Debian and Fedora candidates, not four passing published artifacts.
+The selected release or staged artifacts must still be reviewed against the
+artifact-specific evidence before treating a four-guest result as a release
+qualification.
 
 Requirements are local Docker access, `/dev/kvm` available to the controller,
 `jq`, and GNU coreutils. Benchmarks also require host Python 3 for bounded sample

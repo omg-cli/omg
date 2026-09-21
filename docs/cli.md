@@ -16,22 +16,86 @@ This guide documents every OMG command with detailed explanations, examples, and
 
 | Category | Commands |
 | ---------- | ---------- |
-| **Package Management** | `search`, `install`, `remove`, `update`, `info`, `clean`, `explicit`, `sync`, `why`, `outdated`, `size`, `blame` |
+| **Package Management** | `search`, `install`, `remove`, `update`, `info`, `clean`, `explicit`, `sync`, `why`, `outdated`, `size`, `blame`, `ec`, `tc`, `oc`, `uc` |
 | **Runtime Management** | `use`, `list`, `which` |
 | **Shell Integration** | `hook`, `completions`, `hooks`, `workspace` |
 | **Security & Audit** | `audit`, `status`, `doctor` |
 | **Task Runner** | `run` |
 | **Project Management** | `new`, `tool`, `init`, `self-update` (alias: `up`) |
-| **Environment & Snapshots** | `env`, `snapshot`, `diff` |
-| **Team Collaboration** | `team`, `privacy` |
+| **Environment & Snapshots** | `env`, `snapshot`, `diff`, `migrate` |
+| **Team Collaboration** | `team`, `workspace`, `hooks` |
 | **Container Management** | `container` |
 | **CI/CD & Migration** | `ci`, `migrate` |
 | **History & Rollback** | `history`, `rollback` |
 | **Dashboard** | `dash` (alias: `d`), `stats`, `metrics`, `daemon-status` |
-| **Configuration** | `config`, `daemon`, `account`, `generate-man` |
+| **Configuration** | `config`, `privacy`, `daemon`, `account`, `generate-man` |
 | **Enterprise** | `fleet`, `enterprise` |
 
 > The parser accepts global flags (`-v`/`--verbose`, `-q`/`--quiet`, `--json`, `--all-commands`), but individual commands and early fast paths need not implement every output mode. Do not assume a stable JSON schema without checking that command. `omg --help` hides advanced commands unless `--all-commands` is passed. See [🌍 Global Options](#-global-options).
+
+### Parser coverage at v0.1.223
+
+The command definitions in `src/cli/args.rs` are the parser source of truth. The
+long sections below explain behavior and examples; this index makes the full
+surface and nested commands easy to audit when a release changes.
+
+| Surface | Commands or values |
+| --- | --- |
+| Package | `search`, `install`, `remove`, `update`, `info`, `why`, `outdated`, `size`, `blame`, `diff`, `snapshot`, `ci`, `migrate`, `clean`, `explicit`, `ec`, `tc`, `oc`, `uc`, `sync` |
+| Runtime | `use`, `list`, `which`; 14 native runtimes: `node`, `python`, `go`, `rust`, `ruby`, `java`, `bun`, `pi`, `deno`, `zig`, `dotnet`, `erlang`, `php`, `swift` |
+| Shell and monorepo | `hook`, `completions`, `hooks install/uninstall/status/run`, `workspace init/add/remove/list/run/diff/check/status` |
+| Diagnostics | `status`, `doctor`, `audit scan/sbom/secrets/log/verify/policy/slsa/licenses/fix/export/eol` |
+| Development | `run`, `new`, `tool install/list/remove/update/search/registry`, `init` |
+| Environment | `env capture/check/share/sync`, `snapshot create/list/restore/delete`, `diff`, `migrate export/import` |
+| Team and containers | `team init/join/status/push/pull/members/dashboard/roles/golden-path/compliance/activity`, `container status/run/shell/build/list/images/pull/stop/exec/init` |
+| System and account | `config get/set/list/validate/reset/path`, `privacy status/export/opt-out/opt-in`, Unix `daemon` and `daemon-status`, `metrics`, `generate-man`, feature-gated `account link/status/unlink` |
+| Enterprise and lifecycle | `fleet status`, `enterprise reports/policy/audit-export/license-scan`, `history`, `rollback`, `dash`, `stats`, `self-update` |
+
+The hidden `hook-env` and `complete` commands are implementation entry points
+used by shell integration; they are not intended for direct user workflows.
+Unix-only commands are compiled only on Unix. `account` is compiled when the
+`license` feature is enabled. Use `omg <command> --help` for the exact parser
+syntax after selecting a backend build.
+
+### Exact nested command options
+
+The tables below capture the nested arguments that are easy to miss when
+reading the longer examples. Global flags (`--verbose`, `--quiet`, `--json`,
+`--all-commands`, `--help`, and `--version`) are inherited by every visible
+command unless the parser disables a version flag for that command.
+
+| Command | Arguments and options |
+| --- | --- |
+| `omg hooks install` | `--force`/`-f`; `uninstall`, `status`, and `run <hook>` have no additional options. `run` accepts `pre-commit`, `post-checkout`, or `post-merge`. |
+| `omg workspace init <name>` | No additional options. `add <path>` accepts `--name`/`-n`; `remove <project>`, `list`, `check`, and `status` have no additional options. |
+| `omg workspace run <command> [-- <args...>]` | `--parallel`/`-p`, `--filter`/`-f`, and `--yes`/`-y`. `diff [branch]` compares against `main` when the branch is omitted. |
+| `omg config` | `get <key>`, `set <key> <value>`, `list`, `validate`, `path`; `reset` accepts `--yes`/`-y`. |
+| `omg privacy` | `status`, `opt-out`, and `opt-in`; `export` accepts `--output`/`-o`. |
+| `omg env capture` / `check` | No additional options. `share` accepts `--description`/`-d` and `--public`; `sync <url-or-id>` accepts the Gist URL or ID. |
+| `omg audit sbom` | `--output`/`-o`. `secrets` accepts `--path`/`-p`. `log` accepts `--limit`/`-l`, `--severity`/`-s`, and `--export`/`-e`. |
+| `omg audit slsa <package>` | `--certificate-identity` is optional; when supplied it must match the Fulcio certificate SAN. Without it, any Sigstore identity accepted by the verifier can verify. |
+| `omg audit licenses` | `--format`/`-f` (`table`, `json`, `csv`), `--export`/`-e`, `--filter`, and `--check-policy`. |
+| `omg audit fix` | `--dry-run`, `--yes`/`-y`, and `--min-severity` (`low`, `medium`, `high`, `critical`). |
+| `omg audit export` | `--framework`/`-f` (`soc2`, `iso27001`, `fedramp`, `hipaa`, `pci-dss`), `--period`/`-p`, and `--output`/`-o`. |
+| `omg snapshot create` | Optional `--message`/`-m`. `restore <id>` accepts `--dry-run` and `--yes`/`-y`; `list` and `delete <id>` have no additional options. |
+| `omg ci init <provider>` | Provider is `github`, `gitlab`, or `circleci`; `--advanced` adds the advanced configuration. `validate` and `cache` have no additional options. |
+| `omg migrate export` / `import <manifest>` | Export accepts `--output`/`-o`; import accepts `--dry-run`. |
+| `omg team init <team-id>` | `--name`/`-n`. `roles list`, `golden-path list`, and `golden-path delete <name>` have no additional options. |
+| `omg team golden-path create <name>` | `--node`, `--python`, and `--packages`. `compliance` accepts `--export` and `--enforce`; `activity` accepts `--days`/`-d`. |
+| `omg container run <image> [-- <command...>]` | `--name`/`-n`, `--detach`/`-d`, `--interactive`/`-i`, `--env`/`-e` (repeatable `KEY=VALUE`), `--volume` (repeatable `HOST:CONTAINER`), and `--workdir`/`-w`. |
+| `omg container shell` | `--image`/`-i`, `--workdir`/`-w`, repeatable `--env`/`-e`, and repeatable `--volume`; the default image is `ubuntu:24.04`. |
+| `omg container build` | `--dockerfile`/`-f`, `--tag`/`-t`, `--no-cache`, repeatable `--build-arg`, and `--target`. `list`, `images`, `pull <image>`, `stop <container>`, and `exec <container> [-- <command...>]` have no additional options. |
+| `omg container init` | `--base`/`-b`. |
+| `omg account link` | `--token-stdin`; `status` and `unlink` have no additional options. The command exists only in builds with the `license` feature. |
+| `omg enterprise reports` | `--report-type`/`-r` (`monthly`, `quarterly`, `custom`). `policy show` accepts `--scope`/`-s`. |
+| `omg enterprise audit-export` | `--framework`/`-f`, `--period`/`-p`, and `--output`/`-o`. `license-scan` accepts `--export` (`json` or `csv`). |
+| `omg hook-env` (hidden) | `--shell`/`-s`, defaulting to `zsh`; called by generated shell hooks. `omg complete` (hidden) accepts `--shell`/`-s`, `--current`/`-c`, `--last`/`-l`, and optional `--full`/`-f`. |
+
+`omg hook` and `omg completions` intentionally have different shell
+coverage. The completion generator supports Bash, Zsh, Fish, PowerShell
+(`pwsh`), and Elvish. The runtime PATH hook currently emits scripts for Bash,
+Zsh, and Fish; PowerShell and Elvish are completion-only values and return an
+unsupported-shell error when passed to `omg hook`.
 
 ---
 
@@ -823,7 +887,7 @@ omg audit [SUBCOMMAND]
 | `log` | View audit log entries |
 | `verify` | Check local hash-chain consistency, not authenticity or completeness |
 | `policy` | Show security policy status |
-| `slsa <pkg>` | Check supported artifact signatures; requires exact `--certificate-identity`, establishes no SLSA build level |
+| `slsa <pkg>` | Check supported artifact signatures; optionally bind verification to `--certificate-identity`, and do not treat the result as a SLSA build-level certification |
 | `licenses` | Scan for software license compliance issues |
 | `fix` | Auto-fix vulnerabilities by upgrading packages |
 | `export` | Export compliance evidence for audit frameworks |
@@ -1063,18 +1127,20 @@ omg tool registry
 
 **Tool Registry:**
 
-OMG includes a curated registry of 60+ popular developer tools across categories:
+OMG includes a curated registry of **54 GitHub-release tools**. The exact
+registry names in `src/runtimes/tool_registry.rs` are:
 
-- **search**: ripgrep, fd, fzf
-- **files**: bat, eza
-- **git**: delta, lazygit
-- **system**: htop, btop, dust, duf, procs
-- **dev**: hyperfine, tokei, just, watchexec
-- **node**: yarn, pnpm, tsx, nodemon, prettier, eslint
-- **rust**: cargo-watch, cargo-edit, cargo-nextest, bacon
-- **python**: black, ruff, mypy, poetry
-- **docker**: dive, lazydocker
-- **deploy**: vercel, netlify-cli, wrangler
+```text
+ripgrep fd bat eza fzf zoxide starship just task jq yq gh lazygit delta
+neovim helix zellij helm k9s terraform opentofu vault consul minikube kind
+kustomize tilt skaffold lazydocker glow pandoc shellcheck shfmt hadolint
+actionlint hyperfine tokei dust duf procs ruff uv fnm protoc terragrunt packer
+dive golangci-lint delve stylua kotlin scala elixir ghcup
+```
+
+The registry is separate from the 14 native runtime managers. Together they
+make 68 registered runtime/tool names, but each publisher may expose only
+some operating systems or architectures.
 
 **Tool Resolution:**
 

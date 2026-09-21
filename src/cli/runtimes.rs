@@ -701,12 +701,12 @@ mod tests {
     }
 
     #[test]
-    fn known_runtimes_covers_thirteen_natives_plus_fifty_four_registry_tools() {
+    fn known_runtimes_covers_fourteen_natives_plus_fifty_four_registry_tools() {
         let runtimes = super::known_runtimes().expect("runtime list must build");
         assert_eq!(
             runtimes.len(),
             68,
-            "13 natives + 54 registry tools: {runtimes:?}"
+            "14 natives + 54 registry tools: {runtimes:?}"
         );
         for name in [
             "node",

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 distro=all
-tag=v0.1.218
+tag=v0.1.223
 staged_dir=
 release_dir=
 inventory_file=

@@ -6,7 +6,7 @@ description: Manage system packages, project runtimes, and environment records
 
 # OMG documentation
 
-OMG combines system package backends, project runtime selection, and task execution in one Rust CLI. It is alpha software. Keep your native package tools available and use recoverable machines for package mutations.
+OMG combines system package backends, project runtime selection, and task execution in one Rust CLI. It is approaching beta. Keep your native package tools available and use recoverable machines for package mutations while validating your workflows.
 
 **[Install OMG](./installation.md), then [run a project task](./quickstart.md).** The quickstart selects a runtime without changing system packages.
 
@@ -45,4 +45,4 @@ Performance depends on the operation, backend, query, and cache state. Read [ben
 
 Historical changelogs, dated investigations, and audit reports describe their recorded state, not current feature guarantees.
 
-[Report a bug](https://github.com/PyRo1121/omg/issues) with your version, distribution, command, and redacted output. Report vulnerabilities privately using [SECURITY.md](../SECURITY.md).
+[Report a bug](https://github.com/omg-cli/omg/issues) with your version, distribution, command, and redacted output. Report vulnerabilities privately using [SECURITY.md](../SECURITY.md).

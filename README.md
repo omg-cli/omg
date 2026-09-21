@@ -21,7 +21,7 @@
 ---
 
 > [!IMPORTANT]
-> **Alpha Development Notice**: OMG is under active alpha development. Command surfaces, configuration flags, and on-disk formats may evolve. Always test package mutations on disposable VMs or recoverable developer machines. Keep native package tools (`pacman`, `apt`, `dnf`, `brew`) available.
+> **Beta Preview Notice**: OMG is approaching its beta release. Core package, runtime, task, and environment workflows are exercised across the supported targets, while command surfaces, configuration flags, and on-disk formats may still change before beta. Keep native package tools (`pacman`, `apt`, `dnf`, `brew`) available while evaluating package mutations.
 
 ---
 
@@ -160,7 +160,7 @@ cargo build --release --locked --no-default-features --features fedora,pgp,licen
 cargo build --release --locked --no-default-features --features macos,pgp,license
 ```
 
-> Windows users can run OMG inside [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) on a supported Linux distribution (Arch, Debian, or Ubuntu). A PowerShell helper is available at `https://getomg.xyz/install.ps1`. See [Installation Reference](docs/installation.md).
+> Windows users can run OMG inside [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) on a supported Linux distribution (Arch, Debian, Ubuntu, or Fedora). The PowerShell URL at `https://getomg.xyz/install.ps1` is a guard that explains this native-Windows limitation; run the Linux installer inside WSL instead. See [Installation Reference](docs/installation.md).
 
 ### Updating an Existing Installation
 
@@ -362,7 +362,7 @@ The security model includes explicit trust and coverage limits:
 2. **AUR Safety Boundaries**: AUR packages contain community-submitted code. OMG enables interactive source review and isolated Bubblewrap builds by default. Network access and native builds require explicit configuration opt-ins; see [AUR policy](docs/aur.md).
 3. **Audit Limits**:
    - `omg audit sbom` produces a CycloneDX 1.5 JSON inventory with Arch Linux Security Advisory matching. It does not generate full transitive application dependency graphs for Debian or macOS.
-   - `omg audit slsa` verifies supported Rekor signatures and Fulcio certificate chains for an artifact; it requires `--certificate-identity` and does not certify SLSA Levels 1–3 or build provenance.
+   - `omg audit slsa` verifies supported Rekor signatures and Fulcio certificate chains for an artifact; `--certificate-identity` optionally binds the signer, while an omitted identity is reported as unbounded. It does not certify SLSA Levels 1–3 or build provenance.
    - Audit log verification (`omg audit verify`) confirms internal SHA-256 hash-chain consistency, not independent root-level authenticity.
    - OMG is not a compliance certification tool for SOC 2, ISO 27001, HIPAA, PCI DSS, or FedRAMP.
 4. **Transparent Benchmarks**: We do not claim universal speedups. Performance varies by backend, cache state, repository size, and storage hardware. Inspect our methodology and raw records in [benchmarks/README.md](benchmarks/README.md).
