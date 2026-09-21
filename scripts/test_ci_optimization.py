@@ -20,6 +20,11 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_coverage_preserves_first_attempt_failures(self):
+        script = step_script('coverage.yml', 'Run tests with coverage instrumentation')
+        self.assertRegex(script, r'--retries\s+0(?:\s|$)')
+        self.assertIn('--no-fail-fast', script)
+
     def test_native_cache_recipe_keys_are_valid_and_keep_compatibility_boundaries(self):
         script = step_script('ci.yml', 'Compute native cache identity')
         recipes = [
