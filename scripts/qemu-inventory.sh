@@ -637,10 +637,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')
   remote+="; status_file=\$(mktemp \"\$HOME/inventory-status.XXXXXX\"); trap 'rm -f \"\$status_file\"' EXIT"
-  remote+="; run_omg() { execution_phase=executor; rc=0; timeout --kill-after=5s '$row_timeout' bash -c $supervisor _ \"\$@\" 3>\"\$status_file\" || rc=\$?; if [ \"\$rc\" = 0 ]; then if IFS= read -r rc < \"\$status_file\"; then execution_phase=product; else rc=125; fi; fi; }"
+  remote+="; run_omg() { local deadline=\$1; shift; execution_phase=executor; rc=0; timeout --kill-after=5s \"\$deadline\" bash -c $supervisor _ \"\$@\" 3>\"\$status_file\" || rc=\$?; if [ \"\$rc\" = 0 ]; then if IFS= read -r rc < \"\$status_file\"; then execution_phase=product; else rc=125; fi; fi; }"
   for p in "${chain[@]}"; do
     pargs=$(quote_args "${row_args[$p]}")
-    remote+="; run_omg $quoted_binary $pargs > '$p.prereq.log' 2> '$p.prereq.stderr.log'"
+    remote+="; run_omg '$row_timeout' $quoted_binary $pargs > '$p.prereq.log' 2> '$p.prereq.stderr.log'"
     remote+="; printf 'prereq $p exit=%s\n' \"\$rc\" >&2; cat '$p.prereq.log' '$p.prereq.stderr.log' >&2"
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
     remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
@@ -652,6 +652,14 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; for hook in pre-commit post-checkout post-merge; do printf '#!/bin/sh\\n# user-owned hook fixture\\nexit 23\\n' > \".git/hooks/\$hook\"; chmod 640 \".git/hooks/\$hook\"; done"
   fi
   arg_string=$(quote_args "$args_json")
+  command_timeout=$row_timeout
+  # The pinned Go archive is substantially larger than the other runtime
+  # fixtures and is downloaded through a software-emulated guest. Keep a
+  # hard deadline, but do not classify a progressing official download as a
+  # product hang merely because it exceeds the generic row budget.
+  if [[ "$case" == runtime-go-install ]]; then
+    command_timeout=$((row_timeout * 3))
+  fi
   counter=$(counter_for_case "$case")
   if [[ -n "$counter" ]]; then
     remote+="; $(declare -f check_native_counter)"
@@ -661,7 +669,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     runtime_name=$(jq -r '.[1]' <<< "$args_json")
     remote+="; umask 0002; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install"); $(declare -f check_runtime_usage)"
   fi
-  remote+="; run_omg $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+  remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log; then assertion=1; fi"
   if [[ -n "$counter" ]]; then
@@ -685,7 +693,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   start=$SECONDS
   transport=0
-  budget=$(( (row_timeout + 5) * (${#chain[@]} + 1) + 15 ))
+  budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
   if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then budget=$((budget + 74)); fi
   if [[ "$case" == runtime-go-install ]]; then budget=$((budget + 210)); fi
