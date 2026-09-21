@@ -1,4 +1,16 @@
+---
+title: OMG on Omarchy
+sidebar_position: 47
+description: What OMG adds to an Omarchy setup, and what Omarchy keeps doing itself
+---
+
 # OMG on Omarchy
+
+**In plain words:** Omarchy is one person's ready-made Arch Linux setup. This page
+explains what OMG adds to it, and what Omarchy keeps doing itself.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
 
 **Safer installation defaults, with fewer security settings to assemble yourself.**
 
@@ -24,7 +36,7 @@ The AUR menu makes community software accessible, but community availability is 
 
 The important distinction is between a tool supporting a security option and an installation workflow applying that option for the user. OMG uses existing package tools where appropriate, while adding policy around the operations it manages.
 
-**Evidence status:** the hardening described below is implemented in [PR #399](https://github.com/PyRo1121/omg/pull/399), which was open when this document was researched on September 13, 2026. The implementation reference is [commit cc67ab89](https://github.com/PyRo1121/omg/tree/cc67ab89541f07af7b433bf29d142a78954cd882). These are reviewable capabilities, not a claim that the latest downloadable release contains every change. Check [releases](https://github.com/PyRo1121/omg/releases) for installed-version coverage.
+**Evidence status:** the managed-tool and AUR controls below are in the current tree and are described as release behavior in [v0.1.223](releases/v0.1.223.md). The September 13, 2026 research notes cited [PR #399](https://github.com/omg-cli/omg/pull/399) while that work was still open. Check [releases](https://github.com/omg-cli/omg/releases) for the build you have installed.
 
 | User task | What OMG adds on its managed path | Why it matters |
 | --- | --- | --- |
@@ -36,11 +48,11 @@ The important distinction is between a tool supporting a security option and an 
 | Build an AUR package | Reviews and rechecks sources, then uses an offline Bubblewrap build with a private home and cleared environment by default. | Limits build-time access instead of relying entirely on the user recognizing dangerous shell code. |
 | Install an AUR build result | Inspects archive paths, metadata, links, hooks, and privileged contents before handing sealed bytes to the elevated transaction. Selected system-integrating packages require matching private rebuilds. | Adds checks between community build output and a privileged installation. |
 
-The managed-tool defaults and exception handling are visible in [`src/cli/tool.rs`](https://github.com/PyRo1121/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/cli/tool.rs). The [AUR workflow](aur.md) documents its gates, required confirmations, and compatibility opt-ins.
+The managed-tool defaults and exception handling are visible in [`src/cli/tool.rs`](https://github.com/omg-cli/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/cli/tool.rs). The [AUR workflow](aur.md) documents its gates, required confirmations, and compatibility opt-ins.
 
 ### A concrete npm distinction
 
-For an npm-distributed command-line tool, OMG's managed installer first materializes the dependency tree with `--ignore-scripts`. It then runs `npm audit signatures` and refuses activation if that check fails, unless the user explicitly allows an unverified installation for that package. An approved script phase runs after verification. [Verification ordering commit](https://github.com/PyRo1121/omg/commit/d356fee5)
+For an npm-distributed command-line tool, OMG's managed installer first materializes the dependency tree with `--ignore-scripts`. It then runs `npm audit signatures` and refuses activation if that check fails, unless the user explicitly allows an unverified installation for that package. An approved script phase runs after verification. [Verification ordering commit](https://github.com/omg-cli/omg/commit/d356fee5)
 
 That is a specific advantage over an install performed without those controls. It builds on npm's capabilities and makes their application part of OMG's workflow. Signature verification authenticates evidence about packages; it does not establish that signed code is harmless.
 
@@ -63,9 +75,9 @@ This applies to `omg tool install`'s managed npm path. Selecting Node through `o
 
 ### Protection without pretending exceptions disappear
 
-Some tools need lifecycle scripts, Python source builds, CGO, private registries, or other settings outside the defaults. OMG makes those exceptions explicit and records installation policy receipts. A stricter default can produce a refusal where an unrestricted command would proceed; useful error messages and documented exceptions are part of the product's value. [Policy receipts](https://github.com/PyRo1121/omg/commit/1fc5d2a8), [visible overrides](https://github.com/PyRo1121/omg/commit/f4a89bd4)
+Some tools need lifecycle scripts, Python source builds, CGO, private registries, or other settings outside the defaults. OMG makes those exceptions explicit and records installation policy receipts. A stricter default can produce a refusal where an unrestricted command would proceed; useful error messages and documented exceptions are part of the product's value. [Policy receipts](https://github.com/omg-cli/omg/commit/1fc5d2a8), [visible overrides](https://github.com/omg-cli/omg/commit/f4a89bd4)
 
-On Linux, managed installer subprocesses use `no_new_privs` to prevent execution from gaining new privileges. This does not itself isolate the filesystem or network. AUR's Bubblewrap policy is a separate control. [Privilege restriction](https://github.com/PyRo1121/omg/commit/b76bf0c7)
+On Linux, managed installer subprocesses use `no_new_privs` to prevent execution from gaining new privileges. This does not itself isolate the filesystem or network. AUR's Bubblewrap policy is a separate control. [Privilege restriction](https://github.com/omg-cli/omg/commit/b76bf0c7)
 
 ## How it should fit into Omarchy
 
@@ -98,7 +110,7 @@ OMG implements the following configuration support natively; these workflows do 
 | Project configuration layers | Local overrides, selected `MISE_ENV` environments, selected-environment local overrides, grouped project configurations, and sorted fragments, with child projects overriding ancestors. Environment resolution, tool pins, and task discovery use shared bounded discovery. |
 | Explicit environment sourcing | Supported `_.source` scripts are evaluated during explicit run/task execution. Automatic shell hooks select installed runtimes without importing project environment directives. |
 
-This means users can already reuse supported parts of their mise project configuration with OMG, rather than maintaining a separate set of version pins and simple tasks. The implementation is visible in [tool-pin parsing](https://github.com/PyRo1121/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/hooks/mod.rs), [task execution](https://github.com/PyRo1121/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/core/task_runner.rs), and [environment resolution](https://github.com/PyRo1121/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/config/mise_env.rs).
+This means users can already reuse supported parts of their mise project configuration with OMG, rather than maintaining a separate set of version pins and simple tasks. The implementation is visible in [tool-pin parsing](https://github.com/omg-cli/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/hooks/mod.rs), [task execution](https://github.com/omg-cli/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/core/task_runner.rs), and [environment resolution](https://github.com/omg-cli/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/config/mise_env.rs).
 
 The compatibility boundary is specific: backend-qualified tool entries such as `github:owner/repo` are skipped by the mise pin parser. Task execution is sequential; dependency arguments/patterns, post-dependencies, file tasks, custom shells, conditions, and run/directory templates are unsupported and produce errors instead of silently losing execution controls. Environment support excludes encrypted-secret backends, per-plugin directives, YAML environment files, and full Tera templates. Applying previously ignored local and selected-environment layers changes pins, tasks, and explicit command environments, including inherited home-directory configuration for projects beneath that directory. Follow the [mise migration steps](mise-compatibility.md#migrating-existing-omg-projects) before upgrading. This is configuration compatibility, not a claim of complete mise parity or automatic reuse of mise's installed tool directories. [Runtime management](runtimes.md)
 
@@ -112,7 +124,7 @@ A default needs evidence about ordinary users' experience as well as security me
 4. Predictable PATH behavior alongside the existing mise setup, with a straightforward way to undo the integration.
 5. Release artifacts containing the evaluated hardening, with reproducible commands and linked test results.
 
-This document does not report those integration tests as completed. OMG's [CI evidence](https://github.com/PyRo1121/omg/actions) and [security timeline](https://getomg.xyz/security/) provide separate implementation and verification history. Generic Arch or QEMU success should not be presented as an Omarchy compatibility result unless the run actually tested that environment.
+This document does not report those integration tests as completed. OMG's [CI evidence](https://github.com/omg-cli/omg/actions) and [security timeline](https://getomg.xyz/security/) provide separate implementation and verification history. Generic Arch or QEMU success should not be presented as an Omarchy compatibility result unless the run actually tested that environment.
 
 ## Follow the implementation
 
@@ -122,6 +134,6 @@ This document does not report those integration tests as completed. OMG's [CI ev
 | On main | Merged changes; release inclusion still needs checking. |
 | Released | Included in an identified tagged build users can install. |
 
-For the current work, start with [PR #399](https://github.com/PyRo1121/omg/pull/399), the [public security timeline](https://getomg.xyz/security/), and the [security model](security.md). Individual changes include [manager configuration isolation](https://github.com/PyRo1121/omg/commit/7b0749d2), [managed entrypoint hashing](https://github.com/PyRo1121/omg/commit/8bb84cbc), and [activation rollback](https://github.com/PyRo1121/omg/commit/8e44e924).
+For the current work, start with [PR #399](https://github.com/omg-cli/omg/pull/399), the [public security timeline](https://getomg.xyz/security/), and the [security model](security.md). Individual changes include [manager configuration isolation](https://github.com/omg-cli/omg/commit/7b0749d2), [managed entrypoint hashing](https://github.com/omg-cli/omg/commit/8bb84cbc), and [activation rollback](https://github.com/omg-cli/omg/commit/8e44e924).
 
 **The proposal:** give Omarchy users an approachable installation workflow that applies additional controls at the point they need them, with public evidence explaining what those controls do. Evaluate that fit on real Omarchy systems, then use the results to decide whether broader adoption is warranted.

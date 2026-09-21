@@ -1,11 +1,16 @@
 # mise compatibility in OMG
 
+**In plain words:** If your project already uses mise, this page lists the parts OMG understands and the parts it does not.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 This is an implementation inventory and acceptance plan, not a claim of full compatibility. It follows the request to expand OMG's existing native mise support while retaining OMG's installation controls.
 
 ## Reference and evidence
 
 - Upstream baseline: [mise v2026.9.7](https://github.com/jdx/mise/releases/tag/v2026.9.7), source [0db3fbe9efcee1944bc4990434c1a5ebcb480fca](https://github.com/jdx/mise/tree/0db3fbe9efcee1944bc4990434c1a5ebcb480fca). The annotated tag was resolved through GitHub, rather than treating the tag-object SHA as the source revision.
-- OMG inspected revision: [0de93ce6](https://github.com/PyRo1121/omg/tree/0de93ce6). Inspection date: September 13, 2026.
+- OMG inspected revision: [0de93ce6](https://github.com/omg-cli/omg/tree/0de93ce6). Inspection date: September 13, 2026. The repository has since moved to `omg-cli/omg`. Layered mise pins, project environments, and task dependencies described below are current CLI behavior. This page remains an inventory of what that support includes and what it does not.
 - Existing implementation tests cited below were read, not rerun during this inventory. They are not yet differential tests against the pinned mise binary.
 - Live upstream documentation is useful for discovery. Conformance fixtures must use the pinned source and release because documentation can advance independently.
 

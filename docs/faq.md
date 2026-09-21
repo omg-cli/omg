@@ -6,54 +6,161 @@ description: Frequently asked questions
 
 # Frequently asked questions
 
+**In plain words:** Short answers to the questions people ask most, including the things OMG deliberately does not do.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 ## What is OMG?
 
-OMG combines system-package commands, 14 native runtime managers, a task runner, and selected security tools. It complements pacman, APT, DNF, Homebrew, and existing runtime providers rather than hiding the systems underneath.
+OMG is one program that you use in a terminal window. It installs, updates, and removes
+software, picks the right version of a programming language for a project, and runs the
+tasks a project already defines.
+
+It covers system packages, 14 language runtimes, a task runner, and some security checks.
+It is **approaching beta**, so its makers still change how it behaves, and it does not
+replace every feature of `pacman`, APT, DNF, Homebrew, or the runtime tools you may
+already use.
 
 ## How do I install it?
 
-Follow [installation](./installation.md): download and inspect the installer before execution and satisfy its archive-attestation prerequisites. Source builds require the correct backend feature flags. Linux releases are backend-specific x86_64 archives; macOS releases target ARM64. Native Windows is unsupported. WSL uses its installed Linux distribution, not a separate Windows backend. See installation for recorded Fedora release failures and daemon availability.
+Follow [installation](./installation.md). In short: download the installer, read it, then
+run it. It checks the download before installing anything.
+
+- The check needs the GitHub CLI program, `gh`. If `gh` is missing, installation stops.
+- Releases exist for Arch, Debian, Ubuntu, and Fedora on 64-bit Intel or AMD, and for
+  Apple Silicon Macs.
+- Native Windows is not supported. Inside WSL (a real Linux system inside Windows), use
+  the file for the Linux distribution you installed.
+- Building from source is also possible; it needs Rust and the right backend flags.
 
 ## Is it faster?
 
-Some repeated queries benefit from cached indexes and direct reads. Native subprocesses, network access, and package transactions have different costs. Use the [benchmark records](../benchmarks/README.md) with their host, artifact, sources, and cache conditions; no universal speedup or shell-hook latency is guaranteed.
+Sometimes, for repeated searches and read-only lookups, OMG can answer from a warm cache
+or read your package database directly. Downloads, installations, and network requests
+take the time they take.
 
-## Does it replace my native package manager?
+Measure it on your own machine, with the same query and the same cache state, and treat
+the [benchmark records](../benchmarks/README.md) as measurements of their recorded
+conditions. No universal speedup is promised.
 
-No. Backends use native package infrastructure and have different feature and security coverage. Keep native recovery tools. AUR support does not promise every yay or paru option, and AUR recipes execute community code. See [packages](./packages.md) and [AUR configuration](./aur.md).
+## Does it replace my normal package manager?
+
+No. OMG asks your computer's own package tool to do the work, and each system is covered
+differently. Keep your normal tool available, especially for repairs.
+
+AUR support does not promise every `yay` or `paru` option, and AUR recipes are community
+code that runs on your machine. See [package management](./packages.md) and
+[AUR](./aur.md).
 
 ## Does it collect telemetry?
 
-Installer telemetry requires consent and defaults to no; runtime telemetry is opt-in. `OMG_NO_TELEMETRY=1` disables installer telemetry and `OMG_TELEMETRY=0` disables runtime telemetry. Functional requests to repositories, runtime providers, advisory services, and optional account services remain possible. See [privacy and telemetry](./security.md#privacy-and-telemetry).
+Not unless you turn it on. Installer telemetry asks your permission and defaults to no;
+runtime telemetry is opt-in. `OMG_NO_TELEMETRY=1` turns off installer telemetry, and
+`OMG_TELEMETRY=0` turns off runtime telemetry.
 
-## Which runtimes does it manage?
+Commands still contact package repositories, runtime providers, advisory services, and any
+account service you enabled, because that contact is how they work. See
+[privacy and telemetry](./security.md#privacy-and-telemetry).
 
-OMG has native managers for 14 runtimes: Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, and Swift. Unsupported names fail explicitly. Installation and project builds have provider- and platform-specific prerequisites; check them before replacing existing tooling. See [runtime management](./runtimes.md).
+## Which runtimes can it manage?
+
+Fourteen: Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP,
+and Swift.
+
+A name that OMG does not manage fails with a message instead of guessing. Each runtime has
+its own platform requirements, so read them before you replace the tooling you already
+have. See [runtime management](./runtimes.md).
 
 ## Why use a shell hook?
 
-It activates installed versions selected by project files when changing directories. It does not promise to install missing versions automatically. Avoid conflicting version-manager hooks and follow the instructions for Bash, Zsh, or Fish in [shell integration](./shell-integration.md).
+The hook adds a few lines to your shell's start-up file. After that, when you enter a
+project folder, OMG puts the version that the project asks for at the front of your
+`PATH`.
+
+Technically, the generated hook saves the original `PATH`, restores it when you leave the
+folder, and calls `command omg hook-env` on each prompt so that a shell function named
+`omg` cannot shadow the real binary. Zsh caches the prompt counters for 60 seconds; Bash
+re-reads the snapshot file on each prompt; Fish registers on `PWD` and `fish_prompt` and
+does not define the counter helpers at all.
+
+It switches between versions you already installed; it does not install a missing version
+by itself. Use the hook from only one runtime manager to avoid conflicts. See
+[shell integration](./shell-integration.md).
 
 ## Does `omg.lock` reproduce an environment?
 
-It records runtime versions, explicit packages, and an environment fingerprint. `omg env check` checks drift; `omg env sync` downloads a lockfile and checks it without installing software. Neither restores a complete machine or makes arbitrary dependency resolution reproducible. Review a lockfile before sharing it: it can disclose private inventory. Secret GitHub Gists are unlisted, not encrypted.
+No. It records what was there. The file lists runtime versions, the packages you installed
+yourself, and a SHA-256 fingerprint over the normalized lists, plus a schema version and a
+timestamp.
 
-## What do security commands establish?
+`omg env check` recomputes that fingerprint and reports the differences between the record
+and this machine. `omg env sync` downloads someone else's record and reports differences
+there too; it backs up a differing local file rather than overwriting it silently. Neither
+installs software, and neither rebuilds a machine.
 
-Coverage depends on the backend and operation. The SLSA-named command verifies supported artifact signatures with an expected identity; it does not establish a SLSA build level. Local audit chains check consistency, not authenticity or completeness. SBOM and compliance exports are plaintext, and HIPAA export is unimplemented. Read [security](./security.md) and [retained trust boundaries](../SECURITY.md#security-boundaries-and-retained-trust).
+Capture requires a build with the Arch or Debian backend — a Fedora build refuses instead
+of writing a partial record, so a passing check on an unsupported backend is not possible.
+
+Review a lockfile before you share it: it can reveal what is on your computer. A secret
+GitHub Gist is unlisted, not encrypted.
+
+## What do the security commands prove?
+
+Less than their names might suggest, and that is deliberate.
+
+- The SLSA-named check verifies an artifact's signature against an identity you provide. It
+  does not establish a SLSA build level.
+- Local audit chains show that the record has not changed since it was written. They do not
+  prove who wrote it or that nothing is missing.
+- SBOM and compliance exports are plain text files, to be read by a person or a tool.
+- HIPAA export is not implemented.
+
+Read [security](./security.md) and
+[the retained-trust boundaries](../SECURITY.md#security-boundaries-and-retained-trust).
 
 ## Can I undo an installation?
 
-History recording and rollback depend on backend, configuration, available old packages, and current dependencies. They are not complete machine snapshots. Inspect `omg history` and [rollback limitations](./history.md) before changing state. Never reset malformed history or audit records to hide a failure.
+Sometimes. OMG records transactions where your system's package tool supports it, and
+`omg rollback` can return to an earlier recorded state.
+
+It is not a disk snapshot. Whether it works depends on your system, the older package
+versions still being available, and your current dependencies. Read `omg history` and
+[history and rollback](./history.md) before you change anything.
+
+Never reset or edit a damaged history or audit log to make an error message disappear;
+that destroys the evidence.
 
 ## What does `omg dash` do?
 
-It opens a terminal dashboard. `Tab` selects views, `r` requests refresh, and `q` quits outside text entry. Availability of data depends on the backend and configured services; displayed examples are not live proof of coverage. See [TUI](./tui.md).
+It opens a dashboard inside your terminal window. `Tab` changes view, `r` asks for a
+refresh, and `q` quits while you are not typing in a text box.
+
+Some views stay empty when your system's package tool or an optional service is not
+available. An empty view is not proof that there is nothing to find. See
+[terminal dashboard](./tui.md).
 
 ## How do I diagnose daemon problems?
 
-Use `omg daemon-status` and [troubleshooting](./troubleshooting.md). Only run a daemon supported by your release. Do not blindly delete sockets, caches, or user records to make an error disappear.
+Run `omg daemon-status` first, then follow [troubleshooting](./troubleshooting.md). Only
+run a daemon if the release you installed contains one.
 
-## Where can I contribute?
+Do not delete sockets, caches, or records to make an error message go away: that hides the
+cause and can destroy data.
 
-OMG is [MIT licensed](../LICENSE). Follow [contributing](../CONTRIBUTING.md) and report security issues privately through [SECURITY.md](../SECURITY.md).
+## Where can I get help, or contribute?
+
+- Report a bug in [GitHub Issues](https://github.com/omg-cli/omg/issues) with your OMG
+  version (`omg --version`), your Linux distribution or macOS version, the command, and the
+  output. Remove passwords, tokens, and private folder names first.
+- Report a security problem privately, as described in [SECURITY.md](../SECURITY.md).
+- Contribution steps, code standards, and test environments are in
+  [CONTRIBUTING.md](../CONTRIBUTING.md).
+- OMG is open source under the [MIT License](../LICENSE).
+
+## Where to go next
+
+- [Getting started](./getting-started.md) if you have never used a terminal window.
+- [Glossary](./glossary.md) for plain-language definitions of the words used here.
+- [Installation](./installation.md) and [Quickstart](./quickstart.md) to get going.
+- [Troubleshooting](./troubleshooting.md) when a command fails.

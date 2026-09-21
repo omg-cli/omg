@@ -1,53 +1,35 @@
 ---
 title: IPC Protocol
-sidebar_position: 33
+sidebar_position: 34
 description: Binary protocol for CLI-daemon communication
 ---
 
-# Private Communication Interface
+# IPC
 
-OMG uses a high-performance private interface designed specifically for sub-millisecond responsiveness between the user interface and the background engine.
+**In plain words:** This page describes how the OMG command and the background helper exchange messages. It is background reading for people who want that detail.
 
-## ⚡ Architecture
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
 
-Communication happens exclusively over a local secure channel, which offer several key advantages over standard network protocols:
-- **Direct Speed**: Data is transferred directly within the system kernel, bypassing the entire network stack.
-- **Security by Design**: Access is controlled by standard system permissions, ensuring that only you (the user) can communicate with your background engine.
-- **Reliability**: Ordered and reliable message delivery is guaranteed by the operating system.
+`omg` talks to `omgd` over a Unix domain socket on the local machine. Socket permissions are owner-only. Latency depends on the request, the cache, and the backend.
 
----
+## Framing
 
-## 📨 Protocol Design
+Each connection uses length-delimited frames. A frame carries a version prefix and a bitcode payload. Peers reject frames whose version they do not understand. Payload size depends on the message.
 
-The protocol is optimized for low latency and high throughput, using a structured binary format.
+The typed request and response enums cover search, package info, system status, security audit, explicit package listings, and cache or health checks. See `src/daemon/protocol.rs` for the current variants.
 
-### Framing Strategy
-OMG uses **Length-Delimited Framing**. Every message is prefixed by a **4-byte header** that tells the receiver exactly how many bytes to expect. This allows for:
-- **Zero-Ambiguity boundaries**: No confusion between multiple messages on the same stream.
-- **Memory Efficiency**: The system allocates exactly the right amount of memory for each incoming request.
-- **Backpressure Support**: The daemon can signal the CLI to slow down if it becomes overloaded.
+## Request path
 
-### Binary Serialization
-We use the **Bitcode** high-efficiency binary serializer instead of text-based formats like JSON.
-- **Encoding**: Binary serialization avoids JSON text encoding. Payload size depends on the message; no fixed compression ratio is guaranteed.
-- **Speed**: Serialization and deserialization take only a few microseconds.
-- **Resilience**: The strictly typed nature of the binary format prevents many common communication errors.
+1. The CLI encodes a request and writes one frame.
+2. The daemon decodes it, routes it to a handler, and may answer from memory.
+3. The daemon writes one response frame.
+4. A decode or protocol error fails the call. The CLI does not treat a malformed frame as an empty success.
 
----
+Without a running daemon, supported package queries use the direct backend path. See [architecture](./architecture.md) and [cache](./cache.md).
 
-## 🔄 Interaction Patterns
+## Access
 
-### The Action Lifecycle
-Every interaction follows a predictable path:
-1.  **Request**: The interface packages your command and sends it to the background.
-2.  **Processing**: The engine evaluates the task and routes it to the correct handler.
-3.  **Result**: The answer is returned instantly, paired with a unique identifier to ensure perfect tracking.
-4.  **Error Handling**: Every response provides clear status feedback, from success to specific issues.
-
----
-
-## 🛡️ Security Model
-
-- **Local-Only**: Communication is restricted to your machine and cannot be accessed from the outside world.
-- **Permission Boundary**: Strict access controls ensure that your system state remains private.
-- **Integrity Protection**: The structured nature of the messages ensures that malformed or unauthorized data is rejected immediately.
+- The socket stays on the local machine.
+- The parent directory and socket are checked for owner, type, and permissions before use.
+- A path that fails those checks is not used as a fallback onto another user's socket.

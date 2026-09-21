@@ -1,10 +1,37 @@
 ---
 title: CLI Reference
-sidebar_position: 3
+sidebar_position: 5
 description: Complete command reference for all OMG commands
 ---
 
 # CLI Reference
+
+**In plain words:** every OMG command and option in one place. Treat this page as a
+lookup table: find the command you need, copy the example, and replace the parts in
+`<angle brackets>` with your own values.
+
+> New to the terminal? Read [Getting started](./getting-started.md) first, and keep
+> [the glossary](./glossary.md) open while you work.
+
+## How to read this page
+
+```mermaid
+flowchart LR
+    A[omg --help] --> B[omg search QUERY]
+    B --> C[omg info PACKAGE]
+    C --> D[omg install --dry-run PACKAGE]
+    D --> E[omg install PACKAGE]
+    E --> F[omg doctor]
+```
+
+- A command is written as `omg <command> [options]`. Square brackets mean the part is
+  optional.
+- `<something>` is a placeholder. Replace it, including the brackets, with your own value.
+- `omg <command> --help` always shows the exact options your installed version accepts.
+  When this page and your terminal disagree, trust your terminal.
+- Commands that change your computer say so. Preview them with `--dry-run` first where
+  the option exists.
+- Advanced commands are hidden from the short help list. Add `--all-commands` to see them.
 
 **Complete Command Reference for OMG**
 
@@ -12,7 +39,7 @@ This guide documents every OMG command with detailed explanations, examples, and
 
 ---
 
-## 📋 Command Overview
+## Command Overview
 
 | Category | Commands |
 | ---------- | ---------- |
@@ -31,7 +58,7 @@ This guide documents every OMG command with detailed explanations, examples, and
 | **Configuration** | `config`, `privacy`, `daemon`, `account`, `generate-man` |
 | **Enterprise** | `fleet`, `enterprise` |
 
-> The parser accepts global flags (`-v`/`--verbose`, `-q`/`--quiet`, `--json`, `--all-commands`), but individual commands and early fast paths need not implement every output mode. Do not assume a stable JSON schema without checking that command. `omg --help` hides advanced commands unless `--all-commands` is passed. See [🌍 Global Options](#-global-options).
+> The parser accepts global flags (`-v`/`--verbose`, `-q`/`--quiet`, `--json`, `--all-commands`), but individual commands and early fast paths need not implement every output mode. Do not assume a stable JSON schema without checking that command. `omg --help` hides advanced commands unless `--all-commands` is passed. See [Global options](#global-options).
 
 ### Parser coverage at v0.1.223
 
@@ -99,7 +126,7 @@ unsupported-shell error when passed to `omg hook`.
 
 ---
 
-## 📦 Package Management
+## Package Management
 
 ### omg search
 
@@ -520,7 +547,7 @@ omg blame firefox
 
 ---
 
-## 🔧 Runtime Management
+## Runtime Management
 
 ### omg use
 
@@ -700,7 +727,7 @@ omg which rust
 
 ---
 
-## 🐚 Shell Integration
+## Shell Integration
 
 ### omg hook
 
@@ -867,7 +894,7 @@ truncating data. Streaming exports for larger archives are not supported.
 
 ---
 
-## 🛡️ Security & Audit
+## Security & Audit
 
 ### omg audit
 
@@ -891,7 +918,7 @@ omg audit [SUBCOMMAND]
 | `licenses` | Scan for software license compliance issues |
 | `fix` | Auto-fix vulnerabilities by upgrading packages |
 | `export` | Export compliance evidence for audit frameworks |
-| `eol` | Check end-of-life status for installed runtimes |
+| `eol` | Check end-of-life status for installed Node.js, Python, Rust, Go, Ruby, Java, Bun, and Deno versions |
 
 `scan` requires the Unix daemon and does not fail solely because findings exist. `sbom` always requests Arch advisory matching; it fails on Debian-like systems and lacks a Fedora/macOS system backend. It does not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
 
@@ -973,7 +1000,7 @@ omg doctor [OPTIONS]
 | Option | Description |
 | -------- | ------------- |
 | `--network` | Test network connectivity to package mirrors |
-| `--eol` | Check for end-of-life runtime versions |
+| `--eol` | Check installed Node.js, Python, Rust, Go, Ruby, Java, Bun, and Deno versions for end-of-life dates |
 | `--turbo` | Prime sudo credentials and remove legacy file capabilities; does not grant capability-based package access |
 
 **Checks performed:**
@@ -988,7 +1015,7 @@ omg doctor [OPTIONS]
 
 ---
 
-## 🏃 Task Runner
+## Task Runner
 
 ### omg run
 
@@ -1046,7 +1073,7 @@ omg run build,test,lint --parallel
 
 ---
 
-## 🏗️ Project Management
+## Project Management
 
 ### omg new
 
@@ -1384,7 +1411,7 @@ omg config set telemetry.enabled false
 
 ---
 
-## 📸 Environment & Snapshots
+## Environment & Snapshots
 
 ### omg snapshot
 
@@ -1462,7 +1489,7 @@ omg diff --from old.lock new.lock
 
 ---
 
-## 🤝 Team Collaboration
+## Team Collaboration
 
 ### omg env
 
@@ -1559,7 +1586,7 @@ omg team activity --days 30
 
 ---
 
-## 🐳 Container Management
+## Container Management
 
 ### omg container
 
@@ -1611,7 +1638,7 @@ omg container stop mycontainer
 
 ---
 
-## 🔄 CI/CD & Migration
+## CI/CD & Migration
 
 ### omg ci
 
@@ -1691,7 +1718,7 @@ omg migrate import my-setup.json
 
 ---
 
-## 🏢 Enterprise Features
+## Enterprise Features
 
 ### omg fleet
 
@@ -1763,7 +1790,7 @@ omg enterprise policy show
 
 ---
 
-## 📜 History & Rollback
+## History & Rollback
 
 ### omg history
 
@@ -1824,7 +1851,7 @@ omg rollback abc123
 
 ---
 
-## 📊 Dashboard
+## Dashboard
 
 ### omg dash
 
@@ -1889,7 +1916,7 @@ omg generate-man [--output <dir>]
 
 ---
 
-## 🔑 Dashboard account & daemon
+## Dashboard account & daemon
 
 ### omg account
 
@@ -1943,7 +1970,7 @@ omgd --socket /path/to/socket  # Custom socket path
 
 ---
 
-## ⚡ Ultra-Fast Queries
+## Prompt counters
 
 Prompt counters and hot-path queries run through the main `omg` binary without starting the full async runtime.
 
@@ -1990,7 +2017,7 @@ omg info vim
 
 ---
 
-## 🌍 Global Options
+## Global Options
 
 These options work with all commands:
 
@@ -2005,7 +2032,7 @@ These options work with all commands:
 
 ---
 
-## 📚 See Also
+## See Also
 
 - [Quick Start Guide](./quickstart.md)
 - [Configuration](./configuration.md)

@@ -6,6 +6,11 @@ description: Use OMG from shells, editors, and automation
 
 # Integrations
 
+**In plain words:** How to use OMG alongside the tools you already have, including your operating system package manager.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 OMG can be called from existing development tools. Examples here are command-line integration patterns, not claims of official editor extensions or hosted-provider support.
 
 ## Shells and editors

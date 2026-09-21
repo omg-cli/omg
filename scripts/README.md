@@ -7,6 +7,7 @@ Utility scripts for development, testing, and CI of the OMG project.
 | Script | Purpose | Usage |
 | -------- | --------- | ------- |
 | `check-perf-regression.py` | Verify no performance regressions | `python3 scripts/check-perf-regression.py` |
+| `check-docs-alignment.py` | Fail when docs name a command or option the parser does not have | `python3 scripts/check-docs-alignment.py .` |
 | `generate-benchmark-chart.py` | Create benchmark visualizations | `python3 scripts/generate-benchmark-chart.py` |
 | `extract-release-notes.sh` | Extract release notes for GitHub releases | `./scripts/extract-release-notes.sh` |
 | `collect-release-artifacts.sh` | Stage release artifacts for publishing | `./scripts/collect-release-artifacts.sh <version> <artifact-dir> <release-dir>` |
@@ -36,6 +37,35 @@ The script takes no arguments. It reads the baseline from
 **How it works:** Reads Hyperfine JSON output and compares the absolute search mean with two controls. The pacman comparison detects broad search-cost changes. The `omg status` comparison controls for fixed CLI startup, scheduling, and daemon IPC costs on the same runner. A run fails when the available signals regress beyond the default 35% tolerance and their 95% confidence bounds clear the limits. If a control or its distribution data is absent, the remaining signals retain the fail-closed behavior. Missing, unreadable, or corrupt baseline timing also fails closed.
 
 **Used in:** `.github/workflows/benchmark.yml`
+
+---
+
+## check-docs-alignment.py
+
+**Purpose:** Keep documentation honest about the command surface
+
+**Usage:**
+
+```bash
+python3 scripts/check-docs-alignment.py .
+python3 scripts/check-docs-alignment.py --skip-environment .
+```
+
+`src/cli/args.rs` is the source of truth. The script resolves every `omg ...` line in
+the markdown files under `docs/` (plus `README.md`, `CONTRIBUTING.md`, `SECURITY.md`,
+`FEDORA-ENGINE.md`, and `GATE-TEST.md`) against the command definitions, including nested
+subcommands, aliases, and the global options. It also requires that any `OMG_*`
+environment variable named in the docs exists somewhere in the repository, because the
+installer and the CI scripts own several of them.
+
+Findings print one per line as `<file>:<line>: <problem>`. Exit status is 1 when
+anything fails to resolve, 2 when the repository root or parser cannot be read, and 0
+when every reference resolves. Generated and internal files are skipped:
+`docs/changelog.md` and `docs/superpowers/**`.
+
+**Tests:** `python3 scripts/test_docs_alignment.py`
+
+**Used in:** manual runs and documentation review, not yet wired into CI.
 
 ---
 

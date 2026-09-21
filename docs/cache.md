@@ -1,45 +1,36 @@
 ---
-title: Caching & Indexing
+title: Caching and indexing
 sidebar_position: 32
 description: In-memory and persistent caching strategies
 ---
 
-# Caching & Indexing
+# Caching and indexing
 
-OMG uses in-memory caches, a persistent status snapshot, and a binary snapshot for prompt counters. These stores serve different requests; they are not a single fallback chain for every command.
+**In plain words:** OMG keeps short-lived copies of information it has already looked
+up, so repeating a command is faster. This page explains what is stored, where it is
+stored, and how long it stays.
 
-## 🧠 Tier 1: In-Memory (Hot Cache)
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
 
-The "Hot" layer uses a high-performance, concurrent memory cache designed for sub-millisecond access.
+OMG uses an in-memory cache, a persistent status snapshot, and a binary snapshot for prompt counters. These stores serve different requests. They are not one fallback chain for every command.
 
-- **Technology**: Built on a lock-free, concurrent caching engine.
-- **Data Types**: Stores recent search results, detailed package metadata, and system status results.
-- **Eviction Strategy**: Uses an intelligent Least Recently Used (LRU) policy to stay within memory limits.
-- **Latency**: Depends on the request and cache state; measure the complete command.
+## In-memory cache
 
----
+`omgd` keeps recent search results, package details, and system status in a concurrent memory cache. Eviction keeps that cache bounded. A hit avoids repeating work that is already in memory. Measure the full command before treating a hit as the cost of the operation.
 
-## 💾 Tier 2: Persistent Snapshot (Cold Cache)
+## JSON status snapshot
 
-For data that must survive reboots or daemon restarts, OMG keeps a versioned JSON status snapshot. The daemon writes it through a same-directory temporary file, `fsync`, and atomic rename, so a crash can never leave a truncated file behind.
+The daemon publishes `status-cache.json` through a same-directory temporary file, `fsync`, and atomic rename. The file mode is owner-only. The usual location is `~/.local/share/omg/`. `OMG_DAEMON_DATA_DIR` overrides it.
 
-- **Technology**: Versioned JSON snapshot (`status-cache.json`).
-- **Durability**: Atomic replacement plus owner-only file mode.
-- **Location**: Stored locally in `~/.local/share/omg/` (`OMG_DAEMON_DATA_DIR` overrides it).
-- **Latency**: Depends on storage and snapshot size.
+Transaction history and the hash-chained audit log are separate files. Search indexes are rebuilt from native package databases.
 
----
+## Binary status snapshot
 
-## 🔍 Tier 3: Binary Snapshot Layer
+The daemon writes `omg.status` beside its socket. The file is 32 bytes: a magic number, a version, four package counts, and a timestamp. `omg ec`, `omg tc`, `omg oc`, and `omg uc` read it directly when the file is present, owned by the user, and no older than five minutes. A snapshot can lag package changes between refreshes. A prompt counter is not a live transaction record.
 
-The daemon maintains a binary snapshot for package counters. The `omg ec`, `omg tc`, `omg oc`, and `omg uc` commands can read it without a daemon request. A snapshot can be stale; a prompt counter is not a live transaction-state guarantee.
+## How queries use the caches
 
----
+Official package queries can use daemon caches or a direct backend path. On Arch, official and AUR searches run concurrently unless `--no-aur` is set. AUR lookup does not wait for a short official result list. See [package search](./package-search.md).
 
-## 🔄 Data Lifecycle Patterns
-
-### Search Request Flow
-Official queries can use daemon caches or a direct backend fallback. On Arch, official and AUR searches run concurrently unless `--no-aur` is set. AUR lookup does not wait for insufficient local results. See [search behavior](./package-search.md).
-
-### Status Monitoring
-System status is generated in the background every 5 minutes and stored in Tier 1 and Tier 2 (`status-cache.json`). The daemon also writes the 32-byte atomic Tier 3 binary snapshot (`omg.status` next to the socket), allowing prompt counters (`omg ec|tc|oc|uc`) to read package totals in microseconds with zero IPC.
+System status is refreshed in the background every five minutes and stored in the in-memory cache and in `status-cache.json`. The same refresh writes `omg.status`.

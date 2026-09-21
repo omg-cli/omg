@@ -1,5 +1,9 @@
 # Running the QA pipeline locally
 
+> **Who this page is for:** OMG maintainers and contributors. It documents the local virtual-machine test environment.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 The pipeline is local-first: every leg runs from a checkout with no CI
 involved, and the GitHub workflows mirror these same commands. CI stays
 as a backup; the primary loop is your machine filing issues (and,

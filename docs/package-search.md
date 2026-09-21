@@ -6,6 +6,11 @@ description: Official repository queries, AUR enrichment, and result limits
 
 # Package search
 
+**In plain words:** This page explains where search results come from, how OMG treats community sources, and why a short list is not the same as an empty one.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 ```bash
 omg search ripgrep
 omg search ripgrep --no-aur

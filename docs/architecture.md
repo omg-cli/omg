@@ -1,414 +1,138 @@
 ---
 title: Architecture
-sidebar_position: 30
-description: System architecture and component overview
+sidebar_position: 29
+description: How the CLI, daemon, and package backends fit together
 ---
 
-# Architecture Overview
+# Architecture
 
-**System Design and Component Architecture**
+**In plain words:** A map of how OMG is built: the parts, what each part owns, and how they fit together.
 
-This document provides a high-level overview of OMG's architecture, component interactions, and design decisions.
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
 
----
+OMG ships two binaries, `omg` and `omgd`. Current Linux and macOS release archives include both. Prompt counters are commands on `omg`.
 
-## 🏗️ System Architecture
-
-The main request path is easier to read as a flow than as a component inventory:
+## Request path
 
 ```mermaid
 flowchart LR
-    User[Developer] --> CLI[omg CLI]
-    User --> Fast[omg-fast prompt helper]
-    CLI -->|Unix socket IPC| Daemon[omgd daemon]
-    Fast -->|snapshot or IPC| Daemon
+    User[Developer] --> CLI[omg]
+    User --> Prompt[Prompt counters]
+    CLI -->|Unix socket when omgd is running| Daemon[omgd]
+    Prompt -->|fresh omg.status| Snapshot[Binary status file]
+    Daemon --> Snapshot
     Daemon --> Cache[In-memory caches]
-    Daemon --> State[Atomic status and history files]
-    Daemon --> Backends[Native package backends and HTTPS registries]
-    Backends --> OS[Operating system and package databases]
+    Daemon --> State[JSON status snapshot]
+    CLI --> Backends[Native package backends]
+    Daemon --> Backends
+    Backends --> OS[Package databases and registries]
 ```
 
-The ASCII schematics below show the storage and backend boundaries in more detail.
+Simple `omg search` and `omg info` use a direct backend path. Other queries use `omgd` when it is running and the same direct backends when it is not. Prompt counters (`omg ec`, `omg tc`, `omg oc`, `omg uc`) read the 32-byte `omg.status` file beside the daemon socket when that file is fresh. Otherwise they ask the daemon, then the package backend. Reading the snapshot does not start a daemon.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              USER                                        │
-│                                │                                         │
-│                    ┌───────────┴───────────┐                            │
-│                    ▼                       ▼                            │
-│              ┌──────────┐           ┌──────────────┐                    │
-│              │ Primary  │           │ Speed-Light  │                    │
-│              │ CLI      │           │ Optimizer    │                    │
-│              └────┬─────┘           └──────┬───────┘                    │
-│                   │                        │                            │
-│                   │    Private Interface   │ Direct state read          │
-│                   ▼                        ▼                            │
-│              ┌────────────────────────────────────┐                     │
-│              │           System Daemon            │                     │
-│              │  ┌──────────────────────────────┐  │                     │
-│              │  │      Instant Access Layer    │  │                     │
-│              │  │  ┌─────────┐ ┌────────────┐  │  │                     │
-│              │  │  │  Active  │ │  Global    │  │  │                     │
-│              │  │  │  Cache   │ │  Index     │  │  │                     │
-│              │  │  └─────────┘ └────────────┘  │  │                     │
-│              │  └──────────────────────────────┘  │                     │
-│              │  ┌──────────────────────────────┐  │                     │
-│              │  │      Persistence Layer       │  │                     │
-│              │  │  ┌─────────┐ ┌────────────┐  │  │                     │
-│              │  │  │ Durable │ │ Binary     │  │  │                     │
-│              │  │  │ Storage │ │ Status     │  │  │                     │
-│              │  │  └─────────┘ └────────────┘  │  │                     │
-│              │  └──────────────────────────────┘  │                     │
-│              └────────────────┬───────────────────┘                     │
-│                               │                                         │
-│         ┌─────────────────────┼─────────────────────┐                   │
-│         │                     │                     │                   │
-│         ▼                     ▼                     ▼                   │
-│  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐             │
-│  │   Arch      │      │   Debian    │      │   Cloud     │             │
-│  │   Handler   │      │   Handler   │      │   Sources   │             │
-│  │  (Native)   │      │  (Native)   │      │   (HTTPS)   │             │
-│  └─────────────┘      └─────────────┘      └─────────────┘             │
-│         │                     │                     │                   │
-│         ▼                     ▼                     ▼                   │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    Operating System                              │   │
-│  │    Package DBs        Local Files        Remote Registries       │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+## Binaries
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              USER                                        │
-│                                │                                         │
-│                                ▼                                         │
-│              ┌──────────┐                                                │
-│              │ omg CLI  │                                                │
-│              └────┬─────┘                                                │
-│                   │                                                      │
-│                   │    Unix Socket IPC / direct status read              │
-│                   ▼                                                      │
-│              ┌────────────────────────────────────┐                     │
-│              │           omgd (Daemon)            │                     │
-│              │  ┌──────────────────────────────┐  │                     │
-│              │  │      In-Memory Caches        │  │                     │
-│              │  │  ┌─────────┐ ┌────────────┐  │  │                     │
-│              │  │  │  moka   │ │  Index     │  │  │                     │
-│              │  │  │  LRU    │ │  (Nucleo)  │  │  │                     │
-│              │  │  └─────────┘ └────────────┘  │  │                     │
-│              │  └──────────────────────────────┘  │                     │
-│              │  ┌──────────────────────────────┐  │                     │
-│              │  │        Persistence           │  │                     │
-│              │  │  ┌─────────┐ ┌────────────┐  │  │                     │
-│              │  │  │ Atomic  │ │ Binary     │  │  │                     │
-│              │  │  │  JSON   │ │ Status     │  │  │                     │
-│              │  │  └─────────┘ └────────────┘  │  │                     │
-│              │  └──────────────────────────────┘  │                     │
-│              └────────────────┬───────────────────┘                     │
-│                               │                                         │
-│         ┌─────────────────────┼─────────────────────┐                   │
-│         │                     │                     │                   │
-│         ▼                     ▼                     ▼                   │
-│  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐             │
-│  │   libalpm   │      │  rust-apt   │      │  AUR HTTP   │             │
-│  │   (Arch)    │      │  (Debian)   │      │   Client    │             │
-│  │   Direct    │      │  (Native)   │      │             │             │
-│  │   Bindings  │      │             │      │             │             │
-│  └─────────────┘      └─────────────┘      └─────────────┘             │
-│         │                     │                     │                   │
-│         ▼                     ▼                     ▼                   │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    Operating System                              │   │
-│  │    /var/lib/pacman    /var/lib/dpkg    <https://aur.archlinux.org│>   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
+| Binary | Role |
+| --- | --- |
+| `omg` | Arguments, package and runtime operations, policy, output, and the terminal dashboard |
+| `omgd` | In-memory indexes, background status refresh, and caches for repeated queries |
 
-```
+Native dependencies still vary by backend. Do not assume a static or dependency-free binary. See [installation](./installation.md).
 
----
+The CLI enforces security policy and formats output. It talks to `omgd` over a Unix socket when a daemon is running. Hot paths can skip the async runtime and read `omg.status` directly. That read is not a latency guarantee.
 
-## 📦 Binary Components
+The daemon keeps package indexes and status caches warm. It refreshes status every five minutes. Package transactions still run through the CLI and the selected backend.
 
-Release contents and native dependencies vary by platform and backend. Arch releases include the CLI and daemon; non-Arch release archives omit the daemon. Do not assume static linking or dependency-free portability. See [installation](./installation.md).
-
-### omg (The CLI)
-The primary user interface. It is designed for human interaction, providing rich colored output, progress bars, and interactive TUI elements. It handles argument parsing, security policy enforcement, and communicates with the background daemon via a high-performance Unix socket. Prompt counters (`omg ec|tc|oc|uc`) and other hot paths can bypass the async runtime and read the daemon's binary status snapshot. This establishes no universal latency bound.
-
-### omgd (The Daemon)
-The "brain" of the system. It runs as a lightweight background service that maintains an in-memory index of all system packages and language runtimes. It handles heavy lifting like background vulnerability scanning, metadata indexing, and complex dependency resolution.
-
-
-
----
-
-## 🔄 Data Flow
-
-### Search Request
+## Search
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant C as omg CLI
+    participant C as omg
+    participant B as Package backend
     participant D as omgd
-    participant S as Package sources
-    U->>C: omg search firefox
-    C->>D: Search request over Unix socket
-    alt cache hit
-        D-->>C: Cached result
-    else cache miss
-        D->>S: Query native index and remote sources
-        S-->>D: Matching packages
-        D->>D: Merge, rank, and cache
-        D-->>C: Search result
+    U->>C: omg search ripgrep
+    alt simple search
+        C->>B: Direct query
+        B-->>C: Matches
+    else daemon path
+        C->>D: Search over the Unix socket
+        alt cache hit
+            D-->>C: Cached result
+        else cache miss
+            D->>B: Native index and remote sources
+            B-->>D: Matches
+            D-->>C: Ranked result
+        end
     end
-    C-->>U: Format and display
+    C-->>U: Formatted output
 ```
 
-```
+On Arch, official and AUR searches run concurrently unless `--no-aur` is set. Debian and Ubuntu use APT. Fedora uses DNF and RPM. macOS uses Homebrew. See [package search](./package-search.md).
 
-User: omg search firefox
-         │
-         ▼
-    ┌─────────┐
-    │ omg CLI │ Parse args, create Request
-    └────┬────┘
-         │ Unix Socket
-         ▼
-    ┌─────────┐
-    │  omgd   │ Check moka cache
-    └────┬────┘
-         │ Cache miss
-         ▼
-    ┌──────────────────────────────────┐
-    │ Parallel Query                    │
-    │  ┌─────────┐    ┌─────────────┐  │
-    │  │ libalpm │    │ AUR HTTP    │  │
-    │  │  query  │    │   query     │  │
-    │  └────┬────┘    └──────┬──────┘  │
-    │       │                │         │
-    │       └───────┬────────┘         │
-    │               ▼                  │
-    │         Merge & Rank            │
-    │           (Nucleo)              │
-    └──────────────┬───────────────────┘
-                   │
-                   ▼
-             Update moka cache
-                   │
-                   ▼
-              Serialize Response
-                   │
-                   ▼
-              Return to CLI
-                   │
-                   ▼
-              Format & Display
-
-```
-
-### Runtime Switch
+## Runtime switch
 
 ```mermaid
 flowchart TD
-    A[omg use node 20.10.0] --> B{Version installed?}
+    A[omg use node 22] --> B{Version installed?}
     B -->|Yes| D[Select existing version]
-    B -->|No| C[Download and verify from upstream]
-    C --> E[Extract into OMG version tree]
+    B -->|No| C[Download and verify]
+    C --> E[Extract into the version tree]
     E --> D
-    D --> F[Update current selection]
+    D --> F[Update the current selection]
     F --> G[Shell hook updates PATH]
 ```
 
-```
+Versions live under `~/.local/share/omg/versions`. Unknown runtime names fail. OMG does not download another version manager. Pi installs through npm with lifecycle scripts disabled.
 
-User: omg use node 20.10.0
-         │
-         ▼
-    ┌─────────┐
-    │ omg CLI │ Detect runtime type
-    └────┬────┘
-         │
-         ▼
-    Check if installed
-         │
-    ┌────┴────┐
-    │ Yes     │ No
-    │         ▼
-    │    Download from
-    │    nodejs.org/dist
-    │         │
-    │    Extract to
-    │    versions/node/20.10.0
-    │         │
-    └────┬────┘
-         │
-         ▼
-    Update symlink
-    versions/node/current → 20.10.0
-         │
-         ▼
-    Shell hook updates PATH
+## Package backends
 
-```
+| Platform | Integration |
+| --- | --- |
+| Arch | `libalpm` for local and sync databases, plus an HTTPS AUR client |
+| Debian and Ubuntu | Native APT |
+| Fedora | DNF and RPM database reads, with subprocess fallbacks |
+| macOS | Homebrew |
 
----
+Library bindings avoid a native CLI subprocess on those paths. Command time still depends on the backend, sources, and cache. See [benchmarks](../benchmarks/README.md).
 
-## 🧩 Package Manager Integration
+## Caches
 
-OMG interacts with system package managers using direct library bindings whenever possible to avoid the overhead of spawning subprocesses.
+1. **In-memory.** Recent searches, package details, and status, kept in a concurrent cache inside `omgd`.
+2. **JSON snapshot.** `status-cache.json`, written with a same-directory temporary file, `fsync`, and atomic rename. Transaction history and the audit log are separate files.
+3. **Binary status.** `omg.status` next to the socket. It is 32 bytes: magic, version, four counts, and a timestamp. Prompt counters read it without a daemon request when it is fresh. Readers reject snapshots older than five minutes.
 
-### Arch Linux (libalpm)
-The `ArchPackageManager` implementation uses direct FFI bindings to `libalpm` (via the `alpm` crate). This allows OMG to perform package searches, dependency resolution, and transaction management directly within the process memory space, bypassing the `pacman` CLI entirely. This avoids a subprocess on those paths. End-to-end latency still depends on the command, sources, and cache state.
+Search indexes are rebuilt from native package databases. They are not durable authority.
 
----
+## IPC
 
-## 💾 Caching Strategy
+- Transport is a Unix domain socket.
+- Frames are length-delimited.
+- Payloads use bitcode, with a version prefix on every frame.
 
-OMG uses a multi-tier caching architecture to eliminate the latency typically associated with package managers.
+Requests include search, package info, status, security audit, explicit packages, and health checks. See [IPC](./ipc.md).
 
-### 1. In-Memory (moka)
-The hottest data (recent searches, package details, system status) is kept in a concurrent, high-performance memory cache. This allows multiple CLI instances to share results instantly without hitting the disk.
+## Security boundaries
 
-### 2. Persistent snapshots
-The daemon persists its latest status snapshot as versioned JSON using a same-directory temporary file, `fsync`, and atomic rename. Transaction history and the hash-chained audit log are separate owner-only files; package search indexes are rebuilt from native package-manager databases rather than treated as durable authority.
+There is no single pipeline that runs PGP, SLSA, vulnerability scanning, and policy checks for every download. Package transactions use backend-specific verification. Runtime downloads use provider-specific integrity checks. Explicit policies are enforceable against ALPM's prepared transaction. Native APT, DNF, and Homebrew install and upgrade paths refuse explicit policy instead of claiming the same enforcement.
 
-### 3. Binary Status
-A specialized binary status file is maintained by the daemon to store your system's "vital signs" (update counts, error status). Prompt counters (`omg ec|tc|oc|uc`) can read this snapshot without a daemon request; fallback behavior depends on snapshot availability and backend.
+`omg audit slsa` checks a supported artifact signature. It does not return a SLSA build level. See [security](./security.md).
 
----
+The audit log is `~/.local/share/omg/audit/audit.jsonl`. `omg audit verify` checks the local hash chain.
 
-## 🔌 IPC Protocol
+## Background work
 
-### Transport
+Every five minutes the daemon probes installed runtime versions, refreshes vulnerability counts where that scan is supported, updates the in-memory status cache, writes `omg.status`, and atomically replaces the JSON status snapshot. Arch advisory matching applies to Arch packages.
 
-- **Socket:** Unix Domain Socket
-- **Framing:** Length-Delimited via `LengthDelimitedCodec`
-- **Serialization:** `bitcode` (high-performance binary serialization)
+On SIGINT or SIGTERM the daemon finishes active client requests, stops workers, stops accepting connections, removes the socket, and exits. Restart it with `omg daemon`. Derived caches fill again as requests arrive.
 
-### Message Types
+## Related pages
 
-The protocol supports a wide range of structured requests and responses:
-
-*   **Search**: Query for packages with optional limits.
-*   **Info**: Retrieve detailed metadata for a specific package.
-*   **Status**: Get the current system "vital signs" (package counts, updates).
-*   **SecurityAudit**: Trigger a vulnerability scan across installed packages.
-*   **Explicit**: List packages installed by the user.
-*   **System Controls**: Commands for cache management, pings, and health checks.
-
-### Performance
-
-- **Measurements**: See [benchmark methodology and records](../benchmarks/README.md). Serialization microbenchmarks do not establish full command latency.
-- **Efficiency**: Persistent connections can issue multiple individually framed requests without a duplicate batch protocol.
-
----
-
-## 🔧 Runtime Management Architecture
-
-OMG provides a shared runtime-manager interface. Providers differ in installation, version discovery, platform availability, and upstream tooling. Shared command syntax does not make those behaviors identical.
-
-### Version Storage
-All runtimes are stored in your home directory (`~/.local/share/omg/versions`), ensuring you never need `sudo` to switch a Node.js version and your system-wide packages remain untouched.
-
-### Resolution Strategy
-OMG supports only its native runtime managers. Unknown runtime names fail explicitly rather than downloading or invoking a fallback manager. Pi releases are installed with npm into OMG's version tree using lifecycle scripts disabled, then activated atomically like other runtimes.
-
----
-
-## 🛡️ Security Architecture
-
-### Verification paths
-
-There is no universal pipeline that runs PGP, SLSA, vulnerability scanning, and policy checks for every download. Package transactions use backend-specific verification. Runtime downloads use provider-specific integrity paths. Explicit policies are enforceable against ALPM's prepared transaction; native APT, DNF, and Homebrew install and upgrade paths refuse explicit policy instead of claiming equivalent enforcement.
-
-`omg audit slsa` is a separate supported-artifact-signature check. `--certificate-identity` optionally binds the Fulcio signer identity; when omitted, a valid signature is reported as unbounded. It returns no SLSA build level and does not verify in-toto provenance. Release archive attestations are verified separately by GitHub CLI. See [security architecture and limits](./security.md).
-
-### Audit Log
-
-Hash-chained, tamper-evident logging:
-- Location: `~/.local/share/omg/audit/audit.jsonl`
-- Format: JSON Lines
-- Each entry contains hash of previous entry
-- Integrity verifiable with `omg audit verify`
-
----
-
-## 📊 Background Workers
-
-### Status Refresh Worker
-
-Runs every 300 seconds:
-1. Probe all runtime versions
-2. Count vulnerabilities
-3. Generate system status
-4. Update moka cache
-5. Write binary status file
-6. Atomically persist the versioned JSON status snapshot
-
-### ALSA Scanner (Optional)
-
-When enabled, periodically:
-1. Fetch ALSA issues from security.archlinux.org
-2. Match against installed packages
-3. Update daemon status with CVE count
-
----
-
-## 🔄 Graceful Shutdown
-
-```mermaid
-flowchart TD
-    A[SIGINT or SIGTERM] --> B[Broadcast shutdown signal]
-    B --> C[Finish active client requests]
-    B --> D[Stop background workers]
-    B --> E[Stop accepting IPC requests]
-    C --> F[Remove socket and flush state]
-    D --> F
-    E --> F
-    F --> G[Exit]
-```
-
-```
-
-SIGINT/SIGTERM
-      │
-      ▼
-┌─────────────────┐
-│ Broadcast       │ Send shutdown signal
-│ Channel         │
-└────────┬────────┘
-         │
-    ┌────┴────┬────────────┐
-    ▼         ▼            ▼
-Client    Background    IPC
-Tasks     Workers       Server
-    │         │            │
-    │ Finish  │ Stop       │ Stop
-    │ request │ loop       │ accept
-    │         │            │
-    └────┬────┴────────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Clean up socket │
-└─────────────────┘
-         │
-         ▼
-      Exit
-
-```
-
----
-
-## 📚 Deep Dives
-
-For detailed documentation on specific subsystems:
-
-- [Daemon Internals](./daemon.md)
-- [IPC Protocol](./ipc.md)
-- [Caching System](./cache.md)
-- [Package Search](./package-search.md)
-- [Runtime Management](./runtimes.md)
-- [CLI Reference](./cli.md)
-- [Security & Audit](./security.md)
+- [Daemon](./daemon.md)
+- [IPC](./ipc.md)
+- [Cache](./cache.md)
+- [Package search](./package-search.md)
+- [Runtimes](./runtimes.md)
+- [CLI reference](./cli.md)
+- [Security](./security.md)

@@ -6,9 +6,14 @@ description: Background service lifecycle, IPC, and state management
 
 # Daemon Internals (omgd)
 
+**In plain words:** The daemon is a small helper program that stays in the background so that repeat commands answer faster. It is optional: OMG works without it.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 The OMG daemon keeps package indexes in memory. Most package queries have direct fallback paths; latency depends on the backend, query, cache state, and enabled sources. Vulnerability scans, Unix SOC 2 export, and metrics require a running daemon. Other audit commands have separate backend requirements. See [security coverage](./security.md).
 
-## 🚀 Daemon Lifecycle
+## Daemon Lifecycle
 
 ### 1. Initialization and Socket Setup
 
@@ -16,7 +21,7 @@ When the daemon starts, it resolves its operating environment and establishes a 
 
 - **Socket Resolution**: It identifies the optimal path for the Unix socket in this order: `$OMG_SOCKET_PATH` override, `$XDG_RUNTIME_DIR/omg.sock`, `/run/user/<uid>/omg.sock`, `/tmp/omg-<uid>/omg.sock`, and finally a user-private `<data-dir>/run/omg.sock` used only when the `/tmp` fallback exists but fails validation (e.g. pre-created by another local user).
 - **Cleanup and Bind**: It ensures a fresh start by removing any stale socket files and binding with strict `0600` permissions (user read/write only). The parent directory is created mode `0700` and is enforced on bind and connect to be a real non-symlink directory owned by the current uid with no group/world bits.
-- **Detached Launch**: `omg daemon` (no subcommands) discards stdout and stderr. Run `omg daemon --foreground`, `omgd` directly, or a service manager configured to capture output when you need logs. Both launch modes require a separate matching `omgd` executable; current non-Arch release archives omit it. For daemon status, use `omg daemon-status`; `omg audit` (scan and compliance export) and `omg metrics` require a running daemon.
+- **Detached launch**: `omg daemon` discards stdout and stderr. Run `omg daemon --foreground`, `omgd` directly, or a service manager configured to capture output when you need logs. Both launch modes require a matching `omgd` executable. Current Linux and macOS release archives include that pair. Archives from v0.1.222 and earlier omit `omgd` on non-Arch targets. For daemon status, use `omg daemon-status`. `omg audit scan`, compliance export, and `omg metrics` require a running daemon.
 
 ### 2. State Management
 
@@ -37,7 +42,7 @@ A dedicated worker thread handles ongoing system maintenance without interruptin
 
 ---
 
-## 🛰️ Request Processing
+## Request Processing
 
 Every request from the CLI or third-party tools is processed through a structured execution pipeline:
 
@@ -55,7 +60,7 @@ Requests are automatically routed to specialized handlers based on their type:
 
 ---
 
-## 🔒 Reliability and Failure Recovery
+## Reliability and Failure Recovery
 
 Recovery mechanisms include:
 

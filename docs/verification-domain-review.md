@@ -1,5 +1,9 @@
 # Behavioral domain review
 
+> **Who this page is for:** OMG maintainers and contributors. It documents a dated verification review.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 This ledger reviews the requirements behind provisional inventory gaps. A reviewed
 surface earns execution credit only when all its owning contracts pass admission
 for the current source and platform. This document does not set the global

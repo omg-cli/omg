@@ -6,6 +6,11 @@ description: Package verification, SBOM scope, audit logging, and export limitat
 
 # Security model
 
+**In plain words:** This page describes the checks OMG performs, which of them depend on your operating system, and what its reports do not prove.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 OMG provides package verification, vulnerability reports, secret scanning, and local audit records. These controls do not prove that software is safe or that an organization meets a compliance framework. Capabilities depend on the compiled backend and the command path.
 
 The evidence path has explicit boundaries at each step:
@@ -49,7 +54,7 @@ Run the daemon in a separate terminal, then scan:
 omg audit scan
 ```
 
-The scan requires the Unix daemon and a matching `omgd` executable. Current non-Arch release archives omit `omgd`; see [installation requirements](./installation.md#daemon-requirements). Arch Linux Security Advisory data is specific to Arch packages. OSV queries depend on ecosystem and version matching. Missing findings are not proof that a package is free of vulnerabilities. Do not treat Arch advisory matching as Debian, Fedora, or macOS vulnerability coverage.
+The scan requires the Unix daemon and a matching `omgd` executable. Current Linux and macOS release archives include that pair. Archives from v0.1.222 and earlier omit `omgd` on non-Arch targets. See [installation requirements](./installation.md#daemon-requirements). Arch Linux Security Advisory data is specific to Arch packages. OSV queries depend on ecosystem and version matching. Missing findings are not proof that a package is free of vulnerabilities. Do not treat Arch advisory matching as Debian, Fedora, or macOS vulnerability coverage.
 
 The scan prints findings but does not return a failing exit status merely because it found vulnerabilities. Its human-readable output is not a documented JSON alert interface. `omg audit fix --dry-run` previews available package updates on the Arch backend; an available update is not proof that every advisory is fixed.
 

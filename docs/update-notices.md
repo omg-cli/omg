@@ -1,5 +1,10 @@
 # Built-in update notices
 
+**In plain words:** How OMG tells you that a newer version exists, when it checks, and how to silence the notice.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 After a successful interactive OMG command, OMG checks its local update cache
 and can advise you to run `omg self-update`. Shell integration is not required.
 Existing `omg hook bash`, `omg hook zsh`, and `omg hook fish` integrations can

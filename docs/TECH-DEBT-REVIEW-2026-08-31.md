@@ -1,5 +1,9 @@
 # Extreme Technical Review — 2026-08-31
 
+> **Who this page is for:** OMG maintainers and contributors. It documents a dated technical-debt review.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 90 AI reviewers (18 waves × 5 agents, GLM via ollama-cloud, max thinking),
 each with a distinct scope + lens, cross-checked against live upstream
 research of the archlinux/alpm alpha-crate ecosystem. Full per-agent reports:

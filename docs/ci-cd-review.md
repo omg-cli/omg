@@ -1,5 +1,9 @@
 # CI/CD and QEMU delivery review
 
+> **Who this page is for:** OMG maintainers and contributors. It documents a dated review of the continuous-integration setup.
+> It is not an everyday user guide. If you are new to OMG, start with
+> [Getting started](./getting-started.md).
+
 Security is the primary constraint on delivery performance. Optimizations must
 preserve test coverage, credential boundaries, and verifiable release provenance.
 This review covers OMG and its companion website. Findings and implementation

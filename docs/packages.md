@@ -6,13 +6,18 @@ description: Search, install, update, and remove packages
 
 # Package Management
 
+**In plain words:** Packages are the programs installed on your computer. This page shows how to search for them, install them, update them, and remove them, and what a preview does not promise.
+
+> New to the terminal? Read [Getting started](./getting-started.md) and keep
+> [the glossary](./glossary.md) open while you work.
+
 **Complete Guide to Searching, Installing, and Managing Packages**
 
 OMG has supported backends for Arch, Debian/Ubuntu, Fedora, and macOS, with platform-specific coverage and limitations. AUR support is Arch-specific. Release availability and backend limitations are listed in [installation](./installation.md).
 
 ---
 
-## 🎯 Overview
+## Overview
 
 OMG's package management features:
 
@@ -24,7 +29,7 @@ OMG's package management features:
 
 ---
 
-## 🔍 Package Search
+## Package Search
 
 ### Basic Search
 
@@ -60,7 +65,7 @@ omg search vsc
 
 ---
 
-## 📦 Package Installation
+## Package Installation
 
 ### Install Packages
 
@@ -111,7 +116,7 @@ enable_sccache = false
 
 ---
 
-## 🗑️ Package Removal
+## Package Removal
 
 ### Remove Packages
 
@@ -134,7 +139,7 @@ omg remove pkg1 pkg2 pkg3
 
 ---
 
-## 🔄 System Updates
+## System Updates
 
 ### Update Packages
 
@@ -189,7 +194,7 @@ Info-query timings depend on backend, cache state, and remote metadata. Search b
 
 ---
 
-## 📋 Package Listings
+## Package Listings
 
 ### Explicitly Installed Packages
 
@@ -217,7 +222,7 @@ Shows:
 
 ---
 
-## 🧹 Cleanup
+## Cleanup
 
 ### Clean Caches
 
@@ -243,7 +248,7 @@ omg sync
 
 ---
 
-## 🔐 Security Features
+## Security Features
 
 ### Security Grades
 
@@ -292,7 +297,7 @@ omg audit
 
 ---
 
-## 📜 Transaction History
+## Transaction History
 
 ### View History
 
@@ -322,7 +327,7 @@ omg rollback <transaction-id>
 
 ---
 
-## 🌐 Mirror Management
+## Mirror Management
 
 ### Pacman Mirrors
 
@@ -334,7 +339,7 @@ Default AUR endpoint: `https://aur.archlinux.org`
 
 ---
 
-## 💨 Performance Tips
+## Performance Tips
 
 ### 1. Use the Daemon
 
@@ -368,7 +373,7 @@ omg install pkg3
 
 ---
 
-## 🐧 Platform Support
+## Platform Support
 
 ### Backend and release matrix
 
@@ -398,7 +403,7 @@ Cargo features are additive; `--features debian` does not remove the default Arc
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 ### Search Returns Nothing
 
@@ -439,7 +444,7 @@ ls -la $XDG_RUNTIME_DIR/omg.sock
 
 ---
 
-## 📚 See Also
+## See Also
 
 - [CLI Reference](./cli.md) — All package commands
 - [Security & Compliance](./security.md) — Security grading details

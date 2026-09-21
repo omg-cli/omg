@@ -7,6 +7,11 @@ description: Command mapping and migration guide from yay to OMG
 
 # Migrating from yay
 
+**In plain words:** If you used the yay helper before, this page maps the commands you already know to their OMG equivalents and states plainly where the behaviour differs.
+
+> New to the terminal? Read [Getting started](../getting-started.md) and keep
+> [the glossary](../glossary.md) open while you work.
+
 This guide helps yay users transition to OMG with familiar command patterns and enhanced capabilities.
 
 ## Why Migrate?
@@ -19,7 +24,7 @@ This guide helps yay users transition to OMG with familiar command patterns and 
 | Team Sync | ❌ | ✅ Environment lockfiles |
 | Language | Go | Rust, with native-tool subprocesses on some paths |
 
-Core workflows are ready for evaluation. Keep yay and pacman available while validating your required workflows. Comparisons above describe command intent, not complete feature equivalence. See [benchmark scope](../../benchmarks/README.md) and [security limits](../security.md).
+OMG is approaching beta. Keep yay and pacman available while validating your required workflows. Comparisons above describe command intent, not complete feature equivalence. See [benchmark scope](../../benchmarks/README.md) and [security limits](../security.md).
 
 ## Command Mapping
 
