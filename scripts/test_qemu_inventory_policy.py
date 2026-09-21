@@ -70,9 +70,12 @@ class PolicyTests(unittest.TestCase):
 
     def test_published_and_current_network_dependencies_are_explicit(self):
         rules = json.loads((ROOT / "tests/qemu-inventory-policy.json").read_text())
+        current = hashlib.sha256((ROOT / "tests/cli_behavior_inventory.tsv").read_bytes()).hexdigest()
+        cases = {case['id']: case for case in rules['inventories'][current]['cases']}
+        self.assertEqual(cases['audit-sbom-offline']['network_scope'], 'offline')
         for inventory in rules["inventories"].values():
             cases = {case["id"]: case for case in inventory["cases"]}
-            for identity in ("doctor", "update", "audit-sbom", "runtime-python-install", "container-list"):
+            for identity in ("doctor", "update", "runtime-python-install", "container-list"):
                 self.assertEqual(cases[identity]["network_scope"], "network")
                 self.assertTrue(cases[identity]["network_reason"])
             self.assertEqual(cases["info"]["network_scope"], "offline")

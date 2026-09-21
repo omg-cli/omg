@@ -73,6 +73,25 @@ def parser_fixture():
 
 
 class NativeReceipts(unittest.TestCase):
+    def test_reviewed_cli_fault_contracts_are_admitted_without_general_fault_credit(self):
+        manifest, provenance, report, _ = parser_fixture()
+        actual = json.loads((Path(__file__).resolve().parents[1] / 'tests/contracts/manifest.json').read_text())
+        contracts = [c for c in actual['contracts'] if any(
+            b['lane'] == 'native-cli-fixture' and 'fault' in b['evidence'] for b in c['tests'])]
+        self.assertEqual(len(contracts), 8)
+        manifest['contracts'] = contracts
+        provenance.update(platform='arch', features=['arch', 'pgp', 'license'], lane='native-cli-fixture')
+        execution = report['tests']['install-dry-run-state']
+        report['tests'] = {b['id']: execution for c in contracts for b in c['tests']}
+        rows, required = NATIVE.behavior_receipts(manifest, provenance, report)
+        self.assertEqual(len(required), 8)
+        self.assertTrue(all('fault' in row['evidence'] for row in rows))
+        unrelated = 'omg::e2e_runtime_management::test_detect_nvmrc'
+        contracts[0]['tests'][0]['id'] = unrelated
+        report['tests'][unrelated] = execution
+        with self.assertRaisesRegex(ValueError, 'unsupported fixture evidence'):
+            NATIVE.behavior_receipts(manifest, provenance, report)
+
     def test_fault_and_concurrency_receipts_require_reviewed_daemon_owners(self):
         for name, kind in (
             ('concurrent_pings_preserve_boundary_ids_and_backend_state', 'concurrency'),

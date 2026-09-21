@@ -55,6 +55,17 @@ BEHAVIOR_TESTS = frozenset({
         'capture_without_package_backend_refuses_without_creating_or_overwriting_lockfile'))
 
 
+CLI_FAULT_TESTS = frozenset({
+    'omg::cli_comprehensive::system_tests::config_access_errors_never_report_missing_or_valid_defaults',
+    'omg::cli_comprehensive::system_tests::config_reset_preserves_backup_and_refuses_backup_failure',
+    'omg::cli_comprehensive::system_tests::config_values_round_trip_and_rejected_writes_preserve_state',
+    'omg::security_daemon_optional::audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_it',
+    'omg::security_daemon_optional::audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_history',
+    'omg::security_daemon_optional::sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure',
+    'omg::security_daemon_optional::security_scan_without_daemon_preserves_inventory_errors_and_recovers',
+})
+
+
 DAEMON_TESTS = frozenset('omg::coverage_18::' + name for name in (
     'security_audit_backend_failure_cannot_report_a_clean_scan',
     'debian_search_preserves_catalog_limits_cache_and_refusal_over_real_ipc',
@@ -180,6 +191,8 @@ def execution_receipts(manifest, provenance, report, *, behavior):
                 allowed = {'success', 'state', 'refusal'}
                 if provenance['lane'] == 'native-daemon-fixture':
                     allowed |= {'fault', 'concurrency'}
+                elif binding['id'] in CLI_FAULT_TESTS:
+                    allowed.add('fault')
                 require(set(binding['evidence']) <= allowed, 'unsupported fixture evidence')
             else:
                 require(binding['evidence'] == ['parser'], 'nonparser binding')
