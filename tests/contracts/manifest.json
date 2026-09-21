@@ -4,6 +4,26 @@
   "inventory_source": "Baseline compiled artifacts CI 35540033061 at e689113c; reviewed additive counter grammar from local Arch compilation; unchanged grammar verified, other owner schemas must match on hosted compilation",
   "contracts": [
     {
+      "id": "omg.config.reset.linked-backup.fixture",
+      "source": "src/cli/config.rs",
+      "binary": "omg",
+      "surface": "omg config reset",
+      "platforms": ["arch", "debian", "debian-trixie", "ubuntu", "fedora"],
+      "requires": ["success", "state"],
+      "critical": true,
+      "assertions": {
+        "success": ["reset-succeeds-with-existing-linked-backup"],
+        "state": ["symlink-target-bytes-preserved", "hardlink-target-bytes-preserved", "backup-is-regular-owner-only-file", "backup-matches-original-configuration"]
+      },
+      "scope": "Unprivileged real CLI with isolated configuration and external sentinel files. Covers replacement of pre-existing backup symlinks and hard links without changing their targets, exact backup bytes and mode 0600. This is not native package transactions evidence. Does not claim parent-directory race safety, concurrent reset/write or crash recovery; broader gaps remain.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::cli_comprehensive::system_tests::config_reset_backup_never_overwrites_a_linked_external_file",
+        "evidence": ["success", "state"],
+        "assertions": ["reset-succeeds-with-existing-linked-backup", "symlink-target-bytes-preserved", "hardlink-target-bytes-preserved", "backup-is-regular-owner-only-file", "backup-matches-original-configuration", "fixture-cleanup"]
+      }]
+    },
+    {
       "id": "omg.config.reset.backup.fixture",
       "source": "src/cli/config.rs",
       "binary": "omg",

@@ -364,6 +364,7 @@ class NativeReceipts(unittest.TestCase):
         mapped = [contract for contract in manifest['contracts']
                   if any(binding['lane'] == 'native-cli-fixture' for binding in contract['tests'])]
         self.assertEqual({contract['id'] for contract in mapped}, {
+            'omg.config.reset.linked-backup.fixture',
             'omg.config.reset.backup.fixture',
             'omg.config.set.persistence.fixture',
             'omg.audit.sbom.empty-recovery.fixture',
