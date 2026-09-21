@@ -92,7 +92,9 @@ fn security_scan_without_daemon_preserves_inventory_errors_and_recovers() -> any
             .stdout
             .contains("No vulnerabilities found in scanned packages.")
     );
+    assert_eq!(std::fs::read(&path)?, clean, "scan changed the inventory");
     project.run(&["audit", "fix", "--dry-run"]).assert_success();
+    assert_eq!(std::fs::read(&path)?, clean, "dry-run changed the inventory");
     for args in [vec!["audit", "scan"], vec!["audit", "fix", "--dry-run"]] {
         std::fs::write(&path, b"{broken")?;
         let failed = project.run(&args);
@@ -106,6 +108,11 @@ fn security_scan_without_daemon_preserves_inventory_errors_and_recovers() -> any
         assert_eq!(std::fs::read(&path)?, b"{broken");
         std::fs::write(&path, clean)?;
         project.run(&args).assert_success();
+        assert_eq!(
+            std::fs::read(&path)?,
+            clean,
+            "recovered command {args:?} changed the inventory"
+        );
     }
     assert_eq!(std::fs::read(&path)?, clean);
     project.close_checked();
