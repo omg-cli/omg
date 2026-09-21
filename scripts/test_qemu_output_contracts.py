@@ -125,6 +125,42 @@ class OutputContracts(unittest.TestCase):
                     self.assertIn('npm-probe-failed', logs['runtime-node-install.log'])
                     self.assertIn('exit=17', logs['runtime-node-install.log'])
 
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_go_install_rejects_success_without_compiler(self):
+        rows = ['runtime-go-install\t["use","go","1.27.1"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        result, evidence, logs = self.run_inventory('echo Installed Go\n', rows)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'FAIL')
+        self.assertIn('assertion failed: Go', logs['runtime-go-install.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_go_install_requires_build_program_and_test_effects(self):
+        rows = ['runtime-go-install\t["use","go","1.27.1"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        for fault in ('inactive', 'escaped', 'version-only', 'build-noop', 'wrong-program', 'test-noop', 'test-failure', 'none'):
+            with self.subTest(fault=fault):
+                # Fake compiler models admission only; the actual compiler
+                # runs this exact oracle separately on each supported distro.
+                program = '#!/bin/sh\necho ' + ('wrong' if fault == 'wrong-program' else 'OMG_GO_RUNTIME_OK:go1.27.1') + '\n'
+                build = 'exit 0' if fault == 'build-noop' else f'printf %s {shlex.quote(program)} > probe; chmod 755 probe'
+                test = {'test-noop': 'echo "--- PASS: TestProbe (0.00s)"',
+                        'test-failure': 'echo failing-test >&2; exit 17'}.get(fault,
+                            'echo go-test-executed > test-complete; echo "--- PASS: TestProbe (0.00s)"')
+                compiler = f'#!/bin/sh\ncase "$1" in\nenv) printf "%s\\ngo1.27.1\\n" "$GOROOT";;\nbuild) {build};;\ntest) {test};;\n*) exit 23;;\nesac\n'
+                if fault == 'version-only':
+                    compiler = '#!/bin/sh\necho go1.27.1\n'
+                product = 'base="$OMG_DATA_DIR/versions/go"\nmkdir -p "$base/1.27.1/bin"\n'
+                product += f'printf %s {shlex.quote(compiler)} > "$base/1.27.1/bin/go"\nchmod 755 "$base/1.27.1/bin/go"\n'
+                if fault != 'inactive':
+                    product += 'ln -s 1.27.1 "$base/current"\n'
+                if fault == 'escaped':
+                    product += 'mv "$base/1.27.1/bin/go" "$OMG_DATA_DIR/external"\nln -s "$OMG_DATA_DIR/external" "$base/1.27.1/bin/go"\n'
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual(result.returncode, 0 if fault == 'none' else 1, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'PASS' if fault == 'none' else 'FAIL')
+                if fault == 'test-failure':
+                    self.assertIn('exit=17', logs['runtime-go-install.log'])
+                    self.assertIn('failing-test', logs['runtime-go-install.log'])
+
     def generated_hooks(self):
         source = (ROOT / 'src/cli/git_hooks.rs').read_text(encoding='utf-8')
         return {name: (re.search(r'const ' + constant + r': &str = r#"(.*?)"#;', source, re.S).group(1), 0o755)

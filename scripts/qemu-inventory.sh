@@ -51,6 +51,74 @@ check_native_counter() {
   [[ "$actual" =~ ^[0-9]+$ && "$actual" == "$expected" ]]
 }
 
+check_go_install() (
+  local version=$1 base expected active executable fixture observed status
+  base="$OMG_DATA_DIR/versions/go"
+  expected="$base/$version"
+  active=$(readlink -f "$base/current") || active=""
+  executable=$(readlink -f "$base/current/bin/go") || executable=""
+  if [[ "$active" != "$expected" || ! -L "$base/current" || -L "$expected" \
+        || "$executable" != "$expected/bin/go" || ! -f "$executable" || ! -x "$executable" ]]; then
+    printf 'assertion failed: Go %s lacks an active confined compiler\n' "$version" >&2; return 1
+  fi
+  fixture=$(mktemp -d "$base/.qemu-go-XXXXXX") || return 1
+  trap 'rm -rf -- "$fixture"' EXIT
+  export GOROOT="$expected" GOTOOLCHAIN=local GOENV=off GOWORK=off GOPROXY=off GOSUMDB=off CGO_ENABLED=0 GOMAXPROCS=2
+  export GOPATH="$fixture/gopath" GOCACHE="$fixture/gocache" GOMODCACHE="$fixture/modcache"
+  unset GOFLAGS GOOS GOARCH
+  cd "$fixture" || return 1
+  status=0
+  observed=$(timeout --kill-after=2s 10 "$executable" env GOROOT GOVERSION 2>&1) || status=$?
+  if [[ "$status" != 0 || "$observed" != "$expected"$'\n'"go$version" ]]; then
+    printf 'assertion failed: Go toolchain identity exit=%s observed=%s\n' "$status" "$observed" >&2; return 1
+  fi
+  printf 'module example.invalid/omg-probe\n\ngo 1.27\n' > go.mod
+cat > main.go <<'GO'
+package main
+import("bytes";"compress/gzip";"crypto/sha256";"encoding/hex";"encoding/json";"fmt";"io";"runtime")
+func probe() error {
+  hash:=sha256.Sum256([]byte("abc"))
+  if hex.EncodeToString(hash[:])!="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" {return fmt.Errorf("digest mismatch")}
+  var compressed bytes.Buffer
+  writer:=gzip.NewWriter(&compressed)
+  if _,err:=writer.Write([]byte("omg-go"));err!=nil{return err}; if err:=writer.Close();err!=nil{return err}
+  reader,err:=gzip.NewReader(&compressed);if err!=nil{return err}
+  raw,err:=io.ReadAll(reader);if err!=nil{return err};if err:=reader.Close();err!=nil{return err}
+  if string(raw)!="omg-go" {return fmt.Errorf("compression mismatch")}
+  data,err:=json.Marshal(map[string]int{"answer":42});if err!=nil{return err}
+  var parsed map[string]int;if err:=json.Unmarshal(data,&parsed);err!=nil{return err}
+  channel:=make(chan int);go func(){channel<-parsed["answer"]}()
+  if <-channel!=42{return fmt.Errorf("channel result mismatch")}
+  return nil
+}
+func main(){if err:=probe();err!=nil{panic(err)};fmt.Println("OMG_GO_RUNTIME_OK:"+runtime.Version())}
+GO
+cat > main_test.go <<'GO'
+package main
+import ("testing"; "os")
+func TestProbe(t *testing.T){if err:=probe();err!=nil{t.Fatal(err)};if err:=os.WriteFile("test-complete",[]byte("go-test-executed"),0600);err!=nil{t.Fatal(err)}}
+GO
+  status=0
+  timeout --kill-after=5s 120 "$executable" build -p 2 -o probe . > stage.log 2>&1 || status=$?
+  if [[ "$status" != 0 || ! -x probe ]]; then
+    printf 'assertion failed: Go compilation exit=%s\n' "$status" >&2; cat stage.log >&2; return 1
+  fi
+  status=0
+  observed=$(timeout --kill-after=2s 10 ./probe 2>&1) || status=$?
+  if [[ "$status" != 0 || "$observed" != "OMG_GO_RUNTIME_OK:go$version" ]]; then
+    printf 'assertion failed: Go compiled program exit=%s observed=%s\n' "$status" "$observed" >&2; return 1
+  fi
+  status=0
+  timeout --kill-after=5s 120 "$executable" test -p 2 -count=1 -timeout=10s -v . > stage.log 2>&1 || status=$?
+  if [[ "$status" != 0 || ! -f test-complete || $(cat test-complete 2>/dev/null) != go-test-executed ]] \
+      || ! grep -q '^--- PASS: TestProbe (' stage.log; then
+    printf 'assertion failed: Go test execution exit=%s\n' "$status" >&2; cat stage.log >&2; return 1
+  fi
+  cd "$base" || return 1
+  rm -rf -- "$fixture" || return 1
+  if [[ -e "$fixture" || -L "$fixture" ]]; then printf 'assertion failed: Go fixture cleanup\n' >&2; return 1; fi
+)
+
 check_node_install() {
   local version=$1 base expected active executable npm output status=0
   base="$OMG_DATA_DIR/versions/node"
@@ -443,6 +511,9 @@ while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
   if [[ "$id" == runtime-node-install ]]; then
     jq -e 'length == 3 and .[0] == "use" and .[1] == "node" and (.[2] | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$aj" >/dev/null || exit 2
   fi
+  if [[ "$id" == runtime-go-install ]]; then
+    jq -e 'length == 3 and .[0] == "use" and .[1] == "go" and (.[2] | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$aj" >/dev/null || exit 2
+  fi
 done < <(tail -n +2 "$tsv")
 
 # Replay only prerequisites permitted by the same target and safety gates.
@@ -574,7 +645,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ -n "$counter" ]]; then
     remote+="; $(declare -f check_native_counter)"
   fi
-  if [[ "$case" == runtime-python-install || "$case" == runtime-node-install ]]; then
+  if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then
     runtime_version=$(jq -r '.[2]' <<< "$args_json")
     runtime_name=$(jq -r '.[1]' <<< "$args_json")
     remote+="; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install")"
@@ -586,7 +657,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_native_counter '$distro' '$counter' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: counter fixture cleanup failed\\n' >&2; assertion=1; fi"
   fi
-  if [[ "$case" == runtime-python-install || "$case" == runtime-node-install ]]; then
+  if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then
     remote+="; if [ \"\$rc\" = 0 ] && ! check_${runtime_name}_install '$runtime_version'; then assertion=1; fi"
     remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: runtime fixture cleanup failed\\n' >&2; assertion=1; fi"
   fi
@@ -604,7 +675,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   transport=0
   budget=$(( (row_timeout + 5) * (${#chain[@]} + 1) + 15 ))
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
-  if [[ "$case" == runtime-python-install || "$case" == runtime-node-install ]]; then budget=$((budget + 74)); fi
+  if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then budget=$((budget + 74)); fi
+  if [[ "$case" == runtime-go-install ]]; then budget=$((budget + 210)); fi
   timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
   elapsed=$((SECONDS - start))
   verdict=HARNESS_ERROR; rc=$transport

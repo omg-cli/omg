@@ -19,4 +19,6 @@ The real OMG debug binaries installed Go1.27.1 as an unprivileged user on all fo
 - Debian `/home/omg-audit/omg-go-behavior.GDXZzv`
 - Fedora `/home/omg-audit/omg-go-behavior.eHbNbt`
 
-QEMU runner integration, false-success regressions, inventory policy and cleanup validation remain pending.
+The QEMU runner now includes the row and exact oracle. The initial regression accepted an installer message with no compiler, then correctly rejected it after implementation. Additional fixtures reject inactive/escaped compilers, version-only tools, no-op builds, wrong compiled output, no-op tests and explicit failing tests while preserving diagnostics. Successful fake fixtures test admission only.
+
+The exact extracted oracle passed against all four real WSL installations above. On Ubuntu, temporarily removing the installed `pkg/tool/linux_amd64/compile` caused a compilation-stage failure; restoring the same file recovered a pass. Temporary behavior fixtures are removed and their absence checked. The output/policy/network suite passed all37 tests. The new Go identity replaces only the Node-only policy identity on the unpushed local branch; published and hosted historical identities are unchanged. Hosted QEMU validation remains pending, and these results do not close the global behavioral coverage gap.
