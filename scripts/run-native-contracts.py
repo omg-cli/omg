@@ -26,6 +26,7 @@ require = COVERAGE.require
 
 BEHAVIOR_TESTS = frozenset({
     'omg::security_daemon_optional::sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure',
+    'omg::security_daemon_optional::security_scan_without_daemon_preserves_inventory_errors_and_recovers',
 }) | frozenset('omg::debian_e2e_tests::' + name for name in (
     'test_cli_status_shows_debian_info', 'test_cli_debian_respects_ci_mode')) | frozenset({
     'omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state',

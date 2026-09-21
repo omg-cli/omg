@@ -3178,6 +3178,114 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omg.audit.scan.empty-recovery.fixture",
+      "source": "src/cli/security.rs",
+      "binary": "omg",
+      "surface": "omg audit scan",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "fault"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "empty-inventory-success",
+          "recovery-after-inventory-repair"
+        ],
+        "state": [
+          "corrupt-inventory-unchanged",
+          "repaired-inventory-unchanged"
+        ],
+        "fault": [
+          "corrupt-inventory-explicit-failure",
+          "failure-does-not-report-clean"
+        ]
+      },
+      "scope": "Daemon-disabled debug CLI with isolated empty mock package inventory; audit scan succeeds, rejects corrupt inventory without claiming a clean scan, preserves corrupt state, and recovers after repair. Does not certify populated native advisory matching, fetching, scoring, or actual remediation. This is not native package transactions evidence.",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::security_daemon_optional::security_scan_without_daemon_preserves_inventory_errors_and_recovers",
+          "evidence": [
+            "success",
+            "state",
+            "fault"
+          ],
+          "assertions": [
+            "empty-inventory-success",
+            "recovery-after-inventory-repair",
+            "corrupt-inventory-unchanged",
+            "repaired-inventory-unchanged",
+            "corrupt-inventory-explicit-failure",
+            "failure-does-not-report-clean",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.audit.fix.empty-recovery.fixture",
+      "source": "src/cli/security.rs",
+      "binary": "omg",
+      "surface": "omg audit fix",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "fault"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "empty-inventory-success",
+          "recovery-after-inventory-repair"
+        ],
+        "state": [
+          "corrupt-inventory-unchanged",
+          "repaired-inventory-unchanged"
+        ],
+        "fault": [
+          "corrupt-inventory-explicit-failure",
+          "failure-does-not-report-clean"
+        ]
+      },
+      "scope": "Daemon-disabled debug CLI with isolated empty mock package inventory; audit fix --dry-run succeeds, rejects corrupt inventory without claiming a clean scan, preserves corrupt state, and recovers after repair. Does not certify populated native advisory matching, fetching, scoring, or actual remediation. This is not native package transactions evidence.",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::security_daemon_optional::security_scan_without_daemon_preserves_inventory_errors_and_recovers",
+          "evidence": [
+            "success",
+            "state",
+            "fault"
+          ],
+          "assertions": [
+            "empty-inventory-success",
+            "recovery-after-inventory-repair",
+            "corrupt-inventory-unchanged",
+            "repaired-inventory-unchanged",
+            "corrupt-inventory-explicit-failure",
+            "failure-does-not-report-clean",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [
