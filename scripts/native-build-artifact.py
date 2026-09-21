@@ -216,29 +216,6 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
     raise ArtifactUnavailable('CI native artifact did not become available before the deadline')
 
 
-def ready(root, lanes, context, event, timeout=1500):
-    """Wait once for metadata availability; consumers still admit every byte."""
-    require(isinstance(lanes, list) and 1 <= len(lanes) <= 4, 'invalid native lanes')
-    distros = [row.get('distro') for row in lanes if isinstance(row, dict)]
-    require(len(distros) == len(lanes) and all(isinstance(distro, str) and distro in FEATURES for distro in distros)
-            and len(set(distros)) == len(distros), 'duplicate or foreign native lanes')
-    started = time.monotonic()
-    availability = {}
-    for distro in distros:
-        remaining = timeout - (time.monotonic() - started)
-        try:
-            if remaining <= 0:
-                raise ArtifactUnavailable('shared native readiness deadline exceeded')
-            artifact, run, _ = find_native_artifact(root, distro, context, event, timeout=remaining)
-        except ArtifactUnavailable as error:
-            availability[distro] = 'unavailable'
-            print(f'Unavailable: {distro}: {error}; guest admission remains mandatory', flush=True)
-            continue
-        availability[distro] = 'available'
-        print(f'Available: {distro}, CI run {run["id"]}, attempt {run["run_attempt"]}, artifact {artifact["id"]}', flush=True)
-    return availability
-
-
 def reuse(root, distro, image, features, destination, context, event, timeout=1500):
     build_command(distro, features, {})
     started = time.monotonic()
@@ -352,19 +329,14 @@ def validate_bundle(content, server_digest, expected):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('build', 'reuse', 'ready'))
+    parser.add_argument('mode', choices=('build', 'reuse'))
     parser.add_argument('--distro', choices=tuple(FEATURES))
     parser.add_argument('--image')
     parser.add_argument('--features')
     parser.add_argument('--destination', type=Path)
-    parser.add_argument('--lanes')
     parser.add_argument('--timeout', type=int, default=1500)
     args = parser.parse_args(argv)
     require(1 <= args.timeout <= 1500, 'invalid native wait deadline')
-    if args.mode == 'ready':
-        require(isinstance(args.lanes, str), 'ready requires --lanes')
-        event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
-        return ready(Path.cwd(), json.loads(args.lanes), dict(os.environ), event, args.timeout)
     if not all((args.distro, args.image, args.features, args.destination)):
         parser.error('build/reuse require --distro, --image, --features and --destination')
     parameters = (Path.cwd(), args.distro, args.image, args.features,

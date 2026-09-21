@@ -58,38 +58,6 @@ def bundle(provenance, payload, extra=None):
 
 
 class NativeBuildAdmission(unittest.TestCase):
-    def test_readiness_missing_producer_does_not_suppress_other_guests(self):
-        available = ({'id': 9}, {'id': 123, 'run_attempt': 1}, {})
-        with patch.object(BUILD, 'find_native_artifact', side_effect=[
-                BUILD.ArtifactUnavailable('CI finished without arch'), available]) as find, \
-                patch.object(BUILD.time, 'monotonic', side_effect=[0, 1, 3]):
-            result = BUILD.ready(Path.cwd(), [{'distro': 'arch'}, {'distro': 'debian'}], {}, {}, timeout=10)
-        self.assertEqual([call.args[1] for call in find.call_args_list], ['arch', 'debian'])
-        self.assertEqual(result, {'arch': 'unavailable', 'debian': 'available'})
-
-    def test_readiness_deadline_does_not_allocate_another_wait_budget(self):
-        with patch.object(BUILD, 'find_native_artifact', side_effect=BUILD.ArtifactUnavailable('deadline')) as find, \
-                patch.object(BUILD.time, 'monotonic', side_effect=[0, 1, 11]):
-            result = BUILD.ready(Path.cwd(), [{'distro': 'arch'}, {'distro': 'debian'}], {}, {}, timeout=10)
-        self.assertEqual(find.call_count, 1)
-        self.assertEqual(result, {'arch': 'unavailable', 'debian': 'unavailable'})
-
-    def test_readiness_identity_errors_remain_blocking(self):
-        with patch.object(BUILD, 'find_native_artifact', side_effect=ValueError('foreign source')), \
-                self.assertRaisesRegex(ValueError, 'foreign source'):
-            BUILD.ready(Path.cwd(), [{'distro': 'arch'}], {}, {})
-
-    def test_readiness_wait_shares_one_deadline_and_never_downloads_binaries(self):
-        with patch.object(BUILD, 'find_native_artifact', return_value=({'id': 9}, {'id': 123, 'run_attempt': 1}, {})) as find, \
-                patch.object(BUILD.time, 'monotonic', side_effect=[0, 1, 3]), patch.object(BUILD, 'api') as download:
-            BUILD.ready(Path.cwd(), [{'distro': 'arch'}, {'distro': 'debian'}], {}, {}, timeout=10)
-        self.assertEqual([call.args[1] for call in find.call_args_list], ['arch', 'debian'])
-        self.assertEqual([call.kwargs['timeout'] for call in find.call_args_list], [9, 7])
-        download.assert_not_called()
-        for lanes in ([], [{'distro': 'arch'}, {'distro': 'arch'}], [{'distro': 'foreign'}]):
-            with self.subTest(lanes=lanes), self.assertRaises(ValueError):
-                BUILD.ready(Path.cwd(), lanes, {}, {})
-
     def test_reuse_failure_preserves_diagnostic_for_lifecycle_issue(self):
         from test_ci_optimization import BASH, step_script
         script = step_script('qemu-lane.yml', 'Reuse verified native CI binaries')
@@ -155,10 +123,6 @@ class NativeBuildAdmission(unittest.TestCase):
                                                 'debian,pgp,license', Path(directory) / 'staged'))
                     if mode == 'reuse':
                         self.assertEqual(args[6], {'number': 440})
-            with patch.dict(os.environ, {'GITHUB_EVENT_PATH': str(event_path)}), patch.object(BUILD, 'ready') as wait:
-                BUILD.main(['ready', '--lanes', '[{"distro":"arch"}]', '--timeout', '60'])
-                self.assertEqual(wait.call_args.args[0:2], (Path.cwd(), [{'distro': 'arch'}]))
-                self.assertEqual(wait.call_args.args[3:], ({'number': 440}, 60))
 
     def test_reuse_checks_live_attempt_and_writes_only_validated_files(self):
         for mode in ('valid', 'in-progress', 'queued', 'queued-artifact', 'waiting-artifact',
