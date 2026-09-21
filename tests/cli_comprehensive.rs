@@ -1839,6 +1839,49 @@ mod system_tests {
     use super::*;
 
     #[test]
+    fn config_values_round_trip_and_rejected_writes_preserve_state() {
+        let project = TestProject::new();
+        let config = project.config_dir.path().join("config.toml");
+        for (key, value) in [
+            ("telemetry.enabled", "false"),
+            ("aur.build_concurrency", "2"),
+            ("aur.enable_ccache", "true"),
+            ("aur.enable_sccache", "false"),
+            ("aur.secure_makepkg", "true"),
+            ("aur.makeflags", "-j2"),
+        ] {
+            project
+                .run(&["config", "set", key, "--", value])
+                .assert_success();
+            let read = project.run(&["config", "get", key]);
+            read.assert_success();
+            assert_eq!(read.stdout.trim(), value, "wrong stored value for {key}");
+        }
+        let before = std::fs::read(&config).expect("persisted configuration");
+        for (key, value, diagnostic) in [
+            ("telemetry.enabled", "perhaps", "Invalid boolean"),
+            ("aur.build_concurrency", "0", "concurrency"),
+            ("aur.build_concurrency", "many", "Invalid number"),
+            ("unknown.setting", "true", "Unknown config key"),
+        ] {
+            let rejected = project.run(&["config", "set", key, value]);
+            rejected.assert_failure();
+            assert!(rejected.stderr.contains(diagnostic), "{}", rejected.stderr);
+            assert_eq!(
+                std::fs::read(&config).unwrap(),
+                before,
+                "rejected {key} changed config"
+            );
+        }
+        let read = project.run(&["config", "get", "aur.build_concurrency"]);
+        read.assert_success();
+        assert_eq!(read.stdout.trim(), "2");
+        project.run(&["config", "validate"]).assert_success();
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        project.close_checked();
+    }
+
+    #[test]
     fn test_doctor_help() {
         let result = run_omg(&["doctor", "--help"]);
         result.assert_success();
