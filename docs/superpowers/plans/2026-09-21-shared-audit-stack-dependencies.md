@@ -36,3 +36,9 @@ The global reviewed behavioral denominator, current-revision hosted matrix, and 
 - An initial transport filter selected zero tests; it was corrected and both actual transport tests ran on Arch and Fedora. An edited Windows-mounted helper interrupted Fedora's first orchestration run; copying the stable helper into Linux completed the corrected run. Neither preliminary run was credited as a full pass.
 
 This is a local integration checkpoint, not approval to merge. Fresh hosted evidence and the unresolved local failure remain explicit gates.
+
+## Recovery and remaining gates
+
+WSL shutdown completed and a fresh Ubuntu process listing worked. Without changing source or the test binary, Ubuntu's isolated APT concurrency test passed, then 190 package-manager tests passed (1 ignored), both Unix transport tests passed, and 20 oracle tests passed. Issue #467 stays open: recovery is not a root-cause fix.
+
+Debian subsequently passed 152 security tests, 190 package-manager tests (1 ignored), both Unix transport tests, and 20 oracle tests. The combined QEMU policy suite passed 9/9 on Ubuntu after copying exact workflow files omitted by git archive's export-ignore rules. All four distro feature owners now have targeted local evidence for the source assembly. Hosted checks and independent final review remain pending; no 95% claim is made.
