@@ -57,6 +57,7 @@ impl PersistedCompletionCache {
 
     fn save(&self) -> Result<()> {
         let content = serde_json::to_vec(self).context("Failed to serialize completion cache")?;
+        paths::ensure_data_dir().context("Failed to create completion cache directory")?;
         crate::core::safe_ops::atomic_write_file_sync(Self::path(), content)
             .with_context(|| format!("Failed to write {}", Self::path().display()))
     }

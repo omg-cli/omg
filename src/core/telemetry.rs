@@ -233,10 +233,8 @@ pub fn get_backend() -> String {
 fn create_marker(install_id: &str) -> Result<()> {
     let marker_path = super::paths::installed_marker_path();
 
-    // Ensure parent directory exists
-    if let Some(parent) = marker_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    // Installation telemetry can race other first-start writers.
+    super::paths::ensure_data_dir()?;
 
     let marker = InstallMarker {
         install_id: install_id.to_string(),
@@ -370,8 +368,7 @@ impl EventQueue {
     }
 
     fn path() -> Result<PathBuf> {
-        let data_dir = crate::core::paths::data_dir();
-        std::fs::create_dir_all(&data_dir)?;
+        crate::core::paths::ensure_data_dir()?;
         Ok(telemetry_queue_path())
     }
 
@@ -494,8 +491,7 @@ impl TelemetrySession {
     }
 
     fn path() -> Result<PathBuf> {
-        let data_dir = crate::core::paths::data_dir();
-        std::fs::create_dir_all(&data_dir)?;
+        let data_dir = crate::core::paths::ensure_data_dir()?;
         Ok(data_dir.join("telemetry_session.json"))
     }
 

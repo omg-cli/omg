@@ -756,8 +756,8 @@ pub async fn install(name: &str) -> Result<()> {
     );
 
     let (tools_dir, bin_dir) = get_dirs();
-    fs::create_dir_all(&tools_dir)?;
-    fs::create_dir_all(&bin_dir)?;
+    crate::core::paths::create_private_data_directory(&tools_dir)?;
+    crate::core::paths::create_private_data_directory(&bin_dir)?;
 
     // 1. Check Registry
     if let Some(resolved) = find_registry_entry(name) {

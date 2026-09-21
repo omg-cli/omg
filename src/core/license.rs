@@ -461,7 +461,7 @@ fn license_clock_floor_with(path: &Path, now: i64) -> Result<i64> {
     let parent = path
         .parent()
         .context("License clock watermark path must have a parent directory")?;
-    std::fs::create_dir_all(parent).with_context(|| {
+    crate::core::paths::create_private_data_directory(parent).with_context(|| {
         format!(
             "Failed to create license clock watermark directory: {}",
             parent.display()
@@ -542,7 +542,7 @@ fn persisted_machine_id_fallback() -> String {
         .unwrap_or_else(|| {
             let generated = uuid::Uuid::new_v4().to_string();
             if let Some(parent) = fallback_path.parent()
-                && let Err(error) = std::fs::create_dir_all(parent)
+                && let Err(error) = crate::core::paths::create_private_data_directory(parent)
             {
                 tracing::warn!("Failed to create machine ID directory: {error}");
                 return generated;
@@ -636,8 +636,7 @@ fn verify_jwt_with_key(token: &str, public_key_pem: &[u8]) -> Option<JwtPayload>
 
 /// Get the license file path
 fn license_path() -> Result<PathBuf> {
-    let data_dir = crate::core::paths::data_dir();
-    std::fs::create_dir_all(&data_dir)?;
+    let data_dir = crate::core::paths::ensure_data_dir()?;
     Ok(data_dir.join("license.json"))
 }
 
@@ -684,7 +683,7 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .context("Private state path must have a parent directory")?;
-    std::fs::create_dir_all(parent)?;
+    crate::core::paths::create_private_data_directory(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.as_file_mut().write_all(contents)?;
 

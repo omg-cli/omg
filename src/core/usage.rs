@@ -204,8 +204,7 @@ struct UsageSyncPayload<'a> {
 impl UsageStats {
     /// Get the usage stats file path
     fn path() -> Result<PathBuf> {
-        let data_dir = crate::core::paths::data_dir();
-        std::fs::create_dir_all(&data_dir)?;
+        let data_dir = crate::core::paths::ensure_data_dir()?;
         Ok(data_dir.join("usage.json"))
     }
 

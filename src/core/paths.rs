@@ -136,6 +136,25 @@ pub fn data_dir() -> PathBuf {
     })
 }
 
+/// Create missing data directories privately without changing existing permissions.
+/// Path lookup remains side-effect free; state writers opt into creation.
+pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
+    let path = data_dir();
+    create_private_data_directory(&path)?;
+    Ok(path)
+}
+
+pub(crate) fn create_private_data_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 /// Resolve a binary shipped next to the running executable.
 ///
 /// Returns `None` when no sibling file exists, so callers fall back to
@@ -600,8 +619,6 @@ fn validate_socket_ancestor_chain(
 /// every [`validate_socket_parent`] failure condition.
 #[cfg(unix)]
 pub fn prepare_socket_parent(socket_path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-
     let parent = socket_path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -609,16 +626,9 @@ pub fn prepare_socket_parent(socket_path: &std::path::Path) -> std::io::Result<(
         )
     })?;
     if !parent.exists() {
-        // Single-level fast path keeps 0700 atomic at creation; nested
-        // fallbacks (e.g. <data-dir>/run) need their ancestors first, then
-        // the leaf is tightened before validation runs below.
-        let mut builder = std::fs::DirBuilder::new();
-        if builder.mode(0o700).create(parent).is_err() {
-            std::fs::create_dir_all(parent)?;
-            let mut permissions = std::fs::metadata(parent)?.permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(parent, permissions)?;
-        }
+        // The data directory may itself be missing on daemon-first startup.
+        // Create every new ancestor privately; never chmod existing entries.
+        create_private_data_directory(parent)?;
     }
     validate_socket_parent(socket_path)
 }
@@ -658,6 +668,26 @@ pub fn test_mode() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn data_creation_is_private_and_preserves_existing_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("new-parent");
+        let data = parent.join("data");
+        create_private_data_directory(&data).unwrap();
+        for path in [&parent, &data] {
+            assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+        }
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o775)).unwrap();
+        create_private_data_directory(&data).unwrap();
+        assert_eq!(std::fs::metadata(&data).unwrap().mode() & 0o777, 0o775);
+        let file = root.path().join("file");
+        std::fs::write(&file, b"preserve").unwrap();
+        assert!(create_private_data_directory(&file).is_err());
+        assert_eq!(std::fs::read(file).unwrap(), b"preserve");
+    }
 
     #[test]
     fn elevated_state_ignores_caller_data_and_cache_paths() {
@@ -839,6 +869,15 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0, "socket dir must be owner-only");
+        let ancestor_mode = std::fs::metadata(base.path().join("a"))
+            .expect("ancestor metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            ancestor_mode & 0o777,
+            0o700,
+            "new data ancestor must also be private"
+        );
     }
 
     #[test]
