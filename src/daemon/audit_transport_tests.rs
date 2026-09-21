@@ -191,7 +191,7 @@ async fn real_server_fetches_scores_and_rejects_failed_scans_before_recovery() -
                 let mut socket = BufReader::new(socket);
                 let body_value = http_request(&mut socket).await?;
                 assert_eq!(body_value["package"]["name"], expected_package);
-                assert_eq!(body_value["package"]["ecosystem"], "Arch Linux");
+                assert_eq!(body_value["package"]["ecosystem"], "Debian:12");
                 assert_eq!(body_value["version"], version);
                 assert_eq!(body_value.get("page_token").and_then(serde_json::Value::as_str), token);
                 socket.get_mut().write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await?;
