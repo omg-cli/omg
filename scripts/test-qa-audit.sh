@@ -52,7 +52,8 @@ grep -q "invalid results.json; audit incomplete" <<< "$out" || fail "suite audit
 grep -q "files=2 failing-rows=1" <<< "$out" || fail "suite audit bad summary: $out"
 
 # Malformed evidence alone must not be mistaken for a healthy run.
-for invalid in '{"oops":true}' 'not json'; do
+for invalid in '{"oops":true}' 'not json' '[{"result":"PASS"}]' \
+  '[{"case_id":"x","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":1},{"case_id":"x","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":1}]'; do
   printf '%s\n' "$invalid" > "$scratch/invalid.json"
   rc=0
   out=$("$runner" "$scratch/invalid.json") || rc=$?

@@ -58,9 +58,7 @@ command_for() {
 total_fail=0; invalid_files=0; total_files=${#files[@]}
 for results in "${files[@]}"; do
   evidence_dir="$(dirname "$results")"
-  if ! rows="$(jq -ce '
-    if type != "array" then error("not an array") else . end |
-    map({case_id, distro, result, exit_code, elapsed_seconds})' "$results" 2>/dev/null)"; then
+  if ! rows="$(qa_result_rows "$results" 2>/dev/null)"; then
     invalid_files=$((invalid_files + 1))
     printf '## %s\ninvalid results.json; audit incomplete\n\n' "$results"
     continue

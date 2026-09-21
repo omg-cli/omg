@@ -43,42 +43,24 @@ done
 [[ -n "$evidence_dir" ]] || evidence_dir="$(dirname "$results")"
 for tool in jq gh; do command -v "$tool" >/dev/null || exit 3; done
 
-# Strict schema gate (mirrors report-smoke-sentry.sh): fail closed on junk.
-failures="$(jq -ce '
-  def identifier: type == "string" and test("^[a-z0-9][a-z0-9-]{0,127}$");
-  def distro: type == "string" and IN("arch", "debian", "ubuntu", "fedora", "macos");
-  if type != "array" then error("results must be an array") else . end |
-  if length > 10000 then error("too many results") else . end |
-  if (map([.distro, .case_id]) | unique | length) != length
-  then error("duplicate case identity") else . end |
-  if all(.[];
-    (.case_id | identifier) and
-    (.distro | distro) and
-    (.result | IN("PASS", "SKIPPED", "EXPECTED_REJECTION", "PRODUCT_FAIL", "HARNESS_ERROR", "FAIL", "BLOCKED")) and
-    (.exit_code | type == "number" and floor == . and . >= -1 and . <= 255) and
-    (.elapsed_seconds | type == "number" and . >= 0 and . <= 86400))
-  then . else error("invalid result fields") end |
-  map(select(.result == "PRODUCT_FAIL" or .result == "HARNESS_ERROR" or .result == "FAIL") |
-    {case_id, distro, result, exit_code, elapsed_seconds})
-' "$results")"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/qa-evidence-lib.sh"
+# Validate once, before any GitHub operations or filtering.
+rows="$(qa_result_rows "$results")"
+failures="$(jq -ce 'map(select(.result == "PRODUCT_FAIL" or .result == "HARNESS_ERROR" or .result == "FAIL"))' <<< "$rows")"
 # Healthy verdicts in THIS run resolve open issues for the same fingerprint.
 # Only cases present in this input are considered: a run covering one
 # distro must never close another distro's issues.
 passes="$(jq -ce '
   map(select(.result == "PASS" or .result == "EXPECTED_REJECTION") |
     {case_id, distro})
-' "$results")"
+' <<< "$rows")"
 # Local or otherwise non-authoritative runs may report failures but cannot
 # establish recovery of an issue tracked by the hosted pipeline.
 if [[ "$failures_only" == true ]]; then passes='[]'; fi
 if [[ "$(jq 'length' <<< "$failures")" == 0 && "$(jq 'length' <<< "$passes")" == 0 ]]; then
   printf 'No failures to file and no fixes to resolve.\n'; exit 0
 fi
-
-# Shared evidence helpers (scrub, excerpt_for); single source of truth
-# with qa-audit.sh.
-# shellcheck disable=SC1091
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/qa-evidence-lib.sh"
 
 runbook_for() {
   case "$source" in
