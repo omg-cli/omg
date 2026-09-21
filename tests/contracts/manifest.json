@@ -2738,6 +2738,284 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omgd.connection-capacity.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.connection-cap",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "concurrency",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "concurrency": [
+          "128-connected-clients-serve-exact-pong",
+          "129th-connection-clean-eof-before-and-after-permit-reuse"
+        ],
+        "state": [
+          "released-connection-count-decreases-and-replacement-serves-pong",
+          "all-held-clients-release-and-control-remains-usable"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets, exact connection capacity and disconnect permit reuse with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone daemon process lifecycle, all socket faults or concurrent connection churn",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::connection_capacity_refuses_overflow_and_recovers_released_permits",
+          "evidence": [
+            "concurrency",
+            "state"
+          ],
+          "assertions": [
+            "128-connected-clients-serve-exact-pong",
+            "129th-connection-clean-eof-before-and-after-permit-reuse",
+            "released-connection-count-decreases-and-replacement-serves-pong",
+            "all-held-clients-release-and-control-remains-usable",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames-version-refusal.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "future-version-exact-error-id-code-message-and-eof"
+        ],
+        "state": [
+          "exactly-one-failed-request-metric-increment-per-rejection"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone process lifecycle, all malformed payloads, cancellation or backpressure",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::version_mismatch_gets_exact_parse_error_then_connection_closes",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "future-version-exact-error-id-code-message-and-eof",
+            "exactly-one-failed-request-metric-increment-per-rejection",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames-short-header-refusal.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "short-header-exact-error-id-code-message-and-eof"
+        ],
+        "state": [
+          "exactly-one-failed-request-metric-increment-per-rejection"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone process lifecycle, all malformed payloads, cancellation or backpressure",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::frame_too_short_for_header_gets_parse_error_then_connection_closes",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "short-header-exact-error-id-code-message-and-eof",
+            "exactly-one-failed-request-metric-increment-per-rejection",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames-payload-refusal.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "undecodable-body-error-id-code-cause-prefix-and-eof"
+        ],
+        "state": [
+          "exactly-one-failed-request-metric-increment-per-rejection"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone process lifecycle, all malformed payloads, cancellation or backpressure",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::undecodable_payload_gets_parse_error_validation_failure_then_close",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "undecodable-body-error-id-code-cause-prefix-and-eof",
+            "exactly-one-failed-request-metric-increment-per-rejection",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames-oversize-refusal.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "cap-plus-one-silent-eof-or-connection-reset"
+        ],
+        "state": [
+          "exactly-one-failed-request-metric-increment-per-rejection"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone process lifecycle, all malformed payloads, cancellation or backpressure",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::oversized_frame_tears_down_silently_without_any_response_frame",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "cap-plus-one-silent-eof-or-connection-reset",
+            "exactly-one-failed-request-metric-increment-per-rejection",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.frames-size-boundaries.server-fixture",
+      "source": "src/daemon/server.rs",
+      "binary": "omgd",
+      "surface": "transport:omgd.frames",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "refusal": [
+          "zero-through-four-byte-and-cap-minus-one-and-cap-reach-protocol-validation",
+          "exact-protocol-error-envelope-and-eof-per-size",
+          "fresh-pong-after-boundary-rejections"
+        ],
+        "state": [
+          "exactly-one-failed-request-metric-increment-per-rejection"
+        ]
+      },
+      "scope": "Production server::run over real Unix sockets with checked SIGTERM drain and fixture cleanup; not native package transactions, standalone process lifecycle, all malformed payloads, cancellation or backpressure",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::exact_frame_size_boundaries_reach_protocol_validation",
+          "evidence": [
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "zero-through-four-byte-and-cap-minus-one-and-cap-reach-protocol-validation",
+            "exact-protocol-error-envelope-and-eof-per-size",
+            "fresh-pong-after-boundary-rejections",
+            "exactly-one-failed-request-metric-increment-per-rejection",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

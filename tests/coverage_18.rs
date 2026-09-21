@@ -716,6 +716,55 @@ async fn four_kib_frame_reaches_protocol_parser_before_rejection() -> Result<()>
     fixture.shutdown().await
 }
 
+#[tokio::test]
+#[serial]
+async fn exact_frame_size_boundaries_reach_protocol_validation() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let baseline = requests_failed_probe(&fixture).await?;
+    for (index, size) in [0, 1, 2, 3, 4, REQUEST_WIRE_CAP - 1, REQUEST_WIRE_CAP]
+        .into_iter()
+        .enumerate()
+    {
+        let mut stream = fixture.connect().await?;
+        let mut frame = vec![0; size];
+        if size >= 4 {
+            frame[..4].copy_from_slice(&999_001u32.to_le_bytes());
+        }
+        send_raw_frame(&mut stream, &frame).await?;
+        let expected = if size < 4 {
+            "malformed frame header: frame too short to contain the protocol version header"
+                .to_string()
+        } else {
+            format!(
+                "unsupported peer protocol version 999001 (this daemon speaks {PROTOCOL_VERSION}); update omg"
+            )
+        };
+        match read_response(&mut stream)
+            .await
+            .with_context(|| format!("frame size {size}"))?
+        {
+            Response::Error { id, code, message } => {
+                assert_eq!(id, 0, "frame size {size}");
+                assert_eq!(code, error_codes::PARSE_ERROR, "frame size {size}");
+                assert_eq!(message, expected, "frame size {size}");
+            }
+            other @ Response::Success { .. } => {
+                anyhow::bail!("frame size {size}: expected protocol error, got {other:?}")
+            }
+        }
+        expect_eof(&mut stream, "after boundary frame rejection").await;
+        assert_eq!(
+            requests_failed_probe(&fixture).await?,
+            baseline + u64::try_from(index)? + 1
+        );
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 9020 }).await?,
+        9020,
+    );
+    fixture.shutdown().await
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Contract 4: correct version header, undecodable payload
 // ═══════════════════════════════════════════════════════════════════════════════

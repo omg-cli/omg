@@ -148,7 +148,7 @@ class NativeReceipts(unittest.TestCase):
         manifest = json.loads((root / 'tests/contracts/manifest.json').read_text())
         mapped = [contract for contract in manifest['contracts']
                   if any(binding['lane'] == 'native-daemon-fixture' for binding in contract['tests'])]
-        self.assertEqual(len(mapped), 15)
+        self.assertEqual(len(mapped), 21)
         selected = set()
         for contract in mapped:
             self.assertEqual(contract['binary'], 'omgd')
@@ -165,6 +165,12 @@ class NativeReceipts(unittest.TestCase):
         health = next(c for c in mapped if c['id'] == 'omgd.health-live-process.server-fixture')
         policy = json.loads((root / 'tests/contracts/platforms.json').read_text())
         self.assertEqual(set(health['platforms']), {o['id'] for o in policy['owners'] if o['os'] == 'linux'})
+        capacity = next(c for c in mapped if c['id'] == 'omgd.connection-capacity.server-fixture')
+        self.assertEqual(capacity['source'], 'src/daemon/server.rs')
+        self.assertEqual(set(capacity['requires']), {'concurrency', 'state'})
+        gaps = list(NATIVE.COVERAGE.expand_gaps(json.loads((root / 'tests/contracts/gaps.json').read_text())['gaps']))
+        self.assertTrue(any(g['surface'] == capacity['surface'] for g in gaps),
+                        'one capacity test does not exhaust the broader transport contract')
 
     def test_reviewed_ping_requires_all_contracts_before_surface_credit(self):
         root = Path(__file__).resolve().parents[1]

@@ -57,5 +57,28 @@ permit held by the connection task -> task completion -> permit release.
 confirms that dropping the permit releases its capacity. Changing the product
 limit from 128 to 129 in an isolated negative control fails the overflow assertion.
 This closes a specific test gap; it does not establish a production defect or
-claim complete capacity coverage. This test is not yet admitted to behavioral
-coverage receipts; the broader connection-capacity gap remains open.
+claim complete capacity coverage. The bounded contract is admitted through production-server behavioral receipts;
+the broader connection-capacity gap remains open.
+
+## Frame refusal and exact size boundaries
+
+Five bounded frame contracts now use real production-server receipts: future
+protocol version, short version header, undecodable request body, oversized
+announcement, and exact accepted framing sizes. Each checks the appropriate
+wire refusal, connection teardown, exactly one failed-request metric increment,
+and fixture shutdown/cleanup. The body test checks the diagnostic cause prefix;
+it does not certify an exact bitcode diagnostic or the separate validation-failure
+counter merely because its historical test name mentions that counter.
+
+`exact_frame_size_boundaries_reach_protocol_validation` checks lengths 0, 1, 2,
+3, 4, 1 MiB minus one, and exactly 1 MiB. An exact protocol error proves delivery
+to protocol validation instead of rejection by the framing codec. A final exact
+Pong proves service remains available. The existing oversized test covers cap
+plus one and requires silent teardown, allowing a kernel reset when unread bytes
+remain. No malformed request earns successful-handler credit.
+
+[Tokio's length codec documentation](https://docs.rs/tokio-util/latest/tokio_util/codec/length_delimited/struct.LengthDelimitedCodec.html)
+defines the maximum as the largest accepted frame size. An isolated mutation
+lowering the limit by one byte fails the new boundary test; source restoration is
+checked. Cancellation, backpressure, exhaustive payload decoding, and response
+size boundaries remain open. These contracts do not close the broad frame gap.

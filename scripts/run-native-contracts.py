@@ -47,6 +47,12 @@ BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
 
 
 DAEMON_TESTS = frozenset('omg::coverage_18::' + name for name in (
+    'version_mismatch_gets_exact_parse_error_then_connection_closes',
+    'frame_too_short_for_header_gets_parse_error_then_connection_closes',
+    'undecodable_payload_gets_parse_error_validation_failure_then_close',
+    'oversized_frame_tears_down_silently_without_any_response_frame',
+    'exact_frame_size_boundaries_reach_protocol_validation',
+    'connection_capacity_refuses_overflow_and_recovers_released_permits',
     'health_reports_live_uptime_rss_and_worker_state_without_mutating_packages',
     'concurrent_pings_preserve_boundary_ids_and_backend_state',
     'incomplete_frames_disconnect_without_breaking_a_fresh_client',
