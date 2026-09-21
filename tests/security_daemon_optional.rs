@@ -1,6 +1,56 @@
 pub mod common;
 
 #[test]
+fn audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_history()
+-> anyhow::Result<()> {
+    use omg_lib::core::security::audit::{AuditEventType, AuditLogger, AuditSeverity};
+
+    let project = common::TestProject::new();
+    let path = project.data_dir.path().join("audit/audit.jsonl");
+    let mut logger = AuditLogger::new_in(&path)?;
+    logger.log(
+        AuditEventType::SecurityAudit,
+        AuditSeverity::Info,
+        "fixture",
+        "original event",
+    )?;
+    drop(logger);
+    let original = std::fs::read(&path)?;
+    let valid = project.run(&["audit", "verify"]);
+    valid.assert_success();
+    assert!(
+        valid
+            .stdout
+            .contains("Local audit chain consistency verified")
+    );
+    assert!(valid.stdout.contains("not authenticated"));
+    assert_eq!(std::fs::read(&path)?, original);
+
+    let mut entry: serde_json::Value = serde_json::from_slice(&original)?;
+    entry["description"] = serde_json::json!("rewritten event");
+    let tampered = serde_json::to_vec(&entry)?;
+    std::fs::write(&path, &tampered)?;
+    let rejected = project.run(&["audit", "verify"]);
+    rejected.assert_failure();
+    assert!(!rejected.stdout.contains("consistency verified"));
+    assert_eq!(std::fs::read(&path)?, tampered);
+
+    std::fs::write(&path, &original)?;
+    let marker = project.data_dir.path().join("audit/incomplete");
+    std::fs::write(&marker, b"fixture collection failure")?;
+    let incomplete = project.run(&["audit", "verify"]);
+    incomplete.assert_failure();
+    assert!(!incomplete.stdout.contains("consistency verified"));
+    assert_eq!(std::fs::read(&path)?, original);
+    assert_eq!(std::fs::read(&marker)?, b"fixture collection failure");
+    std::fs::remove_file(&marker)?;
+    project.run(&["audit", "verify"]).assert_success();
+    assert_eq!(std::fs::read(&path)?, original);
+    project.close_checked();
+    Ok(())
+}
+
+#[test]
 fn sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure()
 -> anyhow::Result<()> {
     let project = common::TestProject::new();
@@ -94,7 +144,11 @@ fn security_scan_without_daemon_preserves_inventory_errors_and_recovers() -> any
     );
     assert_eq!(std::fs::read(&path)?, clean, "scan changed the inventory");
     project.run(&["audit", "fix", "--dry-run"]).assert_success();
-    assert_eq!(std::fs::read(&path)?, clean, "dry-run changed the inventory");
+    assert_eq!(
+        std::fs::read(&path)?,
+        clean,
+        "dry-run changed the inventory"
+    );
     for args in [vec!["audit", "scan"], vec!["audit", "fix", "--dry-run"]] {
         std::fs::write(&path, b"{broken")?;
         let failed = project.run(&args);
