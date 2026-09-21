@@ -1839,6 +1839,49 @@ mod system_tests {
     use super::*;
 
     #[test]
+    fn config_access_errors_never_report_missing_or_valid_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = TestProject::new();
+        project
+            .run(&["config", "set", "aur.build_concurrency", "2"])
+            .assert_success();
+        let config = project.config_dir.path().join("config.toml");
+        let original = std::fs::read(&config).unwrap();
+        std::fs::set_permissions(
+            project.config_dir.path(),
+            std::fs::Permissions::from_mode(0),
+        )
+        .unwrap();
+        let validate = project.run(&["config", "validate"]);
+        let reset = project.run(&["config", "reset", "--yes"]);
+        std::fs::set_permissions(
+            project.config_dir.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        for result in [validate, reset] {
+            result.assert_failure();
+            assert!(
+                result.stderr.to_lowercase().contains("permission denied"),
+                "{}",
+                result.stderr
+            );
+            assert!(!result.stdout.contains("using defaults"));
+            assert!(!result.stdout.contains("No config file"));
+        }
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(
+            !project
+                .config_dir
+                .path()
+                .join("config.toml.backup")
+                .exists()
+        );
+        project.run(&["config", "validate"]).assert_success();
+        project.close_checked();
+    }
+
+    #[test]
     fn config_reset_backup_never_overwrites_a_linked_external_file() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         for symbolic in [true, false] {

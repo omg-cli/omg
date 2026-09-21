@@ -158,7 +158,10 @@ pub fn validate() -> Result<()> {
     let mut issues = 0;
 
     // Check if config file exists
-    if !std::path::Path::new(&config_file).exists() {
+    if !std::path::Path::new(&config_file)
+        .try_exists()
+        .context("Failed to inspect configuration file")?
+    {
         println!(
             "  {} No config file found (using defaults)",
             style::dim("•")
@@ -257,7 +260,10 @@ pub fn validate() -> Result<()> {
 pub fn reset(yes: bool) -> Result<()> {
     let config_file = config_path();
 
-    if !std::path::Path::new(&config_file).exists() {
+    if !std::path::Path::new(&config_file)
+        .try_exists()
+        .context("Failed to inspect configuration file")?
+    {
         println!("{} No config file exists", style::dim("•"));
         return Ok(());
     }
