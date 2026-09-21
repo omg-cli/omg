@@ -27,15 +27,11 @@ class ReleaseRecipeAlignment(unittest.TestCase):
                                     env=dict(os.environ, DISTRO=distro, RUSTFLAGS='', BUILD_FEATURES=features,
                                              BUILD_IMAGE='fixture-image', RUNNER_TEMP='/fixture-temp'), timeout=10)
             with self.subTest(distro=distro):
-                if distro == 'debian-trixie':
-                    self.assertEqual(result.stdout.strip(),
-                                     'cargo build --release --no-default-features --features ' + features + ' --locked')
-                else:
-                    self.assertEqual(result.stdout.strip(), 'python3 scripts/native-build-artifact.py build --distro '
-                                     + distro + ' --image fixture-image --features ' + features
-                                     + ' --destination /fixture-temp/native-release')
-                    _, environment = BUILD.build_command(distro, features, {})
-                    self.assertEqual(environment['RUSTFLAGS'], cpu)
+                self.assertEqual(result.stdout.strip(), 'python3 scripts/native-build-artifact.py build --distro '
+                                 + distro + ' --image fixture-image --features ' + features
+                                 + ' --destination /fixture-temp/native-release')
+                _, environment = BUILD.build_command(distro, features, {})
+                self.assertEqual(environment['RUSTFLAGS'], cpu)
 
     def test_staged_cpu_baseline_matches_each_published_distro(self):
         lane = (ROOT / '.github/workflows/qemu-lane.yml').read_text(encoding='utf-8')

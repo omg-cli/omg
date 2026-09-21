@@ -19,10 +19,10 @@ BUILD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BUILD)
 
 
-def fixture():
+def fixture(distro='debian'):
     binary = b'fixture, never executed'
     archive = io.BytesIO()
-    base = 'omg-v1.2.3-x86_64-linux-debian'
+    base = 'omg-v1.2.3-x86_64-linux-' + distro
     with tarfile.open(fileobj=archive, mode='w:gz') as stream:
         for name, content in [('omg', binary), ('omgd', binary), ('README.md', b'readme'), ('LICENSE', b'license')]:
             entry = tarfile.TarInfo(base + '/' + name)
@@ -32,7 +32,7 @@ def fixture():
     payload = archive.getvalue()
     expected = {
         'repository': 'omg-cli/omg', 'source_sha': 'a' * 40, 'run_id': '123', 'run_attempt': 1,
-        'distro': 'debian', 'image': 'debian:bookworm@sha256:' + 'b' * 64,
+        'distro': distro, 'image': ('debian:trixie' if distro == 'debian-trixie' else 'debian:bookworm') + '@sha256:' + 'b' * 64,
         'features': ['debian', 'license', 'pgp'], 'target': 'x86_64-unknown-linux-gnu',
         'profile': 'release', 'instrumentation': 'none', 'cpu': 'generic', 'toolchain': '1.95.0',
         'workflow_path': '.github/workflows/ci.yml',
@@ -58,6 +58,23 @@ def bundle(provenance, payload, extra=None):
 
 
 class NativeBuildAdmission(unittest.TestCase):
+    def test_trixie_pair_retains_its_native_abi_recipe_identity(self):
+        expected, provenance, payload = fixture('debian-trixie')
+        argv, environment = BUILD.build_command('debian-trixie', 'debian,pgp,license', {})
+        self.assertEqual(argv, provenance['build_argv'])
+        self.assertEqual(environment['RUSTFLAGS'], '')
+        data = bundle(provenance, payload)
+        digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+        admitted, _ = BUILD.validate_bundle(data, digest, expected)
+        self.assertEqual(admitted, provenance)
+        for field, foreign in [('distro', 'debian'), ('image', 'debian:bookworm@sha256:' + 'b' * 64),
+                               ('features', ['debian-pure'])]:
+            wrong_recipe = dict(expected, **{field: foreign})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                BUILD.validate_bundle(data, digest, wrong_recipe)
+        with self.assertRaises(ValueError):
+            BUILD.build_command('debian-trixie', 'debian-pure', {})
+
     def test_reuse_failure_preserves_diagnostic_for_lifecycle_issue(self):
         from test_ci_optimization import BASH, step_script
         script = step_script('qemu-lane.yml', 'Reuse verified native CI binaries')
