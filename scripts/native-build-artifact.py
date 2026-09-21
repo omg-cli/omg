@@ -23,6 +23,7 @@ import zipfile
 MAX_DOWNLOAD = 128 * 1024 * 1024
 MAX_EXPANDED = 256 * 1024 * 1024
 FEATURES = {'arch': 'arch,pgp,license', 'debian': 'debian,pgp,license',
+            'debian-trixie': 'debian,pgp,license',
             'ubuntu': 'debian,pgp,license', 'fedora': 'fedora,pgp,license'}
 
 
@@ -291,7 +292,8 @@ def validate_bundle(content, server_digest, expected):
                             'build feature mismatch')
                 else:
                     require(type(actual) is type(value) and actual == value, 'build identity mismatch: ' + field)
-            require(provenance.get('distro') in ('arch', 'debian', 'ubuntu', 'fedora'), 'invalid distro')
+            require(isinstance(provenance.get('distro'), str) and provenance['distro'] in FEATURES,
+                    'invalid distro')
             compiler = provenance.get('compiler')
             require(isinstance(compiler, str) and isinstance(provenance.get('toolchain'), str)
                     and compiler.startswith('rustc ' + provenance['toolchain'] + ' ')
