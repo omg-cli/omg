@@ -65,7 +65,8 @@
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
-        "env_lockfile_integrity"
+        "env_lockfile_integrity",
+        "security_daemon_optional"
       ]
     },
     {
@@ -92,7 +93,8 @@
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
-        "env_lockfile_integrity"
+        "env_lockfile_integrity",
+        "security_daemon_optional"
       ]
     },
     {
@@ -119,7 +121,8 @@
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
-        "env_lockfile_integrity"
+        "env_lockfile_integrity",
+        "security_daemon_optional"
       ]
     },
     {
@@ -141,7 +144,8 @@
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
-        "env_lockfile_integrity"
+        "env_lockfile_integrity",
+        "security_daemon_optional"
       ]
     },
     {
@@ -168,7 +172,8 @@
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
-        "env_lockfile_integrity"
+        "env_lockfile_integrity",
+        "security_daemon_optional"
       ]
     },
     {

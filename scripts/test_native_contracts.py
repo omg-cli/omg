@@ -256,13 +256,17 @@ class NativeReceipts(unittest.TestCase):
             (target / 'debug/env-suite').write_bytes(b'environment harness')
             listing['rust-suites']['omg::env_lockfile_integrity'] = {
                 'package-id': 'owning-package', 'binary-path': str(target / 'debug/env-suite')}
+            (target / 'debug/security-suite').write_bytes(b'security harness')
+            listing['rust-suites']['omg::security_daemon_optional'] = {
+                'package-id': 'owning-package', 'binary-path': str(target / 'debug/security-suite')}
             manifest, _, _, provenance, _ = fixture()
             manifest['contracts'][0]['tests'] = [
                 {'lane': 'native-cli-fixture', 'id': name} for name in sorted(NATIVE.BEHAVIOR_TESTS)]
             combined = NATIVE.mapped_behavior_subjects(manifest, provenance, listing, root)
             self.assertEqual(set(combined), {'omg', 'omgd',
                 'harness:omg::debian_e2e_tests', 'harness:omg::cli_comprehensive',
-                'harness:omg::e2e_runtime_management', 'harness:omg::env_lockfile_integrity'})
+                'harness:omg::e2e_runtime_management', 'harness:omg::env_lockfile_integrity',
+                'harness:omg::security_daemon_optional'})
             missing = copy.deepcopy(listing)
             del missing['rust-suites']['omg::cli_comprehensive']
             with self.assertRaisesRegex(ValueError, 'missing owning'):
@@ -337,6 +341,7 @@ class NativeReceipts(unittest.TestCase):
         mapped = [contract for contract in manifest['contracts']
                   if any(binding['lane'] == 'native-cli-fixture' for binding in contract['tests'])]
         self.assertEqual({contract['id'] for contract in mapped}, {
+            'omg.audit.sbom.empty-recovery.fixture',
             'omg.status.fixture', 'omg.status.json.fixture', 'omg.install.consent.fixture',
             'omg.search.records.fixture', 'omg.search.query.fixture',
             'omg.search.limit.fixture', 'omg.search.json.fixture',
@@ -375,10 +380,10 @@ class NativeReceipts(unittest.TestCase):
         common_debian = {'debian_tests', 'debian_daemon_tests', 'debian_ipc_tests',
                          'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests'}
         for features, expected in (
-            ('pgp,license', set()), ('arch,pgp,license', set()),
-            ('debian,pgp,license', common_debian),
+            ('pgp,license', set()), ('arch,pgp,license', {'security_daemon_optional'}),
+            ('debian,pgp,license', common_debian | {'security_daemon_optional'}),
             ('debian-pure', common_debian | {'debian_pure_integration'}),
-            ('fedora,pgp,license', {'fedora_tests'}),
+            ('fedora,pgp,license', {'fedora_tests', 'security_daemon_optional'}),
         ):
             with self.subTest(features=features):
                 args = NATIVE.cargo_test_args(features)

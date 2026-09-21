@@ -3126,6 +3126,58 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omg.audit.sbom.empty-recovery.fixture",
+      "source": "src/cli/security.rs",
+      "binary": "omg",
+      "surface": "omg audit sbom",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "fedora"
+      ],
+      "requires": [
+        "success",
+        "state",
+        "fault"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "empty-inventory-cyclonedx-export",
+          "recovery-after-inventory-repair"
+        ],
+        "state": [
+          "failed-export-preserves-existing-report",
+          "corrupt-inventory-unchanged"
+        ],
+        "fault": [
+          "corrupt-inventory-explicit-failure"
+        ]
+      },
+      "scope": "Daemon-disabled debug CLI with isolated mock package inventory: empty export, corrupt inventory failure, previous report preservation and recovery. Does not certify populated native inventory, advisory fetching, score accuracy or daemon transport. This is not native package transactions evidence.",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::security_daemon_optional::sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure",
+          "evidence": [
+            "success",
+            "state",
+            "fault"
+          ],
+          "assertions": [
+            "empty-inventory-cyclonedx-export",
+            "recovery-after-inventory-repair",
+            "failed-export-preserves-existing-report",
+            "corrupt-inventory-unchanged",
+            "corrupt-inventory-explicit-failure",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

@@ -24,7 +24,9 @@ COVERAGE = SELECTION.COVERAGE
 require = COVERAGE.require
 
 
-BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
+BEHAVIOR_TESTS = frozenset({
+    'omg::security_daemon_optional::sbom_without_daemon_exports_shared_inventory_and_preserves_report_on_failure',
+}) | frozenset('omg::debian_e2e_tests::' + name for name in (
     'test_cli_status_shows_debian_info', 'test_cli_debian_respects_ci_mode')) | frozenset({
     'omg::cli_comprehensive::search_json_preserves_exact_records_ranking_limits_and_package_state',
     'omg::cli_comprehensive::explicit_shortcut_uses_the_same_isolated_state_as_explicit_count',
@@ -207,6 +209,8 @@ def cargo_test_args(features):
               'e2e_runtime_management', 'env_lockfile_integrity']
     if active & {'arch', 'debian', 'debian-pure', 'fedora'}:
         suites.append('cli_comprehensive')
+    if active & {'arch', 'debian', 'fedora'}:
+        suites.append('security_daemon_optional')
     if active & {'debian', 'debian-pure'}:
         suites.extend(['debian_tests', 'debian_daemon_tests', 'debian_ipc_tests',
                        'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests'])

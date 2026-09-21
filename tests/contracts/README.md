@@ -17,6 +17,14 @@ the report cannot certify the target even if its displayed percentage is high.
 This is not a test pass percentage, source-code coverage, or a claim about
 other lanes/platforms. Broader gaps remain until reviewed evidence closes them.
 
+Linux native owners also select `security_daemon_optional`. Its mapped SBOM
+contract covers only daemon-disabled empty mock inventory export, explicit
+corrupt-inventory failure, unchanged previous report and inventory, recovery,
+and checked fixture cleanup. The actual product pair and integration harness
+are bound by the same CLI receipt path. Populated native inventory, advisory
+fetching, severity accuracy, and daemon transport remain separate obligations;
+this mapping does not remove their behavioral gaps.
+
 Native CI invokes `scripts/run-native-contracts.py` around the existing nextest
 run. It lists the exact feature selection, requires nonempty owned suites,
 captures JUnit output, and hashes the actual parser test harnesses before and
