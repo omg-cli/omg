@@ -227,3 +227,38 @@ skips and failed first attempts. Do not rerun the suite or close broader native
 backend, process-lifecycle, fault or concurrency gaps through this reconciliation.
 Verify the adapter with adversarial unit fixtures, then rerun the owning real
 server suite on all four WSL distros and validate fresh hosted receipts.
+
+### Beta follow-through: Fedora advisories and shared scan parity
+
+The daemon is an optional accelerator. Shared scanning must remain available to
+the CLI without OMGD, and the TUI must not silently use a narrower implementation.
+
+Native investigation on Fedora44 with DNF5 5.4.1.0:
+`dnf5 --cacheonly advisory list --available --security --json` returned60
+package/advisory rows across30 advisories, with31 Moderate,25 Important and4 None
+labels. This is cached observation evidence, not proof of current advisory
+freshness or scanner completeness. `info` returned all collection packages,
+including architectures and subpackages not installed locally; treating that
+array as the affected installed set would over-report.
+
+Implementation requirements:
+- Use DNF's applicable package/advisory selection, not every package from an
+  advisory's detailed collection. Join detailed metadata by advisory identity;
+  preserve RPM epoch, version, release and architecture semantics.
+- Keep advisory identity, references and source distinct from CVSS score.
+  Preserve published qualitative severity; never manufacture numeric scores for
+  Important/Moderate/None. Update result serialization and protocol version if
+  fields change, including old/new peer refusal tests.
+- Run trusted DNF commands with bounded subprocess time/output, honor repository
+  policy, and fail explicitly for command failure, malformed data, incompatible
+  DNF or missing advisory metadata. Empty output is not automatically a clean
+  scan. Establish what fresh and offline scans promise before presenting success.
+- Test multiple architectures, installed versus available versions, duplicate
+  advisories, missing CVEs, unknown severity, partial metadata and failed refresh.
+  Use a deterministic local repository advisory fixture plus native WSL/QEMU
+  runs; do not substitute an injected Arch ecosystem for Fedora applicability.
+- Exercise direct CLI, daemon, export/fix filters and TUI from the same shared
+  result. Test qualitative severity filtering without pretending it is CVSS.
+
+Primary documentation:
+https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html
