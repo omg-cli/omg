@@ -82,3 +82,21 @@ defines the maximum as the largest accepted frame size. An isolated mutation
 lowering the limit by one byte fails the new boundary test; source restoration is
 checked. Cancellation, backpressure, exhaustive payload decoding, and response
 size boundaries remain open. These contracts do not close the broad frame gap.
+
+## DebianSearch transport and cache evidence
+
+`debian_search_preserves_catalog_limits_cache_and_refusal_over_real_ipc` seeds
+1,005 literal package records and checks exact names, versions, descriptions and
+APT source tags through the production server. The first query requests zero
+results, followed by limits one, default fifty, one thousand and usize::MAX.
+One cache miss and four hits must still return the correct wider results; caching
+only the first response would fail. An isolated mutation doing exactly that fails
+at the first wider request, with source restoration checked afterward.
+
+Empty and 500-byte unmatched queries return empty results; a 501-byte query must
+return the exact invalid-parameter envelope. The backend state file remains
+unchanged, a subsequent Ping succeeds, and shutdown and directory cleanup are
+checked. These assertions are admitted as a bounded DebianSearch contract on the
+Unix production-server lane. They do not certify native APT integration, refresh
+races, every text-search ordering case or standalone process behavior, so the
+broader DebianSearch gap remains open.

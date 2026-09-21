@@ -47,6 +47,7 @@ BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
 
 
 DAEMON_TESTS = frozenset('omg::coverage_18::' + name for name in (
+    'debian_search_preserves_catalog_limits_cache_and_refusal_over_real_ipc',
     'version_mismatch_gets_exact_parse_error_then_connection_closes',
     'frame_too_short_for_header_gets_parse_error_then_connection_closes',
     'undecodable_payload_gets_parse_error_validation_failure_then_close',

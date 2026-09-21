@@ -3016,6 +3016,63 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omgd.debian-search.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:DebianSearch",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-catalog-names-versions-descriptions-and-apt-source",
+          "zero-one-default-50-and-maximum-1000-result-limits",
+          "empty-and-500-byte-unmatched-query-return-no-results"
+        ],
+        "refusal": [
+          "501-byte-query-exact-invalid-params-envelope"
+        ],
+        "state": [
+          "zero-limit-cache-preserves-wider-responses-with-one-miss-four-hits",
+          "unchanged-backend-state-and-post-refusal-pong"
+        ]
+      },
+      "scope": "Production server::run over real Unix IPC with literal injected catalog, cache limit widening and checked SIGTERM drain/cleanup; not native package transactions, APT database integration, refresh races, exhaustive text matching or standalone process lifecycle",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::debian_search_preserves_catalog_limits_cache_and_refusal_over_real_ipc",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "exact-catalog-names-versions-descriptions-and-apt-source",
+            "zero-one-default-50-and-maximum-1000-result-limits",
+            "empty-and-500-byte-unmatched-query-return-no-results",
+            "501-byte-query-exact-invalid-params-envelope",
+            "zero-limit-cache-preserves-wider-responses-with-one-miss-four-hits",
+            "unchanged-backend-state-and-post-refusal-pong",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

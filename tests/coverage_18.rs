@@ -1154,6 +1154,106 @@ async fn concurrent_pings_preserve_boundary_ids_and_backend_state() -> Result<()
 
 #[tokio::test]
 #[serial]
+async fn debian_search_preserves_catalog_limits_cache_and_refusal_over_real_ipc() -> Result<()> {
+    let names: Vec<String> = (0..1005).map(|i| format!("cov18debsearch{i:04}")).collect();
+    let records: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "1.0.0")).collect();
+    let fixture = RealServerFixture::with_catalog(&[], &records, true).await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_dnf.json");
+    let before = std::fs::read(&state_path)?;
+    let baseline = metrics_probe(&fixture).await?;
+    // A zero-result first request must not poison subsequent wider cache hits.
+    for (id, limit, count) in [
+        (9100, Some(0), 0),
+        (9101, Some(1), 1),
+        (9102, None, 50),
+        (9103, Some(1000), 1000),
+        (9104, Some(usize::MAX), 1000),
+    ] {
+        match request_on_wire(
+            &fixture,
+            Request::DebianSearch {
+                id,
+                query: "cov18debsearch".into(),
+                limit,
+            },
+        )
+        .await?
+        {
+            Response::Success {
+                id: actual,
+                result: ResponseResult::DebianSearch(packages),
+            } => {
+                assert_eq!(actual, id);
+                assert_eq!(packages.len(), count);
+                for (package, name) in packages.iter().zip(&names) {
+                    assert_eq!(&package.name, name);
+                    assert_eq!(package.version, "1.0.0");
+                    assert_eq!(package.description, "");
+                    assert_eq!(
+                        package.source,
+                        omg_lib::daemon::protocol::WirePackageSource::Apt
+                    );
+                }
+            }
+            other => anyhow::bail!("Debian search returned {other:?}"),
+        }
+    }
+    let after = metrics_probe(&fixture).await?;
+    assert_eq!(after.cache_misses - baseline.cache_misses, 1);
+    assert_eq!(after.cache_hits - baseline.cache_hits, 4);
+    for (id, query) in [(9105, String::new()), (9106, "z".repeat(500))] {
+        match request_on_wire(
+            &fixture,
+            Request::DebianSearch {
+                id,
+                query,
+                limit: None,
+            },
+        )
+        .await?
+        {
+            Response::Success {
+                id: actual,
+                result: ResponseResult::DebianSearch(packages),
+            } => {
+                assert_eq!(actual, id);
+                assert!(packages.is_empty());
+            }
+            other => anyhow::bail!("empty/unmatched Debian search returned {other:?}"),
+        }
+    }
+    match request_on_wire(
+        &fixture,
+        Request::DebianSearch {
+            id: 9107,
+            query: "z".repeat(501),
+            limit: None,
+        },
+    )
+    .await?
+    {
+        Response::Error { id, code, message } => {
+            assert_eq!(id, 9107);
+            assert_eq!(code, error_codes::INVALID_PARAMS);
+            assert_eq!(message, "Query too long (max 500 characters)");
+        }
+        other @ Response::Success { .. } => anyhow::bail!("overlong query succeeded: {other:?}"),
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 9108 }).await?,
+        9108,
+    );
+    assert_eq!(std::fs::read(state_path)?, before);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
 #[cfg(target_os = "linux")]
 async fn health_reports_live_uptime_rss_and_worker_state_without_mutating_packages() -> Result<()> {
     let before_start = Instant::now();
