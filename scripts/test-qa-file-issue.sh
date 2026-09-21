@@ -236,10 +236,21 @@ fi
 # Repository discovery failure must not silently file in an old upstream.
 : > "$CALL_LOG"
 export FAKE_FAIL_OPERATION='repo view'
-if bash "$runner" "$results" --run-url https://run/unknown-repo --source qemu --failures-only >/dev/null 2>&1; then
+if env -u GITHUB_REPOSITORY bash "$runner" "$results" --run-url https://run/unknown-repo --source qemu --failures-only >/dev/null 2>&1; then
   fail "repository discovery failure was accepted"
 fi
 grep -q 'issue list\|issue create\|issue comment\|issue close' "$CALL_LOG" && fail "unknown repository reached issue operations"
+unset FAKE_FAIL_OPERATION
+
+# Hosted repository identity bypasses local discovery and targets that repo.
+: > "$CALL_LOG"
+export FAKE_FAIL_OPERATION='repo view'
+if GITHUB_REPOSITORY=fixture/hosted bash "$runner" "$results" --run-url https://run/hosted-repo --source qemu --failures-only >"$scratch/hosted-output" 2>"$scratch/error"; then
+  grep -q '^repo view' "$CALL_LOG" && fail "hosted identity unnecessarily invoked discovery"
+  grep -q 'issue create.*--repo fixture/hosted' "$CALL_LOG" || fail "hosted identity did not target its repository"
+else
+  fail "explicit hosted repository was rejected"
+fi
 unset FAKE_FAIL_OPERATION
 
 if [[ "$failures" -ne 0 ]]; then printf '%s failure(s)\n' "$failures" >&2; exit 1; fi
