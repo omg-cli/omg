@@ -930,6 +930,39 @@ impl DnfPackageManager {
         Ok(command)
     }
 
+    async fn affected_installed_packages(
+        row: &super::dnf_advisory::ApplicableAdvisory,
+        installed: &[super::types::SecurityPackage],
+    ) -> Result<Vec<super::types::SecurityPackage>> {
+        let (name, architecture) = super::dnf_advisory::package_identity(&row.nevra)?;
+        let evr = &row.nevra[name.len() + 1..row.nevra.len() - architecture.len() - 1];
+        let mut affected = Vec::new();
+        for package in installed.iter().filter(|package| {
+            package.name == name && package.architecture.as_deref() == Some(architecture)
+        }) {
+            let mut command =
+                tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
+            // Package values are data, never interpolated into RPM macros or Lua.
+            command
+                .env("OMG_LEFT_EVR", &package.version)
+                .env("OMG_RIGHT_EVR", evr);
+            command.args(["--eval", r#"%{lua:print(rpm.vercmp(os.getenv("OMG_LEFT_EVR"), os.getenv("OMG_RIGHT_EVR")))}"#]);
+            let output = Self::query_output(command).await?;
+            match std::str::from_utf8(&output)?.trim() {
+                "-1" => affected.push(package.clone()),
+                "0" | "1" => {}
+                _ => anyhow::bail!("Invalid native RPM version comparison result"),
+            }
+        }
+        anyhow::ensure!(
+            !affected.is_empty(),
+            "Advisory {} has no affected installed identity: {}",
+            row.name,
+            row.nevra
+        );
+        Ok(affected)
+    }
+
     async fn native_advisories() -> Result<
         Vec<(
             super::dnf_advisory::ApplicableAdvisory,
@@ -1317,12 +1350,32 @@ impl PackageManager for DnfPackageManager {
             >,
         >,
     > {
-        Some(Box::pin(async {
-            super::dnf_advisory::audit_result(
-                Self::native_advisories()
-                    .await
-                    .context("Failed to query native security advisories")?,
-            )
+        Some(Box::pin(async move {
+            async {
+                let installed = self.security_inventory().await?;
+                let rows = Self::native_advisories().await?;
+                for (row, _) in &rows {
+                    Self::affected_installed_packages(row, &installed).await?;
+                }
+                let mut after = self.security_inventory().await?;
+                let mut before = installed;
+                let identity = |package: &super::types::SecurityPackage| {
+                    (
+                        package.name.clone(),
+                        package.version.clone(),
+                        package.architecture.clone(),
+                    )
+                };
+                before.sort_by_key(identity);
+                after.sort_by_key(identity);
+                anyhow::ensure!(
+                    before == after,
+                    "Installed packages changed during native security audit"
+                );
+                super::dnf_advisory::audit_result(rows)
+            }
+            .await
+            .context("Failed to query native security advisories")
         }))
     }
 
@@ -1589,6 +1642,38 @@ fn reject_unsealed_local_rpm_targets(packages: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_advisory_identity_excludes_patched_versions_and_other_architectures() {
+        let package = |version: &str, architecture: &str| super::super::types::SecurityPackage {
+            name: "fixture".into(),
+            version: version.into(),
+            architecture: Some(architecture.into()),
+            description: String::new(),
+            licenses: Vec::new(),
+        };
+        let row = super::super::dnf_advisory::ApplicableAdvisory {
+            name: "FEDORA-fixture".into(),
+            kind: "security".into(),
+            severity: "Important".into(),
+            nevra: "fixture-1:1.0-2.x86_64".into(),
+        };
+        let installed = vec![
+            package("0:99.0-1", "x86_64"),
+            package("1:1.0-2", "x86_64"),
+            package("1:1.0-3", "x86_64"),
+            package("0:99.0-1", "i686"),
+        ];
+        let affected = DnfPackageManager::affected_installed_packages(&row, &installed)
+            .await
+            .unwrap();
+        assert_eq!(affected, vec![installed[0].clone()]);
+        assert!(
+            DnfPackageManager::affected_installed_packages(&row, &installed[1..])
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn security_inventory_preserves_every_native_rpm_identity() {
