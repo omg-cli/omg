@@ -1,0 +1,6 @@
+Package: no-description
+Version: 0.0.1
+Section: base
+Priority: optional
+Architecture: all
+Maintainer: Your Name <you@email.com>
