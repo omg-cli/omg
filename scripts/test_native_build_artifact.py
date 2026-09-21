@@ -58,38 +58,6 @@ def bundle(provenance, payload, extra=None):
 
 
 class NativeBuildAdmission(unittest.TestCase):
-    def test_readiness_missing_producer_does_not_suppress_other_guests(self):
-        available = ({'id': 9}, {'id': 123, 'run_attempt': 1}, {})
-        with patch.object(BUILD, 'find_native_artifact', side_effect=[
-                BUILD.ArtifactUnavailable('CI finished without arch'), available]) as find, \
-                patch.object(BUILD.time, 'monotonic', side_effect=[0, 1, 3]):
-            result = BUILD.ready(Path.cwd(), [{'distro': 'arch'}, {'distro': 'debian'}], {}, {}, timeout=10)
-        self.assertEqual([call.args[1] for call in find.call_args_list], ['arch', 'debian'])
-        self.assertEqual(result, {'arch': 'unavailable', 'debian': 'available'})
-
-    def test_readiness_deadline_does_not_allocate_another_wait_budget(self):
-        with patch.object(BUILD, 'find_native_artifact', side_effect=BUILD.ArtifactUnavailable('deadline')) as find, \
-                patch.object(BUILD.time, 'monotonic', side_effect=[0, 1, 11]):
-            result = BUILD.ready(Path.cwd(), [{'distro': 'arch'}, {'distro': 'debian'}], {}, {}, timeout=10)
-        self.assertEqual(find.call_count, 1)
-        self.assertEqual(result, {'arch': 'unavailable', 'debian': 'unavailable'})
-
-    def test_readiness_identity_errors_remain_blocking(self):
-        with patch.object(BUILD, 'find_native_artifact', side_effect=ValueError('foreign source')), \
-                self.assertRaisesRegex(ValueError, 'foreign source'):
-            BUILD.ready(Path.cwd(), [{'distro': 'arch'}], {}, {})
-
-    def test_readiness_wait_shares_one_deadline_and_never_downloads_binaries(self):
-        with patch.object(BUILD, 'find_native_artifact', return_value=({'id': 9}, {'id': 123, 'run_attempt': 1}, {})) as find, \
-                patch.object(BUILD.time, 'monotonic', side_effect=[0, 1, 3]), patch.object(BUILD, 'api') as download:
-            BUILD.ready(Path.cwd(), [{'distro': 'arch'}, {'distro': 'debian'}], {}, {}, timeout=10)
-        self.assertEqual([call.args[1] for call in find.call_args_list], ['arch', 'debian'])
-        self.assertEqual([call.kwargs['timeout'] for call in find.call_args_list], [9, 7])
-        download.assert_not_called()
-        for lanes in ([], [{'distro': 'arch'}, {'distro': 'arch'}], [{'distro': 'foreign'}]):
-            with self.subTest(lanes=lanes), self.assertRaises(ValueError):
-                BUILD.ready(Path.cwd(), lanes, {}, {})
-
     def test_reuse_failure_preserves_diagnostic_for_lifecycle_issue(self):
         from test_ci_optimization import BASH, step_script
         script = step_script('qemu-lane.yml', 'Reuse verified native CI binaries')
@@ -119,7 +87,8 @@ class NativeBuildAdmission(unittest.TestCase):
         ci = (root / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         lane = (root / '.github/workflows/qemu-lane.yml').read_text(encoding='utf-8')
         matrix = (root / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')
-        self.assertIn('native-build-artifact.py ready', job_block(matrix, 'prepare'))
+        self.assertNotIn('native-build-artifact.py ready', job_block(matrix, 'prepare'))
+        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu]', job_block(ci, 'qemu'))
         for owner in ('linux-matrix', 'ubuntu'):
             block = job_block(ci, owner)
             self.assertIn('native-build-artifact.py build', block)
@@ -137,8 +106,8 @@ class NativeBuildAdmission(unittest.TestCase):
         self.assertIn('inputs.staged && inputs.reuse-ci', guest)
         self.assertIn('if: inputs.staged && !inputs.reuse-ci', guest)
         self.assertIn("reuse-ci: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}", matrix)
-        for path in ('scripts/native-build-artifact.py', '.github/workflows/ci.yml'):
-            self.assertIn('      - "' + path + '"', matrix)
+        self.assertIn('  pull_request:\n  merge_group:', ci)
+        self.assertIn('python3 scripts/ci-change-scope.py', ci)
 
     def test_cli_dispatches_build_and_reuse_with_exact_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -154,13 +123,10 @@ class NativeBuildAdmission(unittest.TestCase):
                                                 'debian,pgp,license', Path(directory) / 'staged'))
                     if mode == 'reuse':
                         self.assertEqual(args[6], {'number': 440})
-            with patch.dict(os.environ, {'GITHUB_EVENT_PATH': str(event_path)}), patch.object(BUILD, 'ready') as wait:
-                BUILD.main(['ready', '--lanes', '[{"distro":"arch"}]', '--timeout', '60'])
-                self.assertEqual(wait.call_args.args[0:2], (Path.cwd(), [{'distro': 'arch'}]))
-                self.assertEqual(wait.call_args.args[3:], ({'number': 440}, 60))
 
     def test_reuse_checks_live_attempt_and_writes_only_validated_files(self):
-        for mode in ('valid', 'in-progress', 'queued', 'changed-attempt', 'expired', 'older-attempt', 'missing'):
+        for mode in ('valid', 'in-progress', 'queued', 'queued-artifact', 'waiting-artifact',
+                     'changed-attempt', 'expired', 'older-attempt', 'missing'):
             expected, provenance, payload = fixture()
             data = bundle(provenance, payload)
             run = dict(id=123, run_attempt=1, repository={'full_name': 'omg-cli/omg'},
@@ -171,6 +137,8 @@ class NativeBuildAdmission(unittest.TestCase):
                 # Main CI's release job waits for QEMU; requiring workflow
                 # completion before admitting its early artifact would deadlock.
                 run.update(status='in_progress', conclusion=None)
+            if mode in ('queued-artifact', 'waiting-artifact'):
+                run.update(status=mode.split('-')[0], conclusion=None)
             artifact = dict(id=9, name='native-release-debian-1', size_in_bytes=len(data), expired=False,
                             created_at='2026-09-20T09:01:00Z', digest='sha256:' + hashlib.sha256(data).hexdigest())
             if mode == 'expired':
@@ -198,8 +166,9 @@ class NativeBuildAdmission(unittest.TestCase):
                                GITHUB_EVENT_NAME='pull_request')
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
                 with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=data), \
-                        patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'):
-                    if mode in ('valid', 'in-progress', 'queued'):
+                        patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
+                        patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
+                    if mode in ('valid', 'in-progress', 'queued', 'queued-artifact', 'waiting-artifact'):
                         result = BUILD.reuse(root, 'debian', expected['image'], 'debian,pgp,license', destination, context, event)
                         self.assertEqual(result, provenance)
                         self.assertEqual({path.name for path in destination.iterdir()},

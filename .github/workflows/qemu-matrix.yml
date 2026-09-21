@@ -20,67 +20,10 @@
 name: QEMU Matrix
 
 on:
-  push:
-    branches: [main]
-    # Every main commit needs exact-commit evidence for the release gate.
-  pull_request:
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "build.rs"
-      - "rust-toolchain.toml"
-      - ".cargo/**"
-      - "benchmark-hyperfine.sh"
-      - "scripts/record-benchmark-run.py"
-      - "scripts/benchmark-qemu.sh"
-      - "scripts/pull-qemu-controller.sh"
-      - "scripts/test_qemu_controller_pull.py"
-      - "scripts/prepare-qemu-release.py"
-      - "scripts/test_prepare_qemu_release.py"
-      - "scripts/test_qemu_process_isolation.py"
-      - "scripts/check-qemu-controller.sh"
-      - "scripts/check-qemu-health.py"
-      - "scripts/check-qemu-inventory.py"
-      - "scripts/verify-qemu-image.py"
-      - "scripts/test_qemu_image_provenance.py"
-      - "scripts/test_qemu_inventory_policy.py"
-      - "scripts/test_qemu_health.py"
-      - "scripts/test_qemu_network_scope.py"
-      - "scripts/test_qemu_controller_floor.py"
-      - "scripts/qemu-transactions.sh"
-      - "scripts/qemu-storage-faults.py"
-      - "scripts/qemu-controller-egress.py"
-      - "scripts/test_qemu_egress.py"
-      - "scripts/test_qemu_storage_faults.py"
-      - "scripts/qemu-inventory.sh"
-      - "scripts/workspace-overlap-fixture.sh"
-      - "scripts/test_workspace_overlap.py"
-      - "scripts/test_qemu_output_contracts.py"
-      - "scripts/test-release-smoke.sh"
-      - "scripts/release-smoke.sh"
-      - "scripts/test-qa-file-issue.sh"
-      - "scripts/qa-evidence-lib.sh"
-      - "scripts/qa-file-issue.sh"
-      - "scripts/test-qa-audit.sh"
-      - "scripts/qa-audit.sh"
-      - "scripts/test-qa-open-pr.sh"
-      - "scripts/qa-open-pr.sh"
-      - "scripts/export-qemu-evidence.py"
-      - "scripts/test_export_qemu_evidence.py"
-      - "scripts/ci-smoke-report.py"
-      - "scripts/test_ci_smoke_report.py"
-      - "scripts/report-smoke-sentry.sh"
-      - ".github/workflows/qemu-matrix.yml"
-      - ".github/workflows/qemu-lane.yml"
-      - ".github/workflows/ci.yml"
-      - "scripts/native-build-artifact.py"
-      - "scripts/test_native_build_artifact.py"
-      - "scripts/qemu-daemon-check.sh"
-      - "scripts/test_qemu_daemon_contract.py"
-      - "scripts/qemu-image-cache.py"
-      - "scripts/test_qemu_image_cache.py"
+  workflow_call:
+    secrets:
+      OMG_SMOKE_SENTRY_DSN:
+        required: false
   schedule:
     # Nightly, staggered off docker-e2e's 02:00 slot.
     - cron: "17 3 * * *"
@@ -127,7 +70,7 @@ jobs:
   prepare:
     name: "Resolve test selection and provenance"
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
@@ -251,27 +194,8 @@ jobs:
           printf 'Harness/build revision: `%s`\n\nArtifact source: staged=%s, tag=%s\n\nSelected: distro=%s, x64=%s, arm64=%s\n' \
             "$GITHUB_SHA" "$STAGED" "$tag" "$REQUESTED_DISTRO" "$x64" "$arm64" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Wait once for native release artifacts
-        if: github.event_name == 'push' || github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NATIVE_LANES: ${{ steps.selection.outputs.lanes }}
-        run: |
-          python3 scripts/native-build-artifact.py ready --lanes "$NATIVE_LANES" \
-            2>&1 | tee "$RUNNER_TEMP/native-readiness.log"
-
-      - name: Preserve native readiness diagnostics
-        if: always() && (github.event_name == 'push' || github.event_name == 'pull_request')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: native-build-readiness
-          path: ${{ runner.temp }}/native-readiness.log
-          retention-days: 7
-          if-no-files-found: warn
-
-  #########################################################################
-  # Automatic guests share one readiness wait; manual builds remain independent.
-  #########################################################################
+  # Automatic calls are scheduled after native producers by CI.
+  # Standalone nightly/manual runs retain their independent build paths.
   guest:
     name: "Distro lane (${{ matrix.distro }})"
     needs: prepare

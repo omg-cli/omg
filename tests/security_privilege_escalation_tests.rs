@@ -808,7 +808,6 @@ install_from_release
                     "codeql.yml fixture-commit CodeQL",
                     "coverage.yml fixture-commit Coverage",
                     "docker-e2e.yml fixture-commit Docker E2E",
-                    "qemu-matrix.yml fixture-commit Staged QEMU",
                 ]
             };
             assert_eq!(calls.lines().collect::<Vec<_>>(), expected);

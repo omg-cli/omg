@@ -72,7 +72,7 @@ jobs:
           scripts/require-workflow-success.sh codeql.yml "$GITHUB_SHA" CodeQL
           scripts/require-workflow-success.sh coverage.yml "$GITHUB_SHA" Coverage
           scripts/require-workflow-success.sh docker-e2e.yml "$GITHUB_SHA" "Docker E2E"
-          scripts/require-workflow-success.sh qemu-matrix.yml "$GITHUB_SHA" "Staged QEMU"
+          # The successful CI run includes required staged QEMU verification.
 
   # ════════════════════════════════════════════════════════════════════════════
   # BUILD RELEASE ARTIFACTS
