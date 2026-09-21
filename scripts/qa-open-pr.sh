@@ -4,8 +4,8 @@
 # The gate is running this script: nothing opens PRs unprompted. It
 # refuses non-[qa] issues, dirty trees, and unpushed-branch surprises by
 # pushing explicitly, then opens the PR as a draft so a human promotes it.
-# The body uses "Fixes #N" so merging closes the issue (in addition to
-# the nightly resolve-on-green in qa-file-issue.sh).
+# Link the proposed fix without closing on merge. The issue remains open
+# until qa-file-issue.sh receives authoritative passing evidence.
 set -euo pipefail
 
 issue=""; branch=""; base="main"; repo=""; dry_run=false
@@ -45,7 +45,7 @@ title="$(jq -r .title <<< "$issue_json")"
 # (awk/sed/grep only: no bash-4 constructs.)
 replication_for_issue() {
   # The fingerprint marker is deliberately excluded: the gate above already
-  # requires it, and "Fixes #N" carries the identity. That keeps this empty
+  # requires it, and the issue reference carries the identity. That keeps this empty
   # (and the pointer fallback live) when an issue has no replication yet.
   # Each consumer gets its own copy: the first grep would otherwise drain
   # the shared stdin and starve the awks.
@@ -82,7 +82,7 @@ fi
 pr_url="$(gh pr create --repo "$repo" --head "$branch" --base "$base" --draft \
   --title "[qa-fix] #$issue $title" \
   --body "$(cat <<EOF
-Fixes #$issue.
+Related QA issue: #$issue.
 
 Automated fix PR for a pipeline [qa] failure. Opened as a draft:
 verify locally, fill in verification below, then promote.
@@ -96,8 +96,8 @@ $replication
 - [ ] Reran the failing leg from the issue runbook: PASS
 - [ ] Fixture suites green: \`./scripts/test-release-smoke.sh\`, \`./scripts/test-qa-file-issue.sh\`, \`./scripts/test-qa-open-pr.sh\`, \`./scripts/test-qa-audit.sh\`
 
-Merging closes #$issue; the nightly resolve-on-green closes it as well
-if the case passes first.
+Keep the issue open after merge until an authoritative passing run verifies
+the affected case. The issue reporter records that evidence before closure.
 EOF
 )" || exit 3)"
 printf 'opened %s\n' "$pr_url"

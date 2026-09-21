@@ -66,7 +66,9 @@ out=$(bash "$runner" --issue 7 --branch fix-x --repo o/r); assert_rc 0 "$?" "hap
 grep -q "push -u origin fix-x" "$CALL_LOG" || fail "happy path did not push the branch"
 grep -q "pr create" "$CALL_LOG" || fail "happy path opened no PR"
 grep -qF -- "--draft" "$CALL_LOG" || fail "happy path PR is not a draft"
-grep -q "Fixes #7" "$CALL_LOG" || fail "happy path body does not fix-link the issue"
+grep -q "Related QA issue: #7" "$CALL_LOG" || fail "happy path body lost the issue link"
+grep -Eiq '(fix(es|ed)?|close[sd]?|resolve[sd]?) #7' "$CALL_LOG" && fail "merge must not close an issue before verified recovery"
+grep -q "authoritative passing run" "$CALL_LOG" || fail "PR body omitted verification-based closure"
 grep -q "opened https://github.com/x/y/pull/1" <<< "$out" || fail "happy path printed no URL: $out"
 
 # 6. Bad arguments fail before any git/gh mutation.
