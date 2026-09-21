@@ -6,6 +6,6 @@
 //! - Real system packages
 //! - Real cryptographic verification
 //!
-//! Run with: `cargo test --test integration -- --ignored`
+//! Run with: `cargo test --test real_world_integration -- --ignored`
 
 mod security_real_world;
