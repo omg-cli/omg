@@ -100,3 +100,18 @@ checked. These assertions are admitted as a bounded DebianSearch contract on the
 Unix production-server lane. They do not certify native APT integration, refresh
 races, every text-search ordering case or standalone process behavior, so the
 broader DebianSearch gap remains open.
+
+## SecurityAudit inventory admission and recovery
+
+`security_audit_backend_failure_cannot_report_a_clean_scan` checks the actual
+server's empty-inventory result, then corrupts the isolated backend state. The
+next request must return the exact INTERNAL_ERROR, request ID and inventory
+failure cause; it must preserve the corrupt bytes and keep serving Ping. After
+repair, the empty result must recover, all three audit requests must be counted,
+and shutdown/cleanup must complete. An isolated mutation converting inventory
+errors to an empty package list fails as a false clean scan.
+
+This is an inventory admission/refusal contract, not vulnerability scanner
+coverage. No installed packages are scanned here, so advisory networking,
+positive findings, severity scores, scanner errors and cancellation remain open.
+The generic SecurityAudit gap is retained.

@@ -3073,6 +3073,59 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omgd.security-audit-inventory.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:SecurityAudit",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "empty-inventory-zero-counts-and-empty-findings-before-and-after-repair"
+        ],
+        "refusal": [
+          "corrupt-inventory-exact-internal-error-not-clean-scan"
+        ],
+        "state": [
+          "corrupt-inventory-preserved-and-daemon-responds",
+          "three-audit-requests-counted-and-repaired-state-preserved"
+        ]
+      },
+      "scope": "Production server::run over real Unix IPC, empty injected inventory and corrupt inventory refusal with checked SIGTERM drain/cleanup; not native package transactions, vulnerability scanning of installed packages, advisory fetching, scoring, partial scanner failures or standalone process lifecycle",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::security_audit_backend_failure_cannot_report_a_clean_scan",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "empty-inventory-zero-counts-and-empty-findings-before-and-after-repair",
+            "corrupt-inventory-exact-internal-error-not-clean-scan",
+            "corrupt-inventory-preserved-and-daemon-responds",
+            "three-audit-requests-counted-and-repaired-state-preserved",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

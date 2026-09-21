@@ -1254,6 +1254,67 @@ async fn debian_search_preserves_catalog_limits_cache_and_refusal_over_real_ipc(
 
 #[tokio::test]
 #[serial]
+async fn security_audit_backend_failure_cannot_report_a_clean_scan() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_pacman.json");
+    let original = std::fs::read(&state_path)?;
+    let baseline = metrics_probe(&fixture).await?;
+    for id in [9200, 9202] {
+        if id == 9202 {
+            std::fs::write(&state_path, &original)?;
+        }
+        match request_on_wire(&fixture, Request::SecurityAudit { id }).await? {
+            Response::Success {
+                id: actual,
+                result: ResponseResult::SecurityAudit(result),
+            } => {
+                assert_eq!(actual, id);
+                assert_eq!(result.total_vulnerabilities, 0);
+                assert_eq!(result.high_severity, 0);
+                assert!(result.vulnerabilities.is_empty());
+            }
+            other => anyhow::bail!("empty-inventory audit returned {other:?}"),
+        }
+        if id == 9200 {
+            std::fs::write(&state_path, b"{broken-json")?;
+            match request_on_wire(&fixture, Request::SecurityAudit { id: 9201 }).await? {
+                Response::Error { id, code, message } => {
+                    assert_eq!(id, 9201);
+                    assert_eq!(code, error_codes::INTERNAL_ERROR);
+                    assert_eq!(
+                        message,
+                        format!(
+                            "Failed to list packages: failed to parse mock state at {}",
+                            state_path.display()
+                        )
+                    );
+                }
+                other @ Response::Success { .. } => {
+                    anyhow::bail!("unreadable inventory reported clean: {other:?}")
+                }
+            }
+            assert_eq!(std::fs::read(&state_path)?, b"{broken-json");
+            assert_pong(
+                request_on_wire(&fixture, Request::Ping { id: 9203 }).await?,
+                9203,
+            );
+        }
+    }
+    assert_eq!(
+        metrics_probe(&fixture).await?.security_audit_requests - baseline.security_audit_requests,
+        3
+    );
+    assert_eq!(std::fs::read(&state_path)?, original);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
 #[cfg(target_os = "linux")]
 async fn health_reports_live_uptime_rss_and_worker_state_without_mutating_packages() -> Result<()> {
     let before_start = Instant::now();
