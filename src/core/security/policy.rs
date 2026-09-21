@@ -817,6 +817,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_findings_remain_risky_without_a_numeric_score() {
+        use super::super::vulnerability::{VulnerabilityReport, VulnerabilitySource};
+        use crate::package_managers::types::VersionDisplay;
+        struct Finding(Option<String>);
+        impl VulnerabilitySource for Finding {
+            fn scan_package<'a>(
+                &'a self,
+                name: &'a str,
+                version: &'a Version,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<Vec<VulnerabilityReport>, VulnerabilityError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                assert_eq!(name, "candidate");
+                assert_eq!(version.version_string(), "1.0.0");
+                Box::pin(async move {
+                    Ok(vec![VulnerabilityReport {
+                        id: "fixture-advisory".to_owned(),
+                        summary: "Known vulnerable candidate".to_owned(),
+                        score: self.0.clone(),
+                    }])
+                })
+            }
+        }
+        let version = crate::package_managers::parse_version("1.0.0").unwrap();
+        let policy = SecurityPolicy {
+            minimum_grade: SecurityGrade::Verified,
+            ..SecurityPolicy::default()
+        };
+        for score in [None, Some("0"), Some("9.8")] {
+            for official in [false, true] {
+                let source = Finding(score.map(str::to_owned));
+                let grade = policy
+                    .assign_grade(&source, "candidate", &version, official)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    grade,
+                    SecurityGrade::Risk,
+                    "score={score:?}, official={official}"
+                );
+                assert!(matches!(
+                    policy.check_package("candidate", !official, Some("MIT"), grade),
+                    Err(PolicyError::GradeTooLow {
+                        grade: SecurityGrade::Risk,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn official_packages_are_verified_not_locked_by_name() {
         let policy = SecurityPolicy::default();
         let version = crate::package_managers::parse_version_or_zero("2.40");
