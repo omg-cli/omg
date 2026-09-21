@@ -1153,16 +1153,16 @@ fn behavior_inventory_runs_in_hermetic_state() {
         }
         // The hermetic fixture always runs the arch mock backend, so the
         // arch expectation governs here; release lanes resolve their own.
-        let mut expected_exit = case
-            .expected_exit
-            .expect("executable rows declare an exit code")
-            .exit_for(Distro::Arch);
         // Native offline guests have installed packages and must refuse an
         // unavailable advisory source. This fixture has an empty mock inventory,
         // so its distinct contract is a completed empty scan with exit zero.
-        if case.assertions.contains(&Assertion::AuditSourceFailure) {
-            expected_exit = 0;
-        }
+        let expected_exit = if case.assertions.contains(&Assertion::AuditSourceFailure) {
+            0
+        } else {
+            case.expected_exit
+                .expect("executable rows declare an exit code")
+                .exit_for(Distro::Arch)
+        };
         let args: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
         let started = Instant::now();
         let result = project.run_with_env(
