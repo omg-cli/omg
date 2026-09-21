@@ -412,6 +412,31 @@ bootcmd:
       printf '[Time]\nNTP=\nNTP=162.159.200.1 162.159.200.123\nFallbackNTP=\n' > /etc/systemd/timesyncd.conf.d/99-omg-qemu.conf
       systemctl restart --no-block systemd-timesyncd.service
     fi
+write_files:
+  - path: /etc/systemd/system/omg-boot-network.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Bounded QEMU boot network diagnostics
+      [Service]
+      Type=oneshot
+      TimeoutStartSec=15
+      ExecStart=-/usr/bin/env ip -brief address
+      ExecStart=-/usr/bin/env ip -4 route
+      ExecStart=-/usr/bin/journalctl --boot --unit=systemd-networkd --unit=NetworkManager --lines=80 --no-pager
+      StandardOutput=tty
+      StandardError=tty
+      TTYPath=/dev/ttyS0
+  - path: /etc/systemd/system/omg-boot-network.timer
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Capture QEMU networking without SSH
+      [Timer]
+      OnBootSec=45
+      Unit=omg-boot-network.service
+      [Install]
+      WantedBy=timers.target
 CLOCK
 } > user-data
 chmod 600 user-data
@@ -472,6 +497,9 @@ wait_ssh
 # nonzero statuses fatal, but include the detailed errors in boot.log.
 timeout 180 ssh "${opts[@]}" bench@127.0.0.1 'cloud-init status --wait --long && cat /etc/os-release && uname -r && sudo -n true'
 if [[ "$initial" == false ]]; then exit 0; fi
+# Arm diagnostics before the first reboot and every subsequent disk clone.
+# The timer has no network-online dependency, so failed DHCP/SSH cannot hide it.
+ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl daemon-reload && sudo -n systemctl enable omg-boot-network.timer'
 ssh "${opts[@]}" bench@127.0.0.1 "sudo -n systemctl enable '$2'"
 before=$(ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id)
 ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl reboot' || true
