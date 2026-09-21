@@ -50,15 +50,22 @@ pub(crate) fn audit_result(
                 && !advisory.issues.is_empty(),
             "Incomplete Arch advisory identity"
         );
+        // Validate independently of installed matches: candidate cache admission
+        // calls this with an empty inventory before retaining the whole feed.
+        let fixed = advisory
+            .fixed
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_version(value).context("Invalid Arch advisory fixed version"))
+            .transpose()?;
         for package in installed
             .iter()
             .filter(|package| advisory.packages.contains(&package.name))
         {
             let version =
                 parse_version(&package.version).context("Invalid installed Arch version")?;
-            if let Some(fixed) = advisory.fixed.as_deref().filter(|value| !value.is_empty()) {
-                let fixed = parse_version(fixed).context("Invalid Arch advisory fixed version")?;
-                if version >= fixed {
+            if let Some(fixed) = &fixed {
+                if &version >= fixed {
                     continue;
                 }
             }
@@ -192,6 +199,10 @@ mod tests {
         );
         let mut invalid = advisory.clone();
         invalid.fixed = Some("invalid version".into());
+        assert!(
+            audit_result(&[], std::slice::from_ref(&invalid)).is_err(),
+            "cache admission must reject malformed fixed versions without installed matches"
+        );
         assert!(audit_result(&installed, &[invalid]).is_err());
         let mut unknown = advisory;
         unknown.status = "Unexpected".into();
