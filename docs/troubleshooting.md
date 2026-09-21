@@ -6,7 +6,7 @@ description: Diagnose failures without discarding configuration or evidence
 
 # Troubleshooting
 
-OMG is alpha software. Diagnose the failing operation before changing package state, configuration, or persisted data. Keep your native package manager available.
+OMG is approaching beta. Diagnose the failing operation before changing package state, configuration, or persisted data. Keep your native package manager available.
 
 ## Collect a baseline
 

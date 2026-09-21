@@ -8,6 +8,19 @@ description: Package verification, SBOM scope, audit logging, and export limitat
 
 OMG provides package verification, vulnerability reports, secret scanning, and local audit records. These controls do not prove that software is safe or that an organization meets a compliance framework. Capabilities depend on the compiled backend and the command path.
 
+The evidence path has explicit boundaries at each step:
+
+```mermaid
+flowchart LR
+    A[Package or runtime request] --> B[Backend-specific verification]
+    B --> C[Policy and trust checks]
+    C --> D[Mutation or download]
+    D --> E[Local audit record]
+    E --> F[Optional scan, SBOM, or attestation review]
+    F --> G[Evidence for the operator]
+    G -. does not prove .-> H[Software safety or compliance certification]
+```
+
 ## Privileged state storage
 
 Processes running as root use `/var/lib/omg` for data and daemon state, and `/var/cache/omg` for caches. Caller-supplied `OMG_DATA_DIR`, `OMG_DAEMON_DATA_DIR`, `OMG_CACHE_DIR`, home variables, and XDG variables do not select these privileged storage locations. Unprivileged paths and overrides are unchanged. These system directories must remain administrator-controlled; do not redirect them to user-writable storage.
@@ -75,9 +88,9 @@ omg audit slsa ./package.pkg.tar.zst \
   --certificate-identity "$EXPECTED_SIGNER_IDENTITY"
 ```
 
-Set `EXPECTED_SIGNER_IDENTITY` to the exact trusted publisher email or OIDC URI obtained independently. An empty or omitted identity fails verification. Use an existing artifact path without parent-directory traversal.
+Set `EXPECTED_SIGNER_IDENTITY` to the exact trusted publisher email or OIDC URI obtained independently. Omitting the identity still permits a cryptographically valid signature, but the command reports the signer as unbounded; supply the identity to enforce a trust policy. Use an existing artifact path without parent-directory traversal.
 
-The verifier hashes the artifact, queries Rekor, checks the log's signed entry timestamp against a pinned key, and handles supported `hashedrekord` signatures. A successful result requires a supported artifact signature, a Fulcio certificate chain, and an exact identity match.
+The verifier hashes the artifact, queries Rekor, checks the log's signed entry timestamp against a pinned key, and handles supported `hashedrekord` signatures. A successful result requires a supported artifact signature and a Fulcio certificate chain. When an identity is supplied, it must match exactly.
 
 Current limits:
 

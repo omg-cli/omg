@@ -235,7 +235,8 @@ pub enum Commands {
     /// Instantly switch runtime versions (Node, Python, Rust, etc.)
     #[command(disable_version_flag = true, next_help_heading = "Runtime Management")]
     Use {
-        /// Runtime to switch (node, python, go, rust, ruby, java, bun)
+        /// Runtime to switch (node, python, go, rust, ruby, java, bun, pi,
+        /// deno, zig, dotnet, erlang, php, swift)
         runtime: String,
         /// Version to use (e.g., 20.10.0, latest, lts). If omitted, detects from version file.
         version: Option<String>,
