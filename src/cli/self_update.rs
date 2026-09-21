@@ -1292,11 +1292,15 @@ mod tests {
         let cli = root.path().join("candidate-cli");
         let daemon = root.path().join("candidate-daemon");
         let pid_file = root.path().join("descendant.pid");
+        let heartbeat = root.path().join("descendant.heartbeat");
         write_version_probe(
             &cli,
             &format!(
-                "sleep 30 >/dev/null 2>&1 & echo $! > '{}'; echo 'omg 1.2.3'",
-                pid_file.display()
+                "(while :; do printf x >> '{}'; sleep 0.01; done) >/dev/null 2>&1 & \
+                 echo $! > '{}'; while [ ! -s '{}' ]; do :; done; echo 'omg 1.2.3'",
+                heartbeat.display(),
+                pid_file.display(),
+                heartbeat.display()
             ),
         );
         write_version_probe(&daemon, "echo 'omgd 1.2.3'");
@@ -1322,17 +1326,18 @@ mod tests {
             .trim()
             .parse::<i32>()
             .unwrap();
-        for _ in 0..50 {
-            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
-                == Err(nix::errno::Errno::ESRCH)
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let before = fs::metadata(&heartbeat).unwrap().len();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = fs::metadata(&heartbeat).unwrap().len();
+        if after != before {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
         assert_eq!(
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-            Err(nix::errno::Errno::ESRCH)
+            after, before,
+            "forked descendant kept running after its process group was killed"
         );
         assert_eq!(fs::read(&installed).unwrap(), b"previous cli");
         assert_eq!(

@@ -62,7 +62,7 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
       elif [[ "$scenario" == hung_probe ]]; then
         printf '#!/bin/sh\necho "$$" > "%s/probe.pid"\nexec sleep 30\n' "$scenario_dir" > "$tmp_dir/omg"
       elif [[ "$scenario" == forked_probe ]]; then
-        printf '#!/bin/sh\nsleep 30 >/dev/null 2>&1 &\necho "$!" > "%s/descendant.pid"\nprintf "omg 1.2.3\\n"\n' "$scenario_dir" > "$tmp_dir/omg"
+        printf '#!/bin/sh\n(while :; do printf x >> "%s/descendant.heartbeat"; sleep 0.01; done) >/dev/null 2>&1 &\necho "$!" > "%s/descendant.pid"\nwhile [ ! -s "%s/descendant.heartbeat" ]; do :; done\nprintf "omg 1.2.3\\n"\n' "$scenario_dir" "$scenario_dir" "$scenario_dir" > "$tmp_dir/omg"
       fi
       chmod +x "$tmp_dir/omg"
       if [[ "$scenario" != missing_daemon ]]; then
@@ -111,7 +111,11 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
         forked_probe)
           grep -F 'omg version probe left descendant processes running' "$scenario_dir/output"
           [[ -s "$scenario_dir/descendant.pid" ]]
-          if kill -0 "$(cat "$scenario_dir/descendant.pid")" 2>/dev/null; then
+          heartbeat_before=$(wc -c < "$scenario_dir/descendant.heartbeat")
+          sleep 0.1
+          heartbeat_after=$(wc -c < "$scenario_dir/descendant.heartbeat")
+          if [[ "$heartbeat_after" != "$heartbeat_before" ]]; then
+            kill -KILL "$(cat "$scenario_dir/descendant.pid")" 2>/dev/null || true
             printf 'Forked version probe descendant was left running\n' >&2
             exit 1
           fi
