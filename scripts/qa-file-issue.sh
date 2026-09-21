@@ -91,12 +91,16 @@ runbook_for() {
 }
 
 if [[ -z "$repo" ]]; then
-  # Local-first default: file to the checkout's own repo (covers forks),
-  # falling back to upstream only when that cannot be determined.
+  # Local-first default: file to the checkout's own repo (covers forks).
+  # An unknown destination must never fall back to a different repository.
   # Deliberately after the schema gate: junk input must fail before any
   # network call.
-  repo="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || printf 'PyRo1121/omg')}"
+  repo="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || exit 3)}"
 fi
+[[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+  printf 'error: repository must be an explicit owner/name or discoverable from this checkout\n' >&2
+  exit 2
+}
 open_issues="$(gh issue list --repo "$repo" --label "$label" --state all --json number,body,state --limit 1000)"
 filed=0; updated=0; closed=0; errors=0
 while IFS= read -r row; do

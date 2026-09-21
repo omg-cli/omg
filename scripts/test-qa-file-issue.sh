@@ -19,6 +19,7 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$CALL_LOG"
 if [[ "${FAKE_FAIL_OPERATION:-}" == "$1 $2" ]]; then exit 7; fi
 case "$1 $2" in
+  "repo view") printf 'fork/omg\n';;
   "issue list") printf '%s' "${FAKE_ISSUES_JSON:-[]}";;
   "issue view") printf '%s' "${FAKE_COMMENTS_JSON:-[]}";;
   "issue create") printf 'https://github.com/x/y/issues/1\n';;
@@ -207,6 +208,15 @@ if out=$(bash "$runner" "$results" --run-url https://run/local --source qemu --f
 else
   fail "failures-only reporting failed"
 fi
+
+# Repository discovery failure must not silently file in an old upstream.
+: > "$CALL_LOG"
+export FAKE_FAIL_OPERATION='repo view'
+if bash "$runner" "$results" --run-url https://run/unknown-repo --source qemu --failures-only >/dev/null 2>&1; then
+  fail "repository discovery failure was accepted"
+fi
+grep -q 'issue list\|issue create\|issue comment\|issue close' "$CALL_LOG" && fail "unknown repository reached issue operations"
+unset FAKE_FAIL_OPERATION
 
 if [[ "$failures" -ne 0 ]]; then printf '%s failure(s)\n' "$failures" >&2; exit 1; fi
 printf 'qa-file-issue harness: all green\n'
