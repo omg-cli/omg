@@ -244,7 +244,7 @@ A green run is evidence for what it tested, not proof of every command path on e
 
 | Gate | Proves | Does not prove |
 | :--- | :--- | :--- |
-| CI build, test, lint, coverage | The commit compiles and its test inventory passes on the runner | Behaviour on a distribution the runner is not | 
+| CI build, test, lint, coverage | The commit compiles and its test inventory passes on the runner | Behaviour on a distribution the runner is not |
 | Benchmarks | No regression beyond the recorded tolerance for the measured operations | Speed on your hardware, your cache state, or your repository set |
 | Security audit, secret scan, CodeQL | The checked classes of defect were not found by these tools | Absence of every defect class |
 | Staged QEMU (Arch, Debian, Ubuntu, Fedora) | The reviewed CLI inventory and daemon lifecycle work in clean guests | Your configured machine, your repositories, your AUR recipes |
