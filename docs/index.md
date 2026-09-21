@@ -1,48 +1,59 @@
 ---
 title: OMG documentation
 sidebar_position: 1
-description: Manage system packages, project runtimes, and environment records
+description: Learn how OMG manages packages, runtimes, project tasks, and environment records
 ---
 
-# OMG documentation
+# Learn OMG
 
-OMG combines system package backends, project runtime selection, and task execution in one Rust CLI. It is approaching beta. Keep your native package tools available and use recoverable machines for package mutations while validating your workflows.
+OMG gives your development environment one workflow: choose the tools a project needs, run the work it defines, and keep a record of the setup that worked.
 
-**[Install OMG](./installation.md), then [run a project task](./quickstart.md).** The quickstart selects a runtime without changing system packages.
+**New here? Start with the [quickstart](./quickstart.md).** It takes you from installation to a running project in a few commands.
 
-## Choose a workflow
+## Choose your first workflow
 
-- [Packages](./packages.md), [package search](./package-search.md), and [AUR](./aur.md).
-- [Runtimes](./runtimes.md) and [shell integration](./shell-integration.md).
-- [Task runner](./task-runner.md) and [containers](./containers.md).
-- [Environment and team records](./team.md), [workflows](./workflows.md), and [integrations](./integrations.md).
-- [Security evidence](./security.md) and [enterprise report limitations](./enterprise.md).
-- [Terminal dashboard](./tui.md), [history](./history.md), and [troubleshooting](./troubleshooting.md).
+### Build and run a project
 
-## Look up a command or setting
+- [Quickstart](./quickstart.md) — select a runtime, run a task, and capture the environment.
+- [Task runner](./task-runner.md) — run scripts from package.json, Cargo, Make, and other supported project types.
+- [Runtime management](./runtimes.md) — install and switch Node.js, Python, Rust, Go, and more.
+- [Shell integration](./shell-integration.md) — select project versions as you move between directories.
 
-- [CLI reference](./cli.md).
-- [Cheatsheet](./cheatsheet.md).
-- [Configuration](./configuration.md).
-- [FAQ](./faq.md).
-- [Migration from yay](./migration/from-yay.md).
+### Manage packages and tools
 
-## Understand the boundaries
+- [Package operations](./packages.md) — search, inspect, preview, install, and update system packages.
+- [Package search](./package-search.md) — understand sources, filters, and result output.
+- [Developer tools](./cli.md#omg-tool) — install supported npm, Python, Cargo, Go, and other registry tools.
+- [AUR workflow](./aur.md) — review and control source builds on Arch.
 
-Release targets are Linux x86_64 for Arch, Debian, Ubuntu, and Fedora, plus macOS ARM64. Windows use is through WSL, not a native Windows backend. An available backend does not imply equal command coverage. See [installation](./installation.md) for artifact-specific limitations.
+### Keep environments understandable
 
-Environment capture records inventory. Sync shares a lockfile and checks drift; it does not reconstruct identical machines. Security exports are plaintext evidence inputs, not compliance certifications. SLSA-named artifact checks do not establish SLSA build levels. These distinctions are documented in [security](./security.md) and [team workflows](./team.md).
+- [Team workflows](./team.md) — capture, compare, and share environment records.
+- [Workflow patterns](./workflows.md) — combine runtimes, packages, and tasks in a repeatable project flow.
+- [Mise compatibility](./mise-compatibility.md) — see which existing project configuration OMG can reuse.
+- [Security model](./security.md) — understand what OMG verifies and where its boundaries are.
 
-Performance depends on the operation, backend, query, and cache state. Read [benchmark methodology and raw evidence](../benchmarks/README.md) rather than treating local measurements as universal speedups.
+## Look up a command or fix a problem
 
-## Operate and contribute
+- [CLI reference](./cli.md) — commands, options, and machine-readable output.
+- [Cheatsheet](./cheatsheet.md) — common commands at a glance.
+- [Installation](./installation.md) — platform requirements, verification, updates, and source builds.
+- [Configuration](./configuration.md) — persistent settings and environment variables.
+- [FAQ](./faq.md) — common questions and migration notes.
+- [Troubleshooting](./troubleshooting.md) — diagnose failed commands and setup issues.
+
+## The operating model
+
+OMG keeps native package backends and project metadata in view while giving you one command surface. Supported targets currently include Linux x86_64 on Arch, Debian, Ubuntu, and Fedora, plus macOS ARM64. Windows use is through WSL2.
+
+Feature coverage varies by backend and project type. Environment records describe the tools and state OMG can observe; they do not recreate an identical machine. The linked workflow and security guides explain those boundaries where they affect a decision.
+
+## For maintainers and contributors
 
 - [Architecture](./architecture.md), [daemon](./daemon.md), [IPC](./ipc.md), and [cache](./cache.md).
-- [Performance investigation](./performance-tips.md).
-- [Release operations](./release-operations.md) and [release readiness](./release-readiness.md).
-- [Local QEMU checks](./qemu-local.md), [macOS QEMU notes](./qemu-macos.md), and [QA loop](./qa-loop.md).
+- [Release operations](./release-operations.md), [release readiness](./release-readiness.md), and [QA loop](./qa-loop.md).
 - [Contributing](../CONTRIBUTING.md) and [changelog](./changelog.md).
 
-Historical changelogs, dated investigations, and audit reports describe their recorded state, not current feature guarantees.
+Historical changelogs and dated investigations describe the state recorded at the time; the workflow guides above are the best place to learn how OMG works today.
 
-[Report a bug](https://github.com/omg-cli/omg/issues) with your version, distribution, command, and redacted output. Report vulnerabilities privately using [SECURITY.md](../SECURITY.md).
+[Report a bug](https://github.com/omg-cli/omg/issues) with your version, platform, command, and redacted output. Report vulnerabilities privately using [SECURITY.md](../SECURITY.md).

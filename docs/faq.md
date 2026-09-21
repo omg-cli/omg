@@ -8,7 +8,7 @@ description: Frequently asked questions
 
 ## What is OMG?
 
-OMG combines system-package commands, 14 native runtime managers, a task runner, and selected security tools. It is approaching beta, not a replacement for every feature of pacman, APT, DNF, Homebrew, or existing runtime providers.
+OMG combines system-package commands, 14 native runtime managers, a task runner, and selected security tools. It complements pacman, APT, DNF, Homebrew, and existing runtime providers rather than hiding the systems underneath.
 
 ## How do I install it?
 
