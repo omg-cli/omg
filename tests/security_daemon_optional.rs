@@ -32,6 +32,7 @@ fn audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_hi
     std::fs::write(&path, &tampered)?;
     let rejected = project.run(&["audit", "verify"]);
     rejected.assert_failure();
+    assert!(rejected.stdout.contains("Audit log integrity FAILED"));
     assert!(!rejected.stdout.contains("consistency verified"));
     assert_eq!(std::fs::read(&path)?, tampered);
 
@@ -40,6 +41,11 @@ fn audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_hi
     std::fs::write(&marker, b"fixture collection failure")?;
     let incomplete = project.run(&["audit", "verify"]);
     incomplete.assert_failure();
+    assert!(
+        incomplete.stderr.contains("Audit collection is incomplete"),
+        "unexpected failure: {}",
+        incomplete.stderr
+    );
     assert!(!incomplete.stdout.contains("consistency verified"));
     assert_eq!(std::fs::read(&path)?, original);
     assert_eq!(std::fs::read(&marker)?, b"fixture collection failure");
