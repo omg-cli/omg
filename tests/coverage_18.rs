@@ -258,9 +258,13 @@ async fn expect_eof(stream: &mut UnixStream, ctx: &str) {
 
 async fn metrics_probe(fixture: &RealServerFixture) -> Result<MetricsSnapshot> {
     let mut stream = fixture.connect().await?;
+    metrics_on_connection(&mut stream).await
+}
+
+async fn metrics_on_connection(stream: &mut UnixStream) -> Result<MetricsSnapshot> {
     let bytes = omg_lib::daemon::protocol::encode_frame(&Request::Metrics { id: 0xBEEF })?;
-    send_raw_frame(&mut stream, &bytes).await?;
-    match read_response(&mut stream).await? {
+    send_raw_frame(stream, &bytes).await?;
+    match read_response(stream).await? {
         Response::Success {
             id: 0xBEEF,
             result: ResponseResult::Metrics(snapshot),
@@ -918,6 +922,64 @@ async fn wait_for_active_connections(fixture: &RealServerFixture, expected: i64)
     let deadline = Instant::now() + READ_TIMEOUT;
     loop {
         let active = metrics_probe(fixture).await?.active_connections;
+        if active == expected {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "active connections never reached {expected}; last value was {active}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn connection_capacity_refuses_overflow_and_recovers_released_permits() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let mut control = fixture.connect().await?;
+    wait_for_connection_count(&mut control, 1).await?;
+    // Independent contract boundary: do not import the product constant, since
+    // changing or removing its limit must make this test fail.
+    let mut held = Vec::new();
+    for id in 1..128 {
+        let mut client = fixture.connect().await?;
+        client.write_all(&ping_wire(id)?).await?;
+        assert_pong(read_response(&mut client).await?, id);
+        held.push(client);
+    }
+    wait_for_connection_count(&mut control, 128).await?;
+    let mut overflow = fixture.connect().await?;
+    expect_eof(&mut overflow, "129th connection at capacity").await;
+    assert_eq!(
+        metrics_on_connection(&mut control)
+            .await?
+            .active_connections,
+        128
+    );
+
+    drop(held.pop().context("missing held connection")?);
+    wait_for_connection_count(&mut control, 127).await?;
+    let mut replacement = fixture.connect().await?;
+    replacement.write_all(&ping_wire(9001)?).await?;
+    assert_pong(read_response(&mut replacement).await?, 9001);
+    wait_for_connection_count(&mut control, 128).await?;
+    let mut overflow_again = fixture.connect().await?;
+    expect_eof(&mut overflow_again, "capacity after permit reuse").await;
+
+    drop(replacement);
+    drop(held);
+    wait_for_connection_count(&mut control, 1).await?;
+    control.write_all(&ping_wire(9002)?).await?;
+    assert_pong(read_response(&mut control).await?, 9002);
+    drop(control);
+    fixture.shutdown().await
+}
+
+async fn wait_for_connection_count(stream: &mut UnixStream, expected: i64) -> Result<()> {
+    let deadline = Instant::now() + READ_TIMEOUT;
+    loop {
+        let active = metrics_on_connection(stream).await?.active_connections;
         if active == expected {
             return Ok(());
         }

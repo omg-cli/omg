@@ -38,3 +38,24 @@ does not claim to close them or exhaust every scheduler interleaving.
 as EOF at the peer while leaving the local read half available. The interrupted
 request assertion uses that behavior to verify the server's actual close, rather
 than dropping the client and inferring that the server released the connection.
+
+## Connection capacity lifecycle evidence
+
+`connection_capacity_refuses_overflow_and_recovers_released_permits` holds
+128 real production-server connections, proves each accepted client can receive
+an exact Pong, and observes clean EOF for connection 129. It releases one client,
+observes the count fall, proves a replacement works, rejects overflow again, then
+releases all clients and checks continued service and SIGTERM cleanup.
+
+Metrics use an already held control connection: opening a probe connection at
+capacity would itself hit the refusal under test. Bounded polling observes task
+cleanup; it does not retry the refused request until it happens to succeed.
+
+The root path is listener accept -> nonblocking semaphore acquisition -> owned
+permit held by the connection task -> task completion -> permit release.
+[Tokio's owned permit documentation](https://docs.rs/tokio/latest/tokio/sync/struct.OwnedSemaphorePermit.html)
+confirms that dropping the permit releases its capacity. Changing the product
+limit from 128 to 129 in an isolated negative control fails the overflow assertion.
+This closes a specific test gap; it does not establish a production defect or
+claim complete capacity coverage. This test is not yet admitted to behavioral
+coverage receipts; the broader connection-capacity gap remains open.
