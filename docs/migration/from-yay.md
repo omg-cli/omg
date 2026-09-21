@@ -19,7 +19,7 @@ This guide helps yay users transition to OMG with familiar command patterns and 
 | Team Sync | ❌ | ✅ Environment lockfiles |
 | Language | Go | Rust, with native-tool subprocesses on some paths |
 
-OMG is alpha software. Keep yay and pacman available while validating your required workflows. Comparisons above describe command intent, not complete feature equivalence. See [benchmark scope](../../benchmarks/README.md) and [security limits](../security.md).
+OMG is approaching beta. Keep yay and pacman available while validating your required workflows. Comparisons above describe command intent, not complete feature equivalence. See [benchmark scope](../../benchmarks/README.md) and [security limits](../security.md).
 
 ## Command Mapping
 

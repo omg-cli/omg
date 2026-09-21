@@ -8,7 +8,7 @@ description: Select a project runtime, run a task, and check environment drift
 
 Use an existing Node.js project to select a runtime, run a task, and capture an environment record. This tutorial does not install system packages.
 
-OMG is alpha software. Start in a repository you trust, and use a disposable machine for package mutations. Project tasks execute repository code.
+OMG is approaching beta. Start in a repository you trust, and use a disposable machine for package mutations. Project tasks execute repository code.
 
 ## Install OMG
 

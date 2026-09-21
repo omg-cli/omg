@@ -732,16 +732,43 @@ macro_rules! require_ubuntu {
     };
 }
 
+/// Exact status expected from a fresh, empty, unscanned daemon fixture.
+#[cfg(unix)]
+pub fn assert_empty_daemon_status(response: omg_lib::daemon::protocol::Response, expected_id: u64) {
+    use omg_lib::daemon::protocol::{Response, ResponseResult};
+    match response {
+        Response::Success {
+            id,
+            result: ResponseResult::Status(status),
+        } => {
+            assert_eq!(id, expected_id);
+            assert_eq!(
+                (
+                    status.total_packages,
+                    status.explicit_packages,
+                    status.orphan_packages,
+                    status.updates_available
+                ),
+                (0, 0, 0, 0)
+            );
+            assert!(!status.vulnerabilities_scanned);
+            assert_eq!(status.scanned_vulnerability_count(), None);
+            assert!(status.runtime_versions.is_empty());
+        }
+        other => panic!("empty isolated status returned {other:?}"),
+    }
+}
+
 /// Isolated daemon state for handler-level tests: temp dirs, mock Arch
 /// backend, empty index. Shared so cache, concurrency, and IPC fixtures
 /// cannot drift apart.
-#[cfg(feature = "arch")]
+#[cfg(unix)]
 pub struct DaemonTestFixture {
     _temp_dir: TempDir,
     pub state: std::sync::Arc<omg_lib::daemon::handlers::DaemonState>,
 }
 
-#[cfg(feature = "arch")]
+#[cfg(unix)]
 impl DaemonTestFixture {
     pub fn new() -> Result<Self> {
         let temp_dir = TempDir::new()?;

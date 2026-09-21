@@ -1,6 +1,6 @@
 # Install OMG
 
-OMG is alpha software. Use a recoverable development machine or disposable VM for package mutations. Keep your native package manager available.
+OMG is approaching beta. Use a recoverable development machine or disposable VM for package mutations, and keep your native package manager available while validating your workflows.
 
 ## Choose a supported release target
 
@@ -9,11 +9,11 @@ The [release workflow](../.github/workflows/release.yml) builds:
 - Linux x86_64 for Arch, Debian, Ubuntu, and Fedora, each with a separate backend archive.
 - macOS ARM64 for Apple Silicon, with the Homebrew backend.
 
-There is no current Intel macOS or Linux ARM64 release artifact. Rosetta does not run ARM64 binaries on Intel Macs. Native Windows is unsupported; use a supported Linux distribution inside WSL. Fedora support does not establish RHEL compatibility.
+There is no current Intel macOS, Linux ARM64, 32-bit x86, or ARMv7 release artifact. Rosetta does not run ARM64 binaries on Intel Macs. Native Windows is unsupported; use a supported Linux distribution inside WSL (Arch, Debian, Ubuntu, or Fedora). Fedora support does not establish RHEL compatibility, although the installer maps RHEL/CentOS-family identification to the Fedora artifact as a best-effort fallback.
 
-Arch uses ALPM and supports AUR builds. Debian and Ubuntu use the native APT backend. Fedora uses DNF, with database reads and subprocess fallbacks. macOS package operations require Homebrew; OMG itself is not packaged as a Homebrew formula here.
+Arch uses ALPM and supports AUR builds. Debian and Ubuntu use the native APT backend. Fedora uses DNF, with database reads and subprocess fallbacks. macOS package operations require Homebrew; OMG itself is not packaged as a Homebrew formula here. An unknown Linux distribution is assigned the Fedora artifact by the installer, but that fallback is not a support guarantee.
 
-These backends do not have identical policy, audit, or runtime coverage. The recorded `v0.1.218` Fedora package smoke tests failed. Later local candidate results do not establish that a published archive is fixed. Check the [artifact-specific evidence](../benchmarks/README.md) before choosing a release.
+These backends do not have identical policy, audit, or runtime coverage. Review the [artifact-specific evidence](../benchmarks/README.md) and the release notes before choosing a release; a passing result for one backend does not establish equivalent coverage for another.
 
 ## Review and run the installer
 
@@ -39,7 +39,7 @@ Archive verification does not authenticate the bootstrap script retroactively. T
 Apply environment variables to the shell running the script:
 
 ```bash
-OMG_VERSION=v0.1.218 OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 bash omg-install.sh
+OMG_VERSION=v0.1.223 OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 bash omg-install.sh
 INSTALL_DIR="$HOME/.omg/bin" OMG_SKIP_SHELL=1 bash omg-install.sh
 ```
 
@@ -64,9 +64,16 @@ cargo build --release --locked --no-default-features --features debian,pgp,licen
 cargo build --release --locked --no-default-features --features fedora,pgp,license
 # Apple Silicon macOS
 cargo build --release --locked --no-default-features --features macos,pgp,license
+# Debian index fixtures only (not a live package mutation backend)
+cargo build --release --locked --no-default-features --features debian-pure,pgp,license
 ```
 
-Do not run every command. Cargo features are additive, so `--features debian` alone does not remove the default Arch backend. The `license` feature compiles account-linking support; it is not a local CLI paywall.
+Choose one release backend, and use `debian-pure` only for indexing and test
+fixtures. It deliberately refuses live Debian/Ubuntu mutations because it has
+no APT privilege boundary or dpkg conffile semantics. Do not run every release
+command above. Cargo features are additive, so `--features debian` alone does
+not remove the default Arch backend. The `license` feature compiles
+account-linking support; it is not a local CLI paywall.
 
 Inspect `target/release/omg --help` before installing a built binary. An explicit source-install path is `bash ./install.sh --from-source` from a trusted checkout. Source builds are not release-attested binaries.
 
