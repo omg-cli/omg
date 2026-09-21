@@ -32,6 +32,7 @@ HOST_FILES = {
     "benchmark-driver-sha256.txt", "cases.tsv", "controller-id.txt", "release-checksum.txt",
 }
 GUEST_FILES = {
+    "daemon-advisory-shutdown.log",
     "dnf-reason-fault.stdout.log", "dnf-reason-fault.stderr.log",
     "native-explicit.txt", "native-explicit.json",
     "daemon-direct-after-queries.txt", "daemon-foreground-after-queries.txt",

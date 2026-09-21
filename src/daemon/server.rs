@@ -167,7 +167,14 @@ async fn run_with_status_path(
     workers.spawn(async move {
         tracing::info!("Background status worker started");
 
-        async fn refresh_status(state: &Arc<DaemonState>, fast_status_path: &std::path::Path) {
+        async fn refresh_status(
+            state: &Arc<DaemonState>,
+            fast_status_path: &std::path::Path,
+            shutdown: &CancellationToken,
+        ) {
+            if shutdown.is_cancelled() {
+                return;
+            }
             let versions = match tokio::task::spawn_blocking(|| {
                 use crate::cli::runtimes::{ensure_active_version, known_runtimes};
 
@@ -220,17 +227,21 @@ async fn run_with_status_path(
 
             // Isolated fixtures must explicitly configure their advisory
             // source before enabling unsolicited background network work.
-            if !state.background_security_scans {
+            if !state.background_security_scans || shutdown.is_cancelled() {
                 return;
             }
             let previous_vulns = state
                 .cache
                 .get_status()
                 .and_then(|status| status.scanned_vulnerability_count());
-            let scan = state
-                .scan_security()
-                .await
-                .map(|scan| scan.total_vulnerabilities);
+            let scan = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    tracing::debug!("Cancelled background security refresh during shutdown");
+                    return;
+                }
+                result = state.scan_security() => result.map(|scan| scan.total_vulnerabilities),
+            };
             if let Err(error) = &scan {
                 tracing::warn!("Vulnerability scan failed during status refresh: {error}");
             }
@@ -259,10 +270,12 @@ async fn run_with_status_path(
 
         /// Pre-compute caches for instant first queries.
         ///
-        /// Deliberately unconditional: it must run even when status
-        /// publication was skipped above (structural guarantee against the
-        /// early-return regression this replaces).
-        async fn prewarm_caches(state: &Arc<DaemonState>) {
+        /// Independent of status publication while the daemon is active:
+        /// a failed scan must not prevent cache warming. Shutdown stops new work.
+        async fn prewarm_caches(state: &Arc<DaemonState>, shutdown: &CancellationToken) {
+            if shutdown.is_cancelled() {
+                return;
+            }
             // Pre-compute explicit package list for instant first query.
             // The state owns the backend choice so isolated daemons never
             // fall through to a host package database.
@@ -278,6 +291,9 @@ async fn run_with_status_path(
 
             let index = state.index_snapshot();
             for query in ["", "linux", "python", "node", "firefox", "git"] {
+                if shutdown.is_cancelled() {
+                    return;
+                }
                 let results = match super::handlers::search_index_blocking(
                     Arc::clone(&index),
                     query.to_string(),
@@ -299,8 +315,8 @@ async fn run_with_status_path(
         }
 
         // Initial refresh
-        refresh_status(&state_worker, &fast_status_path).await;
-        prewarm_caches(&state_worker).await;
+        refresh_status(&state_worker, &fast_status_path, &worker_token).await;
+        prewarm_caches(&state_worker, &worker_token).await;
 
         // Track last cleanup time for periodic mmap cleanup
         let mut last_cleanup = tokio::time::Instant::now();
@@ -314,10 +330,10 @@ async fn run_with_status_path(
                 }
                 BackgroundEvent::Maintenance => {
                     tracing::debug!("Refreshing system status cache...");
-                    refresh_status(&state_worker, &fast_status_path).await;
+                    refresh_status(&state_worker, &fast_status_path, &worker_token).await;
                     // Independent of status publication: a failed scan must
                     // not degrade first-query latency for unrelated paths.
-                    prewarm_caches(&state_worker).await;
+                    prewarm_caches(&state_worker, &worker_token).await;
                     tracing::debug!("Status cache refreshed");
 
                     // Periodic mmap cleanup (every 30 min) to prevent 500MB+ memory leaks
