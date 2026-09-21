@@ -1,18 +1,16 @@
 ---
 title: Quickstart
 sidebar_position: 2
-description: Select a project runtime, run a task, and check environment drift
+description: Select a project runtime, run a task, and capture a working environment
 ---
 
-# Run a project with OMG
+# From zero to a working project
 
-Use an existing Node.js project to select a runtime, run a task, and capture an environment record. This tutorial does not install system packages.
+OMG gives a project one workflow for selecting a runtime, running its tasks, and recording the setup that worked. This quickstart takes a few minutes and uses an existing Node.js project as the example.
 
-OMG is approaching beta. Start in a repository you trust, and use a disposable machine for package mutations. Project tasks execute repository code.
+## 1. Install OMG
 
-## Install OMG
-
-Follow the [installation guide](./installation.md) for your platform. Release installation requires GitHub CLI for attestation verification. After installation, confirm that your shell finds the expected binary:
+Follow the [installation guide](./installation.md) for your platform. Then verify that your shell can find the binary:
 
 ```bash
 command -v omg
@@ -20,68 +18,54 @@ omg --version
 omg --help
 ```
 
-The commands print the binary path, version, and available commands. If the path is wrong or missing, fix `PATH` before continuing.
+If `command -v omg` points to an older installation, fix `PATH` before continuing.
 
-## Select the project runtime
+## 2. Select the project runtime
 
-From your Node.js project directory:
+Change to a project directory and choose the version it expects:
 
 ```bash
 omg use node 22
 omg which node
 ```
 
-The first command installs Node.js if it is missing and changes OMG's selected version. The second prints the resolved runtime version. Choose a version supported by your project rather than changing an existing version requirement to match this example.
+`omg use` installs the runtime when needed and makes it the selected version for the project context. `omg which` shows the binary that will run. To let OMG read a supported version file instead, use `omg use node` without a version. See [runtime detection](./runtimes.md) for supported files and precedence.
 
-To select from an existing supported version file, run `omg use node` without a version. See [runtime detection](./runtimes.md) for supported files and precedence.
+## 3. Run the project
 
-## Run a project task
-
-Inspect the `scripts` object in your project's `package.json`. If it defines `build`, run:
+Run a task that the repository already defines. For a project with a `build` script in `package.json`:
 
 ```bash
 omg run build
 ```
 
-Expect the project's build output. A failed task makes OMG exit nonzero, but OMG does not preserve the task's exact exit code. `omg run` requires a task name. OMG does not invent a build task or replace dependency installation. Follow the project's instructions for installing JavaScript dependencies first.
+You can use the same command for common tasks such as `dev`, `test`, or `lint`:
 
-## Record the environment
+```bash
+omg run dev
+omg run test
+```
 
-`omg env capture` writes `omg.lock` in the current directory. Review an existing lockfile before replacing it.
+OMG detects the project runner and passes through its output. Install the project's dependencies according to its own instructions before running a task. The [task runner guide](./task-runner.md) covers other project types, including Cargo projects and Makefiles.
+
+## 4. Capture a working environment
+
+When the project is in a good state, record the environment so you can compare another machine or share the setup with a teammate:
 
 ```bash
 omg env capture
 omg env check
 ```
 
-The check compares the recorded environment with the current machine and reports drift. It exits nonzero when they differ. Review the lockfile before committing or sharing it because it contains environment inventory.
+`omg env capture` writes `omg.lock` in the current directory. `omg env check` compares that record with the current machine and reports drift. Review the lockfile before committing or sharing it.
 
-`omg env share` can publish the lockfile through GitHub Gist and requires a `GITHUB_TOKEN` environment variable. Sharing uploads data. `omg env sync <gist-url>` downloads and validates a lockfile, backs up a differing existing file, and checks drift. Neither sync nor check installs packages or runtimes.
+## Choose your next workflow
 
-## Add automatic switching
-
-For directory-based runtime selection, follow [shell integration](./shell-integration.md). Add only the hook for your shell, and avoid conflicting hooks from other runtime managers.
-
-## Inspect system packages
-
-On a supported package backend:
-
-```bash
-omg search ripgrep
-omg info ripgrep
-omg install --dry-run ripgrep
-```
-
-On Arch, search includes AUR unless you pass `--no-aur`. Search results and timings depend on the repository state and enabled sources.
-
-A dry run previews the requested change. It does not establish that package code is safe. To try an actual installation, use a recoverable machine and read [package operations](./packages.md), including backend-specific removal behavior and AUR review requirements.
-
-## Explore the next workflow
-
-- [Run tasks from other project types](./task-runner.md).
-- [Manage Python, Rust, and other runtimes](./runtimes.md).
+- [Manage runtimes automatically when you change directories](./shell-integration.md).
+- [Search and install system packages](./packages.md).
+- [Use existing mise project configuration](./mise-compatibility.md).
 - [Share environment records with a team](./team.md).
-- [Understand security reports and their limits](./security.md).
+- [Understand verification and security boundaries](./security.md).
 - [Resolve a failed command](./troubleshooting.md).
 
-If the tutorial fails, [report the command and redacted output](https://github.com/PyRo1121/omg/issues), along with your OMG version and distribution.
+If the quickstart does not match your project, [open an issue](https://github.com/omg-cli/omg/issues) with your OMG version, platform, command, and redacted output.

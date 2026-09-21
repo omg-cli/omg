@@ -242,6 +242,8 @@ def cargo_test_args(features):
                        'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests'])
     if 'debian-pure' in active:
         suites.append('debian_pure_integration')
+    if 'debian' in active:
+        suites.append('apt_version_ordering')
     if 'fedora' in active:
         suites.append('fedora_tests')
     return ['--lib', '--bins'] + [arg for suite in suites for arg in ('--test', suite)] + [

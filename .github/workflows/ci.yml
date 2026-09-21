@@ -827,9 +827,20 @@ jobs:
   # (PR-controlled) copy of this file, so a PR must never be able to run
   # workflow code holding a write-scoped token. All write-scoped steps live
   # in the push-to-main-only release-tag job below.
+  qemu:
+    name: QEMU behavioral verification
+    needs: [quick-gate, linux-matrix, ubuntu]
+    if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true'
+    uses: ./.github/workflows/qemu-matrix.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      OMG_SMOKE_SENTRY_DSN: ${{ github.event_name != 'pull_request' && secrets.OMG_SMOKE_SENTRY_DSN || '' }}
+
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu]
+    needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu, qemu]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -846,6 +857,8 @@ jobs:
           FEATURE_INTERSECTIONS: ${{ needs.feature-intersections.result }}
           MACOS: ${{ needs.macos.result }}
           UBUNTU: ${{ needs.ubuntu.result }}
+          QEMU: ${{ needs.qemu.result }}
+          QEMU_REQUIRED: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true' }}
         run: |
           echo "## CI Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -858,6 +871,12 @@ jobs:
           echo "| Feature Intersections | $FEATURE_INTERSECTIONS |" >> $GITHUB_STEP_SUMMARY
           echo "| macOS | $MACOS |" >> $GITHUB_STEP_SUMMARY
           echo "| Ubuntu | $UBUNTU |" >> $GITHUB_STEP_SUMMARY
+          echo "| QEMU | $QEMU |" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$QEMU_REQUIRED" == "true" && "$QEMU" != "success" ]]; then
+            echo "::error::Required QEMU verification did not succeed: $QEMU"
+            exit 1
+          fi
 
           if [[ "$QUICK_GATE" != "success" ]]; then
             echo "::error::Quick gate failed"
@@ -944,7 +963,7 @@ jobs:
           scripts/require-workflow-success.sh codeql.yml "$GITHUB_SHA" CodeQL
           scripts/require-workflow-success.sh coverage.yml "$GITHUB_SHA" Coverage
           scripts/require-workflow-success.sh docker-e2e.yml "$GITHUB_SHA" "Docker E2E"
-          scripts/require-workflow-success.sh qemu-matrix.yml "$GITHUB_SHA" "Staged QEMU"
+          # CI Success already requires this run's staged QEMU verification.
 
           git tag "$TAG" "$GITHUB_SHA"
           git push origin "refs/tags/${TAG}"
