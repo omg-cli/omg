@@ -22,9 +22,9 @@
 
 ## Steps
 
-- [ ] Add a focused catalog parser near the Python runtime manager, with deterministic fixtures for supported targets, version/prerelease ordering, excluded variants, malformed checksums, mismatched URLs and unsupported schema.
-- [ ] Fetch metadata with existing response/time bounds. Test HTTP errors and malformed bodies using loopback fixtures; no ambient token or endpoint override.
-- [ ] Integrate catalog selection into Python listing/installation, reuse a fetched catalog for partial-version resolution, preserve historical exact-version fallback and existing fail-closed digest checks.
+- [x] Add a focused catalog parser near the Python runtime manager, with deterministic fixtures for supported targets, version/prerelease ordering, excluded variants, malformed checksums, mismatched URLs and unsupported schema.
+- [x] Fetch metadata with existing response/time bounds. Test HTTP errors and malformed bodies using loopback fixtures; no ambient token or endpoint override.
+- [x] Integrate catalog selection into Python listing/installation, reuse a fetched catalog for partial-version resolution, preserve historical exact-version fallback and existing fail-closed digest checks.
 - [ ] Run narrow unit checks and negative controls; run real installs in isolated WSL state on all four distros and execute Python/pip/stdlib probes. Inspect cleanup and unchanged unrelated state.
 - [ ] Move the bounded fix to the blocked #443 branch, preserving later branch changes. Include the pending native no-retry/admission corrections in the same validation batch.
 - [ ] Require fresh hosted native and QEMU results, inspect failure issues/evidence, then merge in dependency order under standing authorization.
@@ -32,3 +32,13 @@
 ## Review focus
 
 Unknown catalog schema, missing hashes, wrong target/variant, stale historical availability, and redirect/source trust require explicit tests or documented limits. This change does not establish full Python lifecycle coverage or the global 95% target.
+
+## Local evidence and unresolved failures
+
+- Parser and HTTP fixtures were observed failing before implementation. The partial-resolution regression was observed failing before adding refusal of unmatched partial versions.
+- All 23 Python unit tests passed in the final local source run on Arch, Debian, Ubuntu and Fedora. These are incremental WSL checkouts, not clean hosted revision evidence.
+- Real 3.12.14 installation and partial 3.12 activation passed on all four distros, with verified HTTPS, SQLite, ctypes, gzip, SHA-256, venv and pip probes. Those four live binaries preceded the final unmatched-partial refusal; a subsequently rebuilt Ubuntu binary additionally passed refusal of 3.99 while preserving its active 3.12.14 runtime.
+- Final Clippy (`--profile test --lib --tests`, Debian/PGP/license features, warnings denied) passed. Its ownership cleanup removes JSON clones; the six catalog tests passed again after that cleanup. The all-four 23-test logs predate that ownership-only cleanup and must not be presented as exact final-source receipts.
+- An initial TLS probe incorrectly assumed roots must be eagerly loaded. Python documents lazy `capath` loading (https://docs.python.org/3.12/library/ssl.html#ssl.SSLContext.get_ca_certs); the corrected probe performs certificate-verified HTTPS. No TLS product defect was inferred from the invalid probe.
+- Earlier Debian/Ubuntu large-metadata unit runs aborted/segfaulted (#460), and a subsequent Debian compiler attempt segfaulted (#451). Later passing runs do not resolve those issues. A Fedora live attempt also ended during extraction without a diagnostic; later successful execution does not establish why it stopped.
+- Retain local evidence outside `/tmp`: WSL temporary files disappeared after distro restart. Current logs are under `/root/omg-audit/python-catalog-*`, and live installations use disposable directories under `/home/omg-audit/`.
