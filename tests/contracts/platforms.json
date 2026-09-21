@@ -16,6 +16,7 @@
       "omgd": true,
       "native_integration_suites": [
         "git_hooks_contract",
+        "coverage_10",
         "coverage_18",
         "e2e_runtime_management",
         "env_lockfile_integrity"
@@ -41,6 +42,7 @@
         "debian_e2e_tests",
         "debian_pure_integration",
         "git_hooks_contract",
+        "coverage_10",
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
@@ -62,6 +64,7 @@
       "omgd": true,
       "native_integration_suites": [
         "git_hooks_contract",
+        "coverage_10",
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
@@ -90,6 +93,7 @@
         "debian_cache_tests",
         "debian_e2e_tests",
         "git_hooks_contract",
+        "coverage_10",
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
@@ -118,6 +122,7 @@
         "debian_cache_tests",
         "debian_e2e_tests",
         "git_hooks_contract",
+        "coverage_10",
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
@@ -141,6 +146,7 @@
       "native_integration_suites": [
         "fedora_tests",
         "git_hooks_contract",
+        "coverage_10",
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
@@ -169,6 +175,7 @@
         "debian_cache_tests",
         "debian_e2e_tests",
         "git_hooks_contract",
+        "coverage_10",
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
@@ -191,6 +198,7 @@
       "omgd": true,
       "native_integration_suites": [
         "git_hooks_contract",
+        "coverage_10",
         "coverage_18",
         "e2e_runtime_management",
         "env_lockfile_integrity"

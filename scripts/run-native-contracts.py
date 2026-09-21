@@ -215,7 +215,7 @@ def sha256_file(path):
 
 def cargo_test_args(features):
     active = COVERAGE.strings(features.split(','))
-    suites = ['cli_surface', 'git_hooks_contract', 'coverage_18',
+    suites = ['cli_surface', 'git_hooks_contract', 'coverage_10', 'coverage_18',
               'e2e_runtime_management', 'env_lockfile_integrity']
     if active & {'arch', 'debian', 'debian-pure', 'fedora'}:
         suites.append('cli_comprehensive')

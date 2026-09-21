@@ -44,7 +44,7 @@ class NativeRunner(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             root.chmod(0o755)
-            for name in ('cli_comprehensive-fixture', 'e2e_runtime_management-fixture',
+            for name in ('cli_comprehensive-fixture', 'coverage_10-fixture', 'e2e_runtime_management-fixture',
                          'env_lockfile_integrity-fixture', 'other-fixture'):
                 binary = root / name
                 binary.write_text('#!/bin/sh\nid -u\nprintf "%s\\n" "$1"\nexit 23\n')
@@ -419,7 +419,7 @@ class NativeReceipts(unittest.TestCase):
             with self.subTest(features=features):
                 args = NATIVE.cargo_test_args(features)
                 tests = {args[index + 1] for index, value in enumerate(args) if value == '--test'}
-                shared = {'cli_surface', 'git_hooks_contract', 'coverage_18',
+                shared = {'cli_surface', 'git_hooks_contract', 'coverage_10', 'coverage_18',
                           'e2e_runtime_management', 'env_lockfile_integrity'}
                 if set(features.split(',')) & {'arch', 'debian', 'debian-pure', 'fedora'}:
                     shared.add('cli_comprehensive')
