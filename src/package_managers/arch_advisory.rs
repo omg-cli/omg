@@ -12,7 +12,7 @@ use crate::core::security::scan::{
 };
 use crate::core::security::vulnerability::AlsaIssue;
 
-pub(super) fn audit_result(
+pub(crate) fn audit_result(
     installed: &[SecurityPackage],
     advisories: &[AlsaIssue],
 ) -> Result<SecurityAuditResult> {
