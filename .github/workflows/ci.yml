@@ -110,6 +110,8 @@ jobs:
       - name: Setup cache
         if: inputs.skip-cache != true
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          ZSTD_CLEVEL: "6"
         with:
           prefix-key: "v2-portable"
           shared-key: "portable"
@@ -291,6 +293,8 @@ jobs:
       - name: Cache Rust dependencies
         if: inputs.skip-cache != true
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          ZSTD_CLEVEL: "6"
         with:
           prefix-key: v2-platform-dependencies
           cache-on-failure: true
@@ -622,6 +626,8 @@ jobs:
       - name: Cache Rust dependencies
         if: inputs.skip-cache != true
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          ZSTD_CLEVEL: "6"
         with:
           prefix-key: v2-intersection-dependencies
           shared-key: ${{ steps.cache-key.outputs.key }}
@@ -662,8 +668,15 @@ jobs:
       - name: Setup cache
         if: inputs.skip-cache != true
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          ZSTD_CLEVEL: "6"
         with:
-          prefix-key: "v1-macos-arm64"
+          # v1 repeatedly missed restoration but could not reserve its key.
+          # Keep dependency compatibility hashes; recover in a fresh namespace.
+          prefix-key: "v2-macos-dependencies"
+          cache-on-failure: true
+          cache-bin: false
+          cache-workspace-crates: false
 
       # sccache temporarily disabled due to service outage
 
@@ -749,6 +762,8 @@ jobs:
       - name: Setup cache
         if: inputs.skip-cache != true
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          ZSTD_CLEVEL: "6"
         with:
           prefix-key: "v1-ubuntu-debian"
           cache-on-failure: true

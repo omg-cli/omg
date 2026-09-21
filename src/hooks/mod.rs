@@ -827,38 +827,10 @@ fn nvm_node_bin(version: &str) -> Result<Option<PathBuf>> {
 }
 
 fn resolve_nvm_alias(nvm_dir: &Path, alias: &str) -> Result<Option<String>> {
-    let relative = Path::new(alias);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return Ok(None);
+    match crate::core::runtime_resolver::resolve_nvm_alias(nvm_dir, alias) {
+        Err(error) if error.is::<crate::core::runtime_resolver::NvmAliasRejection>() => Ok(None),
+        result => result,
     }
-
-    let alias_root = nvm_dir.join("alias");
-    let canonical_root = match alias_root.canonicalize() {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("Failed to resolve nvm alias directory"),
-    };
-    let candidate = alias_root.join(relative);
-    let canonical = match candidate.canonicalize() {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to resolve nvm alias {}", candidate.display()));
-        }
-    };
-    if !canonical.starts_with(&canonical_root) {
-        return Ok(None);
-    }
-    let Some(content) = read_pin_file(&canonical)? else {
-        return Ok(None);
-    };
-    let resolved = content.trim();
-    Ok((!resolved.is_empty()).then(|| resolved.to_string()))
 }
 
 // Runtime resolution helpers
@@ -1946,6 +1918,49 @@ path = "hostile"
     fn resolve_nvm_alias_missing_is_none() {
         let dir = tempdir().unwrap();
         assert!(resolve_nvm_alias(dir.path(), "lts").unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_nvm_alias_follows_named_chains() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("alias/lts")).unwrap();
+        fs::write(dir.path().join("alias/default"), "lts/jod\n").unwrap();
+        fs::write(dir.path().join("alias/lts/jod"), "v22.14.0\n").unwrap();
+        assert_eq!(
+            resolve_nvm_alias(dir.path(), "default").unwrap().as_deref(),
+            Some("v22.14.0")
+        );
+        dir.close().unwrap();
+    }
+
+    #[test]
+    fn resolve_nvm_alias_strips_comments_and_empty_lines() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("alias")).unwrap();
+        fs::write(
+            dir.path().join("alias/default"),
+            "# selected runtime\n\n v22.14.0 # pinned LTS\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_nvm_alias(dir.path(), "default").unwrap().as_deref(),
+            Some("v22.14.0")
+        );
+        dir.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_nvm_alias_lts_directory_follows_default_alias() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("alias/lts")).unwrap();
+        fs::write(dir.path().join("alias/lts/*"), "lts/jod\n").unwrap();
+        fs::write(dir.path().join("alias/lts/jod"), "v22.14.0\n").unwrap();
+        assert_eq!(
+            resolve_nvm_alias(dir.path(), "lts").unwrap().as_deref(),
+            Some("v22.14.0")
+        );
+        dir.close().unwrap();
     }
 
     #[cfg(unix)]

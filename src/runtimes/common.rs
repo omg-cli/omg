@@ -1838,6 +1838,121 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn github_release_http_failures_never_return_partial_catalogs() -> Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        // The first page is valid. A later failure must invalidate the entire
+        // discovery, rather than presenting an incomplete version catalog.
+        for (status, headers, body, expected) in [
+            (
+                "403 Forbidden",
+                "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1893456000\r\n",
+                "{}",
+                "rate limit exhausted",
+            ),
+            (
+                "429 Too Many Requests",
+                "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1893456000\r\n",
+                "{}",
+                "rate limit exhausted",
+            ),
+            (
+                "403 Forbidden",
+                "X-RateLimit-Remaining: 4999\r\n",
+                "{}",
+                "403 Forbidden",
+            ),
+            (
+                "500 Internal Server Error",
+                "",
+                "{}",
+                "500 Internal Server Error",
+            ),
+            (
+                "200 OK",
+                "",
+                "not-json",
+                "Failed to parse GitHub releases payload",
+            ),
+            (
+                "200 OK",
+                "",
+                "{\"message\":\"not a release list\"}",
+                "Failed to parse GitHub releases payload",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/releases", listener.local_addr()?);
+            let client = reqwest::Client::builder().no_proxy().build()?;
+            let server = async {
+                for page in 1..=2 {
+                    let (mut stream, _) = listener.accept().await?;
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut request = String::new();
+                    reader.read_line(&mut request).await?;
+                    anyhow::ensure!(
+                        request == format!("GET /releases?per_page=1&page={page} HTTP/1.1\r\n"),
+                        "Unexpected release request: {request}"
+                    );
+                    let mut user_agent = false;
+                    loop {
+                        let mut line = String::new();
+                        anyhow::ensure!(
+                            reader.read_line(&mut line).await? > 0,
+                            "Incomplete request"
+                        );
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if line.to_ascii_lowercase().starts_with("user-agent:") {
+                            user_agent = line.trim().ends_with(GITHUB_USER_AGENT);
+                        }
+                    }
+                    anyhow::ensure!(user_agent, "Missing runtime discovery user agent");
+                    let (response_status, response_headers, payload) = if page == 1 {
+                        ("200 OK", "", "[{\"tag_name\":\"v1.0.0\"}]")
+                    } else {
+                        (status, headers, body)
+                    };
+                    stream.write_all(format!(
+                        "HTTP/1.1 {response_status}\r\n{response_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    ).as_bytes()).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            let (result, served) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    fetch_github_releases(&client, &url, 1, 4, |_| false),
+                    server
+                )
+            })
+            .await
+            .context("Release failure fixture timed out")?;
+            served?;
+            let error = format!(
+                "{:#}",
+                result.expect_err("A failed page must not return partial releases")
+            );
+            assert!(error.contains(expected), "{status}: {error}");
+            if headers.contains("Remaining: 0") {
+                assert!(
+                    error.contains("1893456000"),
+                    "Reset diagnostic missing: {error}"
+                );
+            } else {
+                assert!(
+                    !error.contains("rate limit exhausted"),
+                    "Misclassified failure: {error}"
+                );
+                assert!(error.contains(&url), "Missing source context: {error}");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn normalize_version_accepts_common_v_prefix_case() {
         assert_eq!(normalize_version("v1.2.3"), "1.2.3");

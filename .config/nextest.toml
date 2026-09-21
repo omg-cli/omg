@@ -28,7 +28,22 @@ retries = 0
 
 # Isolated Debian fixture contracts must not hide their first failure.
 [[profile.default.overrides]]
-filter = 'test(=test_parse_disabled_source) | test(=test_cli_status_shows_debian_info) | test(=test_cli_debian_respects_ci_mode) | test(=apt_integration::test_update_check_with_mock_updates)'
+filter = 'test(=test_parse_disabled_source) | test(=test_cli_status_shows_debian_info) | test(=test_cli_debian_respects_ci_mode) | test(=cli_receipt_rejects_a_different_product_executable) | test(=apt_integration::test_update_check_with_mock_updates)'
+retries = 0
+
+# Production transport and shutdown failures must remain first-attempt failures.
+[[profile.default.overrides]]
+filter = 'binary(=coverage_18) | binary(=cli_comprehensive) | binary(=git_hooks_contract)'
+retries = 0
+
+# Alias cycles and path escapes are deterministic failures, never retryable.
+[[profile.default.overrides]]
+filter = 'test(core::task_runner::tests::resolve_nvm_alias_) | test(hooks::tests::resolve_nvm_alias_) | test(=nvm_alias_task_executes_the_selected_node_binary) | test(=nvm_directory_without_executable_node_never_starts_the_task)'
+retries = 0
+
+# Loopback HTTP failures must not disappear behind a second discovery attempt.
+[[profile.default.overrides]]
+filter = 'test(=runtimes::common::tests::github_release_http_failures_never_return_partial_catalogs)'
 retries = 0
 
 [profile.ci]

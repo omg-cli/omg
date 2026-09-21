@@ -275,3 +275,50 @@ when a sibling producer has no artifact: readiness logs absence under one shared
 deadline, while each guest still performs mandatory admission and retains its
 lifecycle failure evidence. Invalid identities remain blocking. The focused
 65-test suite and actionlint passed; a new hosted checkpoint is still required.
+
+### Behavioral evidence import (prepared after 56cc1bf1)
+
+Three contracts now map reviewed exact assertions in two Debian CLI fixtures:
+human status, JSON status and explicit install consent. Their separate adapter
+binds the actual debug child executable and owning test harness before/after the
+single existing nextest run, rejects skips/unreviewed mappings, and preserves
+failed attempts. The fixtures assert private state cleanup; a subprocess negative
+control rejects a test harness substituted for the product executable. This is
+mock-backend CLI evidence, not native transaction or daemon coverage. The broader
+inventory remains explicitly incomplete. Local adapter/selection tests pass;
+the new Rust assertions and generated receipts require hosted execution.
+
+The completed 5116471f coverage run 35505933179 retained LCOV with 53,911 of
+70,574 reported source lines hit (76.4%) and 5,817 of 7,593 functions hit.
+This is the arch,pgp,license instrumented build, including compiled in-source
+test code; disabled features and other platforms are not represented. LCOV
+reported BRF=0 and BRH=0, so branch coverage is unavailable, not 100%.
+These instrumentation totals must not substitute for behavioral contract counts.
+
+Checkpoint 56cc1bf1 subsequently passed all nine workflows, including CI
+35516409756 and QEMU 35516409883 with all four guests. The shell correction and
+native artifact reuse therefore have hosted confirmation before the behavioral
+receipt batch is published. Final independent review and the remaining semantic,
+daemon, native fault and interaction work are still pending.
+
+### Daemon transport regression batch
+
+The three CLI fixture contracts passed on Debian, Trixie, Ubuntu and pure Debian
+in CI 35517223784. The pure owner retained 1,463 passed executions, 32 skipped,
+zero failed and zero retried; skips are not covered contracts.
+
+The next daemon batch retains and joins the production server task, checks IPC
+readiness, exercises SIGTERM draining and explicitly removes its fixture state.
+It adds fragmented/coalesced frames, partial-frame disconnect recovery, bounded
+response allocation and truncated-response rejection. The active-connection
+oracle waits for explicit counts instead of sampling a potentially unsettled
+baseline after a fixed delay. An exhaustive request match and witnesses generated
+from one test macro bind all 15 compiled Request variants to the reviewed manifest.
+This is inventory/codec evidence, not successful handler coverage.
+
+A new custom-socket regression requires the fast-status file beside that socket.
+Static inspection shows public server::run currently derives the path globally;
+the hosted regression is expected to expose this before a production repair.
+Rustfmt and TOML parsing pass locally; this Windows host cannot execute the Linux
+server tests. The batch's Rust outcomes remain pending. Automatic QEMU failure
+issue reporting is unchanged, and no synthetic production issue is created.

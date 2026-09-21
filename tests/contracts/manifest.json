@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Parser mappings with native execution adapters; behavioral import remains incomplete",
+  "status": "Parser mappings and three reviewed CLI fixture contracts; broader behavioral import remains incomplete",
   "inventory_source": "Verified compiled artifacts from CI run 35500460442, checkout d2554cd7f1b22e3c706660c390867b9203c6c7aa",
   "contracts": [
     {
@@ -350,6 +350,141 @@
           "assertions": [
             "default-is-unspecified",
             "removed-foreground-is-unknown"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.status.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg status",
+      "platforms": [
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-status"
+        ],
+        "state": [
+          "read-only",
+          "independent-empty-state"
+        ]
+      },
+      "scope": "debug CLI with isolated mock Debian backend; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::debian_e2e_tests::test_cli_status_shows_debian_info",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "exact-status",
+            "read-only",
+            "independent-empty-state",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.status.json.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg status --json",
+      "platforms": [
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "parsed-json-exact-counts"
+        ],
+        "state": [
+          "read-only",
+          "independent-empty-state"
+        ]
+      },
+      "scope": "debug CLI with isolated mock Debian backend; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::debian_e2e_tests::test_cli_status_shows_debian_info",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "parsed-json-exact-counts",
+            "read-only",
+            "independent-empty-state",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omg.install.consent.fixture",
+      "source": "src/cli/args.rs",
+      "binary": "omg",
+      "surface": "omg install --yes",
+      "platforms": [
+        "debian",
+        "debian-trixie",
+        "ubuntu",
+        "debian-pure"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "explicit-consent-no-prompt"
+        ],
+        "refusal": [
+          "ci-does-not-grant-consent"
+        ],
+        "state": [
+          "refusal-unchanged",
+          "exact-installed-versions"
+        ]
+      },
+      "scope": "debug CLI with isolated mock Debian backend; not native package transactions",
+      "tests": [
+        {
+          "lane": "native-cli-fixture",
+          "id": "omg::debian_e2e_tests::test_cli_debian_respects_ci_mode",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "explicit-consent-no-prompt",
+            "ci-does-not-grant-consent",
+            "refusal-unchanged",
+            "exact-installed-versions",
+            "fixture-cleanup"
           ]
         }
       ]

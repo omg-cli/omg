@@ -312,6 +312,106 @@ fn missing_node_runtime_fails_closed_when_install_prompt_unavailable() {
 }
 
 #[test]
+fn nvm_alias_task_executes_the_selected_node_binary() {
+    let project = tempfile::tempdir().unwrap();
+    let shims = tempfile::tempdir().unwrap();
+    let nvm = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"fixture","scripts":{"build":"unused"}}"#,
+    )
+    .unwrap();
+    fs::write(project.path().join("package-lock.json"), "{}").unwrap();
+    fs::create_dir_all(nvm.path().join("alias/lts")).unwrap();
+    fs::write(nvm.path().join("alias/default"), "lts/jod\n").unwrap();
+    fs::write(nvm.path().join("alias/lts/*"), "lts/jod\n").unwrap();
+    fs::write(nvm.path().join("alias/lts/jod"), "v22.14.0\n").unwrap();
+    let node_bin = nvm.path().join("versions/node/v22.14.0/bin");
+    fs::create_dir_all(&node_bin).unwrap();
+    write_shim(&node_bin, "node", "#!/bin/sh\nprintf 'v22.14.0\\n'\n");
+    write_shim(
+        shims.path(),
+        "npm",
+        "#!/bin/sh\nset -eu\nprintf 'NODE: %s\\n' \"$(command -v node)\"\nnode --version\nprintf 'ARGS: %s\\n' \"$*\"\n",
+    );
+    for alias in ["default", "lts"] {
+        fs::write(project.path().join(".nvmrc"), alias).unwrap();
+        let result = run_omg_with_options(
+            &["run", "build", "--", "--verify"],
+            Some(project.path()),
+            &[
+                path_env(shims.path()),
+                ("NVM_DIR", nvm.path().to_str().unwrap()),
+            ],
+        );
+        result.assert_success();
+        let expected = format!("NODE: {}", node_bin.join("node").display());
+        assert!(result.stdout.lines().any(|line| line == expected));
+        assert!(result.stdout.lines().any(|line| line == "v22.14.0"));
+        assert!(
+            result
+                .stdout
+                .lines()
+                .any(|line| line == "ARGS: run build -- --verify")
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(nvm.path().join("alias/default")).unwrap(),
+        "lts/jod\n"
+    );
+    assert_eq!(
+        fs::read_to_string(nvm.path().join("alias/lts/jod")).unwrap(),
+        "v22.14.0\n"
+    );
+    project.close().unwrap();
+    shims.close().unwrap();
+    nvm.close().unwrap();
+}
+
+#[test]
+fn nvm_directory_without_executable_node_never_starts_the_task() {
+    let project = tempfile::tempdir().unwrap();
+    let shims = tempfile::tempdir().unwrap();
+    let nvm = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"fixture","scripts":{"build":"unused"}}"#,
+    )
+    .unwrap();
+    fs::write(project.path().join("package-lock.json"), "{}").unwrap();
+    fs::write(project.path().join(".nvmrc"), "22.14.0").unwrap();
+    let node_bin = nvm.path().join("versions/node/v22.14.0/bin");
+    fs::create_dir_all(&node_bin).unwrap();
+    write_shim(
+        shims.path(),
+        "npm",
+        "#!/bin/sh\nprintf started > task-started\n",
+    );
+    for missing in [true, false] {
+        if !missing {
+            fs::write(node_bin.join("node"), "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(node_bin.join("node"), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let result = run_omg_with_options(
+            &["run", "build"],
+            Some(project.path()),
+            &[
+                path_env(shims.path()),
+                ("NVM_DIR", nvm.path().to_str().unwrap()),
+            ],
+        );
+        result.assert_failure();
+        assert!(
+            !project.path().join("task-started").exists(),
+            "task started with unusable node (missing={missing})"
+        );
+    }
+    project.close().unwrap();
+    shims.close().unwrap();
+    nvm.close().unwrap();
+}
+
+#[test]
 fn pnpm_missing_without_corepack_fails_closed_with_remedy_message() {
     // Contract: a pnpm-managed project run where neither pnpm nor corepack is
     // resolvable must fail with the exact remedy-bearing error naming both

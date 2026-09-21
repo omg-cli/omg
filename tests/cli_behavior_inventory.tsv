@@ -25,10 +25,10 @@ sync	["sync","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-d
 use	["use","invalid-runtime","1.0.0"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 list	["list"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 hook	["hook","bash"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-hooks-install	["hooks","install"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+hooks-install	["hooks","install"]	isolated-write	0	pass	-	hermetic	hermetic:pass	hooks-installed	tempdir-drop
 hooks-status	["hooks","status"]	read	0	pass	hooks-install	hermetic	hermetic:pass	-	tempdir-drop
 hooks-run	["hooks","run","pre-commit"]	controlled-error	0	pass	hooks-install	hermetic	hermetic:pass	-	tempdir-drop
-hooks-uninstall	["hooks","uninstall"]	isolated-write	0	pass	hooks-install	hermetic	hermetic:pass	-	tempdir-drop
+hooks-uninstall	["hooks","uninstall"]	isolated-write	0	pass	hooks-install	hermetic	hermetic:pass	hooks-absent	tempdir-drop
 workspace-init	["workspace","init","smoke"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 workspace-add	["workspace","add",".","--name","fixture"]	isolated-write	0	pass	workspace-init	hermetic	hermetic:pass	-	tempdir-drop
 workspace-list	["workspace","list"]	read	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
@@ -129,7 +129,7 @@ search-quiet	["--quiet","search","firefox"]	read	0	pass	-	hermetic	hermetic:pass
 status-verbose	["--verbose","status"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 info-verbose	["--verbose","info","pacman"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 workspace-readd-after-remove	["workspace","add",".","--name","fixture"]	isolated-write	0	pass	workspace-remove	hermetic	hermetic:pass	-	tempdir-drop
-workspace-run-success	["workspace","run","smoke"]	read	0	pass	workspace-readd-after-remove	hermetic	hermetic:pass	-	tempdir-drop
+workspace-run-success	["workspace","run","smoke"]	read	0	pass	workspace-readd-after-remove	hermetic	hermetic:pass	workspace-filtered-output	tempdir-drop
 all-commands-help	["--all-commands","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 search-flags	["search","--detailed","--no-aur","--limit","3","firefox"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 install-flags	["install","--yes","--dry-run","--allow-local-file","pacman"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -144,8 +144,11 @@ clean-flags	["clean","--orphans","--cache","--aur","--dry-run"]	read	arch:0,debi
 use-uninstall	["use","--uninstall","invalid-runtime"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 list-available	["list","--available"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 hook-uninstall	["hook","--uninstall","bash"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-hooks-install-force	["hooks","install","--force"]	isolated-write	0	pass	hooks-install	hermetic	hermetic:pass	-	tempdir-drop
-workspace-run-flags	["workspace","run","--parallel","--filter","fixture","--yes","smoke"]	read	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
+hooks-install-force	["hooks","install","--force"]	isolated-write	0	pass	hooks-install	hermetic	hermetic:pass	hooks-installed	tempdir-drop
+workspace-add-second	["workspace","add","project","--name","other"]	isolated-write	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
+workspace-run-flags	["workspace","run","--parallel","--filter","fixture","--yes","smoke"]	read	0	pass	workspace-add-second	hermetic	hermetic:pass	workspace-filtered-output	tempdir-drop
+workspace-run-parallel-all	["workspace","run","--parallel","--yes","overlap"]	read	0	pass	workspace-add-second	hermetic	hermetic:pass	workspace-all-output	tempdir-drop
+workspace-run-sequential-all	["workspace","run","--yes","smoke"]	read	0	pass	workspace-add-second	hermetic	hermetic:pass	workspace-all-output	tempdir-drop
 complete-full	["complete","--shell","bash","--current","se","--last","omg","--full","omg se"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-log-flags	["audit","log","--limit","3","--severity","error","--export","${ROOT}/audit-log-export.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-licenses-filter-policy	["audit","licenses","--format","json","--filter","mit","--check-policy"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	json-stdout	tempdir-drop

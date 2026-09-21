@@ -1,9 +1,9 @@
 # OMG and OMGD verification design
 
 Status: user-approved design (2026-09-20), not a claim of implemented coverage.
-CI optimization PR #440 must first pass its final revision. Its portable baseline
-found inherited NVM state leaking into hermetic fixtures; repair that prerequisite
-without ignoring tests or changing the production runtime resolver.
+CI optimization PR #440 must pass its final revision. Its initial portable baseline
+found inherited NVM state leaking into hermetic fixtures; that fixture repair was
+kept separate from subsequent production alias defects demonstrated by regressions.
 
 ## Meaning of complete coverage
 
@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used thirty-four searches (168 requested result slots),
+Exa research used fifty-eight searches (236 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -38,12 +38,29 @@ Selected primary sources were read and checked against repository code.
 | [Rust test isolation](https://doc.rust-lang.org/book/ch11-02-running-tests.html) | Root-run debug mock adapters must use private fixture state; assert a separate child sees an empty inventory | Production root path protections remain in force |
 | [APT sources](https://manpages.debian.org/bookworm/apt/sources.list.5) | Preserve commented repository metadata with enabled=false and distinguish enabled acquisition entries | Retaining disabled configuration is not permission to fetch it |
 | [NVM alias layout](https://github.com/nvm-sh/nvm/blob/master/README.md) | Test real LTS alias directories independently of isolated task fixtures | Fixture isolation does not establish production NVM compatibility |
+| [NVM recursive alias resolver](https://github.com/nvm-sh/nvm/blob/f695512c/nvm.sh) and [cycle tests](https://github.com/nvm-sh/nvm/blob/f695512c/test/fast/Aliases/circular/nvm_resolve_local_alias) | Add offline chained-alias and cycle regressions before changing runtime resolution | Reading a single alias file is not recursive resolution; proposed upstream patches are not evidence of merged behavior |
+| [Tempfile directory permissions](https://docs.rs/tempfile/latest/tempfile/struct.Builder.html#method.permissions) | Create daemon fixture directories explicitly with mode 0700 and validate before binding | TempDir defaults to 0777 filtered by umask; a default temporary directory is not necessarily private |
+| [Proptest shrinking budgets](https://docs.rs/proptest/latest/proptest/test_runner/struct.Config.html#structfield.max_shrink_time) | Bound counterexample minimization separately from generated-case execution when strengthening slow subprocess properties | A shrinking budget does not interrupt a running case; preserve seeds, failure persistence and the original failure |
+| [BuildKit GHA exporter](https://github.com/moby/buildkit/blob/master/cache/remotecache/gha/gha.go) | Do not assume registry-export compression options also apply to GitHub Actions caches | The inspected exporter uses its default compression configuration; unsupported flags are not a measured optimization |
+| [Zstandard environment controls](https://github.com/facebook/zstd/blob/dev/programs/zstd.1.md#environment-variables) and [Actions cache tar commands](https://github.com/actions/toolkit/blob/main/packages/cache/src/internal/tar.ts) | Trial level 6 for newly saved Rust cache archives without invalidating warm keys or changing compiler settings | Higher compression costs CPU; retain only with measured archive-size/save-time evidence and subsequent successful restores |
 | [Docker stage inheritance](https://docs.docker.com/build/building/multi-stage/) | Validate external image digests and local stage references separately | Unknown stage references still require an external digest |
+| [Docker GHA cache](https://docs.docker.com/build/cache/backends/gha/) and [cache management](https://docs.docker.com/build/ci/github-actions/cache/) | Investigate dependency-stage exports to reduce pressure from source-dependent compilation layers | Keep the current max export until measurements justify the storage versus identical-revision rebuild tradeoff; min alone would discard useful intermediate dependencies |
+| [Pinned tool installation](https://github.com/taiki-e/install-action#usage) | Preserve the pinned installer commit, which also pins unspecified tool versions | An omitted explicit tool version is not automatically a floating dependency with this action |
+| [NIST combinatorial test generation and expected outputs](https://csrc.nist.gov/csrc/media/projects/automated-combinatorial-testing-for-software/documents/auto-test--tutorial.pdf) | Strengthen expected-output checks before adding flag combinations to QEMU; input selection and its behavioral oracle are distinct obligations | Pairwise coverage cannot certify higher-order interactions or compensate for incorrect expected results |
+| [Git hook requirements](https://git-scm.com/docs/githooks) | Assert installed hooks are executable regular scripts and removed hooks are absent; isolate global/system Git configuration in guest fixtures | Default-directory fixtures do not cover core.hooksPath, linked worktrees, user-edited hooks, or execution semantics |
+| [which 8.0.5 source archive](https://static.crates.io/crates/which/which-8.0.5.crate) | Check the selected executable path rather than accepting an existing NVM bin directory; inspected finder/checker source after verifying the Cargo.lock SHA-256 | One Exa query returned no results and versioned docs were unavailable; the locked source confirms absolute-path checks without execution, not binary identity or successful startup |
+| [Tokio barrier](https://docs.rs/tokio/latest/tokio/sync/struct.Barrier.html) | Require both workspace tasks to rendezvous before either emits a success marker | The process fixture uses bounded filesystem signals, not Tokio itself; demonstrates overlap of these two tasks, not throughput or all dependency schedules |
+| [setpriv manual](https://man7.org/linux/man-pages/man1/setpriv.1.html), [capabilities manual](https://man7.org/linux/man-pages/man7/capabilities.7.html) | Drop bounding, inheritable and ambient capabilities alongside no-new-privileges, including UID 0 | Local Arch WSL exposed the retained-capability failure; tests now inspect all five capability sets under caller and root identities |
 | [GitHub artifact retention](https://docs.github.com/en/actions/tutorials/store-and-share-data) and [token permissions](https://github.com/github/docs/blob/main/content/actions/tutorials/authenticate-with-github_token.md) | Preserve actionable failure summaries in issues and link bounded artifacts; keep issue writes in the trusted reporter | Artifacts expire and PR execution must not receive issue-write credentials |
 | [GitHub job prerequisites](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-jobs) | One readiness coordinator avoids four idle artifact consumers; each guest still validates the exact binary pair | A shared barrier can increase an individual guest's latency; measure runner time and whole-gate latency separately |
 | [GitHub container shells](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/run-jobs-in-a-container) | Declare Bash explicitly for the native build recipe's Bash conditionals | Tests executing a recipe in Bash must also check the workflow selects that shell; container defaults use sh |
+| [Pinned Rust cache key implementation](https://github.com/Swatinem/rust-cache/blob/6323deb102c322ba6fcbdcafc7e3dddab59af2b6/src/config.ts) | Preserve compiler/environment/manifest hashes while recovering the macOS cache namespace and excluding cached helper binaries | A restore miss plus reservation failure does not by itself prove eviction, a concurrent writer or a service defect; verify a later restore |
+| [GitHub cache limits and eviction](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching) | Measure cache occupancy and verify both saving and subsequent restoration | Near-limit occupancy is not proof of eviction; do not change paid storage settings as a speculative fix |
 | [Cargo feature ownership](https://doc.rust-lang.org/stable/cargo/reference/features.html) | Keep supported success tests on their backend lanes; test explicit portable refusal separately | A cfg-disabled test contributes no behavioral coverage on that build |
+| [Cargo test targets](https://doc.rust-lang.org/cargo/reference/cargo-targets.html) | Verify actual test execution under each feature recipe; enable mock-backed Unix daemon transport tests outside Arch | Fedora reproduced a zero-test success before removing the unnecessary Arch gate; this expands transport coverage, not native backend transaction coverage |
 | [Nextest JUnit](https://nexte.st/docs/machine-readable/junit/) | Preserve successful output or explicit receipts for runtime skips | Default success-output and skipped-test reporting can hide early returns; check installed version |
+| [Nextest binary lists](https://nexte.st/docs/machine-readable/list/) and [executable environment](https://nexte.st/docs/configuration/env-vars/) | Bind CLI fixture receipts to the owning package's non-test executables and check the child helper's actual compiled path | A parser harness digest cannot identify a CLI subprocess; mock backend assertions do not certify native transactions |
+| [Tokio task ownership](https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html) and [Unix signals](https://docs.rs/tokio/latest/tokio/signal/unix/struct.Signal.html) | Retain the real-server task, establish readiness through IPC and join its SIGTERM drain before fixture cleanup | Dropping a handle detaches it; abort does not prove graceful shutdown. Signal listeners affect the whole test process, so server tests remain serial |
 | [Proptest timeouts](https://proptest-rs.github.io/proptest/proptest/forking.html) | Bound generated tests and replace accidental public-network parsing checks with deterministic fixtures | Forking and timeout settings do not create a behavioral oracle |
 | [Mutation timeouts](https://mutants.rs/timeouts.html) | Measure the unmutated owner suite before selecting mutation deadlines | The current 60-second deadline is shorter than some existing unmutated integration tests |
 | [GitHub privileged workflows](https://docs.github.com/en/actions/reference/security/secure-use) | Preserve overflow failure identities in trusted generated artifacts; keep PR artifacts away from issue-write execution | Only allowlisted data is admitted; requested artifact retention remains subject to repository limits |
@@ -256,3 +273,152 @@ no zero-test feature lanes; first-attempt failures visible; critical correctness
 security checks first-failure blocking; valid mutation baselines and reviewed score
 results; and release evidence tied to the exact packaged binaries. Any external
 service or unsupported platform exception remains explicit and separately reported.
+
+### Local Linux verification added on 2026-09-20
+
+Arch WSL executed the 44228779 CLI behavior inventory successfully using Rust
+1.95.0 and arch/pgp/license. All fourteen output-contract and both overlap-fixture
+tests ran locally, including checks previously skipped on Windows. A full quick
+suite exposed retained capabilities when the namespace wrapper kept UID 0. The
+regression failed before explicit capability dropping and passed afterward; the
+quick suite then reported 256 tests with two explicit skips. The root path is now
+covered even when the CI caller is non-root. This is network isolation evidence,
+not a general filesystem sandbox. Ubuntu 26.04 and Fedora 44 WSL are additional
+local feedback owners; they do not replace disposable QEMU transaction/recovery
+lanes or establish coverage of unexecuted scenarios.
+
+The local hook execution regression confirmed that a child exiting 23 still made
+`omg hooks run` return success. The wrapper now returns an error containing the
+child status. `tests/git_hooks_contract.rs` checks an execution receipt plus success,
+nonzero exit and signal termination for all three managed hook names. It is
+compiled on Unix independently of backend feature flags; it does not claim that
+the generated hook templates have been exercised through every Git operation.
+
+The daemon transport suite previously compiled to zero tests without the Arch
+feature. Its fixture injects `MockPackageManager` and uses Unix APIs, so its gate
+now follows Unix support. Fedora and Ubuntu locally execute all 17 tests after the
+change, rather than silently omitting the suite.
+
+QEMU run 35531270230 retained an Ubuntu Python-install failure caused by GitHub's
+unauthenticated API rate limit (HTTP 403, remaining quota zero). Its 175 executed
+inventory rows had 174 passes and one failure; three reviewed rows were skipped.
+The admission checker correctly returned 1 for valid failing evidence, but the
+caller treated every nonzero status as a harness error. The caller now preserves
+independent lifecycle evidence for a validated product failure while still failing
+the overall run. A full harness regression reproduced the classification defect;
+controls require invalid policy evidence and simultaneous harness failures to
+remain harness errors. Live API availability remains an explicit dependency;
+this change does not bypass the failing installation or remove its diagnosis.
+
+### Generated hook lifecycle coverage
+
+The Unix-wide `git_hooks_contract` target now invokes actual Git commits,
+branch and file checkouts, and fast-forward merges after installing the generated
+OMG hooks. Positive and negative assertions check unstaged versus staged lockfile
+warnings, branch versus file checkout notices, merge versus no-op notices, and
+committed/worktree lockfile contents. These supplement the existing manual-hook
+success, exit-23, and signal tests. The six-test target passed locally on Arch,
+Ubuntu, Fedora, and Debian using their respective feature builds. This does not
+cover merge conflicts, every Git configuration, or every generated-hook branch.
+Research: [Git hook invocation contracts](https://git-scm.com/docs/githooks).
+
+### Expanded Linux execution and QEMU hook assertions
+
+The QEMU installed-hook oracle now exercises the installed scripts directly via
+an absolute `core.hooksPath` in a disposable second repository. Commit, branch
+checkout, file checkout, fast-forward merge and no-op controls verify notices and
+lockfile state. Replacing each script with an executable no-op reproduced three
+false passes before the stronger oracle; all are rejected afterward. The full
+16-test oracle suite passed on Arch, Ubuntu, Fedora and Debian WSL. Fedora needed
+its missing local gawk prerequisite. The existing failure receipt/log path remains
+unchanged, including automatic trusted-run issue reporting.
+
+The broad CLI harness previously selected zero tests on non-Arch feature builds.
+Backend-independent cases now compile for Linux backend owners. The pacman database
+inventory, Arch package-info/install/orphan/cache fixtures retain their Arch owner;
+Fedora environment capture remains explicitly unsupported by its compiled backend.
+These restrictions remain coverage debt, not successful native transaction tests.
+Local unprivileged results: 82 CLI tests on Arch, 77 on Ubuntu/Debian, 76 on Fedora,
+plus six hook tests on each. Execution admission now requires these selected
+binaries and the production daemon transport suite to be nonempty; deterministic
+failures have no nextest retries.
+
+WSL default root execution exposed fixture contamination: production root data
+paths deliberately ignore caller environment overrides and use `/var/lib/omg`.
+Dedicated local `omg-audit` accounts now execute the CLI fixtures. The native CI
+runner drops only the CLI comprehensive test harness to nobody inside root
+containers, preserving other suites' privilege model. An actual Arch root-wrapper
+run passed all 82 tests; wrapper controls preserve argv, exit status and ordinary
+suite identity. Root path protections are unchanged.
+
+The newly owned non-Arch CLI tests exposed `update --check` syncing databases.
+The common update lane now skips explicit sync for check, dry-run and no-sync
+modes, consistent with the Arch lane. DNF query-level cache behavior is checked
+separately; mocked CLI output alone cannot prove absence of backend network work.
+
+Research: [Git core.hooksPath](https://git-scm.com/docs/git-config),
+[DNF cache-only semantics](https://dnf.readthedocs.io/en/latest/command_ref.html),
+[nextest target runners](https://nexte.st/docs/features/target-runners/).
+
+Final local evidence for this batch: the license-off `debian-pure` build passed
+76 CLI tests, 17 daemon transport target tests and six hook tests. Its absent
+account command is now asserted as an explicit parser refusal, rather than
+counting that refusal as a successful account interaction. Fedora's new DNF
+cache-only regression failed before the repair; all 50 DNF backend tests passed
+afterward. The actual Fedora `omg update --check` then succeeded without mock mode
+as uid 1000 in a network namespace with no network interfaces configured and all
+capability sets dropped, querying cached native package metadata. It listed updates
+without installing them. Quick gate: 259 tests, two explicit skips. The previous
+6c07cad6 hosted baseline passed all nine workflows including all four QEMU guests;
+this expanded batch still requires its own hosted validation.
+
+### Exact search-result regression
+
+An additional native CLI fixture now checks exact official package records,
+version strings, exact/prefix/word-boundary ranking, case-insensitive queries,
+`search`/`s`, short limits 0/1/2/9, detailed/short-detailed flags, quiet JSON and
+unchanged package-state bytes. It executes 24 combinations per selected backend.
+The candidate passed on Arch, Ubuntu, Fedora and license-off Debian locally.
+Temporarily disabling the production result truncation in the isolated Arch clone
+made the regression fail on limit zero with three unexpected records; restoring
+the production source made it pass. This is mock-backed query behavior, not AUR
+filtering or native repository metadata coverage.
+
+### Native explicit-query parity follow-up
+
+The strengthened QEMU daemon probe passed locally on Arch, Ubuntu 26.04,
+Fedora 44 and Debian 13 with native backends, without mock package state.
+Each run compared four CLI listing/count forms with native package-manager
+output during both daemon launch modes and after shutdown, while asserting
+increasing daemon request counts and zero reported failures. The receipt gate
+now requires query parity. Diagnostic export preserves the expected inventory,
+actual outputs and counters for failure investigation. Eight malformed-output
+negative controls reject wrong names, duplicates, wrong counts and extra JSON.
+Guest jq provisioning precedes this unconditional probe even when benchmarks
+are disabled; hyperfine remains conditional. These checks supplement existing
+transport fixtures and do not prove every native RPC or transaction contract.
+The next extension repeats direct and foreground startup with SIGINT shutdown,
+verifying successful process exit, socket removal and subsequent startup against
+the same private state. All four native WSL backends passed. SIGINT has its own
+mandatory receipt field and separately allowlisted diagnostic files. This does
+not yet test shutdown during an in-flight transaction or forced-death recovery.
+Adversarial receipt tests also reproduced a false-pass when multiple JSON
+documents ended with a valid receipt. The host gate now admits exactly one
+complete object, rejecting missing, false, mistyped or concatenated evidence.
+
+### Runtime discovery failure contracts
+
+Exa follow-up checked GitHub's official [rate-limit rules](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)
+and [HTTP failure guidance](https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api).
+A loopback HTTP regression now supplies a valid first release page followed by
+403/429 exhausted quota, ordinary 403, HTTP 500, malformed JSON or an invalid
+release-list schema. It asserts complete failure instead of a partial catalog,
+correct quota classification/reset diagnostics, source context for other errors,
+pagination arguments and the discovery user agent. All six cases passed with
+the Arch, Debian, Ubuntu and Fedora feature builds locally. This validates the
+shared production fetcher; live upstream quota and full CLI download fixtures
+remain separate unresolved work.
+A temporary isolated-checkout mutation returning accumulated releases after
+quota exhaustion failed this regression with the partial catalog exposed.
+Restoring the production source passed all 56 shared runtime-helper tests on
+Arch. No production runtime behavior was changed in this follow-up.

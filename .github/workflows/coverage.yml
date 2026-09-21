@@ -77,6 +77,8 @@ jobs:
 
       - name: Cache instrumented dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          ZSTD_CLEVEL: "6"
         with:
           prefix-key: v2-coverage-dependencies
           shared-key: arch-b0deabeb3d283da2c-arch-pgp-license

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# qemu-inventory.sh — drive tests/cli_behavior_inventory.tsv rows inside a
+# qemu-inventory.sh â€” drive tests/cli_behavior_inventory.tsv rows inside a
 # running QEMU guest over SSH and record machine-readable evidence.
 #
 # The guest must already be up (see scripts/benchmark-qemu.sh, which calls
@@ -7,6 +7,116 @@
 # TSV `requires` DAG is satisfied naturally. Disposable guests make
 # package/service-mutation rows safe, but they still need --allow-mutations.
 set -euo pipefail
+# BEGIN PRODUCT OUTPUT ORACLE
+# This exact function is sent to the guest and exercised by fault-injection tests.
+check_hook_lifecycle() (
+  # Execute the installed scripts unchanged in a disposable second repository.
+  local hooks=$1 fixture output
+  fixture=$(mktemp -d) || exit 1
+  trap 'rm -rf -- "$fixture"' EXIT
+  cd "$fixture" || exit 1
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  hook_git() {
+    git -c user.name='OMG fixture' -c user.email=fixture@example.invalid \
+      -c commit.gpgsign=false -c core.hooksPath="$hooks" "$@"
+  }
+  expect_notice() {
+    local expected=$1 message=$2
+    shift 2
+    output=$(hook_git "$@" 2>&1) || { printf 'assertion failed: Git operation %s: %s\n' "$*" "$output" >&2; return 1; }
+    if { [[ "$expected" == yes ]] && [[ "$output" != *"$message"* ]]; } \
+      || { [[ "$expected" == no ]] && [[ "$output" == *"$message"* ]]; }; then
+      printf 'assertion failed: hook notice expected=%s during %s: %s\n' "$expected" "$*" "$output" >&2; return 1
+    fi
+  }
+  hook_git init -q -b baseline || exit 1
+  printf 'baseline\n' > omg.lock
+  hook_git add omg.lock || exit 1
+  expect_notice no 'omg.lock has unstaged changes' commit -qm baseline || exit 1
+  printf 'changed\n' > omg.lock
+  expect_notice yes 'omg.lock has unstaged changes' commit --allow-empty -m unstaged || exit 1
+  [[ $(hook_git show HEAD:omg.lock) == baseline ]] || exit 1
+  hook_git checkout -qb changed || exit 1
+  hook_git add omg.lock || exit 1
+  expect_notice no 'omg.lock has unstaged changes' commit -qm changed || exit 1
+  [[ $(hook_git show HEAD:omg.lock) == changed ]] || exit 1
+  expect_notice yes 'Environment changed on branch switch' checkout baseline || exit 1
+  expect_notice no 'Environment changed on branch switch' checkout baseline || exit 1
+  printf 'working tree edit\n' > omg.lock
+  expect_notice no 'Environment changed on branch switch' checkout -- omg.lock || exit 1
+  expect_notice yes 'Environment changed after merge' merge --ff-only changed || exit 1
+  [[ $(cat omg.lock) == changed ]] || exit 1
+  expect_notice no 'Environment changed after merge' merge --ff-only changed || exit 1
+)
+check_product_output() {
+  local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5
+  if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
+    printf 'assertion failed: product emitted a panic report\n' >&2; return 1
+  fi
+  if [[ "$safety" == help-boundary ]] && ! grep -Fq 'Usage:' "$stdout"; then
+    printf 'assertion failed: help output lacks Usage\n' >&2; return 1
+  fi
+  if [[ "$code" != 0 ]] && ! grep -q '[^[:space:]]' "$stderr"; then
+    printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
+  fi
+  if [[ "$code" == 0 ]]; then
+    case "$assertion" in
+      hooks-installed|hooks-absent)
+        local hook label hook_path
+        for hook in pre-commit post-checkout post-merge; do
+          hook_path=".git/hooks/$hook"
+          if [[ "$assertion" == hooks-absent ]]; then
+            if [[ -e "$hook_path" || -L "$hook_path" ]]; then
+              printf 'assertion failed: removed hook remains: %s\n' "$hook" >&2; return 1
+            fi
+          else
+            case "$hook" in pre-commit) label=Pre-commit ;; post-checkout) label=Post-checkout ;; post-merge) label=Post-merge ;; esac
+            if [[ ! -f "$hook_path" || -L "$hook_path" || ! -x "$hook_path" ]] \
+              || ! grep -Fxq "# OMG $label Hook" "$hook_path" || ! sh -n "$hook_path"; then
+              printf 'assertion failed: installed hook is missing, invalid, or not executable: %s\n' "$hook" >&2; return 1
+            fi
+          fi
+        done
+        if [[ "$assertion" == hooks-installed ]] && ! check_hook_lifecycle "$PWD/.git/hooks"; then
+          printf 'assertion failed: installed hook lifecycle contract\n' >&2; return 1
+        fi ;;
+      workspace-filtered-output|workspace-all-output)
+        local primary nested expected_nested=0
+        primary=$(grep -Fxc 'smoke-task-ok' "$stdout" || true)
+        nested=$(grep -Fxc 'nested-smoke-task-ok' "$stdout" || true)
+        [[ "$assertion" != workspace-all-output ]] || expected_nested=1
+        if [[ "$primary" != 1 || "$nested" != "$expected_nested" ]]; then
+          printf 'assertion failed: workspace task counts primary=%s nested=%s; expected primary=1 nested=%s\n' "$primary" "$nested" "$expected_nested" >&2; return 1
+        fi ;;
+      json-stdout)
+        if ! jq -e -s 'length == 1' "$stdout" >/dev/null 2>&1; then
+          printf 'assertion failed: stdout is not exactly one JSON document\n' >&2; return 1
+        fi ;;
+      artifact:*)
+        local artifact=${assertion#artifact:}
+        if [[ ! -f "$artifact" || -L "$artifact" ]] || ! jq -e -s 'length == 1' "$artifact" >/dev/null 2>&1; then
+          printf 'assertion failed: artifact %s is not a regular JSON document\n' "$artifact" >&2; return 1
+        fi ;;
+    esac
+  fi
+  return 0
+}
+# END PRODUCT OUTPUT ORACLE
+# BEGIN ROW LOG
+write_row_log() {
+  local destination=$1 stdout=$2 stderr=$3 identity=$4 verdict=$5
+  {
+    printf 'case=%s verdict=%s\n' "$identity" "$verdict"
+    # The trusted reporter bounds excerpts. Keep the diagnosis ahead of large
+    # JSON/list output, retaining the complete streams for artifact inspection.
+    grep -m 4 '^assertion failed:' "$stderr" || true
+    printf '\nstderr:\n'
+    cat "$stderr"
+    printf '\nstdout:\n'
+    cat "$stdout"
+  } > "$destination"
+}
+# END ROW LOG
 trap 'rc=$?; if [[ "$rc" == 2 ]]; then printf "error: invalid inventory configuration or row %s\n" "${id:-<preflight>}" >&2; fi' EXIT
 
 work=""; distro=""; tiers=""; tag=""; binary=""; tsv=""
@@ -40,6 +150,7 @@ done
 [[ "$row_timeout" =~ ^[0-9]+$ && "$row_timeout" -gt 0 ]] || exit 2
 case "$distro" in arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
 for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3; done
+overlap_fixture=$(jq -rn --rawfile fixture "$(dirname "$0")/workspace-overlap-fixture.sh" '$fixture | @sh')
 [[ "$binary" == /* && "$binary" != *$'\n'* ]] || exit 2
 [[ "$ssh_user" =~ ^[a-z_][a-z0-9_-]*$ && "$ssh_port" =~ ^[0-9]+$ ]] || exit 2
 [[ "$tiers" =~ ^[a-z,-]+$ && "$tiers" != ,* && "$tiers" != *, && "$tiers" != *,,* ]] || exit 2
@@ -142,7 +253,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|json-stdout|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json) ;; *) exit 2 ;; esac
+  case "$a" in -|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
   row_exit["$id"]="$resolved"; row_targets["$id"]="$tg"; row_assertions["$id"]="$a"
@@ -249,8 +360,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
   remote="set -eu; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
-  remote+="; export NO_COLOR=1 LC_ALL=C PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-ok\n' > Makefile"
+  remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n' > Makefile"
+  remote+="; printf '%s' $overlap_fixture > workspace-overlap.sh"
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
+  remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_product_output)"
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')
@@ -261,17 +375,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg $quoted_binary $pargs > '$p.prereq.log' 2> '$p.prereq.stderr.log'"
     remote+="; printf 'prereq $p exit=%s\n' \"\$rc\" >&2; cat '$p.prereq.log' '$p.prereq.stderr.log' >&2"
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
-    if [[ "${row_assertions[$p]}" == artifact:* ]]; then
-      remote+="; if [ \"\$rc\" = 0 ] && ! test -s '${row_assertions[$p]#artifact:}'; then printf '\nOMG_QEMU_RECEIPT:dependency:0:1\n'; exit 0; fi"
-    elif [[ "${row_assertions[$p]}" == json-stdout ]]; then
-      remote+="; if [ \"\$rc\" = 0 ] && ! jq -e -s 'length == 1' '$p.prereq.log' >/dev/null 2>&1; then printf '\nOMG_QEMU_RECEIPT:dependency:0:1\n'; exit 0; fi"
-    fi
+    remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
   done
   arg_string=$(quote_args "$args_json")
-  remote+="; run_omg $quoted_binary $arg_string; assertion=0"
-  if [[ "$assertions" == artifact:* ]]; then
-    remote+="; if [ \"\$rc\" = 0 ]; then test -s '${assertions#artifact:}' || assertion=1; fi"
-  fi
+  remote+="; run_omg $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+  remote+="; cat command.stdout.log; cat command.stderr.log >&2"
+  remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log; then assertion=1; fi"
   # A receipt is emitted only after setup and the command complete. SSH
   # transport/tool failures cannot satisfy an expected product refusal.
   remote+="; printf '\nOMG_QEMU_RECEIPT:%s:%s:%s\n' \"\$execution_phase\" \"\$rc\" \"\$assertion\""
@@ -280,14 +389,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # Put the supervisor AND its receipt inside the namespace. A namespace
     # setup failure must be a transport/harness error, never an expected CLI
     # refusal. Drop back to the SSH user before creating fixtures or running OMG.
-    remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+    remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
   fi
   start=$SECONDS
   transport=0
   budget=$(( (row_timeout + 5) * (${#chain[@]} + 1) + 15 ))
   timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
   elapsed=$((SECONDS - start))
-  cat "$out/rows/$case.stdout.log" "$out/rows/$case.stderr.log" > "$out/rows/$case.log"
   verdict=HARNESS_ERROR; rc=$transport
   receipt=$(tail -n 1 "$out/rows/$case.stdout.log")
   if [[ "$transport" == 0 && "$receipt" =~ ^OMG_QEMU_RECEIPT:(product|executor|dependency):([0-9]{1,3}):([01])$ ]]; then
@@ -303,6 +411,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       fi
     fi
   fi
+  write_row_log "$out/rows/$case.log" "$out/rows/$case.stdout.log" "$out/rows/$case.stderr.log" "$case" "$verdict"
   record "qemu-$distro-$case" "$verdict" "$rc" "$elapsed"
   if [[ "$verdict" == PASS ]]; then pass=$((pass+1)); else fail=$((fail+1)); fi
   printf 'case=%s exit=%s verdict=%s\n' "$case" "$rc" "$verdict"

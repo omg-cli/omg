@@ -1,6 +1,16 @@
 //! Broad CLI smoke and behavior contracts for OMG commands.
 
-#![cfg(feature = "arch")]
+// These contracts use isolated mock package state and child-local configuration.
+// Exercise each Linux backend build instead of silently selecting zero tests.
+#![cfg(all(
+    target_os = "linux",
+    any(
+        feature = "arch",
+        feature = "debian",
+        feature = "debian-pure",
+        feature = "fedora"
+    )
+))]
 
 pub mod common;
 
@@ -30,6 +40,68 @@ fn explicit_shortcut_uses_the_same_isolated_state_as_explicit_count() {
                 .parse::<usize>()
                 .expect("package count");
             assert_eq!(actual, expected, "{distro}: {command:?}");
+        }
+    }
+}
+
+#[test]
+fn search_json_preserves_exact_records_ranking_limits_and_package_state() {
+    let distro = if cfg!(feature = "arch") {
+        "arch"
+    } else if cfg!(feature = "fedora") {
+        "fedora"
+    } else {
+        "debian"
+    };
+    let project = TestProject::for_distro(distro);
+    for (name, version) in [
+        ("qprobe", "1.2.3"),
+        ("qprobe-extra", "2.3.4"),
+        ("addon-qprobe", "3.4.5"),
+        ("unrelated", "4.5.6"),
+    ] {
+        project
+            .mock_available(name, version)
+            .expect("seed query fixture");
+    }
+    let backend = match distro {
+        "arch" => "pacman",
+        "fedora" => "dnf",
+        _ => "apt",
+    };
+    let state = project
+        .data_dir
+        .path()
+        .join(format!("mock_state_{backend}.json"));
+    let before = std::fs::read(&state).expect("fixture state");
+    // Independently specified exact > prefix > word-boundary ordering.
+    let expected = [
+        serde_json::json!({"name":"qprobe","version":"1.2.3","description":"","source":"Official"}),
+        serde_json::json!({"name":"qprobe-extra","version":"2.3.4","description":"","source":"Official"}),
+        serde_json::json!({"name":"addon-qprobe","version":"3.4.5","description":"","source":"Official"}),
+    ];
+    for command in ["search", "s"] {
+        for limit in [0usize, 1, 2, 9] {
+            for flags in [
+                &[][..],
+                &["--detailed", "--no-aur"][..],
+                &["-d", "--quiet"][..],
+            ] {
+                let limit_arg = limit.to_string();
+                let mut args = vec!["--json", command, "QPROBE", "-l", &limit_arg];
+                args.extend_from_slice(flags);
+                let result = project.run(&args);
+                result.assert_success();
+                result.assert_no_ansi();
+                let actual: Vec<serde_json::Value> = serde_json::from_str(&result.stdout)
+                    .expect("stdout must contain only the package JSON array");
+                assert_eq!(actual, expected[..limit.min(expected.len())], "{args:?}");
+                assert_eq!(
+                    std::fs::read(&state).unwrap(),
+                    before,
+                    "search mutated package state: {args:?}"
+                );
+            }
         }
     }
 }
@@ -141,6 +213,28 @@ impl Safety {
             Self::ServiceMutation => "service-mutation",
             Self::Interactive => "interactive",
         }
+    }
+}
+
+#[test]
+fn behavior_inventory_keeps_hook_and_workspace_assertions() {
+    let cases = behavior_cases();
+    for case in &cases {
+        assert_eq!(Safety::parse(case.safety.as_str(), 1), case.safety);
+    }
+    for (id, assertion) in [
+        ("hooks-install", Assertion::HooksInstalled),
+        ("hooks-install-force", Assertion::HooksInstalled),
+        ("workspace-run-parallel-all", Assertion::WorkspaceAllOutput),
+    ] {
+        let case = cases
+            .iter()
+            .find(|case| case.id == id)
+            .expect("required behavioral case");
+        assert!(
+            case.assertions.contains(&assertion),
+            "{id} lost its behavioral assertion"
+        );
     }
 }
 
@@ -329,12 +423,20 @@ impl TargetExpectations {
 enum Assertion {
     JsonStdout,
     Artifact(String),
+    WorkspaceFilteredOutput,
+    WorkspaceAllOutput,
+    HooksInstalled,
+    HooksAbsent,
 }
 
 impl Assertion {
     fn parse(raw: &str, line_number: usize) -> Self {
         match raw {
             "json-stdout" => Self::JsonStdout,
+            "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
+            "workspace-all-output" => Self::WorkspaceAllOutput,
+            "hooks-installed" => Self::HooksInstalled,
+            "hooks-absent" => Self::HooksAbsent,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -822,13 +924,22 @@ fn behavior_inventory_declaration_args_parse() {
     }
 }
 
+#[cfg(feature = "arch")]
 fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
 
-    project.create_file("Makefile", ".PHONY: smoke\nsmoke:\n\t@echo smoke-task-ok\n");
+    project.create_file("Makefile", ".PHONY: smoke overlap\nsmoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n");
+    project.create_file(
+        "workspace-overlap.sh",
+        include_str!("../scripts/workspace-overlap-fixture.sh"),
+    );
     project.create_file("README.md", "# CLI behavior smoke fixture\n");
     project.create_file("project/README.md", "# Nested audit fixture\n");
+    project.create_file(
+        "project/Makefile",
+        ".PHONY: smoke overlap\nsmoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n",
+    );
 
     let pacman_local = project
         .pacman_root
@@ -907,12 +1018,14 @@ fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
     )
 }
 
+#[cfg(feature = "arch")]
 fn has_ansi(text: &str) -> bool {
     text.as_bytes().windows(2).any(|pair| pair == b"\x1b[")
 }
 
 #[test]
 #[serial]
+#[cfg(feature = "arch")] // This inventory fixture explicitly seeds a pacman database.
 fn behavior_inventory_runs_in_hermetic_state() {
     use std::fmt::Write as _;
     use std::time::Instant;
@@ -1004,6 +1117,51 @@ fn behavior_inventory_runs_in_hermetic_state() {
         }
         for assertion in &case.assertions {
             match assertion {
+                Assertion::HooksInstalled | Assertion::HooksAbsent => {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    for (name, label) in [
+                        ("pre-commit", "Pre-commit"),
+                        ("post-checkout", "Post-checkout"),
+                        ("post-merge", "Post-merge"),
+                    ] {
+                        let path = project.path().join(".git/hooks").join(name);
+                        let valid = if matches!(assertion, Assertion::HooksAbsent) {
+                            path.symlink_metadata()
+                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        } else {
+                            let marker = format!("# OMG {label} Hook");
+                            path.symlink_metadata().is_ok_and(|metadata| {
+                                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                            }) && std::fs::read_to_string(&path)
+                                .is_ok_and(|text| text.lines().any(|line| line == marker))
+                                && std::process::Command::new("sh")
+                                    .arg("-n")
+                                    .arg(&path)
+                                    .output()
+                                    .is_ok_and(|output| output.status.success())
+                        };
+                        if !valid {
+                            issues.push(format!("hook {name} did not satisfy {assertion:?}"));
+                        }
+                    }
+                }
+                Assertion::WorkspaceFilteredOutput | Assertion::WorkspaceAllOutput => {
+                    let primary = result
+                        .stdout
+                        .lines()
+                        .filter(|line| *line == "smoke-task-ok")
+                        .count();
+                    let nested = result
+                        .stdout
+                        .lines()
+                        .filter(|line| *line == "nested-smoke-task-ok")
+                        .count();
+                    let expected_nested =
+                        usize::from(matches!(assertion, Assertion::WorkspaceAllOutput));
+                    if primary != 1 || nested != expected_nested {
+                        issues.push(format!("workspace task counts primary={primary} nested={nested}; expected primary=1 nested={expected_nested}"));
+                    }
+                }
                 Assertion::JsonStdout => {
                     if serde_json::from_str::<serde_json::Value>(&result.stdout).is_err() {
                         issues.push("JSON output did not parse".to_string());
@@ -1204,6 +1362,7 @@ mod install_tests {
     // Contract: dry-run exits 0 and explicitly promises no changes
     // (observed: "No changes will be made (dry run)").
     #[test]
+    #[cfg(feature = "arch")] // The installed package fixture is pacman.
     fn test_install_dry_run() {
         let result = run_omg(&["install", "--dry-run", "pacman"]);
         result.assert_success();
@@ -1255,6 +1414,19 @@ mod update_tests {
         result.assert_success();
         result.assert_stdout_contains("Checking for updates · cached");
         result.assert_no_ansi();
+        assert!(
+            !result.stdout.contains("Synced"),
+            "--check refreshed package metadata"
+        );
+        for flag in ["--dry-run", "--no-sync"] {
+            let preview = run_omg(&["update", flag]);
+            preview.assert_success();
+            assert!(
+                !preview.stdout.contains("Synced"),
+                "{flag} refreshed package metadata: {}",
+                preview.stdout
+            );
+        }
     }
 }
 
@@ -1436,6 +1608,7 @@ mod env_tests {
     }
 
     #[test]
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     fn redirected_environment_drift_output_has_no_ansi() {
         let project = TestProject::new();
         let capture = project.run(&["env", "capture"]);
@@ -1503,6 +1676,7 @@ mod security_tests {
     }
 
     #[test]
+    #[cfg(feature = "license")]
     fn test_account_help() {
         let result = run_omg(&["account", "--help"]);
         result.assert_success();
@@ -1510,6 +1684,7 @@ mod security_tests {
     }
 
     #[test]
+    #[cfg(feature = "license")]
     fn account_link_does_not_prompt_without_a_terminal() {
         let result = run_omg_with_env(
             &["account", "link", "invalid-token"],
@@ -1525,6 +1700,14 @@ mod security_tests {
             "non-interactive account linking must not consume stdin:\n{}",
             result.stdout
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "license"))]
+    fn account_is_explicitly_unavailable_without_license_feature() {
+        let result = run_omg(&["account", "--help"]);
+        assert_eq!(result.exit_code, 2);
+        result.assert_stderr_contains("unrecognized subcommand 'account'");
     }
 }
 
@@ -1735,6 +1918,7 @@ mod meta_tests {
 // PACKAGE OPERATIONS
 // ===================
 
+#[cfg(feature = "arch")]
 mod package_ops_tests {
     use super::*;
 
@@ -1742,6 +1926,7 @@ mod package_ops_tests {
     // subcommands (src/cli/args.rs:172-189). The old invocations were clap errors
     // whose message happened to contain "cache"/"orphans", so they passed vacuously.
     #[test]
+    #[cfg(feature = "arch")] // Cache cleanup support and this preview are Arch-specific.
     fn test_clean_cache_dry_run() {
         let result = run_omg(&["clean", "--cache", "--dry-run"]);
         result.assert_success();
@@ -1758,6 +1943,7 @@ mod package_ops_tests {
     }
 
     #[test]
+    #[cfg(feature = "arch")] // This fixture supplies Arch orphan metadata.
     fn test_clean_orphans_dry_run() {
         let result = run_omg(&["clean", "--orphans", "--dry-run"]);
         result.assert_success();
@@ -1830,6 +2016,7 @@ mod workflow_tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "arch")] // This fixture resolves git through the Arch fast info path.
     fn test_search_then_info() {
         // Workflow: search for package, then get info
         let search_result = run_omg(&["search", "git"]);

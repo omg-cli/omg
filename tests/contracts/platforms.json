@@ -14,7 +14,10 @@
       "workflow": "ci.yml",
       "job": "portable",
       "omgd": true,
-      "native_integration_suites": []
+      "native_integration_suites": [
+        "git_hooks_contract",
+        "coverage_18"
+      ]
     },
     {
       "id": "debian-pure",
@@ -34,7 +37,10 @@
         "debian_search_integration",
         "debian_cache_tests",
         "debian_e2e_tests",
-        "debian_pure_integration"
+        "debian_pure_integration",
+        "git_hooks_contract",
+        "coverage_18",
+        "cli_comprehensive"
       ]
     },
     {
@@ -50,7 +56,11 @@
       "workflow": "ci.yml",
       "job": "linux-matrix",
       "omgd": true,
-      "native_integration_suites": []
+      "native_integration_suites": [
+        "git_hooks_contract",
+        "coverage_18",
+        "cli_comprehensive"
+      ]
     },
     {
       "id": "debian",
@@ -71,7 +81,10 @@
         "debian_ipc_tests",
         "debian_search_integration",
         "debian_cache_tests",
-        "debian_e2e_tests"
+        "debian_e2e_tests",
+        "git_hooks_contract",
+        "coverage_18",
+        "cli_comprehensive"
       ]
     },
     {
@@ -93,7 +106,10 @@
         "debian_ipc_tests",
         "debian_search_integration",
         "debian_cache_tests",
-        "debian_e2e_tests"
+        "debian_e2e_tests",
+        "git_hooks_contract",
+        "coverage_18",
+        "cli_comprehensive"
       ]
     },
     {
@@ -110,7 +126,10 @@
       "job": "linux-matrix",
       "omgd": true,
       "native_integration_suites": [
-        "fedora_tests"
+        "fedora_tests",
+        "git_hooks_contract",
+        "coverage_18",
+        "cli_comprehensive"
       ]
     },
     {
@@ -132,7 +151,10 @@
         "debian_ipc_tests",
         "debian_search_integration",
         "debian_cache_tests",
-        "debian_e2e_tests"
+        "debian_e2e_tests",
+        "git_hooks_contract",
+        "coverage_18",
+        "cli_comprehensive"
       ]
     },
     {
@@ -148,7 +170,10 @@
       "workflow": "ci.yml",
       "job": "macos",
       "omgd": true,
-      "native_integration_suites": []
+      "native_integration_suites": [
+        "git_hooks_contract",
+        "coverage_18"
+      ]
     }
   ],
   "gaps": [

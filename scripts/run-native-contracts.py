@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run the existing native tests once, retaining exact parser execution evidence.
+"""Run native tests once, retaining separate parser and CLI fixture evidence.
 
-The binary subjects are compiled test harnesses, NOT release executables. Only
-reviewed parser assertion mappings are accepted by this adapter. These local
-receipts are diagnostic evidence from this job, not signed attestations.
+Parser subjects are test harnesses; CLI fixture subjects are debug executables.
+Neither is a release or native transaction attestation. Only reviewed assertion
+mappings are accepted; these local receipts are diagnostic evidence.
 """
 import argparse
 import hashlib
@@ -24,7 +24,42 @@ COVERAGE = SELECTION.COVERAGE
 require = COVERAGE.require
 
 
+BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
+    'test_cli_status_shows_debian_info', 'test_cli_debian_respects_ci_mode'))
+
+
 def parser_receipts(manifest, provenance, report):
+    return execution_receipts(manifest, provenance, report, behavior=False)
+
+
+def behavior_receipts(manifest, provenance, report):
+    return execution_receipts(manifest, provenance, report, behavior=True)
+
+
+def behavior_subjects(listing, root):
+    """Resolve the same package's child executables, never its parser harness."""
+    meta = listing['rust-build-meta']
+    target = Path(meta['target-directory']).resolve(strict=True)
+    require(target.is_relative_to(root.resolve()), 'target directory escapes checkout')
+    suite = listing['rust-suites']['omg::debian_e2e_tests']
+    subjects = {'harness': Path(suite['binary-path'])}
+    for row in meta['non-test-binaries'][suite['package-id']]:
+        if row['name'] not in ('omg', 'omgd'):
+            continue
+        relative = Path(row['path'])
+        require(not relative.is_absolute() and '..' not in relative.parts
+                and row['kind'] == 'bin-exe' and row['build-platform'] == 'target',
+                'invalid child executable metadata')
+        require(row['name'] not in subjects, 'duplicate child executable')
+        subjects[row['name']] = target / relative
+    require(set(subjects) == {'omg', 'omgd', 'harness'}, 'missing behavior executable')
+    for path in subjects.values():
+        require(path.is_file() and not path.is_symlink()
+                and path.resolve(strict=True).is_relative_to(target), 'unsafe behavior executable')
+    return subjects
+
+
+def execution_receipts(manifest, provenance, report, *, behavior):
     receipts, required = [], []
     for contract in manifest['contracts']:
         if not COVERAGE.applies(contract, provenance):
@@ -32,15 +67,21 @@ def parser_receipts(manifest, provenance, report):
         bindings = [binding for binding in contract['tests'] if binding['lane'] == provenance['lane']]
         if not bindings:
             continue
-        require(contract['requires'] == ['parser'], 'native parser adapter cannot certify behavioral evidence')
+        if not behavior:
+            require(contract['requires'] == ['parser'], 'native parser adapter cannot certify behavioral evidence')
         required.append(contract['id'])
         for binding in bindings:
-            require(binding['evidence'] == ['parser'], 'nonparser binding')
+            if behavior:
+                require(binding['id'] in BEHAVIOR_TESTS and 'fixture-cleanup' in binding['assertions'],
+                        'behavior test or cleanup assertion has not been reviewed')
+                require(set(binding['evidence']) <= {'success', 'state', 'refusal'}, 'unsupported fixture evidence')
+            else:
+                require(binding['evidence'] == ['parser'], 'nonparser binding')
             require(binding['id'] in report['tests'], 'missing mapped execution')
             execution = report['tests'][binding['id']]
             for index, attempt in enumerate(execution['attempts'], 1):
                 result = attempt['result']
-                # A parser fixture has no approved runtime skip path.
+                # These reviewed fixtures have no approved runtime skip path.
                 if result == 'SKIPPED' or execution['runtime_skip']:
                     result = 'BLOCKED'
                 receipt = {key: provenance[key] for key in COVERAGE.IDENTITY}
@@ -48,13 +89,13 @@ def parser_receipts(manifest, provenance, report):
                     schema_version=1, contract=contract['id'], test_id=binding['id'],
                     binary=contract['binary'], binary_sha256=provenance['binaries'][contract['binary']],
                     attempt=index, attempt_count=len(execution['attempts']), result=result,
-                    evidence=['parser'] if result == 'PASS' else [],
+                    evidence=binding['evidence'] if result == 'PASS' else [],
                     assertions=binding['assertions'] if result == 'PASS' else [],
                     duration_ms=attempt['duration_ms'], seed=None,
-                    cleanup='NOT_STARTED' if result == 'BLOCKED' else 'PASS',
+                    cleanup='PASS' if result == 'PASS' else 'NOT_STARTED',
                 )
                 receipts.append(receipt)
-    require(required, 'zero parser contract denominator')
+    require(required, 'zero contract denominator')
     return receipts, sorted(required)
 
 
@@ -70,7 +111,9 @@ def sha256_file(path):
 
 def cargo_test_args(features):
     active = COVERAGE.strings(features.split(','))
-    suites = ['cli_surface']
+    suites = ['cli_surface', 'git_hooks_contract', 'coverage_18']
+    if active & {'arch', 'debian', 'debian-pure', 'fedora'}:
+        suites.append('cli_comprehensive')
     if active & {'debian', 'debian-pure'}:
         suites.extend(['debian_tests', 'debian_daemon_tests', 'debian_ipc_tests',
                        'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests'])
@@ -108,6 +151,13 @@ def main():
         source = command_output(['git', 'rev-parse', 'HEAD'])
         require(source == os.environ['OMG_CONTRACT_SOURCE_SHA'], 'checkout source mismatch')
         features = args.features.split(',')
+        # Cargo/nextest target runners apply to the host platform too. Preserve
+        # all other suites' privilege model; only the isolated CLI harness drops root.
+        if sys.platform == 'linux' and os.geteuid() == 0:
+            host = command_output(['rustc', '-vV']).split('host: ', 1)[1].splitlines()[0]
+            runner_key = 'CARGO_TARGET_' + host.upper().replace('-', '_') + '_RUNNER'
+            require(runner_key not in os.environ, 'root native runner conflicts with configured target runner')
+            os.environ[runner_key] = 'bash scripts/native-test-runner.sh'
         COVERAGE.strings(features)
         cargo_args = cargo_test_args(args.features)
         recipe = {
@@ -118,9 +168,11 @@ def main():
             'env': {key: value for key, value in sorted(os.environ.items())
                     if key in ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC_WRAPPER',
                                'RUSTC_WORKSPACE_WRAPPER', 'CARGO_BUILD_TARGET')
-                    or key.startswith('CARGO_PROFILE_')},
+                    or key.startswith('CARGO_PROFILE_')
+                    or (key.startswith('CARGO_TARGET_') and key.endswith('_RUNNER'))},
             'files': {name: sha256_file(name) for name in
-                      ('Cargo.toml', 'Cargo.lock', '.config/nextest.toml', '.github/workflows/ci.yml')},
+                      ('Cargo.toml', 'Cargo.lock', '.config/nextest.toml', '.github/workflows/ci.yml',
+                       'scripts/native-test-runner.sh')},
         }
         if Path('.cargo/config.toml').is_file():
             recipe['files']['.cargo/config.toml'] = sha256_file('.cargo/config.toml')
@@ -147,11 +199,21 @@ def main():
             'features': sorted(features), 'lane': 'native-parser',
         }
         write_json(evidence / 'provenance.json', provenance)
+        behavior_paths = (behavior_subjects(listing, Path.cwd())
+                          if 'omg::debian_e2e_tests' in listing['rust-suites'] else {})
+        behavior_hashes = {name: sha256_file(path) for name, path in behavior_paths.items()}
+        behavior_directory = evidence / 'behavior'
+        behavior_directory.mkdir(exist_ok=True)
+        for name in ('provenance.json', 'receipts.json', 'required.json', 'coverage.json'):
+            (behavior_directory / name).unlink(missing_ok=True)
         junit = Path('target/nextest/ci/junit.xml')
         # Clear only this invocation's outputs so restored/stale artifacts cannot pass.
         for path in (junit, directory / 'omg.json', directory / 'omgd.json'):
             path.unlink(missing_ok=True)
-        result = subprocess.run(['cargo', 'nextest', 'run', *cargo_args], check=False)
+        run_env = dict(os.environ)
+        if behavior_paths:
+            run_env['OMG_CONTRACT_EXPECTED_CLI'] = str(behavior_paths['omg'])
+        result = subprocess.run(['cargo', 'nextest', 'run', *cargo_args], check=False, env=run_env)
         require(junit.is_file() and not junit.is_symlink()
                 and junit.stat().st_size <= COVERAGE.MAX_BYTES, 'missing or invalid execution report')
         shutil.copyfile(junit, evidence / 'junit.xml')
@@ -170,11 +232,31 @@ def main():
                                          for binary in subjects], receipts, provenance, required)
         write_json(evidence / 'coverage.json', report)
         summary = COVERAGE.render_markdown(report)
+        passed = report['passed']
+        if behavior_paths:
+            require(all(sha256_file(path) == behavior_hashes[name]
+                        for name, path in behavior_paths.items()), 'behavior executable changed during execution')
+            behavior_provenance = dict(provenance, lane='native-cli-fixture', subject_kind='debug-cli-mock-backend',
+                                       binaries={name: behavior_hashes[name] for name in ('omg', 'omgd')},
+                                       harness_sha256=behavior_hashes['harness'])
+            behavior_provenance['recipe_sha256'] = hashlib.sha256(json.dumps(
+                {'recipe': recipe, 'subjects': behavior_hashes}, sort_keys=True,
+                separators=(',', ':')).encode()).hexdigest()
+            write_json(behavior_directory / 'provenance.json', behavior_provenance)
+            behavior_rows, behavior_required = behavior_receipts(manifest, behavior_provenance, execution)
+            write_json(behavior_directory / 'receipts.json', behavior_rows)
+            write_json(behavior_directory / 'required.json', behavior_required)
+            behavior_report = COVERAGE.admit(manifest, [COVERAGE.read_json(directory / (binary + '.json'))
+                                                        for binary in subjects], behavior_rows,
+                                             behavior_provenance, behavior_required)
+            write_json(behavior_directory / 'coverage.json', behavior_report)
+            summary += '\n' + COVERAGE.render_markdown(behavior_report)
+            passed = passed and behavior_report['passed']
         print(summary)
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as stream:
                 stream.write(summary)
-        return 1 if result.returncode or not report['passed'] else 0
+        return 1 if result.returncode or not passed else 0
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
         write_json(evidence / 'admission-error.json', {'schema_version': 1, 'error': str(error)})
         print('Native contract admission failed: ' + str(error), file=sys.stderr)

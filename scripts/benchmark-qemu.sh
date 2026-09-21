@@ -412,6 +412,31 @@ bootcmd:
       printf '[Time]\nNTP=\nNTP=162.159.200.1 162.159.200.123\nFallbackNTP=\n' > /etc/systemd/timesyncd.conf.d/99-omg-qemu.conf
       systemctl restart --no-block systemd-timesyncd.service
     fi
+write_files:
+  - path: /etc/systemd/system/omg-boot-network.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Bounded QEMU boot network diagnostics
+      [Service]
+      Type=oneshot
+      TimeoutStartSec=15
+      ExecStart=-/usr/bin/env ip -brief address
+      ExecStart=-/usr/bin/env ip -4 route
+      ExecStart=-/usr/bin/journalctl --boot --unit=systemd-networkd --unit=NetworkManager --lines=80 --no-pager
+      StandardOutput=tty
+      StandardError=tty
+      TTYPath=/dev/ttyS0
+  - path: /etc/systemd/system/omg-boot-network.timer
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Capture QEMU networking without SSH
+      [Timer]
+      OnBootSec=45
+      Unit=omg-boot-network.service
+      [Install]
+      WantedBy=timers.target
 CLOCK
 } > user-data
 chmod 600 user-data
@@ -472,6 +497,9 @@ wait_ssh
 # nonzero statuses fatal, but include the detailed errors in boot.log.
 timeout 180 ssh "${opts[@]}" bench@127.0.0.1 'cloud-init status --wait --long && cat /etc/os-release && uname -r && sudo -n true'
 if [[ "$initial" == false ]]; then exit 0; fi
+# Arm diagnostics before the first reboot and every subsequent disk clone.
+# The timer has no network-online dependency, so failed DHCP/SSH cannot hide it.
+ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl daemon-reload && sudo -n systemctl enable omg-boot-network.timer'
 ssh "${opts[@]}" bench@127.0.0.1 "sudo -n systemctl enable '$2'"
 before=$(ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id)
 ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl reboot' || true
@@ -490,6 +518,7 @@ if [[ -n "$inventory_tiers" ]]; then
   # The inventory executor runs inside the controller (same netns as the
   # guest); /work is bind-mounted there.
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
+  cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"
   cp "$tsv" "$work/cases.tsv"
   if [[ "$inventory_isolation" == true ]]; then
     cp "$inventory_policy" "$work/inventory-policy.json"
@@ -571,13 +600,15 @@ version=$("${version_cmd[@]}")
 [[ $(awk '$1 == "Version:" {print $2}' evidence/omg-info.txt) == "$version" ]]
 # Exercise both direct daemon startup and the actual CLI foreground launcher
 # while the package databases and installed fixture are available.
+guest_tools=(jq)
+[[ "$benchmark" != true ]] || guest_tools+=(hyperfine)
+case "$distro" in
+  arch) sudo -n pacman -S --noconfirm --needed "${guest_tools[@]}" || exit 120 ;;
+  debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${guest_tools[@]}" || exit 120 ;;
+  fedora) sudo -n dnf install -y "${guest_tools[@]}" || exit 120 ;;
+esac
 timeout --kill-after=5s 240s bash "$HOME/qemu-daemon-check.sh" "$bin" "$HOME/evidence"
 if [[ "$benchmark" == true ]]; then
-  case "$distro" in
-    arch) sudo -n pacman -S --noconfirm --needed hyperfine jq || exit 120 ;;
-    debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends hyperfine jq || exit 120 ;;
-    fedora) sudo -n dnf install -y hyperfine jq || exit 120 ;;
-  esac
   OMG_BENCH_BINARY="$bin" OMG_BENCH_EXPORT_DIR="$HOME/evidence/benchmarks" \
     bash "$HOME/benchmark-hyperfine.sh" --guest || exit 120
 fi
@@ -652,9 +683,10 @@ fi
 if [[ "$rc" == 0 ]]; then
   # A zero guest exit alone is insufficient: require the daemon probe receipt.
   daemon_receipt="$work/guest/evidence/daemon-lifecycle.json"
-  if ! [[ -f "$daemon_receipt" && $(wc -c < "$daemon_receipt") -le 4096 ]] || ! jq -e '
+  if ! [[ -f "$daemon_receipt" && $(wc -c < "$daemon_receipt") -le 4096 ]] || ! jq -e -s '
+    length == 1 and (.[0] | type == "object") and (.[0] |
     .schema_version == 1 and .direct == true and .foreground == true and
-    .ipc == true and .singleton == true and .shutdown == true and .restart == true
+    .ipc == true and .singleton == true and .shutdown == true and .restart == true and .query_parity == true and .sigint == true)
   ' "$daemon_receipt" >/dev/null; then
     printf 'Missing or incomplete daemon lifecycle evidence\n' >&2
     exit 1
@@ -839,7 +871,15 @@ if [[ -n "$inventory_policy" ]]; then
   python3 "$here/check-qemu-inventory.py" --policy "$inventory_policy" --inventory "$tsv" \
     --results "$work/inventory/results.json" --summary "$work/inventory/summary.json" \
     --distro "$distro" --tiers "$inventory_tiers" > "$work/inventory-admission.json" || policy_rc=$?
-  if [[ "$policy_rc" != 0 ]]; then
+  if [[ "$policy_rc" == 1 && "$inventory_product_failure" == true ]] &&
+    jq -e '.schema_version == 1 and .passed == false and
+           (.counts.failed | type == "number") and .counts.failed > 0 and
+           .counts.harness_error == 0' "$work/inventory-admission.json" >/dev/null 2>&1; then
+    # Exit 1 with a validated failure receipt means the selected product
+    # cases failed. Preserve independent lifecycle evidence; the row failure
+    # still makes the overall command fail below. Invalid admission is exit 2.
+    :
+  elif [[ "$policy_rc" != 0 ]]; then
     [[ "$rc" != 0 ]] || rc=120
     inventory_harness_error=true
   fi

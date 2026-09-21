@@ -57,6 +57,8 @@ jobs:
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          ZSTD_CLEVEL: "6"
         with:
           prefix-key: "mutation"
           # Mutants uses scratch build directories, not the root target.

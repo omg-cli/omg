@@ -150,6 +150,10 @@ pub(crate) async fn update_official_only(
 ) -> Result<()> {
     let pm = crate::package_managers::get_package_manager()?;
 
+    // Preview modes must not mutate repository metadata or request elevation.
+    // Keep this consistent with the Arch update lane.
+    let use_cached = no_sync || check_only || dry_run;
+
     crate::cli::modern_ui::print_phase_header(
         "🔄",
         "Update",
@@ -159,7 +163,7 @@ pub(crate) async fn update_official_only(
             } else {
                 "Dry run · checking for updates"
             }
-        } else if no_sync {
+        } else if use_cached {
             "Checking for updates · cached"
         } else {
             "Checking for updates"
@@ -167,7 +171,7 @@ pub(crate) async fn update_official_only(
     );
 
     let check_start = std::time::Instant::now();
-    let official_updates = if no_sync {
+    let official_updates = if use_cached {
         match try_daemon_list_updates().await {
             Some(updates) => updates,
             None => pm.list_updates().await?,

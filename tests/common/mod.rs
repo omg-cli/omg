@@ -245,7 +245,9 @@ pub fn run_omg_with_options(
     env_vars: &[(&str, &str)],
 ) -> CommandResult {
     let home = TempDir::new().expect("Failed to create isolated home");
-    run_omg_with_home(args, dir, env_vars, home.path())
+    let result = run_omg_with_home(args, dir, env_vars, home.path());
+    home.close().expect("Failed to clean isolated CLI home");
+    result
 }
 
 fn run_omg_with_home(
@@ -259,6 +261,13 @@ fn run_omg_with_home(
     let start = Instant::now();
     let command_timeout = command_timeout(env_vars);
 
+    if let Some(expected) = std::env::var_os("OMG_CONTRACT_EXPECTED_CLI") {
+        assert_eq!(
+            std::fs::canonicalize(env!("CARGO_BIN_EXE_omg")).expect("CLI executable exists"),
+            std::fs::canonicalize(expected).expect("Receipt subject exists"),
+            "CLI fixture executable differs from the admitted receipt subject"
+        );
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_omg"));
     cmd.args(args)
         .env("OMG_TEST_MODE", "1")

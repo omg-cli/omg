@@ -22,11 +22,57 @@ The `cli-surfaces-*` artifacts contain, per owner:
   assertions, first-failure history and explicit debt. Admission errors are
   preserved in `admission-error.json` and fail the owning job.
 
-Only reviewed parser mappings are translated by this adapter. A JUnit pass
+For Debian, Trixie, Ubuntu and pure Debian, `execution/behavior/` separately
+records three reviewed CLI fixture contracts: status, JSON status and explicit
+installation consent. The actual debug `omg`/`omgd` pair and owning integration
+harness are hashed before and after execution. The child helper checks that its
+compiled CLI path matches the admitted subject, reaps children and checks home
+cleanup; the two mapped tests explicitly close their state directories.
+The status fixture asserts exact seeded counts, unchanged state and independent
+empty state. Consent asserts refusal without `--yes`, unchanged refused state,
+and exact installed versions after consent. These use a mock Debian backend;
+they do not certify native transactions or daemon behavior. Wider gaps remain.
+
+Only explicitly reviewed mappings are translated. A generic JUnit pass
 cannot automatically certify state changes, cleanup or successful transactions.
 The QEMU inventory/evidence gate and trusted automatic issue reporter remain
 separate and mandatory. Native receipts do not replace their native DB, process,
 filesystem or recovery assertions.
+
+QEMU inventory execution additionally checks each selected product's own output:
+help must contain Usage, an expected failure must explain itself on stderr, panic
+reports cannot satisfy any expected exit, and JSON output/export assertions require
+exactly one valid document. Export artifacts must be regular files. The same checks
+apply to replayed prerequisites, whose failures block dependent cases; a prerequisite's
+diagnostic cannot satisfy the final command's error contract. Assertion diagnostics
+remain in the row logs consumed by failure reporting. Fault-injection tests exercise
+both the guest oracle and the full inventory runner with a local SSH substitute.
+These are output-quality checks, not semantic schema, flag interaction, state-change
+or recovery coverage. Those stronger contracts still require explicit assertions.
+
+The workspace scenarios use two registered projects with distinct task markers.
+Filtered execution requires the selected marker once and the excluded marker zero
+times; sequential and parallel unfiltered execution require both exactly once,
+without relying on output order. The parallel row runs a shared bounded rendezvous fixture: neither task can
+complete without observing its peer. Serial negative controls must time out and
+remove their ready signals. This proves overlap of two independent tasks, not
+every dependency schedule or argument interaction. Git-hook install/force-install rows
+require three regular executable scripts with the expected markers and valid shell
+syntax; uninstall requires their absence. QEMU additionally runs those installed
+scripts through real Git commits, branch/file checkouts and fast-forward merges in
+a disposable repository, with positive and negative notice and lockfile assertions.
+The separate native hook target checks the same lifecycle and manual child failure
+propagation. User-modified hook preservation remains a separate contract.
+Published inventory policy hashes are retained separately from
+the expanded checkout inventory, so old release evidence is not reinterpreted.
+
+Linux backend owners also execute the backend-independent CLI comprehensive
+cases; Arch-specific package fixtures retain their Arch owner. All native owners
+require nonempty hook and production daemon transport targets. In root Linux CI
+containers, a recorded target runner drops only the comprehensive CLI harness to
+an unprivileged identity, keeping fixture paths separate from real root state.
+These additional JUnit results are execution evidence, not automatic behavioral
+coverage credit in the contract manifest.
 
 JUnit's skipped-test reporting varies by nextest version. The independent list
 supplies ignored/filtered counts even when no XML row exists. A selected test
@@ -65,3 +111,16 @@ uses one shared deadline, including when a producer never uploads its artifact.
 This adds a shared readiness barrier, so compare total runner minutes and guest
 completion time on hosted runs before claiming a measured speedup.
 The trusted automatic QEMU issue reporter still owns failure publication.
+
+The unconditional native daemon probe compares `--json explicit`,
+`explicit --count`, `ec`, and `--json explicit --count` against an independent
+native package inventory on Arch, Debian, Ubuntu and Fedora. It checks both
+direct and CLI foreground daemon startup, increasing request counters with no
+reported failures, and direct CLI queries after shutdown. A mandatory
+`query_parity` receipt prevents missing checks from passing admission. Exact
+query outputs and daemon counters are allowlisted diagnostic artifacts. This
+does not establish coverage of every RPC variant or native transaction.
+The probe also sends SIGINT to both direct and foreground-launched daemon
+processes, verifies successful termination and socket removal, and starts the
+next lifecycle against the same private state. Admission requires `sigint: true`;
+signal-specific logs and query outputs remain separate exported artifacts.
