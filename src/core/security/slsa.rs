@@ -1618,7 +1618,7 @@ mod tests {
         assert_eq!(
             verify_fulcio_chain(leaf.der(), now, &ca_roots, "").as_deref(),
             Some("https://accounts.example.com/users/alice"),
-            "generated certificate chain must bind identity; root={ca_pem} leaf={cert_pem}"
+            "generated certificate chain must bind identity"
         );
         assert!(
             SlsaVerifier::verify_digest_with_bytes(
@@ -1627,9 +1627,7 @@ mod tests {
                 &artifact_bytes,
                 good_sig.to_der().as_bytes(),
             ),
-            "generated artifact signature must verify; public_key={} signature={}",
-            b64(&leaf_key.public_key_der()),
-            b64(good_sig.to_der().as_bytes())
+            "generated artifact signature must verify"
         );
 
         // Valid chain + correct signature -> verified AND identity bound.
