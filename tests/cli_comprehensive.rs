@@ -1195,6 +1195,16 @@ fn behavior_inventory_runs_in_hermetic_state() {
         {
             issues.push("failure did not explain itself on stderr".to_string());
         }
+        let audit_success = match case.id.as_str() {
+            "audit" | "audit-scan" => Some("No vulnerabilities found in scanned packages."),
+            "audit-fix" | "audit-fix-flags" => Some("No vulnerabilities found!"),
+            _ => None,
+        };
+        if let Some(expected) = audit_success
+            && !result.stdout.contains(expected)
+        {
+            issues.push("empty-inventory audit did not report its completed scan".to_string());
+        }
         for assertion in &case.assertions {
             match assertion {
                 Assertion::HooksInstalled | Assertion::HooksAbsent => {

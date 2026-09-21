@@ -14,6 +14,97 @@ impl Drop for RunningTask {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn cancelled_active_and_waiting_scans_release_the_lock_without_caching() -> anyhow::Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    let package = format!("cancel-scan-{}", uuid::Uuid::new_v4());
+    let state_path = temp.path().join("mock_state_pacman.json");
+    let inventory = serde_json::to_vec(&serde_json::json!({
+        "installed": {package.clone(): "1.0.0"}, "available": {}
+    }))?;
+    std::fs::write(&state_path, &inventory)?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/v1/query", listener.local_addr()?);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let expected = package.clone();
+    let mut http = RunningTask(tokio::spawn(async move {
+        let (socket, _) = listener.accept().await?;
+        let mut socket = BufReader::new(socket);
+        assert_eq!(
+            http_request(&mut socket).await?["package"]["name"],
+            expected
+        );
+        started_tx
+            .send(())
+            .map_err(|()| anyhow::anyhow!("scan observer disappeared"))?;
+        // Deliberately withhold the response. Cancellation must tear down the
+        // unfinished fetch; a later request cannot reuse a completed result.
+        match timeout(Duration::from_secs(5), socket.read(&mut [0])).await? {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => anyhow::bail!("cancelled HTTP request was not closed: {other:?}"),
+        }
+        let (socket, _) = listener.accept().await?;
+        let mut socket = BufReader::new(socket);
+        assert_eq!(
+            http_request(&mut socket).await?["package"]["name"],
+            expected
+        );
+        let body = r#"{"vulns":[{"id":"fresh-after-cancel","severity":[{"score":"8.1"}]}]}"#;
+        socket
+            .get_mut()
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await?;
+        anyhow::Ok(())
+    }));
+    let manager = Arc::new(MockPackageManager::new_in("arch", temp.path()));
+    let mut state = DaemonState::new_isolated(temp.path(), PackageIndex::empty(), manager)?;
+    state.vulnerability_scanner = Arc::new(VulnerabilityScanner::with_osv_api_url(endpoint));
+    let state = Arc::new(state);
+    let active_state = Arc::clone(&state);
+    let mut active = RunningTask(tokio::spawn(async move {
+        active_state.scan_security().await?;
+        anyhow::Ok(())
+    }));
+    timeout(Duration::from_secs(5), started_rx).await??;
+    assert!(
+        state.security_scan_lock.try_lock().is_err(),
+        "active fetch must own the scan lock"
+    );
+    let mut waiting = Box::pin(state.scan_security());
+    assert!(futures::poll!(&mut waiting).is_pending());
+    drop(waiting);
+    active.0.abort();
+    let cancelled = timeout(Duration::from_secs(5), &mut active.0)
+        .await?
+        .expect_err("active scan must be cancelled");
+    assert!(cancelled.is_cancelled());
+    let recovered = timeout(Duration::from_secs(5), state.scan_security()).await??;
+    assert_eq!(recovered.total_vulnerabilities, 1);
+    assert_eq!(recovered.high_severity, 1);
+    assert_eq!(recovered.vulnerabilities[0].0, package);
+    assert_eq!(recovered.vulnerabilities[0].1[0].id, "fresh-after-cancel");
+    assert_eq!(
+        recovered.vulnerabilities[0].1[0].score.as_deref(),
+        Some("8.1")
+    );
+    timeout(Duration::from_secs(5), &mut http.0).await???;
+    assert_eq!(std::fs::read(state_path)?, inventory);
+    drop(state);
+    let path = temp.path().to_path_buf();
+    temp.close()?;
+    anyhow::ensure!(!path.exists(), "cancel fixture survived cleanup");
+    Ok(())
+}
+
 async fn request(stream: &mut UnixStream, message: Request) -> anyhow::Result<Response> {
     timeout(Duration::from_secs(10), async {
         let frame = protocol::encode_frame(&message)?;

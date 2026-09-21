@@ -61,8 +61,8 @@ complete	["complete","--shell","bash","--current","se","--last","omg"]	read	0	pa
 which	["which","node"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 status	["status","--fast"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 doctor	["doctor"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-audit	["audit"]	read	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-audit-scan	["audit","scan"]	read	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit	["audit"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit-scan	["audit","scan"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-sbom	["audit","sbom","--output","${ROOT}/sbom.json"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	artifact:sbom.json	tempdir-drop
 audit-secrets	["audit","secrets","--path","project"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-log	["audit","log","--limit","3"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -71,7 +71,7 @@ audit-policy	["audit","policy"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-d
 audit-slsa	["audit","slsa","${ROOT}/project/README.md"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-slsa-identity	["audit","slsa","--certificate-identity","dev@example.invalid","${ROOT}/project/README.md"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-licenses	["audit","licenses","--format","json"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	json-stdout	tempdir-drop
-audit-fix	["audit","fix","--dry-run"]	read	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit-fix	["audit","fix","--dry-run"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-export	["audit","export","--output","${ROOT}/audit-evidence"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-eol	["audit","eol"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 run	["run","smoke","--using","make"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -156,7 +156,7 @@ complete-full	["complete","--shell","bash","--current","se","--last","omg","--fu
 audit-log-flags	["audit","log","--limit","3","--severity","error","--export","${ROOT}/audit-log-export.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-licenses-filter-policy	["audit","licenses","--format","json","--filter","mit","--check-policy"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	json-stdout	tempdir-drop
 audit-licenses-export	["audit","licenses","--format","csv","--export","${ROOT}/licenses-export.csv"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-audit-fix-flags	["audit","fix","--dry-run","--yes","--min-severity","high"]	read	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit-fix-flags	["audit","fix","--dry-run","--yes","--min-severity","high"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-export-flags	["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 run-parallel	["run","--parallel","smoke"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 run-all	["run","--all","smoke"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop

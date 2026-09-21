@@ -199,3 +199,18 @@ All production call sites of the older ALSA-only `scan_system` path have now
 been removed. The legacy public method and its tests remain; this change does
 not remove API compatibility. Explicit contention/cancellation coverage of the
 new scan lock and native advisory ecosystem coverage remain outstanding.
+
+Cancellation evidence now covers the shared daemon scan task: a real HTTP
+response is withheld, an explicitly polled waiting scan is dropped, the active
+task is aborted, its HTTP connection must close, and a new scan must obtain fresh
+findings. The fixture checks inventory preservation and cleanup. Removing the
+scan lock causes the test to fail. This proves task cancellation and lock release;
+it does not claim that an arbitrary IPC disconnect cancels an in-flight scan.
+
+Hosted revision7f068ff1 exposed stale integration expectations: cli_comprehensive
+still expected four empty-inventory audit commands to fail without a daemon, and
+coverage_2 expected the daemon gate. Those checks now require successful scan
+output, with corrupt-inventory refusal retained in security_daemon_optional.
+The inventory digest is updated in the QEMU allowlist while retaining historical
+entries. Local inventory, paywall, QEMU/release harness and lint checks pass;
+the failed hosted runs remain recorded and need fresh revision validation.
