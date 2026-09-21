@@ -36,6 +36,20 @@ fn audit_verify_rejects_tampering_and_incomplete_collection_without_rewriting_hi
     assert!(!rejected.stdout.contains("consistency verified"));
     assert_eq!(std::fs::read(&path)?, tampered);
 
+    for malformed in [b"{truncated".as_slice(), b"\xff\n".as_slice()] {
+        std::fs::write(&path, malformed)?;
+        let corrupt = project.run(&["audit", "verify"]);
+        corrupt.assert_failure();
+        assert!(
+            corrupt.stderr.contains("Failed to open audit log"),
+            "unexpected corruption diagnostic: {}",
+            corrupt.stderr
+        );
+        assert!(!corrupt.stdout.contains("No audit log exists"));
+        assert!(!corrupt.stdout.contains("consistency verified"));
+        assert_eq!(std::fs::read(&path)?, malformed);
+    }
+
     std::fs::write(&path, &original)?;
     let marker = project.data_dir.path().join("audit/incomplete");
     std::fs::write(&marker, b"fixture collection failure")?;
