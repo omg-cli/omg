@@ -11,6 +11,23 @@ use std::path::Path;
 impl LocalCommandRunner for EnvCommands {
     async fn execute(&self, _ctx: &CliContext) -> Result<()> {
         match self {
+            EnvCommands::Export { source_target } => {
+                let state = EnvironmentState::load("omg.lock")?;
+                let output = crate::core::env::portable::from_snapshot(
+                    state.runtimes,
+                    state.packages,
+                    source_target,
+                )?;
+                print!("{output}");
+                Ok(())
+            }
+            EnvCommands::Plan { target } => {
+                let content = crate::core::env::fingerprint::read_lockfile(Path::new(".omg.toml"))
+                    .context("Cannot read .omg.toml for environment planning")?;
+                let output = crate::core::env::portable::to_json(&content, target)?;
+                println!("{output}");
+                Ok(())
+            }
             EnvCommands::Capture => capture().await,
             EnvCommands::Check => check().await,
             EnvCommands::Share {

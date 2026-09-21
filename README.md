@@ -275,7 +275,7 @@ after it ships. See [release operations](docs/release-operations.md) for the ful
 | [Installation](docs/installation.md) — downloads, attestation, removal | [Architecture](docs/architecture.md) — CLI, daemon, IPC, caches |
 | [Quickstart](docs/quickstart.md) — a project in four commands | [Security](docs/security.md) — evidence and its limits |
 | [Cheat sheet](docs/cheatsheet.md) — one page of everyday commands | [Troubleshooting](docs/troubleshooting.md) — safe diagnosis |
-| [Glossary](docs/glossary.md) — every term in plain words | [Task runner](docs/task-runner.md) · [Runtimes](docs/runtimes.md) · [AUR](docs/aur.md) |
+| [Glossary](docs/glossary.md) — every term in plain words | [Task runner](docs/task-runner.md) · [Runtimes](docs/runtimes.md) · [Portable environments](docs/environment-portability.md) · [AUR](docs/aur.md) |
 
 The same topics are curated for the web at **[getomg.xyz/docs](https://getomg.xyz/docs)**.
 
