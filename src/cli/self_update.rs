@@ -329,7 +329,11 @@ async fn probe_update_binary(
             // may fork a helper which inherits the output pipes and otherwise
             // keeps the timed-out probe alive after its direct child exits.
             #[cfg(unix)]
-            kill_probe_group(probe_group)?;
+            if probe_group_has_descendants(probe_group)? {
+                kill_probe_group(probe_group)?;
+            } else {
+                kill_probe_leader(probe_group)?;
+            }
             child
                 .wait()
                 .await
@@ -420,6 +424,19 @@ fn kill_probe_group(group: u32) -> Result<()> {
     match killpg(group_pid, Signal::SIGKILL) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
         Err(error) => Err(error).context("Failed to kill version probe group"),
+    }
+}
+
+#[cfg(unix)]
+fn kill_probe_leader(pid: u32) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let pid = i32::try_from(pid).context("Version probe process ID exceeded i32")?;
+    match kill(Pid::from_raw(pid), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error).context("Failed to kill version probe leader"),
     }
 }
 
