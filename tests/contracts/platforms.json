@@ -19,7 +19,9 @@
         "coverage_10",
         "coverage_18",
         "e2e_runtime_management",
-        "env_lockfile_integrity"
+        "env_lockfile_integrity",
+        "daemon_e2e_caching",
+        "daemon_e2e_concurrency"
       ]
     },
     {
@@ -46,7 +48,9 @@
         "coverage_18",
         "cli_comprehensive",
         "e2e_runtime_management",
-        "env_lockfile_integrity"
+        "env_lockfile_integrity",
+        "daemon_e2e_caching",
+        "daemon_e2e_concurrency"
       ]
     },
     {
@@ -69,7 +73,9 @@
         "cli_comprehensive",
         "e2e_runtime_management",
         "env_lockfile_integrity",
-        "security_daemon_optional"
+        "security_daemon_optional",
+        "daemon_e2e_caching",
+        "daemon_e2e_concurrency"
       ]
     },
     {
@@ -98,7 +104,9 @@
         "cli_comprehensive",
         "e2e_runtime_management",
         "env_lockfile_integrity",
-        "security_daemon_optional"
+        "security_daemon_optional",
+        "daemon_e2e_caching",
+        "daemon_e2e_concurrency"
       ]
     },
     {
@@ -127,7 +135,9 @@
         "cli_comprehensive",
         "e2e_runtime_management",
         "env_lockfile_integrity",
-        "security_daemon_optional"
+        "security_daemon_optional",
+        "daemon_e2e_caching",
+        "daemon_e2e_concurrency"
       ]
     },
     {
@@ -151,7 +161,9 @@
         "cli_comprehensive",
         "e2e_runtime_management",
         "env_lockfile_integrity",
-        "security_daemon_optional"
+        "security_daemon_optional",
+        "daemon_e2e_caching",
+        "daemon_e2e_concurrency"
       ]
     },
     {
@@ -180,7 +192,9 @@
         "cli_comprehensive",
         "e2e_runtime_management",
         "env_lockfile_integrity",
-        "security_daemon_optional"
+        "security_daemon_optional",
+        "daemon_e2e_caching",
+        "daemon_e2e_concurrency"
       ]
     },
     {
@@ -201,7 +215,9 @@
         "coverage_10",
         "coverage_18",
         "e2e_runtime_management",
-        "env_lockfile_integrity"
+        "env_lockfile_integrity",
+        "daemon_e2e_caching",
+        "daemon_e2e_concurrency"
       ]
     }
   ],

@@ -1,4 +1,4 @@
-#![cfg(feature = "arch")]
+#![cfg(unix)]
 
 //! Daemon cache hit/miss rates, invalidation, coherency, and memory pressure.
 
@@ -16,10 +16,47 @@ use common::DaemonTestFixture as CacheTestFixture;
 
 async fn clear_cache(fixture: &CacheTestFixture) {
     let response = fixture.send_request(Request::CacheClear { id: 0 }).await;
-    assert!(
-        matches!(response, Response::Success { .. }),
-        "CacheClear request failed: {response:?}"
-    );
+    match response {
+        Response::Success {
+            id: 0,
+            result: ResponseResult::Message(message),
+        } => assert_eq!(message, "cleared"),
+        other => panic!("CacheClear returned {other:?}"),
+    }
+}
+
+async fn empty_search(fixture: &CacheTestFixture, id: u64) {
+    match fixture
+        .send_request(Request::Search {
+            id,
+            query: "test".to_string(),
+            limit: Some(10),
+        })
+        .await
+    {
+        Response::Success {
+            id: response_id,
+            result: ResponseResult::Search(result),
+        } => {
+            assert_eq!(response_id, id);
+            assert!(result.packages.is_empty());
+            assert_eq!(result.total, 0);
+        }
+        other => panic!("fixture search returned {other:?}"),
+    }
+}
+
+async fn cache_counts(fixture: &CacheTestFixture, id: u64) -> (u64, u64) {
+    match fixture.send_request(Request::Metrics { id }).await {
+        Response::Success {
+            id: response_id,
+            result: ResponseResult::Metrics(metrics),
+        } => {
+            assert_eq!(response_id, id);
+            (metrics.cache_hits, metrics.cache_misses)
+        }
+        other => panic!("cache metrics returned {other:?}"),
+    }
 }
 
 // ============================================================================
@@ -44,22 +81,10 @@ async fn test_cache_hit_rate_tracking() -> Result<()> {
     };
 
     // Perform a search (cache miss)
-    fixture
-        .send_request(Request::Search {
-            id: 1,
-            query: "test".to_string(),
-            limit: Some(10),
-        })
-        .await;
+    empty_search(&fixture, 1).await;
 
     // Repeat same search (cache hit)
-    fixture
-        .send_request(Request::Search {
-            id: 2,
-            query: "test".to_string(),
-            limit: Some(10),
-        })
-        .await;
+    empty_search(&fixture, 2).await;
 
     // Check metrics
     let metrics2 = fixture.send_request(Request::Metrics { id: 101 }).await;
@@ -74,8 +99,8 @@ async fn test_cache_hit_rate_tracking() -> Result<()> {
     let hits_delta = metrics.cache_hits - initial_hits;
     let misses_delta = metrics.cache_misses - initial_misses;
 
-    assert!(misses_delta >= 1, "Should have at least 1 cache miss");
-    assert!(hits_delta >= 1, "Should have at least 1 cache hit");
+    assert_eq!(misses_delta, 1, "Exactly one uncached search");
+    assert_eq!(hits_delta, 1, "Exactly one repeated search");
 
     let hit_rate = hits_delta as f64 / (hits_delta + misses_delta) as f64;
     println!("Cache hit rate: {:.2}%", hit_rate * 100.0);
@@ -102,19 +127,9 @@ async fn test_explicit_cache_clear() -> Result<()> {
         }
     }
 
-    async fn search(fixture: &CacheTestFixture, id: u64) {
-        fixture
-            .send_request(Request::Search {
-                id,
-                query: "test".to_string(),
-                limit: Some(10),
-            })
-            .await;
-    }
-
     // Populate the cache and observe the miss.
     let misses_before = cache_misses(&fixture, 1).await;
-    search(&fixture, 2).await;
+    empty_search(&fixture, 2).await;
     let misses_after_first = cache_misses(&fixture, 3).await;
     assert!(
         misses_after_first > misses_before,
@@ -122,7 +137,7 @@ async fn test_explicit_cache_clear() -> Result<()> {
     );
 
     // Repeat: served from cache (no new miss).
-    search(&fixture, 4).await;
+    empty_search(&fixture, 4).await;
     let misses_after_repeat = cache_misses(&fixture, 5).await;
     assert_eq!(
         misses_after_repeat, misses_after_first,
@@ -138,7 +153,7 @@ async fn test_explicit_cache_clear() -> Result<()> {
 
     // The same query must now be a miss again: invalidation is observable
     // through request semantics, not only through internal stats.
-    search(&fixture, 7).await;
+    empty_search(&fixture, 7).await;
     let misses_after_clear = cache_misses(&fixture, 8).await;
     assert!(
         misses_after_clear > misses_after_repeat,
@@ -157,34 +172,8 @@ async fn test_explicit_cache_clear() -> Result<()> {
 async fn test_repeated_status_reads_are_consistent() -> Result<()> {
     let fixture = CacheTestFixture::new()?;
 
-    // First status request
-    let status1 = fixture.send_request(Request::Status { id: 1 }).await;
-
-    // A second live status read over unchanged isolated state must agree.
-    let status2 = fixture.send_request(Request::Status { id: 2 }).await;
-
-    // Both should succeed and return same data
-    match (status1, status2) {
-        (
-            Response::Success {
-                result: ResponseResult::Status(s1),
-                ..
-            },
-            Response::Success {
-                result: ResponseResult::Status(s2),
-                ..
-            },
-        ) => {
-            assert_eq!(
-                s1.total_packages, s2.total_packages,
-                "repeated total package counts must agree"
-            );
-            assert_eq!(
-                s1.explicit_packages, s2.explicit_packages,
-                "repeated explicit package counts must agree"
-            );
-        }
-        _ => unreachable!("Status requests should succeed"),
+    for id in [1, 2] {
+        common::assert_empty_daemon_status(fixture.send_request(Request::Status { id }).await, id);
     }
 
     Ok(())
@@ -194,57 +183,35 @@ async fn test_repeated_status_reads_are_consistent() -> Result<()> {
 #[serial]
 async fn test_package_info_cache_coherency() -> Result<()> {
     let fixture = CacheTestFixture::new()?;
+    let baseline = cache_counts(&fixture, 10).await;
 
-    // First info request
-    let info1 = fixture
-        .send_request(Request::Info {
-            id: 1,
-            package: "bash".to_string(),
-        })
-        .await;
-
-    // Second info request (should be cached)
-    let info2 = fixture
-        .send_request(Request::Info {
-            id: 2,
-            package: "bash".to_string(),
-        })
-        .await;
-
-    // Both should return same data
-    match (info1, info2) {
-        (
+    // The isolated mock catalog contains this exact package. Two errors
+    // cannot establish successful metadata caching.
+    for id in [1, 2] {
+        match fixture
+            .send_request(Request::Info {
+                id,
+                package: "git".to_string(),
+            })
+            .await
+        {
             Response::Success {
-                result: ResponseResult::Info(i1),
-                ..
-            },
-            Response::Success {
-                result: ResponseResult::Info(i2),
-                ..
-            },
-        ) => {
-            assert_eq!(i1.name, i2.name, "Cached info should match");
-            assert_eq!(i1.version, i2.version, "Cached version should match");
+                id: response_id,
+                result: ResponseResult::Info(info),
+            } => {
+                assert_eq!(response_id, id);
+                assert_eq!(info.name, "git");
+                assert_eq!(info.version, "2.43.0");
+                assert_eq!(info.description, "Version control");
+                assert_eq!(info.source, WirePackageSource::Official);
+            }
+            other => panic!("known package info returned {other:?}"),
         }
-        (
-            Response::Error {
-                code: code1,
-                message: message1,
-                ..
-            },
-            Response::Error {
-                code: code2,
-                message: message2,
-                ..
-            },
-        ) => {
-            assert_eq!(code1, code2, "Cached errors should preserve the error code");
-            assert_eq!(
-                message1, message2,
-                "Cached errors should preserve the message"
-            );
-        }
-        _ => panic!("Repeated info requests returned different response variants"),
+        let current = cache_counts(&fixture, 10 + id).await;
+        assert_eq!(
+            (current.0 - baseline.0, current.1 - baseline.1),
+            (id - 1, 1)
+        );
     }
 
     Ok(())
@@ -260,39 +227,30 @@ async fn test_missing_package_returns_error_consistently() -> Result<()> {
     let fixture = CacheTestFixture::new()?;
     let nonexistent_package = "this-package-definitely-does-not-exist-12345";
 
-    let response1 = fixture
-        .send_request(Request::Info {
-            id: 1,
-            package: nonexistent_package.to_string(),
-        })
-        .await;
-    let response2 = fixture
-        .send_request(Request::Info {
-            id: 2,
-            package: nonexistent_package.to_string(),
-        })
-        .await;
-
-    match (response1, response2) {
-        (
+    for id in [1, 2] {
+        match fixture
+            .send_request(Request::Info {
+                id,
+                package: nonexistent_package.to_string(),
+            })
+            .await
+        {
             Response::Error {
-                code: code1,
-                message: message1,
-                ..
-            },
-            Response::Error {
-                code: code2,
-                message: message2,
-                ..
-            },
-        ) => {
-            assert_eq!(code1, code2, "Repeated missing-package errors should match");
-            assert_eq!(
-                message1, message2,
-                "Repeated missing-package messages should match"
-            );
+                id: response_id,
+                code,
+                message,
+            } => {
+                assert_eq!(response_id, id);
+                assert_eq!(
+                    code,
+                    omg_lib::daemon::protocol::error_codes::PACKAGE_NOT_FOUND
+                );
+                assert_eq!(message, format!("Package not found: {nonexistent_package}"));
+            }
+            other @ Response::Success { .. } => {
+                panic!("missing package info returned {other:?}")
+            }
         }
-        _ => panic!("Missing package requests returned inconsistent responses"),
     }
 
     Ok(())

@@ -1,4 +1,4 @@
-#![cfg(feature = "arch")]
+#![cfg(unix)]
 
 //! Daemon concurrent clients, request queuing, races, and thread safety.
 
@@ -9,13 +9,6 @@ use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-
-/// Helper to extract response ID
-const fn response_id(response: &Response) -> u64 {
-    match response {
-        Response::Success { id, .. } | Response::Error { id, .. } => *id,
-    }
-}
 
 pub mod common;
 
@@ -54,13 +47,17 @@ async fn test_concurrent_search_requests() -> Result<()> {
     for handle in handles {
         let (id, response) = handle.await?;
         match response {
-            Response::Success { .. } => success_count += 1,
-            Response::Error { code, message, .. } => {
-                panic!("concurrent search {id} failed: code={code} message={message}")
+            Response::Success {
+                id: actual_id,
+                result: ResponseResult::Search(result),
+            } => {
+                assert_eq!(actual_id, id);
+                assert!(result.packages.is_empty());
+                assert_eq!(result.total, 0);
+                success_count += 1;
             }
+            other => panic!("concurrent search {id} returned {other:?}"),
         }
-        // Verify response ID matches request ID
-        assert_eq!(response_id(&response), id);
     }
 
     assert_eq!(success_count, 50, "every concurrent search should succeed");
@@ -84,33 +81,10 @@ async fn test_concurrent_status_requests() -> Result<()> {
         handles.push(handle);
     }
 
-    // All should return the same result (cached).
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        let response = handle.await?;
-        match response {
-            Response::Success {
-                result: ResponseResult::Status(status),
-                ..
-            } => results.push(status),
-            response => panic!("Concurrent status request failed: {response:?}"),
-        }
-    }
-    assert_eq!(
-        results.len(),
-        20,
-        "Every status request should return a result"
-    );
-
-    // All status results should be consistent
-    if results.len() > 1 {
-        let first = &results[0];
-        for status in &results[1..] {
-            assert_eq!(
-                status.total_packages, first.total_packages,
-                "Concurrent status requests should return consistent data"
-            );
-        }
+    // The fixture has no installed packages and has never scanned advisories.
+    // Matching but incorrect status values must not satisfy this contract.
+    for (id, handle) in handles.into_iter().enumerate() {
+        common::assert_empty_daemon_status(handle.await?, id as u64);
     }
 
     Ok(())
@@ -137,7 +111,17 @@ async fn test_concurrent_read_and_cache_clear() -> Result<()> {
                     query: "test".to_string(),
                     limit: Some(10),
                 };
-                let _response = handle_request(Arc::clone(&state), request).await;
+                match handle_request(Arc::clone(&state), request).await {
+                    Response::Success {
+                        id,
+                        result: ResponseResult::Search(result),
+                    } => {
+                        assert_eq!(id, (i * 5 + j) as u64);
+                        assert!(result.packages.is_empty());
+                        assert_eq!(result.total, 0);
+                    }
+                    other => panic!("concurrent search returned {other:?}"),
+                }
                 completed += 1;
             }
             completed
@@ -167,12 +151,18 @@ async fn test_concurrent_read_and_cache_clear() -> Result<()> {
         "Every concurrent read should complete"
     );
 
-    for handle in clear_handles {
+    for (index, handle) in clear_handles.into_iter().enumerate() {
         let response = handle.await?;
-        assert!(
-            matches!(response, Response::Success { .. }),
-            "Cache clear should succeed"
-        );
+        match response {
+            Response::Success {
+                id,
+                result: ResponseResult::Message(message),
+            } => {
+                assert_eq!(id, 1000 + index as u64);
+                assert_eq!(message, "cleared");
+            }
+            other => panic!("concurrent cache clear returned {other:?}"),
+        }
     }
 
     Ok(())
@@ -198,7 +188,17 @@ async fn test_concurrent_cache_updates() -> Result<()> {
                     query: query.clone(),
                     limit: Some(10),
                 };
-                let _response = handle_request(Arc::clone(&state), request).await;
+                match handle_request(Arc::clone(&state), request).await {
+                    Response::Success {
+                        id,
+                        result: ResponseResult::Search(result),
+                    } => {
+                        assert_eq!(id, i as u64);
+                        assert!(result.packages.is_empty());
+                        assert_eq!(result.total, 0);
+                    }
+                    other => panic!("concurrent cache update returned {other:?}"),
+                }
                 completed += 1;
             }
             completed
@@ -240,8 +240,8 @@ async fn test_no_deadlock_with_recursive_locks() -> Result<()> {
     // Use timeout to detect deadlock
     let timeout_duration = Duration::from_secs(10);
     let result = tokio::time::timeout(timeout_duration, async {
-        for handle in handles {
-            handle.await.unwrap();
+        for (id, handle) in handles.into_iter().enumerate() {
+            common::assert_empty_daemon_status(handle.await.unwrap(), id as u64);
         }
     })
     .await;
@@ -277,36 +277,17 @@ async fn test_no_race_in_cache_updates() -> Result<()> {
 
     // All 50 hits on the same key must succeed AND agree: the cached result
     // set for a given query is immutable once inserted.
-    let mut results = vec![];
-    let mut total_responses = 0;
-    for handle in handles {
-        total_responses += 1;
+    for (expected_id, handle) in handles.into_iter().enumerate() {
         match handle.await? {
             Response::Success {
-                result: ResponseResult::Search(search_result),
-                ..
-            } => results.push(search_result),
-            Response::Error { code, message, .. } => {
-                panic!("concurrent same-key search failed: code={code} message={message}")
+                id,
+                result: ResponseResult::Search(result),
+            } => {
+                assert_eq!(id, expected_id as u64);
+                assert!(result.packages.is_empty());
+                assert_eq!(result.total, 0);
             }
-            other @ Response::Success { .. } => panic!("unexpected response to Search: {other:?}"),
-        }
-    }
-
-    assert_eq!(
-        total_responses, 50,
-        "every same-key search must receive a response"
-    );
-    assert_eq!(results.len(), 50, "every same-key search must succeed");
-
-    // All cached results should be identical
-    if results.len() > 1 {
-        let first = &results[0];
-        for result in &results[1..] {
-            assert_eq!(
-                result.total, first.total,
-                "Concurrent cache updates should not cause inconsistency"
-            );
+            other => panic!("concurrent same-key search returned {other:?}"),
         }
     }
 
@@ -317,6 +298,13 @@ async fn test_no_race_in_cache_updates() -> Result<()> {
 #[serial]
 async fn test_no_race_in_metrics_updates() -> Result<()> {
     let fixture = ConcurrencyTestFixture::new()?;
+    let baseline = match fixture.send_request(Request::Metrics { id: 1001 }).await {
+        Response::Success {
+            id: 1001,
+            result: ResponseResult::Metrics(metrics),
+        } => metrics,
+        other => panic!("baseline metrics returned {other:?}"),
+    };
 
     // Submit many requests to increment metrics
     let mut handles = vec![];
@@ -330,8 +318,17 @@ async fn test_no_race_in_metrics_updates() -> Result<()> {
     }
 
     // Wait for all to complete
-    for handle in handles {
-        handle.await?;
+    for (index, handle) in handles.into_iter().enumerate() {
+        match handle.await? {
+            Response::Success {
+                id,
+                result: ResponseResult::Ping(message),
+            } => {
+                assert_eq!(id, index as u64);
+                assert_eq!(message, "pong");
+            }
+            other => panic!("concurrent ping returned {other:?}"),
+        }
     }
 
     // Check final metrics
@@ -340,17 +337,14 @@ async fn test_no_race_in_metrics_updates() -> Result<()> {
 
     let metrics = match metrics_response {
         Response::Success {
+            id: 1000,
             result: ResponseResult::Metrics(metrics),
-            ..
         } => metrics,
         response => panic!("Metrics request failed: {response:?}"),
     };
     // Should have processed all 101 requests (100 pings + 1 metrics)
-    assert!(
-        metrics.requests_total >= 101,
-        "Metrics should accurately count concurrent requests: got {}",
-        metrics.requests_total
-    );
+    assert_eq!(metrics.requests_total - baseline.requests_total, 101);
+    assert_eq!(metrics.requests_failed, baseline.requests_failed);
 
     Ok(())
 }
@@ -363,6 +357,13 @@ async fn test_no_race_in_metrics_updates() -> Result<()> {
 #[serial]
 async fn test_shared_state_thread_safety() -> Result<()> {
     let fixture = ConcurrencyTestFixture::new()?;
+    let baseline = match fixture.send_request(Request::Metrics { id: 1000 }).await {
+        Response::Success {
+            id: 1000,
+            result: ResponseResult::Metrics(metrics),
+        } => metrics,
+        other => panic!("baseline metrics returned {other:?}"),
+    };
 
     // Mix of different request types accessing shared state
     let mut handles = vec![];
@@ -411,22 +412,54 @@ async fn test_shared_state_thread_safety() -> Result<()> {
         handles.push(handle);
     }
 
-    // All five request types are infallible for these inputs and the fresh
-    // state's rate-limit budget (burst 200) covers all 50 requests, so every
-    // response must be a Success carrying its request's id. The previous
-    // `matches!(Success | Error)` accepted literally every possible response
-    // and proved nothing.
-    let mut successes = 0;
-    for handle in handles {
+    // Handles retain request order even when tasks finish out of order.
+    // Verify each of the four operation types, not just a success envelope.
+    assert_eq!(handles.len(), 50);
+    for (expected_id, handle) in handles.into_iter().enumerate() {
         let response = handle.await?;
-        match &response {
-            Response::Success { .. } => successes += 1,
-            Response::Error { id, code, message } => {
-                panic!("request {id} failed under mixed concurrency: code={code} message={message}")
+        let expected_id = expected_id as u64;
+        if (20..40).contains(&expected_id) {
+            common::assert_empty_daemon_status(response, expected_id);
+            continue;
+        }
+        match response {
+            Response::Success { id, result } => {
+                assert_eq!(id, expected_id);
+                match (expected_id, result) {
+                    (0..=19, ResponseResult::Search(result)) => {
+                        assert!(result.packages.is_empty());
+                        assert_eq!(result.total, 0);
+                    }
+                    (40..=44, ResponseResult::Message(message)) => {
+                        assert_eq!(message, "cleared");
+                    }
+                    (45..=49, ResponseResult::Metrics(metrics)) => {
+                        assert!(
+                            (1..=50).contains(&(metrics.requests_total - baseline.requests_total))
+                        );
+                        assert_eq!(metrics.requests_failed, baseline.requests_failed);
+                        assert_eq!(metrics.rate_limit_hits, baseline.rate_limit_hits);
+                    }
+                    (_, other) => panic!("mixed request {expected_id} returned {other:?}"),
+                }
+            }
+            other @ Response::Error { .. } => {
+                panic!("mixed request {expected_id} returned {other:?}")
             }
         }
     }
-    assert_eq!(successes, 50, "all mixed-workload requests must succeed");
+
+    match fixture.send_request(Request::Metrics { id: 1001 }).await {
+        Response::Success {
+            id: 1001,
+            result: ResponseResult::Metrics(metrics),
+        } => {
+            assert_eq!(metrics.requests_total - baseline.requests_total, 51);
+            assert_eq!(metrics.requests_failed, baseline.requests_failed);
+            assert_eq!(metrics.rate_limit_hits, baseline.rate_limit_hits);
+        }
+        other => panic!("final mixed-workload metrics returned {other:?}"),
+    }
 
     Ok(())
 }
