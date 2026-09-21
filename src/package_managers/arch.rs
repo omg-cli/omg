@@ -94,6 +94,20 @@ async fn after_privileged_alpm_write() -> AnyhowResult<()> {
 }
 
 impl PackageManager for ArchPackageManager {
+    fn security_inventory(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = AnyhowResult<Vec<crate::package_managers::types::SecurityPackage>>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            tokio::task::spawn_blocking(super::alpm_direct::security_inventory).await?
+        })
+    }
+
     fn name(&self) -> &'static str {
         "pacman"
     }

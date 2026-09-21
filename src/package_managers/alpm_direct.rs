@@ -227,6 +227,36 @@ pub fn get_package_info(name: &str) -> Result<Option<PackageInfo>> {
     })
 }
 
+/// Preserve native ALPM identities and license metadata for security exports.
+pub fn security_inventory() -> Result<Vec<crate::package_managers::types::SecurityPackage>> {
+    with_handle(|handle| {
+        handle
+            .localdb()
+            .pkgs()
+            .iter()
+            .map(|package| {
+                let name = package.name().to_owned();
+                let version = package.version().to_string();
+                let architecture = package
+                    .arch()
+                    .context("Installed ALPM package lacks architecture")?
+                    .to_owned();
+                anyhow::ensure!(
+                    !name.is_empty() && !version.is_empty() && !architecture.is_empty(),
+                    "Incomplete installed ALPM identity"
+                );
+                Ok(crate::package_managers::types::SecurityPackage {
+                    name,
+                    version,
+                    architecture: Some(architecture),
+                    description: package.desc().unwrap_or("").to_owned(),
+                    licenses: package.licenses().into_iter().map(str::to_owned).collect(),
+                })
+            })
+            .collect()
+    })
+}
+
 /// List all installed packages - INSTANT
 pub fn list_installed_fast() -> Result<Vec<LocalPackage>> {
     with_handle(|handle| {
@@ -438,6 +468,55 @@ pub fn list_all_package_names() -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_inventory_matches_native_pacman_identities() {
+        let output = crate::core::privilege::system_command("pacman")
+            .unwrap()
+            .env("LC_ALL", "C")
+            .arg("-Qi")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reference = String::from_utf8(output.stdout).unwrap();
+        let mut expected: Vec<_> = reference
+            .split("\n\n")
+            .filter(|paragraph| !paragraph.trim().is_empty())
+            .map(|paragraph| {
+                let field = |name| {
+                    paragraph
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find_map(|(key, value)| (key.trim() == name).then(|| value.trim()))
+                        .unwrap_or_else(|| panic!("pacman record lacks {name}"))
+                };
+                (
+                    field("Name").to_owned(),
+                    field("Version").to_owned(),
+                    field("Architecture").to_owned(),
+                )
+            })
+            .collect();
+        let mut actual: Vec<_> = security_inventory()
+            .unwrap()
+            .into_iter()
+            .map(|package| (package.name, package.version, package.architecture.unwrap()))
+            .collect();
+        expected.sort();
+        actual.sort();
+        assert!(
+            !expected.is_empty(),
+            "native pacman fixture must contain installed packages"
+        );
+        assert_eq!(
+            actual, expected,
+            "security inventory changed native package identities"
+        );
+    }
 
     /// The libalpm-backed queries read the real system database; skip them in
     /// environments without an installed pacman local db (CI containers).

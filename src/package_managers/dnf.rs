@@ -1275,6 +1275,37 @@ impl DnfPackageManager {
 }
 
 impl PackageManager for DnfPackageManager {
+    fn security_inventory(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::SecurityPackage>>> + Send + '_>> {
+        Box::pin(async {
+            let mut command =
+                tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+            // Query every installed version and architecture, even excluded
+            // packages. Installed inventory needs no repository metadata.
+            command.args([
+                "--cacheonly",
+                "--disable-repo=*",
+                "--setopt=disable_excludes=*",
+                "repoquery",
+                "--installed",
+                "--queryformat",
+                "%{name}\t%{arch}\t%{epoch}:%{version}-%{release}\t%{repoid}\\n",
+            ]);
+            let output = Self::query_output(command).await?;
+            Ok(Self::parse_versioned_packages(&output)?
+                .into_iter()
+                .map(|package| super::types::SecurityPackage {
+                    name: package.name,
+                    version: package.version,
+                    architecture: Some(package.architecture),
+                    description: String::new(),
+                    licenses: Vec::new(),
+                })
+                .collect())
+        })
+    }
+
     fn security_audit(
         &self,
     ) -> Option<
@@ -1558,6 +1589,48 @@ fn reject_unsealed_local_rpm_targets(packages: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn security_inventory_preserves_every_native_rpm_identity() {
+        let mut reference =
+            tokio::process::Command::from(crate::core::privilege::system_command("rpm").unwrap());
+        reference.args([
+            "-qa",
+            "--qf",
+            "%{NAME}\t%{ARCH}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\\n",
+        ]);
+        let bytes = DnfPackageManager::query_output(reference).await.unwrap();
+        // RPM stores imported keys as architecture-less synthetic gpg-pubkey
+        // headers. DNF excludes these trust records from software inventory.
+        let mut expected: Vec<_> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("gpg-pubkey\t(none)\t"))
+            .map(str::to_owned)
+            .collect();
+        let packages = DnfPackageManager::new().security_inventory().await.unwrap();
+        let mut actual: Vec<_> = packages
+            .into_iter()
+            .map(|package| {
+                format!(
+                    "{}\t{}\t{}",
+                    package.name,
+                    package.architecture.unwrap(),
+                    package.version
+                )
+            })
+            .collect();
+        expected.sort();
+        actual.sort();
+        assert!(
+            !expected.is_empty(),
+            "native RPM fixture must contain installed packages"
+        );
+        assert_eq!(
+            actual, expected,
+            "security inventory lost or changed native identities"
+        );
+    }
 
     #[tokio::test]
     async fn native_advisory_command_refuses_unavailable_repository() {

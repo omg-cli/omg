@@ -1757,6 +1757,193 @@ fn parse_status_paragraph(paragraph: &str) -> Option<(String, String, String, St
     }
 }
 
+/// Security exports read every installed stanza without a name-only cache or
+/// silently dropping incomplete identities.
+pub fn security_inventory() -> Result<Vec<crate::package_managers::types::SecurityPackage>> {
+    parse_security_inventory(&fs::read_to_string("/var/lib/dpkg/status")?)
+}
+
+fn parse_security_inventory(
+    contents: &str,
+) -> Result<Vec<crate::package_managers::types::SecurityPackage>> {
+    let mut packages = Vec::new();
+    let mut identities = std::collections::BTreeSet::new();
+    for paragraph in status_paragraphs(contents) {
+        if paragraph.trim().is_empty() {
+            continue;
+        }
+        let mut statuses = paragraph
+            .lines()
+            .filter_map(|line| line.strip_prefix("Status:"));
+        let status = statuses.next().context("dpkg entry lacks Status")?;
+        anyhow::ensure!(
+            statuses.next().is_none(),
+            "dpkg entry has duplicate Status fields"
+        );
+        let fields: Vec<_> = status.split_whitespace().collect();
+        anyhow::ensure!(
+            fields.len() == 3
+                && matches!(
+                    fields[0],
+                    "install" | "hold" | "deinstall" | "purge" | "unknown"
+                )
+                && fields[1] == "ok",
+            "Invalid or broken dpkg package status: {status}"
+        );
+        if matches!(fields[2], "not-installed" | "config-files") {
+            continue;
+        }
+        anyhow::ensure!(
+            fields[2] == "installed",
+            "Incomplete dpkg package state: {status}"
+        );
+        let (name, version, description, architecture) = parse_status_paragraph(paragraph)
+            .context("Installed dpkg entry lacks a package name")?;
+        anyhow::ensure!(
+            !version.is_empty() && !architecture.is_empty(),
+            "Installed dpkg entry '{name}' lacks version or architecture"
+        );
+        anyhow::ensure!(
+            identities.insert((name.clone(), architecture.clone())),
+            "Duplicate installed dpkg identity: {name}:{architecture}"
+        );
+        packages.push(crate::package_managers::types::SecurityPackage {
+            name,
+            version,
+            description,
+            architecture: Some(architecture),
+            licenses: Vec::new(),
+        });
+    }
+    Ok(packages)
+}
+
+#[cfg(test)]
+mod security_inventory_tests {
+    use super::parse_security_inventory;
+
+    #[test]
+    fn security_inventory_matches_native_dpkg_identities() {
+        let output = crate::core::privilege::system_command("dpkg-query")
+            .unwrap()
+            .args([
+                "--show",
+                "--showformat=${Package}\t${Architecture}\t${Version}\t${db:Status-Status}\n",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reference = String::from_utf8(output.stdout).unwrap();
+        let mut expected: Vec<_> = reference
+            .lines()
+            .filter_map(|line| {
+                let (identity, state) = line.rsplit_once('\t').expect("dpkg query row lacks state");
+                (state == "installed").then(|| identity.to_owned())
+            })
+            .collect();
+        let mut actual: Vec<_> = super::security_inventory()
+            .unwrap()
+            .into_iter()
+            .map(|package| {
+                format!(
+                    "{}\t{}\t{}",
+                    package.name,
+                    package.architecture.unwrap(),
+                    package.version
+                )
+            })
+            .collect();
+        expected.sort();
+        actual.sort();
+        assert!(
+            !expected.is_empty(),
+            "native dpkg fixture must contain installed packages"
+        );
+        assert_eq!(
+            actual, expected,
+            "security inventory changed native package identities"
+        );
+    }
+
+    #[test]
+    fn security_inventory_rejects_ambiguous_or_incomplete_package_states() {
+        let entry =
+            "Package: fixture\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n";
+        assert!(
+            parse_security_inventory(&entry.replace("Status: install ok installed\n", "")).is_err()
+        );
+        for status in [
+            "install ok unpacked",
+            "install ok half-installed",
+            "install ok half-configured",
+            "install ok triggers-awaited",
+            "install ok triggers-pending",
+            "install reinstreq installed",
+            "invalid ok installed",
+            "install ok invented",
+        ] {
+            assert!(
+                parse_security_inventory(&entry.replace("install ok installed", status)).is_err(),
+                "{status}"
+            );
+        }
+        assert!(
+            parse_security_inventory(&entry.replace(
+                "Status: install ok installed",
+                "Status: install ok installed\nStatus: deinstall ok config-files"
+            ))
+            .is_err()
+        );
+        for selection in ["install", "hold", "deinstall", "purge", "unknown"] {
+            assert_eq!(
+                parse_security_inventory(
+                    &entry.replace("install ok installed", &format!("{selection} ok installed"))
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn security_inventory_preserves_multiarch_epochs_and_refuses_partial_entries() {
+        let first = "Package: libfixture\nStatus: install ok installed\nVersion: 2:1.0~rc1-3\nArchitecture: amd64\nDescription: first\n";
+        let second = first.replace("amd64", "i386");
+        let fixture = format!("{first}\n{second}");
+        let packages = parse_security_inventory(&fixture).unwrap();
+        assert_eq!(packages.len(), 2);
+        assert_eq!(
+            parse_security_inventory(&format!("{fixture}\n\n"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(parse_security_inventory("\n\n").unwrap().is_empty());
+        assert_eq!(packages[0].version, "2:1.0~rc1-3");
+        assert_eq!(packages[1].architecture.as_deref(), Some("i386"));
+        for missing in [
+            "Package: libfixture\n",
+            "Version: 2:1.0~rc1-3\n",
+            "Architecture: amd64\n",
+        ] {
+            assert!(parse_security_inventory(&first.replace(missing, "")).is_err());
+        }
+        assert!(parse_security_inventory(&format!("{first}\n{first}")).is_err());
+        assert!(
+            parse_security_inventory(
+                &first.replace("install ok installed", "deinstall ok config-files")
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+}
+
 pub fn list_installed_fast() -> Result<Vec<DpkgPackageEntry>> {
     if crate::core::paths::test_mode() {
         return Ok(vec![DpkgPackageEntry {
