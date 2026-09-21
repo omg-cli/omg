@@ -174,3 +174,15 @@ is the next primary source: https://dnf5.readthedocs.io/en/stable/commands/advis
 The pagination page-budget branch is now explicitly exercised:100 unique
 continuations must fail, then a fresh complete scan succeeds without partial
 cache reuse.
+
+TUI parity follow-through: `App::run_security_audit` now uses the same optional-
+daemon scan helper as CLI audit commands. A Fedora regression first failed
+because the old path required an Arch/Debian backend. It now passes on all four
+Linux test builds with the daemon disabled, proving empty-inventory success,
+corrupt-inventory refusal, repaired-state recovery and checked fixture cleanup.
+This does not certify populated native Fedora scans.
+
+One production legacy caller remains: `server.rs` background status refresh
+still calls `VulnerabilityScanner::scan_system`. Consolidation must verify cache
+publication and concurrent background/on-demand fetching; replacing it without
+those checks could introduce duplicate requests or stale status claims.

@@ -112,7 +112,8 @@ impl LocalCommandRunner for AuditCommands {
 }
 
 /// Prefer the warm daemon, but keep scanning available without it.
-async fn security_audit_result() -> Result<crate::core::security::scan::SecurityAuditResult> {
+pub(super) async fn security_audit_result()
+-> Result<crate::core::security::scan::SecurityAuditResult> {
     #[cfg(unix)]
     if let Ok(mut client) = DaemonClient::connect().await {
         return client
