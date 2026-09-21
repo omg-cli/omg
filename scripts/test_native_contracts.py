@@ -148,7 +148,7 @@ class NativeReceipts(unittest.TestCase):
         manifest = json.loads((root / 'tests/contracts/manifest.json').read_text())
         mapped = [contract for contract in manifest['contracts']
                   if any(binding['lane'] == 'native-daemon-fixture' for binding in contract['tests'])]
-        self.assertEqual(len(mapped), 14)
+        self.assertEqual(len(mapped), 15)
         selected = set()
         for contract in mapped:
             self.assertEqual(contract['binary'], 'omgd')
@@ -162,6 +162,9 @@ class NativeReceipts(unittest.TestCase):
                 self.assertTrue(promised <= set(binding['assertions']))
                 selected.add(binding['id'])
         self.assertEqual(selected, NATIVE.DAEMON_TESTS)
+        health = next(c for c in mapped if c['id'] == 'omgd.health-live-process.server-fixture')
+        policy = json.loads((root / 'tests/contracts/platforms.json').read_text())
+        self.assertEqual(set(health['platforms']), {o['id'] for o in policy['owners'] if o['os'] == 'linux'})
 
     def test_reviewed_ping_requires_all_contracts_before_surface_credit(self):
         root = Path(__file__).resolve().parents[1]

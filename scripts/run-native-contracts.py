@@ -47,6 +47,7 @@ BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
 
 
 DAEMON_TESTS = frozenset('omg::coverage_18::' + name for name in (
+    'health_reports_live_uptime_rss_and_worker_state_without_mutating_packages',
     'concurrent_pings_preserve_boundary_ids_and_backend_state',
     'incomplete_frames_disconnect_without_breaking_a_fresh_client',
     'rate_limited_burst_rejects_with_exact_envelope_and_keeps_connection_open',

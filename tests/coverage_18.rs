@@ -1040,3 +1040,97 @@ async fn concurrent_pings_preserve_boundary_ids_and_backend_state() -> Result<()
     assert_eq!(std::fs::read(&state_path)?, before);
     fixture.shutdown().await
 }
+
+#[tokio::test]
+#[serial]
+#[cfg(target_os = "linux")]
+async fn health_reports_live_uptime_rss_and_worker_state_without_mutating_packages() -> Result<()> {
+    let before_start = Instant::now();
+    let fixture = RealServerFixture::new().await?;
+    let after_start = Instant::now();
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_pacman.json");
+    let before = std::fs::read(&state_path)?;
+    // Elapsed time is part of this contract: a constant zero uptime must fail.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut resident_pages = None;
+    let mut baseline_rss = 0;
+    let mut peak_rss = 0;
+    let mut baseline_uptime = 0;
+    for id in [0, u64::MAX] {
+        if id != 0 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let minimum_uptime = after_start.elapsed().as_secs();
+        let response = request_on_wire(&fixture, Request::Health { id }).await?;
+        let maximum_uptime = before_start.elapsed().as_secs();
+        match response {
+            Response::Success {
+                id: response_id,
+                result: ResponseResult::Health(health),
+            } => {
+                assert_eq!(response_id, id);
+                assert_eq!(health.status, "healthy");
+                assert!(
+                    (minimum_uptime..=maximum_uptime).contains(&health.uptime_seconds),
+                    "uptime {} outside independently measured {minimum_uptime}..={maximum_uptime}",
+                    health.uptime_seconds
+                );
+                // VmRSS is approximate and can change while the process runs.
+                // A loaded Rust test process must nevertheless have resident memory.
+                assert!(
+                    health.memory_usage_mb > 0,
+                    "Linux Health reported no resident memory"
+                );
+                assert_eq!(health.background_worker_failures, 0);
+                assert!(
+                    health.active_connections >= 1,
+                    "the health connection must be active"
+                );
+                if id == 0 {
+                    baseline_uptime = health.uptime_seconds;
+                    baseline_rss = health.memory_usage_mb;
+                    let mut mapping = memmap2::MmapMut::map_anon(64 * 1024 * 1024)?;
+                    mapping.fill(0x5a);
+                    std::hint::black_box(&mapping);
+                    resident_pages = Some(mapping);
+                } else {
+                    assert!(
+                        health.uptime_seconds > baseline_uptime,
+                        "uptime did not advance"
+                    );
+                    peak_rss = health.memory_usage_mb;
+                    assert!(
+                        peak_rss >= baseline_rss + 32,
+                        "resident memory did not reflect 64 MiB touched mapping: {baseline_rss} -> {peak_rss}"
+                    );
+                }
+            }
+            other => panic!("health returned {other:?}"),
+        }
+    }
+    drop(resident_pages);
+    match request_on_wire(&fixture, Request::Health { id: 813 }).await? {
+        Response::Success {
+            id: 813,
+            result: ResponseResult::Health(health),
+        } => {
+            assert!(
+                health.memory_usage_mb + 32 <= peak_rss,
+                "resident memory did not fall after unmapping: {peak_rss} -> {}",
+                health.memory_usage_mb
+            );
+        }
+        other => panic!("post-unmap health returned {other:?}"),
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 812 }).await?,
+        812,
+    );
+    assert_eq!(std::fs::read(&state_path)?, before);
+    fixture.shutdown().await
+}

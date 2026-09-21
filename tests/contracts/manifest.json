@@ -2688,6 +2688,56 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omgd.health-live-process.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Health",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "healthy-status-and-boundary-request-ids",
+          "uptime-within-independent-monotonic-start-bracket",
+          "rss-rises-and-falls-with-touched-64-mib-anonymous-mapping",
+          "zero-worker-failures-and-active-health-connection"
+        ],
+        "state": [
+          "package-state-bytes-preserved-and-follow-up-pong"
+        ]
+      },
+      "scope": "Linux production server::run over real Unix IPC in an isolated healthy fixture; controlled resident-memory mapping and checked SIGTERM drain/cleanup; not native package transactions, degraded/unhealthy transitions, exact approximate-cache statistics, missing procfs or standalone process health",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::health_reports_live_uptime_rss_and_worker_state_without_mutating_packages",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "healthy-status-and-boundary-request-ids",
+            "uptime-within-independent-monotonic-start-bracket",
+            "rss-rises-and-falls-with-touched-64-mib-anonymous-mapping",
+            "zero-worker-failures-and-active-health-connection",
+            "package-state-bytes-preserved-and-follow-up-pong",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used eighty-two searches (277 requested result slots),
+Exa research used eighty-three searches (278 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -847,3 +847,19 @@ Ping is the first explicit per-surface review in
 contracts replace its provisional blanket gap: exact concurrent responses/state,
 interrupted-request recovery, and rate-limit envelopes/recovery. Partial evidence
 still earns no surface credit, and global inventory review remains incomplete.
+
+### Linux Health process observations
+
+The production-wire healthy-state test brackets daemon construction with
+independent monotonic timestamps, requires advancing uptime across separated
+observations, and verifies boundary response IDs, zero worker failures, an active
+health connection and unchanged backend bytes. It also touches a 64 MiB anonymous
+mapping and requires resident memory to rise, then fall after unmapping, by at
+least 32 MiB. This catches a constant nonzero memory report without pretending
+that [procfs VmRSS](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html)
+is an exact snapshot. Constant-uptime and constant-RSS source mutations both
+failed the owning test; source restoration precedes final verification.
+
+This contract belongs only to Linux owners. It does not certify degraded or
+unhealthy transitions, worker-failure reporting, unavailable procfs, exact cache
+statistics or standalone OMGD process behavior. Health's broader gap stays open.
