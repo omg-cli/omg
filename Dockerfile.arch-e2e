@@ -42,6 +42,8 @@ RUN cargo chef prepare --recipe-path /tmp/omg-recipe.json
 
 FROM toolchain AS builder
 COPY --from=planner /tmp/omg-recipe.json /tmp/omg-recipe.json
+# cargo-chef omits optional path patches from its manifest skeleton.
+COPY vendor/ vendor/
 # Ordinary image layers (not cache mounts) are exported by the GHA cache.
 # Keep toolchain, path, profile and default Arch features identical to the build.
 RUN cargo chef cook --release --locked -j 2 --recipe-path /tmp/omg-recipe.json
