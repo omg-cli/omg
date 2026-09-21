@@ -249,7 +249,7 @@ impl SbomGenerator {
     /// Export SBOM to default location
     pub fn export_default(&self, sbom: &Sbom) -> Result<std::path::PathBuf, SbomError> {
         let sbom_dir = paths::data_dir().join("sbom");
-        std::fs::create_dir_all(&sbom_dir).map_err(|source| SbomError::CreateDir {
+        paths::create_private_data_directory(&sbom_dir).map_err(|source| SbomError::CreateDir {
             path: sbom_dir.display().to_string(),
             source,
         })?;

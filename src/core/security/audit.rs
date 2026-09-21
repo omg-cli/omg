@@ -257,7 +257,7 @@ impl AuditLogger {
                 "audit log path must have a parent directory",
             ),
         })?;
-        std::fs::create_dir_all(log_dir).map_err(|source| AuditError::CreateDir {
+        paths::create_private_data_directory(log_dir).map_err(|source| AuditError::CreateDir {
             path: log_dir.display().to_string(),
             source,
         })?;
@@ -964,6 +964,19 @@ pub fn audit_log_nonblocking(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn fresh_audit_store_creates_private_data_ancestors() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        let data = root.path().join("data");
+        let store = data.join("audit");
+        let _logger = super::AuditLogger::new_in(store.join("audit.jsonl"))?;
+        for path in [&data, &store] {
+            assert_eq!(std::fs::metadata(path)?.permissions().mode() & 0o777, 0o700);
+        }
+        Ok(())
+    }
     use super::*;
 
     #[cfg(target_os = "linux")]
@@ -1862,7 +1875,7 @@ pub fn record_operation(operation: &str, targets: &[String], outcome: &str) -> a
     let mut logger = if crate::core::privilege::is_root() {
         use std::os::unix::fs::MetadataExt;
         let directory = Path::new("/var/log/omg");
-        std::fs::create_dir_all(directory)?;
+        paths::create_private_data_directory(directory)?;
         for path in directory.ancestors() {
             let metadata = std::fs::symlink_metadata(path)?;
             anyhow::ensure!(
@@ -1911,7 +1924,7 @@ fn mark_audit_incomplete() {
 
 fn mark_audit_incomplete_at(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        paths::create_private_data_directory(parent)?;
     }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
