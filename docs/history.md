@@ -6,54 +6,136 @@ description: Inspect recorded transactions and understand recovery limits
 
 # History & Rollback
 
-**In plain words:** OMG can record what it changed on your computer. This page explains what the record contains, how to read it, and why a rollback is not the same as restoring a backup.
+**In plain words:** OMG can record what it changed on your computer. This page explains what
+the record contains, how to read it, and why a rollback is not the same as restoring a backup.
 
 > New to the terminal? Read [Getting started](./getting-started.md) and keep
 > [the glossary](./glossary.md) open while you work.
 
-History records supported OMG operations. It is not a complete audit of all native package-manager activity, a filesystem backup, or proof of who performed an operation.
+History records supported OMG operations. It is not a complete audit of all native
+package-manager activity, a filesystem backup, or proof of who performed an operation.
 
-## View records
+## What one record contains
 
-```bash
-omg history
-omg history --limit 5
-omg history --search firefox
-omg history --help
+`history.json` holds completed transactions. Each entry says what changed, when, and whether
+it succeeded:
+
+```json
+{
+  "id": "0a1b2c3d…",
+  "timestamp": 1762900000,
+  "transaction_type": "update",
+  "success": true,
+  "changes": [
+    { "name": "ripgrep", "old_version": "14.1.0", "new_version": "14.1.1", "source": "extra" }
+  ]
+}
 ```
 
-The usual path is `~/.local/share/omg/history.json`, resolved from the configured data location. Recording can be disabled or directed elsewhere by the caller. Missing records do not prove that no package change occurred. Preserve failure status when interpreting records; a failed action is not a committed installation.
+- `transaction_type` is one of `install`, `remove`, `update`, or `sync`.
+- `old_version` and `new_version` are optional: an install has no previous version, and a
+  removal has no new one. The pair is what makes a rollback possible.
+- `source` is the repository a package came from. Sources that need their own install path
+  (`aur`, `local`) are treated differently from official repositories, because the system
+  package manager cannot restore them on its own.
+- `success: false` records an attempt that failed. A failed action is **not** a committed
+  installation; check native package state before retrying.
 
-`src/core/history.rs` limits the live history to 1,000 transactions and archives retired records. Back up the associated archive as well as the live file using the paths resolved by the implementation. Stop writers before an approved backup and keep it private. Do not assume copying only `history.json` preserves every record.
+## Read and filter the record
 
-## Recording failures
+```bash
+omg history                        # most recent transactions first
+omg history --limit 5              # just the last five
+omg history --type update          # install | remove | update | sync
+omg history --search ripgrep       # transactions that touched one package
+omg history --from 2026-09-01 --to 2026-09-21
+omg history --help                 # the exact flags for your build
+```
 
-Package execution and persistence are different operations. A package transaction can succeed while history persistence fails; an error must not be read as proof that the package manager changed nothing. Inspect native package state before retrying.
+The usual path is `~/.local/share/omg/history.json`, resolved from the configured data
+location. Recording can be disabled or redirected by the caller, so a missing record does not
+prove that no package change occurred.
 
-Fedora records match DNF transactions through a unique comment and retain native versions. This does not backfill earlier native history, establish a human actor, or guarantee recovery from a partial RPM failure. See [Fedora implementation notes](../FEDORA-ENGINE.md).
+## How the file is maintained
+
+- **Bounded live file.** The live file is capped at 1,000 entries
+  (`MAX_HISTORY_TRANSACTIONS`). Retired entries move to a sibling JSONL archive rather than
+  being dropped, so older transactions remain readable.
+- **Atomic writes.** The live file is replaced through a temporary file and a rename, so a
+  reader never sees a half-written file.
+- **Cross-process locking.** A sibling lock coordinates readers and writers, so two OMG
+  processes cannot interleave a rewrite.
+
+```bash
+# Back up the live log and its archive together, or only recent history survives.
+ls -l ~/.local/share/omg/history.json ~/.local/share/omg/history.json.archive.jsonl
+```
+
+**Limit:** copying only `history.json` does not preserve every record. Stop writers before an
+approved backup, keep the copy private — it lists installed software — and treat the archive
+as part of the same record.
+
+
+## Recording failures are separate from package failures
+
+Execution and persistence are different operations. A package transaction can succeed while
+history persistence fails; that error must not be read as proof that nothing changed. Inspect
+native package state, then decide whether to re-record.
+
+Fedora records match DNF transactions through a unique comment and retain native versions.
+This does not backfill earlier native history, establish a human actor, or guarantee recovery
+from a partial RPM failure. See [Fedora implementation notes](../FEDORA-ENGINE.md).
 
 ## Rollback
 
 ```bash
-omg rollback --help
+omg history                     # find the transaction id you want to return to
+omg rollback 0a1b2c3d           # asks for confirmation
+omg rollback 0a1b2c3d --yes     # non-interactive; do not add this to a diagnostic script
 ```
 
-Review the transaction and backend requirements before running `omg rollback TRANSACTION_ID`. Rollback changes package state. It depends on retained old versions, current dependencies, and supported backend operations; it is not a guaranteed inverse of install, remove, or update. AUR rebuilds and arbitrary native package operations are not covered by a universal rollback promise.
+Rollback reinstalls the earlier recorded versions. It works only when all of these hold:
 
-Retain native recovery tools and a tested machine/VM backup for major upgrades. A package downgrade does not restore application data, configuration migrations, running processes, or external services. Do not automatically confirm rollback in a diagnostic script.
+1. The backend supports that operation for those packages.
+2. The earlier versions are still available — from the package cache or the repository.
+3. The current dependency set still accepts them.
 
-## Corruption and recovery
+**Limit:** rollback is not a guaranteed inverse of install, remove, or update. AUR rebuilds
+and arbitrary native package operations are not covered by a universal rollback promise, and
+`omg clean --all` can remove exactly the cached artifacts a rollback would need. `omg clean`
+consults history so versions referenced by a **recent** transaction survive, but that window
+is finite.
 
-Preserve malformed history and the exact error. Read-only diagnostics must not rewrite or quarantine evidence. Normal transaction-recording recovery is a separate path and may preserve a corrupt file before recording new data; it does not authorize manually replacing history with an empty array.
+```bash
+omg clean --cache --dry-run     # review what cleanup would remove before running it
+```
 
-Do not edit audit hashes, reset audit logs, or remove archived history to make checks pass. Local audit-chain verification checks consistency, not authenticity or completeness. See [security](./security.md) and [troubleshooting](./troubleshooting.md).
-
-## Before an upgrade
+Before a major upgrade, in order:
 
 1. Inspect current package state and recent records.
 2. Verify recoverable backups and retained package artifacts.
-3. Review the update preview and backend-specific warnings.
+3. Review the update preview and any backend-specific warnings.
 4. Perform the approved transaction separately from diagnostics.
-5. Check native package state and history afterward, including persistence errors.
+5. Check native package state and history afterwards, including persistence errors.
 
-See [packages](./packages.md), [configuration](./configuration.md), and [CLI reference](./cli.md).
+**Limit:** a package downgrade does not restore application data, configuration migrations,
+running processes, or external services. Keep native recovery tools and a tested machine or VM
+backup for anything that matters.
+
+## Corruption and recovery
+
+Preserve malformed history and the exact error. Read-only diagnostics must not rewrite or
+quarantine evidence. Normal recovery after a corrupt file may preserve a copy before recording
+new data, but that path never authorizes replacing history with an empty array, and missing
+history does not prove that no transaction occurred.
+
+Do not edit audit hashes, reset audit logs, or delete archived history to make a check pass:
+local chain verification checks consistency, not authenticity or completeness. See
+[security](./security.md) and [troubleshooting](./troubleshooting.md).
+
+## Where to go next
+
+- [Under the hood](./under-the-hood.md) for this schema alongside caches and the audit chain.
+- [Package management](./packages.md) for the operations that get recorded.
+- [Configuration](./configuration.md) for where data paths are resolved from.
+- [CLI reference](./cli.md) for every `omg history` and `omg rollback` option.

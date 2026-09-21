@@ -17,6 +17,26 @@ omg dash
 
 The dashboard presents available package, runtime, security, activity, and team data. Availability depends on the backend, daemon, and configured services. An empty or unavailable view is not evidence of zero vulnerabilities or a compliant fleet.
 
+## What each view is for
+
+```bash
+omg dash     # opens the dashboard; the alias `omg d` is the same command
+```
+
+The six views are switched with `1` to `6` or `Tab`:
+
+| Key | View | Shows |
+| :--- | :--- | :--- |
+| `1` | Dashboard | Package counts, security summary, and system overview |
+| `2` | Packages | Search results, with selection and a confirmation step before anything changes |
+| `3` | Runtimes | Installed runtime versions and the one currently selected |
+| `4` | Security | Scan findings and the classification assigned to them |
+| `5` | Activity | Recorded transactions from the history log |
+| `6` | Team | Shared environment state when this machine is part of a team workspace |
+
+The keys are defined in `src/cli/tui/app.rs`, which is the source of truth if a release
+changes them.
+
 ## Navigation
 
 - `1` through `6`: Dashboard, Packages, Runtimes, Security, Activity, Team.
@@ -43,5 +63,25 @@ The current source uses ratatui 0.30 with its crossterm backend and crossterm 0.
 ## Troubleshooting
 
 Use a terminal with the expected capabilities and a UTF-8 locale. Do not force an incorrect `TERM` value. If an exited process leaves terminal settings broken, `reset` or `stty sane` can restore them.
+
+
+## Limits
+
+- **A view can be empty for several reasons.** The dashboard only renders what the backend,
+  the daemon, and any configured service actually return. An empty Security or Team view is
+  not evidence of a clean machine or a compliant fleet.
+- **The dashboard never decides for you.** Package actions ask for confirmation, and the same
+  policy, review, and privilege rules apply as on the command line. Nothing in the TUI
+  bypasses [policy](./security.md) or AUR review.
+- **Refresh is periodic, not live.** The loop re-checks after five seconds and a slow backend
+  can take longer, so treat displayed numbers as the most recent observation.
+- **Keys can change between releases.** `src/cli/tui/app.rs` in the release you installed is
+  the authority; the table above documents the current build.
+
+## Where to go next
+
+- [Getting started](./getting-started.md) if you have not used a terminal-based interface before.
+- [Status and health](./cli.md) for the equivalent non-interactive commands.
+- [Under the hood](./under-the-hood.md) for where the displayed data comes from.
 
 Record terminal name, dimensions, OMG version, backend, and the failing interaction. Redact account data from screenshots. Do not start another daemon, clear history, or delete sockets just because a view is unavailable. See [troubleshooting](./troubleshooting.md).

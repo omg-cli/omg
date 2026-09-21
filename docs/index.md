@@ -29,6 +29,13 @@ OMG is one program that installs and updates software for you, chooses language 
 - [Security evidence](./security.md) and [enterprise report limitations](./enterprise.md).
 - [Terminal dashboard](./tui.md), [history](./history.md), and [troubleshooting](./troubleshooting.md).
 
+## Go deeper
+
+Two tracks, depending on what you need:
+
+- **Reading and doing:** [Getting started](./getting-started.md), [quickstart](./quickstart.md), [cheat sheet](./cheatsheet.md), and the [glossary](./glossary.md) cover the everyday surface in plain language.
+- **Reasoning about behaviour:** [Under the hood](./under-the-hood.md) explains the two-process split, cache freshness, backend query paths, the AUR gates, lockfile contents, and the audit chain — the detail you want when a result is not what you expected. [Architecture](./architecture.md), [daemon](./daemon.md), [IPC](./ipc.md), and [cache](./cache.md) go one level further.
+
 ## Look up a command or setting
 
 - [CLI reference](./cli.md).
