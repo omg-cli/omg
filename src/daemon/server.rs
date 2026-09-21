@@ -904,6 +904,7 @@ mod tests {
             score: Some("9.8".into()),
             advisory_severity: None,
             native_advisory: None,
+            affected_installed: Vec::new(),
         };
         let response = Response::Success {
             id: 91,
@@ -989,6 +990,7 @@ mod tests {
                         score: Some("9.8".into()),
                         advisory_severity: None,
                         native_advisory: None,
+                        affected_installed: Vec::new(),
                     }],
                 )],
             }),

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Every frame is `[u32 LE version][bitcode payload]`. Peers reject frames
 /// whose version differs instead of attempting a decode that could
 /// silently mis-map same-shaped variants.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Frame layout error for [`encode_frame`] / [`split_frame`].
 #[derive(Debug, thiserror::Error)]
@@ -497,6 +497,11 @@ mod tests {
                 vulnerabilities: vec![(
                     "package".into(),
                     vec![Vulnerability {
+                        affected_installed: vec![crate::core::security::scan::InstalledIdentity {
+                            name: "package".into(),
+                            version: "0:1-1".into(),
+                            architecture: Some("x86_64".into()),
+                        }],
                         id: "FEDORA-fixture".into(),
                         summary: "Published severity without CVSS".into(),
                         score: None,
@@ -525,10 +530,10 @@ mod tests {
         );
 
         let mut old_frame = frame;
-        old_frame[..4].copy_from_slice(&2u32.to_le_bytes());
+        old_frame[..4].copy_from_slice(&3u32.to_le_bytes());
         assert!(matches!(
             split_frame(&old_frame),
-            Err(FrameError::VersionMismatch { peer: 2, ours: 3 })
+            Err(FrameError::VersionMismatch { peer: 3, ours: 4 })
         ));
     }
 

@@ -72,7 +72,7 @@ pub(super) struct AdvisoryReference {
 }
 
 /// Split only the structural NEVRA fields; DNF performs RPM ordering.
-fn package_identity(nevra: &str) -> Result<(&str, &str)> {
+pub(super) fn package_identity(nevra: &str) -> Result<(&str, &str)> {
     ensure!(
         !nevra.chars().any(|c| c.is_whitespace() || c.is_control()),
         "Invalid advisory NEVRA whitespace"
@@ -124,6 +124,7 @@ pub(super) fn audit_result(
             _ => AdvisorySeverity::Unspecified,
         };
         let finding = Vulnerability {
+            affected_installed: Vec::new(),
             id: row.name,
             summary: detail.title,
             score: None,

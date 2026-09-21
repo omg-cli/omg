@@ -191,7 +191,7 @@ async fn real_server_fetches_scores_and_rejects_failed_scans_before_recovery() -
                 let mut socket = BufReader::new(socket);
                 let body_value = http_request(&mut socket).await?;
                 assert_eq!(body_value["package"]["name"], expected_package);
-                assert_eq!(body_value["package"]["ecosystem"], "Arch Linux");
+                assert_eq!(body_value["package"]["ecosystem"], "Debian:12");
                 assert_eq!(body_value["version"], version);
                 assert_eq!(body_value.get("page_token").and_then(serde_json::Value::as_str), token);
                 socket.get_mut().write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await?;
@@ -256,6 +256,12 @@ async fn real_server_fetches_scores_and_rejects_failed_scans_before_recovery() -
                 assert_eq!(audit.vulnerabilities[0].0, package);
                 let findings = &audit.vulnerabilities[0].1;
                 assert_eq!(findings.len(), 3);
+                for finding in findings {
+                    assert_eq!(finding.affected_installed.len(), 1);
+                    assert_eq!(finding.affected_installed[0].name, package);
+                    assert_eq!(finding.affected_installed[0].version, "1.0.0");
+                    assert_eq!(finding.affected_installed[0].architecture, None);
+                }
                 assert_eq!(findings[0].id, "high");
                 assert_eq!(findings[0].summary, "vector");
                 assert_eq!(findings[0].score.as_deref(), Some("9.8"));
@@ -295,6 +301,15 @@ async fn real_server_fetches_scores_and_rejects_failed_scans_before_recovery() -
             assert_eq!(audit.vulnerabilities[0].0, package);
             assert_eq!(audit.vulnerabilities[0].1.len(), 1);
             assert_eq!(audit.vulnerabilities[0].1[0].id, "recovered");
+            assert_eq!(audit.vulnerabilities[0].1[0].affected_installed.len(), 1);
+            assert_eq!(
+                audit.vulnerabilities[0].1[0].affected_installed[0].name,
+                package
+            );
+            assert_eq!(
+                audit.vulnerabilities[0].1[0].affected_installed[0].version,
+                "2.0.0"
+            );
             assert_eq!(audit.vulnerabilities[0].1[0].score.as_deref(), Some("7"));
         }
         other => anyhow::bail!("expected recovered audit, got {other:?}"),
