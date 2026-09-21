@@ -160,7 +160,8 @@ class NativeBuildAdmission(unittest.TestCase):
                 self.assertEqual(wait.call_args.args[3:], ({'number': 440}, 60))
 
     def test_reuse_checks_live_attempt_and_writes_only_validated_files(self):
-        for mode in ('valid', 'in-progress', 'queued', 'changed-attempt', 'expired', 'older-attempt', 'missing'):
+        for mode in ('valid', 'in-progress', 'queued', 'queued-artifact', 'waiting-artifact',
+                     'changed-attempt', 'expired', 'older-attempt', 'missing'):
             expected, provenance, payload = fixture()
             data = bundle(provenance, payload)
             run = dict(id=123, run_attempt=1, repository={'full_name': 'omg-cli/omg'},
@@ -171,6 +172,8 @@ class NativeBuildAdmission(unittest.TestCase):
                 # Main CI's release job waits for QEMU; requiring workflow
                 # completion before admitting its early artifact would deadlock.
                 run.update(status='in_progress', conclusion=None)
+            if mode in ('queued-artifact', 'waiting-artifact'):
+                run.update(status=mode.split('-')[0], conclusion=None)
             artifact = dict(id=9, name='native-release-debian-1', size_in_bytes=len(data), expired=False,
                             created_at='2026-09-20T09:01:00Z', digest='sha256:' + hashlib.sha256(data).hexdigest())
             if mode == 'expired':
@@ -198,8 +201,9 @@ class NativeBuildAdmission(unittest.TestCase):
                                GITHUB_EVENT_NAME='pull_request')
                 event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
                 with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=data), \
-                        patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'):
-                    if mode in ('valid', 'in-progress', 'queued'):
+                        patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
+                        patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
+                    if mode in ('valid', 'in-progress', 'queued', 'queued-artifact', 'waiting-artifact'):
                         result = BUILD.reuse(root, 'debian', expected['image'], 'debian,pgp,license', destination, context, event)
                         self.assertEqual(result, provenance)
                         self.assertEqual({path.name for path in destination.iterdir()},

@@ -187,13 +187,18 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
         else:
             run = api_json(f'repos/{repository}/actions/runs/{selected_id}')
             validate_producer_run(run, expected_run)
-        if run and run.get('status') not in ('queued', 'requested', 'waiting', 'pending'):
+        # Aggregate scheduling status does not establish artifact availability.
+        # A started attempt may already have uploaded a native lane's output
+        # while another job is waiting. Keep timestamp and byte admission intact.
+        if run and run.get('run_started_at') is not None:
             attempt = run['run_attempt']
             listing = api_json(f'repos/{repository}/actions/runs/{selected_id}/artifacts?per_page=100')
             require(type(listing.get('total_count')) is int and listing['total_count'] <= 100,
                     'excessive producer artifact list')
             artifacts = [row for row in listing['artifacts']
                          if row.get('name') == f'native-release-{distro}-{attempt}']
+            print(f'Native artifact lookup: run={selected_id} attempt={attempt} '
+                  f'status={run.get("status")} distro={distro} matches={len(artifacts)}', flush=True)
             require(len(artifacts) <= 1, 'ambiguous native artifact')
             if artifacts:
                 artifact = artifacts[0]
