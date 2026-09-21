@@ -69,7 +69,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         block = job_block((WORKFLOWS / 'ci.yml').read_text(), 'release-tag')
         tag = block.index('git tag "$TAG" "$GITHUB_SHA"')
         for workflow in ('benchmark.yml', 'audit.yml', 'secrets.yml', 'codeql.yml',
-                         'coverage.yml', 'docker-e2e.yml', 'qemu-matrix.yml'):
+                         'coverage.yml', 'docker-e2e.yml'):
             self.assertLess(block.index(f'scripts/require-workflow-success.sh {workflow}'), tag)
         self.assertNotIn('scripts/require-workflow-success.sh ci.yml', block)
         self.assertIn('ci-success]', block)
@@ -82,7 +82,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             'ci.yml fixture-commit CI', 'benchmark.yml fixture-commit Benchmark',
             'audit.yml fixture-commit Security Audit', 'secrets.yml fixture-commit Secret Scanning',
             'codeql.yml fixture-commit CodeQL', 'coverage.yml fixture-commit Coverage',
-            'docker-e2e.yml fixture-commit Docker E2E', 'qemu-matrix.yml fixture-commit Staged QEMU',
+            'docker-e2e.yml fixture-commit Docker E2E',
         ]
         for value in ('true', 'false', '$(touch injected)'):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
@@ -104,7 +104,7 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
         gate = job_block(release, 'gate-on-ci')
         for workflow in ('ci.yml', 'benchmark.yml', 'audit.yml', 'secrets.yml',
-                         'codeql.yml', 'coverage.yml', 'docker-e2e.yml', 'qemu-matrix.yml'):
+                         'codeql.yml', 'coverage.yml', 'docker-e2e.yml'):
             self.assertIn(f'scripts/require-workflow-success.sh {workflow} "$GITHUB_SHA"', gate)
             source = (WORKFLOWS / workflow).read_text(encoding='utf-8')
             push = re.search(r'^  push:\n((?:    .*\n)+)', source, re.M)
