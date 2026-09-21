@@ -88,6 +88,24 @@ class ReportingBoundaryTests(unittest.TestCase):
                             {row["case_id"]}, diagnostics)
         self.assertEqual(diagnostics, {})
 
+    def test_lifecycle_failure_includes_later_stage_errors_after_guest_pass(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/results.json", json.dumps([row]))
+            archive.writestr("run-a/guest-check.log", "PASS: package lifecycle")
+            archive.writestr("run-a/transactions.log", "clone failed to become ready")
+            archive.writestr("run-a/health-validation.log", "SSH connection refused")
+            archive.writestr("run-b/transactions.log", "unrelated private output")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        excerpt = diagnostics[(row["case_id"], "arch")]
+        self.assertIn("clone failed to become ready", excerpt)
+        self.assertIn("SSH connection refused", excerpt)
+        self.assertIn("transactions.log", excerpt)
+        self.assertNotIn("unrelated private output", excerpt)
+        self.assertLessEqual(len(excerpt.encode("utf-8")), 1400)
+
     def test_transaction_receipts_do_not_poison_case_reporting(self):
         output = io.BytesIO()
         case = self.row("PASS")
