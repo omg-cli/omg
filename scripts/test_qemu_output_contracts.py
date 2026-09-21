@@ -196,6 +196,25 @@ class OutputContracts(unittest.TestCase):
                     self.assertIn('exit=17', logs['runtime-go-install.log'])
                     self.assertIn('failing-test', logs['runtime-go-install.log'])
 
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_go_install_gets_a_bounded_large_archive_budget(self):
+        rows = ['runtime-go-install\t["use","go","1.27.1"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        program = '#!/bin/sh\necho OMG_GO_RUNTIME_OK:go1.27.1\n'
+        compiler = (
+            '#!/bin/sh\ncase "$1" in\n'
+            'env) printf "%s\\ngo1.27.1\\n" "$GOROOT";;\n'
+            f'build) printf %s {shlex.quote(program)} > probe; chmod 755 probe;;\n'
+            'test) echo go-test-executed > test-complete; echo "--- PASS: TestProbe (0.00s)";;\n'
+            '*) exit 23;;\nesac\n'
+        )
+        product = self.runtime_usage_fixture('go')
+        product += 'sleep 2\nbase="$OMG_DATA_DIR/versions/go"\nmkdir -p "$base/1.27.1/bin"\n'
+        product += f'printf %s {shlex.quote(compiler)} > "$base/1.27.1/bin/go"\nchmod 755 "$base/1.27.1/bin/go"\n'
+        product += 'ln -s 1.27.1 "$base/current"\n'
+        result, evidence, logs = self.run_inventory(product, rows, row_timeout=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'PASS', logs)
+
     def generated_hooks(self):
         source = (ROOT / 'src/cli/git_hooks.rs').read_text(encoding='utf-8')
         return {name: (re.search(r'const ' + constant + r': &str = r#"(.*?)"#;', source, re.S).group(1), 0o755)
@@ -269,7 +288,7 @@ class OutputContracts(unittest.TestCase):
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
-    def run_inventory(self, product, rows, *, native_commands=None, distro='arch'):
+    def run_inventory(self, product, rows, *, native_commands=None, distro='arch', row_timeout=None):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -295,11 +314,14 @@ class OutputContracts(unittest.TestCase):
             env = dict(os.environ, HOME=shell_path(root / 'home'),
                        GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
                        PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
+            command = [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'),
+                       str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
+                       '--binary', shell_path(binary), '--tsv', str(inventory),
+                       '--distro', distro, '--tiers', 'hermetic', '--tag', 'fixture']
+            if row_timeout is not None:
+                command += ['--row-timeout', str(row_timeout)]
             result = subprocess.run(
-                [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'),
-                 str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
-                 '--binary', shell_path(binary), '--tsv', str(inventory),
-                 '--distro', distro, '--tiers', 'hermetic', '--tag', 'fixture'],
+                command,
                 env=env, capture_output=True, text=True, timeout=30)
             evidence = root / 'inventory/results.json'
             self.assertTrue(evidence.exists(), result.stdout + result.stderr)
