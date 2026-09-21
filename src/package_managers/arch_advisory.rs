@@ -2,7 +2,7 @@
 //! introduced-version boundary; installed packages remain candidates until
 //! the published fix is installed (the arch-audit comparison model).
 use anyhow::{Context, Result, ensure};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use super::types::{SecurityPackage, parse_version};
 
@@ -18,7 +18,13 @@ pub(crate) fn audit_result(
 ) -> Result<SecurityAuditResult> {
     ensure!(!advisories.is_empty(), "Arch advisory feed is empty");
     let mut groups: BTreeMap<String, Vec<Vulnerability>> = BTreeMap::new();
+    let mut identities = HashSet::new();
     for advisory in advisories {
+        ensure!(
+            identities.insert(&advisory.name),
+            "Duplicate Arch advisory identity: {}",
+            advisory.name
+        );
         ensure!(
             matches!(
                 advisory.status.as_str(),
@@ -161,6 +167,10 @@ mod tests {
         let result = audit_result(&installed, std::slice::from_ref(&advisory)).unwrap();
         assert_eq!(result.total_vulnerabilities, 1);
         assert_eq!(result.high_severity, 1);
+        assert!(
+            audit_result(&installed, &[advisory.clone(), advisory.clone()]).is_err(),
+            "duplicate advisory identities must not inflate findings"
+        );
         let finding = &result.vulnerabilities[0].1[0];
         assert_eq!(finding.affected_installed[0].version, "1.0-1");
         assert_eq!(
