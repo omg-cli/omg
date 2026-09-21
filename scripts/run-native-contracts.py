@@ -224,6 +224,12 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n', encoding='utf-8')
 
 
+def admission_exit_code(process_status, execution, contracts_passed):
+    # Nextest may accept a later attempt, but every selected test's first
+    # failure remains fatal, even before that test owns a reviewed contract.
+    return int(bool(process_status or execution['counts']['failed'] or not contracts_passed))
+
+
 def command_output(argv):
     return subprocess.check_output(argv, text=True, encoding='utf-8').strip()
 
@@ -366,7 +372,7 @@ def main():
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as stream:
                 stream.write(summary)
-        return 1 if result.returncode or not passed else 0
+        return admission_exit_code(result.returncode, execution, passed)
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
         write_json(evidence / 'admission-error.json', {'schema_version': 1, 'error': str(error)})
         print('Native contract admission failed: ' + str(error), file=sys.stderr)
