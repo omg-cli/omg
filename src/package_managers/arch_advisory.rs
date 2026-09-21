@@ -21,6 +21,14 @@ pub(crate) fn audit_result(
     let mut identities = HashSet::new();
     for advisory in advisories {
         ensure!(
+            !advisory.name.trim().is_empty()
+                && !advisory.packages.is_empty()
+                && advisory.packages.iter().all(|name| !name.trim().is_empty())
+                && !advisory.issues.is_empty()
+                && advisory.issues.iter().all(|id| !id.trim().is_empty()),
+            "Incomplete Arch advisory identity"
+        );
+        ensure!(
             identities.insert(&advisory.name),
             "Duplicate Arch advisory identity: {}",
             advisory.name
@@ -44,12 +52,6 @@ pub(crate) fn audit_result(
             "Unknown" => AdvisorySeverity::Unspecified,
             _ => anyhow::bail!("Unknown Arch advisory severity for {}", advisory.name),
         };
-        ensure!(
-            !advisory.name.is_empty()
-                && !advisory.packages.is_empty()
-                && !advisory.issues.is_empty(),
-            "Incomplete Arch advisory identity"
-        );
         // Validate independently of installed matches: candidate cache admission
         // calls this with an empty inventory before retaining the whole feed.
         let fixed = advisory
@@ -117,6 +119,27 @@ pub(crate) fn audit_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_advisory_identifiers_cannot_be_admitted_as_clean_evidence() {
+        let valid: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-test","packages":["fixture"],"status":"Vulnerable","severity":"High","affected":"1.0-1","fixed":null,"issues":["CVE-test"],"type":"code execution"}"#).unwrap();
+        for status in ["Vulnerable", "Not affected"] {
+            for field in ["name", "packages", "issues"] {
+                let mut invalid = valid.clone();
+                invalid.status = status.into();
+                match field {
+                    "name" => invalid.name = " ".into(),
+                    "packages" => invalid.packages.push(String::new()),
+                    "issues" => invalid.issues.push(" ".into()),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    audit_result(&[], &[invalid]).is_err(),
+                    "blank {field} in {status} feed must fail before cache admission"
+                );
+            }
+        }
+    }
 
     #[test]
     fn unknown_severity_and_unpublished_fix_do_not_invent_safety_or_scores() {
