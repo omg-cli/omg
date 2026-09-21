@@ -1,5 +1,5 @@
 //! Shared package audit orchestration for direct CLI and daemon requests.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 
@@ -113,7 +113,7 @@ pub async fn scan_installed(
 ) -> Result<SecurityAuditResult> {
     if let Some(native) = manager.security_audit() {
         let result = native.await?;
-        log_completed_scan(&result);
+        log_completed_scan(&result).await?;
         return Ok(result);
     }
     let installed = manager
@@ -174,20 +174,30 @@ pub async fn scan_installed(
     result
         .vulnerabilities
         .sort_by(|left, right| left.0.cmp(&right.0));
-    log_completed_scan(&result);
+    log_completed_scan(&result).await?;
     Ok(result)
 }
 
-fn log_completed_scan(result: &SecurityAuditResult) {
-    super::audit_log_nonblocking(
-        super::AuditEventType::SecurityAudit,
-        super::AuditSeverity::Info,
-        "security_scan",
-        &format!(
-            "Security audit completed: {} vulnerabilities found ({} high severity)",
-            result.total_vulnerabilities, result.high_severity
-        ),
+async fn log_completed_scan(result: &SecurityAuditResult) -> Result<()> {
+    // A successful CLI/TUI/daemon scan must not outlive its completion record.
+    // Capture the destination now and keep filesystem locking/fsync off Tokio.
+    let path = crate::core::paths::data_dir().join("audit/audit.jsonl");
+    let description = format!(
+        "Security audit completed: {} vulnerabilities found ({} high severity)",
+        result.total_vulnerabilities, result.high_severity
     );
+    tokio::task::spawn_blocking(move || {
+        let mut logger = super::AuditLogger::new_in(path)?;
+        logger.log(
+            super::AuditEventType::SecurityAudit,
+            super::AuditSeverity::Info,
+            "security_scan",
+            &description,
+        )
+    })
+    .await
+    .context("Security audit log writer failed")?
+    .context("Failed to persist completed security audit")
 }
 
 #[cfg(test)]

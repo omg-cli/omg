@@ -75,9 +75,11 @@ sleep() { printf 'sleep %s\n' "$1" >> "$CALLS"; }
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text()
         self.assertLess(source.index('"$here/pull-qemu-controller.sh"'), source.index('started=true'))
         self.assertIn('docker run --pull=never -d', source)
-        workflow = (ROOT / '.github/workflows/qemu-matrix.yml').read_text()
-        self.assertIn('"scripts/pull-qemu-controller.sh"', workflow)
-        self.assertIn('"scripts/test_qemu_controller_pull.py"', workflow)
+        # All PR changes reach CI; its documentation-only classifier cannot
+        # exclude controller scripts from the dependent QEMU job.
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        self.assertIn('  pull_request:\n  merge_group:', workflow)
+        self.assertIn('uses: ./.github/workflows/qemu-matrix.yml', workflow)
 
 
 if __name__ == '__main__':
