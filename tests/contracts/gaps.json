@@ -2919,7 +2919,6 @@
         "ipc:Explicit",
         "ipc:ExplicitCount",
         "ipc:SecurityAudit",
-        "ipc:Ping",
         "ipc:CacheStats",
         "ipc:CacheClear",
         "ipc:RefreshIndex",

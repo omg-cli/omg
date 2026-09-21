@@ -2541,6 +2541,153 @@
           ]
         }
       ]
+    },
+    {
+      "id": "omgd.ping-responses.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Ping",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "concurrency",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-pong-and-u64-boundary-request-ids"
+        ],
+        "concurrency": [
+          "sixteen-connected-clients-released-through-barrier"
+        ],
+        "state": [
+          "package-state-bytes-preserved-and-follow-up-pong"
+        ]
+      },
+      "scope": "Reviewed Ping request semantics and representative interruption/rate-limit recovery over production Unix sockets; checked SIGTERM drain and cleanup; not native package transactions or standalone process lifecycle; general protocol framing, socket authorization and connection capacity retain separate open contracts",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::concurrent_pings_preserve_boundary_ids_and_backend_state",
+          "evidence": [
+            "success",
+            "concurrency",
+            "state"
+          ],
+          "assertions": [
+            "exact-pong-and-u64-boundary-request-ids",
+            "sixteen-connected-clients-released-through-barrier",
+            "package-state-bytes-preserved-and-follow-up-pong",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.ping-interrupted.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Ping",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "fault",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "fault": [
+          "half-closed-partial-header-and-body-produce-eof"
+        ],
+        "state": [
+          "fresh-client-exact-pong-after-each-interruption"
+        ]
+      },
+      "scope": "Reviewed Ping request semantics and representative interruption/rate-limit recovery over production Unix sockets; checked SIGTERM drain and cleanup; not native package transactions or standalone process lifecycle; general protocol framing, socket authorization and connection capacity retain separate open contracts",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::incomplete_frames_disconnect_without_breaking_a_fresh_client",
+          "evidence": [
+            "fault",
+            "state"
+          ],
+          "assertions": [
+            "half-closed-partial-header-and-body-produce-eof",
+            "fresh-client-exact-pong-after-each-interruption",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "omgd.ping-rate-limit.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:Ping",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "served-burst-responses-have-exact-pong-and-id"
+        ],
+        "refusal": [
+          "rate-limited-burst-exact-code-message-and-id"
+        ],
+        "state": [
+          "same-connection-pong-after-token-refill"
+        ]
+      },
+      "scope": "Reviewed Ping request semantics and representative interruption/rate-limit recovery over production Unix sockets; checked SIGTERM drain and cleanup; not native package transactions or standalone process lifecycle; general protocol framing, socket authorization and connection capacity retain separate open contracts",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::rate_limited_burst_rejects_with_exact_envelope_and_keeps_connection_open",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "served-burst-responses-have-exact-pong-and-id",
+            "rate-limited-burst-exact-code-message-and-id",
+            "same-connection-pong-after-token-refill",
+            "fixture-cleanup"
+          ]
+        }
+      ]
     }
   ],
   "interfaces": [

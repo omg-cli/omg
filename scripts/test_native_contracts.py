@@ -55,6 +55,26 @@ def parser_fixture():
 
 
 class NativeReceipts(unittest.TestCase):
+    def test_fault_and_concurrency_receipts_require_reviewed_daemon_owners(self):
+        for name, kind in (
+            ('concurrent_pings_preserve_boundary_ids_and_backend_state', 'concurrency'),
+            ('incomplete_frames_disconnect_without_breaking_a_fresh_client', 'fault'),
+        ):
+            manifest, provenance, report, _ = parser_fixture()
+            identity = 'omg::coverage_18::' + name
+            contract = manifest['contracts'][0]
+            contract.update(binary='omgd', requires=[kind], assertions={kind: ['observed-condition']})
+            contract['tests'][0].update(lane='native-daemon-fixture', id=identity,
+                evidence=[kind], assertions=['observed-condition', 'fixture-cleanup'])
+            provenance.update(lane='native-daemon-fixture', binaries={'omgd': 'd' * 64})
+            report['tests'][identity] = report['tests'].pop('install-dry-run-state')
+            rows, _ = NATIVE.behavior_receipts(manifest, provenance, report)
+            self.assertEqual(rows[0]['evidence'], [kind])
+            provenance['lane'] = 'native-cli-fixture'
+            contract['tests'][0]['lane'] = 'native-cli-fixture'
+            with self.assertRaises(ValueError):
+                NATIVE.behavior_receipts(manifest, provenance, report)
+
     def test_daemon_subject_is_the_owned_production_server_harness(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -128,7 +148,7 @@ class NativeReceipts(unittest.TestCase):
         manifest = json.loads((root / 'tests/contracts/manifest.json').read_text())
         mapped = [contract for contract in manifest['contracts']
                   if any(binding['lane'] == 'native-daemon-fixture' for binding in contract['tests'])]
-        self.assertEqual(len(mapped), 11)
+        self.assertEqual(len(mapped), 14)
         selected = set()
         for contract in mapped:
             self.assertEqual(contract['binary'], 'omgd')
@@ -137,8 +157,25 @@ class NativeReceipts(unittest.TestCase):
             for binding in contract['tests']:
                 self.assertIn(binding['id'], NATIVE.DAEMON_TESTS)
                 self.assertIn('fixture-cleanup', binding['assertions'])
+                promised = {assertion for kind in binding['evidence']
+                            for assertion in contract['assertions'][kind]}
+                self.assertTrue(promised <= set(binding['assertions']))
                 selected.add(binding['id'])
         self.assertEqual(selected, NATIVE.DAEMON_TESTS)
+
+    def test_reviewed_ping_requires_all_contracts_before_surface_credit(self):
+        root = Path(__file__).resolve().parents[1]
+        manifest = json.loads((root / 'tests/contracts/manifest.json').read_text())
+        gaps = list(NATIVE.COVERAGE.expand_gaps(json.loads((root / 'tests/contracts/gaps.json').read_text())['gaps']))
+        contracts = {c['id']: c for c in manifest['contracts'] if c['surface'] == 'ipc:Ping'}
+        self.assertEqual(len(contracts), 3)
+        self.assertFalse(any(g['surface'] == 'ipc:Ping' for g in gaps))
+        for identity in contracts:
+            partial = NATIVE.COVERAGE.behavioral_progress(contracts, [], set(contracts) - {identity})
+            self.assertEqual(partial['covered'], 0)
+        complete = NATIVE.COVERAGE.behavioral_progress(contracts, [], set(contracts))
+        self.assertEqual(complete['covered_surfaces'], ['ipc:Ping'])
+        self.assertFalse(complete['target_met'], 'one domain cannot certify inventory review')
 
     def test_entrypoint_loads_contracts_before_binding_and_reports_binding_failure(self):
         manifest = {'contracts': [{'id': 'reviewed-contract'}]}

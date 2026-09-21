@@ -547,6 +547,7 @@ async fn incomplete_frames_disconnect_without_breaking_a_fresh_client() -> Resul
         let mut interrupted = fixture.connect().await?;
         interrupted.write_all(&wire[..length]).await?;
         interrupted.shutdown().await?;
+        expect_eof(&mut interrupted, "half-closed incomplete Ping frame").await;
         drop(interrupted);
         let mut fresh = fixture.connect().await?;
         fresh.write_all(&ping_wire(911 + length as u64)?).await?;
@@ -874,8 +875,9 @@ async fn rate_limited_burst_rejects_with_exact_envelope_and_keeps_connection_ope
             continue;
         }
         match response {
-            Response::Success { id, .. } => {
+            Response::Success { id, result } => {
                 assert_eq!(*id, i as u64, "served response must echo its request id");
+                assert!(matches!(result, ResponseResult::Ping(message) if message == "pong"));
             }
             other @ Response::Error { .. } => {
                 panic!("request {i} was neither served nor rate-limited, got {other:?}")
@@ -888,12 +890,7 @@ async fn rate_limited_burst_rejects_with_exact_envelope_and_keeps_connection_ope
     tokio::time::sleep(Duration::from_millis(300)).await;
     let follow_up = omg_lib::daemon::protocol::encode_frame(&Request::Ping { id: 4242 })?;
     send_raw_frame(&mut stream, &follow_up).await?;
-    match read_response(&mut stream).await? {
-        Response::Success { id, .. } => assert_eq!(id, 4242),
-        other @ Response::Error { .. } => {
-            panic!("connection must stay usable after a rate-limit rejection, got {other:?}")
-        }
-    }
+    assert_pong(read_response(&mut stream).await?, 4242);
     fixture.shutdown().await
 }
 
@@ -999,6 +996,46 @@ async fn suggestions_preserve_catalog_order_limits_refusal_and_state_over_real_i
     assert_pong(
         request_on_wire(&fixture, Request::Ping { id: 811 }).await?,
         811,
+    );
+    assert_eq!(std::fs::read(&state_path)?, before);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn concurrent_pings_preserve_boundary_ids_and_backend_state() -> Result<()> {
+    let fixture = RealServerFixture::new().await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_pacman.json");
+    let before = std::fs::read(&state_path)?;
+    let mut ids = vec![0, 1, u64::MAX - 1, u64::MAX];
+    ids.extend(2..14);
+    let barrier = Arc::new(tokio::sync::Barrier::new(ids.len() + 1));
+    let mut clients = tokio::task::JoinSet::new();
+    for id in ids {
+        let socket = fixture.socket_path.clone();
+        let barrier = Arc::clone(&barrier);
+        clients.spawn(async move {
+            let mut stream = UnixStream::connect(socket).await?;
+            barrier.wait().await;
+            stream.write_all(&ping_wire(id)?).await?;
+            assert_pong(read_response(&mut stream).await?, id);
+            Ok::<(), anyhow::Error>(())
+        });
+    }
+    timeout(READ_TIMEOUT, barrier.wait())
+        .await
+        .context("Ping clients failed to connect together")?;
+    while let Some(result) = timeout(READ_TIMEOUT, clients.join_next()).await? {
+        result.context("Ping client panicked")??;
+    }
+    assert_pong(
+        request_on_wire(&fixture, Request::Ping { id: 77 }).await?,
+        77,
     );
     assert_eq!(std::fs::read(&state_path)?, before);
     fixture.shutdown().await

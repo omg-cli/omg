@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used eighty-one searches (276 requested result slots),
+Exa research used eighty-two searches (277 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -841,3 +841,9 @@ The same audit considered cache statistics. [Moka's documented entry count](http
 is approximate under concurrent updates and pending maintenance; a naive exact
 cache-count assertion would impose an unsupported guarantee. No eventual-success
 poll was added to turn an arbitrary cache sample into coverage.
+
+Ping is the first explicit per-surface review in
+[the domain ledger](verification-domain-review.md). Three required production-wire
+contracts replace its provisional blanket gap: exact concurrent responses/state,
+interrupted-request recovery, and rate-limit envelopes/recovery. Partial evidence
+still earns no surface credit, and global inventory review remains incomplete.
