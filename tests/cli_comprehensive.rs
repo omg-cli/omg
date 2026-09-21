@@ -1153,6 +1153,42 @@ fn behavior_inventory_runs_in_hermetic_state() {
             .expect("write CLI behavior index row");
             continue;
         }
+        // Account behavior is unavailable without the license feature. Verify
+        // that refusal, but never label it as a successful account operation.
+        if !cfg!(feature = "license") && case.args.first().is_some_and(|arg| arg == "account") {
+            let args: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
+            let result = project.run(&args);
+            let refused = result.exit_code == 2
+                && result.stdout.is_empty()
+                && result.stderr.contains("unrecognized subcommand 'account'");
+            let verdict = if refused {
+                "unavailable-feature"
+            } else {
+                "fail"
+            };
+            if !refused {
+                failures.push(format!(
+                    "{}: license-disabled account was not explicitly refused",
+                    case.id
+                ));
+            }
+            writeln!(
+                index,
+                "{}\t{command}\t{}\t2\t{}\t{}\t{}\t-\tlicense-disabled\t{verdict}",
+                case.id,
+                case.safety.as_str(),
+                result.exit_code,
+                result.stdout.len(),
+                result.stderr.len()
+            )
+            .expect("write unavailable feature row");
+            if let Some(dir) = &evidence_dir {
+                std::fs::write(dir.join(format!("{:03}-{}.txt", number + 1, case.id)),
+                    format!("command: {command}\nux_verdict: {verdict}\n--- stdout ---\n{}\n--- stderr ---\n{}", result.stdout, result.stderr))
+                    .expect("write unavailable feature transcript");
+            }
+            continue;
+        }
         // The hermetic fixture always runs the arch mock backend, so the
         // arch expectation governs here; release lanes resolve their own.
         // Native offline guests have installed packages and must refuse an
