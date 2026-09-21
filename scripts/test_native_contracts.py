@@ -280,6 +280,10 @@ class NativeReceipts(unittest.TestCase):
             manifest, _, _, provenance, _ = fixture()
             manifest['contracts'][0]['tests'] = [
                 {'lane': 'native-cli-fixture', 'id': name} for name in sorted(NATIVE.BEHAVIOR_TESTS)]
+            # Nextest includes the library suite under the bare package name.
+            # It is not the owner of every integration identity with that prefix.
+            listing['rust-suites']['omg'] = {
+                'package-id': 'owning-package', 'binary-path': str(target / 'debug/suite')}
             combined = NATIVE.mapped_behavior_subjects(manifest, provenance, listing, root)
             self.assertEqual(set(combined), {'omg', 'omgd',
                 'harness:omg::debian_e2e_tests', 'harness:omg::cli_comprehensive',

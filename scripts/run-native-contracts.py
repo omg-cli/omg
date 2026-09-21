@@ -141,8 +141,10 @@ def mapped_behavior_subjects(manifest, provenance, listing, root):
             for binding in contract['tests']:
                 if binding['lane'] == 'native-cli-fixture':
                     require(binding['id'] in BEHAVIOR_TESTS, 'unreviewed behavior test')
+                    # Native CLI owners are integration binaries. Nextest's bare
+                    # package ID names its library, not all prefixed test suites.
                     owners = [suite for suite in listing['rust-suites']
-                              if binding['id'].startswith(suite + '::')]
+                              if '::' in suite and binding['id'].startswith(suite + '::')]
                     require(len(owners) == 1, 'missing owning behavior harness or ambiguous identity')
                     suites.add(owners[0])
     combined = {}
