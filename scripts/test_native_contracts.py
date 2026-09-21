@@ -1,6 +1,7 @@
 """Receipts must derive from observed executions of reviewed assertions."""
 import importlib.util
 import copy
+import hashlib
 import json
 from pathlib import Path
 import unittest
@@ -54,6 +55,91 @@ def parser_fixture():
 
 
 class NativeReceipts(unittest.TestCase):
+    def test_daemon_subject_is_the_owned_production_server_harness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / 'target'
+            target.mkdir()
+            harness = target / 'coverage-18'
+            harness.write_bytes(b'production server inside integration harness')
+            before = NATIVE.sha256_file(harness)
+            _, _, _, provenance, _ = fixture()
+            observed = NATIVE.daemon_provenance(provenance, {'source': 'fixture'}, harness, before)
+            self.assertEqual(observed['binaries']['omgd'], before)
+            self.assertEqual(observed['subject_kind'], 'production-server-test-harness-injected-backend')
+            harness.write_bytes(b'replaced harness')
+            with self.assertRaisesRegex(ValueError, 'changed during execution'):
+                NATIVE.daemon_provenance(provenance, {'source': 'fixture'}, harness, before)
+            listing = {'rust-build-meta': {'target-directory': str(target)}, 'rust-suites': {
+                'omg::bin/omgd': {'package-id': 'omg'},
+                'omg::coverage_18': {'package-id': 'omg', 'binary-path': str(harness)}}}
+            self.assertEqual(NATIVE.daemon_subject(listing, root), harness)
+            listing['rust-suites']['omg::coverage_18']['package-id'] = 'foreign'
+            with self.assertRaisesRegex(ValueError, 'package'):
+                NATIVE.daemon_subject(listing, root)
+            listing['rust-suites']['omg::coverage_18']['package-id'] = 'omg'
+            listing['rust-suites']['omg::coverage_18']['binary-path'] = str(root / 'outside')
+            (root / 'outside').write_bytes(b'foreign')
+            with self.assertRaisesRegex(ValueError, 'harness'):
+                NATIVE.daemon_subject(listing, root)
+
+    def test_daemon_receipts_preserve_failures_skips_and_harness_identity(self):
+        manifest, provenance, report, required = parser_fixture()
+        identity = 'omg::coverage_18::package_inventory_and_updates_survive_the_production_transport'
+        contract = manifest['contracts'][0]
+        contract.update(binary='omgd', requires=['success'], assertions={'success': ['exact-inventory']})
+        contract['tests'][0].update(lane='native-daemon-fixture', id=identity,
+            evidence=['success'], assertions=['exact-inventory', 'fixture-cleanup'])
+        provenance.update(lane='native-daemon-fixture', binaries={'omgd': 'd' * 64})
+        report['tests'][identity] = report['tests'].pop('install-dry-run-state')
+        rows, selected = NATIVE.behavior_receipts(manifest, provenance, report)
+        self.assertEqual(selected, required)
+        self.assertEqual(rows[0]['binary_sha256'], 'd' * 64)
+        self.assertEqual(rows[0]['evidence'], ['success'])
+        contract['surface'] = 'ipc:Status'
+        contract['source'] = 'src/daemon/protocol.rs'
+        manifest['interfaces'] = [dict(id='ipc:Status', binary='omgd', source='src/daemon/protocol.rs', platforms=['arch'])]
+        manifest['gaps'] = [dict(surface='omgd', platforms=['arch'], owner='daemon',
+                                reason='process behavior remains unverified', missing=['success'])]
+        surface = dict(schema_version=1, binary='omgd', available=True,
+                       build={key: provenance[key] for key in ('source_sha', 'platform', 'os', 'arch', 'features')},
+                       commands=[dict(path='omgd', arguments=[])])
+        manifest['surface_digests'] = [dict(binary='omgd', platform='arch', features=provenance['features'],
+            sha256=hashlib.sha256(json.dumps({key: value for key, value in surface.items() if key != 'build'},
+                sort_keys=True, separators=(',', ':')).encode()).hexdigest())]
+        admitted = NATIVE.COVERAGE.admit(manifest, [surface], rows, provenance, selected)
+        self.assertTrue(admitted['passed'])
+        self.assertFalse(admitted['behavioral_progress']['target_met'])
+        report['tests'][identity]['attempts'].insert(0, {'result': 'FAIL', 'duration_ms': 1})
+        rows, _ = NATIVE.behavior_receipts(manifest, provenance, report)
+        self.assertEqual([row['result'] for row in rows], ['FAIL', 'PASS'])
+        self.assertEqual(rows[0]['assertions'], [])
+        self.assertFalse(NATIVE.COVERAGE.admit(manifest, [surface], rows, provenance, selected)['passed'])
+        report['tests'][identity]['runtime_skip'] = True
+        rows, _ = NATIVE.behavior_receipts(manifest, provenance, report)
+        self.assertEqual([row['result'] for row in rows], ['BLOCKED', 'BLOCKED'])
+        self.assertTrue(all(not row['evidence'] for row in rows))
+        contract['tests'][0]['id'] = 'omg::coverage_18::unreviewed'
+        with self.assertRaises(ValueError):
+            NATIVE.behavior_receipts(manifest, provenance, report)
+
+    def test_real_daemon_manifest_has_only_reviewed_production_server_assertions(self):
+        root = Path(__file__).resolve().parents[1]
+        manifest = json.loads((root / 'tests/contracts/manifest.json').read_text())
+        mapped = [contract for contract in manifest['contracts']
+                  if any(binding['lane'] == 'native-daemon-fixture' for binding in contract['tests'])]
+        self.assertEqual(len(mapped), 10)
+        selected = set()
+        for contract in mapped:
+            self.assertEqual(contract['binary'], 'omgd')
+            self.assertTrue(contract['critical'])
+            self.assertIn('not native package transactions', contract['scope'])
+            for binding in contract['tests']:
+                self.assertIn(binding['id'], NATIVE.DAEMON_TESTS)
+                self.assertIn('fixture-cleanup', binding['assertions'])
+                selected.add(binding['id'])
+        self.assertEqual(selected, NATIVE.DAEMON_TESTS)
+
     def test_entrypoint_loads_contracts_before_binding_and_reports_binding_failure(self):
         manifest = {'contracts': [{'id': 'reviewed-contract'}]}
         gaps = [{'id': 'known-gap'}]
@@ -213,7 +299,8 @@ class NativeReceipts(unittest.TestCase):
                 'omg.runtime.' + name + '.fixture' for name in (
                     'nvmrc', 'python-pin', 'tool-versions', 'go-mod', 'multi-runtime',
                     'pin-precedence', 'rust-pin', 'rust-pin-locked', 'engines-range', 'which-node',
-                    'uninstall-lifecycle', 'which-registry', 'list-installed', 'list-runtime', 'list-json')} | {
+                    'uninstall-lifecycle', 'which-registry', 'list-installed', 'list-runtime', 'list-json',
+                    'list-installed-backend-errors', 'list-runtime-backend-errors', 'list-json-backend-errors')} | {
                 'omg.environment.' + name + '.fixture' for name in (
                     'capture-registry', 'php-restore', 'registry-restore', 'unsupported-capture')} | {
                 'omg.snapshot.list-index-failures.fixture',
@@ -224,6 +311,10 @@ class NativeReceipts(unittest.TestCase):
             for binding in contract['tests']:
                 self.assertIn(binding['id'], NATIVE.BEHAVIOR_TESTS)
                 self.assertIn('fixture-cleanup', binding['assertions'])
+                promised = {assertion for kind in binding['evidence']
+                            for assertion in contract['assertions'][kind]}
+                self.assertTrue(promised <= set(binding['assertions']),
+                                f"{contract['id']}: {binding['id']} lacks {promised - set(binding['assertions'])}")
 
     def test_platform_policy_matches_real_native_selection(self):
         root = Path(__file__).resolve().parents[1]

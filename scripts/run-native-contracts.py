@@ -46,6 +46,40 @@ BEHAVIOR_TESTS = frozenset('omg::debian_e2e_tests::' + name for name in (
         'capture_without_package_backend_refuses_without_creating_or_overwriting_lockfile'))
 
 
+DAEMON_TESTS = frozenset('omg::coverage_18::' + name for name in (
+    'package_inventory_and_updates_survive_the_production_transport',
+    'clearing_search_cache_forces_a_new_lookup_over_real_ipc',
+    'package_info_cache_preserves_metadata_and_missing_package_identity',
+    'isolated_refresh_refusal_preserves_server_liveness',
+    'fragmented_then_coalesced_frames_preserve_response_order_and_ids',
+    'active_connection_metric_returns_to_baseline_after_disconnect'))
+
+
+def daemon_subject(listing, root):
+    """The production server runs inside coverage_18, not a child omgd binary."""
+    target = Path(listing['rust-build-meta']['target-directory']).resolve(strict=True)
+    require(target.is_relative_to(root.resolve()), 'target directory escapes checkout')
+    suite = listing['rust-suites']['omg::coverage_18']
+    require(suite['package-id'] == listing['rust-suites']['omg::bin/omgd']['package-id'],
+            'daemon harness package mismatch')
+    path = Path(suite['binary-path'])
+    require(path.is_file() and not path.is_symlink() and path.resolve(strict=True).is_relative_to(target),
+            'invalid daemon harness')
+    return path
+
+
+def daemon_provenance(provenance, recipe, path, before_hash):
+    require(sha256_file(path) == before_hash, 'daemon harness changed during execution')
+    result = dict(provenance, lane='native-daemon-fixture',
+        subject_kind='production-server-test-harness-injected-backend',
+        binaries=dict(provenance['binaries'], omgd=before_hash),
+        harnesses_sha256={'omg::coverage_18': before_hash})
+    result['recipe_sha256'] = hashlib.sha256(json.dumps(
+        {'recipe': recipe, 'daemon_harness': before_hash}, sort_keys=True,
+        separators=(',', ':')).encode()).hexdigest()
+    return result
+
+
 def parser_receipts(manifest, provenance, report):
     return execution_receipts(manifest, provenance, report, behavior=False)
 
@@ -111,7 +145,10 @@ def execution_receipts(manifest, provenance, report, *, behavior):
         required.append(contract['id'])
         for binding in bindings:
             if behavior:
-                require(binding['id'] in BEHAVIOR_TESTS and 'fixture-cleanup' in binding['assertions'],
+                reviewed = DAEMON_TESTS if provenance['lane'] == 'native-daemon-fixture' else BEHAVIOR_TESTS
+                if provenance['lane'] == 'native-daemon-fixture':
+                    require(contract['binary'] == 'omgd', 'daemon fixture cannot certify a CLI binary')
+                require(binding['id'] in reviewed and 'fixture-cleanup' in binding['assertions'],
                         'behavior test or cleanup assertion has not been reviewed')
                 require(set(binding['evidence']) <= {'success', 'state', 'refusal'}, 'unsupported fixture evidence')
             else:
@@ -243,10 +280,15 @@ def main():
         write_json(evidence / 'provenance.json', provenance)
         behavior_paths = mapped_behavior_subjects(manifest, provenance, listing, Path.cwd())
         behavior_hashes = {name: sha256_file(path) for name, path in behavior_paths.items()}
+        daemon_path = daemon_subject(listing, Path.cwd())
+        daemon_hash = sha256_file(daemon_path)
         behavior_directory = evidence / 'behavior'
         behavior_directory.mkdir(exist_ok=True)
+        daemon_directory = evidence / 'daemon'
+        daemon_directory.mkdir(exist_ok=True)
         for name in ('provenance.json', 'receipts.json', 'required.json', 'coverage.json'):
             (behavior_directory / name).unlink(missing_ok=True)
+            (daemon_directory / name).unlink(missing_ok=True)
         junit = Path('target/nextest/ci/junit.xml')
         # Clear only this invocation's outputs so restored/stale artifacts cannot pass.
         for path in (junit, directory / 'omg.json', directory / 'omgd.json'):
@@ -293,6 +335,17 @@ def main():
             write_json(behavior_directory / 'coverage.json', behavior_report)
             summary += '\n' + COVERAGE.render_markdown(behavior_report)
             passed = passed and behavior_report['passed']
+        service_provenance = daemon_provenance(provenance, recipe, daemon_path, daemon_hash)
+        write_json(daemon_directory / 'provenance.json', service_provenance)
+        daemon_rows, daemon_required = behavior_receipts(manifest, service_provenance, execution)
+        write_json(daemon_directory / 'receipts.json', daemon_rows)
+        write_json(daemon_directory / 'required.json', daemon_required)
+        daemon_report = COVERAGE.admit(manifest, [COVERAGE.read_json(directory / (binary + '.json'))
+                                                for binary in subjects], daemon_rows,
+                                     service_provenance, daemon_required)
+        write_json(daemon_directory / 'coverage.json', daemon_report)
+        summary += '\n' + COVERAGE.render_markdown(daemon_report)
+        passed = passed and daemon_report['passed']
         print(summary)
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as stream:

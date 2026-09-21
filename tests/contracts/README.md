@@ -180,3 +180,15 @@ A missing, inactive, wrong-version, broken or escaped installation fails even
 when the CLI exits zero. Cleanup is checked before the row passes. This stronger
 oracle also applies to reviewed published inventories with that row identity;
 it does not change their recorded hashes or pretend they gained other tests.
+
+`execution/daemon/` contains a separate `native-daemon-fixture` report for ten
+reviewed production-server contracts. Its OMGD binary hash identifies the actual
+`coverage_18` integration harness containing `server::run`; it never identifies
+a standalone daemon executable that these tests did not launch. The OMG hash
+in this lane remains the parser harness used for compiled surface inventory;
+this lane admits no OMG CLI contracts. Harness ownership and pre/post execution
+hashes are checked. The same nextest run supplies the observations, so this
+reconciliation does not add another test run. Injected package state, real Unix
+transport, explicit SIGTERM drain and checked cleanup are the bounded scope.
+Native backend, executable lifecycle, security-audit and wider request/fault
+coverage remain separate gaps. Do not add percentages from separate lane reports.

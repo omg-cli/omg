@@ -21,7 +21,7 @@ unimplemented tests remain visible debt and cannot be counted as success.
 
 ## Research method and decisions
 
-Exa research used seventy-eight searches (273 requested result slots),
+Exa research used eighty searches (275 requested result slots),
 covering CLI reflection, daemon timing/concurrency, VM testing, test selection and
 mutation, process isolation, state machines, combinatorial interactions and VM
 fault injection, NVM alias layout, Docker stage inheritance and issue evidence.
@@ -790,3 +790,35 @@ external writes, successful deletion after restoring the valid index, empty fina
 index, and checked cleanup. The two bounded list/delete contracts do not certify
 concurrent replacement, crash consistency, creation or restoration. Existing
 broader inventory gaps remain open.
+
+### Production-server execution receipts
+
+[Nextest listing](https://nexte.st/docs/listing/) provides machine-readable test
+and binary identities. The native adapter now uses the already-selected
+`coverage_18` harness as the subject of a separate `native-daemon-fixture` lane.
+It checks the owning package and target path, hashes the harness before and
+after the existing nextest run, and reconciles JUnit results without rerunning
+tests. Ten bounded contracts cover literal status/explicit/update responses,
+search-cache invalidation, positive/missing package info, isolated refresh
+refusal, fragmented/coalesced frame ordering and active-connection metrics.
+Every mapped test drains the production server through SIGTERM and explicitly
+checks fixture cleanup. These are production server-library tests over real
+Unix sockets with an injected backend, not native package transactions or
+standalone OMGD process attestations. Broader gaps remain unchanged.
+
+The adapter rejects foreign or changed harnesses, unreviewed tests and missing
+cleanup assertions; skips are BLOCKED and first failures survive later passes.
+An admission rehearsal using a prior hosted execution and a synthetic subject
+hash validates schema compatibility only and earns no coverage credit. Current
+hosted receipts must supply the real harness digest before this lane is admitted.
+One unsuccessful Exa query returned no results; it is included in the search
+count and contributes no supporting authority.
+
+The ac289b46 native CI run also exposed an incorrect list-contract mapping:
+two tests each implemented only part of the combined state/refusal assertion
+set. Admission correctly failed with `test lacks required assertion` after
+product tests passed. The installed-list and backend-error tests now own separate
+contracts on the same surfaces, so complete surface credit still requires both.
+The local manifest check now verifies every binding's promised assertions before
+shipping. No assertions were added to a test's receipt unless that test checks
+them, and the admission rule was not relaxed. The failed hosted run is retained.
