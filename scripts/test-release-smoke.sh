@@ -761,6 +761,7 @@ cat > "$scratch/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ ${FAKE_INVENTORY_TRANSPORT:-0} == 0 ]] || exit "$FAKE_INVENTORY_TRANSPORT"
+if [[ -n "${FAKE_INVENTORY_HOME:-}" ]]; then export HOME="$FAKE_INVENTORY_HOME"; fi
 exec bash -c "${!#}"
 EOF
 cat > "$scratch/fake inventory omg" <<'EOF'
@@ -780,6 +781,13 @@ case "$1" in
   literal) [[ "$2" == '$(touch MUST_NOT_EXIST)' ]] ;;
   empty-arg) [[ "$#" == 3 && "$2" == '' && "$3" == tail ]] ;;
   path) command -v 'fake inventory omg' ;;
+  update)
+    case "${2:-}" in
+      --fast) printf 'Fast System Update\nSynced package catalogs\nUpgraded 5 packages\n' ;;
+      --turbo) printf 'TURBO System Update\ncached, no sync\nUpgraded 1 packages\n' ;;
+      *) exit 2 ;;
+    esac
+    ;;
   *) exit 2 ;;
 esac
 EOF
@@ -788,11 +796,13 @@ inv_header=$'case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier
 inv_row() { printf '%s\t%s\t%s\t%s\tpass\t%s\thermetic\t%s\t%s\ttempdir-drop\n' "$1" "$2" "${6:-read}" "$3" "${4:--}" "${7:-hermetic:pass}" "${5:--}"; }
 run_inventory() {
   local name=$1 expected=$2
+  local mutation_args=()
   shift 2
+  [[ ${FAKE_INVENTORY_ALLOW_MUTATIONS:-0} != 1 ]] || mutation_args+=(--allow-mutations)
   mkdir -p "$scratch/inventory-$name/guest"
   printf '%s\n' "$inv_header" > "$scratch/inventory-$name.tsv"
   printf '%s\n' "$@" >> "$scratch/inventory-$name.tsv"
-  assert_rc "$expected" bash -c 'export FAKE_INVENTORY_PID=$$; exec "$@"' _ "$inventory_runner" --work "$scratch/inventory-$name" --distro arch --tiers hermetic --tag v9.9.9 --binary "$scratch/fake inventory omg" --tsv "$scratch/inventory-$name.tsv" --row-timeout 1
+  assert_rc "$expected" bash -c 'export FAKE_INVENTORY_PID=$$; exec "$@"' _ "$inventory_runner" --work "$scratch/inventory-$name" --distro arch --tiers hermetic --tag v9.9.9 --binary "$scratch/fake inventory omg" --tsv "$scratch/inventory-$name.tsv" --row-timeout 1 "${mutation_args[@]}"
 }
 inv_verdict() {
   jq -e --arg id "qemu-arch-$2" --arg verdict "$3" 'any(.[]; .case_id == $id and .result == $verdict)' "$scratch/inventory-$1/inventory/results.json" >/dev/null || fail "inventory $1/$2 expected $3"
@@ -832,6 +842,36 @@ inv_verdict assertions missing-child BLOCKED
 inv_verdict assertions export PASS
 inv_verdict assertions import PASS
 inv_verdict assertions literal PASS
+export FAKE_INVENTORY_ALLOW_MUTATIONS=1
+run_inventory update-modes 0 \
+  "$(inv_row update-fast '["update","--fast"]' 0 - update-fast-output package-mutation)" \
+  "$(inv_row update-turbo '["update","--turbo"]' 0 - update-turbo-output package-mutation)"
+inv_verdict update-modes update-fast PASS
+inv_verdict update-modes update-turbo PASS
+run_inventory update-mode-lies 1 \
+  "$(inv_row update-fast '["json"]' 0 - update-fast-output package-mutation)" \
+  "$(inv_row update-turbo '["json"]' 0 - update-turbo-output package-mutation)"
+inv_verdict update-mode-lies update-fast FAIL
+inv_verdict update-mode-lies update-turbo FAIL
+mkdir -p "$scratch/inventory-home"
+cat > "$scratch/inventory-home/qemu-daemon-check.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# == 2 && -x "$1" && -d "$2" ]]
+printf '{"schema_version":1,"direct":true,"foreground":true,"ipc":true,"singleton":true,"shutdown":true,"restart":true,"query_parity":%s,"sigint":true,"cleanup":true,"backend_faults":[]}\n' \
+  "${FAKE_DAEMON_QUERY_PARITY:-true}" > "$2/daemon-lifecycle.json"
+printf 'foreground daemon lifecycle verified\n'
+EOF
+chmod 700 "$scratch/inventory-home/qemu-daemon-check.sh"
+export FAKE_INVENTORY_HOME="$scratch/inventory-home"
+run_inventory daemon-foreground 0 \
+  "$(inv_row daemon-foreground '["daemon","--foreground"]' 0 - daemon-foreground-lifecycle service-mutation)"
+inv_verdict daemon-foreground daemon-foreground PASS
+export FAKE_DAEMON_QUERY_PARITY=false
+run_inventory daemon-foreground-lies 1 \
+  "$(inv_row daemon-foreground '["daemon","--foreground"]' 0 - daemon-foreground-lifecycle service-mutation)"
+inv_verdict daemon-foreground-lies daemon-foreground FAIL
+unset FAKE_DAEMON_QUERY_PARITY FAKE_INVENTORY_HOME FAKE_INVENTORY_ALLOW_MUTATIONS
 run_inventory empty-argument 0 "$(inv_row empty '["empty-arg","","tail"]' 0)"
 inv_verdict empty-argument empty PASS
 run_inventory json-dependency 1 \
@@ -862,5 +902,18 @@ assert_rc 2 "$inventory_runner" --work "$scratch/inventory-refusal" --distro arc
 mkdir -p "$scratch/inventory-schema/guest"
 assert_rc 1 "$inventory_runner" --work "$scratch/inventory-schema" --distro arch --tiers credentialed --tag v9.9.9 --binary "$scratch/fake inventory omg" --tsv "$repo_root/tests/cli_behavior_inventory.tsv"
 inv_verdict schema inventory-selection HARNESS_ERROR
+
+# Advertised update modes and the foreground daemon must remain executable
+# behavioral rows. A declaration-only regression would silently restore the
+# four-distro skips this harness is intended to prevent.
+for covered in update-fast update-turbo daemon-foreground; do
+  awk -F '\t' -v id="$covered" '
+    $1 == id {
+      if ($5 != "pass" || $8 != "arch:pass,debian:pass,ubuntu:pass,fedora:pass") exit 1
+      found = 1
+    }
+    END { exit !found }
+  ' "$repo_root/tests/cli_behavior_inventory.tsv" || fail "$covered is not an executable all-distro inventory row"
+done
 
 printf 'PASS: release smoke and QEMU fixture suite\n'

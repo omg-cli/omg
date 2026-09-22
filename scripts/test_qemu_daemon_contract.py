@@ -81,6 +81,25 @@ class DaemonContractTests(unittest.TestCase):
                                         cwd=root, capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, passed, result.stderr)
 
+    @unittest.skipIf(os.name == 'nt', 'native query diagnostics require POSIX jq')
+    def test_query_mismatch_reports_bounded_native_and_omg_set_differences(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        begin = source.index('# BEGIN EXPLICIT QUERY ORACLE')
+        end = source.index('# END EXPLICIT QUERY ORACLE', begin)
+        function = source[begin:end]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'expected').write_text('["bash","native-only"]')
+            (root / 'listing').write_text('{"packages":["bash","omg-only","omg-only"],"count":3}')
+            result = subprocess.run(
+                [BASH, '-c', function + '\nreport_explicit_query_difference expected listing fixture'],
+                cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('fixture native_count=2 omg_count=3', result.stderr)
+            self.assertIn('native_only=["native-only"]', result.stderr)
+            self.assertIn('omg_only=["omg-only"]', result.stderr)
+            self.assertIn('omg_duplicates=["omg-only"]', result.stderr)
+
     def test_shell_startup_does_not_skip_this_users_ipc_check_for_another_process(self):
         source = (ROOT / 'src/cli/init.rs').read_text(encoding='utf-8')
         command = re.search(r'const DAEMON_SHELL_START: &str = "([^"]+)";', source).group(1)

@@ -346,6 +346,25 @@ check_product_output() {
         if [[ ! -f "$artifact" || -L "$artifact" ]] || ! jq -e -s 'length == 1' "$artifact" >/dev/null 2>&1; then
           printf 'assertion failed: artifact %s is not a regular JSON document\n' "$artifact" >&2; return 1
         fi ;;
+      update-fast-output)
+        if ! grep -Eqi 'Fast System Update|Syncing package|Synced' "$stdout" \
+          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' "$stdout"; then
+          printf 'assertion failed: update --fast lacked sync and completion evidence\n' >&2; return 1
+        fi ;;
+      update-turbo-output)
+        if ! grep -Eqi 'TURBO System Update|Turbo upgrade|cached, no sync|Checking for updates.*cached' "$stdout" \
+          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' "$stdout"; then
+          printf 'assertion failed: update --turbo lacked cached-mode and completion evidence\n' >&2; return 1
+        fi ;;
+      daemon-foreground-lifecycle)
+        if [[ ! -f daemon-evidence/daemon-lifecycle.json || -L daemon-evidence/daemon-lifecycle.json ]] \
+          || ! jq -e -s 'length == 1 and (.[0] | .schema_version == 1 and
+            .direct == true and .foreground == true and .ipc == true and
+            .singleton == true and .shutdown == true and .restart == true and
+            .query_parity == true and .sigint == true and .cleanup == true and
+            (.backend_faults | type == "array"))' daemon-evidence/daemon-lifecycle.json >/dev/null; then
+          printf 'assertion failed: daemon --foreground lifecycle receipt is missing or incomplete\n' >&2; return 1
+        fi ;;
     esac
   fi
   return 0
@@ -512,7 +531,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|audit-source-failure|sbom-source-failure|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json) ;; *) exit 2 ;; esac
+  case "$a" in -|audit-source-failure|sbom-source-failure|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
   row_exit["$id"]="$resolved"; row_targets["$id"]="$tg"; row_assertions["$id"]="$a"
@@ -660,6 +679,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == runtime-go-install ]]; then
     command_timeout=$((row_timeout * 3))
   fi
+  if [[ "$case" == update-fast ]]; then
+    command_timeout=$((row_timeout * 3))
+  elif [[ "$case" == daemon-foreground ]]; then
+    command_timeout=240
+    remote+="; mkdir -p daemon-evidence"
+  fi
   counter=$(counter_for_case "$case")
   if [[ -n "$counter" ]]; then
     remote+="; $(declare -f check_native_counter)"
@@ -669,7 +694,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     runtime_name=$(jq -r '.[1]' <<< "$args_json")
     remote+="; umask 0002; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install"); $(declare -f check_runtime_usage)"
   fi
-  remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+  if [[ "$case" == daemon-foreground ]]; then
+    remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
+  else
+    remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+  fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log; then assertion=1; fi"
   if [[ -n "$counter" ]]; then

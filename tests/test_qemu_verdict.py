@@ -35,6 +35,7 @@ report_inventory='[{"case_id":"qemu-arch-row","distro":"arch","result":"FAIL","e
             rows = json.loads((work / 'sentry-results.json').read_text())
             self.assertEqual((rows[0]['result'], rows[0]['exit_code']), ('PASS', 0))
             self.assertEqual(rows[1]['result'], 'FAIL')
+            self.assertIn('arch lifecycle=PASS overall=PRODUCT_FAIL', result.stdout)
 
 
 if __name__ == '__main__':

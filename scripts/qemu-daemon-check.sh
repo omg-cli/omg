@@ -16,6 +16,26 @@ check_explicit_query_outputs() {
   done
   jq -e -s --argjson wanted "$wanted" 'length == 1 and (.[0] | type == "object") and .[0].count == $wanted' "$jsoncount" >/dev/null
 }
+report_explicit_query_difference() {
+  local expected=$1 listing=$2 label=$3
+  jq -r -s --slurpfile expected "$expected" --arg label "$label" '
+    if length == 1 and (.[0] | type == "object") and
+       (.[0].packages | type == "array") and
+       ($expected | length == 1) and ($expected[0] | type == "array") then
+      .[0].packages as $actual |
+      (($expected[0] - $actual) | unique) as $native_only |
+      (($actual - $expected[0]) | unique) as $omg_only |
+      ($actual | sort | group_by(.) | map(select(length > 1) | .[0])) as $omg_duplicates |
+      "\($label) native_count=\($expected[0] | length) omg_count=\($actual | length)",
+      "native_only=\($native_only[0:50] | @json)",
+      "omg_only=\($omg_only[0:50] | @json)",
+      "omg_duplicates=\($omg_duplicates[0:50] | @json)",
+      "difference_truncated=\(($native_only | length) > 50 or ($omg_only | length) > 50 or ($omg_duplicates | length) > 50)"
+    else
+      "\($label) package listing was not a single valid query document"
+    end
+  ' "$listing" >&2
+}
 # END EXPLICIT QUERY ORACLE
 # BEGIN BACKEND FAULT ORACLE
 check_backend_refusal() {
@@ -79,6 +99,8 @@ query_cli() {
   if ! check_explicit_query_outputs "$evidence/native-explicit.json" \
     "$evidence/$label-explicit.json" "$evidence/$label-count.txt" \
     "$evidence/$label-shortcut.txt" "$evidence/$label-count.json"; then
+    report_explicit_query_difference "$evidence/native-explicit.json" \
+      "$evidence/$label-explicit.json" "$label"
     printf 'assertion failed: %s explicit listing/count differs from native package inventory\n' "$label" >&2
     return 1
   fi

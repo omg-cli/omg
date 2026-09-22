@@ -335,6 +335,20 @@ impl DnfPackageManager {
         Ok(())
     }
 
+    /// DNF reports install reasons by package name, while RPM can retain
+    /// multiple installed versions of the same name (notably kernels).
+    /// Explicit-package APIs are name inventories, so collapse those parallel
+    /// versions before returning a listing or count.
+    fn explicit_package_names(packages: impl IntoIterator<Item = InstalledPackage>) -> Vec<String> {
+        packages
+            .into_iter()
+            .filter(|package| package.reason == InstallReason::User)
+            .map(|package| package.name)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Load installed packages from RPM `SQLite` database
     ///
     /// Reads directly from `/var/lib/rpm/rpmdb.sqlite` and parses RPM header blobs
@@ -1576,10 +1590,7 @@ impl PackageManager for DnfPackageManager {
             let mut installed = self.load_installed_packages().await?;
             Self::apply_current_install_reasons(&mut installed).await?;
             let total = installed.len();
-            let explicit = installed
-                .iter()
-                .filter(|p| p.reason == InstallReason::User)
-                .count();
+            let explicit = Self::explicit_package_names(installed).len();
 
             let (orphans, updates) = if fast {
                 (0, 0)
@@ -1599,12 +1610,7 @@ impl PackageManager for DnfPackageManager {
         Box::pin(async move {
             let mut installed = self.load_installed_packages().await?;
             Self::apply_current_install_reasons(&mut installed).await?;
-
-            Ok(installed
-                .into_iter()
-                .filter(|pkg| pkg.reason == InstallReason::User)
-                .map(|pkg| pkg.name)
-                .collect())
+            Ok(Self::explicit_package_names(installed))
         })
     }
 
@@ -2603,6 +2609,38 @@ mod tests {
             cached
                 .iter()
                 .any(|package| package.release.ends_with("i686"))
+        );
+    }
+
+    #[test]
+    fn explicit_package_names_collapse_parallel_installed_versions() {
+        let packages = vec![
+            InstalledPackage {
+                name: "kernel-core".to_string(),
+                version: "6.17.1".to_string(),
+                release: "1.fc44".to_string(),
+                summary: "Kernel".to_string(),
+                reason: InstallReason::User,
+            },
+            InstalledPackage {
+                name: "kernel-core".to_string(),
+                version: "6.17.2".to_string(),
+                release: "1.fc44".to_string(),
+                summary: "Kernel".to_string(),
+                reason: InstallReason::User,
+            },
+            InstalledPackage {
+                name: "kernel-modules".to_string(),
+                version: "6.17.2".to_string(),
+                release: "1.fc44".to_string(),
+                summary: "Kernel modules".to_string(),
+                reason: InstallReason::Dependency,
+            },
+        ];
+
+        assert_eq!(
+            DnfPackageManager::explicit_package_names(packages),
+            vec!["kernel-core"]
         );
     }
 
