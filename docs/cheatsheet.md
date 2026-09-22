@@ -29,7 +29,7 @@ omg daemon-status
 - `omg --version` prints the installed version.
 - `omg doctor` checks the machine's setup and reports problems (it exits 0 when healthy, 1 when it finds issues).
 - `omg status` shows a short system summary.
-- `omg daemon-status` shows whether the background helper is running.
+- `omg daemon-status` shows whether the background helper is running on Unix builds.
 
 For the exact options of any command, add `--help`. For example:
 
@@ -51,6 +51,7 @@ omg outdated
 ```
 
 - `omg search` finds packages. On Arch it includes the AUR unless you add `--no-aur`.
+  In an attended terminal, you can select a result to open details without installing it.
 - `omg info` shows one package's details.
 - `omg why` explains why a package is installed, through the chain of packages that need it.
 - `omg explicit --count` prints how many packages you asked for yourself.
@@ -83,7 +84,8 @@ omg which node
 omg use node 22
 ```
 
-- `omg list` shows the versions you already have; `--available` adds the ones you could download.
+- `omg list` shows installed versions. With a runtime name, `--available` lists
+  remote versions instead; it does not add them to the installed list.
 - `omg which` prints the version that is active now.
 - `omg use` switches to a version and installs it first if it is missing.
 
@@ -134,7 +136,7 @@ omg audit verify
 omg audit sbom -o sbom.json
 ```
 
-These operations have [backend and evidence limits](./security.md). Scan findings alone do not cause failure. SBOM advisory matching requires Arch support; exports are plaintext. Local log verification proves neither authenticity nor completeness. The SLSA-named command does not verify a SLSA build level.
+These operations have [backend and evidence limits](./security.md). Scan findings alone do not cause failure. System SBOM generation supports Arch, Debian, Ubuntu, and Fedora builds; exports are plaintext. Local log verification proves neither authenticity nor completeness. The SLSA-named command does not verify a SLSA build level.
 
 ## I want to undo a change
 
@@ -159,7 +161,8 @@ omg dash
 ```
 
 - `omg config` reads and checks OMG's settings; `config path` prints where the settings file lives.
-- `omg account status` shows whether this machine is linked to an optional dashboard account.
+- `omg account status` shows whether this machine is linked to an optional dashboard account
+  in builds with the `license` feature.
 - `omg container status` shows whether Docker or Podman is available.
 - `omg hooks status` and `omg hooks uninstall` manage the Git hooks OMG can install in a project.
 - `omg dash` opens a full-screen dashboard: `Tab` selects views, `r` requests a refresh, and `q` quits outside text entry.

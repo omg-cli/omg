@@ -1,4 +1,14 @@
+---
+title: Portable environment planning
+sidebar_position: 41
+description: Preview explicit package mappings for another supported platform
+---
+
 # Portable environment planning
+
+This page helps you describe the tools a project needs on several operating systems. OMG can print a read-only plan for one target. The plan does not install packages or copy files.
+
+If you are new to terminals or package managers, start with [getting started](./getting-started.md) and the [glossary](./glossary.md).
 
 ## Start from an existing capture
 
@@ -62,7 +72,19 @@ to the user's home. Paths are validated lexically only. No file contents are rea
 and existence, symlinks, ownership, conflicts and permissions are not checked by
 this preview. Do not include credentials or employer-private data in shared files.
 
+The environment section uses schema version 1. The planner accepts a manifest up
+to 256 KiB, at most 512 tools, and at most 128 dotfile mappings. Tool and package
+identifiers may be up to 128 characters; relative dotfile paths may be up to 1024
+characters. Invalid targets, undeclared tool mappings, unsafe paths, and duplicate
+dotfile destinations fail validation.
+
 This is the first portability increment. Cross-platform resolution, reviewed
 application, dotfile backups and an expanded lock schema remain unimplemented.
 Existing `omg env capture`, `check`, `share` and `sync` retain their existing
 behavior. A captured lockfile is not yet a portable installation recipe.
+
+## Where to go next
+
+Read [team environments](./team.md) for capture and drift checks. See
+[configuration](./configuration.md) for the separate OMG settings file and
+[troubleshooting](./troubleshooting.md) for help with a failed plan.

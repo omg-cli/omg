@@ -84,3 +84,9 @@ Coverage depends on backend and daemon availability. These collect evidence, not
 Review generated Dockerfiles, image inputs, and writable mounts before executing them. OMG's volume parser does not support a `:ro` suffix; use native engine controls when read-only mounts are required. See [containers](./containers.md).
 
 For failures, preserve the original error and records. Do not run a blanket reset, delete sockets without checking ownership, clear history, or weaken verification. See [troubleshooting](./troubleshooting.md) and [history](./history.md).
+
+## Where to go next
+
+Use [runtime management](./runtimes.md) for version selection,
+[run project tasks](./task-runner.md) for project commands, and
+[troubleshooting](./troubleshooting.md) when a step fails.

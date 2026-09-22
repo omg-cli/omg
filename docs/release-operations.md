@@ -1,4 +1,10 @@
-# Release Operations
+---
+title: Release operations
+sidebar_position: 61
+description: Build, verify, publish, resync, and roll back OMG releases
+---
+
+# Release operations
 
 > **Who this page is for:** OMG maintainers and contributors. It documents publishing a release.
 > It is not an everyday user guide. If you are new to OMG, start with
@@ -12,7 +18,7 @@ How releases are built, published, verified, and rolled back.
 flowchart TD
     A[Tag push v* or manual dispatch] --> B[gate-on-ci]
     B --> C[Build Arch, Debian, Ubuntu, Fedora, and macOS archives]
-    C --> D[Generate SBOM and collect allowlisted artifacts]
+    C --> D[Smoke-test APT archives, generate SBOM, collect artifacts]
     D --> E[Verify checksums and attestations]
     E --> F[Publish GitHub Release]
     F --> G[Upload archives and sidecars to R2]
@@ -24,10 +30,11 @@ flowchart TD
 tag push (v*) or manual dispatch
         │
         ▼
-gate-on-ci ──▶ build-arch / build-debian / build-ubuntu / build-fedora / build-macos
+gate-on-ci ──▶ build-arch / build-debian (Bookworm + Trixie) / build-ubuntu / build-fedora / build-macos
    (1)                  │  (digest-pinned distro containers, 1.95.0 toolchain)
                         ▼
-                   release (SBOM → checksum-verified collection → attest → GitHub Release)
+                   smoke-apt (APT 6 and APT 7) → release
+                   (SBOM → checksum-verified collection → attest → GitHub Release)
                         │
                         ▼
                    sync-r2  (environment: production)
@@ -45,15 +52,16 @@ Checks configured in `.github/workflows/release.yml`:
 - **Reproducible dependency set.** Every build uses `--locked` against
   `Cargo.lock`; the SBOM job fails if generation mutates the lockfile.
 - **Artifact allowlist.** `scripts/collect-release-artifacts.sh` refuses
-  anything that is not exactly the five platform archives, their `.sha256`
-  sidecars, and the CycloneDX SBOM.
+  anything that is not exactly the six platform archives, their `.sha256`
+  sidecars, and the CycloneDX SBOM. The sixth archive targets Debian Trixie
+  and other supported APT 7 hosts.
 - **Fail-closed publish.** If any uploaded R2 object cannot be re-downloaded
   byte-identical, the job aborts *before* the `latest-version` marker moves.
 - **Cache policy matches mutability.** Version-addressed archives and `.sha256`
   sidecars are uploaded with `Cache-Control: public, max-age=31536000,
-  immutable`; the only mutable pointer, the `latest-version` marker, is
-  published with `Cache-Control: no-store` by both `release.yml` and
-  `scripts/r2-rollback.sh`, so subsequent version checks fetch the current marker.
+  immutable`. The mutable `install.sh` mirror and its sidecar use
+  `max-age=0, must-revalidate`. The `latest-version` marker uses `no-store`
+  in both `release.yml` and `scripts/r2-rollback.sh`.
 - **Remote R2 only.** Wrangler 4's `r2 object` commands default to local
   Miniflare storage. `release.yml` and `scripts/r2-rollback.sh` pass `--remote`
   so publishes hit the production `omg-releases` bucket.
@@ -71,8 +79,8 @@ GitHub Actions attestations do not by themselves establish SLSA Levels 1–3 or 
 If GitHub publication succeeds but `sync-r2` does not, dispatch the `Release`
 workflow from `main` with `sync_existing_tag` set to the published tag and
 `dry_run` set to `false`. The default dry run does not sync or publish. This
-path does not rebuild or edit the release. It downloads exactly five archives
-and five checksum sidecars, verifies every checksum and GitHub attestation
+path does not rebuild or edit the release. It downloads exactly six archives
+and six checksum sidecars, verifies every checksum and GitHub attestation
 against the tag's commit, then runs the normal production R2 upload,
 round-trip verification, and latest-marker sequence.
 
@@ -104,8 +112,10 @@ downgrade policy.
 
 ## Rollback
 
-`latest-version` is the only intentionally mutable pointer; release operations
-must treat version-addressed archives as immutable. To select a previously
+`latest-version` is the version-selection pointer; release operations
+must treat version-addressed archives as immutable. The release job also
+refreshes the mutable bucket copy of `install.sh` and its checksum sidecar.
+To select a previously
 published version for new downloads:
 
 ```bash
@@ -115,7 +125,7 @@ export CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=...
 ```
 
 The script refuses to move the marker to a version whose archives are not
-fully present in R2 (all five platforms). Fresh installations use the selected
+fully present in R2 (all six archives). Fresh installations use the selected
 version. Installed clients resolve the same marker, but a normal `omg self-update`
 refuses a version older than the installed binary. Users must run
 `omg self-update --force` to accept that downgrade. Checksum and provenance
@@ -152,4 +162,8 @@ Rotation procedure:
   explicit error directing users to the manual path rather than
   installing a wrong-arch binary.
 
-**Last Updated:** 2026-09-04
+## Where to go next
+
+- [Release readiness](./release-readiness.md) lists checks before a tag.
+- [QA issue loop](./qa-loop.md) explains smoke and guest failure reporting.
+- [Troubleshooting](./troubleshooting.md) covers failed installs and updates.

@@ -91,8 +91,9 @@ Capabilities differ, and OMG does not pretend otherwise:
 | :--- | :--- |
 | Core package queries and mutations | Use the direct backend path; the daemon is an optimisation, not a dependency |
 | `omg audit scan` | Prefer the daemon's warm state, then fall back to the direct package backend and scanner |
-| Unix SOC 2 export, `omg metrics` | Require a running daemon and fail explicitly without one |
-| Prompt counters (`omg ec`, `tc`, `oc`, `uc`) | Read the status snapshot file directly, so they work with no daemon at all |
+| Unix SOC 2 export | Runs its scan directly if the daemon is unavailable; a supported system SBOM backend is still required |
+| `omg metrics` | Requires a running daemon and fails explicitly without one |
+| Prompt counters (`omg ec`, `tc`, `oc`, `uc`) | Read a valid, fresh status file first. If it is unavailable, they try the daemon and then direct package data |
 
 See [cache](./cache.md) for the snapshot rules and [daemon](./daemon.md) for lifecycle
 detail.
@@ -105,6 +106,9 @@ detail.
 - **Version-bounded.** A frame from a different protocol version is rejected with both
   versions reported (`VersionMismatch`). Keep `omg` and `omgd` from the same release, which
   is why they ship as a pair; see [installation](./installation.md).
+- **Bounded work.** The server limits an incoming request to 1 MiB, an encoded response to
+  8 MiB, and concurrent client connections to 128. Requests have a 30-second timeout.
+  These are resource limits, not a promise that every query finishes in that time.
 - **Derived state only.** Everything the daemon caches can be rebuilt from the native
   package databases, so stopping or killing it never corrupts a package transaction.
 

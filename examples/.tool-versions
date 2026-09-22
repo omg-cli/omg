@@ -1,160 +1,26 @@
-# OMG Tool Versions Example
-# Compatible with mise, asdf, and other version managers
+# Project runtime pins read by OMG's shell hook and "omg use <runtime>".
+# These versions are examples. Choose versions available for your platform.
+# Keep one line per runtime: the first matching entry in this file wins.
 #
-# This file locks runtime versions for your project.
-# Place it in your project root to ensure all team members use the same versions.
+# Copy this file to a project root, edit the versions, and commit it.
+# Install a selected version explicitly, for example:
+#   omg use node 22
+# Or let OMG detect this file for one named runtime:
+#   omg use node
+# Inspect installed versions with "omg list node" and selection with "omg which node".
 #
-# Usage:
-#   omg use        # Auto-detects and activates versions from this file
-#   omg env check  # Verifies current environment matches this file
-#   omg env sync   # Installs missing versions and activates them
+# Automatic directory switching requires a Bash, Zsh, or Fish hook.
+# It selects installed versions only. It does not install missing versions.
 
-# ============================================================================
-# JAVASCRIPT/TYPESCRIPT RUNTIMES
-# ============================================================================
+node 22
+python 3.12
+go 1.23
+rust stable
 
-# Node.js - LTS version (recommended for production)
-node 20.11.0
-
-# Bun - Fast JavaScript runtime
-#bun 1.0.25
-
-# Deno - Secure JavaScript/TypeScript runtime
-#deno 1.40.0
-
-# ============================================================================
-# PYTHON
-# ============================================================================
-
-# Python - Latest stable 3.x
-python 3.12.1
-
-# Python - Legacy version (if needed)
-#python 2.7.18
-
-# ============================================================================
-# RUST
-# ============================================================================
-
-# Rust - Stable channel (recommended)
-rust 1.92.0
-
-# Rust - Nightly channel (for bleeding-edge features)
-#rust nightly-2026-01-15
-
-# ============================================================================
-# GO
-# ============================================================================
-
-# Go - Latest stable
-go 1.23.0
-
-# ============================================================================
-# RUBY
-# ============================================================================
-
-# Ruby - Latest stable
-ruby 3.3.0
-
-# ============================================================================
-# JAVA
-# ============================================================================
-
-# Java - OpenJDK LTS
-java 21.0.1
-
-# Java - Oracle GraalVM (for native images)
-#java graalvm-21.0.1
-
-# ============================================================================
-# OTHER RUNTIMES (via mise)
-# ============================================================================
-
-# PHP
-#php 8.3.0
-
-# Elixir
-#elixir 1.16.0
-
-# Erlang
-#erlang 26.2
-
-# Zig
-#zig 0.12.0
-
-# Lua
-#lua 5.4.6
-
-# Kotlin
-#kotlin 1.9.22
-
-# Scala
-#scala 3.3.1
-
-# ============================================================================
-# EXAMPLE CONFIGURATIONS
-# ============================================================================
-
-# --- Full-Stack JavaScript Project ---
-# node 20.11.0
-# bun 1.0.25
-# deno 1.40.0
-
-# --- Python Data Science Project ---
-# python 3.12.1
-# jupyter 7.0.0
-
-# --- Rust Systems Project ---
-# rust 1.92.0
-# rust nightly-2026-01-15
-
-# --- Polyglot Microservices ---
-# node 20.11.0
-# go 1.23.0
-# rust 1.92.0
-# python 3.12.1
-# java 21.0.1
-
-# --- Mobile Development ---
-# node 20.11.0
-# java 21.0.1
-# kotlin 1.9.22
-# ruby 3.3.0
-
-# ============================================================================
-# NOTES
-# ============================================================================
-
-# Version Format:
-# - Exact: "node 20.11.0" (recommended for reproducibility)
-# - Prefix: "node 20" (uses latest 20.x)
-# - Latest: "node latest" (not recommended for teams)
-# - Channels: "rust stable", "rust nightly", "rust beta"
-
-# Multiple Versions:
-# You can specify multiple versions of the same runtime:
-#   node 18.19.0
-#   node 20.11.0
-# OMG will use the LAST specified version as active.
-
-# Environment Variables:
-# Set runtime-specific environment variables in your shell config or .envrc:
-#   export NODE_OPTIONS="--max-old-space-size=4096"
-#   export RUST_BACKTRACE=1
-#   export GOPATH=$HOME/go
-
-# Team Workflow:
-# 1. Project lead creates .tool-versions with locked versions
-# 2. Commit .tool-versions to git
-# 3. Team members run:
-#      omg env sync  # Installs + activates all versions
-# 4. CI/CD runs same command for reproducible builds
-
-# Updating Versions:
-#   omg use node latest  # Updates .tool-versions to latest Node
-#   git diff .tool-versions  # Review changes
-#   git commit -m "chore: bump node to latest"
-
-# Checking Drift:
-#   omg env check  # Shows mismatches between .tool-versions and current env
-#   omg env diff   # Detailed diff output
+# Other native managers include ruby, java, bun, deno, pi, zig, dotnet,
+# erlang, php, and swift. See docs/runtimes.md for platform requirements.
+#
+# This file does not create omg.lock. "omg env capture" creates that separate
+# environment record, and "omg env check" compares against omg.lock.
+# "omg env sync <gist-url-or-id>" downloads a shared record and checks drift.
+# It does not install missing runtimes or packages.

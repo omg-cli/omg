@@ -3,13 +3,14 @@
 //! Pins observable CLI contracts for `container init/status/list/images/pull/
 //! stop/run`: generated Dockerfile content, refusal-to-overwrite semantics,
 //! base-image sanitization, and pre-runtime validation of user-supplied
-//! references. Runtime-dependent paths are exercised against a deliberately
-//! emptied PATH so behavior is deterministic on any machine.
+//! references. Runtime-dependent paths use isolated fake engines or a
+//! deliberately emptied PATH so behavior is deterministic on any machine.
 
 pub mod common;
 
 use common::*;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 /// A PATH containing no executables at all: `docker`/`podman` detection must
@@ -45,6 +46,60 @@ fn init_creates_dockerfile_with_default_base_in_empty_project() {
         "default base image must be ubuntu:24.04, got:\n{dockerfile}"
     );
     result.assert_stdout_contains("Base image: ubuntu:24.04");
+    result.assert_stdout_contains("omg container build -f Dockerfile.omg -t myapp");
+}
+
+/// The default Dockerfile must stay relative to the build context. The
+/// container manager rejects absolute recipe paths before invoking the engine.
+#[test]
+fn build_with_default_dockerfile_reaches_the_engine() {
+    let project = TestProject::new();
+    project.create_file("Dockerfile", "FROM scratch\n");
+
+    let fake = TempDir::new().expect("fake container engine directory");
+    let log = fake.path().join("argv.log");
+    for name in ["docker", "podman"] {
+        let executable = fake.path().join(name);
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$OMG_CONTAINER_LOG\"\n",
+        )
+        .expect("write fake container engine");
+        let mut permissions = fs::metadata(&executable)
+            .expect("fake engine metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).expect("make fake engine executable");
+    }
+
+    let path = format!(
+        "{}:{}",
+        fake.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let result = project.run_with_env(
+        &["container", "build", "--tag", "omg-docs:latest"],
+        &[
+            ("PATH", path.as_str()),
+            (
+                "OMG_CONTAINER_LOG",
+                log.to_str().expect("fake log path is UTF-8"),
+            ),
+        ],
+    );
+    result.assert_success();
+
+    let args = fs::read_to_string(&log).expect("fake docker invocation");
+    let lines: Vec<&str> = args.lines().collect();
+    assert!(lines.len() >= 7, "incomplete fake docker argv: {args}");
+    assert_eq!(
+        &lines[lines.len() - 7..lines.len() - 1],
+        ["build", "-f", "Dockerfile", "-t", "omg-docs:latest", "--",],
+    );
+    assert_eq!(
+        lines.last(),
+        Some(&project.path().to_str().expect("project UTF-8"))
+    );
 }
 
 /// Contract: project marker files are detected and each mapped to its pinned

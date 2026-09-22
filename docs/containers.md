@@ -69,12 +69,13 @@ troubleshooting shortcut.
 
 ```bash
 omg container init                        # writes Dockerfile.omg for this project
-omg container build -f Dockerfile.omg -t myapp .
+omg container build -f Dockerfile.omg -t myapp
 ```
 
-Generation inspects the project, its runtime selectors, and the base image you ask for, then
-writes `Dockerfile.omg` and keeps a `.dockerignore` in step. It refuses to overwrite an
-existing `Dockerfile.omg`, so a second run cannot silently replace a recipe you edited.
+Generation checks for `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, and
+`requirements.txt` in the current directory. It writes `Dockerfile.omg` and adds protective
+ignore rules to `.dockerignore` and existing Dockerfile-specific or Podman ignore files.
+It refuses to overwrite an existing `Dockerfile.omg`.
 
 The generator pins every remote installer it emits to a digest. If it cannot establish those
 digests it refuses to write the file at all, with a message that says so, rather than emitting
@@ -102,6 +103,15 @@ unrelated containers or prune shared images as part of checking something else.
   a result must be repeatable, and review a new image as you would any other dependency.
 - **Host access is explicit.** Every `--volume` and `--workdir` you pass widens what the
   container can read or change on your machine.
+
+## If something goes wrong
+
+| What you see | What to do |
+| --- | --- |
+| `No container runtime detected` | Install and start Docker or Podman, then run `omg container status`. |
+| `Dockerfile.omg already exists` | Review the existing file. Use `omg container build -f Dockerfile.omg` to build it. |
+| A digest cannot be pinned | Retry when the publisher is reachable. Inspect the generated recipe before building. |
+| A volume option is rejected | OMG accepts `HOST:CONTAINER` only. Use the native engine if you need a read-only mount. |
 
 ## Where to go next
 

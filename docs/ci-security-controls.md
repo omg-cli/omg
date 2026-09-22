@@ -1,3 +1,9 @@
+---
+title: CI security controls
+sidebar_position: 98
+description: Maintainer guide to CI gates, QEMU evidence, and failure reporting
+---
+
 # CI security controls
 
 > **Who this page is for:** OMG maintainers and contributors. It documents continuous-integration controls.
@@ -11,13 +17,14 @@ E2E and QEMU for the exact source commit.
 
 ## Repository enforcement
 
-The active GitHub rulesets are recorded in `.github/security-rules/`:
+The checked-in ruleset definitions are recorded in `.github/security-rules/`. Confirm their
+live enforcement in GitHub repository settings before relying on them:
 
-- `23399194` requires a PR, resolved review conversations, an up-to-date branch,
+- `main.json` requires a PR, resolved review conversations, an up-to-date branch,
   `CI Success` and `Generate Coverage Report` from the GitHub Actions integration.
   Both checks run on every PR, so documentation changes cannot deadlock on a
   path-filtered required workflow. Main cannot be deleted or force-pushed.
-- `23399197` prevents updates and deletion of `v*` tags. New version tags remain
+- `release-tags.json` prevents updates and deletion of `v*` tags. New version tags remain
   permitted so the gated release workflow can create them.
 
 No actor is listed for bypass. The sole-maintainer policy requires zero external
@@ -116,3 +123,9 @@ References: [GitHub secure use](https://docs.github.com/en/actions/reference/sec
 [QEMU security](https://www.qemu.org/docs/master/system/security.html),
 [journalctl](https://www.freedesktop.org/software/systemd/man/journalctl), and
 [SLSA artifact verification](https://slsa.dev/spec/v1.2/verifying-artifacts).
+
+## Where to go next
+
+- [Security model](./security.md) for the limits of user-facing audit evidence.
+- [QEMU image renewal](./qemu-image-renewal.md) for pin review and hosted validation.
+- [Contributing](../CONTRIBUTING.md) for the contribution workflow.

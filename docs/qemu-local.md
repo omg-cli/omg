@@ -1,13 +1,20 @@
+---
+title: Local QA pipeline
+sidebar_position: 62
+description: Run release smoke and QEMU guest checks from a checkout
+---
+
 # Running the QA pipeline locally
 
 > **Who this page is for:** OMG maintainers and contributors. It documents the local virtual-machine test environment.
 > It is not an everyday user guide. If you are new to OMG, start with
 > [Getting started](./getting-started.md).
 
-The pipeline is local-first: every leg runs from a checkout with no CI
-involved, and the GitHub workflows mirror these same commands. CI stays
-as a backup; the primary loop is your machine filing issues (and,
-once enabled, PRs) that agents work while you iterate.
+The local scripts let you test a candidate from a checkout without waiting
+for hosted CI. The GitHub workflows run the corresponding release smoke and
+QEMU paths and retain evidence. Local failures can open issues; the trusted
+hosted reporter closes an issue only after a qualifying passing push to
+`main`. See [the QA issue loop](./qa-loop.md).
 
 ## Prerequisites
 
@@ -23,7 +30,8 @@ once enabled, PRs) that agents work while you iterate.
   locally, know it installs/removes the `tree` probe package).
 - One-time: `gh label create qa-failure --description "Automated QA pipeline failures" --color B60205`
   (filing targets this label). Optional Sentry reporting reads
-  `~/.config/omg-smoke/sentry.json` or `OMG_SMOKE_SENTRY_CONFIG`.
+  `~/.config/omg-smoke/sentry.json`, `OMG_SMOKE_SENTRY_CONFIG`, or
+  `OMG_SMOKE_SENTRY_DSN` when no file is configured.
   See [reporter configuration](../scripts/README.md#optional-sentry-reporting).
 
 ## What to run
@@ -32,8 +40,9 @@ once enabled, PRs) that agents work while you iterate.
 
 The workflow repository variable `OMG_QEMU_ARM_RUNNER` selects a single runner
 label for both the ARM health job and ARM guests. When unset it defaults to
-`ubuntu-24.04-arm`. The three ARM guest jobs in run `34778845877` lacked
-`/dev/kvm` on that default label; a label does not establish KVM availability.
+`ubuntu-24.04-arm`. In historical run `34778845877`, the three ARM guest
+jobs lacked `/dev/kvm` on that default label. This is evidence about that
+run, not the current runner; a label does not establish KVM availability.
 Do not configure a replacement label until a matching runner is available.
 
 The selected runner must run native Linux aarch64, provide Docker, Bash,
@@ -113,11 +122,9 @@ exactly like `.github/workflows/release.yml` does, then:
 ./scripts/release-smoke.sh --release vX.Y.Z --distro all --staged-dir <dir>
 ```
 
-Native macOS smoke (on a Mac):
-
-```bash
-./scripts/release-smoke.sh --release vX.Y.Z --distro macos --executor native
-```
+Native macOS smoke needs an independent archive digest pin before it can
+execute a release binary on the host. Follow the commands in
+[macOS release smoke](./qemu-macos.md#run-a-published-archive-locally).
 
 Full QEMU guests (needs KVM + Docker):
 
@@ -147,8 +154,8 @@ under guest evidence. See [Linux audit storage and migration](security.md#audit-
 
 ## What inventory results prove
 
-The inventory currently has 184 rows: 167 hermetic-tier contracts, three
-container package contracts, and 14 declaration-only rows. The `hermetic`
+The current inventory has 196 rows: 176 hermetic-tier contracts, nine
+container-tier contracts, and 11 rows in other or combined tiers. The `hermetic`
 tier names the fixture-based Rust test contracts. Running these rows in a
 real guest is not hermetic: runtime downloads and other network operations
 still need network access. Guest images are pinned, but package index refreshes
@@ -209,13 +216,17 @@ execution evidence.
 
 ## Filing issues (and the coming PRs) from a local run
 
-Dry-run first, file second. Use a unique run URL per local run so
-repeat runs comment rather than staying silent:
+`benchmark-qemu.sh` and `release-smoke.sh` attempt to file local failures
+themselves and write `issue-filing.log`. A local pass does not close a hosted
+issue. If that filing failed, inspect the log and dry-run the helper before
+retrying. For QEMU, use `sentry-results.json` when present because it includes
+inventory failures as well as the lifecycle result; `results.json` alone is
+only the lifecycle row. Use a unique run URL so a repeat failure comments:
 
 ```bash
 RUN_URL="local-$(hostname)-$(date -u +%Y%m%dT%H%M%SZ)"
-./scripts/qa-file-issue.sh <run-dir>/results.json --run-url "$RUN_URL" --source qemu-matrix --dry-run
-./scripts/qa-file-issue.sh <run-dir>/results.json --run-url "$RUN_URL" --source qemu-matrix
+./scripts/qa-file-issue.sh <run-dir>/sentry-results.json --run-url "$RUN_URL" --source qemu-matrix --failures-only --dry-run
+./scripts/qa-file-issue.sh <run-dir>/sentry-results.json --run-url "$RUN_URL" --source qemu-matrix --failures-only
 ```
 
 Notes:
@@ -224,8 +235,10 @@ Notes:
   (forks file to the fork); override with `--repo owner/name`.
 - Evidence dir defaults to the results file's directory; excerpts come
   from transcripts / `guest-check.log` / inventory row logs.
-- The filed issue's runbook has the rerun command; green reruns
-  auto-close it. See `docs/qa-loop.md` for the full contract.
+- Closing requires `--fixed-by-pr N` for a pushed pull request whose
+  commit passed. The trusted reporter adds that flag when GitHub
+  associates the passing commit with a pull request. A direct push does
+  not close. See `docs/qa-loop.md`.
 - Fingerprints are shared between local and CI runs (same `--source`
   names), so a CI nightly and your local run update the same issues
   instead of duplicating them.
@@ -243,8 +256,8 @@ committed on a branch:
 The script refuses non-`[qa]` issues, closed issues, dirty trees, and
 unknown branches; then pushes the branch and opens a **draft** PR with
 `Fixes #123` plus a verification checklist. Verify per the checklist,
-promote from draft, merge — merging closes the issue (the nightly
-resolve-on-green would close it too).
+promote from draft, and merge. The issue stays open until a passing run
+of that pushed commit closes it. A local pass does not.
 
 ## Evidence map
 
@@ -271,7 +284,8 @@ resolve-on-green would close it too).
    `test-qa-file-issue`, `test-qa-open-pr`, `test-qa-audit`).
 2. Container smoke on your build, all four distros.
 3. QEMU guests per distro with `--inventory-tiers hermetic,container --inventory-allow-mutations`.
-4. File with `--dry-run`, review, then file for real.
+4. Inspect each `issue-filing.log`. If local filing failed, dry-run a manual
+   retry, review it, then file for real.
 5. Summarize what failed for the audit — paste-ready, secrets scrubbed:
 
 ```bash
@@ -281,3 +295,9 @@ resolve-on-green would close it too).
 
 Bring that output back: it is the input to the code/command audit —
 no pending-row flips, no expectation edits, just errors.
+
+## Where to go next
+
+- [QA issue loop](./qa-loop.md) explains when an issue opens or closes.
+- [QEMU image review](./qemu-image-renewal.md) covers image provenance expiry.
+- [Release readiness](./release-readiness.md) lists the publication gates.

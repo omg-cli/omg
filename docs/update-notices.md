@@ -22,7 +22,7 @@ version you are running. It is never the authority for an installation.
 OMG 0.1.223 is available (installed: 0.1.222). Update with your package manager or `omg self-update`. Notes: https://github.com/omg-cli/omg/releases/tag/v0.1.223
 ```
 
-- A **successful interactive command** can print it after its own output. A failed command
+- On Unix, a **successful interactive command** can print it after its own output. A failed command
   never prints a notice and never changes its exit status.
 - A shell integration installed with `omg hook bash`, `omg hook zsh`, or `omg hook fish` can
   show the same notice in an interactive terminal. The hook is not required: notices work
@@ -67,8 +67,8 @@ interactive, successful, and not already handled by one of those cases.
 ls -l "${XDG_CACHE_HOME:-$HOME/.cache}/omg/update-notice.json"
 ```
 
-`OMG_CACHE_DIR` overrides the location. The file holds a timestamp and the last version seen;
-it is not required for OMG to work, and a damaged copy can simply be removed so the next
+`OMG_CACHE_DIR` overrides the location. The file holds the last check time, last notice time,
+and last version seen. It is not required for OMG to work. A damaged copy can be removed so the next
 eligible command recreates it.
 
 ## Turn it off
@@ -101,5 +101,5 @@ variable only matters for interactive use.
 ## Where to go next
 
 - [Installation](./installation.md) for the update and uninstall procedures themselves.
-- [Update and release notes](./releases/v0.1.223.md) for what a specific release changed.
+- [Release notes](https://github.com/omg-cli/omg/releases) for what a specific release changed.
 - [Configuration](./configuration.md) for cache and config locations.

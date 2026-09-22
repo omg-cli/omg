@@ -53,7 +53,9 @@ OMG and native package tools use the same underlying system package state. Avoid
 
 ## Account and team services
 
-Local package/runtime use does not require linking a dashboard account. Optional account linking consumes a token through standard input:
+Local package/runtime use does not require linking a dashboard account. The
+optional `account` command is present only in builds with the `license`
+feature. Where available, linking consumes a token through standard input:
 
 ```bash
 omg account link --token-stdin
@@ -65,4 +67,6 @@ Feed it from an approved credential source, never a literal argv value. Environm
 
 Record OMG version, backend, project revision, working directory, exit status, and the actual command used. Local builds do not verify hosted authentication, billing, or invitation delivery. Troubleshoot those at their owning service rather than inventing a client-side workaround.
 
-See [workflows](./workflows.md), [configuration](./configuration.md), and [troubleshooting](./troubleshooting.md).
+## Where to go next
+
+See [workflows](./workflows.md), [configuration](./configuration.md), and [troubleshooting](./troubleshooting.md) for setup and support.

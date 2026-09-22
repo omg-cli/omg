@@ -1,589 +1,133 @@
 ---
-title: Task Runner
+title: Run project tasks
 sidebar_position: 13
-description: Unified task execution across ecosystems
+description: Find and run project build, test, and other tasks with OMG
 ---
 
-# Task Runner
+# Run project tasks
 
-**In plain words:** a project usually defines its own commands, such as `build` or `test`.
-`omg run` finds the right one for the project you are in and runs it, so you do not have to
-remember which tool this particular project uses.
+`omg run` runs a named task from the project directory you are in. It can use scripts from several project file formats. A task runs code from that project, so review unfamiliar repositories before using it.
 
-> New to the terminal? Read [Getting started](./getting-started.md) and
-> [the glossary](./glossary.md) first. `omg run` executes code that lives in the project
-> folder, so only run tasks in projects you trust.
+## What you need first
 
-**Unified Task Execution Across All Ecosystems**
+- [Install OMG](./installation.md) and open a terminal in your project directory.
+- Install the project's normal build tools and dependencies. OMG may offer to install a missing runtime or enable a JavaScript package manager, but task detection does not install every dependency.
+- If you need a term explained, see the [glossary](./glossary.md).
 
-OMG's task runner (`omg run`) detects supported project files and resolves a named task. It executes project-controlled code, not a sandboxed command. Review untrusted repositories before running tasks or accepting setup prompts. Missing tools or malformed configuration can cause explicit failures; detection does not guarantee dependency installation or a successful build.
+## Run a task
 
----
-
-## Overview
-
-Instead of remembering:
-
-- `npm run dev` or `yarn dev` or `pnpm dev` or `bun dev`
-- `cargo test` or `make test` or `poetry run test`
-- Which package manager to use for each project
-
-Just use:
+For a project that defines `build`, run:
 
 ```bash
-omg run dev
-omg run test
 omg run build
 ```
 
-OMG automatically:
-
-1. **Detects** the project type from config files
-2. **Activates** the correct runtime version (from `.nvmrc`, etc.)
-3. **Selects** the appropriate package manager
-4. **Executes** the task with proper arguments
-
----
-
-## Supported Project Types
-
-| Config File | Detected Runtime | Task Execution |
-| ------------- | ------------------ | ---------------- |
-| `package.json` | Node.js/Bun | npm/yarn/pnpm/bun |
-| `deno.json` | Deno | `deno task` |
-| `Cargo.toml` | Rust | `cargo` |
-| `Makefile` | Make | `make` |
-| `Taskfile.yml` | Task | `task` |
-| `pyproject.toml` | Python (Poetry) | `poetry run` |
-| `Pipfile` | Python (Pipenv) | `pipenv run` |
-| `composer.json` | PHP (Composer) | `composer run-script` |
-| `pom.xml` | Java (Maven) | `mvn` |
-| `build.gradle` | Java (Gradle) | `gradle` |
-
----
-
-## Basic Usage
-
-### Running Tasks
-
-Tasks allow you to interact with your project's lifecycle without needing to remember ecosystem-specific commands.
-
-- **Action Execution**: Run named tasks defined in your project configuration (e.g., `dev`, `test`, `build`).
-- **Dynamic Discovery**: View all tasks supported by your current project type.
-- **Parameter Passing**: Forward custom flags and arguments directly to the underlying tool.
-
-### How Tasks Are Resolved
-
-The system uses a sophisticated 11-tier discovery engine to determine the correct execution path, now enhanced with an intelligent priority hierarchy and ambiguity resolution:
-
-1. **Project Identification**: The detector inspects supported configuration files in the current directory, including Cargo, Node/Bun, Python, Maven/Gradle, Composer, and Deno files. It is not a recursive breadth-first repository search.
-2. **Ecosystem Priority**: If a task name exists in multiple ecosystems (e.g., both `Cargo.toml` and `package.json`), OMG uses a weighted priority system:
-    - **Rust (Cargo)**: 100
-    - **JavaScript/TypeScript (Node/Bun)**: 90
-    - **Python (Poetry/Pipenv)**: 80
-    - **Go (Task)**: 75
-    - **Ruby (Rake)**: 70
-    - **Java (Maven/Gradle)**: 60
-    - **PHP (Composer)**: 50
-    - **mise tasks** (`mise.toml` / `.mise.toml` `[tasks]`): 45
-    - **Make**: 40
-3. **Ambiguity Resolution**: If priorities are equal or user preferences are not defined, OMG will:
-    - **Interactive Prompt**: Ask you which ecosystem you intended to use.
-    - **Explicit Override**: Respect the `--using <ecosystem>` flag (e.g., `omg run test --using node`).
-    - **Multi-Execution**: Run across all detected ecosystems if the `--all` flag is provided.
-4. **Project Configuration**: You can permanently resolve ambiguity by creating a `.omg.toml` file in your project root:
-
-    ```toml
-    [scripts]
-    test = "rust"
-    build = "node"
-    ```
-
-5. **Runtime Activation**: Before execution, the system detects and activates the required runtime version from files like `.nvmrc` or `rust-toolchain.toml`.
-6. **Manager Selection**: For multi-manager ecosystems (like JavaScript), the system follows a strict priority logic:
-    - Explicit `packageManager` field in the configuration.
-    - Lockfile detection (prioritizing modern alternatives like `bun.lockb` or `pnpm-lock.yaml`).
-    - System default (falling back to standard managers if no preference is found).
-7. **Task Matching**: Discovered scripts or targets are matched against the user request and executed within the optimized environment.
-
-### Resolution Flow
-
-```mermaid
-flowchart TD
-    Start([omg run task]) --> Detect[Scan for Project Files]
-    Detect --> Match{Task Matches?}
-    Match -- No --> Fallback[Smart Guessing]
-    Match -- Yes --> Config{Config in .omg.toml?}
-
-    Config -- Yes --> Exec[Execute with Configured Ecosystem]
-    Config -- No --> Multi{Multiple Matches?}
-
-    Multi -- No --> Exec
-    Multi -- Yes --> Priority{Priority Difference?}
-
-    Priority -- Yes --> High[Pick Highest Priority] --> Exec
-    Priority -- No --> All{--all flag?}
-
-    All -- Yes --> ExecAll[Run in All Ecosystems]
-    All -- No --> Using{--using flag?}
-
-    Using -- Yes --> ExecUsing[Run Specific Ecosystem]
-    Using -- No --> Prompt[Interactive Selection] --> Exec
-```
-
----
-
-## Advanced Options
-
-| Flag | Description | Example |
-| ------ | ------------- | --------- |
-| `--using` | Force a specific ecosystem | `omg run test --using rs` |
-| `--all` | Run task in all detected ecosystems | `omg run build --all` |
-| `--watch`, `-w` | Re-run on file changes | `omg run test --watch` |
-| `--parallel`, `-p` | Run multiple tasks in parallel | `omg run build,test -p` |
-
----
-
-## JavaScript/TypeScript Projects
-
-### Package Manager Detection
-
-OMG selects the package manager in this order:
-
-1. **`packageManager` field** in `package.json` (highest priority)
-2. **Lockfile detection**:
-   - `bun.lockb` → Bun
-   - `pnpm-lock.yaml` → pnpm
-   - `yarn.lock` → Yarn
-   - `package-lock.json` → npm
-3. **Default**: Bun (if installed) → npm (fallback)
-
-### Examples
+OMG prints the selected ecosystem and source file before it runs the task. To pass arguments to the task, put `--` before them:
 
 ```bash
-# Project with package.json
-omg run dev        # → npm run dev (or bun/yarn/pnpm)
-omg run build      # → npm run build
-omg run test       # → npm run test
-
-# With arguments
 omg run test -- --coverage
 ```
 
-### packageManager Field
+Task names can contain ASCII letters, digits, `-`, `_`, and `.`. A colon in a requested name, such as `test:watch`, is rejected by the current CLI. Run that script with its native tool instead.
 
-OMG respects the `packageManager` field in `package.json`:
+## Project files OMG reads
 
-```json
-{
-  "name": "my-app",
-  "packageManager": "bun@1.1.0"
-}
-```
+OMG detects most tasks in the current directory. It does not search all subdirectories. The exception is mise configuration, which also reads ancestor directories.
 
-This ensures all team members use the same package manager version.
+| Project file | Tasks OMG discovers | Command it uses |
+| --- | --- | --- |
+| `package.json` | Entries in `scripts`, plus `install` when no install script exists | Selected npm, pnpm, Yarn, or Bun command |
+| `deno.json` | Entries in `tasks` | `deno task` |
+| `composer.json` | Entries in `scripts` | `composer run-script` |
+| `Cargo.toml` | `build`, `test`, `check`, `run`, `clippy`, `fmt` | `cargo` |
+| `Makefile` | Plain targets OMG can read from the file | `make` |
+| `pyproject.toml` | `[tool.poetry.scripts]` entries | `poetry run` |
+| `Pipfile` | `[scripts]` entries | `pipenv run` |
+| `pom.xml` | `clean`, `compile`, `test`, `package`, `install` | `mvn` |
+| `build.gradle` or `build.gradle.kts` | `build`, `test`, `run`, `clean` | `./gradlew` |
+| Supported mise project files | Supported `[tasks]` declarations | Native OMG task execution through `sh` |
+| `Taskfile.yml` or `Taskfile.yaml` | `list`; other names use the fallback path | `task` |
+| `Rakefile` | `tasks`; other names use the fallback path | `rake` |
 
-Supported values:
+The Taskfile and Rakefile integrations do not parse their task lists. `omg run build` can still try `task build` or `rake build` when no discovered task has that name. The fallback can also try an executable with the requested name. Check the project file before relying on a fallback.
 
-- `bun@1.1.0`
-- `pnpm@9.0.0`
-- `yarn@4.0.0`
-- `npm@10.0.0`
+`deno.jsonc` is not read by the current task detector. For a JSONC-only project, use `deno task` directly.
 
-### Corepack Integration
+## Choose between matching tasks
 
-If `packageManager` specifies pnpm or yarn, OMG can enable them via corepack:
+If the same task name exists in several project files, OMG normally chooses the highest-priority ecosystem. Rust ranks above JavaScript, Python, Go, Ruby, Java, PHP, mise, and Make. Ecosystems at the same priority can prompt in an interactive terminal. Without a terminal, an unresolved tie fails and asks you to choose.
 
-```bash
-# OMG will prompt:
-# "pnpm is not installed. Enable via corepack? [Y/n]"
-omg run dev
-```
-
-### Runtime Version Detection
-
-OMG checks for Node/Bun version files:
-
-| File | Example Content |
-| ------ | ----------------- |
-| `.nvmrc` | `20.10.0` |
-| `.node-version` | `20` |
-| `.bun-version` | `1.0.25` |
-| `package.json` engines | `{ "node": ">=18" }` |
-| `package.json` volta | `{ "node": "20.10.0" }` |
-
----
-
-## Rust Projects
-
-### Detection
-
-Rust projects are detected by `Cargo.toml`.
-
-### Task Mapping
-
-| omg run | cargo equivalent |
-| --------- | ------------------ |
-| `omg run build` | `cargo build` |
-| `omg run test` | `cargo test` |
-| `omg run run` | `cargo run` |
-| `omg run check` | `cargo check` |
-| `omg run bench` | `cargo bench` |
-| `omg run doc` | `cargo doc` |
-| `omg run fmt` | `cargo fmt` |
-| `omg run clippy` | `cargo clippy` |
-
-### Examples
+Use `--using` to choose an ecosystem:
 
 ```bash
-# Build release
-omg run build -- --release
-
-# Run with arguments
-omg run run -- --help
-
-# Test specific module
-omg run test -- tests::my_test
+omg run test --using rust
 ```
 
-### Toolchain Detection
-
-OMG reads `rust-toolchain.toml`:
+You can set a preference in the project's `.omg.toml`:
 
 ```toml
-[toolchain]
-channel = "1.75.0"
-components = ["rustfmt", "clippy"]
+[scripts]
+test = "rust"
+build = "node"
 ```
 
-The correct toolchain is activated before running tasks.
+`--all` runs every detected match for one task name, one after another. If one fails, execution stops. `--all` and `--using` cannot be combined.
 
----
+## Choose a JavaScript package manager
 
-## Python Projects
-
-### Poetry Projects (pyproject.toml)
-
-For projects with Poetry:
-
-```bash
-omg run serve     # → poetry run serve
-omg run test      # → poetry run pytest
-omg run lint      # → poetry run lint
-```
-
-### Pipenv Projects (Pipfile)
-
-For projects with Pipenv:
-
-```bash
-omg run dev       # → pipenv run dev
-omg run test      # → pipenv run test
-```
-
-### Virtual Environment Activation
-
-OMG automatically activates the correct Python version from `.python-version`:
-
-```bash
-# When .python-version contains "3.12.0"
-omg run test
-# Runs with Python 3.12.0 activated
-```
-
----
-
-## Makefile Projects
-
-### Detection
-
-Projects with `Makefile` in the root.
-
-### Task Mapping
-
-Make targets become `omg run` tasks:
-
-```makefile
-# Makefile
-build:
- go build -o bin/app
-
-test:
- go test ./...
-
-clean:
- rm -rf bin/
-```
-
-```bash
-omg run build   # → make build
-omg run test    # → make test
-omg run clean   # → make clean
-```
-
-### Listing Targets
-
-`omg run` has no `--list` flag. To see available targets, inspect the project
-file directly (`make help`, or read the Makefile), then run them via
-`omg run <task>`.
-
----
-
-## Taskfile Projects
-
-### Detection
-
-Projects with `Taskfile.yml` or `Taskfile.yaml`.
-
-### Example Taskfile
-
-```yaml
-# Taskfile.yml
-version: '3'
-
-tasks:
-  build:
-    cmds:
-      - go build -o bin/app
-    desc: Build the application
-
-  test:
-    cmds:
-      - go test ./...
-    desc: Run tests
-```
-
-### Usage
-
-```bash
-omg run build   # → task build
-omg run test    # → task test
-```
-
----
-
-## Java Projects
-
-### Maven (pom.xml)
-
-```bash
-omg run test     # → mvn test
-omg run package  # → mvn package
-omg run install  # → mvn install
-omg run clean    # → mvn clean
-```
-
-### Gradle (build.gradle)
-
-```bash
-omg run test     # → gradle test
-omg run build    # → gradle build
-omg run run      # → gradle run
-```
-
----
-
-## Deno Projects
-
-### Detection
-
-Projects with `deno.json` or `deno.jsonc`.
-
-### Example
+For `package.json`, OMG checks the `packageManager` field first. It then checks `bun.lockb`, `pnpm-lock.yaml`, `yarn.lock`, and `package-lock.json` or `npm-shrinkwrap.json`, in that order. With no marker, it uses npm. The current detector does not use `bun.lock` as a marker.
 
 ```json
 {
-  "tasks": {
-    "dev": "deno run --watch main.ts",
-    "test": "deno test"
-  }
+  "packageManager": "pnpm@9.0.0",
+  "scripts": { "build": "vite build" }
 }
 ```
 
-```bash
-omg run dev    # → deno task dev
-omg run test   # → deno task test
-```
+The field selects the manager name. OMG does not pin or install the exact `@9.0.0` version from that field. If pnpm or Yarn is missing, OMG may offer to enable it through Corepack. Check the tool version separately when exact reproducibility matters.
 
----
-
-## PHP Projects
-
-### Composer (composer.json)
-
-```json
-{
-  "scripts": {
-    "test": "phpunit",
-    "lint": "phpcs"
-  }
-}
-```
+## Watch and parallel modes
 
 ```bash
-omg run test   # → composer run-script test
-omg run lint   # → composer run-script lint
+omg run test --watch
 ```
 
----
-
-## Runtime Resolution
-
-`omg run` resolves project pins through OMG's native runtime managers. There is no backend override or implicit fallback manager.
-
----
-
-## Auto-Install Prompts
-
-When required tools are missing, OMG prompts to install:
-
-### Rust Toolchains
+Watch mode reruns a single task when watched files change. Stop it with Ctrl+C.
 
 ```bash
-$ omg run build
-# rust-toolchain.toml specifies 1.75.0
-# → "Rust 1.75.0 not installed. Install now? [Y/n]"
+omg run build,test --parallel
 ```
 
-### Node.js Versions
+Parallel mode takes a comma-separated list of task names. The CLI rejects conflicting combinations of `--watch`, `--parallel`, `--using`, and `--all`. See `omg run --help` for the accepted flags.
+At most 16 task names can run in one parallel invocation. Each task receives
+the extra arguments you pass after `--`.
 
-```bash
-$ omg run dev
-# .nvmrc specifies 20.10.0
-# → "Node 20.10.0 not installed. Install now? [Y/n]"
+## mise tasks
+
+OMG reads layered mise project files, including supported local and selected-environment files. It accepts a string task or a table with `run`, `depends`, `dir`, `env`, `description`, and `hide` properties. Dependencies run once in declared order before the requested task. Missing dependencies and cycles fail before execution. Unsupported execution controls fail during discovery.
+
+```toml
+[tasks]
+build = { run = "cargo build", depends = ["generate"] }
+generate = "echo ready"
 ```
 
-### Package Managers
+`omg run build --using mise` selects this task if another ecosystem also defines `build`. The task runs from the configuration file's project root unless `dir` sets a literal relative directory. See [mise compatibility](./mise-compatibility.md) for supported layers and limits.
 
-```bash
-$ omg run dev
-# packageManager: "pnpm@9.0.0"
-# → "pnpm not installed. Enable via corepack? [Y/n]"
-```
+## If something goes wrong
 
----
+| What you see | What to check |
+| --- | --- |
+| Wrong ecosystem selected | Run with `--using`, or set `[scripts]` in `.omg.toml`. |
+| Task not found | Check the supported project file in the current directory and the exact task name. |
+| A different JavaScript manager runs | Check `packageManager` and lockfiles in the order above. |
+| A runtime installation prompt appears | Review the project pin and requested version before accepting it. |
+| A command fails after detection | Run the underlying project command to diagnose its dependencies and script. |
 
-## Task Discovery
+`omg run` has no `--list` option. Read the project's scripts or targets, or use its native listing command. `omg env capture` records an environment snapshot, not a complete dependency lock. Keep ecosystem lockfiles and normal build checks.
 
-There is no `omg run --list` flag today — discovery happens by inspecting your
-project files:
+## Where to go next
 
-**For package.json:** read the `scripts` block (`dev`, `build`, `test`, `lint`, …).
-
-**For Cargo.toml:** standard cargo targets apply (`build`, `test`, `run`, `check`).
-
-**For Makefile:** run `make help` or read the targets directly (`all`, `test`,
-`clean`, …).
-
-Any script/target you find can be executed with `omg run <task>`.
-
----
-
-## Best Practices
-
-### 1. Use Version Files
-
-Always include version files for reproducibility:
-
-```bash
-# Node.js project
-echo "20.10.0" > .nvmrc
-
-# Python project
-echo "3.12.0" > .python-version
-
-# Rust project
-cat > rust-toolchain.toml << 'EOF'
-[toolchain]
-channel = "stable"
-EOF
-```
-
-### 2. Use packageManager Field
-
-For JavaScript projects, specify the package manager:
-
-```json
-{
-  "packageManager": "bun@1.1.0"
-}
-```
-
-### 3. Document Available Tasks
-
-Use descriptive script names and comments:
-
-```json
-{
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "test": "vitest",
-    "test:watch": "vitest --watch",
-    "lint": "eslint src/"
-  }
-}
-```
-
-### 4. Capture Environment
-
-Lock the complete environment:
-
-```bash
-omg env capture
-git add omg.lock
-git commit -m "chore: update environment lockfile"
-```
-
----
-
-## Troubleshooting
-
-### Wrong Runtime Version
-
-```bash
-# Check which version is active
-omg which node
-
-# Force specific version
-omg use node 20.10.0
-
-# Run task with explicit version
-omg run dev
-```
-
-### Task Not Found
-
-```bash
-# List available tasks by reading the project file
-jq '.scripts' package.json   # npm-style projects
-make -qp 2>/dev/null | awk -F':' '/^[a-zA-Z0-9][^$#\/\t=]*:/ {print $1}'   # Makefile
-
-# Check project file is detected
-ls -la package.json Cargo.toml Makefile
-
-# Try direct execution
-npm run dev
-```
-
-### Wrong Package Manager
-
-There is no dry-run listing — run the task and OMG prints which manager it uses:
-
-```bash
-omg run dev        # Output shows "via npm" / "via bun" / "via pnpm" etc.
-
-# Set explicitly in package.json
-{
-  "packageManager": "pnpm@9.0.0"
-}
-```
-
----
-
-## See Also
-
-- [Runtime Management](./runtimes.md) — Version file formats and runtime setup
-- [Shell Integration](./shell-integration.md) — PATH management
-- [Configuration](./configuration.md) — runtime and task settings
-- [Workflows](./workflows.md) — Complete project setup workflows
+- [Runtime management](./runtimes.md) explains version pins.
+- [Shell integration](./shell-integration.md) explains directory-based switching.
+- [Troubleshooting](./troubleshooting.md) has more diagnosis steps and support links.

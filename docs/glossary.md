@@ -81,8 +81,9 @@ one unit.
 operating system family has one: `pacman` on Arch Linux, `apt` on Debian and Ubuntu,
 `dnf` on Fedora, and Homebrew on macOS.
 
-**Backend** — which of those package managers OMG talks to on your machine. OMG asks the
-package manager to do the work; it does not replace it.
+**Backend** — OMG's path for reading package data and applying changes on your
+operating system. Arch uses ALPM, Debian and Ubuntu use APT, Fedora uses RPM and
+DNF, and macOS uses Homebrew. Keep the native package tool available for repair.
 
 **Repository** — an online collection of packages that your computer can install from.
 

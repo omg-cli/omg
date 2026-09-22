@@ -34,6 +34,13 @@ run it. It checks the download before installing anything.
   the file for the Linux distribution you installed.
 - Building from source is also possible; it needs Rust and the right backend flags.
 
+## How do I find a command or option?
+
+Run `omg --help` for the main commands, or `omg --all-commands --help` to include
+advanced commands. Run `omg <command> --help` for that command's arguments and
+options. The [CLI reference](./cli.md) explains behavior and platform limits;
+the help output shows what your installed build accepts.
+
 ## Is it faster?
 
 Sometimes, for repeated searches and read-only lookups, OMG can answer from a warm cache
@@ -46,8 +53,9 @@ conditions. No universal speedup is promised.
 
 ## Does it replace my normal package manager?
 
-No. OMG asks your computer's own package tool to do the work, and each system is covered
-differently. Keep your normal tool available, especially for repairs.
+No. OMG uses each system's package database and transaction path. Arch uses ALPM,
+Debian and Ubuntu use APT, Fedora uses RPM and DNF, and macOS uses Homebrew. Keep
+the native tool available, especially for repairs.
 
 AUR support does not promise every `yay` or `paru` option, and AUR recipes are community
 code that runs on your machine. See [package management](./packages.md) and
@@ -74,9 +82,9 @@ have. See [runtime management](./runtimes.md).
 
 ## Why use a shell hook?
 
-The hook adds a few lines to your shell's start-up file. After that, when you enter a
-project folder, OMG puts the version that the project asks for at the front of your
-`PATH`.
+The hook runs when you enter a project folder and puts its installed runtime version
+at the front of your `PATH`. `omg init` can add the hook to your shell's start-up
+file, or you can add the line shown in [shell integration](./shell-integration.md).
 
 Technically, the generated hook saves the original `PATH`, restores it when you leave the
 folder, and calls `command omg hook-env` on each prompt so that a shell function named
@@ -109,8 +117,9 @@ GitHub Gist is unlisted, not encrypted.
 
 Less than their names might suggest, and that is deliberate.
 
-- The SLSA-named check verifies an artifact's signature against an identity you provide. It
-  does not establish a SLSA build level.
+- The SLSA-named check verifies an artifact's signature. The current verifier
+  requires `--certificate-identity` and rejects a missing or empty value.
+  A valid signature does not establish a SLSA build level.
 - Local audit chains show that the record has not changed since it was written. They do not
   prove who wrote it or that nothing is missing.
 - SBOM and compliance exports are plain text files, to be read by a person or a tool.

@@ -369,8 +369,10 @@ pub fn build(
     let manager = ContainerManager::new()?;
     let cwd = std::env::current_dir()?;
 
-    let dockerfile_path =
-        dockerfile.map_or_else(|| cwd.join("Dockerfile"), std::path::PathBuf::from);
+    let dockerfile_path = dockerfile.map_or_else(
+        || std::path::PathBuf::from("Dockerfile"),
+        std::path::PathBuf::from,
+    );
 
     if !dockerfile_path.exists() {
         let error_msg = format!("Dockerfile not found: {}", dockerfile_path.display());
@@ -611,7 +613,7 @@ pub fn init(base_image: Option<String>) -> Result<()> {
         Cmd::success("Created Dockerfile.omg"),
         Cmd::card("Configuration", details),
         Cmd::println("\n  Build with:"),
-        Cmd::println("    omg container build -t myapp ."),
+        Cmd::println("    omg container build -f Dockerfile.omg -t myapp"),
     ]))?;
 
     Ok(())

@@ -1,10 +1,10 @@
 ---
-title: CLI Reference
+title: CLI reference
 sidebar_position: 5
 description: Complete command reference for all OMG commands
 ---
 
-# CLI Reference
+# CLI reference
 
 **In plain words:** every OMG command and option in one place. Treat this page as a
 lookup table: find the command you need, copy the example, and replace the parts in
@@ -33,13 +33,7 @@ flowchart LR
   the option exists.
 - Advanced commands are hidden from the short help list. Add `--all-commands` to see them.
 
-**Complete Command Reference for OMG**
-
-This guide documents every OMG command with detailed explanations, examples, and use cases. Commands are organized by category.
-
----
-
-## Command Overview
+## Command overview
 
 | Category | Commands |
 | ---------- | ---------- |
@@ -100,7 +94,7 @@ command unless the parser disables a version flag for that command.
 | `omg privacy` | `status`, `opt-out`, and `opt-in`; `export` accepts `--output`/`-o`. |
 | `omg env capture` / `check` | No additional options. `share` accepts `--description`/`-d` and `--public`; `sync <url-or-id>` accepts the Gist URL or ID. |
 | `omg audit sbom` | `--output`/`-o`. `secrets` accepts `--path`/`-p`. `log` accepts `--limit`/`-l`, `--severity`/`-s`, and `--export`/`-e`. |
-| `omg audit slsa <package>` | `--certificate-identity` is optional; when supplied it must match the Fulcio certificate SAN. Without it, any Sigstore identity accepted by the verifier can verify. |
+| `omg audit slsa <package>` | `--certificate-identity <identity>` is required for verification and must match the signer identity in the certificate. Omission or an empty value fails. |
 | `omg audit licenses` | `--format`/`-f` (`table`, `json`, `csv`), `--export`/`-e`, `--filter`, and `--check-policy`. |
 | `omg audit fix` | `--dry-run`, `--yes`/`-y`, and `--min-severity` (`low`, `medium`, `high`, `critical`). |
 | `omg audit export` | `--framework`/`-f` (`soc2`, `iso27001`, `fedramp`, `hipaa`, `pci-dss`), `--period`/`-p`, and `--output`/`-o`. |
@@ -130,7 +124,7 @@ unsupported-shell error when passed to `omg hook`.
 
 ### omg search
 
-Search for packages across official repositories and AUR.
+Search configured package sources. Arch also searches the AUR unless `--no-aur` is set.
 
 ```bash
 omg search <query> [OPTIONS] [aliases: s]
@@ -160,6 +154,9 @@ omg search node --limit 10
 **Performance:**
 
 Latency depends on the backend, cache state, query, and enabled sources. See [benchmark scope and records](../benchmarks/README.md).
+In an attended terminal, the result list can ask you to choose a package for
+details. Selecting one does not install it. Piped output and `--json` skip this
+picker. See [package search](./package-search.md).
 
 ---
 
@@ -217,11 +214,10 @@ After [setting up shell completion](shell-integration.md),
 try `omg install frfx<Tab>`. Package completion also works after `-y`, additional
 package names, and the `i` alias.
 
-**Security:**
-
-- Packages are graded (LOCKED, VERIFIED, COMMUNITY, RISK)
-- Policy enforcement applied before installation
-- PGP signatures verified for official packages
+**Security:** OMG applies its configured policy on supported install paths.
+Source grades describe classification, not package safety or an independent
+signature check. AUR builds have separate review and approval rules. See
+[security](./security.md) and [AUR support](./aur.md).
 
 ---
 
@@ -237,7 +233,7 @@ omg remove <packages...> [OPTIONS] [aliases: r]
 
 | Option | Short | Description |
 | -------- | ------- | ------------- |
-| `--recursive` | `-r` | Also remove unused dependencies |
+| `--recursive` | `-r` | Also remove unused dependencies (Arch backend only) |
 | `--yes` | `-y` | Skip confirmation prompt |
 | `--dry-run` | | Show what would be removed without making changes |
 
@@ -330,14 +326,10 @@ omg info firefox
 omg info visual-studio-code-bin
 ```
 
-**Output includes:**
-
-- Package name and version
-- Description
-- Repository (official/AUR)
-- Dependencies
-- Installation status
-- Security grade
+**Output:** the available fields depend on the package source and backend.
+The core view shows a name, version, source, installation status, and
+description. Some backends also provide size, dependencies, licenses, or AUR
+metadata. The command does not report a security grade.
 
 **Performance:**
 
@@ -385,6 +377,12 @@ omg clean --dry-run --all
 # Non-interactive full cleanup (scripts, CI)
 omg clean --all --yes
 ```
+
+Bare `omg clean` lists cleanup actions. On Arch, cache cleanup keeps one
+recent package version by default and warns about rollback references without
+preserving those older versions. The APT backend supports orphan cleanup but
+rejects cache, AUR, and all cleanup. Fedora supports orphan and downloaded
+package cache cleanup but has no AUR cleanup. See [caching](./cache.md).
 
 ---
 
@@ -909,20 +907,20 @@ omg audit [SUBCOMMAND]
 | Subcommand | Description |
 | ------------ | ------------- |
 | `scan` | Scan for vulnerabilities (default) |
-| `sbom` | Generate installed Arch package CycloneDX 1.5 inventory with advisory matching |
+| `sbom` | Generate a CycloneDX 1.5 inventory of installed packages and matching vulnerability evidence on supported Linux backends |
 | `secrets` | Scan for leaked credentials |
 | `log` | View audit log entries |
 | `verify` | Check local hash-chain consistency, not authenticity or completeness |
 | `policy` | Show security policy status |
-| `slsa <pkg>` | Check supported artifact signatures; optionally bind verification to `--certificate-identity`, and do not treat the result as a SLSA build-level certification |
+| `slsa <pkg>` | Check supported artifact signatures against the required `--certificate-identity`; this does not certify a SLSA build level |
 | `licenses` | Scan for software license compliance issues |
 | `fix` | Auto-fix vulnerabilities by upgrading packages |
 | `export` | Export compliance evidence for audit frameworks |
 | `eol` | Check end-of-life status for installed Node.js, Python, Rust, Go, Ruby, Java, Bun, and Deno versions |
 
-`scan` prefers the Unix daemon but falls back to the direct package backend and shared scanner; it does not fail solely because findings exist. `sbom` always requests Arch advisory matching; it fails on Debian-like systems and lacks a Fedora/macOS system backend. It does not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
+In published v0.1.223, `scan` requires the Unix daemon, and `sbom` succeeds on Arch when its inventory and advisories are available. Debian and Ubuntu fail at the required SBOM vulnerability scan; Fedora has no system SBOM backend. The newer main checkout can scan directly when the daemon is unavailable and supports system SBOMs on Arch, Debian, Ubuntu, and Fedora. Neither version fails `scan` solely because findings exist. SBOMs do not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
 
-`omg audit export --framework soc2` requires the daemon and supported SBOM backend. The other accepted framework names return unimplemented errors. `--period` labels the export; it does not filter history. Output is plaintext and can be partial on failure. See [security limits](./security.md).
+`omg audit export --framework soc2` uses the supported SBOM backend. Published v0.1.223 requires the daemon and can fail on Debian or Ubuntu at the SBOM step. The newer main checkout prefers the daemon and can scan directly when it is absent. The other accepted framework names return unimplemented errors. `--period` labels the export; it does not filter history. Output is plaintext and can be partial on failure. See [security limits](./security.md).
 
 **Options for `log`:**
 
@@ -935,11 +933,11 @@ omg audit [SUBCOMMAND]
 **Examples:**
 
 ```bash
-# Vulnerability scan (default)
+# Vulnerability scan (v0.1.223 requires omgd)
 omg audit
 omg audit scan
 
-# Generate SBOM
+# Generate SBOM (v0.1.223: Arch; newer main: Arch, Debian, Ubuntu, Fedora)
 omg audit sbom -o sbom.json
 
 # Scan for secrets

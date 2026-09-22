@@ -1,4 +1,10 @@
-# Release Readiness Checklist
+---
+title: Release readiness
+sidebar_position: 60
+description: Checks maintainers complete before publishing a release
+---
+
+# Release readiness checklist
 
 > **Who this page is for:** OMG maintainers and contributors. It documents the release checklist.
 > It is not an everyday user guide. If you are new to OMG, start with
@@ -46,7 +52,7 @@ cargo clippy --all-targets --no-default-features --features macos,license --lock
 ## 4) CI Expectations
 
 - Quick gate passes (`fmt`, portable `clippy`, `check`, portable tests)
-- Linux matrix passes (Arch, Debian, Fedora)
+- Linux matrix passes (Arch, Debian Bookworm and Trixie, Fedora, and the Ubuntu job)
 - Native macOS job passes. Linux jobs exercise the distribution backend, not WSL integration; verify WSL separately before claiming coverage
 - Coverage job completes and uploads merged report
 
@@ -55,9 +61,17 @@ cargo clippy --all-targets --no-default-features --features macos,license --lock
 - No new warnings/errors in scoped `clippy` runs
 - No regressions in critical tests (`e2e_package_operations`, daemon cache/lifecycle)
 - README and CONTRIBUTING reflect current Rust requirement (1.95.0+)
-- Release artifacts build successfully on all target platforms
-- Each published archive passes the selected smoke cases; retain artifact hashes and failures
+- All six release archives build successfully: Arch, Debian Bookworm, Debian
+  Trixie, Ubuntu, Fedora, and Apple Silicon macOS.
+- APT 6 and APT 7 staged smoke passes before publication. The selected
+  published-archive smoke cases also pass; retain artifact hashes and failures.
 - Daemon-dependent commands have a matching `omgd` binary in the tested installation
 - Archive checksums and tag/workflow-bound attestations verify
 - Generated release SBOM is present and the generation step leaves `Cargo.lock` unchanged
 - Public docs distinguish local candidate evidence from published-artifact results and make no SLSA-level or compliance-certification claim
+
+## Where to go next
+
+- [Release operations](./release-operations.md) covers publication and R2 recovery.
+- [QA loop](./qa-loop.md) explains how failed cases become issues.
+- [QEMU local guide](./qemu-local.md) describes guest evidence and its limits.

@@ -1,5 +1,5 @@
 ---
-title: Terminal Dashboard
+title: Terminal dashboard
 sidebar_position: 41
 description: Inspect OMG state in a terminal
 ---
@@ -34,8 +34,7 @@ The six views are switched with `1` to `6` or `Tab`:
 | `5` | Activity | Recorded transactions from the history log |
 | `6` | Team | Shared environment state when this machine is part of a team workspace |
 
-The keys are defined in `src/cli/tui/app.rs`, which is the source of truth if a release
-changes them.
+The keys are defined in `src/cli/tui/app.rs` and `src/cli/tui/mod.rs`.
 
 ## Navigation
 
@@ -47,18 +46,28 @@ changes them.
 - Escape: leave search or the current interaction.
 - `r`: request refresh outside text entry.
 - `q`: quit outside text entry.
+- `Ctrl+C`: quit, including during text entry.
+- `u`, `c`, `o` on Dashboard: ask to update packages, clean package caches,
+  or remove orphans. Enter confirms and Escape cancels.
+- `a` on Security: run a security audit.
 
 In search mode, character keys are text input rather than global shortcuts. Review the displayed action before confirming anything that could change state.
 
 ## Refresh and evidence
 
-The application loop checks for periodic refresh after five seconds; individual data retrieval can take longer. Manual refresh does not imply instantaneous retrieval. Counts and timestamps reflect available observations, not a promise of complete package or account coverage.
+The application loop checks local and daemon data every five seconds. Remote
+team data refreshes at most every five minutes while the Team view is open.
+Individual retrieval can take longer. Manual refresh does not imply
+instantaneous retrieval. Counts and timestamps reflect available observations,
+not a promise of complete package or account coverage.
 
 Security grades are classifications, not signature receipts. Activity is not a complete audit of native package-manager operations. See [security](./security.md) and [history](./history.md).
 
 ## Implementation
 
-The current source uses ratatui 0.30 with its crossterm backend and crossterm 0.29. Application state and key handling live in `src/cli/tui/app.rs`; rendering is in `src/cli/tui/ui.rs`; terminal lifecycle is in `src/cli/tui/mod.rs`. These source files, not copied pseudocode, define the implementation.
+Application state and most key handling live in `src/cli/tui/app.rs`.
+Actions, refresh scheduling, and terminal lifecycle live in
+`src/cli/tui/mod.rs`. Rendering is in `src/cli/tui/ui.rs`.
 
 ## Troubleshooting
 

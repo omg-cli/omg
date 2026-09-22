@@ -19,11 +19,12 @@ OMG ships two binaries, `omg` and `omgd`. Current Linux and macOS release archiv
 flowchart LR
     User[Developer] --> CLI[omg]
     User --> Prompt[Prompt counters]
-    CLI -->|Unix socket when omgd is running| Daemon[omgd]
+    CLI -->|Selected queries over a Unix socket| Daemon[omgd]
     Prompt -->|fresh omg.status| Snapshot[Binary status file]
     Daemon --> Snapshot
     Daemon --> Cache[In-memory caches]
     Daemon --> State[JSON status snapshot]
+    Daemon --> Audit[Best-effort audit events]
     CLI --> Backends[Native package backends]
     Daemon --> Backends
     Backends --> OS[Package databases and registries]
@@ -40,7 +41,7 @@ Simple `omg search` and `omg info` use a direct backend path. Other queries use 
 
 Native dependencies still vary by backend. Do not assume a static or dependency-free binary. See [installation](./installation.md).
 
-The CLI enforces security policy and formats output. It talks to `omgd` over a Unix socket when a daemon is running. Hot paths can skip the async runtime and read `omg.status` directly. That read is not a latency guarantee.
+The CLI enforces security policy and formats output. Selected queries talk to `omgd` over a Unix socket when it is running. Hot paths can skip the async runtime and read `omg.status` directly. That read is not a latency guarantee.
 
 The daemon keeps package indexes and status caches warm. It refreshes status every five minutes. Package transactions still run through the CLI and the selected backend.
 
@@ -119,7 +120,7 @@ There is no single pipeline that runs PGP, SLSA, vulnerability scanning, and pol
 
 `omg audit slsa` checks a supported artifact signature. It does not return a SLSA build level. See [security](./security.md).
 
-The audit log is `~/.local/share/omg/audit/audit.jsonl`. `omg audit verify` checks the local hash chain.
+The unprivileged audit log defaults to `~/.local/share/omg/audit/audit.jsonl`; root uses a separate data store. `omg audit verify` checks local hash-chain consistency, not authenticity or completeness.
 
 ## Background work
 

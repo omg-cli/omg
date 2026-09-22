@@ -13,8 +13,8 @@ long it stays valid, and what is safe to delete.
 > New to the terminal? Read [Getting started](./getting-started.md) and keep
 > [the glossary](./glossary.md) open while you work.
 
-There are three stores, and they answer different questions. None of them is a fallback for
-another, and only one of them is durable enough to be worth backing up.
+These three stores answer different questions. All are derived data; back up
+history and your installed runtimes separately.
 
 ## The three tiers
 
@@ -40,8 +40,8 @@ directory but are **not** caches: see [history](./history.md) and
 
 ## What the binary snapshot contains
 
-`omg.status` is a fixed 32-byte record, which is why reading it costs less than starting a
-process or querying a package database:
+`omg.status` is a fixed 32-byte record. Shell hooks can read it without
+starting an OMG process or querying a package database:
 
 ```text
 offset  size  field
@@ -65,8 +65,8 @@ snapshot or the new one, never a half-written file.
 1. The CLI asks the daemon when it is running. A hit returns immediately from memory.
 2. A miss searches the daemon's in-memory index and, when the command needs them, the native
    databases and remote sources.
-3. Without a daemon, the same query takes the direct backend path. Results agree; only
-   latency and cache behaviour differ.
+3. Without a daemon, the query takes the direct backend path. The paths can
+   briefly disagree if their data was refreshed at different times.
 
 ```bash
 omg search ripgrep --no-aur    # skip the network-backed AUR lane entirely
@@ -80,10 +80,10 @@ and uses the first that answers, rather than trying each mirror in turn.
 ## What is safe to remove
 
 - **In-memory cache:** nothing to remove; it disappears with the process.
-- **`status-cache.json` and `omg.status`:** derived data. Removing them costs one refresh,
-  not data. Use the approved cleanup path (`omg clean --cache --dry-run` first) rather than
-  deleting directories by hand; the cache directory also holds package artifacts that a
-  rollback may need.
+- **`status-cache.json` and `omg.status`:** derived data. They refill on refresh.
+  `omg clean --cache` cleans package archives, not these status snapshots.
+  Do not delete a whole data or cache directory to reset a snapshot: it can
+  contain history, installed software, or artifacts needed for rollback.
 - **Search indexes:** rebuilt from the native package databases, so they are never the
   authority.
 - **Never:** `history.json`, the audit log, or the runtime versions directory. Those are
@@ -98,8 +98,8 @@ and uses the first that answers, rather than trying each mirror in turn.
   to a few minutes behind a package change. It is a display convenience, not a transaction
   record.
 - **A stale or rejected file is not an error.** If ownership, size, or age fails the check,
-  OMG quietly takes the slower path. That is intentional: the counter stays correct rather
-  than fast-but-wrong.
+  the CLI counters take their fallback path. The shell hook may print zero for some
+  counters when its snapshot is unavailable; use `omg status` for a fresh check.
 
 ## Where to go next
 

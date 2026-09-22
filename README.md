@@ -168,7 +168,7 @@ omg run test
 
 # Inspect the machine
 omg audit scan
-omg audit sbom                  # Arch system-package inventory
+omg audit sbom                  # system-package inventory and vulnerability evidence on supported Linux backends
 omg history
 ```
 
