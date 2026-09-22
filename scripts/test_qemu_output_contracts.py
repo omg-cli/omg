@@ -215,6 +215,25 @@ class OutputContracts(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(evidence[0]['result'], 'PASS', logs)
 
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_system_update_transactions_outlive_the_generic_row_budget(self):
+        rows = [
+            'update-check\t["update","--check"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\tnone',
+            'update-turbo\t["update","--turbo"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\tupdate-turbo-output\tnone',
+        ]
+        product = (
+            'if [[ "$1" == update && "$2" == --check ]]; then sleep 2; exit 0; fi\n'
+            'sleep 1\n'
+            'printf "%s\\n" "TURBO System Update" "cached, no sync" "Upgraded 1 package"\n'
+        )
+        result, evidence, logs = self.run_inventory(product, rows, row_timeout=1)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(evidence[0]['case_id'], 'qemu-arch-update-check')
+        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+        self.assertEqual(evidence[0]['exit_code'], 124)
+        self.assertEqual(evidence[1]['case_id'], 'qemu-arch-update-turbo')
+        self.assertEqual(evidence[1]['result'], 'PASS', logs)
+
     def generated_hooks(self):
         source = (ROOT / 'src/cli/git_hooks.rs').read_text(encoding='utf-8')
         return {name: (re.search(r'const ' + constant + r': &str = r#"(.*?)"#;', source, re.S).group(1), 0o755)

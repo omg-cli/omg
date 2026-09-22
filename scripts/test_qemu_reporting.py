@@ -192,6 +192,30 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(REPORT.projection([self.row("PASS")], True), [self.row("PASS")])
         self.assertEqual(REPORT.projection([self.row(), self.row("PASS")], True), [self.row()])
 
+    def test_unexecuted_inventory_stays_behind_the_lifecycle_failure(self):
+        lifecycle = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR",
+                         exit_code=1, elapsed_seconds=62)
+        placeholders = [
+            dict(self.row(), case_id=f"qemu-arch-case-{index}", result="BLOCKED",
+                 exit_code=-1, elapsed_seconds=0)
+            for index in range(30)
+        ]
+        other = dict(self.row(), case_id="qemu-debian-search", distro="debian")
+        selected = REPORT.projection([lifecycle, *placeholders, other], False)
+        self.assertEqual(selected, [lifecycle, other])
+
+    def test_executed_inventory_block_survives_alongside_a_lifecycle_failure(self):
+        lifecycle = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR", exit_code=1)
+        executed = dict(self.row("PASS"), case_id="qemu-arch-search")
+        blocked = dict(self.row(), case_id="qemu-arch-child", result="BLOCKED",
+                       exit_code=-1, elapsed_seconds=0)
+        selected = REPORT.projection([lifecycle, executed, blocked], True)
+        self.assertEqual(selected, [
+            lifecycle,
+            executed,
+            dict(blocked, result="HARNESS_ERROR"),
+        ])
+
     def test_detailed_failures_replace_duplicate_aggregate_issue(self):
         aggregate = dict(self.row(), case_id="qemu-matrix-workflow", distro="ubuntu")
         for rows in ([aggregate, self.row()], [self.row(), aggregate]):

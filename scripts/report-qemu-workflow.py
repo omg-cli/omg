@@ -180,9 +180,41 @@ def archive_rows(content, allowed_cases, diagnostics=None):
     return rows
 
 
+def unexecuted_inventory_distros(rows):
+    """Distros whose inventory rows were never started.
+
+    A guest that dies before inventory writes one BLOCKED placeholder per
+    requested case. Those placeholders are not separate failures. Promoting
+    every one of them hides the lifecycle diagnosis and trips the issue cap.
+    """
+    grouped = {}
+    failed_lifecycle = set()
+    for row in rows:
+        distro = row["distro"]
+        case_id = row["case_id"]
+        if case_id in (f"qemu-{distro}-lifecycle", f"qemu-{distro}-aarch64-lifecycle"):
+            if row["result"] in FAILURES:
+                failed_lifecycle.add(distro)
+            continue
+        if case_id == "qemu-matrix-workflow" or case_id.startswith("qemu-matrix-"):
+            continue
+        grouped.setdefault(distro, []).append(row)
+    return {
+        distro for distro, group in grouped.items()
+        if distro in failed_lifecycle and all(
+            item["result"] == "BLOCKED" and item["exit_code"] == -1 and item["elapsed_seconds"] == 0
+            for item in group
+        )
+    }
+
+
 def projection(rows, successful_main):
+    placeholders = unexecuted_inventory_distros(rows)
     selected = {}
     for row in rows:
+        if (row["distro"] in placeholders and row["result"] == "BLOCKED"
+                and row["exit_code"] == -1 and row["elapsed_seconds"] == 0):
+            continue
         key = row["case_id"], row["distro"]
         if row["result"] in FAILURES:
             # The existing issue helper treats BLOCKED as context rather than
