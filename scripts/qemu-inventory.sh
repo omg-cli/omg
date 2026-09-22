@@ -683,7 +683,15 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == runtime-go-install ]]; then
     command_timeout=$((row_timeout * 3))
   fi
-  if [[ "$case" == update-fast ]]; then
+  # dnf5 cacheonly=metadata reuses repository metadata and still downloads
+  # packages (dnf5-caching(7); cached_update_args). Run 35694347149 downloaded
+  # 256 MiB and was killed at dnf step 419/420 when the 120s deadline
+  # returned 124. The completed guest spent 26s on step 420 and finished the
+  # same 204-package transaction in 72s. Twice the generic budget covers that
+  # measured tail. The 3x ceiling stays on runtime-go-install and update --fast.
+  if [[ "$case" == update-turbo ]]; then
+    command_timeout=$((row_timeout * 2))
+  elif [[ "$case" == update-fast ]]; then
     command_timeout=$((row_timeout * 3))
   elif [[ "$case" == daemon-foreground ]]; then
     command_timeout=240
