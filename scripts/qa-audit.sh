@@ -58,6 +58,16 @@ command_for() {
 total_fail=0; invalid_files=0; total_files=${#files[@]}
 for results in "${files[@]}"; do
   evidence_dir="$(dirname "$results")"
+  if [[ "$results" == */transactions/results.json ]]; then
+    if ! rows="$(qa_transaction_rows "$results" 2>/dev/null)"; then
+      invalid_files=$((invalid_files + 1))
+      printf '## %s\ninvalid transaction evidence; audit incomplete\n\n' "$results"
+      continue
+    fi
+    counts="$(jq -r 'group_by(.result) | map("\(.[0].result)=\(length)") | join(" ")' <<< "$rows")"
+    printf '## %s\ntransaction verdicts: %s\nclean\n\n' "$results" "${counts:-empty}"
+    continue
+  fi
   if ! rows="$(qa_result_rows "$results" 2>/dev/null)"; then
     invalid_files=$((invalid_files + 1))
     printf '## %s\ninvalid results.json; audit incomplete\n\n' "$results"

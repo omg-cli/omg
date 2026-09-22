@@ -25,6 +25,58 @@ qa_result_rows() {
 ' "$1"
 }
 
+# Validate the reset native-vs-OMG transaction receipt. Transaction trials use
+# a deliberately different schema from inventory/lifecycle rows, but they are
+# still first-class audit evidence. The summary must be complete, agree byte
+# for byte with results.json, cover every expected operation/tool/round tuple,
+# and bind each trial to the correct pristine base.
+qa_transaction_rows() {
+  local results=$1 summary
+  summary="$(dirname "$results")/summary.json"
+  [[ -f "$summary" ]] || return 1
+  jq -ce --slurpfile raw "$results" '
+    def digest: type == "string" and test("^[0-9a-f]{64}$");
+    def uuid: type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$");
+    def trial_id:
+      .id == (.operation + "-" + .tool + "-" + (("000" + (.round | tostring))[-3:]));
+    if type != "object" or ($raw | length) != 1 or ($raw[0] | type) != "array"
+    then error("invalid transaction document") else . end |
+    if .schema_version != 2 or .kind != "transaction-suite"
+       or (.distro | IN("arch", "debian", "ubuntu", "fedora") | not)
+       or .complete != true or .phase != "complete"
+       or (.samples_per_tool | type) != "number" or (.samples_per_tool | floor) != .samples_per_tool
+       or .samples_per_tool < 1 or .samples_per_tool > 100
+       or .expected_trials != (.samples_per_tool * 4)
+       or (.bases.install | digest | not) or (.bases.remove | digest | not)
+       or .results != $raw[0]
+    then error("incomplete or inconsistent transaction summary") else . end |
+    if (.results | length) != .expected_trials
+       or ([.results[].id] | unique | length) != .expected_trials
+       or ([.results[].boot_id] | unique | length) != .expected_trials
+       or (all(.results[];
+            (.operation | IN("install", "remove")) and
+            (.tool | IN("native", "omg")) and
+            (.round | type) == "number" and
+            (.round | floor) == .round and .round >= 1 and .round <= 100 and
+            trial_id and .result == "PASS" and .exit_code == 0 and
+            (.boot_id | uuid) and (.base_sha256 | digest))) | not
+    then error("invalid transaction trials") else . end |
+    . as $summary |
+    if (all(.results[]; .round <= $summary.samples_per_tool) | not)
+       or (all(.results[]; . as $trial | .base_sha256 == $summary.bases[$trial.operation]) | not)
+       or ([range(1; .samples_per_tool + 1) as $round |
+             ["install", "remove"][] as $operation |
+             ["native", "omg"][] as $tool |
+             ($operation + "-" + $tool + "-" + (("000" + ($round | tostring))[-3:]))]
+           | sort) != ([.results[].id] | sort)
+    then error("transaction coverage or base mismatch") else . end |
+    [.results[] | {
+      case_id:("transaction-" + .id), distro:$summary.distro,
+      result, exit_code, elapsed_seconds:0
+    }]
+  ' "$summary"
+}
+
 # Best-effort secret scrubber for log excerpts. By design the harnesses
 # never print credentials; this is a second net, not the first.
 scrub() {
