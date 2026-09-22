@@ -83,7 +83,8 @@ class PolicyTests(unittest.TestCase):
         current = hashlib.sha256((ROOT / "tests/cli_behavior_inventory.tsv").read_bytes()).hexdigest()
         cases = {case['id']: case for case in rules['inventories'][current]['cases']}
         self.assertEqual(cases['audit-sbom-offline']['network_scope'], 'offline')
-        self.assertEqual(cases['update-turbo']['network_scope'], 'offline')
+        self.assertEqual(cases['update-turbo']['network_scope'], 'network')
+        self.assertTrue(cases['update-turbo']['network_reason'])
         self.assertEqual(cases['daemon-foreground']['network_scope'], 'offline')
         for inventory in rules["inventories"].values():
             cases = {case["id"]: case for case in inventory["cases"]}

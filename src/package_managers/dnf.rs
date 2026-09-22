@@ -259,6 +259,13 @@ impl Default for DnfPackageManager {
 }
 
 impl DnfPackageManager {
+    fn cached_update_args() -> Vec<String> {
+        ["--cacheonly", "upgrade", "-y"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1446,6 +1453,20 @@ impl PackageManager for DnfPackageManager {
         }))
     }
 
+    fn transact_cached_update_with_history<'a>(
+        &'a self,
+        history: Option<&'a crate::core::history::HistoryManager>,
+    ) -> Option<Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>> {
+        Some(Box::pin(async move {
+            self.recorded_mutation(
+                crate::core::history::TransactionType::Update,
+                Self::cached_update_args(),
+                history,
+            )
+            .await
+        }))
+    }
+
     fn search(
         &self,
         query: &str,
@@ -2168,6 +2189,14 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("do not accept package operands")
+        );
+    }
+
+    #[test]
+    fn cached_update_disables_implicit_metadata_refresh() {
+        assert_eq!(
+            DnfPackageManager::cached_update_args(),
+            ["--cacheonly", "upgrade", "-y"]
         );
     }
 

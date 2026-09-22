@@ -252,11 +252,15 @@ pub(crate) async fn update_official_only(
     let pb =
         crate::cli::modern_ui::modern_spinner("Upgrading", &format!("{count} official packages"));
     let history = crate::core::history::HistoryManager::new()?;
-    if let Some(operation) = pm.transact_with_history(
-        crate::core::history::TransactionType::Update,
-        &[],
-        Some(&history),
-    ) {
+    let native_operation = match mode {
+        UpdateMode::Turbo => pm.transact_cached_update_with_history(Some(&history)),
+        UpdateMode::Standard | UpdateMode::Fast => pm.transact_with_history(
+            crate::core::history::TransactionType::Update,
+            &[],
+            Some(&history),
+        ),
+    };
+    if let Some(operation) = native_operation {
         operation.await?;
     } else {
         pm.update().await?;

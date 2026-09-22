@@ -19185,7 +19185,8 @@
             "container"
           ],
           "allowed_skips": {},
-          "network_scope": "offline"
+          "network_scope": "network",
+          "network_reason": "cached metadata mode may download package payloads while skipping repository synchronization"
         },
         {
           "id": "daemon-foreground",

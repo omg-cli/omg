@@ -1,5 +1,4 @@
 import json
-import errno
 import os
 from pathlib import Path
 import subprocess
@@ -24,44 +23,9 @@ class NetworkScopeTests(unittest.TestCase):
     def test_root_remote_wrapper_also_drops_all_capabilities(self):
         self.check_remote_wrapper(as_root=True)
 
-    @unittest.skipIf(os.name == "nt", "Linux network namespaces are verified in hosted CI")
-    def test_cached_upgrade_wrapper_retains_root_inside_offline_namespace(self):
-        source = (ROOT / "scripts/qemu-inventory.sh").read_text()
-        line = next(
-            line.strip()
-            for line in source.splitlines()
-            if line.strip().startswith('remote="sudo -n unshare') and 'USER=root' in line
-        )
-        probe = """
-import json, os, socket, subprocess
-connections=[]
-for family,address in [(socket.AF_INET,('192.0.2.1',443)),(socket.AF_INET6,('2001:db8::1',443))]:
-    with socket.socket(family,socket.SOCK_STREAM) as client:
-        client.settimeout(1); connections.append(client.connect_ex(address))
-print(json.dumps(dict(uid=os.getuid(), routes4=json.loads(subprocess.check_output(['ip','-j','-4','route','show','table','all'])), routes6=json.loads(subprocess.check_output(['ip','-j','-6','route','show','table','all'])), connections=connections)))
-"""
-        import shlex
-        command = shlex.join([sys.executable, "-c", probe])
-        script = 'remote=' + shlex.quote(command) + '\n' + line + '\nbash -c "$remote"'
-        result = subprocess.run(
-            ["sudo", "-n", "bash", "-euo", "pipefail", "-c", script],
-            capture_output=True, text=True, timeout=15,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        receipt = json.loads(result.stdout)
-        self.assertEqual(receipt["uid"], 0)
-        self.assertEqual(receipt["routes4"], [])
-        self.assertEqual(receipt["routes6"], [])
-        self.assertEqual(receipt["connections"][0], errno.ENETUNREACH)
-        self.assertIn(receipt["connections"][1], (errno.ENETUNREACH, errno.EADDRNOTAVAIL))
-
     def check_remote_wrapper(self, *, as_root):
         source = (ROOT / "scripts/qemu-inventory.sh").read_text()
-        line = next(
-            line.strip()
-            for line in source.splitlines()
-            if line.strip().startswith('remote="sudo -n unshare') and 'setpriv' in line
-        )
+        line = next(line.strip() for line in source.splitlines() if line.strip().startswith('remote="sudo -n unshare'))
         probe = """
 import errno, json, os, socket, subprocess
 from pathlib import Path
