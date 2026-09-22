@@ -107,8 +107,9 @@ omg env check
 Environment capture needs the Arch or Debian backend, so it works on the same machines where
 yay did. `omg env check` reports drift and does not install anything.
 
-Security commands have their own scope: `omg audit scan` needs the daemon, and `omg audit sbom`
-needs the Arch backend plus advisory access. Neither is a compliance certification; see
+Security commands have their own scope: `omg audit scan` uses the daemon when available and
+falls back to a direct scan, while `omg audit sbom` needs the Arch backend plus advisory access.
+Neither is a compliance certification; see
 [security](../security.md).
 
 ## Next steps

@@ -2,324 +2,213 @@
 
 # OMG
 
-**One package manager for every Linux distribution and macOS — and it performs the work itself.**
+**Packages. Runtimes. Security. One command.**
 
+OMG brings system packages, language runtimes, developer tools, project tasks, and
+vulnerability evidence into one Rust CLI. It gives Arch, Debian, Ubuntu, Fedora,
+and Apple silicon macOS one consistent, security-first workflow without making you
+assemble a different toolchain on every machine.
+
+[![Beta](https://img.shields.io/badge/status-beta-f59e0b)](#beta-status)
 [![CI](https://github.com/omg-cli/omg/actions/workflows/ci.yml/badge.svg)](https://github.com/omg-cli/omg/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/omg-cli/omg)](https://github.com/omg-cli/omg/releases/latest)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](rust-toolchain.toml)
-[![Docs](https://img.shields.io/badge/docs-getomg.xyz%2Fdocs-purple)](https://getomg.xyz/docs)
-[![Website](https://img.shields.io/badge/website-getomg.xyz-blue)](https://getomg.xyz)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2563eb)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-getomg.xyz-7c3aed)](https://getomg.xyz/docs)
 
-[Install](#install-in-one-step) · [First five commands](#first-five-commands) · [Why OMG](#why-omg) · [What it replaces](#what-omg-replaces) · [What it does](#what-it-does) · [Security](#security-built-into-installation) · [Limits](#what-omg-does-not-do) · [Docs](https://getomg.xyz/docs)
+[Install](#install) · [Why OMG](#why-omg) · [Security](#security-is-part-of-the-workflow) · [Platforms](#supported-platforms) · [Docs](https://getomg.xyz/docs)
 
 </div>
 
-> [!IMPORTANT]
-> **Beta.** Command surfaces, configuration keys, and on-disk formats can still change. Keep
-> `pacman`, `apt`, `dnf`, or `brew` available as a recovery path, and validate package changes on
-> a machine you can reinstall.
+```bash
+omg search ripgrep              # one search command on every supported system
+omg install ripgrep --dry-run   # inspect the package plan before changing anything
+omg use node 24                 # install and select a project runtime
+omg run test                    # run the task this project already defines
+omg audit scan                  # fetch advisories and show vulnerability evidence
+```
+
+The daemon is optional. When `omgd` is running, OMG reuses warm package indexes,
+cached vulnerability results, and status snapshots. When it is not, package
+commands and vulnerability scanning take the direct path and still work.
 
 ## Why OMG
 
-- **Every distribution's package manager, in one program — implemented in OMG's own code.** OMG
-  reads each family's package database and performs the transaction itself: a native APT database
-  reader, resolver, and transaction engine for Debian, Ubuntu, Mint, Pop!_OS and their relatives; a
-  native RPM/DNF engine for Fedora, RHEL, CentOS, Rocky and Alma; `libalpm` access for Arch and its
-  derivatives; and a Homebrew path for Apple silicon macOS. You do not install a different helper per
-  distribution, and you do not relearn flags when you switch machines.
-- **It does the work, not a subprocess.** Installing, upgrading, and removing never shell out to
-  `pacman`, `apt-get`, `dpkg`, `dnf`, or `rpm`. The external programs OMG starts are helper tools —
-  `git`, `gpg`, Bubblewrap for sandboxed builds, `systemctl`, `setpriv` — plus APT's own
-  `apt-get update` when publishing authenticated package lists, and the Homebrew binary on macOS
-  after a policy gate that blocks operations OMG cannot validate.
-- **Safer and more secure than the stock tooling, by default.** Every download is verified, managed
-  tools install with lifecycle scripts disabled, AUR recipes are reviewed and built in an offline
-  sandbox, produced archives are inspected before installation, and each mutation is recorded in a
-  hash-chained audit log and in history.
-- **Faster because it does not spawn another program.** Queries are in-process database reads instead
-  of a subprocess, mirrors are raced in parallel, and an optional daemon keeps indexes and status
-  warm. Measured numbers and their conditions are published in
-  [the benchmark records](benchmarks/README.md) rather than asserted here.
-- **Free, open source, no account.** MIT licensed, no account required for local use, and telemetry
-  off by default.
+| | What you get |
+| :--- | :--- |
+| **One workflow across systems** | Use the same commands on Arch, Debian, Ubuntu, Fedora, macOS, and supported Linux distributions inside WSL. |
+| **Security during the operation** | Verify downloads, constrain developer-tool installers, review and sandbox AUR builds, inspect produced archives, and record mutations as they happen. |
+| **The whole development environment** | Manage system packages, 14 language runtimes, 54 curated developer tools, project tasks, environment records, and security evidence from one CLI. |
+| **Fast paths without a hard daemon dependency** | Read ALPM, APT, and RPM state in process where supported. Run `omgd` for warm caches and background refreshes, or leave it off. |
+| **Evidence instead of promises** | CI exercises real Linux guests through QEMU, preserves per-command receipts, and files detailed issues when a gate fails. Benchmark claims require comparable recorded work. |
 
-## Who it is for
+OMG is written in Rust and distributed under the MIT license. Local use needs no
+account, and telemetry is off by default.
 
-- **Anyone who touches more than one Linux distribution** — a Debian laptop and a Fedora build box,
-  Ubuntu in CI and Arch on the desktop — who wants one command syntax and one set of safety checks
-  across all of them.
-- **Teams standardising on a workflow** instead of on a distribution: the same commands, the same
-  policy, and the same recorded environment, whatever each machine runs.
-- **Polyglot developers** who need Node, Python, Go, Rust, and friends pinned per project instead of
-  per machine.
-- **Arch users** specifically for the AUR: source review, an offline Bubblewrap build, archive
-  inspection, and attended approval for privileged content — treated as a first-class source rather
-  than a separate helper.
-- **macOS developers on Apple silicon** who want the same interface they use on Linux.
+## More than a package-manager wrapper
 
-**Not for you if** you want a graphical package manager, a compliance certification tool, or a
-Nix-style fully declarative system. OMG is a terminal tool, and packages still come from your
-distribution's repositories as your distribution's packages.
+OMG uses the package data and transaction boundary appropriate to each platform:
+direct `libalpm` access on Arch, APT database and `libapt` integration on Debian
+and Ubuntu, direct RPM database reads plus guarded DNF operations on Fedora, and
+a policy-gated Homebrew path on macOS. AUR support is implemented as its own
+review, dependency, sandbox, and archive-inspection pipeline.
 
-*New to the terminal?* Start with [Getting started](docs/getting-started.md) and keep
-[the glossary](docs/glossary.md) nearby.
-
-## What OMG replaces
-
-| Instead of | OMG uses | Where the code lives |
+| Job | Commands | What OMG adds |
 | :--- | :--- | :--- |
-| `apt`, `apt-get`, `dpkg` | A native APT database reader, dependency resolver, and transaction engine, including running each package's own maintainer scripts | `src/package_managers/debian_db/` |
-| `dnf`, `rpm` | A native RPM database reader and DNF-backed engine | `src/package_managers/dnf.rs` |
-| `pacman` | Direct `libalpm` access for queries and transactions | `src/package_managers/alpm_direct.rs`, `pacman_db/` |
-| `yay`, `paru`, `pikaur` | An AUR index, PKGBUILD parser, dependency resolver, and Bubblewrap build path with review and archive inspection | `src/package_managers/aur/` |
-| `brew` | The Homebrew path, with policy and audit gates around it | `src/package_managers/homebrew.rs` |
-| `nvm`, `pyenv`, `asdf`, `mise`, `rustup`, `sdkman` | 14 native runtime managers that download, verify, extract, and link versions in your home folder | `src/runtimes/` |
-| `make`, `npm run`, `cargo test`, ecosystem wrappers | A task resolver that finds the runner your project already defines and passes arguments through | `src/core/task_runner.rs` |
-| Manual `curl \| bash`, `npm i -g`, `pip install` habits | `omg tool install` with per-ecosystem policies: scripts off, signatures checked, `--locked`, isolated environments | `src/cli/tool.rs` |
+| Find and change packages | `search`, `info`, `why`, `install`, `remove`, `update`, `clean` | One interface, previews, backend-aware policy, history |
+| Use the AUR | `search`, `install`, `update` | Source review, offline Bubblewrap builds, output inspection, attended approval for privileged content |
+| Manage runtimes | `use`, `list`, `which`, `uninstall` | Native managers for Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, and Swift |
+| Install developer tools | `tool search`, `tool install`, `tool list` | Curated registry and ecosystem-specific install policy for npm, Python, Cargo, Go, and system packages |
+| Run project tasks | `run` | Detects the task system the project already uses and forwards arguments |
+| Record environment intent | `env capture`, `env check`, `env share`, `env sync` | Inventory, portable intent, and drift reporting without pretending to rebuild the machine |
+| Inspect security | `audit scan`, `audit sbom`, `audit policy`, `audit verify` | OSV and native advisory evidence, CycloneDX output, local policy, hash-chain verification |
+| Operate and investigate | `status`, `doctor`, `dash`, `history`, `rollback` | Health checks, terminal dashboard, transaction records, and bounded rollback |
 
-Published Linux archives are x86_64 and backend-specific, so you install the build that matches the
-family you run. See the platform table below and [installation](docs/installation.md) for the exact
-artifact per system.
+## Security is part of the workflow
 
-## Install in one step
+Security checks sit on the path to installation and activation instead of living
+only in a separate report.
 
-You need `curl`, a supported system, and the GitHub CLI (`gh`) for the build-provenance check. The
-installer verifies the archive before anything is copied, and stops if verification fails.
+| Boundary | OMG behavior |
+| :--- | :--- |
+| **OMG releases** | The installer verifies the release digest and GitHub build attestation before copying binaries. Self-update replaces `omg` and `omgd` from the same verified archive. |
+| **Runtime downloads** | Each provider's available checksum or signature policy is applied before extraction. Staging is bounded, path-safe, and published only after validation. |
+| **Developer tools** | npm lifecycle scripts are disabled by default and signatures are checked; Python tools use isolated environments and wheels by default; Cargo requests locked installs; Go disables automatic toolchain downloads and CGO. |
+| **AUR source** | Recipes and source declarations are reviewed before execution. Builds use Bubblewrap with an isolated home, a cleared environment, and no network by default. |
+| **AUR output** | Archive paths, links, metadata, hooks, capabilities, and setuid/setgid files are inspected. High-risk output requires explicit approval bound to the inspected archive. |
+| **Vulnerability evidence** | Direct and daemon-backed scans share the same inventory and scoring code. OMG preserves published CVSS or advisory severity and does not invent a numeric score when upstream provides none. |
+| **Audit history** | Mutations produce local records protected by a hash chain. Verification detects tampering; it does not claim an external identity or compliance certification. |
+| **Privilege changes** | OMG runs as the regular user and requests elevation only for the package mutation that needs it. Privileged state uses administrator-controlled paths. |
 
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://getomg.xyz/install.sh -o omg-install.sh
-less omg-install.sh                                      # read it first
-OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 bash omg-install.sh  # no telemetry, no shell edits
-export PATH="$HOME/.local/bin:$PATH"                     # this window only
-omg --version
-```
+Read the [security model](docs/security.md), [AUR policy](docs/aur.md), and
+[documented trust boundaries](SECURITY.md) for the exact guarantees and limits.
 
-Then, once, to finish the setup on your terms:
-
-```bash
-omg init          # asks before it changes anything: shell hook, daemon, first capture
-```
-
-| Your system | Backend | Notes |
-| :--- | :--- | :--- |
-| Arch Linux, x86_64 | ALPM + AUR | Widest coverage: AUR review, offline builds, policy, rollback |
-| Debian or Ubuntu, x86_64 | APT | Native APT operations; no AUR |
-| Fedora, x86_64 | DNF / RPM | Experimental backend, exercised in QEMU |
-| Apple silicon macOS | Homebrew | Published as ARM64; Intel macOS is not supported |
-| Windows | via WSL | Install a supported Linux distribution in WSL; there is no native Windows build |
-
-<details>
-<summary><strong>Other install paths</strong> (AUR, source build, updating, uninstalling)</summary>
-
-```bash
-# Arch, from a source checkout with the matching recipe (third-party packaging: check it first)
-yay -S omg-bin
-
-# Any supported system: build from a reviewed checkout, one backend at a time
-cargo build --release --locked --no-default-features --features arch,pgp,license   # also: debian, fedora, macos
-bash ./install.sh --from-source
-
-# Update an existing installation (both binaries, from one verified archive)
-omg self-update
-```
-
-## First five commands
-
-Nothing here changes your system until the fourth line, and that one asks you to confirm first.
-
-```bash
-omg --help                      # what exists (--all-commands adds the advanced surface)
-omg search ripgrep              # find a package; on Arch this includes the AUR
-omg install --dry-run ripgrep   # read the plan, change nothing
-omg install ripgrep             # install it
-omg doctor                      # confirm the machine is healthy (exit 0 healthy, exit 1 issues)
-```
-
-Then, in a project you trust:
-
-```bash
-omg use node 22                 # select a runtime version for this project
-omg run build                   # run the task the project already defines
-omg env capture                 # record the environment in omg.lock
-omg env check                   # report drift against that record
-```
-
-### What each flag actually does
-
-```bash
-# Search lanes. On Arch, official repositories and the AUR are queried concurrently.
-omg search ripgrep --no-aur         # skip the network-backed AUR lane entirely
-omg search ripgrep --detailed       # add source metadata such as votes and popularity
-omg search ripgrep --limit 50       # raise the result cap (default 15)
-
-# Mutations. Every one of these accepts a preview flag; none of them is a safety verdict.
-omg install ripgrep --dry-run       # print the planned transaction, change nothing
-omg remove ripgrep --recursive      # Arch only: also remove dependencies nothing else needs
-omg update --check                  # list what would be updated, change nothing
-omg update --aur-only               # Arch only: refresh AUR packages, leave official upgrades to pacman -Syu
-omg clean --cache --dry-run         # show what cache cleanup would delete
-
-# Runtimes. Versions install inside your home folder; no password is involved.
-omg use python 3.12                 # install if missing, then select it
-omg use python 3.11 --uninstall     # remove a version (switch away from it first)
-omg list node --available           # include versions you could download, not just installed ones
-
-# Records and diagnosis.
-omg env check                       # exit status 1 means this machine drifted from omg.lock
-omg history --type update           # filter recorded transactions by kind
-omg rollback <transaction-id>       # return to an earlier recorded version, where supported
-omg daemon --foreground             # run the optional helper in this terminal to read its output
-```
-
-## How it works
-
-Two programs ship together. The CLI does the work; the daemon only keeps derived state warm, so a
-package operation never depends on it being up.
-
-| Component | Role | Without it |
-| :--- | :--- | :--- |
-| `omg` | Arguments, backend queries and mutations, policy, output, task runner, prompt counters | Nothing runs — this is the program you use |
-| `omgd` | Warm in-memory index, background status refresh, status snapshots | Package commands take direct backend paths; scans, Unix SOC 2 export, and metrics need it |
-| Backend | ALPM + AUR, APT, DNF/RPM, or Homebrew | No package operations; runtimes, tasks, and records still work |
-| `omg.status` | Fixed 32-byte snapshot read by `omg ec`, `tc`, `oc`, `uc` | Prompt counters fall back to the slower CLI path |
-
-**[Under the hood](docs/under-the-hood.md)** explains the rest with the detail that matters when
-something goes wrong: socket resolution and message framing, the three cache tiers and their
-freshness rules, when a subprocess fallback is used instead of a native library, the five AUR gates
-and what each blocks, what a lockfile fingerprint actually hashes, how the audit chain is built, and
-why rollback is not a snapshot.
-
-
-- Coming from **v0.1.222**? Run `omg self-update`, then `omg self-update --force` once so the daemon is replaced too.
-- Coming from **v0.1.221 or earlier**, follow the [signing-repository migration](docs/releases/v0.1.222.md) first.
-- A package-managed installation (for example an AUR package someone else maintains) updates and uninstalls through that package manager, not through `omg self-update`. This repository does not guarantee that such a package exists or matches a release; check what you install.
-- Uninstall a script installation with the installer's `--uninstall` mode. It backs up each shell file it edits and leaves your data in `~/.local/share/omg` alone.
-- `OMG_VERSION=v0.1.223`, `INSTALL_DIR="$HOME/.omg/bin"`, `OMG_NO_TELEMETRY=1`, and `OMG_SKIP_SHELL=1` are read from the environment when the installer runs. Full procedure: [installation](docs/installation.md).
-
-</details>
-
-
-## What it does
+## How it fits together
 
 ```mermaid
 flowchart LR
-    You[You, in a terminal] --> CLI[omg]
-    CLI --> Packages[Packages: search, install, update, remove]
-    CLI --> Runtimes[Runtime versions: 14 languages]
-    CLI --> Tasks[Project tasks: build, test, lint]
-    CLI --> Env[Environment records: capture, check, share]
-    Packages --> Native[Your system tool: ALPM, APT, DNF, Homebrew]
-    Runtimes --> Data[Your data directory, no password needed]
-    CLI <--> Daemon[Optional omgd daemon: warm indexes]
+    User[Developer] --> CLI[omg CLI]
+    CLI --> Packages[System packages]
+    CLI --> Runtimes[14 runtime managers]
+    CLI --> Tools[Developer tools]
+    CLI --> Tasks[Project tasks]
+    CLI --> Security[Vulnerability and audit engine]
+
+    Packages --> ALPM[ALPM and AUR]
+    Packages --> APT[APT and libapt]
+    Packages --> DNF[RPM and DNF]
+    Packages --> Brew[Homebrew]
+    Security --> Advisories[OSV and native advisories]
+
+    CLI <-->|optional local IPC| Daemon[omgd]
+    Daemon --> Warm[Warm indexes and status snapshots]
 ```
 
-| You want to | Run | Notes |
+`omg` remains the product entry point and owns direct execution. `omgd` keeps
+derived state warm and serves the same shared security engine over local Unix IPC.
+Stopping the daemon may make a cold command slower; it does not disable ordinary
+package operations or vulnerability scans.
+
+## Install
+
+The installer requires `curl` and the GitHub CLI (`gh`). It downloads the correct
+release pair, verifies its digest and build provenance, and then installs into your
+home directory.
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://getomg.xyz/install.sh -o omg-install.sh
+less omg-install.sh
+OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 bash omg-install.sh
+export PATH="$HOME/.local/bin:$PATH"
+omg --version
+```
+
+Then choose the setup you want:
+
+```bash
+omg init
+```
+
+`omg init` asks before enabling shell integration, starting the optional daemon,
+or capturing initial state. See [installation](docs/installation.md) for source
+builds, custom paths, updating, and uninstalling.
+
+## Supported platforms
+
+| Platform | Package path | Release status |
 | :--- | :--- | :--- |
-| Find and inspect a package | `omg search`, `omg info`, `omg why` | AUR results on Arch unless `--no-aur` |
-| Change packages safely | `omg install`, `omg remove`, `omg update`, `omg clean` | Every one accepts a preview flag |
-| Choose a runtime version | `omg use`, `omg list`, `omg which` | Installs inside your home folder |
-| Run the project's tasks | `omg run build`, `omg run test` | Detects `package.json`, `Cargo.toml`, `Makefile`, more |
-| Install developer tools | `omg tool install prettier` | Managed policies: scripts off, signatures checked |
-| Record an environment | `omg env capture`, `omg env check` | Writes `omg.lock`; needs an Arch or Debian backend |
-| Watch the system | `omg dash`, `omg status`, `omg metrics` | `dash` is a full-screen terminal dashboard |
-| Keep indexes warm | `omg daemon`, `omg daemon-status` | Optional; every package command works without it |
-| Audit what happened | `omg history`, `omg rollback`, `omg audit` | Limits are documented, not glossed over |
+| Arch Linux x86_64 | ALPM plus first-class AUR pipeline | Supported; broadest package-security coverage |
+| Debian 12/13 x86_64 | APT database and matching `libapt` ABI | Supported with ABI-specific release binaries |
+| Ubuntu 24.04/26.04 x86_64 | APT database and matching `libapt` ABI | Supported with ABI-specific release binaries |
+| Fedora x86_64 | Direct RPM state plus DNF repository operations | Experimental |
+| Apple silicon macOS | Policy-gated Homebrew integration | Supported on ARM64 |
+| Windows | A supported Linux distribution in WSL | No native Windows build |
 
-**Runtime managers (14):** Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang,
-PHP, Swift — plus 54 registry developer tools. Shell hooks for Bash, Zsh, and Fish read project pins
-such as `.nvmrc` automatically; the hook is optional.
+Published releases do not currently target Intel macOS or Linux ARM64. Backend
+availability also does not imply identical policy, audit, or rollback coverage;
+the [installation matrix](docs/installation.md) and [security model](docs/security.md)
+state the differences.
 
-**Already using mise or yay?** Supported mise pins, environment layers, and task dependencies are
-reused ([compatibility notes](docs/mise-compatibility.md)), and the
-[yay migration guide](docs/migration/from-yay.md) maps the commands you already know while stating
-what does not map.
+## Start using it
 
-## Backend coverage in detail
+```bash
+# Read-only discovery
+omg --help
+omg search ripgrep
+omg info ripgrep
+omg doctor
 
-| System | Backend | Covered | Not covered |
-| :--- | :--- | :--- | :--- |
-| Arch Linux | ALPM + AUR | Search, install, update, remove, policy, transaction history, rollback, AUR review and sandboxed builds | AUR entries are community recipes, not publisher-verified packages |
-| Debian, Ubuntu | Native APT | Search, install, update, remove, history, environment capture | No AUR; audit and policy coverage differs from Arch |
-| Fedora | DNF / RPM | RPM database reads and DNF-backed operations | Experimental; Fedora evidence does not establish RHEL compatibility, and environment capture refuses explicitly |
-| Apple silicon macOS | Homebrew | Homebrew-backed package operations | No AUR, no Linux advisory matching; published as ARM64 only |
-| Windows | via WSL | Whatever the guest Linux distribution supports | No native backend; WSL is not a QEMU-tested guest |
+# Preview first, then apply
+omg install ripgrep --dry-run
+omg install ripgrep
 
-An available backend does not imply identical command, audit, or runtime coverage. Source builds and
-system prerequisites: [installation](docs/installation.md).
+# Enter a project
+omg use python 3.13
+omg run test
 
+# Inspect the machine
+omg audit scan
+omg audit sbom                  # Arch system-package inventory
+omg history
+```
 
-## Security built into installation
+Useful next reads:
 
-OMG applies checks at download, build, activation, and privileged installation boundaries.
+- [Getting started](docs/getting-started.md) — a guided first session.
+- [Quickstart](docs/quickstart.md) — runtimes and tasks in an existing project.
+- [Cheat sheet](docs/cheatsheet.md) — everyday commands on one page.
+- [Under the hood](docs/under-the-hood.md) — backends, caches, IPC, AUR gates, and the audit chain.
+- [CLI reference](docs/cli.md) — the complete command surface.
+- [Troubleshooting](docs/troubleshooting.md) — safe diagnosis and recovery.
 
-| Boundary | What happens |
-| :--- | :--- |
-| Downloads | Runtime installers verify the checksum or signature they expect and refuse a download that lacks required integrity evidence. Release archives are checked against a published digest and a GitHub build attestation. |
-| Managed npm tools | `omg tool install` stages the package with lifecycle scripts disabled and runs npm signature verification before activation. Running scripts needs an explicit package-scoped exception. |
-| Managed Python, Cargo, and Go tools | Python tools get a dedicated virtual environment and wheels by default. Cargo installs request `--locked`. Go installs disable CGO and automatic toolchain downloads and set checksum and proxy policy. |
-| AUR recipes | Source review is on by default, the source manifest is rechecked before execution, and builds run in Bubblewrap with an isolated home, a cleared environment, and no build network. |
-| AUR output | Bounded archive inspection checks paths, metadata, links, and privileged contents before installation. Install hooks, capabilities, and setuid/setgid files need explicit, attended approval. |
-| High-risk AUR packages | Packages with privileged or system-integration contents require matching output from a second private build, and approval is bound to the inspected archive hashes. |
-| Privilege handoffs | Privileged subprocesses use trusted executable paths with dangerous environment settings scrubbed, and accepted AUR bytes are passed sealed. |
+## Tested like a system tool
 
-Run OMG as your regular user: it asks for elevation when a package mutation needs it, refuses root
-for AUR builds, and never asks you to run the whole tool as root to work around a failure.
+The release gate checks more than parser acceptance. It builds backend-specific
+`omg`/`omgd` pairs, runs unit and integration suites, scans dependencies and
+workflows, exercises containers, and boots Arch, Debian, Ubuntu, and Fedora guests
+under QEMU. Guest inventory rows retain stdout, stderr, exit status, prerequisites,
+and completion receipts. Trusted main-branch failures can open detailed GitHub
+issues automatically so the failure remains part of the project history.
 
-Read [AUR policy](docs/aur.md) and the [security model](docs/security.md) for exact scope and
-opt-ins.
+The gate is intentionally evidence-bound: a skipped command is not coverage, a
+retry does not erase the first failure, and a green run proves only the behavior it
+actually exercised. See [QEMU evidence](docs/qemu-local.md) and
+[CI security controls](docs/ci-security-controls.md).
 
-## What OMG does not do
+## Beta status
 
-The point of a tool like this is knowing where it stops.
-
-- **Not a compliance product.** No SOC 2, ISO 27001, HIPAA, PCI DSS, or FedRAMP certification is
-  implied. `omg audit export` writes plaintext evidence for a human reviewer; the HIPAA export is
-  not implemented.
-- **Audit evidence has stated limits.** `omg audit sbom` matches Arch Linux advisories and does not
-  build full transitive graphs for Debian or macOS. `omg audit slsa` verifies a supported artifact
-  signature, not a SLSA build level. `omg audit verify` proves the local hash chain was not edited,
-  not who wrote it.
-- **No promised speedups.** Some repeated queries get faster from warm caches. Nothing more is
-  claimed, and the recorded runs, hosts, and cache states are published in
-  [the benchmark methodology](benchmarks/README.md).
-- **It does not rebuild machines.** `omg env capture` records inventory, `omg env share` uploads it,
-  and `omg env sync` downloads one and reports drift. None of them installs software. Capture needs
-  an Arch or Debian backend.
-- **Rollback is not a snapshot.** `omg rollback` returns to a recorded transaction when the backend,
-  the retained package versions, and your current dependencies allow it.
-- **It does not run everywhere.** Release targets are Linux x86_64 (Arch, Debian, Ubuntu, Fedora)
-  and Apple silicon macOS. Intel macOS, Linux ARM64, and native Windows have no published release.
-
-## How releases are produced
-
-Every published archive is built by the release workflow from the tagged commit and carries an
-attestation bound to that tag and workflow. Before publication the commit must pass CI, benchmarks,
-security audit, secret scanning, CodeQL, coverage, Docker end-to-end tests, and staged QEMU runs;
-after publication, published-archive QEMU re-verifies provenance and exercises daemon lifecycle in
-all four Linux guests. A green run is evidence for what it tested, not proof of every command path:
-see [CI security controls](docs/ci-security-controls.md) and [QEMU evidence](docs/qemu-local.md).
-
-## Documentation
-
-| Start here | Go deeper |
-| :--- | :--- |
-| [Getting started](docs/getting-started.md) — assumes no terminal experience | [Under the hood](docs/under-the-hood.md) — caches, IPC, AUR gates, audit chain |
-| [Installation](docs/installation.md) — downloads, attestation, removal | [Architecture](docs/architecture.md) — components and data flow |
-| [Quickstart](docs/quickstart.md) — a project in four commands | [Security](docs/security.md) — evidence and its limits |
-| [Cheat sheet](docs/cheatsheet.md) — one page of everyday commands | [Troubleshooting](docs/troubleshooting.md) — safe diagnosis |
-| [Glossary](docs/glossary.md) — every term in plain words | [Task runner](docs/task-runner.md) · [Runtimes](docs/runtimes.md) · [Portable environments](docs/environment-portability.md) · [AUR](docs/aur.md) |
-
-The same topics are curated for the web at **[getomg.xyz/docs](https://getomg.xyz/docs)**.
+OMG is in beta. Command surfaces, configuration keys, and on-disk formats may
+change. Keep the native package tool available as a recovery path and evaluate
+package mutations on a machine you can restore. The project publishes limitations
+instead of hiding them; start with [security](docs/security.md) and
+[release readiness](docs/release-readiness.md) when assessing production use.
 
 ## Contributing
 
-Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers code standards, the QEMU
-multi-distribution test environments, and how to run the checks locally.
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains the coding
+standards, local checks, and QEMU environments.
 
-- **Bugs and ideas:** [GitHub Issues](https://github.com/omg-cli/omg/issues) — include
-  `omg --version`, your distribution, and the command output.
-- **Security reports:** privately, as described in [SECURITY.md](SECURITY.md).
+- Report bugs and feature ideas through [GitHub Issues](https://github.com/omg-cli/omg/issues).
+- Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 

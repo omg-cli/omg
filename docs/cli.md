@@ -920,7 +920,7 @@ omg audit [SUBCOMMAND]
 | `export` | Export compliance evidence for audit frameworks |
 | `eol` | Check end-of-life status for installed Node.js, Python, Rust, Go, Ruby, Java, Bun, and Deno versions |
 
-`scan` requires the Unix daemon and does not fail solely because findings exist. `sbom` always requests Arch advisory matching; it fails on Debian-like systems and lacks a Fedora/macOS system backend. It does not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
+`scan` prefers the Unix daemon but falls back to the direct package backend and shared scanner; it does not fail solely because findings exist. `sbom` always requests Arch advisory matching; it fails on Debian-like systems and lacks a Fedora/macOS system backend. It does not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
 
 `omg audit export --framework soc2` requires the daemon and supported SBOM backend. The other accepted framework names return unimplemented errors. `--period` labels the export; it does not filter history. Output is plaintext and can be partial on failure. See [security limits](./security.md).
 

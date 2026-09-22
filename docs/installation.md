@@ -202,7 +202,7 @@ omg completions bash
 
 ## The background helper (daemon)
 
-OMG runs most package commands directly. A few commands need a separate helper program called the daemon, whose file name is `omgd`: vulnerability scans, Unix SOC 2 export, and metrics. The current SBOM command also needs the Arch package backend and access to an advisory service, whether or not the daemon runs. [The glossary](./glossary.md) explains the word "daemon".
+OMG runs package commands and vulnerability scans without a separate helper. The optional daemon, whose file name is `omgd`, keeps package indexes, vulnerability results, and status snapshots warm; `omg audit scan` uses it when available and starts a direct cold scan otherwise. Unix SOC 2 export and metrics still require the daemon. The current SBOM command needs the Arch package backend and access to an advisory service, whether or not the daemon runs. [The glossary](./glossary.md) explains the word "daemon".
 
 ```bash
 omg daemon-status
