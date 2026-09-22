@@ -344,19 +344,19 @@ check_product_output() {
       search-official-limit-three)
         if ! awk '
           /^  \| Search$/ { headings++; next }
-          /^    firefox$/ { queries++; next }
+          /^    git$/ { queries++; next }
           /^  [^[:space:]]+ [^[:space:]]+  / {
             results++
-            if ($1 !~ /firefox/ || $3 != "Official" || NF != 3) bad=1
+            if ($1 !~ /git/ || $3 != "Official" || NF != 3) bad=1
             next
           }
-          /^  \(\+[0-9]+ more packages\.\.\.\)$/ { more++; next }
+          /^  \(\+[1-9][0-9]* more packages\.\.\.\)$/ { more++; next }
           /^[[:space:]]*$/ { next }
           /^OMG_QEMU_RECEIPT:/ { next }
           { bad=1 }
-          END { exit !(headings == 1 && queries == 1 && results >= 1 && results <= 3 && more <= 1 && (more == 0 || results == 3) && !bad) }
+          END { exit !(headings == 1 && queries == 1 && results == 3 && more == 1 && !bad) }
         ' "$stdout"; then
-          printf 'assertion failed: official firefox search lacks bounded matching results\n' >&2; return 1
+          printf 'assertion failed: official git search lacks three results and a positive remainder\n' >&2; return 1
         fi ;;
       artifact:*)
         local artifact=${assertion#artifact:}
