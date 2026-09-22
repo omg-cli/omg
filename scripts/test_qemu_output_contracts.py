@@ -485,6 +485,8 @@ esac
             valid.replace('    git\n', '    chrome\n'),
             valid.replace('  git 2.55.0-1  Official\n', '  git 2.55.0-1  AUR\n'),
             valid.replace('  git 2.55.0-1  Official\n', '  git 2.55.0-1  Official\n' * 4),
+            ('\n  | Search\n    git\n' + '  git 2.55.0-1  Official\n' * 3
+             + '  (+1 more packages...)\n'),
             valid.replace('  git 2.55.0-1  Official\n', '  unrelated 2.55.0-1  Official\n'),
             valid + 'unrelated warning hidden after results\n',
             valid.replace('  git-absorb 0.9.0-2  Official\n', ''),

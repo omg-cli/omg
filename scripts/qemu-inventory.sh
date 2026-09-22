@@ -348,6 +348,7 @@ check_product_output() {
           /^  [^[:space:]]+ [^[:space:]]+  / {
             results++
             if ($1 !~ /git/ || $3 != "Official" || NF != 3) bad=1
+            if (seen[$1]++) bad=1
             next
           }
           /^  \(\+[1-9][0-9]* more packages\.\.\.\)$/ { more++; next }
