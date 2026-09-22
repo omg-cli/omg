@@ -259,6 +259,13 @@ impl Default for DnfPackageManager {
 }
 
 impl DnfPackageManager {
+    fn cached_update_args() -> Vec<String> {
+        ["--setopt=cacheonly=metadata", "upgrade", "-y"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -333,6 +340,20 @@ impl DnfPackageManager {
             };
         }
         Ok(())
+    }
+
+    /// DNF reports install reasons by package name, while RPM can retain
+    /// multiple installed versions of the same name (notably kernels).
+    /// Explicit-package APIs are name inventories, so collapse those parallel
+    /// versions before returning a listing or count.
+    fn explicit_package_names(packages: impl IntoIterator<Item = InstalledPackage>) -> Vec<String> {
+        packages
+            .into_iter()
+            .filter(|package| package.reason == InstallReason::User)
+            .map(|package| package.name)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// Load installed packages from RPM `SQLite` database
@@ -1432,6 +1453,20 @@ impl PackageManager for DnfPackageManager {
         }))
     }
 
+    fn transact_cached_update_with_history<'a>(
+        &'a self,
+        history: Option<&'a crate::core::history::HistoryManager>,
+    ) -> Option<Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>> {
+        Some(Box::pin(async move {
+            self.recorded_mutation(
+                crate::core::history::TransactionType::Update,
+                Self::cached_update_args(),
+                history,
+            )
+            .await
+        }))
+    }
+
     fn search(
         &self,
         query: &str,
@@ -1576,10 +1611,7 @@ impl PackageManager for DnfPackageManager {
             let mut installed = self.load_installed_packages().await?;
             Self::apply_current_install_reasons(&mut installed).await?;
             let total = installed.len();
-            let explicit = installed
-                .iter()
-                .filter(|p| p.reason == InstallReason::User)
-                .count();
+            let explicit = Self::explicit_package_names(installed).len();
 
             let (orphans, updates) = if fast {
                 (0, 0)
@@ -1599,12 +1631,7 @@ impl PackageManager for DnfPackageManager {
         Box::pin(async move {
             let mut installed = self.load_installed_packages().await?;
             Self::apply_current_install_reasons(&mut installed).await?;
-
-            Ok(installed
-                .into_iter()
-                .filter(|pkg| pkg.reason == InstallReason::User)
-                .map(|pkg| pkg.name)
-                .collect())
+            Ok(Self::explicit_package_names(installed))
         })
     }
 
@@ -2166,6 +2193,14 @@ mod tests {
     }
 
     #[test]
+    fn cached_update_reuses_metadata_but_allows_package_downloads() {
+        assert_eq!(
+            DnfPackageManager::cached_update_args(),
+            ["--setopt=cacheonly=metadata", "upgrade", "-y"]
+        );
+    }
+
+    #[test]
     fn native_history_correlates_only_our_transaction() {
         let mut transactions: Vec<NativeTransaction> = serde_json::from_str(r#"[
             {"id":1,"comment":"ours","status":"Ok","packages":[{"nevra":"tree-0:2.2.1-4.fc44.x86_64","action":"Install"}]},
@@ -2603,6 +2638,38 @@ mod tests {
             cached
                 .iter()
                 .any(|package| package.release.ends_with("i686"))
+        );
+    }
+
+    #[test]
+    fn explicit_package_names_collapse_parallel_installed_versions() {
+        let packages = vec![
+            InstalledPackage {
+                name: "kernel-core".to_string(),
+                version: "6.17.1".to_string(),
+                release: "1.fc44".to_string(),
+                summary: "Kernel".to_string(),
+                reason: InstallReason::User,
+            },
+            InstalledPackage {
+                name: "kernel-core".to_string(),
+                version: "6.17.2".to_string(),
+                release: "1.fc44".to_string(),
+                summary: "Kernel".to_string(),
+                reason: InstallReason::User,
+            },
+            InstalledPackage {
+                name: "kernel-modules".to_string(),
+                version: "6.17.2".to_string(),
+                release: "1.fc44".to_string(),
+                summary: "Kernel modules".to_string(),
+                reason: InstallReason::Dependency,
+            },
+        ];
+
+        assert_eq!(
+            DnfPackageManager::explicit_package_names(packages),
+            vec!["kernel-core"]
         );
     }
 

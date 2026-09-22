@@ -15,6 +15,14 @@ class NetworkScopeTests(unittest.TestCase):
         runner = (ROOT / "scripts/qemu-inventory.sh").read_text()
         self.assertIn('--isolate-hermetic) isolate_hermetic=true', runner)
 
+    def test_daemon_fault_probe_retains_scoped_sudo_inside_offline_namespace(self):
+        runner = (ROOT / "scripts/qemu-inventory.sh").read_text()
+        self.assertIn('if [[ "$case" == daemon-foreground ]]; then', runner)
+        self.assertIn(
+            'sudo -n unshare --net -- sudo -n -u \'$ssh_user\'',
+            runner,
+        )
+
     @unittest.skipIf(os.name == "nt", "Linux network namespaces are verified in hosted CI")
     def test_actual_remote_wrapper_has_no_external_interface_and_preserves_user(self):
         self.check_remote_wrapper(as_root=False)
@@ -25,7 +33,11 @@ class NetworkScopeTests(unittest.TestCase):
 
     def check_remote_wrapper(self, *, as_root):
         source = (ROOT / "scripts/qemu-inventory.sh").read_text()
-        line = next(line.strip() for line in source.splitlines() if line.strip().startswith('remote="sudo -n unshare'))
+        line = next(
+            line.strip()
+            for line in source.splitlines()
+            if line.strip().startswith('remote="sudo -n unshare') and "setpriv" in line
+        )
         probe = """
 import errno, json, os, socket, subprocess
 from pathlib import Path

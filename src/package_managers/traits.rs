@@ -78,6 +78,16 @@ pub trait PackageManager: Send + Sync {
         None
     }
 
+    /// Execute a system update from already-synchronized repository metadata.
+    /// Package payload downloads are still allowed. Backends that cannot bind
+    /// native history to this mode leave execution to [`Self::update`].
+    fn transact_cached_update_with_history<'a>(
+        &'a self,
+        _history: Option<&'a crate::core::history::HistoryManager>,
+    ) -> Option<Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>> {
+        None
+    }
+
     /// Install packages
     fn install(&self, packages: &[String])
     -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;

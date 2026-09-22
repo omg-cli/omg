@@ -346,6 +346,27 @@ check_product_output() {
         if [[ ! -f "$artifact" || -L "$artifact" ]] || ! jq -e -s 'length == 1' "$artifact" >/dev/null 2>&1; then
           printf 'assertion failed: artifact %s is not a regular JSON document\n' "$artifact" >&2; return 1
         fi ;;
+      update-fast-output)
+        if ! grep -Fq 'Fast System Update' "$stdout" \
+          || ! grep -Eqi 'Syncing package|Synced' "$stdout" \
+          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' "$stdout"; then
+          printf 'assertion failed: update --fast lacked sync and completion evidence\n' >&2; return 1
+        fi ;;
+      update-turbo-output)
+        if ! grep -Fq 'TURBO System Update' "$stdout" \
+          || ! grep -Eqi 'Turbo upgrade|cached, no sync|Checking for updates.*cached' "$stdout" \
+          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' "$stdout"; then
+          printf 'assertion failed: update --turbo lacked cached-mode and completion evidence\n' >&2; return 1
+        fi ;;
+      daemon-foreground-lifecycle)
+        if [[ ! -f daemon-evidence/daemon-lifecycle.json || -L daemon-evidence/daemon-lifecycle.json ]] \
+          || ! jq -e -s 'length == 1 and (.[0] | .schema_version == 1 and
+            .direct == true and .foreground == true and .ipc == true and
+            .singleton == true and .shutdown == true and .restart == true and
+            .query_parity == true and .sigint == true and .cleanup == true and
+            (.backend_faults | type == "array"))' daemon-evidence/daemon-lifecycle.json >/dev/null; then
+          printf 'assertion failed: daemon --foreground lifecycle receipt is missing or incomplete\n' >&2; return 1
+        fi ;;
     esac
   fi
   return 0
@@ -476,14 +497,14 @@ resolve_exit() {
 IFS= read -r header < "$tsv"
 [[ "$header" == $'case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup' ]] || exit 2
 awk -F '\t' 'NR > 1 { if (NF != 10) exit 1; for (i = 1; i <= NF; i++) if ($i == "") exit 1 }' "$tsv" || exit 2
-declare -A row_args=() row_requires=() row_tier=() row_safety=() row_ux=() row_exit=() row_targets=() row_assertions=()
+declare -A row_args=() row_requires=() row_tier=() row_safety=() row_ux=() row_exit=() row_targets=() row_assertions=() row_cleanup=()
 counter_for_case() {
   case "$1" in
     explicit-shortcut) printf ec ;; total-shortcut) printf tc ;;
     orphan-shortcut) printf oc ;; updates-shortcut) printf uc ;;
   esac
 }
-while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
+while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   [[ "$id" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && -z "${row_args[$id]:-}" ]] || exit 2
   [[ "$r" == - || "$r" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || exit 2
   [[ "$r" == - || -n "${row_args[$r]:-}" ]] || exit 2
@@ -512,10 +533,12 @@ while IFS=$'\t' read -r id aj s e u r t tg a _cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|audit-source-failure|sbom-source-failure|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json) ;; *) exit 2 ;; esac
+  case "$a" in -|audit-source-failure|sbom-source-failure|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle) ;; *) exit 2 ;; esac
+  case "$cleanup" in tempdir-drop|none|container-prune|host-state-restore|vm-revert|daemon-stop) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
   row_exit["$id"]="$resolved"; row_targets["$id"]="$tg"; row_assertions["$id"]="$a"
+  row_cleanup["$id"]="$cleanup"
   if [[ "$id" == runtime-python-install ]]; then
     jq -e 'length == 3 and .[0] == "use" and .[1] == "python" and (.[2] | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$aj" >/dev/null || exit 2
   fi
@@ -552,7 +575,7 @@ prereq_runnable() { # id -> 0 when replayable
 
 # Process substitution (not a pipeline): pass/fail counters below must
 # survive the loop; a `tail | while` pipeline would trap them in a subshell.
-while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux requires tier targets assertions _cleanup; do
+while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux requires tier targets assertions cleanup; do
   # Case ids flow into a remote shell command below: reject anything
   # outside the identifier shape instead of executing it.
   if [[ ! "$case" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
@@ -660,6 +683,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == runtime-go-install ]]; then
     command_timeout=$((row_timeout * 3))
   fi
+  if [[ "$case" == update-fast ]]; then
+    command_timeout=$((row_timeout * 3))
+  elif [[ "$case" == daemon-foreground ]]; then
+    command_timeout=240
+    remote+="; mkdir -p daemon-evidence"
+  fi
   counter=$(counter_for_case "$case")
   if [[ -n "$counter" ]]; then
     remote+="; $(declare -f check_native_counter)"
@@ -669,7 +698,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     runtime_name=$(jq -r '.[1]' <<< "$args_json")
     remote+="; umask 0002; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install"); $(declare -f check_runtime_usage)"
   fi
-  remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+  if [[ "$case" == daemon-foreground ]]; then
+    remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
+  else
+    remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+  fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log; then assertion=1; fi"
   if [[ -n "$counter" ]]; then
@@ -681,6 +714,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if [ \"\$rc\" = 0 ] && ! check_runtime_usage '$runtime_name'; then assertion=1; fi"
     remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: runtime fixture cleanup failed\\n' >&2; assertion=1; fi"
   fi
+  # Every inventory row receives a private fixture directory. Product-specific
+  # cleanup assertions run above; removal here proves the harness itself does
+  # not leak state that could make a later row pass.
+  remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: row fixture cleanup failed (%s)\\n' '$cleanup' >&2; assertion=1; fi"
   # A receipt is emitted only after setup and the command complete. SSH
   # transport/tool failures cannot satisfy an expected product refusal.
   remote+="; printf '\nOMG_QEMU_RECEIPT:%s:%s:%s\n' \"\$execution_phase\" \"\$rc\" \"\$assertion\""
@@ -689,7 +726,15 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # Put the supervisor AND its receipt inside the namespace. A namespace
     # setup failure must be a transport/harness error, never an expected CLI
     # refusal. Drop back to the SSH user before creating fixtures or running OMG.
-    remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+    if [[ "$case" == daemon-foreground ]]; then
+      # The daemon fault probe owns a second, private mount namespace and must
+      # use its tightly scoped passwordless sudo before dropping all privileges
+      # around the submitted binary. Keep that capability inside this offline
+      # network namespace while running the lifecycle itself as the SSH user.
+      remote="sudo -n unshare --net -- sudo -n -u '$ssh_user' env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+    else
+      remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+    fi
   fi
   start=$SECONDS
   transport=0

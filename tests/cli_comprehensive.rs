@@ -306,6 +306,9 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
         ("hooks-install", Assertion::HooksInstalled),
         ("hooks-install-force", Assertion::HooksInstalled),
         ("workspace-run-parallel-all", Assertion::WorkspaceAllOutput),
+        ("update-fast", Assertion::UpdateFastOutput),
+        ("update-turbo", Assertion::UpdateTurboOutput),
+        ("daemon-foreground", Assertion::DaemonForegroundLifecycle),
     ] {
         let case = cases
             .iter()
@@ -509,6 +512,9 @@ enum Assertion {
     WorkspaceAllOutput,
     HooksInstalled,
     HooksAbsent,
+    UpdateFastOutput,
+    UpdateTurboOutput,
+    DaemonForegroundLifecycle,
 }
 
 impl Assertion {
@@ -521,6 +527,9 @@ impl Assertion {
             "workspace-all-output" => Self::WorkspaceAllOutput,
             "hooks-installed" => Self::HooksInstalled,
             "hooks-absent" => Self::HooksAbsent,
+            "update-fast-output" => Self::UpdateFastOutput,
+            "update-turbo-output" => Self::UpdateTurboOutput,
+            "daemon-foreground-lifecycle" => Self::DaemonForegroundLifecycle,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1337,6 +1346,11 @@ fn behavior_inventory_runs_in_hermetic_state() {
                             path.display()
                         ));
                     }
+                }
+                Assertion::UpdateFastOutput
+                | Assertion::UpdateTurboOutput
+                | Assertion::DaemonForegroundLifecycle => {
+                    unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
             }
         }

@@ -237,7 +237,7 @@ controller="omg-qemu-${work##*/}"
 printf 'Starting %s (%s). Evidence: %s\n' "$distro" "$arch" "$work"
 result=HARNESS_ERROR
 cleanup() {
-  local rc=$? remaining safe_to_remove=true report_rc
+  local rc=$? remaining safe_to_remove=true report_rc overall_result
   trap - EXIT
   if [[ ${started:-false} == true ]]; then
     safe_to_remove=false
@@ -279,7 +279,11 @@ cleanup() {
   reporting_rc=0
   timeout --kill-after=2s 12s env OMG_SMOKE_RELEASE="$tag" OMG_SMOKE_ENVIRONMENT=qemu-matrix "$repo_root/scripts/report-smoke-sentry.sh" "$report_input" > "$work/reporting.log" 2>&1 || reporting_rc=$?
   jq -n --argjson exit_code "$reporting_rc" '{exit_code:$exit_code}' > "$work/reporting-status.json"
-  printf '%s %s. Evidence: %s\n' "$distro" "$result" "$work"
+  overall_result=$result
+  if [[ "$result" == PASS && "$inventory_product_failure" == true ]]; then
+    overall_result=PRODUCT_FAIL
+  fi
+  printf '%s lifecycle=%s overall=%s. Evidence: %s\n' "$distro" "$result" "$overall_result" "$work"
   exit "$rc"
 }
 trap cleanup EXIT
