@@ -9,7 +9,6 @@ vulnerability evidence into one Rust CLI. It gives Arch, Debian, Ubuntu, Fedora,
 and Apple silicon macOS one consistent, security-first workflow without making you
 assemble a different toolchain on every machine.
 
-[![Beta](https://img.shields.io/badge/status-beta-f59e0b)](#beta-status)
 [![CI](https://github.com/omg-cli/omg/actions/workflows/ci.yml/badge.svg)](https://github.com/omg-cli/omg/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/omg-cli/omg)](https://github.com/omg-cli/omg/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2563eb)](LICENSE)
@@ -27,9 +26,9 @@ omg run test                    # run the task this project already defines
 omg audit scan                  # fetch advisories and show vulnerability evidence
 ```
 
-The daemon is optional. When `omgd` is running, OMG reuses warm package indexes,
-cached vulnerability results, and status snapshots. When it is not, package
-commands and vulnerability scanning take the direct path and still work.
+The daemon is optional for package operations. It keeps package indexes, vulnerability
+results, and status snapshots warm. In published v0.1.223, `omg audit scan`
+requires `omgd`; the current main checkout adds direct scanning when the daemon is absent.
 
 ## Why OMG
 
@@ -105,8 +104,8 @@ flowchart LR
 
 `omg` remains the product entry point and owns direct execution. `omgd` keeps
 derived state warm and serves the same shared security engine over local Unix IPC.
-Stopping the daemon may make a cold command slower; it does not disable ordinary
-package operations or vulnerability scans.
+Stopping the daemon does not disable ordinary package operations. In published
+v0.1.223, `omg audit scan` still needs `omgd`; the main checkout can scan directly.
 
 ## Install
 
@@ -196,13 +195,12 @@ retry does not erase the first failure, and a green run proves only the behavior
 actually exercised. See [QEMU evidence](docs/qemu-local.md) and
 [CI security controls](docs/ci-security-controls.md).
 
-## Beta status
+## Release status
 
-OMG is in beta. Command surfaces, configuration keys, and on-disk formats may
-change. Keep the native package tool available as a recovery path and evaluate
-package mutations on a machine you can restore. The project publishes limitations
-instead of hiding them; start with [security](docs/security.md) and
-[release readiness](docs/release-readiness.md) when assessing production use.
+OMG is approaching beta. The latest published release predates beta, and command
+surfaces, configuration keys, and on-disk formats may change. Keep the native
+package tool available as a recovery path. See [security](docs/security.md) and
+[release readiness](docs/release-readiness.md) for current guarantees and limits.
 
 ## Contributing
 

@@ -15,7 +15,7 @@ clearly, and you can stop after any step.
 If a word here is unfamiliar, [the glossary](./glossary.md) explains it in everyday
 language. If you would rather have a friend or colleague help you, show them this page.
 
-**OMG is in beta.** That means the people who make it still change how it works. Use it on
+**OMG is approaching beta.** The people who make it still change how it works. Use it on
 a computer you can reinstall if something goes wrong, and keep your normal package
 installer available. On Arch Linux that is `pacman`, on Debian and Ubuntu it is `apt`, on
 Fedora it is `dnf`, and on macOS it is Homebrew.
