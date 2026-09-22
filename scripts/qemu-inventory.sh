@@ -726,7 +726,15 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # Put the supervisor AND its receipt inside the namespace. A namespace
     # setup failure must be a transport/harness error, never an expected CLI
     # refusal. Drop back to the SSH user before creating fixtures or running OMG.
-    remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+    if [[ "$case" == daemon-foreground ]]; then
+      # The daemon fault probe owns a second, private mount namespace and must
+      # use its tightly scoped passwordless sudo before dropping all privileges
+      # around the submitted binary. Keep that capability inside this offline
+      # network namespace while running the lifecycle itself as the SSH user.
+      remote="sudo -n unshare --net -- sudo -n -u '$ssh_user' env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+    else
+      remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+    fi
   fi
   start=$SECONDS
   transport=0
