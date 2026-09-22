@@ -23,7 +23,8 @@ enum AlpmRequest {
 }
 
 pub struct AlpmWorker {
-    tx: tokio::sync::mpsc::Sender<AlpmRequest>,
+    tx: Option<tokio::sync::mpsc::Sender<AlpmRequest>>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 const ALPM_REQUEST_QUEUE_CAPACITY: usize = 128;
@@ -69,7 +70,7 @@ impl AlpmWorker {
         let (tx, mut rx) = request_channel();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
 
-        thread::spawn(move || {
+        let thread = thread::spawn(move || {
             let mut loaded = match load_alpm_worker() {
                 Ok(loaded) => loaded,
                 Err(error) => {
@@ -113,12 +114,17 @@ impl AlpmWorker {
             .recv()
             .context("ALPM worker exited during initialization")?
             .map_err(anyhow::Error::msg)?;
-        Ok(Self { tx })
+        Ok(Self {
+            tx: Some(tx),
+            thread: Some(thread),
+        })
     }
 
     pub async fn get_info(&self, name: String) -> Result<Option<PackageInfo>> {
         let (tx, rx) = oneshot::channel();
         self.tx
+            .as_ref()
+            .context("ALPM worker is shutting down")?
             .send(AlpmRequest::Info(name, tx))
             .await
             .context("ALPM worker request queue closed")?;
@@ -130,6 +136,8 @@ impl AlpmWorker {
     pub async fn list_updates(&self) -> Result<Vec<UpdateInfo>> {
         let (tx, rx) = oneshot::channel();
         self.tx
+            .as_ref()
+            .context("ALPM worker is shutting down")?
             .send(AlpmRequest::ListUpdates(tx))
             .await
             .context("ALPM worker request queue closed")?;
@@ -139,10 +147,49 @@ impl AlpmWorker {
     }
 }
 
+impl Drop for AlpmWorker {
+    fn drop(&mut self) {
+        // Closing the last request sender lets the owner thread leave
+        // blocking_recv and destroy its native libalpm handle. Join before
+        // process/runtime teardown so native destruction cannot race exit.
+        self.tx.take();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::error!("ALPM worker panicked during shutdown");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AlpmRequest, AlpmWorker, request_channel};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::oneshot;
+
+    #[test]
+    fn drop_waits_for_the_native_owner_thread() {
+        let (tx, mut rx) = request_channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_on_thread = Arc::clone(&exited);
+        let thread = std::thread::spawn(move || {
+            while rx.blocking_recv().is_some() {}
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            exited_on_thread.store(true, Ordering::Release);
+        });
+        let worker = AlpmWorker {
+            tx: Some(tx),
+            thread: Some(thread),
+        };
+
+        drop(worker);
+
+        assert!(
+            exited.load(Ordering::Acquire),
+            "drop returned before the native-owner thread exited"
+        );
+    }
 
     #[test]
     fn request_queue_applies_backpressure_at_its_capacity() {
