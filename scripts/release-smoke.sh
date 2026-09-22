@@ -24,6 +24,8 @@ Options:
   --distro ID                arch, debian, ubuntu, fedora, macos, or all (default: all;
                              all covers the container distros; macos needs --executor native)
   --case ID                  Run one release contract
+  --apt-abi 6|7              APT host ABI for debian/ubuntu (default: 6); ABI 7
+                             uses Debian 13/Ubuntu 26.04 and the Trixie archive
   --family NAME              Run one contract family (default: package)
   --tier NAME                Run one execution tier (default: container)
   --executor NAME            container runs probes in distro images; native runs the
@@ -95,6 +97,14 @@ load_distro() {
       ;;
     *) return 1 ;;
   esac
+  if [[ "$apt_abi" == 7 ]]; then
+    distro_suffix="-x86_64-linux-debian-trixie"
+    case "$1" in
+      debian) distro_image="debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958" ;;
+      ubuntu) distro_image="ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78" ;;
+      *) return 1 ;;
+    esac
+  fi
 }
 
 require_engine() {
@@ -352,8 +362,11 @@ PROBE
   chmod 700 "$path"
 }
 
-record_nonexecution() {
+record_nonexecution() (
   local distro=$1 result=$2 message=$3 case_id expectation evidence_dir targets_entry
+  # Resolve the requested inputs even when acquisition or engine setup failed.
+  # These describe expectations, never an image or artifact actually executed.
+  load_distro "$distro" || return 3
   for case_id in "${selected_cases[@]}"; do
     targets_entry="$(case_field targets "$case_id")" || targets_entry=""
     expectation="$(target_for_distro "$targets_entry" "$distro")" || expectation="missing"
@@ -366,12 +379,14 @@ record_nonexecution() {
       printf 'result=%s\n' "$result"
       printf 'expectation=%s\n' "$expectation"
       printf 'release=%s\n' "$tag"
+      printf 'expected_archive=omg-%s%s.tar.gz\n' "$tag" "$distro_suffix"
+      printf 'expected_image=%s\n' "${distro_image:-native-host}"
       printf 'engine=%s\n' "$engine"
       printf 'elapsed_seconds=0\n'
     } > "$evidence_dir/metadata.txt"
     write_result "$evidence_dir" "$case_id" "$distro" "$result" 3 0 "$expectation"
   done
-}
+)
 
 record_harness_error() {
   record_nonexecution "$1" "HARNESS_ERROR" "$2"
@@ -603,6 +618,7 @@ release="latest"
 release_set=false
 staged_dir=""
 distro="all"
+apt_abi=6
 case_id=""
 family="package"
 tier="container"
@@ -615,12 +631,13 @@ evidence_base="${OMG_SMOKE_EVIDENCE_DIR:-$repo_root/target/release-smoke}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h) usage; exit 0 ;;
-    --release|--staged-dir|--distro|--case|--family|--tier|--executor|--timeout-seconds|--container-engine|--evidence-dir)
+    --release|--staged-dir|--distro|--apt-abi|--case|--family|--tier|--executor|--timeout-seconds|--container-engine|--evidence-dir)
       [[ $# -ge 2 ]] || { printf 'error: %s requires a value\n' "$1" >&2; exit 2; }
       case "$1" in
         --release) release=$2; release_set=true ;;
         --staged-dir) staged_dir=$2 ;;
         --distro) distro=$2 ;;
+        --apt-abi) apt_abi=$2 ;;
         --case) case_id=$2 ;;
         --family) family=$2 ;;
         --tier) tier=$2 ;;
@@ -643,6 +660,11 @@ case "$distro" in
   arch|debian|ubuntu|fedora|macos|all) ;;
   *) printf 'error: invalid distro %q\n' "$distro" >&2; exit 2 ;;
 esac
+if [[ "$apt_abi" != 6 && "$apt_abi" != 7 ]] ||
+   { [[ "$apt_abi" == 7 && "$distro" != debian && "$distro" != ubuntu ]]; }; then
+  printf 'error: --apt-abi requires 6 or 7; ABI 7 requires --distro debian or ubuntu\n' >&2
+  exit 2
+fi
 if [[ "$executor" != "container" && "$executor" != "native" ]]; then
   printf 'error: invalid executor %q; valid values: container|native\n' "$executor" >&2
   exit 2

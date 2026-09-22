@@ -22,6 +22,7 @@ fi
 archives=(
   "omg-v${version}-x86_64-linux-arch.tar.gz"
   "omg-v${version}-x86_64-linux-debian.tar.gz"
+  "omg-v${version}-x86_64-linux-debian-trixie.tar.gz"
   "omg-v${version}-x86_64-linux-ubuntu.tar.gz"
   "omg-v${version}-x86_64-linux-fedora.tar.gz"
   "omg-v${version}-aarch64-darwin.tar.gz"
