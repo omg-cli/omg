@@ -96,8 +96,9 @@ cat <<EOF_FOOTER
 | Platform | Architecture | Binary |
 |----------|--------------|--------|
 | Arch Linux | x86_64 | \`omg-v${version}-x86_64-linux-arch.tar.gz\` |
-| Debian | x86_64 | \`omg-v${version}-x86_64-linux-debian.tar.gz\` |
-| Ubuntu | x86_64 | \`omg-v${version}-x86_64-linux-ubuntu.tar.gz\` |
+| Debian (APT 6) | x86_64 | \`omg-v${version}-x86_64-linux-debian.tar.gz\` |
+| Ubuntu (APT 6) | x86_64 | \`omg-v${version}-x86_64-linux-ubuntu.tar.gz\` |
+| Debian 13 / Ubuntu 26.04 (APT 7) | x86_64 | \`omg-v${version}-x86_64-linux-debian-trixie.tar.gz\` |
 | Fedora/RHEL | x86_64 | \`omg-v${version}-x86_64-linux-fedora.tar.gz\` |
 | macOS | ARM64 | \`omg-v${version}-aarch64-darwin.tar.gz\` |
 | WSL | x86_64 | Use the binary matching the installed Linux distribution |

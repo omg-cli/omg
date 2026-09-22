@@ -52,6 +52,7 @@ LATEST_VERSION_URL="${RELEASES_BASE_URL}/latest-version"
 MAX_LATEST_VERSION_BYTES=256
 MAX_ARCHIVE_BYTES=$((256 * 1024 * 1024))
 MAX_CHECKSUM_BYTES=1024
+MAX_VERSION_PROBE_SECONDS=10
 
 # Detect directory
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
@@ -155,6 +156,64 @@ install_binary() {
   fi
   rmdir "$staging_dir" 2>/dev/null || rm -rf "$staging_dir"
 }
+
+# Commit a release's CLI and daemon as one recoverable pair. The filesystem
+# cannot rename two paths atomically, so preserve the original CLI until the
+# daemon replacement succeeds and restore it on every failure or signal.
+install_binary_pair() (
+  local first_src="$1" first_dst="$2" second_src="$3" second_dst="$4"
+  local transaction_dir first_backup
+  local had_first=false first_committed=false
+
+  if [[ ! -f "$first_src" || ! -f "$second_src" ]]; then
+    warn "Refusing to install an incomplete binary pair"
+    return 1
+  fi
+  for destination in "$first_dst" "$second_dst"; do
+    if [[ -d "$destination" && ! -L "$destination" ]]; then
+      warn "Refusing to install over a directory: $destination"
+      return 1
+    fi
+  done
+  if ! transaction_dir=$(mktemp -d "$(dirname "$first_dst")/omg-pair.XXXXXX"); then
+    warn "Failed to create a private binary-pair transaction directory"
+    return 1
+  fi
+  first_backup="$transaction_dir/first-backup"
+
+  rollback_binary_pair() {
+    if [[ "$first_committed" == true ]]; then
+      if [[ "$had_first" == true ]]; then
+        if ! rename_install_binary "$first_backup" "$first_dst"; then
+          warn "CRITICAL: failed to restore $first_dst after daemon installation failed"
+        fi
+      else
+        rm -f "$first_dst"
+      fi
+    fi
+    rm -rf "$transaction_dir"
+  }
+  trap rollback_binary_pair EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  if [[ -e "$first_dst" || -L "$first_dst" ]]; then
+    if ! cp -pP "$first_dst" "$first_backup"; then
+      warn "Failed to preserve $first_dst before installing the binary pair"
+      return 1
+    fi
+    had_first=true
+  fi
+
+  install_binary "$first_src" "$first_dst" || return 1
+  first_committed=true
+  install_binary "$second_src" "$second_dst" || return 1
+
+  first_committed=false
+  trap - EXIT HUP INT TERM
+  rm -rf "$transaction_dir"
+)
 
 rename_install_binary() {
   # Destination is always a rename target, even if it became a directory
@@ -268,20 +327,99 @@ detect_arch() {
   esac
 }
 
+probe_release_binary() (
+  local binary="$1" name="$2" version="$3"
+  local output
+  output=$(mktemp "$tmp_dir/${name}-version-probe.XXXXXX") || return 1
+  if [[ ! -f "$binary" || -L "$binary" || ! -x "$binary" ]]; then
+    warn "Prebuilt ${name} is not a regular executable"
+    return 1
+  fi
+  # A candidate is untrusted until this probe succeeds. Give it an isolated
+  # process group so a forked helper cannot outlive a refusal or timeout.
+  set -m
+  "$binary" --version > "$output" 2>&1 &
+  local probe_pid=$!
+  local deadline=$((SECONDS + MAX_VERSION_PROBE_SECONDS))
+  while kill -0 "$probe_pid" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      kill -KILL -- "-$probe_pid" 2>/dev/null || true
+      wait "$probe_pid" 2>/dev/null || true
+      warn "Prebuilt ${name} version probe timed out; existing binaries were not replaced"
+      return 1
+    fi
+    sleep 0.1
+  done
+  if ! wait "$probe_pid"; then
+    warn "Prebuilt ${name} cannot run on this system; existing binaries were not replaced"
+    head -c 4096 "$output" >&2
+    return 1
+  fi
+  if kill -0 -- "-$probe_pid" 2>/dev/null; then
+    kill -KILL -- "-$probe_pid" 2>/dev/null || true
+    warn "Prebuilt ${name} version probe left descendant processes running; existing binaries were not replaced"
+    return 1
+  fi
+  local reported
+  reported=$(head -c 4097 "$output")
+  if [[ "$reported" != "${name} ${version#v}" ]]; then
+    warn "Prebuilt ${name} does not report ${name} ${version#v}; existing binaries were not replaced"
+    return 1
+  fi
+)
+
+select_apt_release() {
+  local distro="$1" arch="$2" root="${3:-/}" major directory
+  # The published native APT pairs are x86_64. Never guess a foreign ABI,
+  # consult caller-controlled loader paths, or downgrade to a different backend.
+  if [[ "$arch" == x86_64 ]]; then
+    for major in 7.0 6.0; do
+      for directory in usr/lib/x86_64-linux-gnu lib/x86_64-linux-gnu; do
+        if [[ -f "${root%/}/$directory/libapt-pkg.so.$major" ]]; then
+          if [[ "$major" == 7.0 ]]; then
+            printf 'debian-trixie\n'
+          else
+            printf '%s\n' "$distro"
+          fi
+          return 0
+        fi
+      done
+    done
+  fi
+  printf 'No compatible native APT release for %s/%s: require a published architecture and libapt-pkg.so.6.0 or .7.0\n' "$distro" "$arch" >&2
+  return 1
+}
+
 select_artifact() {
   local version="$1"
   local os="$2"
   local distro="$3"
   local arch="$4"
+  local library_root="${5:-/}"
   local asset_name=""
 
   case "$os" in
   linux)
     case "$distro" in
-    arch | debian | ubuntu | fedora)
+    debian | ubuntu)
+      local apt_target
+      if ! apt_target=$(select_apt_release "$distro" "$arch" "$library_root"); then
+        return 1
+      fi
+      asset_name="omg-${version}-${arch}-linux-${apt_target}.tar.gz"
+      ;;
+    arch | fedora)
+      if [[ "$arch" != x86_64 ]]; then
+        printf 'No published OMG Linux artifact for %s/%s; use a supported x86_64 host or build from source\n' "$distro" "$arch" >&2
+        return 1
+      fi
       asset_name="omg-${version}-${arch}-linux-${distro}.tar.gz"
       ;;
     *)
+      if [[ "$arch" != x86_64 ]]; then
+        printf 'No published OMG Linux artifact for %s/%s; use a supported x86_64 host or build from source\n' "$distro" "$arch" >&2
+        return 1
+      fi
       # Fallback to Fedora binary for unknown distros
       warn "Unknown Linux distro '${distro}', using Fedora binary (pure Rust, most portable)"
       asset_name="omg-${version}-${arch}-linux-fedora.tar.gz"
@@ -400,7 +538,9 @@ install_from_release() {
 
   # Select correct artifact name
   local artifact_name
-  artifact_name=$(select_artifact "$actual_version" "$detected_os" "$detected_distro" "$detected_arch")
+  if ! artifact_name=$(select_artifact "$actual_version" "$detected_os" "$detected_distro" "$detected_arch"); then
+    return 1
+  fi
 
   if [[ -z "$artifact_name" ]]; then
     warn "Unable to determine artifact name for ${detected_os}/${detected_distro}/${detected_arch}"
@@ -501,14 +641,17 @@ install_from_release() {
     warn "Prebuilt archive missing omg binary"
     return 1
   fi
+  if [[ -z "$omgd_path" ]]; then
+    warn "Prebuilt archive missing omgd binary; existing binaries were not replaced"
+    return 1
+  fi
+  # Both authenticated candidates must start and match the requested release
+  # before the first destination write. A distro name alone does not prove ABI.
+  probe_release_binary "$omg_path" omg "$actual_version" || return 1
+  probe_release_binary "$omgd_path" omgd "$actual_version" || return 1
 
   mkdir -p "$INSTALL_DIR"
-  install_binary "$omg_path" "$INSTALL_DIR/omg" || return 1
-  if [[ -n "$omgd_path" ]]; then
-    install_binary "$omgd_path" "$INSTALL_DIR/omgd" || return 1
-  else
-    info "Prebuilt archive does not include omgd; skipping daemon install"
-  fi
+  install_binary_pair "$omg_path" "$INSTALL_DIR/omg" "$omgd_path" "$INSTALL_DIR/omgd" || return 1
 
   success "Installed prebuilt binaries to $INSTALL_DIR"
   return 0

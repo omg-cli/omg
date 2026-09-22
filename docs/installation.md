@@ -54,6 +54,19 @@ Arch uses ALPM and supports AUR builds. Debian and Ubuntu use the native APT bac
 
 These backends do not have identical policy, audit, or runtime coverage. Review the [artifact-specific evidence](../benchmarks/README.md) and the release notes before choosing a release; a passing result for one backend does not establish equivalent coverage for another.
 
+### Debian and Ubuntu library compatibility
+
+The installer and self-updater select an archive using the installed system APT library. Match that library when downloading an archive manually:
+
+| System library | Typical distributions | Archive suffix |
+| --- | --- | --- |
+| `libapt-pkg.so.6.0` | Debian 12, Ubuntu 24.04 | `x86_64-linux-debian.tar.gz` or `x86_64-linux-ubuntu.tar.gz`, respectively |
+| `libapt-pkg.so.7.0` | Debian 13, Ubuntu 26.04 | `x86_64-linux-debian-trixie.tar.gz` |
+
+The APT 7 archive must exist in the selected release. Older releases may contain only APT 6 archives; those binaries cannot load against APT 7. Choose a release containing the compatible archive or build from source on the target system. Do not create a library symlink between incompatible major versions.
+
+Before replacing an installed pair, the installer and self-updater verify that both candidate executables (`omg` and `omgd`) start and report the requested version. A failed probe leaves the existing pair in place. These probes establish loader/version compatibility, not full package-manager behavior.
+
 ## Step 1: Download the installer and read it
 
 > **Warning:** the installer changes your computer. It copies the OMG programs into your home folder and, unless you set `OMG_SKIP_SHELL=1`, it can also add lines to your shell start-up files. Read it before you run it.

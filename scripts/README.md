@@ -323,14 +323,17 @@ assets; `install.sh` consumes them via the GitHub releases API.
 | Platform | Archive name |
 | -------- | ------------ |
 | Arch Linux | `omg-v<version>-<arch>-linux-arch.tar.gz` |
-| Debian | `omg-v<version>-<arch>-linux-debian.tar.gz` |
-| Ubuntu | `omg-v<version>-<arch>-linux-ubuntu.tar.gz` |
+| Debian (APT 6) | `omg-v<version>-x86_64-linux-debian.tar.gz` |
+| Ubuntu (APT 6) | `omg-v<version>-x86_64-linux-ubuntu.tar.gz` |
+| Debian 13 / Ubuntu 26.04 (APT 7) | `omg-v<version>-x86_64-linux-debian-trixie.tar.gz` |
 | Fedora / unknown Linux distro fallback | `omg-v<version>-<arch>-linux-fedora.tar.gz` |
 | macOS | `omg-v<version>-<arch>-darwin.tar.gz` |
 
 - `<version>` is the release tag without the leading `v` (e.g. `0.1.204`).
-- `<arch>` is one of `x86_64`, `aarch64`, `i686`, `armv7l` (see `detect_arch`
-  in `install.sh`).
+- Published Linux archives use `x86_64`; macOS uses `aarch64`. Architecture
+  detection alone does not mean a release archive exists for that target.
+- Debian/Ubuntu selection checks the native APT library ABI. APT 7 uses the
+  Trixie pair on either distro; APT 6 retains the distro-specific archive.
 - Every archive MUST have a sidecar `<archive-name>.sha256` containing exactly
   one standard `sha256sum` entry. `install.sh` refuses missing, malformed, or
   mismatched sidecars.

@@ -396,6 +396,7 @@ install_from_release
         for platform in [
             "x86_64-linux-arch",
             "x86_64-linux-debian",
+            "x86_64-linux-debian-trixie",
             "x86_64-linux-ubuntu",
             "x86_64-linux-fedora",
             "aarch64-darwin",

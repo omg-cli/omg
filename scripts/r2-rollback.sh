@@ -2,7 +2,7 @@
 # Roll back the published "latest" version marker in the omg-releases R2 bucket.
 #
 # Usage:
-#   ./scripts/r2-rollback.sh <version> [--dry-run]
+#   ./scripts/r2-rollback.sh <version> [--dry-run] [--allow-legacy-apt6]
 #
 # Re-points the single mutable `latest-version` marker at an already-published
 # release version WITHOUT touching any archives or checksums. Existing clients
@@ -25,10 +25,12 @@ usage() {
 }
 
 dry_run=false
+allow_legacy_apt6=false
 version=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=true ;;
+    --allow-legacy-apt6) allow_legacy_apt6=true ;;
     -h|--help) usage 0 ;;
     -*) echo "error: unknown option: $arg" >&2; usage ;;
     *)
@@ -68,7 +70,13 @@ prefix="omg-v${version}"
 # Pre-flight: the target version must be fully published (archive + checksum
 # present for every supported platform) before the marker may move to it.
 echo "Verifying $prefix artifacts exist in R2..."
-for arch in x86_64-linux-arch x86_64-linux-debian x86_64-linux-ubuntu x86_64-linux-fedora aarch64-darwin; do
+platforms=(x86_64-linux-arch x86_64-linux-debian x86_64-linux-ubuntu x86_64-linux-fedora aarch64-darwin)
+if [[ "$allow_legacy_apt6" == true ]]; then
+  echo "WARNING: legacy rollback explicitly excludes APT7; APT7-only clients cannot install this release." >&2
+else
+  platforms+=(x86_64-linux-debian-trixie)
+fi
+for arch in "${platforms[@]}"; do
   for suffix in tar.gz tar.gz.sha256; do
     artifact="${prefix}-${arch}.${suffix}"
     object="omg-releases/${artifact}"
