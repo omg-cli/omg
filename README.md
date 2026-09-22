@@ -2,7 +2,7 @@
 
 # OMG
 
-**One command line for system packages, language runtimes, and project tasks — on Linux, Apple silicon macOS, and WSL.**
+**One package manager for every Linux distribution and macOS — and it performs the work itself.**
 
 [![CI](https://github.com/omg-cli/omg/actions/workflows/ci.yml/badge.svg)](https://github.com/omg-cli/omg/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/omg-cli/omg)](https://github.com/omg-cli/omg/releases/latest)
@@ -11,45 +11,76 @@
 [![Docs](https://img.shields.io/badge/docs-getomg.xyz%2Fdocs-purple)](https://getomg.xyz/docs)
 [![Website](https://img.shields.io/badge/website-getomg.xyz-blue)](https://getomg.xyz)
 
-[Install](#install-in-one-step) · [First five commands](#first-five-commands) · [Why OMG](#why-omg) · [What it does](#what-it-does) · [Security](#security-built-into-installation) · [Limits](#what-omg-does-not-do) · [Docs](https://getomg.xyz/docs)
+[Install](#install-in-one-step) · [First five commands](#first-five-commands) · [Why OMG](#why-omg) · [What it replaces](#what-omg-replaces) · [What it does](#what-it-does) · [Security](#security-built-into-installation) · [Limits](#what-omg-does-not-do) · [Docs](https://getomg.xyz/docs)
 
 </div>
 
 > [!IMPORTANT]
 > **Beta.** Command surfaces, configuration keys, and on-disk formats can still change. Keep
-> `pacman`, `apt`, `dnf`, or `brew` installed, and validate package changes on a machine you can
-> reinstall.
+> `pacman`, `apt`, `dnf`, or `brew` available as a recovery path, and validate package changes on
+> a machine you can reinstall.
 
 ## Why OMG
 
-- **Stop switching tools.** Search, install, update, and remove packages; choose a language
-  version per project; run the build and test tasks a project already defines — one CLI instead
-  of four, and the same commands across every supported system.
-- **Your system's package manager still does the work.** OMG drives ALPM, APT, DNF, or Homebrew
-  rather than replacing it, so everything you install stays maintainable by the tools you already
-  trust.
-- **Checks where the risk is.** Downloads are verified, managed tools install with lifecycle
-  scripts disabled by default, AUR recipes are reviewed and built in an offline sandbox, and every
-  mutation can be inspected afterwards in history.
+- **Every distribution's package manager, in one program — implemented in OMG's own code.** OMG
+  reads each family's package database and performs the transaction itself: a native APT database
+  reader, resolver, and transaction engine for Debian, Ubuntu, Mint, Pop!_OS and their relatives; a
+  native RPM/DNF engine for Fedora, RHEL, CentOS, Rocky and Alma; `libalpm` access for Arch and its
+  derivatives; and a Homebrew path for Apple silicon macOS. You do not install a different helper per
+  distribution, and you do not relearn flags when you switch machines.
+- **It does the work, not a subprocess.** Installing, upgrading, and removing never shell out to
+  `pacman`, `apt-get`, `dpkg`, `dnf`, or `rpm`. The external programs OMG starts are helper tools —
+  `git`, `gpg`, Bubblewrap for sandboxed builds, `systemctl`, `setpriv` — plus APT's own
+  `apt-get update` when publishing authenticated package lists, and the Homebrew binary on macOS
+  after a policy gate that blocks operations OMG cannot validate.
+- **Safer and more secure than the stock tooling, by default.** Every download is verified, managed
+  tools install with lifecycle scripts disabled, AUR recipes are reviewed and built in an offline
+  sandbox, produced archives are inspected before installation, and each mutation is recorded in a
+  hash-chained audit log and in history.
+- **Faster because it does not spawn another program.** Queries are in-process database reads instead
+  of a subprocess, mirrors are raced in parallel, and an optional daemon keeps indexes and status
+  warm. Measured numbers and their conditions are published in
+  [the benchmark records](benchmarks/README.md) rather than asserted here.
 - **Free, open source, no account.** MIT licensed, no account required for local use, and telemetry
   off by default.
 
 ## Who it is for
 
-- **Arch users** who want AUR installs with source review, an offline Bubblewrap build, and archive
-  inspection by default — without giving up `pacman`.
+- **Anyone who touches more than one Linux distribution** — a Debian laptop and a Fedora build box,
+  Ubuntu in CI and Arch on the desktop — who wants one command syntax and one set of safety checks
+  across all of them.
+- **Teams standardising on a workflow** instead of on a distribution: the same commands, the same
+  policy, and the same recorded environment, whatever each machine runs.
 - **Polyglot developers** who need Node, Python, Go, Rust, and friends pinned per project instead of
   per machine.
-- **Teams** who want a recorded environment (`omg.lock`) that a colleague or a CI job can compare
-  against, with drift reported rather than guessed at.
-- **Anyone running several of those at once**, on a laptop, a desktop, or a disposable VM.
+- **Arch users** specifically for the AUR: source review, an offline Bubblewrap build, archive
+  inspection, and attended approval for privileged content — treated as a first-class source rather
+  than a separate helper.
+- **macOS developers on Apple silicon** who want the same interface they use on Linux.
 
-**Not for you if** you want a graphical package manager, a compliance certification tool, a
-Nix-style fully declarative system, or a replacement for your distribution's package manager. OMG
-is a terminal tool that wraps what you already have.
+**Not for you if** you want a graphical package manager, a compliance certification tool, or a
+Nix-style fully declarative system. OMG is a terminal tool, and packages still come from your
+distribution's repositories as your distribution's packages.
 
 *New to the terminal?* Start with [Getting started](docs/getting-started.md) and keep
 [the glossary](docs/glossary.md) nearby.
+
+## What OMG replaces
+
+| Instead of | OMG uses | Where the code lives |
+| :--- | :--- | :--- |
+| `apt`, `apt-get`, `dpkg` | A native APT database reader, dependency resolver, and transaction engine, including running each package's own maintainer scripts | `src/package_managers/debian_db/` |
+| `dnf`, `rpm` | A native RPM database reader and DNF-backed engine | `src/package_managers/dnf.rs` |
+| `pacman` | Direct `libalpm` access for queries and transactions | `src/package_managers/alpm_direct.rs`, `pacman_db/` |
+| `yay`, `paru`, `pikaur` | An AUR index, PKGBUILD parser, dependency resolver, and Bubblewrap build path with review and archive inspection | `src/package_managers/aur/` |
+| `brew` | The Homebrew path, with policy and audit gates around it | `src/package_managers/homebrew.rs` |
+| `nvm`, `pyenv`, `asdf`, `mise`, `rustup`, `sdkman` | 14 native runtime managers that download, verify, extract, and link versions in your home folder | `src/runtimes/` |
+| `make`, `npm run`, `cargo test`, ecosystem wrappers | A task resolver that finds the runner your project already defines and passes arguments through | `src/core/task_runner.rs` |
+| Manual `curl \| bash`, `npm i -g`, `pip install` habits | `omg tool install` with per-ecosystem policies: scripts off, signatures checked, `--locked`, isolated environments | `src/cli/tool.rs` |
+
+Published Linux archives are x86_64 and backend-specific, so you install the build that matches the
+family you run. See the platform table below and [installation](docs/installation.md) for the exact
+artifact per system.
 
 ## Install in one step
 
