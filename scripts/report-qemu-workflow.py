@@ -61,6 +61,8 @@ def canonical_case_ids(policy):
     identifiers.update(f"qemu-{distro}-lifecycle" for distro in DISTROS)
     identifiers.update(f"qemu-{distro}-aarch64-lifecycle" for distro in DISTROS)
     identifiers.add("qemu-matrix-workflow")
+    identifiers.update(("qemu-matrix-x86-workflow", "qemu-matrix-arm-workflow",
+                        "qemu-matrix-all-workflow", "qemu-arm-runner-kvm-health"))
     return identifiers
 
 
@@ -198,6 +200,39 @@ def projection(rows, successful_main):
     return list(selected.values())
 
 
+def workflow_receipt(jobs, conclusion):
+    """Return an aggregate identity scoped to the architecture actually run.
+
+    ARM runner health is a prerequisite with its own identity: an x86 matrix
+    success is not evidence that missing ARM KVM access recovered.
+    """
+    if not isinstance(jobs, list):
+        raise ValueError("invalid workflow jobs")
+    arm_health = None
+    x86_selected = False
+    arm_selected = False
+    for job in jobs:
+        if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+            raise ValueError("invalid workflow job")
+        name = job["name"]
+        job_conclusion = job.get("conclusion")
+        if name == "ARM guest runner KVM health":
+            arm_health = job_conclusion
+            arm_selected = job_conclusion != "skipped"
+        elif "QEMU guest arm64" in name:
+            arm_selected = arm_selected or job_conclusion != "skipped"
+        elif "QEMU guest (" in name:
+            x86_selected = x86_selected or job_conclusion != "skipped"
+    if arm_health not in (None, "success", "skipped"):
+        return dict(case_id="qemu-arm-runner-kvm-health", distro="ubuntu",
+                    result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
+    scope = "all" if arm_selected and x86_selected else "arm" if arm_selected else "x86"
+    passed = conclusion == "success"
+    return dict(case_id=f"qemu-matrix-{scope}-workflow", distro="ubuntu",
+                result="PASS" if passed else "HARNESS_ERROR",
+                exit_code=0 if passed else 1, elapsed_seconds=0)
+
+
 def bound_issue_updates(selected):
     """Bound issue creation without dropping the validated diagnostic catalog."""
     failures = [row for row in selected if row["result"] in FAILURES]
@@ -268,8 +303,14 @@ def main():
     except (ValueError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError):
         selected = []
         evidence_error = True
-    if evidence_error or (run["conclusion"] != "success" and not any(row["result"] in FAILURES for row in selected)):
-        selected.append(dict(case_id="qemu-matrix-workflow", distro="ubuntu", result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0))
+    jobs = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100"))
+    job_rows = jobs.get("jobs")
+    receipt = workflow_receipt(job_rows, run["conclusion"])
+    selected = [receipt if row["case_id"] == "qemu-matrix-workflow" else row for row in selected]
+    if evidence_error:
+        selected.append(workflow_receipt(job_rows, "failure"))
+    elif run["conclusion"] != "success" and not any(row["result"] in FAILURES for row in selected):
+        selected.append(receipt)
     if not selected:
         print("No authoritative case updates to report")
         return 0
@@ -280,8 +321,7 @@ def main():
         if current["object"]["sha"] != run["head_sha"]:
             selected = [row for row in selected if row["result"] != "PASS"]
         elif not evidence_error:
-            selected.append(dict(case_id="qemu-matrix-workflow", distro="ubuntu", result="PASS", exit_code=0, elapsed_seconds=0))
-    jobs = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100"))
+            selected.append(receipt)
     details = []
     for job in jobs["jobs"][:100]:
         if job["conclusion"] not in ("success", "skipped"):

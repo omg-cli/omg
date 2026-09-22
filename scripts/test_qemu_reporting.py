@@ -229,6 +229,23 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(REPORT.projection([aggregate], True), [aggregate])
         self.assertEqual(REPORT.projection([aggregate], False), [])
 
+    def test_arm_health_failure_has_distinct_identity_from_x86_matrix_success(self):
+        arm_failure = REPORT.workflow_receipt([
+            {"name": "ARM guest runner KVM health", "conclusion": "failure"},
+            {"name": "Distro lane (arch) / QEMU guest (arch)", "conclusion": "success"},
+        ], "failure")
+        x86_success = REPORT.workflow_receipt([
+            {"name": "ARM guest runner KVM health", "conclusion": "skipped"},
+            {"name": "Distro lane (arch) / QEMU guest (arch)", "conclusion": "success"},
+        ], "success")
+        self.assertEqual(arm_failure, dict(
+            case_id="qemu-arm-runner-kvm-health", distro="ubuntu",
+            result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0,
+        ))
+        self.assertEqual(x86_success["case_id"], "qemu-matrix-x86-workflow")
+        self.assertEqual(x86_success["result"], "PASS")
+        self.assertNotEqual(arm_failure["case_id"], x86_success["case_id"])
+
     def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
                            corrupt=False, expired=False, helper_fails=False, case_log=None,
                            log_case="search", main_shas=None, changed_attempt=False,
@@ -310,7 +327,7 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], "scripts/qa-file-issue.sh")
         self.assertEqual(calls[0][1], [row, dict(
-            case_id="qemu-matrix-workflow", distro="ubuntu", result="PASS",
+            case_id="qemu-matrix-x86-workflow", distro="ubuntu", result="PASS",
             exit_code=0, elapsed_seconds=0)])
         self.assertEqual(catalog["failures"], [])
 
@@ -382,7 +399,7 @@ class ReportingBoundaryTests(unittest.TestCase):
                 calls, catalog = self.run_report_fixture([self.row()], **options)
                 self.assertTrue(catalog["evidence_invalid_or_unavailable"])
                 self.assertEqual(calls[0][1][0]["result"], "HARNESS_ERROR")
-                self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-workflow")
+                self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-x86-workflow")
 
     def test_cancelled_run_makes_no_issue_updates(self):
         calls, catalog = self.run_report_fixture([self.row()], conclusion="cancelled")
@@ -433,7 +450,7 @@ class ReportingBoundaryTests(unittest.TestCase):
         reported = [row for call in calls for row in call[1]]
         self.assertFalse(any(row["result"] in REPORT.FAILURES for row in reported))
         self.assertEqual({(row["case_id"], row["distro"]) for row in reported
-                          if row["case_id"] != "qemu-matrix-workflow"},
+                          if not row["case_id"].startswith("qemu-matrix-")},
                          {(row["case_id"], row["distro"]) for row in rows})
 
     def test_privileged_report_job_excludes_pull_request_runs(self):

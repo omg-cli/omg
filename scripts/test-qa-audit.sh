@@ -51,6 +51,30 @@ out=$("$runner" "$scratch/suite") || rc=$?
 grep -q "invalid results.json; audit incomplete" <<< "$out" || fail "suite audit did not flag the junk file"
 grep -q "files=2 failing-rows=1" <<< "$out" || fail "suite audit bad summary: $out"
 
+# A complete transaction suite has its own schema and must be audited as
+# transaction evidence instead of being rejected as malformed case rows.
+mkdir -p "$scratch/transactions/run/transactions"
+cat > "$scratch/transactions/run/transactions/results.json" <<'EOF'
+[{"id":"install-native-001","operation":"install","tool":"native","round":1,"result":"PASS","exit_code":0,"boot_id":"11111111-1111-4111-8111-111111111111","base_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"id":"install-omg-001","operation":"install","tool":"omg","round":1,"result":"PASS","exit_code":0,"boot_id":"22222222-2222-4222-8222-222222222222","base_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"id":"remove-native-001","operation":"remove","tool":"native","round":1,"result":"PASS","exit_code":0,"boot_id":"33333333-3333-4333-8333-333333333333","base_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"id":"remove-omg-001","operation":"remove","tool":"omg","round":1,"result":"PASS","exit_code":0,"boot_id":"44444444-4444-4444-8444-444444444444","base_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+EOF
+cat > "$scratch/transactions/run/transactions/summary.json" <<'EOF'
+{"schema_version":2,"kind":"transaction-suite","distro":"debian","complete":true,"phase":"complete","samples_per_tool":1,"expected_trials":4,"bases":{"install":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","remove":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"results":[{"id":"install-native-001","operation":"install","tool":"native","round":1,"result":"PASS","exit_code":0,"boot_id":"11111111-1111-4111-8111-111111111111","base_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"id":"install-omg-001","operation":"install","tool":"omg","round":1,"result":"PASS","exit_code":0,"boot_id":"22222222-2222-4222-8222-222222222222","base_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"id":"remove-native-001","operation":"remove","tool":"native","round":1,"result":"PASS","exit_code":0,"boot_id":"33333333-3333-4333-8333-333333333333","base_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"id":"remove-omg-001","operation":"remove","tool":"omg","round":1,"result":"PASS","exit_code":0,"boot_id":"44444444-4444-4444-8444-444444444444","base_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}
+EOF
+out=""; rc=0
+out=$("$runner" "$scratch/transactions") || rc=$?
+[[ "$rc" -eq 0 ]] || fail "complete transaction audit must pass, got $rc: $out"
+grep -q 'transaction verdicts: PASS=4' <<< "$out" || fail "transaction audit omitted verdicts: $out"
+grep -q 'invalid-files=0' <<< "$out" || fail "valid transaction evidence was rejected: $out"
+
+# Incomplete transaction evidence must fail closed even if every recorded row
+# currently says PASS.
+jq '.complete=false | .phase="trials"' "$scratch/transactions/run/transactions/summary.json" > "$scratch/transactions/run/transactions/summary.next.json"
+mv "$scratch/transactions/run/transactions/summary.next.json" "$scratch/transactions/run/transactions/summary.json"
+out=""; rc=0
+out=$("$runner" "$scratch/transactions") || rc=$?
+[[ "$rc" -eq 1 ]] || fail "incomplete transaction audit must fail, got $rc"
+grep -q 'invalid transaction evidence; audit incomplete' <<< "$out" || fail "incomplete transaction evidence was not identified: $out"
+
 # Malformed evidence alone must not be mistaken for a healthy run.
 for invalid in '{"oops":true}' 'not json' '[{"result":"PASS"}]' \
   '[{"case_id":"x","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":1},{"case_id":"x","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":1}]'; do
