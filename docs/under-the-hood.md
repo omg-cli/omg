@@ -23,7 +23,7 @@ Releases ship a CLI (`omg`) and a daemon (`omgd`). They have separate jobs:
 | Program | Owns | Without it |
 | :--- | :--- | :--- |
 | `omg` | Argument parsing, backend queries and mutations, policy, output, prompt counters, interactive views | Nothing works; this is the program you run |
-| `omgd` | A warm in-memory index, background status refresh, the JSON and binary status snapshots | Package commands still work through direct backend paths; vulnerability scans, Unix SOC 2 export, and metrics need the daemon |
+| `omgd` | A warm in-memory index, cached vulnerability results, background status refresh, the JSON and binary status snapshots | Package commands and vulnerability scans still work through direct paths; Unix SOC 2 export and metrics need the daemon |
 
 ```bash
 omg daemon --foreground    # start omgd in this terminal so you can read its output

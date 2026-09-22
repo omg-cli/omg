@@ -45,16 +45,15 @@ Report vulnerabilities privately using [SECURITY.md](../SECURITY.md).
 ## Vulnerability scanning
 
 ```bash
-omg daemon --foreground
-```
-
-Run the daemon in a separate terminal, then scan:
-
-```bash
 omg audit scan
 ```
 
-The scan requires the Unix daemon and a matching `omgd` executable. Current Linux and macOS release archives include that pair. Archives from v0.1.222 and earlier omit `omgd` on non-Arch targets. See [installation requirements](./installation.md#daemon-requirements). Arch Linux Security Advisory data is specific to Arch packages. OSV queries depend on ecosystem and version matching. Missing findings are not proof that a package is free of vulnerabilities. Do not treat Arch advisory matching as Debian, Fedora, or macOS vulnerability coverage.
+The CLI prefers a running `omgd` process so repeated scans can reuse its warm package
+manager and vulnerability cache. If the daemon is unavailable, the CLI creates the selected
+package backend and scanner itself; the scan remains available but starts cold. Arch Linux
+Security Advisory data is specific to Arch packages. OSV queries depend on ecosystem and
+version matching. Missing findings are not proof that a package is free of vulnerabilities.
+Do not treat Arch advisory matching as Debian, Fedora, or macOS vulnerability coverage.
 
 The scan prints findings but does not return a failing exit status merely because it found vulnerabilities. Its human-readable output is not a documented JSON alert interface. `omg audit fix --dry-run` previews available package updates on the Arch backend; an available update is not proof that every advisory is fixed.
 

@@ -28,7 +28,8 @@ omg daemon-status           # resolved socket, ownership, and whether a process 
 | :--- | :--- |
 | `omg search`, `omg info`, `omg install`, `omg update`, `omg remove` | Work through the direct backend path |
 | `omg ec`, `omg tc`, `omg oc`, `omg uc` | Work: they read the status snapshot file rather than asking the daemon |
-| `omg audit scan`, Unix SOC 2 export, `omg metrics` | Fail explicitly; these are daemon-backed |
+| `omg audit scan` | Works through a direct cold scan; the daemon path reuses warm package and vulnerability state |
+| Unix SOC 2 export, `omg metrics` | Fail explicitly; these are daemon-backed |
 | `omg audit sbom` | Requires the Arch backend and advisory access independently of daemon state |
 
 ## Startup, one instance at a time
