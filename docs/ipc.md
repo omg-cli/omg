@@ -90,7 +90,8 @@ Capabilities differ, and OMG does not pretend otherwise:
 | Situation | Behaviour |
 | :--- | :--- |
 | Core package queries and mutations | Use the direct backend path; the daemon is an optimisation, not a dependency |
-| `omg audit scan`, Unix SOC 2 export, `omg metrics` | Require a running daemon and fail explicitly without one |
+| `omg audit scan` | Prefer the daemon's warm state, then fall back to the direct package backend and scanner |
+| Unix SOC 2 export, `omg metrics` | Require a running daemon and fail explicitly without one |
 | Prompt counters (`omg ec`, `tc`, `oc`, `uc`) | Read the status snapshot file directly, so they work with no daemon at all |
 
 See [cache](./cache.md) for the snapshot rules and [daemon](./daemon.md) for lifecycle
