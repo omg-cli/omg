@@ -219,7 +219,7 @@ If a published release is (or may be) compromised, follow this runbook.
 
 ### Immediate containment (first hour)
 
-1. **Stop exposure:** remove the affected archives, `.sha256` sidecars, and the SBOM from the GitHub Release, and delete the corresponding `omg-releases/` objects in R2. If a good earlier version exists, run `./scripts/r2-rollback.sh <previous-version>` so update checks resolve to it.
+1. **Stop exposure:** remove the affected archives, `.sha256` sidecars, and the SBOM from the GitHub Release, and delete the corresponding `omg-releases/` objects in R2. If a good earlier version exists, run `./scripts/r2-rollback.sh <previous-version>` so update checks resolve to it. The rollback requires all platform archives and sidecars, including the Trixie/APT7 pair. For a historical release predating APT7 artifacts, explicitly pass `--allow-legacy-apt6`; APT7-only clients will be unable to install that version. Use `--dry-run` to check availability before moving the marker. Never substitute an APT6 archive for the missing APT7 binary.
 2. **Revoke tokens:** delete `CLOUDFLARE_API_TOKEN` immediately — do not wait for analysis. Rotate per the procedure in [docs/release-operations.md](docs/release-operations.md).
 3. **Freeze releases:** no new tags until containment is confirmed.
 

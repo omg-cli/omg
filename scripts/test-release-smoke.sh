@@ -182,6 +182,33 @@ grep -q '"result":"HARNESS_ERROR"' "$(results_file "$scratch/missing-evidence")"
 
 make_stage "$scratch/valid"
 export FAKE_CONTAINER_STATE="$scratch/container-state"
+assert_rc 2 "$runner" --apt-abi 8 --distro debian
+assert_rc 2 "$runner" --apt-abi 7 --distro arch
+make_stage "$scratch/apt7" debian-trixie
+for apt_distro in debian ubuntu; do
+  export FAKE_ENGINE_ARGS="$scratch/apt7-$apt_distro-engine"
+  assert_rc 0 "$runner" --release v9.9.9 --distro "$apt_distro" --apt-abi 7 \
+    --case release-package-search-tree --container-engine fake-engine \
+    --staged-dir "$scratch/apt7" --evidence-dir "$scratch/apt7-$apt_distro-evidence"
+  grep -q '"result":"PASS"' "$(results_file "$scratch/apt7-$apt_distro-evidence")" || fail 'APT 7 silently skipped the distro contract'
+  grep -q "\"distro\":\"$apt_distro\"" "$(results_file "$scratch/apt7-$apt_distro-evidence")" || fail 'APT 7 lost the inventory distro identity'
+  if [[ "$apt_distro" == debian ]]; then image_tag=debian:trixie; else image_tag=ubuntu:26.04; fi
+  grep -q "$image_tag@sha256:" "$FAKE_ENGINE_ARGS" || fail 'APT 7 used the wrong host image'
+  export FAKE_RUN_EXIT=1
+  assert_rc 1 "$runner" --release v9.9.9 --distro "$apt_distro" --apt-abi 7 \
+    --case release-package-search-tree --container-engine fake-engine \
+    --staged-dir "$scratch/apt7" --evidence-dir "$scratch/apt7-$apt_distro-failure"
+  grep -q '"result":"PRODUCT_FAIL"' "$(results_file "$scratch/apt7-$apt_distro-failure")" || fail 'APT 7 hid a failing behavior'
+  unset FAKE_RUN_EXIT
+  assert_rc 3 "$runner" --release v9.9.9 --distro "$apt_distro" --apt-abi 7 \
+    --case release-package-search-tree --container-engine fake-engine \
+    --staged-dir "$scratch/valid" --evidence-dir "$scratch/apt7-$apt_distro-missing"
+  grep -q '"result":"HARNESS_ERROR"' "$(results_file "$scratch/apt7-$apt_distro-missing")" || fail 'missing APT 7 archive was silently skipped'
+  missing_metadata="$(dirname "$(results_file "$scratch/apt7-$apt_distro-missing")")/$apt_distro-release-package-search-tree/metadata.txt"
+  grep -Fxq 'expected_archive=omg-v9.9.9-x86_64-linux-debian-trixie.tar.gz' "$missing_metadata" || fail 'missing APT 7 evidence lost the expected archive'
+  grep -q "^expected_image=$image_tag@sha256:" "$missing_metadata" || fail 'missing APT 7 evidence lost the pinned host image'
+done
+unset FAKE_ENGINE_ARGS
 for failure_code in 120 125 126 127; do
   export FAKE_RUN_EXIT="$failure_code"
   assert_rc 3 "$runner" "${base_args[@]}" --staged-dir "$scratch/valid" --evidence-dir "$scratch/launch-error-$failure_code"

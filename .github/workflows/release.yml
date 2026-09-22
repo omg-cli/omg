@@ -126,12 +126,20 @@ jobs:
           path: omg-v*.tar.gz*
 
   build-debian:
-    name: "Build Debian"
+    name: "Build ${{ matrix.distro }}"
     needs: gate-on-ci
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            image: debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931
+          - distro: debian-trixie
+            image: debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
     container:
-      image: debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931
+      image: ${{ matrix.image }}
     env:
       DEBIAN_FRONTEND: noninteractive
       CARGO_HOME: /usr/local/cargo
@@ -175,19 +183,20 @@ jobs:
           cargo build --release --no-default-features --features debian,pgp,license --locked
 
       - name: Package
+        env:
+          DISTRO: ${{ matrix.distro }}
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
-          mkdir -p "omg-v${VERSION}-x86_64-linux-debian"
-          cp target/release/omg "omg-v${VERSION}-x86_64-linux-debian/"
-          cp target/release/omgd "omg-v${VERSION}-x86_64-linux-debian/"
-          cp README.md LICENSE "omg-v${VERSION}-x86_64-linux-debian/"
-          tar -czvf "omg-v${VERSION}-x86_64-linux-debian.tar.gz" "omg-v${VERSION}-x86_64-linux-debian"
-          sha256sum "omg-v${VERSION}-x86_64-linux-debian.tar.gz" > "omg-v${VERSION}-x86_64-linux-debian.tar.gz.sha256"
+          PACKAGE="omg-v${VERSION}-x86_64-linux-${DISTRO}"
+          mkdir -p "$PACKAGE"
+          cp target/release/omg target/release/omgd README.md LICENSE "$PACKAGE/"
+          tar -czvf "${PACKAGE}.tar.gz" "$PACKAGE"
+          sha256sum "${PACKAGE}.tar.gz" > "${PACKAGE}.tar.gz.sha256"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: debian-build
+          name: ${{ matrix.distro }}-build
           path: omg-v*.tar.gz*
 
   build-ubuntu:
@@ -323,11 +332,59 @@ jobs:
   # PUBLISH RELEASE
   # ════════════════════════════════════════════════════════════════════════════
 
+  smoke-apt:
+    name: "Staged APT smoke (${{ matrix.distro }}, ABI ${{ matrix.abi }})"
+    needs: [build-debian, build-ubuntu]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            abi: '6'
+            artifact: debian-build
+          - distro: ubuntu
+            abi: '6'
+            artifact: ubuntu-build
+          - distro: debian
+            abi: '7'
+            artifact: debian-trixie-build
+          - distro: ubuntu
+            abi: '7'
+            artifact: debian-trixie-build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: staged-release
+      - name: Exercise staged APT release
+        env:
+          DISTRO: ${{ matrix.distro }}
+          APT_ABI: ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          test -n "$VERSION"
+          ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
+            --distro "$DISTRO" --apt-abi "$APT_ABI" --evidence-dir apt-smoke-evidence
+      - name: Preserve staged APT smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staged-apt-smoke-${{ matrix.distro }}-${{ matrix.abi }}
+          path: apt-smoke-evidence/
+          retention-days: 14
+          if-no-files-found: error
+
   release:
     name: "Create Release"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: [build-arch, build-debian, build-ubuntu, build-fedora, build-macos]
+    needs: [build-arch, build-debian, build-ubuntu, build-fedora, build-macos, smoke-apt]
     permissions:
       contents: write
       id-token: write
@@ -340,6 +397,7 @@ jobs:
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: '*-build'
           path: artifacts
 
       - name: Install SBOM metadata toolchain
@@ -525,14 +583,18 @@ jobs:
           gh release download "$SYNC_EXISTING_TAG" \
             --pattern "omg-${SYNC_EXISTING_TAG}-*.tar.gz" \
             --pattern "omg-${SYNC_EXISTING_TAG}-*.tar.gz.sha256" \
+            --pattern "omg-${SYNC_EXISTING_TAG}.cdx.json" \
             --dir release
           mapfile -t archives < <(find release -maxdepth 1 -type f -name '*.tar.gz' -print | sort)
           mapfile -t checksums < <(find release -maxdepth 1 -type f -name '*.tar.gz.sha256' -print | sort)
-          if (( ${#archives[@]} != 5 || ${#checksums[@]} != 5 )); then
-            echo "::error::Expected five archives and five checksums"
+          if (( ${#archives[@]} != 6 || ${#checksums[@]} != 6 )); then
+            echo "::error::Expected six archives and six checksums, including Debian Trixie (APT 7)"
             exit 1
           fi
-          (cd release && sha256sum --check ./*.sha256)
+          # Resync must satisfy the same exact platform and checksum contract
+          # as a fresh release before any object or installer is published.
+          mv release downloaded-release
+          bash scripts/collect-release-artifacts.sh "$VERSION" downloaded-release release
           for archive in "${archives[@]}"; do
             gh attestation verify "$archive" \
               --repo "$GITHUB_REPOSITORY" \
