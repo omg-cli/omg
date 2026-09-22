@@ -11,7 +11,7 @@ description: Small, reviewable package and project workflows
 > New to the terminal? Read [Getting started](./getting-started.md) and keep
 > [the glossary](./glossary.md) open while you work.
 
-Examples assume a backend-compatible installation completed using the [verified installation procedure](./installation.md). They are not scripts to execute unattended on an existing machine. OMG is in beta; keep native recovery tools and backups while validating package changes.
+Examples assume a backend-compatible installation completed using the [verified installation procedure](./installation.md). They are not scripts to execute unattended on an existing machine. OMG is approaching beta; keep native recovery tools and backups while validating package changes.
 
 The common path is deliberately staged: inspect first, preview changes, then approve the mutation.
 

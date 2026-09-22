@@ -14,7 +14,7 @@ This page shows you how to use OMG with a Node.js project you already have. You 
 
 Two things to know before you start:
 
-- **OMG is in beta.** Its makers still change how it behaves.
+- **OMG is approaching beta.** Commands and formats may still change.
 - **Project tasks run code from your project folder.** Use a project you trust, and use a machine you can reinstall if you later change system packages.
 
 ## What you need first

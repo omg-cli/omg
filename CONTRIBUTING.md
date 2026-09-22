@@ -3,7 +3,7 @@
 Start with a reproducible bug, a focused code change, or a documentation correction.
 Describe the behavior you changed and the checks you ran.
 
-OMG is in beta. Package operations can change the host, and some tests call native
+OMG is approaching beta. Package operations can change the host, and some tests call native
 package tools. Read [the test guide](tests/README.md) before running broad suites.
 
 ## Get a checkout

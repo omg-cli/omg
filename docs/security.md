@@ -48,9 +48,9 @@ Report vulnerabilities privately using [SECURITY.md](../SECURITY.md).
 omg audit scan
 ```
 
-The CLI prefers a running `omgd` process so repeated scans can reuse its warm package
-manager and vulnerability cache. If the daemon is unavailable, the CLI creates the selected
-package backend and scanner itself; the scan remains available but starts cold. Arch uses
+Published v0.1.223 requires a running `omgd` for `omg audit scan`. The newer main checkout
+prefers the daemon so repeated scans can reuse its warm cache, but creates the selected
+backend and scanner itself when the daemon is unavailable. In that newer checkout, Arch uses
 Arch Linux Security Advisory data. Fedora uses native DNF advisories. Debian and Ubuntu
 query OSV using their distribution release as the ecosystem. Missing findings are not
 proof that a package is free of vulnerabilities. Do not treat one distribution's
@@ -121,7 +121,7 @@ The local command emits an installed-package CycloneDX 1.5 JSON inventory:
 omg audit sbom --output ./sbom.json
 ```
 
-The CLI always includes a vulnerability scan; there is no flag to turn it off. System SBOM generation supports Arch, Debian, Ubuntu, and Fedora when the selected package backend can supply a complete installed inventory and its advisory source is available. Arch uses Arch advisories, Fedora uses DNF advisories, and Debian and Ubuntu query OSV. macOS has no system SBOM backend. An inventory or advisory failure stops generation instead of producing a partial success.
+The CLI always includes a vulnerability scan; there is no flag to turn it off. In published v0.1.223, the command succeeds on Arch when inventory and advisory data are available. Debian and Ubuntu have inventory code but fail at the required vulnerability scan; Fedora has no system SBOM backend. The newer main checkout supports Arch, Debian, Ubuntu, and Fedora when their inventory and advisory sources are available. It uses Arch advisories, DNF advisories on Fedora, and OSV on Debian and Ubuntu. macOS has no system SBOM backend. An inventory or advisory failure stops generation instead of producing a partial success.
 
 The inventory contains package names, versions, descriptions when available, PURLs, available license metadata, and matched vulnerability findings. Fedora's native inventory does not currently supply descriptions or licenses. The generator compares installed identities before and after the scan and refuses a changed inventory. It does not resolve dependency edges or populate component file hashes. It is not an application dependency inventory, a complete supply-chain graph, or proof of regulatory compliance. An advisory fetch failure must not be read as a clean report.
 
@@ -160,7 +160,7 @@ Privileged backend operations record attempts and outcomes synchronously. An int
 omg audit export --framework soc2 --output ./audit-evidence
 ```
 
-Only `soc2` generates files on this command path. It exports up to 1,000 recent audit entries, a vulnerability scan, a system SBOM, and a policy snapshot. On Unix the scan prefers the daemon and falls back to a direct scan. The system SBOM still needs a supported backend and advisory data. `iso27001`, `fedramp`, `hipaa`, and `pci-dss` are accepted names but return an unimplemented error. A failed export may leave partial files.
+Only `soc2` generates files on this command path. It exports up to 1,000 recent audit entries, a vulnerability scan, a system SBOM, and a policy snapshot. In published v0.1.223, the scan requires `omgd`, and Debian/Ubuntu export fails at the required SBOM scan. The newer main checkout can scan directly when the daemon is unavailable and supports more system SBOM backends. Every backend still needs available inventory and advisory data. `iso27001`, `fedramp`, `hipaa`, and `pci-dss` are accepted names but return an unimplemented error. A failed export may leave partial files.
 
 `--period` is metadata, not a time-range filter. The separate `omg enterprise audit-export` command produces a generic inventory bundle, not framework-specific controls. See [enterprise limits](./enterprise.md).
 

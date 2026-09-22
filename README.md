@@ -138,8 +138,8 @@ and uninstalling.
 | Platform | Package path | Release status |
 | :--- | :--- | :--- |
 | Arch Linux x86_64 | ALPM plus first-class AUR pipeline | Supported; broadest package-security coverage |
-| Debian 12 / Ubuntu 24.04 x86_64 | APT 6 database | Supported with Debian or Ubuntu release binaries |
-| Debian 13 / Ubuntu 26.04 x86_64 | APT 7 database; Ubuntu 26.04 uses the Debian Trixie release pair | Supported with the Debian Trixie release binary |
+| Debian 12 / Ubuntu 24.04 x86_64 | APT 6 database | Supported by published v0.1.223 release binaries |
+| Debian 13 / Ubuntu 26.04 x86_64 | APT 7 database | Current main checkout supports the Trixie archive mapping; v0.1.223 has no APT 7 artifact |
 | Fedora x86_64 | Direct RPM state plus DNF repository operations | Experimental |
 | Apple silicon macOS | Policy-gated Homebrew integration | Supported on ARM64 |
 | Windows | A supported Linux distribution in WSL | No native Windows build |

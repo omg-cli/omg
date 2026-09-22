@@ -53,7 +53,7 @@ OMG includes built-in security features:
 
 - **Package verification:** Follows the selected backend and its repository trust settings; native PGP checks require the `pgp` feature
 - **Vulnerability scanning:** Reports matched advisories for installed packages; no findings do not prove a package is safe
-- **SBOM generation:** CycloneDX 1.5 installed-package inventories on supported Arch, Debian, Ubuntu, and Fedora backends
+- **SBOM generation:** CycloneDX 1.5 installed-package inventory on Arch in v0.1.223; current main also supports Debian, Ubuntu, and Fedora when inventory and advisory data are available
 - **Security Grading:** Source-based policy grades, not proof of package safety or SLSA levels
 - **Audit Logging:** Local hash-chain consistency checks, not authenticated or complete history
 
@@ -82,7 +82,8 @@ render the complete accepted hook before authorization.
 - **Runtime Integrity:** Publisher-provided checksums detect corruption where available; they do not authenticate a compromised publisher
 
 The system SBOM includes a vulnerability scan and fails when its inventory or advisory
-source fails. The release SBOM is a separate inventory of Cargo dependencies. Neither
+source fails. In v0.1.223, Debian and Ubuntu fail at that required scan and Fedora has no
+system SBOM backend. The release SBOM is a separate inventory of Cargo dependencies. Neither
 contains a resolved dependency graph for all software on the machine. macOS has no
 system SBOM backend in this build.
 
@@ -207,7 +208,7 @@ Security updates are announced via:
 
 OMG provides inventory and audit inputs, not compliance certification. It does not implement HIPAA controls.
 
-`omg audit export --framework soc2` generates evidence on supported Arch, Debian, Ubuntu, and Fedora backends when their installed inventory and advisory sources are available. On Unix it prefers a running daemon for the vulnerability scan and falls back to a direct scan when the daemon is unavailable. Other framework names on that command return unimplemented errors. `omg enterprise audit-export` remains Arch-only and generates the same generic inventory bundle for every accepted framework name; selecting HIPAA does not add HIPAA evidence. Period labels do not filter audit history.
+`omg audit export --framework soc2` generates evidence on supported backends when their installed inventory and advisory sources are available. In published v0.1.223, this requires `omgd` and succeeds with the system SBOM on Arch; Debian and Ubuntu fail at the required SBOM scan, and Fedora lacks that backend. Current main supports Arch, Debian, Ubuntu, and Fedora and can scan directly when the daemon is unavailable. Other framework names on that command return unimplemented errors. `omg enterprise audit-export` remains Arch-only and generates the same generic inventory bundle for every accepted framework name; selecting HIPAA does not add HIPAA evidence. Period labels do not filter audit history.
 
 Exports are plaintext JSON or CSV. Some use owner-only permissions, but that is not encryption. Restrict destinations, inspect contents and permissions, and encrypt externally when required. SBOMs do not include a resolved dependency graph. See [security evidence limits](docs/security.md) and [enterprise exports](docs/enterprise.md).
 

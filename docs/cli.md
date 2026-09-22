@@ -918,9 +918,9 @@ omg audit [SUBCOMMAND]
 | `export` | Export compliance evidence for audit frameworks |
 | `eol` | Check end-of-life status for installed Node.js, Python, Rust, Go, Ruby, Java, Bun, and Deno versions |
 
-`scan` prefers the Unix daemon but falls back to the direct package backend and shared scanner; it does not fail solely because findings exist. `sbom` uses the native installed-package inventory and shared scanner on Arch, Debian, Ubuntu, and Fedora. It fails on unsupported distributions, including macOS, and does not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
+In published v0.1.223, `scan` requires the Unix daemon, and `sbom` succeeds on Arch when its inventory and advisories are available. Debian and Ubuntu fail at the required SBOM vulnerability scan; Fedora has no system SBOM backend. The newer main checkout can scan directly when the daemon is unavailable and supports system SBOMs on Arch, Debian, Ubuntu, and Fedora. Neither version fails `scan` solely because findings exist. SBOMs do not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
 
-`omg audit export --framework soc2` uses the supported SBOM backend and prefers the daemon for its scan, with a direct scan fallback. The other accepted framework names return unimplemented errors. `--period` labels the export; it does not filter history. Output is plaintext and can be partial on failure. See [security limits](./security.md).
+`omg audit export --framework soc2` uses the supported SBOM backend. Published v0.1.223 requires the daemon and can fail on Debian or Ubuntu at the SBOM step. The newer main checkout prefers the daemon and can scan directly when it is absent. The other accepted framework names return unimplemented errors. `--period` labels the export; it does not filter history. Output is plaintext and can be partial on failure. See [security limits](./security.md).
 
 **Options for `log`:**
 
@@ -933,11 +933,11 @@ omg audit [SUBCOMMAND]
 **Examples:**
 
 ```bash
-# Vulnerability scan (default)
+# Vulnerability scan (v0.1.223 requires omgd)
 omg audit
 omg audit scan
 
-# Generate SBOM
+# Generate SBOM (v0.1.223: Arch; newer main: Arch, Debian, Ubuntu, Fedora)
 omg audit sbom -o sbom.json
 
 # Scan for secrets

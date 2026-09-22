@@ -12,7 +12,7 @@ into your home folder.
 
 **New to the terminal?** Read [Getting started](./getting-started.md) first. It explains the words on this page and shows you how to open a terminal. [The glossary](./glossary.md) explains any other term you meet.
 
-> **Warning:** OMG is in beta, so its makers still change how it behaves. Use a machine you can reinstall (or a virtual machine) when you change system packages, and keep your native package tool (`pacman`, `apt`, `dnf`, or Homebrew) available while you try things.
+> **Warning:** OMG is approaching beta, so its makers still change how it behaves. Use a machine you can reinstall (or a virtual machine) when you change system packages, and keep your native package tool (`pacman`, `apt`, `dnf`, or Homebrew) available while you try things.
 
 ## Which download do I need?
 
@@ -28,6 +28,10 @@ You usually do not download OMG by hand. The installer script works out which re
 | Windows | A Linux system inside WSL | The file for the Linux distribution you installed in WSL |
 | Mac with an Intel processor | Not supported by current releases | None; Rosetta does not run ARM64 programs on Intel Macs |
 | Linux on ARM (for example, a Raspberry Pi) | Not supported by current releases | None |
+
+The APT 7 row describes the newer main checkout. The installer currently serves v0.1.223,
+which has no Debian 13 or Ubuntu 26.04 archive; use a release that publishes the matching
+artifact or build from source on the target system.
 
 In those file names, `<version>` is replaced by the release number, so release 0.1.223 is `omg-v0.1.223-x86_64-linux-arch.tar.gz` on Arch.
 
@@ -64,7 +68,7 @@ The installer and self-updater select an archive using the installed system APT 
 | `libapt-pkg.so.6.0` | Debian 12, Ubuntu 24.04 | `x86_64-linux-debian.tar.gz` or `x86_64-linux-ubuntu.tar.gz`, respectively |
 | `libapt-pkg.so.7.0` | Debian 13, Ubuntu 26.04 | `x86_64-linux-debian-trixie.tar.gz` |
 
-The APT 7 archive must exist in the selected release. Older releases may contain only APT 6 archives; those binaries cannot load against APT 7. Choose a release containing the compatible archive or build from source on the target system. Do not create a library symlink between incompatible major versions.
+The APT 7 archive must exist in the selected release. Published v0.1.223 has only APT 6 archives; the APT 7 mapping is available in the newer main checkout. Those older binaries cannot load against APT 7. Choose a release containing the compatible archive or build from source on the target system. Do not create a library symlink between incompatible major versions.
 
 Before replacing an installed pair, the installer and self-updater verify that both candidate executables (`omg` and `omgd`) start and report the requested version. A failed probe leaves the existing pair in place. These probes establish loader/version compatibility, not full package-manager behavior.
 

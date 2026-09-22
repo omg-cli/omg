@@ -18,7 +18,7 @@ software, picks the right version of a programming language for a project, and r
 tasks a project already defines.
 
 It covers system packages, 14 language runtimes, a task runner, and some security checks.
-It is **in beta**, so its makers still change how it behaves, and it does not
+It is **approaching beta**, so its makers still change how it behaves, and it does not
 replace every feature of `pacman`, APT, DNF, Homebrew, or the runtime tools you may
 already use.
 

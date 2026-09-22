@@ -13,7 +13,7 @@ using it on a new system.
 
 **New to the terminal?** Start with [Getting started](./getting-started.md). It explains the words and shows what you should see after each step. Look up anything unfamiliar in [the glossary](./glossary.md).
 
-**OMG is in beta.** That means its makers still change how it behaves. Keep your native package tools available, and use a machine you can reinstall while you try out package changes.
+**OMG is approaching beta.** Its makers still change how it behaves. Keep your native package tools available, and use a machine you can reinstall while you try out package changes.
 
 ## Start here
 
