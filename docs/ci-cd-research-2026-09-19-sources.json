@@ -1,0 +1,151 @@
+{
+  "date": "2026-09-19",
+  "search_engine": "Exa",
+  "workstreams": 6,
+  "searches": [
+    {
+      "id": "orchestration",
+      "query": "Official GitHub Actions documentation optimizing required checks path filters merge queue merge_group concurrency queue max pending cancel-in-progress"
+    },
+    {
+      "id": "rust",
+      "query": "Official Cargo rust compiler documentation build timings profiles LTO codegen units incremental CI optimization linker rust cache"
+    },
+    {
+      "id": "cache",
+      "query": "Swatinem rust-cache README workspace cache mtime cleanup shared-key cache-workspace save-if sccache Rust limitations"
+    },
+    {
+      "id": "tests",
+      "query": "Official cargo nextest documentation reuse builds archive partition sharding test groups retries JUnit CI"
+    },
+    {
+      "id": "artifacts",
+      "query": "Official GitHub Actions reusable workflows artifact attestations promote build artifacts immutable artifact digest compression level downloading other workflow run source ref"
+    },
+    {
+      "id": "containers",
+      "query": "Official Docker BuildKit GitHub Actions cache backend gha mode max registry cache multi-stage Rust cargo chef build context"
+    },
+    {
+      "id": "security",
+      "query": "Official CodeQL Rust build-mode none dependency caching cargo deny cargo audit advisories duplicate checks gitleaks trufflehog GitHub Actions"
+    },
+    {
+      "id": "measurement",
+      "query": "Official GitHub Actions workflow metrics job execution time queue time cache usage artifact retention workflow usage billing public repositories larger runners"
+    },
+    {
+      "id": "cache-correctness",
+      "query": "Official Cargo fingerprint mtime checkout CI checksum freshness rust-cache workspace artifacts sccache cannot cache binary linking incremental Rust"
+    },
+    {
+      "id": "controller",
+      "query": "Official Docker documentation build cache invalidation apt-get update pinned digest image refresh pull retry network transient failures"
+    },
+    {
+      "id": "coverage",
+      "query": "cargo llvm cov official README merge reports nextest archive instrumentation profraw coverage performance no-report clean workspace"
+    },
+    {
+      "id": "gates",
+      "query": "GitHub Actions official required status checks skipped workflows paths filter 300 files diff merge_group reusable workflow artifacts permissions"
+    },
+    {
+      "id": "maintenance",
+      "query": "Official Renovate configuration groupName prConcurrentLimit prHourlyLimit rebaseWhen schedule dependencyDashboardApproval security updates GitHub Actions"
+    },
+    {
+      "id": "audit-tools",
+      "query": "Official cargo deny check advisories cargo audit differences yanked unmaintained ignore licenses bans sources"
+    },
+    {
+      "id": "nextest-groups",
+      "query": "site:nexte.st test groups max-threads retries slow-timeout JUnit flaky tests"
+    }
+  ],
+  "requested_result_slots": 76,
+  "returned_url_entries": 76,
+  "unique_url_strings": 67,
+  "note": "URL normalization removes queries/trailing slashes and normalizes case; redirects may represent additional duplicates. Search candidates are not all validated authorities. Only primary sources support recommendations.",
+  "candidate_urls": [
+    "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue",
+    "https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks",
+    "https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax",
+    "https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency",
+    "https://docs.github.com/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue",
+    "https://docs.github.com/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs",
+    "https://doc.rust-lang.org/stable/cargo/reference/timings.html",
+    "https://doc.rust-lang.org/stable/cargo/guide/build-performance.html",
+    "https://doc.rust-lang.org/cargo/reference/profiles.html?highlight=lto",
+    "https://doc.rust-lang.org/stable/cargo/reference/build-cache.html",
+    "https://doc.rust-lang.org/stable/cargo/commands/cargo-rustc.html",
+    "https://github.com/swatinem/rust-cache",
+    "https://github.com/Swatinem/rust-cache/issues/155",
+    "https://deepwiki.com/Swatinem/rust-cache/3.3-caching-strategy",
+    "https://github.com/Swatinem/rust-cache/issues/348",
+    "https://github.com/Swatinem/rust-cache/issues/86",
+    "https://nexte.st/docs/ci-features/archiving/",
+    "https://nexte.st/docs/ci-features/partitioning/",
+    "https://nexte.st/docs/configuration/reference/",
+    "https://nexte.st/docs/configuration/",
+    "https://nexte.st/docs/machine-readable/junit/",
+    "https://nexte.st/docs/running/",
+    "https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/increase-security-rating",
+    "https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations",
+    "https://github.com/actions/attest?tab=readme-ov-file",
+    "https://docs.github.com/en/actions/concepts/security/artifact-attestations",
+    "https://cli.github.com/manual/gh%5Fattestation%5Fverify",
+    "https://docs.docker.com/build/ci/github-actions/cache/",
+    "https://docs.docker.com/build/cache/backends/gha/",
+    "https://github.com/docker/build-push-action?tab=readme-ov-file",
+    "https://docs.docker.com/build/cache/backends/",
+    "https://github.com/docker/build-push-action/blob/e27bcee4eb9e7b4bc168418e3364c4482120393a/docs/advanced/cache.md",
+    "https://docs.github.com/en/code-security/reference/code-scanning/codeql/build-options-for-compiled-languages",
+    "https://docs.github.com/en/code-security/how-tos/find-and-fix-code-vulnerabilities/manage-your-configuration/codeql-for-compiled-languages",
+    "https://github.com/github/codeql-action/blob/3c42562190b32a78b600bdff70fbe8949331edbe/README.md",
+    "https://github.com/ThreatFlux/openai_rust_sdk/blob/main/.github/workflows/security.yml",
+    "https://github.com/EmbarkStudios/cargo-deny/issues/386",
+    "https://docs.github.com/en/actions/concepts/metrics",
+    "https://docs.github.com/en/billing/concepts/product-billing/github-actions",
+    "https://docs.github.com/en/actions/how-tos/administer/view-metrics",
+    "https://github.com/github/docs/blob/main/content/actions/how-tos/monitor-workflows/view-job-execution-time.md",
+    "https://docs.github.com/en/organizations/collaborating-with-groups-in-organizations/viewing-github-actions-metrics-for-your-organization",
+    "https://doc.rust-lang.org/stable/nightly-rustc/cargo/core/compiler/fingerprint/index.html",
+    "https://github.com/rust-lang/cargo/blob/master/src/compiler/fingerprint/mod.rs",
+    "https://doc.rust-lang.org/1.89.0/cargo/reference/unstable.html",
+    "https://github.com/rust-lang/cargo/issues/6529",
+    "https://docs.docker.com/build/cache/invalidation/",
+    "https://docs.docker.com/reference/cli/docker/image/pull/?highlight=docker&highlight=pull",
+    "https://docs.docker.com/build/cache",
+    "https://docs.docker.com/build/building/best-practices/",
+    "https://docs.docker.com/build/cache/optimize/",
+    "https://github.com/taiki-e/cargo-llvm-cov/blob/main/README.md",
+    "https://github.com/taiki-e/cargo-llvm-cov?tab=readme-ov-file",
+    "https://docs.rs/crate/cargo-llvm-cov/latest",
+    "https://docs.rs/crate/cargo-llvm-cov/latest/source/docs/cargo-llvm-cov.txt",
+    "https://github.com/dorny/paths-filter/blob/master/README.md",
+    "https://docs.github.com/en/enterprise-cloud@latest/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks",
+    "https://docs.github.com/en/pull-requests/reference/status-checks",
+    "https://docs.renovatebot.com/configuration-options/",
+    "https://github.com/renovatebot/renovate/blob/main/docs/usage/configuration-options.md",
+    "https://github.com/renovatebot/renovate/blob/main/lib/config/options/index.ts",
+    "https://docs.renovatebot.com/presets-config/",
+    "https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html",
+    "https://embarkstudios.github.io/cargo-deny/cli/check.html",
+    "https://embarkstudios.github.io/cargo-deny/checks/cfg.html",
+    "https://nexte.st/docs/configuration/test-groups/",
+    "https://nexte.st/docs/features/retries/"
+  ],
+  "direct_primary_fetches": [
+    "https://github.com/mozilla/sccache/blob/main/docs/Rust.md",
+    "https://github.com/Swatinem/rust-cache/blob/6323deb102c322ba6fcbdcafc7e3dddab59af2b6/README.md",
+    "https://github.com/actions/upload-artifact",
+    "https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency",
+    "https://docs.github.com/en/code-security/reference/code-scanning/codeql/build-options-for-compiled-languages",
+    "https://docs.docker.com/build/cache/backends/gha/",
+    "https://nexte.st/docs/configuration/test-groups/",
+    "https://nexte.st/docs/features/retries/",
+    "https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/increase-security-rating"
+  ]
+}
