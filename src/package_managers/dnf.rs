@@ -260,7 +260,7 @@ impl Default for DnfPackageManager {
 
 impl DnfPackageManager {
     fn cached_update_args() -> Vec<String> {
-        ["--cacheonly", "upgrade", "-y"]
+        ["--setopt=cacheonly=metadata", "upgrade", "-y"]
             .into_iter()
             .map(str::to_owned)
             .collect()
@@ -2193,10 +2193,10 @@ mod tests {
     }
 
     #[test]
-    fn cached_update_disables_implicit_metadata_refresh() {
+    fn cached_update_reuses_metadata_but_allows_package_downloads() {
         assert_eq!(
             DnfPackageManager::cached_update_args(),
-            ["--cacheonly", "upgrade", "-y"]
+            ["--setopt=cacheonly=metadata", "upgrade", "-y"]
         );
     }
 
