@@ -9,7 +9,6 @@ vulnerability evidence into one Rust CLI. It gives Arch, Debian, Ubuntu, Fedora,
 and Apple silicon macOS one consistent, security-first workflow without making you
 assemble a different toolchain on every machine.
 
-[![Beta](https://img.shields.io/badge/status-beta-f59e0b)](#beta-status)
 [![CI](https://github.com/omg-cli/omg/actions/workflows/ci.yml/badge.svg)](https://github.com/omg-cli/omg/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/omg-cli/omg)](https://github.com/omg-cli/omg/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2563eb)](LICENSE)
@@ -27,9 +26,9 @@ omg run test                    # run the task this project already defines
 omg audit scan                  # fetch advisories and show vulnerability evidence
 ```
 
-The daemon is optional. When `omgd` is running, OMG reuses warm package indexes,
-cached vulnerability results, and status snapshots. When it is not, package
-commands and vulnerability scanning take the direct path and still work.
+The daemon is optional for package operations. It keeps package indexes, vulnerability
+results, and status snapshots warm. In published v0.1.223, `omg audit scan`
+requires `omgd`; the current main checkout adds direct scanning when the daemon is absent.
 
 ## Why OMG
 
@@ -37,7 +36,7 @@ commands and vulnerability scanning take the direct path and still work.
 | :--- | :--- |
 | **One workflow across systems** | Use the same commands on Arch, Debian, Ubuntu, Fedora, macOS, and supported Linux distributions inside WSL. |
 | **Security during the operation** | Verify downloads, constrain developer-tool installers, review and sandbox AUR builds, inspect produced archives, and record mutations as they happen. |
-| **The whole development environment** | Manage system packages, 14 language runtimes, 54 curated developer tools, project tasks, environment records, and security evidence from one CLI. |
+| **The whole development environment** | Manage system packages, 14 native runtime managers, 54 curated developer tools, project tasks, environment records, and security evidence from one CLI. |
 | **Fast paths without a hard daemon dependency** | Read ALPM, APT, and RPM state in process where supported. Run `omgd` for warm caches and background refreshes, or leave it off. |
 | **Evidence instead of promises** | CI exercises real Linux guests through QEMU, preserves per-command receipts, and files detailed issues when a gate fails. Benchmark claims require comparable recorded work. |
 
@@ -56,7 +55,7 @@ review, dependency, sandbox, and archive-inspection pipeline.
 | :--- | :--- | :--- |
 | Find and change packages | `search`, `info`, `why`, `install`, `remove`, `update`, `clean` | One interface, previews, backend-aware policy, history |
 | Use the AUR | `search`, `install`, `update` | Source review, offline Bubblewrap builds, output inspection, attended approval for privileged content |
-| Manage runtimes | `use`, `list`, `which`, `uninstall` | Native managers for Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, and Swift |
+| Manage runtimes | `use`, `list`, `which`, `use --uninstall` | Native managers for Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, and Swift |
 | Install developer tools | `tool search`, `tool install`, `tool list` | Curated registry and ecosystem-specific install policy for npm, Python, Cargo, Go, and system packages |
 | Run project tasks | `run` | Detects the task system the project already uses and forwards arguments |
 | Record environment intent | `env capture`, `env check`, `env share`, `env sync` | Inventory, portable intent, and drift reporting without pretending to rebuild the machine |
@@ -105,8 +104,8 @@ flowchart LR
 
 `omg` remains the product entry point and owns direct execution. `omgd` keeps
 derived state warm and serves the same shared security engine over local Unix IPC.
-Stopping the daemon may make a cold command slower; it does not disable ordinary
-package operations or vulnerability scans.
+Stopping the daemon does not disable ordinary package operations. In published
+v0.1.223, `omg audit scan` still needs `omgd`; the main checkout can scan directly.
 
 ## Install
 
@@ -128,17 +127,19 @@ Then choose the setup you want:
 omg init
 ```
 
-`omg init` asks before enabling shell integration, starting the optional daemon,
-or capturing initial state. See [installation](docs/installation.md) for source
-builds, custom paths, updating, and uninstalling.
+In an interactive terminal, `omg init` asks before setting up shell integration,
+the optional daemon, or an initial environment record. In a non-interactive
+terminal it uses defaults, so review its options first. See
+[installation](docs/installation.md) for source builds, custom paths, updating,
+and uninstalling.
 
 ## Supported platforms
 
 | Platform | Package path | Release status |
 | :--- | :--- | :--- |
 | Arch Linux x86_64 | ALPM plus first-class AUR pipeline | Supported; broadest package-security coverage |
-| Debian 12/13 x86_64 | APT database and matching `libapt` ABI | Supported with ABI-specific release binaries |
-| Ubuntu 24.04/26.04 x86_64 | APT database and matching `libapt` ABI | Supported with ABI-specific release binaries |
+| Debian 12 / Ubuntu 24.04 x86_64 | APT 6 database | Supported by published v0.1.223 release binaries |
+| Debian 13 / Ubuntu 26.04 x86_64 | APT 7 database | Current main checkout supports the Trixie archive mapping; v0.1.223 has no APT 7 artifact |
 | Fedora x86_64 | Direct RPM state plus DNF repository operations | Experimental |
 | Apple silicon macOS | Policy-gated Homebrew integration | Supported on ARM64 |
 | Windows | A supported Linux distribution in WSL | No native Windows build |
@@ -194,13 +195,12 @@ retry does not erase the first failure, and a green run proves only the behavior
 actually exercised. See [QEMU evidence](docs/qemu-local.md) and
 [CI security controls](docs/ci-security-controls.md).
 
-## Beta status
+## Release status
 
-OMG is in beta. Command surfaces, configuration keys, and on-disk formats may
-change. Keep the native package tool available as a recovery path and evaluate
-package mutations on a machine you can restore. The project publishes limitations
-instead of hiding them; start with [security](docs/security.md) and
-[release readiness](docs/release-readiness.md) when assessing production use.
+OMG is approaching beta. The latest published release predates beta, and command
+surfaces, configuration keys, and on-disk formats may change. Keep the native
+package tool available as a recovery path. See [security](docs/security.md) and
+[release readiness](docs/release-readiness.md) for current guarantees and limits.
 
 ## Contributing
 
