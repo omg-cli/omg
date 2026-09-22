@@ -307,7 +307,7 @@ class OutputContracts(unittest.TestCase):
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
-    def run_inventory(self, product, rows, *, native_commands=None, distro='arch', row_timeout=None):
+    def run_inventory(self, product, rows, *, native_commands=None, distro='arch', tiers='hermetic', row_timeout=None):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -336,7 +336,7 @@ class OutputContracts(unittest.TestCase):
             command = [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'),
                        str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
                        '--binary', shell_path(binary), '--tsv', str(inventory),
-                       '--distro', distro, '--tiers', 'hermetic', '--tag', 'fixture']
+                       '--distro', distro, '--tiers', tiers, '--tag', 'fixture']
             if row_timeout is not None:
                 command += ['--row-timeout', str(row_timeout)]
             result = subprocess.run(
@@ -462,6 +462,49 @@ esac
         for content in ('', 'ok', '{}\n{}', 'notice\n{}'):
             self.assertNotEqual(self.run_oracle(assertion='json-stdout', stdout=content).returncode, 0)
         self.assertEqual(self.run_oracle(assertion='json-stdout', stdout='{"packages":[]}').returncode, 0)
+
+    def test_official_search_limit_checks_actual_results(self):
+        valid = ('\n  | Search\n    firefox\n'
+                 '  firefox 156.0-1  Official\n'
+                 '  firefox-adblock-plus 4.43.4-1  Official\n'
+                 '  firefox-dark-reader 4.9.130-1  Official\n'
+                 '  (+226 more packages...)\n')
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        row = next(line for line in inventory.splitlines() if line.startswith('search-flags\t'))
+        self.assertEqual(row.split('\t')[8], 'search-official-limit-three')
+        self.assertEqual(row.split('\t')[6:8], ['container', 'arch:pass,debian:pass,ubuntu:pass,fedora:pass'])
+        args = json.loads(row.split('\t')[1])
+        self.assertEqual(args, ['search', '--detailed', '--no-aur', '--limit', '3', 'firefox'])
+        self.assertEqual(self.run_oracle(assertion='search-official-limit-three', stdout=valid).returncode, 0)
+        fedora = valid.replace('  firefox-adblock-plus 4.43.4-1  Official\n',
+                               '  browserpass-firefox 3.1.2-5.fc44  Official\n')
+        self.assertEqual(self.run_oracle(assertion='search-official-limit-three', stdout=fedora).returncode, 0)
+        for output in (
+            '',
+            '  | Search\n    firefox\n',
+            valid.replace('    firefox\n', '    chrome\n'),
+            valid.replace('  firefox 156.0-1  Official\n', '  firefox 156.0-1  AUR\n'),
+            valid.replace('  firefox 156.0-1  Official\n', '  firefox 156.0-1  Official\n' * 4),
+            valid.replace('  firefox 156.0-1  Official\n', '  unrelated 156.0-1  Official\n'),
+            valid + 'unrelated warning hidden after results\n',
+            valid.replace('  firefox-adblock-plus 4.43.4-1  Official\n', ''),
+        ):
+            with self.subTest(output=output):
+                self.assertNotEqual(self.run_oracle(assertion='search-official-limit-three', stdout=output).returncode, 0)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_search_oracle_rejects_false_green_product_in_actual_runner(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        row = next(line for line in inventory.splitlines() if line.startswith('search-flags\t'))
+        valid = 'printf "\\n  | Search\\n    firefox\\n  firefox 156.0-1  Official\\n"\n'
+        invalid = 'printf "\\n  | Search\\n    firefox\\n  unrelated 1  Official\\n"\n'
+        for product, expected in ((valid, 'PASS'), (invalid, 'FAIL')):
+            with self.subTest(expected=expected):
+                result, evidence, logs = self.run_inventory(product, [row], tiers='container')
+                self.assertEqual(evidence[0]['result'], expected, result.stderr)
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+                if expected == 'FAIL':
+                    self.assertIn('bounded matching results', logs['search-flags.log'])
 
     def test_workspace_filter_requires_selected_task_once_and_excludes_other_task(self):
         for output in ('', 'nested-smoke-task-ok\n',

@@ -341,6 +341,23 @@ check_product_output() {
         if ! jq -e -s 'length == 1' "$stdout" >/dev/null 2>&1; then
           printf 'assertion failed: stdout is not exactly one JSON document\n' >&2; return 1
         fi ;;
+      search-official-limit-three)
+        if ! awk '
+          /^  \| Search$/ { headings++; next }
+          /^    firefox$/ { queries++; next }
+          /^  [^[:space:]]+ [^[:space:]]+  / {
+            results++
+            if ($1 !~ /firefox/ || $3 != "Official" || NF != 3) bad=1
+            next
+          }
+          /^  \(\+[0-9]+ more packages\.\.\.\)$/ { more++; next }
+          /^[[:space:]]*$/ { next }
+          /^OMG_QEMU_RECEIPT:/ { next }
+          { bad=1 }
+          END { exit !(headings == 1 && queries == 1 && results >= 1 && results <= 3 && more <= 1 && (more == 0 || results == 3) && !bad) }
+        ' "$stdout"; then
+          printf 'assertion failed: official firefox search lacks bounded matching results\n' >&2; return 1
+        fi ;;
       artifact:*)
         local artifact=${assertion#artifact:}
         if [[ ! -f "$artifact" || -L "$artifact" ]] || ! jq -e -s 'length == 1' "$artifact" >/dev/null 2>&1; then
@@ -533,7 +550,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|audit-source-failure|sbom-source-failure|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle) ;; *) exit 2 ;; esac
+  case "$a" in -|audit-source-failure|sbom-source-failure|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three) ;; *) exit 2 ;; esac
   case "$cleanup" in tempdir-drop|none|container-prune|host-state-restore|vm-revert|daemon-stop) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
