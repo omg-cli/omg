@@ -50,10 +50,11 @@ omg audit scan
 
 The CLI prefers a running `omgd` process so repeated scans can reuse its warm package
 manager and vulnerability cache. If the daemon is unavailable, the CLI creates the selected
-package backend and scanner itself; the scan remains available but starts cold. Arch Linux
-Security Advisory data is specific to Arch packages. OSV queries depend on ecosystem and
-version matching. Missing findings are not proof that a package is free of vulnerabilities.
-Do not treat Arch advisory matching as Debian, Fedora, or macOS vulnerability coverage.
+package backend and scanner itself; the scan remains available but starts cold. Arch uses
+Arch Linux Security Advisory data. Fedora uses native DNF advisories. Debian and Ubuntu
+query OSV using their distribution release as the ecosystem. Missing findings are not
+proof that a package is free of vulnerabilities. Do not treat one distribution's
+advisories as coverage for another.
 
 The scan prints findings but does not return a failing exit status merely because it found vulnerabilities. Its human-readable output is not a documented JSON alert interface. `omg audit fix --dry-run` previews available package updates on the Arch backend; an available update is not proof that every advisory is fixed.
 
@@ -73,7 +74,7 @@ omg audit policy
 
 The policy supports minimum grades, AUR restrictions, package bans, PGP requirements, and license allowlists. See [configuration](./configuration.md).
 
-Explicit package policies are checked against ALPM's prepared transaction, including dependencies. Native APT, DNF, and Homebrew install and upgrade paths refuse explicit policies because a separate precheck cannot guarantee the final native transaction. Do not assume that a policy enforced on Arch is enforced identically elsewhere. Pure-Debian production mutations remain disabled pending authenticated repository authority.
+Explicit package policies are checked against ALPM's prepared transaction, including dependencies. Native APT, DNF, and Homebrew install and upgrade paths refuse explicit policies because a separate precheck cannot guarantee the final native transaction. Do not assume that a policy enforced on Arch is enforced identically elsewhere. A build with only the `debian-pure` indexing feature refuses live Debian package mutations; use an APT-backed build for those operations.
 
 ## Package and runtime verification
 
@@ -92,9 +93,9 @@ omg audit slsa ./package.pkg.tar.zst \
   --certificate-identity "$EXPECTED_SIGNER_IDENTITY"
 ```
 
-Set `EXPECTED_SIGNER_IDENTITY` to the exact trusted publisher email or OIDC URI obtained independently. Omitting the identity still permits a cryptographically valid signature, but the command reports the signer as unbounded; supply the identity to enforce a trust policy. Use an existing artifact path without parent-directory traversal.
+Set `EXPECTED_SIGNER_IDENTITY` to the exact trusted publisher email or OIDC URI obtained independently. The current verifier rejects a missing or empty identity, so supply one even though the parser accepts the option as optional. Use an existing artifact path without parent-directory traversal.
 
-The verifier hashes the artifact, queries Rekor, checks the log's signed entry timestamp against a pinned key, and handles supported `hashedrekord` signatures. A successful result requires a supported artifact signature and a Fulcio certificate chain. When an identity is supplied, it must match exactly.
+The verifier hashes the artifact, queries Rekor, checks the log's signed entry timestamp against a pinned key, and handles supported `hashedrekord` signatures. A successful result requires a supported artifact signature and a Fulcio certificate chain. The required identity must match exactly.
 
 Current limits:
 
@@ -120,9 +121,9 @@ The local command emits an installed-package CycloneDX 1.5 JSON inventory:
 omg audit sbom --output ./sbom.json
 ```
 
-The CLI always requests Arch advisory matching. It works with the Arch backend and available advisory data. Debian-like generation fails rather than applying Arch advisories to Debian packages. Fedora and macOS builds lack this system-SBOM backend. There is no CLI flag to disable vulnerability inclusion.
+The CLI always includes a vulnerability scan; there is no flag to turn it off. System SBOM generation supports Arch, Debian, Ubuntu, and Fedora when the selected package backend can supply a complete installed inventory and its advisory source is available. Arch uses Arch advisories, Fedora uses DNF advisories, and Debian and Ubuntu query OSV. macOS has no system SBOM backend. An inventory or advisory failure stops generation instead of producing a partial success.
 
-The inventory contains package names, versions, descriptions, PURLs, available license metadata, and matched Arch advisories. It does not resolve dependency edges or populate component file hashes. It is not an application dependency inventory, a complete supply-chain graph, or proof of regulatory compliance. An advisory fetch failure must not be read as a clean report.
+The inventory contains package names, versions, descriptions when available, PURLs, available license metadata, and matched vulnerability findings. Fedora's native inventory does not currently supply descriptions or licenses. The generator compares installed identities before and after the scan and refuses a changed inventory. It does not resolve dependency edges or populate component file hashes. It is not an application dependency inventory, a complete supply-chain graph, or proof of regulatory compliance. An advisory fetch failure must not be read as a clean report.
 
 The default location is `~/.local/share/omg/sbom/`. SBOM files are plaintext. Use a restricted destination and inspect permissions before sharing them.
 
@@ -159,7 +160,7 @@ Privileged backend operations record attempts and outcomes synchronously. An int
 omg audit export --framework soc2 --output ./audit-evidence
 ```
 
-Only `soc2` generates files on this command path. It exports up to 1,000 recent audit entries, a daemon vulnerability scan, a system SBOM, and a policy snapshot. The Unix daemon and supported SBOM backend are required. `iso27001`, `fedramp`, `hipaa`, and `pci-dss` are accepted names but return an unimplemented error. A failed export may leave partial files.
+Only `soc2` generates files on this command path. It exports up to 1,000 recent audit entries, a vulnerability scan, a system SBOM, and a policy snapshot. On Unix the scan prefers the daemon and falls back to a direct scan. The system SBOM still needs a supported backend and advisory data. `iso27001`, `fedramp`, `hipaa`, and `pci-dss` are accepted names but return an unimplemented error. A failed export may leave partial files.
 
 `--period` is metadata, not a time-range filter. The separate `omg enterprise audit-export` command produces a generic inventory bundle, not framework-specific controls. See [enterprise limits](./enterprise.md).
 

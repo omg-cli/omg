@@ -41,7 +41,7 @@ Check `command -v omg` afterwards to see which binary your shell actually finds.
 | `yay -Ss <query>` | `omg search <query>` | Official repositories and the AUR on Arch; `--no-aur` restricts it to official results |
 | `yay -Si <pkg>` | `omg info <pkg>` | Package details from the selected backend |
 | `yay -S <pkg>` | `omg install <pkg>` | AUR entries are detected; review applies before the build |
-| `yay -S --noconfirm` | `omg install -y` | `-y` skips confirmation prompts, not the attended approval for privileged AUR output |
+| `yay -S --noconfirm <pkg>` | `omg install -y <pkg>` | `-y` skips normal confirmation, not the attended approval for privileged AUR output |
 | `yay -R <pkg>` | `omg remove <pkg>` | Review the removal plan before confirming |
 | `yay -Rns <pkg>` | `omg remove --recursive <pkg>` | Arch only: also removes dependencies nothing else needs |
 | `yay -Syu` | `omg update` | Syncs and upgrades, official packages and AUR |
@@ -49,11 +49,12 @@ Check `command -v omg` afterwards to see which binary your shell actually finds.
 | `yay -Sy` | `omg sync` | Refreshes repository metadata only |
 | `yay -Qu` | `omg outdated` | Lists packages with a newer version available |
 | `yay -Qe` | `omg explicit` | Lists packages you asked for yourself |
-| `yay -Qtd` | `omg clean --orphans` | Removes dependencies nothing needs any more |
+| `yay -Qtd` | `omg clean --orphans --dry-run` | Previews orphan cleanup. Remove `--dry-run` only after reviewing the list. |
 | `yay -Sc` | `omg clean --cache` | Requests package-cache cleanup |
 
-Preview first when a command changes state: `omg install --dry-run`, `omg remove --dry-run`,
-`omg update --check`, and `omg clean --dry-run --all`.
+Preview first when a command changes state: `omg install --dry-run <pkg>`,
+`omg remove --dry-run <pkg>`, `omg update --check`, and
+`omg clean --dry-run --all`.
 
 ## What does not map
 
@@ -72,8 +73,8 @@ around it.
 ## What changes in how AUR builds run
 
 Run OMG as your regular account. Fetching, review, and building stay unprivileged, and OMG asks
-for elevation only for the validated package transaction. `sudo omg …` is deprecated, and AUR
-builds refuse to run at all when OMG starts as root.
+for elevation only for the validated package transaction. AUR builds refuse to run
+when OMG starts as root, so do not use `sudo omg` for them.
 
 Once a recipe is accepted, OMG re-hashes the source tree, builds offline in Bubblewrap by
 default, inspects the resulting archive, and hands sealed bytes to the privileged step.
@@ -108,7 +109,9 @@ Environment capture needs the Arch or Debian backend, so it works on the same ma
 yay did. `omg env check` reports drift and does not install anything.
 
 Security commands have their own scope: `omg audit scan` uses the daemon when available and
-falls back to a direct scan, while `omg audit sbom` needs the Arch backend plus advisory access.
+falls back to a direct scan. `omg audit sbom` works with the Arch system-package
+inventory and advisory source. On other Linux backends, it can also generate a
+system SBOM when their inventory and advisory source are available.
 Neither is a compliance certification; see
 [security](../security.md).
 

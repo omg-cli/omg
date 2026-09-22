@@ -1,10 +1,10 @@
 ---
-title: History and Rollback
+title: History and rollback
 sidebar_position: 42
 description: Inspect recorded transactions and understand recovery limits
 ---
 
-# History & Rollback
+# History and rollback
 
 **In plain words:** OMG can record what it changed on your computer. This page explains what
 the record contains, how to read it, and why a rollback is not the same as restoring a backup.
@@ -23,8 +23,8 @@ it succeeded:
 ```json
 {
   "id": "0a1b2c3d…",
-  "timestamp": 1762900000,
-  "transaction_type": "update",
+  "timestamp": "2025-11-11T19:46:40Z",
+  "transaction_type": "Update",
   "success": true,
   "changes": [
     { "name": "ripgrep", "old_version": "14.1.0", "new_version": "14.1.1", "source": "extra" }
@@ -102,9 +102,9 @@ Rollback reinstalls the earlier recorded versions. It works only when all of the
 
 **Limit:** rollback is not a guaranteed inverse of install, remove, or update. AUR rebuilds
 and arbitrary native package operations are not covered by a universal rollback promise, and
-`omg clean --all` can remove exactly the cached artifacts a rollback would need. `omg clean`
-consults history so versions referenced by a **recent** transaction survive, but that window
-is finite.
+`omg clean --all` can remove exactly the cached artifacts a rollback would need. On Arch,
+`omg clean --cache` checks the last 30 days of history and warns about referenced older
+versions. It does not keep those versions on your behalf.
 
 ```bash
 omg clean --cache --dry-run     # review what cleanup would remove before running it

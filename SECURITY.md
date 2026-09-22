@@ -51,9 +51,9 @@ OMG includes built-in security features:
 
 ### Package Security
 
-- **PGP Verification:** Automatic package signature verification
-- **Vulnerability Scanning:** CVE detection for installed packages
-- **SBOM Generation:** Software Bill of Materials in CycloneDX format
+- **Package verification:** Follows the selected backend and its repository trust settings; native PGP checks require the `pgp` feature
+- **Vulnerability scanning:** Reports matched advisories for installed packages; no findings do not prove a package is safe
+- **SBOM generation:** CycloneDX 1.5 installed-package inventories on supported Arch, Debian, Ubuntu, and Fedora backends
 - **Security Grading:** Source-based policy grades, not proof of package safety or SLSA levels
 - **Audit Logging:** Local hash-chain consistency checks, not authenticated or complete history
 
@@ -71,15 +71,20 @@ render the complete accepted hook before authorization.
 
 - **Privilege Separation:** Minimal sudo usage with sudoloop
 - **Sandbox Support:** AUR builds can use bubblewrap/chroot
-- **Secret Scanning:** Detects leaked credentials before commit
+- **Secret Scanning:** `omg audit secrets` reports potential credentials when you run it; a clean result is not proof none remain
 - **Policy Enforcement:** Configurable security policies via `policy.toml`
 
 ### Supply Chain Security
 
 - **Dependency Pinning:** Lockfiles for reproducible builds
 - **Release Attestations:** GitHub Actions provenance for release archives and the Cargo dependency SBOM; no claimed SLSA build level
-- **Signature Verification:** PGP signatures on official packages
-- **Mirror Verification:** Checksum validation on downloads
+- **Signature Verification:** Official package checks follow the selected backend's repository trust configuration
+- **Runtime Integrity:** Publisher-provided checksums detect corruption where available; they do not authenticate a compromised publisher
+
+The system SBOM includes a vulnerability scan and fails when its inventory or advisory
+source fails. The release SBOM is a separate inventory of Cargo dependencies. Neither
+contains a resolved dependency graph for all software on the machine. macOS has no
+system SBOM backend in this build.
 
 ## Known Security Considerations
 
@@ -93,7 +98,7 @@ No known dependency vulnerabilities are accepted. Release gates run `cargo audit
 
 ### Key Trust on First Use
 
-AUR package keys listed in `validpgpkeys` are fetched over HKPS and imported into the user's GnuPG home on first sight, with no fingerprint confirmation prompt. The import prints the key fingerprint to stderr so it is never silent, and the GnuPG home is created `0700` (pre-existing homes are re-validated for ownership and mode before import). Silent TOFU is the accepted model here, matching what `makepkg` itself does with an unfamiliar key.
+AUR package keys listed in `validpgpkeys` are fetched over HKPS in builds with the `pgp` feature and imported into the user's GnuPG home on first sight, with no fingerprint confirmation prompt. The import prints the key fingerprint to stderr, and the GnuPG home is created `0700` (pre-existing homes are re-validated for ownership and mode before import). This is trust on first use, not independent publisher authentication. OMG also creates a package-scoped keyring containing the declared keys for the build.
 
 Native Windows is not supported. Windows users should run OMG inside WSL, where the installed Linux distribution determines the package backend.
 
@@ -109,7 +114,7 @@ OMG requires sudo access for:
 
 - Sudoloop limits password prompts
 - Dry-run mode (`--dry-run`) shows what would happen
-- Policy enforcement prevents unauthorized operations
+- Policy enforcement rejects operations covered by the active local policy; backend enforcement limits still apply
 - Privileged OMG backends persist attempt and outcome records. Interrupted operations and external tools require separate investigation.
 
 ### AUR Package Security
@@ -119,7 +124,7 @@ AUR packages are community-maintained and not officially verified.
 **Built-in Protections:**
 
 - Security grading (COMMUNITY level)
-- Optional PKGBUILD review before build
+- PKGBUILD review before build is enabled by default; disabling it is an explicit trust decision
 - Sandboxed builds (bubblewrap/chroot)
 - PGP verification where available
 
@@ -127,7 +132,7 @@ AUR packages are community-maintained and not officially verified.
 
 - Review PKGBUILDs before installation
 - Use `--dry-run` to preview changes
-- Enable `review_pkgbuild = true` under `[aur]` in `~/.config/omg/config.toml`
+- Keep the default `review_pkgbuild = true` setting under `[aur]` in `~/.config/omg/config.toml`
 - Check package popularity and votes
 
 ## Security Best Practices
@@ -202,7 +207,7 @@ Security updates are announced via:
 
 OMG provides inventory and audit inputs, not compliance certification. It does not implement HIPAA controls.
 
-`omg audit export --framework soc2` generates evidence on supported Arch systems with a running daemon. Other framework names on that command return unimplemented errors. `omg enterprise audit-export` generates the same generic inventory bundle for every accepted framework name; selecting HIPAA does not add HIPAA evidence. Period labels do not filter audit history.
+`omg audit export --framework soc2` generates evidence on supported Arch, Debian, Ubuntu, and Fedora backends when their installed inventory and advisory sources are available. On Unix it prefers a running daemon for the vulnerability scan and falls back to a direct scan when the daemon is unavailable. Other framework names on that command return unimplemented errors. `omg enterprise audit-export` remains Arch-only and generates the same generic inventory bundle for every accepted framework name; selecting HIPAA does not add HIPAA evidence. Period labels do not filter audit history.
 
 Exports are plaintext JSON or CSV. Some use owner-only permissions, but that is not encryption. Restrict destinations, inspect contents and permissions, and encrypt externally when required. SBOMs do not include a resolved dependency graph. See [security evidence limits](docs/security.md) and [enterprise exports](docs/enterprise.md).
 
@@ -290,8 +295,9 @@ Explicit package policies are enforced again against ALPM's prepared install or
 upgrade plan, including dependencies. Native APT/DNF/Homebrew install and upgrade paths
 refuse explicit policies because OMG cannot guarantee their final plan matches a
 separate precheck. Use their default policy or an enforceable ALPM transaction.
-Pure-Debian production mutations are disabled until independently authenticated
-repository authority is implemented; the native APT backend remains available.
+A build with only the `debian-pure` indexing feature refuses live Debian package
+mutations because its user cache is not installation authority. The native APT
+backend remains available for those operations.
 
 Local audit verification establishes internal hash-chain consistency only. The
 owner can rewrite and rehash a user-owned collection, remove entries, or delete

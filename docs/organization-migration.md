@@ -1,4 +1,10 @@
-# Organization transfer and verified updates
+---
+title: Moving to omg-cli/omg
+sidebar_position: 46
+description: Verify updates across OMG's repository signing change
+---
+
+# Moving to omg-cli/omg
 
 **In plain words:** This page is for anyone following an old link or an old instruction that points at a previous location of the project.
 
@@ -33,6 +39,12 @@ contain the organization-aware signer selection before using it for this step.
 After that upgrade, use `omg self-update` normally. Do not disable provenance
 verification to work around the repository transfer.
 
+If you do not know which version is installed, run `omg --version` first. For a
+version through v0.1.221, follow the one-time verified upgrade path above.
+For a later version, `omg self-update` uses the organization signing identity.
+If verification fails, keep the error and the existing binary. Do not treat a
+redirected download link as proof that its signer is trusted.
+
 ## Release checklist
 
 - Merge and validate the organization-aware updater, installer and release tests.
@@ -41,3 +53,8 @@ verification to work around the repository transfer.
 - Verify all archives against that version's single expected signing identity.
 - Exercise the legacy in-place migration and subsequent built-in update path.
 - Document the one-time signer migration in the release notes before promotion.
+
+## Where to go next
+
+See [installation](./installation.md) for release verification and
+[troubleshooting](./troubleshooting.md) for help with a failed update.

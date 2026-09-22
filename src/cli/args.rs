@@ -1106,7 +1106,7 @@ pub enum AuditCommands {
         /// Package file to verify
         package: String,
         /// Require the Fulcio certificate SAN to match this identity
-        /// (email or OIDC URI). Without it, any Sigstore identity verifies.
+        /// (email or OIDC URI). Verification rejects a missing identity.
         #[arg(long)]
         certificate_identity: Option<String>,
     },

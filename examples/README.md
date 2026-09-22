@@ -1,38 +1,37 @@
-# OMG Configuration Examples
+# OMG configuration examples
 
-This directory provides starter templates for configuring OMG and locking project runtime versions.
+These files are starting points. Read and edit a copy before using it. The [configuration guide](../docs/configuration.md) lists the accepted settings and defaults.
 
-## Available Templates
+| File | Copy to | What it controls |
+| --- | --- | --- |
+| [`config.toml`](./config.toml) | The path printed by `omg config path` | Local OMG settings such as telemetry and AUR builds |
+| [`policy.toml`](./policy.toml) | The policy path described in the [security guide](../docs/security.md#security-policy) | Local security policy |
+| [`.tool-versions`](./.tool-versions) | Your project root | Runtime version requests for that project |
 
-| File | Target Location | Description |
-| :--- | :--- | :--- |
-| [`config.toml`](config.toml) | `~/.config/omg/config.toml` | Main configuration template with annotated settings for AUR builds, telemetry, and cache controls. |
-| [`policy.toml`](policy.toml) | `~/.config/omg/policy.toml` | Security policy template for defining minimum trust grades, allowed licenses, and package restrictions. |
-| [`.tool-versions`](.tool-versions) | `<project-root>/.tool-versions` | Standard version-locking file for pinning Node, Python, Go, Rust, and other project runtimes. |
+## Before copying a file
 
-## Quick Start
+Run `omg config path` to find the settings file on this machine. Review `config.toml` before replacing an existing file. Review policy changes with whoever owns the policy; an example is not an approved organization policy.
 
-Copy the templates to your user configuration directory:
+For a new project, copy `.tool-versions` into its root, edit the example versions, and commit the reviewed file. `omg use node` can detect the Node pin there. The shell hook can select an already installed version when you enter the project. The file does not install runtimes, write `omg.lock`, or guarantee identical dependencies.
+
+## Check your changes
 
 ```bash
-mkdir -p ~/.config/omg
-cp examples/config.toml ~/.config/omg/
-cp examples/policy.toml ~/.config/omg/
+omg config validate
 ```
 
-Verify your active configuration:
-
 ```bash
-omg config list
-omg config validate
 omg audit policy
 ```
 
-## Authoritative Documentation
+```bash
+omg which node
+```
 
-For complete reference manuals, available settings, security boundaries, and migration guides, see the official documentation:
+If the commands report an error, keep the original file and use [troubleshooting](../docs/troubleshooting.md) to diagnose it.
 
-- **[Configuration Guide](../docs/configuration.md)** — All valid settings, defaults, environment overrides, and limits
-- **[Security Policy Guide](../docs/security.md#security-policy)** — Policy grades, enforcement rules, and audit verification
-- **[Runtime Management](../docs/runtimes.md)** — Version pinning, switching, and `.tool-versions` compatibility
-- **[AUR Support](../docs/aur.md)** — Build concurrency, sandbox options, and review mechanisms
+## Where to go next
+
+- [Runtime management](../docs/runtimes.md) explains version files and installation.
+- [Team environments](../docs/team.md) explains the separate `omg.lock` record.
+- [AUR support](../docs/aur.md) explains build settings and their limits.

@@ -1,506 +1,106 @@
 ---
-title: Shell Integration
+title: Shell integration
 sidebar_position: 12
-description: Hooks, completions, and PATH management
+description: Select installed runtime versions when you change directories
 ---
 
-# Shell Integration
+# Shell integration
 
-**In plain words:** One small addition to your shell start-up file lets OMG select the right language version automatically when you enter a project folder. This page has the exact line for each shell, how to check it works, and how to remove it.
+A shell is the program that reads commands in your terminal. OMG can add a hook to Bash, Zsh, or Fish so a project selects its installed runtime versions when you enter its directory. The hook changes your shell's `PATH`, the list of directories it searches for commands.
 
-> New to the terminal? Read [Getting started](./getting-started.md) and keep
-> [the glossary](./glossary.md) open while you work.
+## What you need first
 
-**Hooks, Completions, and PATH Management**
+- [Install OMG](./installation.md) so the `omg` command is available.
+- Know which shell your terminal runs. If you are unsure, read [getting started](./getting-started.md) and the [glossary](./glossary.md).
+- Check your shell startup file for an existing OMG hook before adding a line. A second hook can duplicate work.
 
-This guide covers OMG's shell integration features including the shell hook, completions, and ultra-fast shell functions.
+## Add a hook
 
----
+Add the line for your shell to its startup file, then open a new terminal.
 
-## Overview
+| Shell | Startup file | Line to add |
+| --- | --- | --- |
+| Bash | `~/.bashrc` | `eval "$(omg hook bash)"` |
+| Zsh | `~/.zshrc` | `eval "$(omg hook zsh)"` |
+| Fish | `~/.config/fish/config.fish` | `omg hook fish | source` |
 
-OMG provides deep shell integration that:
-
-1. **Automatically updates PATH** when you change directories
-2. **Detects version files** and activates the correct runtime
-3. **Provides shell completions**, whose behavior depends on shell setup and available metadata
-4. **Exposes ultra-fast functions** for shell prompts
-
----
-
-## Shell Hook Installation
-
-### What the Hook Does
-
-The shell hook:
-
-- Runs on every directory change (`cd`)
-- Runs on every prompt (to catch `pushd`, `popd`, etc.)
-- Detects version files (`.nvmrc`, `.python-version`, etc.)
-- Prepends correct runtime `bin` directories to PATH
-- Provides fast package count functions
-
-### Installation by Shell
-
-#### Zsh
-
-Add to `~/.zshrc`:
+For example, after adding the Zsh line, open a new Zsh terminal and enter a project with a `.node-version` file. Run:
 
 ```bash
-eval "$(omg hook zsh)"
+omg which node
 ```
 
-Reload:
+Then run:
 
 ```bash
-source ~/.zshrc
-# or
-exec zsh
+node --version
 ```
 
-#### Bash
+The second command should use the installed version selected for that project. If it does not, check the pin, installed versions with `omg list node`, and the shell's `PATH`. The hook selects installed versions; it does not download a missing runtime.
 
-Add to `~/.bashrc`:
+`omg hook <shell>` prints the hook text. It does not edit your startup file when used normally. To remove an OMG-owned line from a startup file, use the matching `--uninstall` form, then start a new shell:
 
 ```bash
-eval "$(omg hook bash)"
+omg hook zsh --uninstall
 ```
 
-Reload:
+The uninstall command removes only recognized OMG hook lines and writes an
+`.omg-backup` copy beside the startup file. It refuses to rewrite a
+symlink-managed startup file; edit that file's managed source instead.
+
+## How pins are selected
+
+OMG checks the current directory first, then its parents. A nearer pin wins. Within one directory, dedicated version files win over mise project files. For example, `.node-version` wins over `.nvmrc`, and both win over a Node pin in `mise.toml`.
+
+| Runtime | Version files read by the hook |
+| --- | --- |
+| Node.js | `.node-version`, `.nvmrc`, `package.json`, `.tool-versions` |
+| Python | `.python-version`, `pyproject.toml`, `.tool-versions` |
+| Go | `.go-version`, `go.mod`, `.tool-versions` |
+| Rust | `rust-toolchain`, `rust-toolchain.toml`, `.tool-versions` |
+| Deno | `.deno-version`, `.dvmrc`, `.tool-versions` |
+| Other native managers | Their dedicated file, where supported, or `.tool-versions` |
+
+OMG also reads supported `[tools]` pins from layered mise project files. See [runtime management](./runtimes.md) and [mise project files](./mise-compatibility.md) for the full list and precedence. A malformed current-directory pin does not run project code. The hook warns and leaves the base `PATH` in use. A malformed ancestor pin is skipped with a warning.
+
+The hook changes runtime search paths when your directory changes or a prompt runs. It restores the prior base `PATH` before applying the next directory's pins. It does not load mise `[env]` entries, read environment files, or execute source scripts. Explicit `omg run` tasks can resolve those values.
+
+## Completions
+
+Completions suggest commands and values when you press Tab. These are separate from the runtime hook. OMG can install them for Bash, Zsh, Fish, PowerShell, and Elvish.
 
 ```bash
-source ~/.bashrc
-# or
-exec bash
+omg completions bash
 ```
 
-#### Fish
-
-Add to `~/.config/fish/config.fish`:
-
-```fish
-omg hook fish | source
-```
-
-Reload:
-
-```fish
-source ~/.config/fish/config.fish
-# or
-exec fish
-```
-
-### Verifying Installation
+Replace `bash` with your shell's name. Without `--stdout`, the command installs the generated file in a user location. Check its printed path and restart the shell. Use `--stdout` when you want to inspect or redirect the script:
 
 ```bash
-# Test hook output
-omg hook zsh
-
-# Check if hook is active
-type _omg_hook
-
-# Test version detection
-cd /path/to/project/with/.nvmrc
-echo $PATH | grep omg
+omg completions zsh --stdout
 ```
 
----
-
-## How Version Detection Works
-
-### Detection Order
-
-When you enter a directory, OMG checks for version files in this order:
-
-1. **Current directory**
-2. **Parent directories** (walking up to filesystem root)
-
-If no version file matches, the shell hook restores the base PATH.
-
-### Supported Version Files
-
-| File | Runtime | Priority |
-| ------ | --------- | ---------- |
-| `.node-version` | Node.js | 1 (highest) |
-| `.nvmrc` | Node.js | 2 |
-| `.bun-version` | Bun | 1 |
-| `.python-version` | Python | 1 |
-| `pyproject.toml` | Python | 2 (`[project.requires-python]`) |
-| `.ruby-version` | Ruby | 1 |
-| `.go-version` | Go | 1 |
-| `go.mod` | Go | 2 |
-| `.java-version` | Java | 1 |
-| `rust-toolchain` | Rust | 1 |
-| `rust-toolchain.toml` | Rust | 2 |
-| `.deno-version` | Deno | 1 |
-| `.dvmrc` | Deno | 2 |
-| `.zig-version` | Zig | 1 |
-| `global.json` | .NET SDK | 1 |
-| `.php-version` | PHP | 1 |
-| `.swift-version` | Swift | 1 |
-| `.tool-versions` | Multiple | Universal multi-tool pin |
-| `package.json` | Node/Bun | Engines / Volta |
-| `mise.toml`, `.mise.toml` | Multiple | Universal `[tools]` pin |
-
-### Version File Formats
-
-#### Simple Version Files
-
-`.nvmrc`, `.python-version`, `.go-version`, etc.:
-
-```
-20.10.0
-```
-
-Or with `v` prefix:
-
-```
-v20.10.0
-```
-
-Or aliases (Node.js):
-
-```
-lts/*
-lts/hydrogen
-```
-
-#### rust-toolchain.toml
-
-```toml
-[toolchain]
-channel = "stable"  # or "nightly" or "1.75.0"
-components = ["rustfmt", "clippy"]
-targets = ["wasm32-unknown-unknown"]
-profile = "minimal"
-```
-
-Or simple `rust-toolchain` file:
-
-```
-stable
-```
-
-#### .tool-versions (asdf format)
-
-```
-node 20.10.0
-python 3.12.0
-rust stable
-go 1.21.0
-```
-
-#### package.json
-
-```json
-{
-  "engines": {
-    "node": ">=18 &lt;21",
-    "bun": ">=1.0"
-  },
-  "volta": {
-    "node": "20.10.0",
-    "bun": "1.0.25"
-  }
-}
-```
-
-Priority: `engines` > `volta`
-
----
+Dynamic package suggestions depend on the backend and available package metadata. Completion is a convenience; it does not validate or install the selected package.
 
 ## Prompt counters
 
-Bash and Zsh hooks define package-count helpers. They read `omg.status` beside the daemon socket after checking size, magic, version, ownership, and a five-minute timestamp. Fish's generated hook does not define these helpers. Use `omg ec` there, or call the CLI from the prompt.
+Bash and Zsh hooks also provide `omg-ec`, `omg-tc`, `omg-oc`, and `omg-uc` for explicit, total, orphan, and update counts. They read a daemon status snapshot when its size, format, owner, and five-minute age checks pass. Zsh caches values in the shell for up to 60 seconds. Bash reads the snapshot on each helper call. The Fish hook does not define these helpers; use `omg ec` and the other CLI count commands there.
 
-### Shell helpers
+A missing or rejected status snapshot can produce a fallback value. Treat prompt counters as status hints, not a fresh package audit.
 
-Zsh keeps `omg-ec`, `omg-tc`, `omg-oc`, and `omg-uc` in shell variables and refreshes them at most every 60 seconds. Until the first successful read, those variables are `0`. Bash defines the same short names as aliases of the file readers below, so each prompt call reads the file.
+## If something goes wrong
 
-| Function | Returns |
+| What you see | What to do |
 | --- | --- |
-| `omg-ec` | Explicit package count |
-| `omg-tc` | Total package count |
-| `omg-oc` | Orphan count |
-| `omg-uc` | Updates count |
-| `omg-explicit-count` | Explicit count read from `omg.status`, or `omg explicit --count` when the file is rejected |
-| `omg-total-count` | Total count read from `omg.status`, or `0` when the file is rejected |
-| `omg-orphan-count` | Orphan count read from `omg.status`, or `0` when the file is rejected |
-| `omg-updates-count` | Update count read from `omg.status`, or `0` when the file is rejected |
-
-### Using in Prompts
-
-#### Zsh Prompt
-
-```bash
-# In ~/.zshrc
-PROMPT='[📦 $(omg-ec)] %~$ '
-
-# Or with colors
-PROMPT='%F{cyan}[$(omg-ec) pkgs]%f %~$ '
-
-# Full example with git
-PROMPT='%F{green}%n@%m%f %F{blue}%~%f $(git_prompt_info)[📦 $(omg-ec)]$ '
-```
-
-#### Bash Prompt
-
-```bash
-# In ~/.bashrc
-export PS1='[\w] $(omg-ec) pkgs$ '
-
-# With colors
-export PS1='\[\e[36m\][$(omg-ec) pkgs]\[\e[0m\] \w$ '
-```
-
-#### Fish prompt
-
-The generated Fish hook does not define `omg-ec`. Read the count from the CLI:
-
-```fish
-function fish_prompt
-    echo -n (omg ec)" pkgs "
-    set_color blue
-    echo -n (prompt_pwd)
-    set_color normal
-    echo '$ '
-end
-```
-
-### Performance Comparison
-
-Cached prompt values avoid a fresh query but can be stale. Compare fresh queries separately, with the same backend and cache conditions. See [benchmark evidence](../benchmarks/README.md); this guide establishes no timing thresholds.
-
----
-
-## Shell Completions
-
-### Installation
-
-#### Zsh
-
-```bash
-# Create completions directory
-mkdir -p ~/.zsh/completions
-
-# Generate completions (note --stdout: bare `omg completions <shell>` installs instead of printing)
-omg completions zsh --stdout > ~/.zsh/completions/_omg
-
-# Add to fpath in ~/.zshrc (if not already)
-fpath=(~/.zsh/completions $fpath)
-autoload -Uz compinit && compinit
-
-# Rebuild completion cache
-rm ~/.zcompdump
-compinit
-```
-
-#### Bash
-
-```bash
-# System-wide
-omg completions bash --stdout | sudo tee /etc/bash_completion.d/omg >/dev/null
-
-# Or user-only
-omg completions bash
-
-# Source immediately
-source /etc/bash_completion.d/omg
-```
-
-#### Fish
-
-```bash
-# User completions
-omg completions fish
-
-# System-wide
-omg completions fish --stdout | sudo tee /usr/share/fish/vendor_completions.d/omg.fish >/dev/null
-```
-
-### Completion Features
-
-OMG provides intelligent completions for:
-
-- **Commands**: All subcommands with descriptions
-- **Package names**: From the daemon index when that index is available
-- **Runtime versions**: Installed and available versions
-- **Options**: All flags with descriptions
-
-### Fuzzy Matching
-
-OMG uses Nucleo for ultra-fast fuzzy matching:
-
-```bash
-omg i frfx<TAB>
-# Completes to: firefox
-```
-
----
-
-## Hook behavior
-
-`omg hook bash`, `omg hook zsh`, and `omg hook fish` print the scripts below. The printed script is the source of truth. Each hook saves the original `PATH`, restores environment changes from the previous directory, and calls `command omg hook-env` so a shell function named `omg` cannot shadow the binary. An interactive shell can also start the daily update-notice check.
-
-Zsh registers `_omg_hook` on `precmd_functions` and `chpwd_functions`, then refreshes its in-shell counter cache at most every 60 seconds. Bash registers `_omg_hook` on `PROMPT_COMMAND`, including when that variable is an array. Bash counter helpers read the status file on each call. Fish registers `_omg_hook` on `PWD` and `fish_prompt`.
-
-The generated hook fills in the status path as the daemon socket's sibling, `omg.status`. Zsh and Bash accept the file only when it is a regular, user-owned, 32-byte snapshot with magic `OMGS`, version 1, and a timestamp no older than five minutes.
-
----
-
-## Manual PATH Management
-
-If you prefer manual control over PATH:
-
-### Without Hook
-
-```bash
-# Manually add runtime paths
-export PATH="$HOME/.local/share/omg/versions/node/current/bin:$PATH"
-export PATH="$HOME/.local/share/omg/versions/python/current/bin:$PATH"
-export PATH="$HOME/.local/share/omg/versions/go/current/bin:$PATH"
-export PATH="$HOME/.local/share/omg/versions/rust/current/bin:$PATH"
-```
-
-### Project-Specific
-
-```bash
-# Add to project's .envrc (if using direnv)
-export PATH="$HOME/.local/share/omg/versions/node/20.10.0/bin:$PATH"
-```
-
-### Check Active Versions
-
-```bash
-# See what's in PATH
-echo $PATH | tr ':' '\n' | grep omg
-
-# Check symlinks
-ls -la ~/.local/share/omg/versions/node/current
-```
-
----
-
-## Configuration Options
-
-### PATH Hooks
-
-OMG uses shell hooks for runtime switching:
-
-- PATH is updated on directory changes.
-- No wrapper or shim executable layer is installed.
-- Bash, Zsh, and Fish hooks are selected explicitly with `omg hook <shell>`.
-
-### Runtime Resolution
-
-Shell hooks resolve only OMG's native runtime installations. Unknown pins do not add anything to `PATH`.
-
----
-
-## Troubleshooting
-
-### Hook Not Running
-
-```bash
-# 1. Check hook is in shell config
-grep "omg hook" ~/.zshrc
-
-# 2. Verify hook works
-omg hook zsh | head -20
-
-# 3. Check function exists
-type _omg_hook
-
-# 4. Force reload
-exec zsh
-```
-
-### Wrong Version Active
-
-```bash
-# 1. Check version files
-ls -la .nvmrc .python-version .tool-versions
-
-# 2. Check what OMG detects
-omg which node
-
-# 3. Check PATH order
-echo $PATH | tr ':' '\n' | head -10
-# OMG paths should be first
-
-# 4. Force switch
-omg use node 20.10.0
-```
-
-### Slow Directory Changes
-
-```bash
-# 1. Ensure daemon is running
-omg status
-
-# 2. Check hook-env timing
-time omg hook-env -s zsh
-# Record the result and compare against your own baseline.
-
-# 3. If slow, the daemon may be down
-omg daemon
-```
-
-### Completions Not Working
-
-```bash
-# Zsh
-rm ~/.zcompdump
-omg completions zsh --stdout > ~/.zsh/completions/_omg
-compinit
-
-# Check fpath
-echo $fpath | tr ' ' '\n' | grep completions
-```
-
----
-
-## Performance Tips
-
-### 1. Keep Daemon Running
-
-```bash
-# Start daemon on login
-echo "omg daemon &" >> ~/.zprofile
-
-# Or use systemd
-systemctl --user enable omgd
-```
-
-### 2. Use Cached Functions in Prompts
-
-```bash
-# Fast (cached)
-PROMPT='$(omg-ec) pkgs$ '
-
-# Avoid (hits binary each time)
-PROMPT='$(omg explicit --count) pkgs$ '
-```
-
-### 3. Minimize Version Files
-
-Only place version files in project roots, not deeply nested directories.
-
-### 4. Combine with Starship/Powerlevel10k
-
-These prompt themes have built-in version display. Combine with OMG:
-
-```bash
-# OMG handles PATH, Starship handles display
-eval "$(omg hook zsh)"
-eval "$(starship init zsh)"
-```
-
----
-
-## See Also
-
-- [Quick Start](./quickstart.md) — Initial setup
-- [Configuration](./configuration.md) — Shell and runtime settings
-- [Runtime Management](./runtimes.md) — Version file details
-- [Troubleshooting](./troubleshooting.md) — Common issues
+| Your old runtime remains active | Check that the hook line appears once in the correct startup file, then start a new shell. |
+| A pin does not select a runtime | Check `omg list <runtime>`; the selected version must already be installed. |
+| A different pin wins | Look for a nearer directory or a dedicated version file in the same directory. |
+| Tab completion does not appear | Run `omg completions <shell>`, check the printed install path, and restart the shell. |
+| Directory changes feel slow | Measure `omg hook-env -s zsh` with your shell's timing tool and compare under the same conditions. |
+
+Do not delete daemon sockets or rewrite shell startup files as a first troubleshooting step. See [troubleshooting](./troubleshooting.md) for diagnosis and support.
+
+## Where to go next
+
+- [Runtime management](./runtimes.md) explains installation and pin formats.
+- [Configuration](./configuration.md) explains local settings.
+- [Run project tasks](./task-runner.md) explains explicit project execution.

@@ -1,4 +1,4 @@
-# Development Scripts
+# Development scripts
 
 Utility scripts for development, testing, and CI of the OMG project.
 
@@ -15,7 +15,7 @@ Utility scripts for development, testing, and CI of the OMG project.
 | `gen-release-notes.sh` | Generate release notes for a version | `./scripts/gen-release-notes.sh <version>` |
 | `r2-rollback.sh` | Roll back R2 release artifacts | `./scripts/r2-rollback.sh` |
 | `record-benchmark-run.py` | Archive a hyperfine run into `benchmarks/records/` | `python3 scripts/record-benchmark-run.py` |
-| `release-smoke.sh` | Smoke-test a published release archive in distro containers | `./scripts/release-smoke.sh --release latest --distro all` |
+| `release-smoke.sh` | Smoke-test published or staged archives in distro containers or a native macOS runner | `./scripts/release-smoke.sh --release latest --distro all` |
 
 ---
 
@@ -131,6 +131,12 @@ soft passes hide product failures.
   2 and list valid contract identifiers.
 - `--distro` accepts `arch`, `debian`, `ubuntu`, `fedora`, or `all`. A product
   failure on one distribution does not stop the remaining distributions.
+- `--distro all` covers the four Linux container distributions. Native macOS
+  needs `--distro macos --executor native` and an independent digest pin file
+  supplied through `OMG_SMOKE_DIGEST_PIN_FILE`. This mode changes the host's
+  Homebrew state; use a disposable macOS runner. `--apt-abi 7` selects the
+  Trixie archive and Debian 13 or Ubuntu 26.04 for a Debian or Ubuntu run.
+  The default APT ABI is 6.
 - `--timeout-seconds` limits each container execution to 300 seconds by default.
   GNU `timeout` is required. A timeout reports `HARNESS_ERROR` with exit code
   124, or 137 if forced termination was needed. Setup failures use code 120.
@@ -159,9 +165,10 @@ soft passes hide product failures.
 ### Optional Sentry reporting
 
 `report-smoke-sentry.sh` runs after the coordinator has collected results and each
-case has completed cleanup. It reads `~/.config/omg-smoke/sentry.json`, or the path
-in `OMG_SMOKE_SENTRY_CONFIG`. Missing configuration disables reporting. Reporting
-requires `jq` and `curl`; failures do not change the original test exit status.
+case has completed cleanup. It reads `~/.config/omg-smoke/sentry.json`, the path
+in `OMG_SMOKE_SENTRY_CONFIG`, or `OMG_SMOKE_SENTRY_DSN` when no file is configured.
+The DSN is not written to the log. Missing configuration disables reporting.
+Reporting requires `jq` and `curl`; failures do not change the original test exit status.
 
 Keep the configuration outside the repository with permissions `600`. Its JSON
 object contains a `dsn` string for a hosted Sentry project. Do not put API tokens,
@@ -310,15 +317,16 @@ fake Docker boundary. Those fixtures do not claim to execute guest commands.
 
 Cold-cache benchmarks, repeated-guest statistics, and exhaustive CLI coverage
 remain separate work. Passing this runner does not declare that every OMG command
-works on every distro. The published Debian artifact also fails to load on Debian
-13 because it requires libapt-pkg.so.6.0. Do not infer Debian 13 support from the
-Bookworm result.
+works on every distro. Its Debian guest is Bookworm (APT 6), so that result does
+not prove Debian 13 behavior. The release pipeline builds a separate Trixie
+(APT 7) archive and smoke-tests it before publication.
 
 ## Release Artifact Naming (canonical scheme)
 
 All release pipelines and the installer MUST use this single naming convention.
-`.github/workflows/release.yml` is the source of truth that produces these
-assets; `install.sh` consumes them via the GitHub releases API.
+`.github/workflows/release.yml` produces these assets. `install.sh` selects an
+archive by host and APT ABI, then downloads it and its checksum sidecar from
+the R2 release domain. GitHub Releases remains a release mirror.
 
 | Platform | Archive name |
 | -------- | ------------ |
@@ -329,7 +337,7 @@ assets; `install.sh` consumes them via the GitHub releases API.
 | Fedora / unknown Linux distro fallback | `omg-v<version>-<arch>-linux-fedora.tar.gz` |
 | macOS | `omg-v<version>-<arch>-darwin.tar.gz` |
 
-- `<version>` is the release tag without the leading `v` (e.g. `0.1.204`).
+- `<version>` is the release tag without the leading `v` (e.g. `0.1.223`).
 - Published Linux archives use `x86_64`; macOS uses `aarch64`. Architecture
   detection alone does not mean a release archive exists for that target.
 - Debian/Ubuntu selection checks the native APT library ABI. APT 7 uses the

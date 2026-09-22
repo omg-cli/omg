@@ -1,77 +1,58 @@
-# macOS guests: verdict and path
+---
+title: macOS release smoke
+sidebar_position: 63
+description: Run macOS package smoke tests on a native runner
+---
 
-> **Who this page is for:** OMG maintainers and contributors. It documents the macOS virtual-machine notes.
-> It is not an everyday user guide. If you are new to OMG, start with
-> [Getting started](./getting-started.md).
+# macOS release smoke
 
-## Verdict
+OMG runs macOS release smoke directly on a disposable Apple Silicon host. It does not boot a macOS guest under QEMU. This page explains why and shows the exact native runner requirements. It is for maintainers; new users should start with [getting started](./getting-started.md).
 
-No macOS-on-QEMU in CI. Apple's EULA permits macOS virtualization only on
-Apple-branded hardware, so Linux-hosted macOS guests (OSX-KVM and kin) are
-out for this project — legally, not technically.
+## Why this lane is native
 
-Tart (the state-of-the-art Apple-silicon VM manager) does not help on
-hosted runners either: it needs an Apple Silicon host with nested
-virtualization, which GitHub-hosted `macos-*` runners (themselves VMs) do
-not provide. Tart is viable only with self-hosted Mac hardware or a paid
-managed-VM service (e.g. Cirrus), neither of which this project has.
+The project's macOS release archive targets `aarch64-darwin`. Apple licenses macOS virtualization on Apple-branded computers, and GitHub says its hosted macOS runners do not support nested virtualization. The repository therefore uses the hosted `macos-14` runner directly. [Apple's macOS license](https://www.apple.com/legal/sla/) and [GitHub's hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) are the current external sources for those constraints. Check the license for the macOS version you use before designing a new VM lane.
 
-## Recommended path: native smoke on GitHub-hosted macOS runners
+The runner executes package probes on the host. It resets the `tree` probe package with `brew uninstall tree || true` and can install or remove it during a test. A local run changes your Homebrew state. Use a disposable Mac or review that effect before running.
 
-GitHub-hosted `macos-14`/`macos-15` runners are fresh ephemeral VMs per
-job — the isolation property QEMU buys on Linux already holds there. No
-guest layer is needed.
+## Current CI path
 
-### Status: implemented
+The `smoke-macos` job in `.github/workflows/release-smoke.yml` runs on `macos-14`. It installs GNU coreutils for `gtimeout`, pins the release archive to GitHub's server-computed asset digest, and runs:
 
-- `scripts/release-smoke.sh` has `--executor container|native` plus a
-  `macos` distro (`--distro macos` requires `--executor native` and vice
-  versa). Native cases reset the shared probe package
-  (`brew uninstall tree || true`), then run the same probes against the
-  `aarch64-darwin` archive with `OMG_PROBE_ROOT` pointing at the staged
-  dir. Metadata records `image=native-host`, `engine=native`, and
-  `expectation=pass` (the inventory targets name container distros only,
-  so a native run establishes the baseline).
-- macOS toolset fallbacks: `TIMEOUT_BIN` selects `timeout` or `gtimeout`
-  (coreutils), `SHA256_BIN` selects `sha256sum` or `shasum -a 256`.
-- `scripts/report-smoke-sentry.sh` accepts `distro: macos` and prefers
-  `uuidgen` (macOS) with a `/proc` fallback (Linux).
-- Harness proof: `scripts/test-release-smoke.sh` covers stub-`brew` +
-  fake-`omg` tarballs (pass, bad-search, bad-version), pairing
-  rejections, and a restricted-PATH `macbin` run proving the
-  `shasum`/`gtimeout` fallbacks.
-- CI: the `Smoke macos (native)` job (`macos-14`) in
-  `.github/workflows/release-smoke.yml` runs
-  `./scripts/release-smoke.sh --distro macos --executor native` and
-  uploads `release-smoke-macos` evidence in the same `results.json`
-  schema, so Sentry reporting, issue filing, and dashboards work
-  unchanged.
+```bash
+./scripts/release-smoke.sh --release "$RELEASE_TAG" --distro macos --executor native
+```
 
-Prior gap analysis (now closed):
+The job supplies `OMG_SMOKE_DIGEST_PIN_FILE`. Native mode refuses to start without this independently recorded digest. For a published archive, the runner also verifies its release attestation before extraction. The archive's own `.sha256` sidecar alone cannot establish the trusted digest if both archive and sidecar change.
 
-- `scripts/release-smoke.sh` executes every case inside a digest-pinned
-  distro container (`--container-engine docker|podman`). macOS runners
-  ship no Docker daemon.
-- The fix is a native executor mode: run the TSV-selected cases directly
-  on the (disposable) runner with hermetic dirs, keeping the same
-  results.json evidence schema so Sentry reporting, issue filing, and
-  dashboards work unchanged.
-- The OMG side is ready: the `macos` Cargo feature (Homebrew backend)
-  exists, and `macos-14` already runs CI in `.github/workflows/ci.yml`.
+The job uploads `release-smoke-macos` evidence using the same `results.json` schema as container smoke. `scripts/test-release-smoke.sh` covers the native mode with fake `brew` and `omg` binaries, including failure cases and the `shasum`/`gtimeout` fallbacks. Those fixtures do not prove a published archive passed on a real Mac.
 
-## Non-goals
+## Run a published archive locally
 
-- OSX-KVM / macOS-Simple-KVM on Linux hosts (EULA).
-- Tart on hosted runners (no nested virt).
-- Colima-as-Docker on macOS runners (heavy, flaky; native mode is simpler
-  and the host is already disposable).
+On an Apple Silicon Mac with Homebrew, `gh` authentication, GNU coreutils,
+`jq`, and a disposable Homebrew state, resolve the latest published tag. The
+pin file must contain the GitHub asset digest for the exact archive.
 
-## Sources
+```bash
+TAG="$(gh release view --repo omg-cli/omg --json tagName --jq .tagName)"
+gh api "repos/omg-cli/omg/releases/tags/$TAG" \
+  --jq '.assets[] | select(.name | endswith("-aarch64-darwin.tar.gz")) | "\(.digest | sub("^sha256:"; ""))  \(.name)"' \
+  > smoke-digest-pins.txt
+```
 
-- Apple hardware-only virtualization: Apple EULA / compliant-supplier
-  guidance, e.g. https://www.accio.com/plp/mac-os-virtual-machine-online
-- Tart needs Apple Silicon + no nested virt on CI runners:
-  https://github.com/suzuke/agend/blob/HEAD/e2e/README.md,
-  https://github.com/netwindhq/gha-outrunner/blob/HEAD/docs/tutorial/tart-macos.md
-- ARM runners free for public repos (for the Linux side of the matrix):
-  https://github.blog/changelog/2025-08-07-arm64-hosted-runners-for-public-repositories-are-now-generally-available/
+Check that the file contains one 64-character SHA-256 digest and the expected archive name. Then run the smoke test:
+
+```bash
+OMG_SMOKE_DIGEST_PIN_FILE="$PWD/smoke-digest-pins.txt" \
+  ./scripts/release-smoke.sh --release "$TAG" --distro macos --executor native
+```
+
+For a staged archive, use `--staged-dir DIR` with an explicit tag and a digest recorded independently of that staged directory. Keep the pin file and `results.json` with the release evidence.
+
+## Limits and next steps
+
+- `--distro all` covers Linux container images. It does not include macOS.
+- `--executor native` only pairs with `--distro macos`.
+- The native lane tests selected package contracts. It does not establish parity for every OMG command, runtime, or Homebrew state.
+- The shared probe inventory names container distros, so native macOS cases use a baseline pass expectation. Read the observed case results and transcript before claiming success.
+
+See [release operations](./release-operations.md) for publication, [scripts](../scripts/README.md) for smoke options, and [QA loop](./qa-loop.md) for filing failures.

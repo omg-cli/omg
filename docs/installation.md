@@ -6,13 +6,13 @@ description: Choose the right download for your computer and install OMG step by
 
 # Install OMG
 
-**In plain words:** This page explains how to put OMG on your computer, which download your machine needs, how to update it, and how to remove it again.
-
-This page shows you how to put OMG on your computer. It starts with a table that tells you which download matches your computer, then walks through the installation one command at a time.
+This page helps you choose the right OMG release, install it, update it, and remove it.
+The installer verifies a release archive before copying the `omg` and `omgd` programs
+into your home folder.
 
 **New to the terminal?** Read [Getting started](./getting-started.md) first. It explains the words on this page and shows you how to open a terminal. [The glossary](./glossary.md) explains any other term you meet.
 
-> **Warning:** OMG is approaching beta, so its makers still change how it behaves. Use a machine you can reinstall (or a virtual machine) when you change system packages, and keep your native package tool (`pacman`, `apt`, `dnf`, or Homebrew) available while you try things.
+> **Warning:** OMG is in beta, so its makers still change how it behaves. Use a machine you can reinstall (or a virtual machine) when you change system packages, and keep your native package tool (`pacman`, `apt`, `dnf`, or Homebrew) available while you try things.
 
 ## Which download do I need?
 
@@ -21,7 +21,8 @@ You usually do not download OMG by hand. The installer script works out which re
 | Your computer | What OMG uses there | Release file the installer downloads |
 | --- | --- | --- |
 | Arch Linux (64-bit Intel or AMD) | Arch packages (ALPM) and the AUR | `omg-v<version>-x86_64-linux-arch.tar.gz` |
-| Debian or Ubuntu (64-bit Intel or AMD) | Debian packages (APT) | `omg-v<version>-x86_64-linux-debian.tar.gz` or `omg-v<version>-x86_64-linux-ubuntu.tar.gz` |
+| Debian 12 or Ubuntu 24.04 (64-bit Intel or AMD) | Debian packages (APT 6) | `omg-v<version>-x86_64-linux-debian.tar.gz` or `omg-v<version>-x86_64-linux-ubuntu.tar.gz` |
+| Debian 13 or Ubuntu 26.04 (64-bit Intel or AMD) | Debian packages (APT 7) | `omg-v<version>-x86_64-linux-debian-trixie.tar.gz` |
 | Fedora (64-bit Intel or AMD) | RPM packages (DNF) | `omg-v<version>-x86_64-linux-fedora.tar.gz` |
 | Mac with Apple silicon (M1 or newer) | Homebrew packages | `omg-v<version>-aarch64-darwin.tar.gz` |
 | Windows | A Linux system inside WSL | The file for the Linux distribution you installed in WSL |
@@ -91,7 +92,11 @@ flowchart LR
     E --> F[Add that folder to PATH]
 ```
 
-The installer downloads the release file for your computer, checks it, and installs it. It may first offer to install a missing helper program with your package manager; read that prompt before you answer. Without `OMG_SKIP_SHELL=1` the installer can modify shell start-up files, so the command below keeps shell edits switched off.
+The installer downloads the release file for your computer, checks it, and installs it.
+The prebuilt-release path requires its helper programs to be installed already. The
+separate `--from-source` path may offer to install missing build tools with your package
+manager. Without `OMG_SKIP_SHELL=1` the installer can modify shell start-up files,
+so the command below keeps shell edits switched off.
 
 ```bash
 OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 bash omg-install.sh
@@ -177,6 +182,13 @@ Inspect `target/release/omg --help` before installing a built binary. An explici
 
 Next, [the quickstart](./quickstart.md) shows how to use OMG in a project. This part is optional: it makes OMG switch runtime versions automatically when you change folders. A **shell hook** is a few lines that run when your shell starts or changes folders; [the glossary](./glossary.md) explains the word. Add the line for your shell to its configuration file, once.
 
+You can also run `omg init` in an interactive terminal to choose the shell hook,
+daemon startup, telemetry setting, and initial environment capture. With `--defaults`,
+or when no terminal is attached, it applies defaults and captures an `omg.lock`
+without asking each question. Use `--skip-shell` and `--skip-daemon` to skip those
+two setup actions. Review an existing `omg.lock` before running the defaults in
+a project folder.
+
 ```bash
 # Bash
 eval "$(omg hook bash)"
@@ -202,7 +214,7 @@ omg completions bash
 
 ## The background helper (daemon)
 
-OMG runs package commands and vulnerability scans without a separate helper. The optional daemon, whose file name is `omgd`, keeps package indexes, vulnerability results, and status snapshots warm; `omg audit scan` uses it when available and starts a direct cold scan otherwise. Unix SOC 2 export and metrics still require the daemon. The current SBOM command needs the Arch package backend and access to an advisory service, whether or not the daemon runs. [The glossary](./glossary.md) explains the word "daemon".
+OMG runs package commands and vulnerability scans without a separate helper. The optional daemon, whose file name is `omgd`, keeps package indexes, vulnerability results, and status snapshots warm. `omg audit scan` and the vulnerability portion of `omg audit export --framework soc2` use it when available and scan directly otherwise. Metrics still require the daemon. `omg audit sbom` supports system-package inventories on Arch, Debian, Ubuntu, and Fedora; it includes a vulnerability scan and can fail if that scan or the package inventory fails. Homebrew is not supported by this SBOM path. [The glossary](./glossary.md) explains the word "daemon".
 
 ```bash
 omg daemon-status

@@ -69,3 +69,9 @@ The local host policy at `~/.config/omg/policy.toml` is separate and is shown by
 ## Self-hosting
 
 OMG provides no self-hosted registry initialization or package mirroring commands. Use each package ecosystem's native mirroring tools.
+
+## Where to go next
+
+- [Security model](./security.md) for the scope of scans, audit logs, and SOC 2 export.
+- [Configuration](./configuration.md) for the local policy file.
+- [CLI reference](./cli.md) for accepted command options.

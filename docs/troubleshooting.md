@@ -11,7 +11,7 @@ description: Diagnose failures without discarding configuration or evidence
 > New to the terminal? Read [Getting started](./getting-started.md) and keep
 > [the glossary](./glossary.md) open while you work.
 
-OMG is approaching beta. Diagnose the failing operation before changing package state, configuration, or persisted data. Keep your native package manager available.
+OMG is in beta. Diagnose the failing operation before changing package state, configuration, or persisted data. Keep your native package manager available.
 
 ## Collect a baseline
 

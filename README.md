@@ -37,7 +37,7 @@ commands and vulnerability scanning take the direct path and still work.
 | :--- | :--- |
 | **One workflow across systems** | Use the same commands on Arch, Debian, Ubuntu, Fedora, macOS, and supported Linux distributions inside WSL. |
 | **Security during the operation** | Verify downloads, constrain developer-tool installers, review and sandbox AUR builds, inspect produced archives, and record mutations as they happen. |
-| **The whole development environment** | Manage system packages, 14 language runtimes, 54 curated developer tools, project tasks, environment records, and security evidence from one CLI. |
+| **The whole development environment** | Manage system packages, 14 native runtime managers, 54 curated developer tools, project tasks, environment records, and security evidence from one CLI. |
 | **Fast paths without a hard daemon dependency** | Read ALPM, APT, and RPM state in process where supported. Run `omgd` for warm caches and background refreshes, or leave it off. |
 | **Evidence instead of promises** | CI exercises real Linux guests through QEMU, preserves per-command receipts, and files detailed issues when a gate fails. Benchmark claims require comparable recorded work. |
 
@@ -56,7 +56,7 @@ review, dependency, sandbox, and archive-inspection pipeline.
 | :--- | :--- | :--- |
 | Find and change packages | `search`, `info`, `why`, `install`, `remove`, `update`, `clean` | One interface, previews, backend-aware policy, history |
 | Use the AUR | `search`, `install`, `update` | Source review, offline Bubblewrap builds, output inspection, attended approval for privileged content |
-| Manage runtimes | `use`, `list`, `which`, `uninstall` | Native managers for Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, and Swift |
+| Manage runtimes | `use`, `list`, `which`, `use --uninstall` | Native managers for Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, and Swift |
 | Install developer tools | `tool search`, `tool install`, `tool list` | Curated registry and ecosystem-specific install policy for npm, Python, Cargo, Go, and system packages |
 | Run project tasks | `run` | Detects the task system the project already uses and forwards arguments |
 | Record environment intent | `env capture`, `env check`, `env share`, `env sync` | Inventory, portable intent, and drift reporting without pretending to rebuild the machine |
@@ -128,17 +128,19 @@ Then choose the setup you want:
 omg init
 ```
 
-`omg init` asks before enabling shell integration, starting the optional daemon,
-or capturing initial state. See [installation](docs/installation.md) for source
-builds, custom paths, updating, and uninstalling.
+In an interactive terminal, `omg init` asks before setting up shell integration,
+the optional daemon, or an initial environment record. In a non-interactive
+terminal it uses defaults, so review its options first. See
+[installation](docs/installation.md) for source builds, custom paths, updating,
+and uninstalling.
 
 ## Supported platforms
 
 | Platform | Package path | Release status |
 | :--- | :--- | :--- |
 | Arch Linux x86_64 | ALPM plus first-class AUR pipeline | Supported; broadest package-security coverage |
-| Debian 12/13 x86_64 | APT database and matching `libapt` ABI | Supported with ABI-specific release binaries |
-| Ubuntu 24.04/26.04 x86_64 | APT database and matching `libapt` ABI | Supported with ABI-specific release binaries |
+| Debian 12 / Ubuntu 24.04 x86_64 | APT 6 database | Supported with Debian or Ubuntu release binaries |
+| Debian 13 / Ubuntu 26.04 x86_64 | APT 7 database; Ubuntu 26.04 uses the Debian Trixie release pair | Supported with the Debian Trixie release binary |
 | Fedora x86_64 | Direct RPM state plus DNF repository operations | Experimental |
 | Apple silicon macOS | Policy-gated Homebrew integration | Supported on ARM64 |
 | Windows | A supported Linux distribution in WSL | No native Windows build |
@@ -167,7 +169,7 @@ omg run test
 
 # Inspect the machine
 omg audit scan
-omg audit sbom                  # Arch system-package inventory
+omg audit sbom                  # system-package inventory and vulnerability evidence on supported Linux backends
 omg history
 ```
 

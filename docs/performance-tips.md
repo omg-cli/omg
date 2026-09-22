@@ -21,9 +21,9 @@ change that helps one can be irrelevant to another.
 
 | Setting | What it changes | Trade-off |
 | :--- | :--- | :--- |
-| `omg daemon` running | Repeated searches and status calls answer from memory | A background process holds memory and an open socket |
+| `omg daemon` running | Selected queries can reuse a warm index and status cache | A background process holds memory and an open socket; simple search and info paths can still query directly |
 | `omg status --fast` | Skips the slower dependency scan and reports counts | Fewer details in the output |
-| `omg ec`, `tc`, `oc`, `uc` | Read a 32-byte snapshot file instead of starting work | Values can be a few minutes stale |
+| `omg ec`, `tc`, `oc`, `uc` | Read a valid, fresh 32-byte snapshot when available | Fall back to a daemon request or direct package data if the file is missing or stale |
 | `omg search --no-aur` | Removes the network-backed AUR lane from Arch searches | You lose AUR results for that query |
 | `omg update --check` | Reports what would change and changes nothing | One extra command before the real update |
 | `omg update --fast` | Sync and upgrade in one operation, no preview | You give up the review step |

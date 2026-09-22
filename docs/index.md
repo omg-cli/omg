@@ -6,11 +6,14 @@ description: Manage system packages, project runtimes, and environment records
 
 # OMG documentation
 
-OMG is one program that installs and updates software for you, chooses language versions for a project, and runs the tasks a project defines. It is a Rust command-line tool that works on Arch Linux, Debian, Ubuntu, Fedora, and Apple Silicon macOS.
+OMG manages system packages, developer tools, runtime versions, and project tasks from a
+terminal. Current releases target Arch Linux, Debian, Ubuntu, Fedora, and Apple silicon
+macOS. Some commands depend on the package backend, so check a feature's page before
+using it on a new system.
 
 **New to the terminal?** Start with [Getting started](./getting-started.md). It explains the words and shows what you should see after each step. Look up anything unfamiliar in [the glossary](./glossary.md).
 
-**OMG is approaching beta.** That means its makers still change how it behaves. Keep your native package tools available, and use a machine you can reinstall while you try out package changes.
+**OMG is in beta.** That means its makers still change how it behaves. Keep your native package tools available, and use a machine you can reinstall while you try out package changes.
 
 ## Start here
 
@@ -20,26 +23,32 @@ OMG is one program that installs and updates software for you, chooses language 
 4. [Cheat sheet](./cheatsheet.md) — the everyday commands on one page.
 5. [FAQ](./faq.md) — short, plain answers to common questions.
 
-## Choose a workflow
+## Find the right guide
 
-- [Packages](./packages.md), [package search](./package-search.md), and [AUR](./aur.md).
-- [Runtimes](./runtimes.md), [shell integration](./shell-integration.md), and [mise compatibility](./mise-compatibility.md).
-- [Task runner](./task-runner.md) and [containers](./containers.md).
-- [Environment and team records](./team.md), [workflows](./workflows.md), and [integrations](./integrations.md).
-- [Security evidence](./security.md) and [enterprise report limitations](./enterprise.md).
-- [Terminal dashboard](./tui.md), [history](./history.md), and [troubleshooting](./troubleshooting.md).
+| You want to... | Read |
+| --- | --- |
+| Search for, install, update, or remove a system package | [Packages](./packages.md) and [package search](./package-search.md) |
+| Use community build recipes on Arch | [AUR](./aur.md) |
+| Choose a runtime or install a developer tool | [Runtimes](./runtimes.md), [mise compatibility](./mise-compatibility.md), and [CLI reference](./cli.md) |
+| Run a task already defined by a project | [Task runner](./task-runner.md) |
+| Switch versions when you enter a folder | [Shell integration](./shell-integration.md) |
+| Capture, compare, or share an environment | [Workflows](./workflows.md), [portable environments](./environment-portability.md), and [team setup](./team.md) |
+| Check vulnerabilities, export an SBOM, or inspect audit records | [Security](./security.md) and [enterprise report limits](./enterprise.md) |
+| Use a container or the terminal dashboard | [Containers](./containers.md) and [dashboard](./tui.md) |
+| Investigate a failure or an earlier package change | [Troubleshooting](./troubleshooting.md), [history](./history.md), and [cache](./cache.md) |
+| Look up every command or setting | [CLI reference](./cli.md) and [configuration](./configuration.md) |
 
-## Go deeper
+## How OMG works
 
-Two tracks, depending on what you need:
-
-- **Reading and doing:** [Getting started](./getting-started.md), [quickstart](./quickstart.md), [cheat sheet](./cheatsheet.md), and the [glossary](./glossary.md) cover the everyday surface in plain language.
-- **Reasoning about behaviour:** [Under the hood](./under-the-hood.md) explains the two-process split, cache freshness, backend query paths, the AUR gates, lockfile contents, and the audit chain — the detail you want when a result is not what you expected. [Architecture](./architecture.md), [daemon](./daemon.md), [IPC](./ipc.md), and [cache](./cache.md) go one level further.
+[Under the hood](./under-the-hood.md) explains the package backends, optional daemon,
+runtime selection, AUR checks, and local audit records. For implementation details,
+read [architecture](./architecture.md), [daemon](./daemon.md), [IPC](./ipc.md), and
+[cache](./cache.md).
 
 ## Look up a command or setting
 
 - [CLI reference](./cli.md).
-- [Cheatsheet](./cheatsheet.md).
+- [Cheat sheet](./cheatsheet.md).
 - [Glossary](./glossary.md) — what every technical word in these docs means.
 - [Configuration](./configuration.md).
 - [FAQ](./faq.md).

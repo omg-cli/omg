@@ -11,7 +11,7 @@ description: Small, reviewable package and project workflows
 > New to the terminal? Read [Getting started](./getting-started.md) and keep
 > [the glossary](./glossary.md) open while you work.
 
-Examples assume a backend-compatible installation completed using the [verified installation procedure](./installation.md). They are not scripts to execute unattended on an existing machine. OMG is approaching beta; keep native recovery tools and backups while validating package changes.
+Examples assume a backend-compatible installation completed using the [verified installation procedure](./installation.md). They are not scripts to execute unattended on an existing machine. OMG is in beta; keep native recovery tools and backups while validating package changes.
 
 The common path is deliberately staged: inspect first, preview changes, then approve the mutation.
 
@@ -84,3 +84,9 @@ Coverage depends on backend and daemon availability. These collect evidence, not
 Review generated Dockerfiles, image inputs, and writable mounts before executing them. OMG's volume parser does not support a `:ro` suffix; use native engine controls when read-only mounts are required. See [containers](./containers.md).
 
 For failures, preserve the original error and records. Do not run a blanket reset, delete sockets without checking ownership, clear history, or weaken verification. See [troubleshooting](./troubleshooting.md) and [history](./history.md).
+
+## Where to go next
+
+Use [runtime management](./runtimes.md) for version selection,
+[run project tasks](./task-runner.md) for project commands, and
+[troubleshooting](./troubleshooting.md) when a step fails.

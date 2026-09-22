@@ -4,7 +4,7 @@ sidebar_position: 2
 description: A first walkthrough for people who have never used a terminal before
 ---
 
-# Getting started (no computer experience needed)
+# Getting started
 
 **In plain words:** OMG is a program you use by typing short instructions. It installs
 and updates other programs for you, and it can also choose which version of a
@@ -27,9 +27,9 @@ matches your computer.
 
 | Your computer | What OMG needs | Where to continue |
 | --- | --- | --- |
-| Mac with Apple silicon (M1, M2, M3, M4) | macOS on ARM64 | This page, then [installation](./installation.md) |
+| Mac with Apple silicon | macOS on ARM64 | This page, then [installation](./installation.md) |
 | Mac with an Intel processor | Not supported by OMG releases | Use a supported computer or a Linux virtual machine |
-| Linux, Arch-based | Arch Linux x86_64 | This page, then [installation](./installation.md) |
+| Linux, Arch Linux | Arch Linux x86_64 | This page, then [installation](./installation.md) |
 | Linux, Debian or Ubuntu | Debian or Ubuntu x86_64 | This page, then [installation](./installation.md) |
 | Linux, Fedora | Fedora x86_64 | This page, then [installation](./installation.md) |
 | Windows | OMG runs inside WSL, which is a real Linux system in Windows | [install a Linux distribution in WSL](https://learn.microsoft.com/windows/wsl/install), then follow the Linux steps |
@@ -44,8 +44,8 @@ of your Linux distribution.
 cat /etc/os-release
 ```
 
-If your system is not in the table, OMG cannot run there yet. Do not download a package
-with a similar name from another source; it would not be the same program.
+If your system is not in the table, there is no supported OMG release for it. Do not
+download a package with a similar name from another source; it may be a different program.
 
 ## Step 2: Open the terminal
 
@@ -78,8 +78,9 @@ Installing means copying the OMG program onto your computer. You need an interne
 connection for this step.
 
 The installer downloads a ready-made file, checks that the file is the one the OMG
-project published, and then copies it into a folder inside your home folder. It does not
-change system files, and it does not ask for your password.
+project published, and then copies it into a folder inside your home folder. This
+prebuilt-release path does not change system files or need an administrator password.
+The separate source-build path can offer to install missing build tools with `sudo`.
 
 **Read the script before you run it.** The first command below only downloads it, so you
 can look at it. The second command runs it.
@@ -139,8 +140,8 @@ later: nothing else on this page needs it.
 
 ## Step 4: Try commands that change nothing
 
-These commands only read information. Run them in any order. You cannot break anything
-with them.
+These commands inspect your system without installing or removing packages. Run them
+in any order.
 
 ```bash
 omg --help
@@ -170,17 +171,19 @@ be updated, and how many are no longer needed. Add `--fast` to skip the slower c
 omg search ripgrep
 ```
 
-Searches the package sources for programs whose name or description contains that word.
-`ripgrep` is a small, popular search tool, so it is a safe word to practise with. On Arch
-Linux the list includes community entries from the AUR; add `--no-aur` to leave those
-out. You can search for anything, for example `omg search chess`.
+Searches the configured package sources for matching programs. In an interactive
+terminal, OMG may offer a picker to show details for one result; that picker does not
+install it. On Arch Linux the list includes community entries from the AUR; add
+`--no-aur` to leave those out. You can search for anything, for example
+`omg search chess`.
 
 ```bash
 omg info ripgrep
 ```
 
-Shows the details of one package: its version, size, license, and dependencies (the other
-packages it needs).
+Shows details for one package. The available fields vary by package source and
+operating system. For example, a Debian lookup may show only its name, version,
+description, and whether it is installed.
 
 ```bash
 omg why ripgrep
@@ -194,8 +197,8 @@ Explains why a package is on your computer. Add `--reverse` to see what needs it
 computer. Installing changes your system. Read the output before agreeing to anything.
 If the computer is not yours, or you cannot reinstall it, skip this step.
 
-Always look before you leap. Most OMG commands accept `--dry-run`, which shows what would
-happen and changes nothing:
+Preview this installation with `--dry-run`. The `install`, `remove`, `update`, and
+`clean` commands accept this option; read each command's help before using it:
 
 ```bash
 omg install --dry-run ripgrep
@@ -214,7 +217,7 @@ of packages it wants to add before you agree.
 Now check that the program is there:
 
 ```bash
-ripgrep --version
+rg --version
 ```
 
 Finally, remove it again, because this was only practice:
@@ -224,8 +227,8 @@ omg remove --dry-run ripgrep
 omg remove ripgrep
 ```
 
-To update everything on your computer, the command is `omg update`. Preview it first with
-`omg update --check`, which only lists what would change.
+To update managed system packages and runtimes, use `omg update`. Preview available
+updates first with `omg update --check`, which only lists them.
 
 ## Step 6: Choose a version of a programming language (optional)
 
@@ -244,7 +247,7 @@ progress lines and then a message that the version is selected.
 omg which node
 ```
 
-Prints the version OMG will use when you type `node`.
+Prints the selected Node.js version. It does not print the executable path.
 
 To see what is installed, and what else is available:
 
@@ -273,7 +276,7 @@ the reason usually is.
 | What you see | What it usually means | What to do |
 | --- | --- | --- |
 | `omg: command not found` | Your computer cannot find the OMG program | Repeat the `export PATH="$HOME/.local/bin:$PATH"` line, or open a new terminal window |
-| `Permission denied` | The change needs the all-powerful account, or a file belongs to someone else | Let OMG ask for your password. Do not run OMG itself as root |
+| `Permission denied` | A system package operation needs elevation, or a file belongs to someone else | Read the full error. Let OMG request elevation for a package operation; do not run OMG itself as root or change file ownership without identifying the owner |
 | `Could not connect` or a timeout | No internet, or the package sources are unreachable | Check your internet connection, then run `omg doctor --network` |
 | `Checksum` or `attestation` failure | The downloaded file did not match the published proof | Stop. Do not try to disable the check. Report it, see below |
 | A long list of packages you did not ask for | Those are the dependencies: the packages your choice needs | Read the list. Cancel if you do not recognise the package names |

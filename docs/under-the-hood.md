@@ -192,8 +192,8 @@ Every recorded transaction is one entry in `history.json`:
 ```json
 {
   "id": "…",
-  "timestamp": 1762900000,
-  "transaction_type": "update",
+  "timestamp": "2025-11-11T19:46:40Z",
+  "transaction_type": "Update",
   "success": true,
   "changes": [
     { "name": "ripgrep", "old_version": "14.1.0", "new_version": "14.1.1", "source": "extra" }
@@ -208,11 +208,12 @@ is capped; retired entries move to a sibling `.archive.jsonl` instead of being d
 omg history --limit 5
 omg history --type update --search ripgrep --from 2026-09-01
 omg rollback 0a1b2c3d             # needs the earlier version still to be available
-omg clean --cache --dry-run       # review before removing cached packages or build output
+omg clean --cache --dry-run       # review package archive cleanup
 ```
 
-`omg clean` consults history so package versions referenced by a recent transaction
-survive cache cleanup. That is what keeps a rollback possible at all.
+On Arch, `omg clean --cache` checks the last 30 days of history and warns when
+cleanup may remove older versions used by rollback. The warning does not keep
+those archives. Keep a backup of any exact older archive you may need.
 
 **Limit:** rollback reinstalls an earlier recorded version. It needs backend support, the
 old package still being available, and a dependency set that still accepts it. It is not a
@@ -258,8 +259,10 @@ omg install ripgrep    # your shell stays unprivileged; sudo is requested at the
   issue, and a drifted `omg env check` exits non-zero. Branch on the status, not the text.
 - **`--json`** is accepted by the parser, but not every command implements a stable
   schema. Check the specific command before parsing its output.
-- **Prompt counters** read a cached snapshot. Use `omg status` for a fresh count and the
-  native tool when you need the authority.
+- **Prompt counters** use a cached snapshot when it passes validation, then take a
+  fallback path when it does not. Shell hooks can print zero for some counters
+  without a valid snapshot. Use `omg status` for a fresh count and the native
+  tool when you need the authority.
 - **Dry runs** preview a plan. They are not a safety verdict about the resulting package.
 
 ## Source map

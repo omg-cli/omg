@@ -6,21 +6,32 @@ description: What OMG adds to an Omarchy setup, and what Omarchy keeps doing its
 
 # OMG on Omarchy
 
-**In plain words:** Omarchy is one person's ready-made Arch Linux setup. This page
-explains what OMG adds to it, and what Omarchy keeps doing itself.
+**In plain words:** Omarchy is an Arch Linux setup with its own update workflow.
+This page explains where OMG can fit and which update steps should stay with Omarchy.
 
 > New to the terminal? Read [Getting started](./getting-started.md) and keep
 > [the glossary](./glossary.md) open while you work.
 
-**Safer installation defaults, with fewer security settings to assemble yourself.**
-
-OMG existed before its creator switched to Omarchy. Omarchy became his daily driver, and using it every day made the needs of people arriving from Windows and macOS particularly relevant: finding software, selecting runtimes, and understanding what an installation is allowed to do.
-
-OMG brings those tasks into one CLI. Its case for Omarchy is concrete: apply installation controls consistently so users have fewer security settings to discover and assemble themselves. Omarchy should continue to own operating-system updates, migrations, and recovery.
-
-A user should not need to remember which command disables install scripts, when to verify downloaded packages, or how to separate a tool's dependencies from the rest of the machine. OMG applies those decisions on its managed installation paths. Experienced users benefit from consistency too: the same checks run again when they install or update another tool.
+OMG can manage developer tools and AUR packages on Arch. Its managed tool installers
+apply the checks described below. Those checks do not apply to every direct use of npm,
+pip, Cargo, Go, or pacman. Omarchy should continue to own operating-system updates,
+migrations, and recovery.
 
 This is a proposal for evaluation, not an announcement of Omarchy adoption or endorsement.
+
+## Before you try an integration
+
+Use a build that includes the Arch backend. Keep Omarchy's updater as the owner of
+system upgrades. To inspect AUR updates without installing them, run:
+
+```bash
+omg update --aur-only --check
+```
+
+You should see AUR update candidates or an up-to-date message. This command skips the
+official update lane. An Omarchy integration should place `omg update --aur-only` only
+where its updater already delegates AUR work; it should retain Omarchy's surrounding
+preflight checks, migrations, snapshots, and recovery steps.
 
 ## What Omarchy already provides
 
@@ -112,7 +123,7 @@ OMG implements the following configuration support natively; these workflows do 
 
 This means users can already reuse supported parts of their mise project configuration with OMG, rather than maintaining a separate set of version pins and simple tasks. The implementation is visible in [tool-pin parsing](https://github.com/omg-cli/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/hooks/mod.rs), [task execution](https://github.com/omg-cli/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/core/task_runner.rs), and [environment resolution](https://github.com/omg-cli/omg/blob/cc67ab89541f07af7b433bf29d142a78954cd882/src/config/mise_env.rs).
 
-The compatibility boundary is specific: backend-qualified tool entries such as `github:owner/repo` are skipped by the mise pin parser. Task execution is sequential; dependency arguments/patterns, post-dependencies, file tasks, custom shells, conditions, and run/directory templates are unsupported and produce errors instead of silently losing execution controls. Environment support excludes encrypted-secret backends, per-plugin directives, YAML environment files, and full Tera templates. Applying previously ignored local and selected-environment layers changes pins, tasks, and explicit command environments, including inherited home-directory configuration for projects beneath that directory. Follow the [mise migration steps](mise-compatibility.md#migrating-existing-omg-projects) before upgrading. This is configuration compatibility, not a claim of complete mise parity or automatic reuse of mise's installed tool directories. [Runtime management](runtimes.md)
+The compatibility boundary is specific: backend-qualified tool entries such as `github:owner/repo` are skipped by the mise pin parser. Task execution is sequential; dependency arguments/patterns, post-dependencies, file tasks, custom shells, conditions, and run/directory templates are unsupported and produce errors instead of silently losing execution controls. Environment support excludes encrypted-secret backends, per-plugin directives, YAML environment files, and full Tera templates. Applying previously ignored local and selected-environment layers changes pins, tasks, and explicit command environments, including inherited home-directory configuration for projects beneath that directory. Follow [Check a project before migrating](mise-compatibility.md#check-a-project-before-migrating) before upgrading. This is configuration compatibility, not a claim of complete mise parity or automatic reuse of mise's installed tool directories. [Runtime management](runtimes.md)
 
 ## What would justify making it a default?
 

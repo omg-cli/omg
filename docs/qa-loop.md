@@ -1,13 +1,21 @@
-# QA repeat loop: pipeline files it, agents fix it, pipeline verifies it
+---
+title: QA issue loop
+sidebar_position: 65
+description: How smoke and QEMU failures become tracked issues
+---
+
+# QA issue loop
 
 > **Who this page is for:** OMG maintainers and contributors. It documents release checks and evidence.
 > It is not an everyday user guide. If you are new to OMG, start with
 > [Getting started](./getting-started.md).
 
-Three scheduled pipelines test every supported platform; one script turns
-failures into agent-actionable issues and green runs into auto-closes.
+Release smoke and the QEMU matrix produce evidence for the selected platforms.
+Trusted reporter jobs turn eligible failures into issues. A passing QEMU run
+can close an issue when a successful push to `main` tests the current commit
+and GitHub associates that commit with a pull request.
 
-## Legs (all supported platforms)
+## Execution lanes
 
 | Leg | Workflow | Distros | Trigger |
 |---|---|---|---|
@@ -19,11 +27,18 @@ failures into agent-actionable issues and green runs into auto-closes.
 Every leg uploads per-case `results.json` evidence in the same schema
 (`case_id`, `distro`, `result`, `exit_code`, `elapsed_seconds`).
 
-## Filing (nightly only, never fails the build)
+## Filing and closing issues
 
-Each workflow has a `file-issues` job (`schedule` only,
-`continue-on-error: true`) that runs `scripts/qa-file-issue.sh` per
-`results.json` with `--source qemu-matrix` or `--source release-smoke`:
+The release smoke workflow has a nightly `file-issues` job. It runs
+`scripts/qa-file-issue.sh` with `--source release-smoke --failures-only`;
+filing errors do not change the smoke result. QEMU filing runs in the separate
+`qemu-report.yml` trusted `workflow_run` workflow. That reporter validates
+completed QEMU Matrix or eligible main-branch CI evidence, then calls the
+same issue helper with `--source qemu-matrix`. It rejects pull-request
+artifacts as inputs to the privileged reporter. Local runs also use
+`--failures-only`.
+
+For both reporters:
 
 - Fingerprint is `source:distro:case` (not the verdict), carried in an
   HTML marker, so flapping verdicts update one issue instead of dupes.
@@ -34,9 +49,12 @@ Each workflow has a `file-issues` job (`schedule` only,
   scrubbed excerpts leave the machine; full logs stay in run artifacts.
 - Repeat failures while open land as comments (with a fresh excerpt);
   a recurrence after a close files a follow-up linking the closed issue.
-- Cases reporting `PASS`/`EXPECTED_REJECTION` in a run **close** their
-  open issue (comment + close), scoped strictly to cases present in that
-  run's input — one distro's run never closes another's issues.
+- Cases reporting `PASS`/`EXPECTED_REJECTION` close an open issue only
+  when the trusted QEMU reporter verifies a successful current-`main` push,
+  finds an associated pull request, and passes `--fixed-by-pr N`. A local pass, a
+  direct push without an associated PR, and a scheduled or dispatched
+  published-release run leave the issue open. Closure covers only cases
+  present in that input; one distro's run cannot close another's issues.
 - Schema violations fail closed before any `gh` mutation; `--dry-run`
   plans creates/comments/closes without mutating.
 
@@ -58,9 +76,10 @@ setup gets a sanitized fallback record when no harness results exist.
    case, distro, excerpt, evidence paths, rerun command.
 2. Repro with the runbook command (same release tag as the linked run).
 3. Fix, land the change through the normal PR/CI path.
-4. Do nothing else: the next scheduled run comments and closes the issue
-   on green, or appends a fresh excerpt on red. If it regresses later, a
-   follow-up issue links back here.
+4. Do nothing else: a later passing run of that commit on `main`
+   comments and closes the issue, or a red run appends a fresh excerpt.
+   A local pass does not close it. If it regresses later, a follow-up
+   issue links back here.
 
 ## What the loop cannot cover (by design)
 
@@ -82,3 +101,9 @@ setup gets a sanitized fallback record when no harness results exist.
 - Create the `qa-failure` label.
 - Add the `OMG_SMOKE_SENTRY_DSN` secret (smoke Sentry reporting; absence
   is a visible notice, not a silent no-op).
+
+## Where to go next
+
+- [Local QA pipeline](./qemu-local.md) gives commands and evidence paths.
+- [Release operations](./release-operations.md) covers publication gates.
+- [Troubleshooting](./troubleshooting.md) explains what to include in a failure report.

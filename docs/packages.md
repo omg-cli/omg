@@ -1,454 +1,138 @@
 ---
-title: Package Management
+title: Package management
 sidebar_position: 10
-description: Search, install, update, and remove packages
+description: Search, install, update, remove, and clean packages on a supported system
 ---
 
-# Package Management
+# Package management
 
-**In plain words:** Packages are the programs installed on your computer. This page shows how to search for them, install them, update them, and remove them, and what a preview does not promise.
+OMG works with the package system for your operating system. This page shows the common commands and explains where behavior depends on the backend. A package is software installed through that system. Start with [getting started](./getting-started.md) if you have not used a terminal before.
 
-> New to the terminal? Read [Getting started](./getting-started.md) and keep
-> [the glossary](./glossary.md) open while you work.
+## What you need first
 
-**Complete Guide to Searching, Installing, and Managing Packages**
+- A [supported backend and build](./installation.md). Arch supports official repositories and the Arch User Repository (AUR). Debian and Ubuntu use APT, Fedora uses DNF, and macOS uses Homebrew. Native Windows has no backend.
+- Permission to install or remove software. Run `omg` as your regular user; it asks for elevation when a system transaction needs it.
 
-OMG has supported backends for Arch, Debian/Ubuntu, Fedora, and macOS, with platform-specific coverage and limitations. AUR support is Arch-specific. Release availability and backend limitations are listed in [installation](./installation.md).
+| System | Package source | Important limit |
+| --- | --- | --- |
+| Arch Linux | Official repositories and AUR | AUR recipes need review and a build. Arch has the broadest package workflow. |
+| Debian or Ubuntu | APT | No AUR. Cache cleanup is not implemented in the APT backend. |
+| Fedora | DNF and RPM | No AUR. Some audit and rollback features have separate backend limits. |
+| Apple Silicon macOS | Homebrew | No AUR. The published macOS release targets ARM64. |
+| Windows | None natively | Use a supported Linux distribution inside WSL. |
 
----
+Published Linux release archives are backend-specific and target x86_64.
+See [installation](./installation.md) for build features, system dependencies,
+and the release matrix. The `debian-pure` feature is for index and test work;
+it refuses live Debian or Ubuntu package mutations.
 
-## Overview
-
-OMG's package management features:
-
-- **Daemon-backed searches** with [artifact-specific benchmark evidence](../benchmarks/README.md)
-- **Unified AUR integration** — no separate AUR helper needed — see [AUR Support](./aur.md)
-- **Security grading** — source/advisory classification, not a safety certification
-- **Policy enforcement** — local configured rules with backend-specific coverage
-- **Transaction history** — recorded operations where supported and enabled; rollback has backend and artifact limits
-
----
-
-## Package Search
-
-### Basic Search
+## Find a package
 
 ```bash
-# Search all repositories (official + AUR)
-omg search vim
-
-# Limit results
-omg search vim --limit 10
-
-# Detailed results with votes/popularity where available
-omg search visual-studio-code -d
-
-# Skip community sources, official repos only
-omg search --no-aur firefox
+omg search ripgrep
 ```
 
-### Search Performance
-
-Use the [benchmark records](../benchmarks/README.md) for artifact-specific measurements. Query, sources, backend, and cache state must match before comparing timings.
-
-### Fuzzy Matching
-
-OMG uses Nucleo for intelligent fuzzy matching:
+The default result limit is 15. On Arch, search also queries the AUR unless you pass `--no-aur`. A result is a name and source match, not a safety verdict. An attended terminal offers a picker to open a result's details. It does not install the selected package.
 
 ```bash
-omg search frfx
-# Finds: firefox, firefox-developer-edition
-
-omg search vsc
-# Finds: visual-studio-code-bin, vscodium-bin
+omg search ripgrep --no-aur --limit 30
+omg info ripgrep
+omg why ripgrep
+omg outdated
 ```
 
----
+See [package search](./package-search.md) for ranking, JSON output, and network limits. `omg info` shows the fields available from that source; it does not promise the same metadata on every backend.
 
-## Package Installation
+## Preview and install
 
-### Install Packages
+`omg install` changes your package database and may install other packages that the requested package needs. Review the preview before the transaction.
 
 ```bash
-# Install single package
-omg install firefox
-
-# Install multiple packages
-omg install firefox chromium brave-bin
-
-# Install AUR package (auto-detected)
-omg install visual-studio-code-bin
-
-# Install a package (dependency marking is handled by the backend)
-omg install libfoo
+omg install --dry-run ripgrep
 ```
-
-### Installation Lifecycle
-
-1. **Security Analysis**: Every package is evaluated against the system's security criteria and assigned a grade.
-2. **Policy Validation**: The system checks the package against defined rules, ensuring it meets organizational or user-set standards.
-3. **Conflict Resolution**: Dependencies are mapped and resolved, ensuring that all required components are available.
-4. **Download & Integrity**: Artifacts are retrieved over secure channels and verified using cryptographic signatures and hashes.
-5. **Integration**: Official packages are integrated through the system backend, while custom sources are prepared and deployed efficiently.
-6. **Audit Recording**: The entire transaction is logged to the history database for future reference or rollback.
-
-### AUR Build Options
-
-Configure in `~/.config/omg/config.toml`:
-
-```toml
-[aur]
-# Parallel build jobs
-build_concurrency = 8
-
-# makepkg flags
-makeflags = "-j8"
-
-# Cache built packages
-cache_builds = true
-
-# Use ccache for C/C++
-enable_ccache = true
-
-# Use sccache for Rust
-enable_sccache = false
-```
-
----
-
-## Package Removal
-
-### Remove Packages
 
 ```bash
-# Remove single package
-omg remove firefox
-
-# Remove with orphaned dependencies
-omg remove firefox -r  # Arch backend only
-
-# Remove multiple packages
-omg remove pkg1 pkg2 pkg3
+omg install ripgrep
 ```
 
-### Safety Features
+You can name multiple packages. With no name, `omg install` opens a package picker in an attended terminal and requires you to select one package. It fails when there is no terminal. `--yes` skips the normal confirmation; it does not choose a package or bypass separate AUR approval. Installing a local archive requires `--allow-local-file` in addition to the archive path.
 
-- Confirms before removing packages
-- Won't remove system dependencies
-- Warns about dependent packages
+On Arch, an AUR package goes through the [AUR build and review](./aur.md). An official package follows the selected native backend. OMG applies its configured [security policy](./security.md) before supported install paths, but a grade does not certify that a package is safe.
+Use `omg config path` to find your configuration file. See
+[configuration](./configuration.md) for AUR settings and policy keys.
 
----
+## Check and apply updates
 
-## System Updates
-
-### Update Packages
+`omg update` can change many packages and runtimes. Check what is available first.
 
 ```bash
-# Update everything (official + AUR)
-omg update
-
-# Check for updates without installing
 omg update --check
 ```
 
-### Update Flow
-
-1. **Database Sync** — Fresh package lists
-2. **Official Updates** — Via pacman
-3. **AUR Updates** — Parallel builds
-4. **History Recording** — All changes logged
-
-### Selective Updates
-
 ```bash
-# Update specific package
-omg install firefox  # Re-installing updates if newer
-
-# Update official only (traditional pacman)
-sudo pacman -Syu
+omg update --dry-run
 ```
 
----
-
-## ℹ️ Package Information
-
-### Get Package Details
-
 ```bash
-omg info firefox
+omg update
 ```
 
-**Output includes:**
+The normal Arch path handles official packages and installed AUR packages. `--aur-only` updates AUR packages without an official database sync or system upgrade. It conflicts with `--fast` and `--turbo`. `--no-sync` uses cached package metadata, `--fast` combines sync and upgrade without a preview, and `--turbo` skips sync and uses cached data. Read the [CLI reference](./cli.md#omg-update) and any backend warning before using these modes.
 
-- Name and version
-- Description
-- Repository (official/AUR)
-- Dependencies and optional dependencies
-- Installed files count
-- Security grade
-- Installation status
+## Remove a package
 
-### Performance
-
-Info-query timings depend on backend, cache state, and remote metadata. Search benchmarks do not establish info-query latency.
-
----
-
-## Package Listings
-
-### Explicitly Installed Packages
+Removal changes the installed package set. Preview it first.
 
 ```bash
-# List all explicit packages
-omg explicit
-
-# Count only
-omg explicit --count
+omg remove --dry-run ripgrep
 ```
 
-### System Status
+```bash
+omg remove ripgrep
+```
+
+`omg remove --recursive ripgrep` also removes unused dependencies on the Arch backend. Other backends do not promise that behavior. The native package system decides whether a dependency conflict blocks removal.
+
+## Inspect counts and clean up
 
 ```bash
 omg status
+omg explicit
+omg explicit --count
+omg clean
 ```
 
-Shows:
-
-- Total packages
-- Explicit packages
-- Orphaned packages
-- Updates available
-- Vulnerabilities
-
----
-
-## Cleanup
-
-### Clean Caches
+Bare `omg clean` shows available cleanup actions. Cleanup can remove package archives needed for rollback, so preview the chosen action first.
 
 ```bash
-# Remove orphaned packages
-omg clean --orphans
-
-# Clear package cache
-omg clean --cache
-
-# Clear AUR build cache
-omg clean --aur
-
-# Full cleanup
-omg clean --all
+omg clean --cache --dry-run
+omg clean --orphans --dry-run
 ```
 
-### Sync Databases
+On Arch, `--cache` keeps one recent package version by default and warns when recent history refers to versions that cleanup may remove. The warning does not preserve those versions. `--aur` removes AUR build directories and `--all` combines orphan, cache, and AUR cleanup. The APT backend supports orphan cleanup but rejects `--cache`, `--aur`, and `--all`. Fedora supports orphan and downloaded package cache cleanup, but has no AUR cleanup. See [caching](./cache.md) and [history](./history.md) before deleting artifacts.
+
+`omg sync` refreshes package database metadata. It does not install updates.
+
+## History and recovery
 
 ```bash
-omg sync
-```
-
----
-
-## Security Features
-
-### Security Grades
-
-Policy grades describe classification, not a guarantee of package safety or an independent signature receipt. Core package names do not establish SLSA provenance. See [security grades](./security.md#security-grades):
-
-| Grade | Meaning | Examples |
-| ------- | --------- | ---------- |
-| **LOCKED** | Policy enum value, not an established SLSA level | Not assigned by current source classification |
-| **VERIFIED** | Official repository source classification | Official repo packages |
-| **COMMUNITY** | AUR/unsigned | AUR packages |
-| **RISK** | Known vulnerabilities | CVE-affected packages |
-
-### Policy Enforcement
-
-Create `~/.config/omg/policy.toml`:
-
-```toml
-# Minimum grade required
-minimum_grade = "Verified"
-
-# Allow AUR packages
-allow_aur = true
-
-# Require PGP signatures
-require_pgp = false
-
-# Allowed licenses (SPDX)
-allowed_licenses = ["Apache-2.0", "MIT"]
-
-# Banned packages
-banned_packages = ["some-bad-pkg"]
-```
-
-### Vulnerability Checking
-
-OMG checks installed packages against:
-
-- **Arch Linux Security Advisory (ALSA)**
-- **OSV.dev global database**
-
-Run audit:
-
-```bash
-omg audit
-```
-
----
-
-## Transaction History
-
-### View History
-
-```bash
-# Recent transactions
-omg history
-
-# Last 5 transactions
 omg history --limit 5
 ```
 
-### Rollback
+OMG records supported transactions, but the log is not a record of every native package manager action. `omg rollback` can reverse some recorded changes if the backend and exact older packages are available. It is not a machine backup. Read [history and rollback](./history.md) before using it.
 
-```bash
-# Interactive rollback
-omg rollback
+## If something goes wrong
 
-# Rollback specific transaction
-omg rollback <transaction-id>
-```
+| What you see | What to do |
+| --- | --- |
+| No search results | Check spelling and source configuration. Refresh metadata with `omg sync`, then try the native package tool. |
+| An AUR build fails | Keep the error output. Check [AUR troubleshooting](./aur.md#if-something-goes-wrong) before changing build settings. |
+| A permission or daemon error | Run `omg doctor` and read [troubleshooting](./troubleshooting.md). Do not run the AUR build as root. |
+| A cleanup option is rejected | Check this page's backend limits and `omg clean --help`. |
 
-**Rollback Constraints:**
+## Where to go next
 
-- Official packages restore from package cache; AUR packages rebuild from recorded git commits
-- Requires cached archives or accessible remote sources
-- May have dependency conflicts if system libraries have changed
-
----
-
-## Mirror Management
-
-### Pacman Mirrors
-
-OMG uses system pacman mirrors. Configure in `/etc/pacman.d/mirrorlist`.
-
-### AUR Source
-
-Default AUR endpoint: `https://aur.archlinux.org`
-
----
-
-## Performance Tips
-
-### 1. Use the Daemon
-
-```bash
-# Start daemon for cache
-omg daemon
-
-# Verify it's running
-omg status
-```
-
-### 2. Use prompt counters in scripts
-
-```bash
-# Ultra-fast package count
-omg ec  # Explicit count
-omg tc  # Total count
-```
-
-### 3. Batch Operations
-
-```bash
-# Install multiple at once
-omg install pkg1 pkg2 pkg3
-
-# Rather than individual commands
-omg install pkg1
-omg install pkg2
-omg install pkg3
-```
-
----
-
-## Platform Support
-
-### Backend and release matrix
-
-| Host or backend | Build feature | Package source | Documented coverage and limits |
-| --- | --- | --- | --- |
-| Arch Linux | `arch` (the default) | libalpm plus the AUR | The broadest package surface, including AUR build, review, policy, and rollback workflows. |
-| Debian or Ubuntu | `debian` | Native APT database and packages | Native APT operations; no AUR. Build with `libapt-pkg-dev`, `clang`, `cmake`, `pkg-config`, and OpenSSL development headers. |
-| Fedora | `fedora` | DNF/RPM | RPM database reads and DNF-backed operations. Fedora release evidence does not establish compatibility with every RHEL derivative. |
-| Apple Silicon macOS | `macos` | Homebrew | Homebrew-backed package operations. The published macOS release is ARM64; Intel macOS is not a supported release target. |
-| Debian index/test build | `debian-pure` | Pure-Rust Debian index | Read/index fixtures only. It refuses live Debian/Ubuntu mutations; use the `debian` APT-backed build for a real machine. |
-| Windows | none | none | Native Windows has no backend or release. Use a supported Linux distribution inside WSL; WSL uses that guest's backend. |
-
-Published Linux archives are x86_64 and backend-specific. The published macOS archive is Apple Silicon ARM64. Linux ARM64 builds are staged test artifacts rather than published release archives. Runtime managers also have provider-specific host limits, so a package backend being available does not guarantee identical runtime or audit coverage.
-
-Build a backend explicitly from a reviewed checkout:
-
-```bash
-cargo build --release --locked --no-default-features --features arch,pgp,license
-cargo build --release --locked --no-default-features --features debian,pgp,license
-cargo build --release --locked --no-default-features --features fedora,pgp,license
-cargo build --release --locked --no-default-features --features macos,pgp,license
-# Index/test fixtures only; this build refuses live Debian/Ubuntu mutations.
-cargo build --release --locked --no-default-features --features debian-pure,pgp,license
-```
-
-Cargo features are additive; `--features debian` does not remove the default Arch backend unless `--no-default-features` is also supplied. `debian-pure` is not a live package backend and must not be used as a release build. The optional `license` feature gates only the `omg account` subcommand. See [installation](./installation.md) for system prerequisites and release artifact provenance.
-
----
-
-## Troubleshooting
-
-### Search Returns Nothing
-
-```bash
-# Sync databases
-omg sync
-
-# Restart daemon
-pkill omgd && omg daemon
-
-# Try direct
-pacman -Ss <query>
-```
-
-### AUR Build Fails
-
-```bash
-# Check base-devel
-pacman -Q base-devel
-
-# Clear cache and retry
-omg clean --aur
-omg install <package>
-
-# Check logs
-cat ~/.cache/omg/logs/*.log
-```
-
-### Permission Denied
-
-```bash
-# AUR builds shouldn't need sudo
-# Official installs prompt for sudo
-
-# If socket issues
-ls -la $XDG_RUNTIME_DIR/omg.sock
-```
-
----
-
-## See Also
-
-- [CLI Reference](./cli.md) — All package commands
-- [Security & Compliance](./security.md) — Security grading details
-- [Configuration](./configuration.md) — Policy configuration
-- [History & Rollback](./history.md) — Transaction management
-- [Integrations](./integrations.md) — Using OMG with fzf, ripgrep, and other tools
-- [Troubleshooting](./troubleshooting.md) — Common package management issues
+- [CLI reference](./cli.md) lists every package option.
+- [AUR support](./aur.md) explains community builds and approvals.
+- [History and rollback](./history.md) explains what recovery requires.
+- [Troubleshooting](./troubleshooting.md) shows how to report a failed command.

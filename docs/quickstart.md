@@ -6,7 +6,7 @@ description: Choose a runtime for a project, run one of its tasks, and record th
 
 # Run a project with OMG
 
-**In plain words:** This page takes you from a finished installation to running one command in one of your own projects. It does not install system packages, and it does not change anything you cannot undo.
+**In plain words:** This page takes you from a finished installation to running a task in one of your own projects. It does not install system packages. It can download Node.js and write an environment record in the project folder.
 
 This page shows you how to use OMG with a Node.js project you already have. You will choose the version of Node.js the project uses, run one of the project's own tasks, and save a record of the environment. You will not install system packages here.
 
@@ -14,7 +14,7 @@ This page shows you how to use OMG with a Node.js project you already have. You 
 
 Two things to know before you start:
 
-- **OMG is approaching beta.** Its makers still change how it behaves.
+- **OMG is in beta.** Its makers still change how it behaves.
 - **Project tasks run code from your project folder.** Use a project you trust, and use a machine you can reinstall if you later change system packages.
 
 ## What you need first
@@ -53,7 +53,7 @@ omg use node 22
 omg which node
 ```
 
-**What you should see:** the first command switches Node.js to version 22, or installs it first if it is missing. The second prints the version that is active now, starting with the word `node`.
+**What you should see:** the first command selects a Node.js 22 release, or installs one first if needed. The second prints the selected version, starting with the word `node`. It does not print the executable path.
 
 Choose a version your project actually supports. Do not change the project's version requirement just to match this example. To let OMG read an existing project version file instead, run `omg use node` without a version number. [Runtime management](./runtimes.md) lists the supported files and their order.
 
@@ -142,22 +142,21 @@ The steps above are short on purpose. Here is what each one did on your behalf, 
 what you need when the result is not what you expected.
 
 ```bash
-omg which node    # prints the concrete version directory that will be used, not a symlink name
+omg which node    # prints the selected Node.js version
 ```
 
 - **Runtime selection.** `omg use node 22` resolves a version request against the versions
   already installed; if the version is missing it downloads the official release, verifies
   it, extracts it under `versions/node/<version>` in your data directory, and updates the
-  `current` link. `omg which node` then reports the resolved directory. When a project pin
+  `current` link. `omg which node` then reports the selected version. When a project pin
   exists (`.node-version`, `.nvmrc`, `package.json`, `.tool-versions`), the shell hook
-  prepends that concrete version directory to `PATH` when you enter the folder, which is why
-  the pin wins over whatever you selected globally.
-- **Task execution.** `omg run build` inspects the files in the current directory, decides
-  which ecosystem owns the task name, and executes that ecosystem's runner. When several
-  projects could own a name, the weighted priority decides (Rust 100, Node/Bun/Deno 90,
-  Python 80, Go 75, Ruby 70, Java 60, PHP 50, mise 45, Make 40); `--using <ecosystem>`
-  overrides it and `--all` runs every detected project. Arguments after `--` are passed to
-  the underlying tool untouched.
+  selects the project's installed version when you enter the folder. The hook does not
+  download a missing version.
+- **Task execution.** `omg run build` inspects the current directory, chooses a task
+  runner, and runs that project's command. If several runners define the same task,
+  use `--using <ecosystem>` to choose one or `--all` to run each detected match.
+  Arguments after `--` go to the underlying task. See [task runner](./task-runner.md)
+  for detection rules and precedence.
 - **Environment record.** `omg env capture` probes the registered runtimes and tools,
   collects the explicitly installed packages from your backend, normalizes both lists, and
   stores them with a schema version, a timestamp, and a SHA-256 fingerprint in `omg.lock`.

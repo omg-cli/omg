@@ -12,9 +12,9 @@ repeat commands answer faster. It is optional: OMG works without it.
 > New to the terminal? Read [Getting started](./getting-started.md) and keep
 > [the glossary](./glossary.md) open while you work.
 
-The daemon owns one thing: derived state that is expensive to rebuild. Package queries and
-mutations have direct backend paths, so a stopped daemon costs latency, not capability.
-Everything it holds can be rebuilt from the native package databases.
+The daemon keeps derived package and status data warm for repeated queries. Package
+transactions run through the CLI and its selected backend. Most commands still work
+without `omgd`; the daemon-backed metrics command is an exception.
 
 ```bash
 omg daemon                  # start it detached in the background
@@ -27,10 +27,11 @@ omg daemon-status           # resolved socket, ownership, and whether a process 
 | Command | Without a running daemon |
 | :--- | :--- |
 | `omg search`, `omg info`, `omg install`, `omg update`, `omg remove` | Work through the direct backend path |
-| `omg ec`, `omg tc`, `omg oc`, `omg uc` | Work: they read the status snapshot file rather than asking the daemon |
+| `omg ec`, `omg tc`, `omg oc`, `omg uc` | Work: use a fresh status file when available, then the daemon or direct package data |
 | `omg audit scan` | Works through a direct cold scan; the daemon path reuses warm package and vulnerability state |
-| Unix SOC 2 export, `omg metrics` | Fail explicitly; these are daemon-backed |
-| `omg audit sbom` | Requires the Arch backend and advisory access independently of daemon state |
+| Unix SOC 2 export | Runs its vulnerability scan directly if the daemon is unavailable; it still needs a supported system SBOM backend |
+| `omg metrics` | Fails explicitly; it is daemon-backed |
+| `omg audit sbom` | Works with a supported system inventory and advisory source independently of daemon state (Arch, Debian, Ubuntu, or Fedora) |
 
 ## Startup, one instance at a time
 
@@ -70,8 +71,9 @@ frame format and the message families.
 - **Binary status snapshot:** the fixed 32-byte record read by the prompt counters. See
   [cache](./cache.md) for its layout and freshness rule.
 
-**Limit:** all of this is derived. Stopping or killing the daemon cannot corrupt a package
-transaction, and it never rewrites history or the audit log, which are separate owners.
+**Limit:** all cached package and status state is derived. The daemon does not own package
+transactions or transaction history. It can append best-effort security events to the audit
+log; see [security](./security.md#audit-logging) for what that log proves.
 
 ## Background refresh
 
@@ -92,7 +94,7 @@ does not block other callers. Requests route by kind:
 
 | Kind | Handled by |
 | :--- | :--- |
-| Package operations | The official repository or AUR backend for this system |
+| Package queries | The in-memory index or selected package backend |
 | Security work | The vulnerability and policy engines |
 | Status and counts | The in-memory cache, or the native state when the cache is cold |
 
@@ -101,8 +103,8 @@ can tell "nothing matched" apart from "the answer never arrived".
 
 ## Shutdown and failure behaviour
 
-- **Signals.** On SIGINT or SIGTERM the daemon stops accepting connections, lets in-flight
-  requests finish, stops its workers, writes its final snapshot, and removes the socket file.
+- **Signals.** On SIGINT or SIGTERM the daemon stops accepting connections, cancels background
+  work, and gives owned tasks up to 30 seconds to finish. It then removes the socket file.
 - **Interrupted refresh.** A failed refresh leaves the previous snapshot in place and the next
   pass retries. A missing or stale snapshot only changes which path a caller takes.
 - **No network.** Daemon-served queries then answer from the in-memory index and the native
