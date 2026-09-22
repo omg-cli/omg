@@ -280,7 +280,7 @@ cleanup() {
   timeout --kill-after=2s 12s env OMG_SMOKE_RELEASE="$tag" OMG_SMOKE_ENVIRONMENT=qemu-matrix "$repo_root/scripts/report-smoke-sentry.sh" "$report_input" > "$work/reporting.log" 2>&1 || reporting_rc=$?
   jq -n --argjson exit_code "$reporting_rc" '{exit_code:$exit_code}' > "$work/reporting-status.json"
   overall_result=$result
-  if [[ "$inventory_product_failure" == true ]]; then
+  if [[ "$result" == PASS && "$inventory_product_failure" == true ]]; then
     overall_result=PRODUCT_FAIL
   fi
   printf '%s lifecycle=%s overall=%s. Evidence: %s\n' "$distro" "$result" "$overall_result" "$work"

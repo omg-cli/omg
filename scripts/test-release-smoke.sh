@@ -788,6 +788,8 @@ case "$1" in
       *) exit 2 ;;
     esac
     ;;
+  update-standard-sync) printf 'Update\nSynced package catalogs\nSystem is up to date\n' ;;
+  update-standard-cached) printf 'Update\nChecking for updates · cached\nSystem is up to date\n' ;;
   *) exit 2 ;;
 esac
 EOF
@@ -849,8 +851,8 @@ run_inventory update-modes 0 \
 inv_verdict update-modes update-fast PASS
 inv_verdict update-modes update-turbo PASS
 run_inventory update-mode-lies 1 \
-  "$(inv_row update-fast '["json"]' 0 - update-fast-output package-mutation)" \
-  "$(inv_row update-turbo '["json"]' 0 - update-turbo-output package-mutation)"
+  "$(inv_row update-fast '["update-standard-sync"]' 0 - update-fast-output package-mutation)" \
+  "$(inv_row update-turbo '["update-standard-cached"]' 0 - update-turbo-output package-mutation)"
 inv_verdict update-mode-lies update-fast FAIL
 inv_verdict update-mode-lies update-turbo FAIL
 mkdir -p "$scratch/inventory-home"
