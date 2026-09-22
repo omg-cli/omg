@@ -726,7 +726,15 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # Put the supervisor AND its receipt inside the namespace. A namespace
     # setup failure must be a transport/harness error, never an expected CLI
     # refusal. Drop back to the SSH user before creating fixtures or running OMG.
-    remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+    if [[ "$case" == update-turbo ]]; then
+      # A real cached upgrade must retain package-manager privileges. Running
+      # the complete CLI as root inside the isolated namespace proves the
+      # transaction path without allowing repository egress; separate rows
+      # cover unprivileged elevation and refusal behavior.
+      remote="sudo -n unshare --net -- env HOME=\"\$HOME\" USER=root LOGNAME=root $remote"
+    else
+      remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+    fi
   fi
   start=$SECONDS
   transport=0
