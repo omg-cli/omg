@@ -28,9 +28,9 @@
 # - "native": Direct builds (fast, less secure)
 #build_method = "bubblewrap"
 
-# Maximum concurrent AUR builds (default: number of CPU cores)
+# Maximum concurrent AUR builds (default: 1; max: 8)
 # Adjust based on available RAM (each build can use 1-2GB)
-#build_concurrency = 8
+#build_concurrency = 4
 
 # Require interactive PKGBUILD review before building (default: true)
 # Disable only for CI that accepts unreviewed AUR code (`aur.review_pkgbuild = false`), or:
@@ -91,7 +91,7 @@
 # Retains the default sandbox and review settings:
 #
 # [aur]
-# build_concurrency = 16
+# build_concurrency = 8
 # cache_builds = true
 # enable_ccache = true
 

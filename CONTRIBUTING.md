@@ -19,7 +19,7 @@ Start with a reproducible bug, a focused improvement, or a documentation correct
 
 ```bash
 # Clone the repository
-git clone https://github.com/PyRo1121/omg.git
+git clone https://github.com/omg-cli/omg.git
 cd omg
 
 # Check your toolchain meets MSRV 1.95.0
@@ -64,7 +64,6 @@ omg/
 │   ├── core/
 │   │   ├── types.rs        # Shared types
 │   │   ├── error.rs        # Error handling
-│   │   ├── database.rs     # redb wrapper
 │   │   ├── client.rs       # Daemon IPC client
 │   │   ├── http.rs         # HTTP client utilities
 │   │   └── paths.rs        # Path helpers
@@ -77,6 +76,8 @@ omg/
 │   │   ├── alpm_ops.rs     # Direct ALPM operations
 │   │   ├── aur.rs          # AUR client
 │   │   ├── debian.rs       # APT integration
+│   │   ├── dnf.rs          # RPM/DNF integration
+│   │   ├── homebrew.rs     # macOS Homebrew integration
 │   │   └── types.rs        # Package types
 │   ├── runtimes/
 │   │   ├── node.rs         # Node.js/npm
@@ -85,7 +86,14 @@ omg/
 │   │   ├── rust.rs         # Cargo
 │   │   ├── ruby.rs         # Gems
 │   │   ├── java.rs         # Maven/Gradle
-│   │   └── bun.rs          # Bun runtime
+│   │   ├── bun.rs          # Bun runtime
+│   │   ├── pi.rs           # Pi runtime
+│   │   ├── deno.rs         # Deno runtime
+│   │   ├── zig.rs          # Zig toolchain
+│   │   ├── dotnet.rs       # .NET SDK
+│   │   ├── erlang.rs       # Erlang/OTP
+│   │   ├── php.rs          # PHP runtime
+│   │   └── swift.rs        # Swift toolchain
 │   └── config/
 │       └── settings.rs     # Configuration
 ├── tests/                  # Integration tests
@@ -138,8 +146,8 @@ GitHub's Quick Gate invokes the quick target once; do not repeat its formatting,
 Do not run `cargo clippy --all-targets --all-features` on Arch. That command enables incompatible native package-manager bindings.
 
 **Key clippy rules we follow:**
-- No `as any`, `@ts-ignore`, or type error suppression
-- No `.unwrap()` in production code (use `.expect()` with context)
+- Deny warnings in CI: code must compile warning-free under target platform features
+- No `.unwrap()` in production code (use `.expect()` with context or `?`)
 - Prefer `Arc` over `Clone` for large types in async contexts
 - Use `Cow<str>` for conditional ownership
 
@@ -247,10 +255,10 @@ pub fn shared_client() -> &'static Client {
 cargo test --features arch
 
 # Run specific test
-cargo test --features arch test_database_open
+cargo test --features arch test_validate_build_concurrency
 
 # Run tests in a module
-cargo test --features arch core::database::tests
+cargo test --features arch core::fast_status::tests
 
 # Show test output
 cargo test --features arch -- --nocapture
@@ -270,10 +278,10 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_database_open() {
-        let temp_dir = TempDir::new().unwrap();
-        let db = Database::open(temp_dir.path().join("test.db"));
-        assert!(db.is_ok());
+    fn test_validate_build_concurrency() {
+        assert!(validate_build_concurrency(1).is_ok());
+        assert!(validate_build_concurrency(8).is_ok());
+        assert!(validate_build_concurrency(0).is_err());
     }
 
     #[tokio::test]
@@ -568,9 +576,8 @@ Every contribution makes OMG better. Whether it's code, documentation, bug repor
   full commit `rev` for supply-chain integrity. Updates require a deliberate
   rev bump applied to **all five entries together** (they come from the same
   repo commit), plus a lockfile review.
-- **sequoia-openpgp** is intentionally a pre-release (PQC) build with
-  `allow-experimental-crypto` / `allow-variable-time-crypto`. This is
-  acceptable because OMG uses it only for public-key **signature
+- **sequoia-openpgp** tracks the stable 2.x line with `allow-experimental-crypto`.
+  This is acceptable because OMG uses it only for public-key **signature
   verification**, never private-key decryption.
 - The MSRV is pinned in `rust-toolchain.toml`, `package.rust-version`, and CI;
   all three must move together.

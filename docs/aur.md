@@ -88,7 +88,7 @@ Add these to your `~/.config/omg/config.toml`:
 # Build isolation (default: "bubblewrap"); "chroot" or "native"
 build_method = "bubblewrap"
 
-# Maximum concurrent AUR builds (default: CPU count)
+# Maximum concurrent AUR builds (default: 1)
 build_concurrency = 4
 
 # Require interactive PKGBUILD review before building (default: true)

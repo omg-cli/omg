@@ -225,7 +225,7 @@ If a published release is (or may be) compromised, follow this runbook.
 
 ### Assessment
 
-4. Determine blast radius: compare attestation provenance (`gh attestation verify … -R PyRo1121/omg`) and checksums for every published archive against the CI-generated artifacts (upload artifacts in the release run, plus `attest-build-provenance` records).
+4. Determine blast radius: compare attestation provenance (`gh attestation verify … -R omg-cli/omg`) and checksums for every published archive against the CI-generated artifacts (upload artifacts in the release run, plus `attest-build-provenance` records).
 5. If CI itself is suspect, review workflow diffs, runner logs, and the vendored npm lockfile integrity (`.github/deps/release-tools/package-lock.json` has registered integrity hashes for every transitive dependency).
 
 ### Recovery
@@ -254,7 +254,7 @@ Current implementation details are documented in [the security reference](docs/s
 
 Release installation requires GitHub CLI (`gh`) verification of the archive's
 attestation against the requested tag and `.github/workflows/release.yml` in
-`PyRo1121/omg`. A missing verifier or rejected attestation stops the installer.
+`omg-cli/omg` (with legacy releases `<= v0.1.221` signed under `PyRo1121/omg`). A missing verifier or rejected attestation stops the installer.
 Source builds require explicitly running a checked-out `install.sh --from-source`;
 piped execution never builds the current directory. The initial bootstrap script
 is executable code: fetching it from mutable `main` trusts the repository owner

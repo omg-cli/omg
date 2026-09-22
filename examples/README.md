@@ -90,7 +90,7 @@ This directory contains example configuration files to help you get started with
 ```toml
 [aur]
 build_method = "native"
-build_concurrency = 16
+build_concurrency = 8
 cache_builds = true
 enable_ccache = true
 enable_sccache = true
@@ -132,8 +132,6 @@ require_pgp = true
 
 **config.toml:**
 ```toml
-data_dir = "/opt/omg"
-auto_update = false
 telemetry_enabled = false
 
 [aur]
@@ -164,18 +162,11 @@ Or use environment variable:
 export OMG_TELEMETRY=0
 ```
 
-### Change Default Shell
+### Shell Hook Integration
 
-```toml
-# config.toml
-default_shell = "bash"  # or "zsh", "fish", "powershell"
-```
-
-### Use Shims Instead of PATH
-
-```toml
-# config.toml
-shims_enabled = true
+Add the hook to your shell configuration (`~/.bashrc`, `~/.zshrc`, etc.):
+```bash
+eval "$(omg hook bash)"
 ```
 
 ### Restrict to Official Packages Only
@@ -303,6 +294,6 @@ Found a useful configuration pattern? Share it!
 
 1. Add your example to this directory
 2. Document the use case
-3. Submit a PR to `https://github.com/PyRo1121/omg`
+3. Submit a PR to `https://github.com/omg-cli/omg`
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for details.
