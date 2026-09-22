@@ -1,7 +1,7 @@
 //! Security audit command implementations
 //!
 //! Provides CLI handlers for vulnerability scanning, SBOM generation, secret detection,
-//! license compliance, SLSA verification, and audit log management.
+//! license compliance, artifact-signature verification, and audit log management.
 
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
@@ -57,11 +57,16 @@ impl LocalCommandRunner for AuditCommands {
             ui::print_spacer();
         }
         match self {
-            AuditCommands::Scan => scan(ctx).await,
-            AuditCommands::Sbom { output } => {
-                // SBOMs always include vulnerability data; the former `--vulns`
-                // flag was dead (a SetTrue bool defaulting to true).
-                generate_sbom(output.clone(), true, ctx).await
+            AuditCommands::Scan { fail_on_findings } => {
+                scan_with_options(ctx, *fail_on_findings).await
+            }
+            AuditCommands::Sbom {
+                output,
+                inventory_only,
+            } => {
+                // Advisory matching remains the fail-closed default. The explicit
+                // inventory-only mode records that matching was skipped.
+                generate_sbom(output.clone(), !inventory_only, ctx).await
             }
             AuditCommands::Secrets { path } => scan_secrets(path.clone(), ctx),
             AuditCommands::Log {
@@ -79,7 +84,7 @@ impl LocalCommandRunner for AuditCommands {
             AuditCommands::Slsa {
                 package,
                 certificate_identity,
-            } => check_slsa(package, certificate_identity.as_deref(), ctx).await,
+            } => check_slsa(package, certificate_identity, ctx).await,
             AuditCommands::Licenses {
                 format,
                 export,
@@ -127,13 +132,18 @@ pub(super) async fn security_audit_result()
 }
 
 /// Perform security audit (vulnerability scan)
-pub async fn scan(_ctx: &CliContext) -> Result<()> {
+pub async fn scan(ctx: &CliContext) -> Result<()> {
+    scan_with_options(ctx, false).await
+}
+
+async fn scan_with_options(_ctx: &CliContext, fail_on_findings: bool) -> Result<()> {
     ui::print_header("Secure", "Vulnerability Scan");
 
     #[cfg(unix)]
     {
         let res = security_audit_result().await?;
-        if res.total_vulnerabilities == 0 {
+        let total_findings = res.total_vulnerabilities;
+        if total_findings == 0 {
             ui::print_success("No vulnerabilities found in scanned packages.");
         } else {
             ui::print_warning(format!(
@@ -173,7 +183,7 @@ pub async fn scan(_ctx: &CliContext) -> Result<()> {
             }
             ui::print_tip("Run 'omg audit sbom' to generate a full security report.");
         }
-        Ok(())
+        enforce_scan_findings(total_findings, fail_on_findings)
     }
 
     #[cfg(not(unix))]
@@ -182,6 +192,14 @@ pub async fn scan(_ctx: &CliContext) -> Result<()> {
             "Security audit requires the daemon, which is only available on Unix systems."
         );
     }
+}
+
+fn enforce_scan_findings(total_findings: usize, fail_on_findings: bool) -> Result<()> {
+    anyhow::ensure!(
+        !fail_on_findings || total_findings == 0,
+        "Vulnerability scan found {total_findings} finding(s)"
+    );
+    Ok(())
 }
 
 /// Generate SBOM (Software Bill of Materials)
@@ -200,10 +218,18 @@ pub async fn generate_sbom(
     // The format string mirrors what `SbomGenerator` actually emits; keep the
     // two in sync when bumping spec versions.
     // Spec registry: https://cyclonedx.org/spec-version/
-    let sbom = generator
+    let mut sbom = generator
         .generate_system_sbom()
         .await
         .context("Failed to generate system SBOM")?;
+
+    if !include_vulns {
+        mark_inventory_only(&mut sbom)?;
+        println!(
+            "{} Inventory only: advisory matching was skipped; an empty vulnerability list is not a clean scan.",
+            style::warning("⚠")
+        );
+    }
 
     let path = if let Some(output_path) = output {
         let path = std::path::PathBuf::from(&output_path);
@@ -236,6 +262,21 @@ pub async fn generate_sbom(
     );
     println!("  {} CycloneDX 1.5 (JSON)", style::dim("Format:"));
 
+    Ok(())
+}
+
+fn mark_inventory_only(sbom: &mut crate::core::security::Sbom) -> Result<()> {
+    let system = sbom
+        .metadata
+        .component
+        .as_mut()
+        .context("System SBOM is missing its operating-system component")?;
+    system.properties.get_or_insert_with(Vec::new).push(
+        crate::core::security::sbom::SbomProperty {
+            name: "omg:advisory-scan".to_string(),
+            value: "not-performed".to_string(),
+        },
+    );
     Ok(())
 }
 
@@ -627,10 +668,10 @@ pub fn scan_secrets(path: Option<String>, _ctx: &CliContext) -> Result<()> {
     enforce_secret_scan_result(&result)
 }
 
-/// Check SLSA provenance for a package
+/// Verify a Sigstore artifact signature against the required signer identity.
 pub async fn check_slsa(
     package: &str,
-    certificate_identity: Option<&str>,
+    certificate_identity: &str,
     _ctx: &CliContext,
 ) -> Result<()> {
     use crate::core::security::SlsaVerifier;
@@ -639,7 +680,7 @@ pub async fn check_slsa(
     crate::core::security::validate_relative_path(package)?;
 
     println!(
-        "{} Checking SLSA provenance for {}...\n",
+        "{} Verifying artifact signature for {}...\n",
         style::runtime("OMG"),
         style::maybe_color(package, |t| t.white().to_string())
     );
@@ -651,30 +692,18 @@ pub async fn check_slsa(
 
     let verifier = SlsaVerifier::new();
     let result = verifier
-        .verify_provenance(path, None::<&std::path::Path>, certificate_identity)
+        .verify_provenance(path, None::<&std::path::Path>, Some(certificate_identity))
         .await?;
 
-    // Trust-policy honesty (audit sec2 F-05): without an identity predicate,
-    // ANY Sigstore signer's valid signature "verifies" - cryptographically
-    // true but meaningless as a trust statement. Say so loudly instead of
-    // implying the artifact came from a trusted builder.
-    if result.verified && certificate_identity.is_none() {
-        println!(
-            "  {} No --certificate-identity was specified: the signature is \nvalid but the SIGNER is unbounded (identity: {}). \nSupply --certificate-identity to enforce a trust policy.",
-            style::warning("⚠"),
-            result.builder_id.as_deref().unwrap_or("unknown")
-        );
-    }
-
-    require_slsa_verified(result.verified, result.error.as_deref())?;
+    require_artifact_signature_verified(result.verified, result.error.as_deref())?;
 
     println!(
-        "{} SLSA verification passed",
+        "{} Artifact signature verified against the required signer identity",
         style::maybe_color("✓", |t| t.green().to_string())
     );
     println!(
-        "  {} {}",
-        style::dim("Level:"),
+        "  {} {} (build provenance not verified)",
+        style::dim("SLSA level:"),
         style::maybe_color(&result.slsa_level.to_string(), |t| t.cyan().to_string())
     );
 
@@ -682,7 +711,7 @@ pub async fn check_slsa(
         println!("  {} {}", style::dim("Rekor Entry:"), entry);
     }
     if let Some(builder) = &result.builder_id {
-        println!("  {} {}", style::dim("Builder:"), builder);
+        println!("  {} {}", style::dim("Signer:"), builder);
     }
     if let Some(timestamp) = &result.build_timestamp {
         println!("  {} {}", style::dim("Build Time:"), timestamp);
@@ -691,13 +720,13 @@ pub async fn check_slsa(
     Ok(())
 }
 
-fn require_slsa_verified(verified: bool, error: Option<&str>) -> Result<()> {
+fn require_artifact_signature_verified(verified: bool, error: Option<&str>) -> Result<()> {
     if verified {
         return Ok(());
     }
     match error {
-        Some(reason) => anyhow::bail!("SLSA verification failed: {reason}"),
-        None => anyhow::bail!("SLSA verification failed"),
+        Some(reason) => anyhow::bail!("Artifact signature verification failed: {reason}"),
+        None => anyhow::bail!("Artifact signature verification failed"),
     }
 }
 
@@ -843,8 +872,16 @@ pub fn scan_licenses(
         );
     }
 
-    // Get installed packages and their licenses
+    // Policy evaluation must cover every installed package. A display filter
+    // cannot turn an omitted violation into a successful compliance check.
     let packages = installed_packages_with_licenses()?;
+    let policy_violations = if check_policy {
+        let policy = SecurityPolicy::load_default().context("Failed to load security policy")?;
+        license_policy_violations(&packages, &policy)
+    } else {
+        Vec::new()
+    };
+    let installed_count = packages.len();
 
     // Filter by license if specified, categorizing each package once.
     // `from_license` tokenizes the expression, so it must not be recomputed
@@ -882,7 +919,7 @@ pub fn scan_licenses(
         stdout.write_all(&report)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
-        return Ok(());
+        return enforce_license_policy(&policy_violations);
     }
 
     // Print summary
@@ -932,42 +969,15 @@ pub fn scan_licenses(
 
     // Check against policy if requested
     if check_policy {
-        let policy = SecurityPolicy::load_default().context("Failed to load security policy")?;
-        let mut violations = Vec::new();
-
-        for (name, license, _, _) in &filtered_packages {
-            // Check against allowed licenses (if policy specifies them)
-            if !policy.allowed_licenses.is_empty()
-                && !crate::core::security::policy::license_matches_allowlist(
-                    license,
-                    &policy.allowed_licenses,
-                )
-            {
-                violations.push((
-                    name.clone(),
-                    license.clone(),
-                    "Not in allowed list".to_string(),
-                ));
-            }
-
-            // Check for AGPL (commonly restricted in commercial use)
-            if license.to_lowercase().contains("agpl") {
-                violations.push((
-                    name.clone(),
-                    license.clone(),
-                    "AGPL requires review".to_string(),
-                ));
-            }
-        }
-
-        if violations.is_empty() {
+        println!("  Policy checked all {installed_count} installed packages.");
+        if policy_violations.is_empty() {
             println!(
-                "  {} All packages comply with license policy\n",
+                "  {} No configured license restrictions were violated\n",
                 style::success("✓")
             );
         } else {
             println!("  {} License Policy Violations:\n", style::warning("⚠"));
-            for (name, license, reason) in &violations {
+            for (name, license, reason) in &policy_violations {
                 println!(
                     "    {} {} ({}) - {}",
                     style::error("✗"),
@@ -1013,6 +1023,42 @@ pub fn scan_licenses(
         }
     }
 
+    enforce_license_policy(&policy_violations)
+}
+
+type LicenseViolation = (String, String, &'static str);
+
+fn license_policy_violations(
+    packages: &[(String, String, String)],
+    policy: &SecurityPolicy,
+) -> Vec<LicenseViolation> {
+    let mut violations = Vec::new();
+    for (name, license, _) in packages {
+        // ALPM stores separate license entries; the display string joins them
+        // with commas, but every entry represents a cumulative obligation.
+        let expression = crate::core::security::policy::combined_license_expression(
+            license.split(',').map(str::trim),
+        );
+        if !policy.allowed_licenses.is_empty()
+            && !expression.as_deref().is_some_and(|expression| {
+                crate::core::security::policy::license_matches_allowlist(
+                    expression,
+                    &policy.allowed_licenses,
+                )
+            })
+        {
+            violations.push((name.clone(), license.clone(), "Not in allowed list"));
+        }
+    }
+    violations
+}
+
+fn enforce_license_policy(violations: &[LicenseViolation]) -> Result<()> {
+    anyhow::ensure!(
+        violations.is_empty(),
+        "License policy check found {} violation(s)",
+        violations.len()
+    );
     Ok(())
 }
 
@@ -1623,6 +1669,87 @@ mod tests {
     }
 
     #[test]
+    fn license_policy_checks_unfiltered_inventory_and_fails_on_violations() {
+        let packages = vec![
+            ("visible".to_string(), "MIT".to_string(), "1.0".to_string()),
+            (
+                "hidden".to_string(),
+                "AGPL-3.0".to_string(),
+                "1.0".to_string(),
+            ),
+        ];
+        let policy = SecurityPolicy {
+            allowed_licenses: vec!["MIT".to_string()],
+            ..SecurityPolicy::default()
+        };
+        let violations = license_policy_violations(&packages, &policy);
+        assert!(violations.iter().any(|(name, _, _)| name == "hidden"));
+        assert!(enforce_license_policy(&violations).is_err());
+    }
+
+    #[test]
+    fn explicitly_allowed_agpl_is_not_a_license_policy_violation() {
+        let packages = vec![(
+            "allowed".to_string(),
+            "AGPL-3.0".to_string(),
+            "1.0".to_string(),
+        )];
+        let policy = SecurityPolicy {
+            allowed_licenses: vec!["AGPL-3.0".to_string()],
+            ..SecurityPolicy::default()
+        };
+        assert!(license_policy_violations(&packages, &policy).is_empty());
+    }
+
+    #[test]
+    fn separate_alpm_license_entries_all_must_be_allowed() {
+        let packages = vec![(
+            "dual-license".to_string(),
+            "MIT, GPL-3.0".to_string(),
+            "1.0".to_string(),
+        )];
+        let policy = SecurityPolicy {
+            allowed_licenses: vec!["MIT".to_string()],
+            ..SecurityPolicy::default()
+        };
+
+        let violations = license_policy_violations(&packages, &policy);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].0, "dual-license");
+        assert!(enforce_license_policy(&violations).is_err());
+    }
+
+    #[test]
+    fn vulnerability_findings_only_fail_when_requested() {
+        assert!(enforce_scan_findings(2, false).is_ok());
+        assert!(enforce_scan_findings(2, true).is_err());
+        assert!(enforce_scan_findings(0, true).is_ok());
+    }
+
+    #[test]
+    fn inventory_only_sbom_marks_skipped_advisories_in_exported_json() {
+        let mut sbom: crate::core::security::Sbom = serde_json::from_value(serde_json::json!({
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "serialNumber": "urn:uuid:00000000-0000-0000-0000-000000000000",
+            "version": 1,
+            "metadata": {
+                "timestamp": "2026-09-22T00:00:00Z",
+                "tools": [],
+                "component": { "type": "operating-system", "name": "Arch Linux", "version": "rolling" }
+            },
+            "components": []
+        }))
+        .expect("minimal system SBOM");
+        mark_inventory_only(&mut sbom).expect("inventory-only marker");
+        let value = serde_json::to_value(sbom).expect("serialized SBOM");
+        assert_eq!(
+            value["metadata"]["component"]["properties"][0],
+            serde_json::json!({ "name": "omg:advisory-scan", "value": "not-performed" })
+        );
+    }
+
+    #[test]
     fn critical_secret_findings_fail_the_command() {
         use crate::core::security::secrets::{SecretFinding, SecretSeverity, SecretType};
 
@@ -1671,24 +1798,25 @@ mod tests {
     }
 
     #[test]
-    fn slsa_check_fails_when_provenance_is_unverified() {
-        let err = require_slsa_verified(false, Some("no attestation"))
-            .expect_err("unverified provenance must fail the command");
+    fn slsa_check_fails_when_artifact_signature_is_unverified() {
+        let err = require_artifact_signature_verified(false, Some("no attestation"))
+            .expect_err("unverified artifact signature must fail the command");
         assert!(
-            err.to_string().contains("SLSA verification failed"),
+            err.to_string()
+                .contains("Artifact signature verification failed"),
             "got: {err}"
         );
         assert!(
             err.to_string().contains("no attestation"),
             "failure reason must be preserved, got: {err}"
         );
-        assert!(require_slsa_verified(true, None).is_ok());
-        let missing_reason =
-            require_slsa_verified(false, None).expect_err("unverified without details still fails");
+        assert!(require_artifact_signature_verified(true, None).is_ok());
+        let missing_reason = require_artifact_signature_verified(false, None)
+            .expect_err("unverified without details still fails");
         assert!(
             missing_reason
                 .to_string()
-                .contains("SLSA verification failed")
+                .contains("Artifact signature verification failed")
         );
     }
 

@@ -1,8 +1,7 @@
 //! Shared audit findings joined to exact installed SBOM components.
 use super::sbom::{
     Sbom, SbomComponent, SbomError, SbomLicense, SbomLicenseInfo, SbomMetadata, SbomProperty,
-    SbomTool, SbomVulnAffects, SbomVulnRating, SbomVulnReference, SbomVulnSource,
-    SbomVulnerability,
+    SbomTool, SbomVulnAdvisory, SbomVulnAffects, SbomVulnRating, SbomVulnSource, SbomVulnerability,
 };
 use super::scan::{AdvisorySeverity, SecurityAuditResult};
 use crate::core::env::distro::Distro;
@@ -52,7 +51,7 @@ pub(super) async fn generate(include_vulns: bool) -> Result<Sbom, SbomError> {
 
 fn purl(package: &SecurityPackage, distro: Distro) -> anyhow::Result<String> {
     let (kind, namespace) = match distro {
-        Distro::Arch => ("pacman", "archlinux"),
+        Distro::Arch => ("alpm", "arch"),
         Distro::Debian => ("deb", "debian"),
         Distro::Ubuntu => ("deb", "ubuntu"),
         Distro::Fedora => ("rpm", "fedora"),
@@ -220,19 +219,17 @@ pub(super) fn compose(
                     ratings,
                     description: Some(description),
                     affects,
-                    references: finding
+                    references: vec![],
+                    advisories: finding
                         .native_advisory
                         .as_ref()
                         .map(|native| {
                             native
                                 .references
                                 .iter()
-                                .map(|reference| SbomVulnReference {
-                                    id: reference.id.clone(),
-                                    source: SbomVulnSource {
-                                        name: reference.kind.clone(),
-                                        url: Some(reference.url.clone()),
-                                    },
+                                .map(|reference| SbomVulnAdvisory {
+                                    title: Some(format!("{}: {}", reference.kind, reference.id)),
+                                    url: reference.url.clone(),
                                 })
                                 .collect()
                         })
@@ -319,7 +316,7 @@ mod tests {
             licenses: vec!["custom license".into()],
         };
         for (distro, name, prefix) in [
-            (Distro::Arch, "Arch Linux", "pkg:pacman/archlinux/"),
+            (Distro::Arch, "Arch Linux", "pkg:alpm/arch/"),
             (Distro::Debian, "Debian", "pkg:deb/debian/"),
             (Distro::Ubuntu, "Ubuntu", "pkg:deb/ubuntu/"),
             (Distro::Fedora, "Fedora", "pkg:rpm/fedora/"),
@@ -411,8 +408,8 @@ mod tests {
             published_severity: "Important".into(),
             description: "Upstream details".into(),
             references: vec![crate::core::security::scan::AdvisoryReference {
-                id: "CVE-fixture".into(),
-                kind: "cve".into(),
+                id: "BZ-fixture".into(),
+                kind: "bugzilla".into(),
                 url: "https://example.test/advisory".into(),
             }],
         });
@@ -426,10 +423,8 @@ mod tests {
                 |property| property.name == "omg:advisory:title" && property.value == "fixture"
             )
         );
-        assert_eq!(
-            evidence.references[0].source.url.as_deref(),
-            Some("https://example.test/advisory")
-        );
+        assert_eq!(evidence.advisories[0].url, "https://example.test/advisory");
+        assert!(evidence.references.is_empty());
         assert!(evidence.properties.iter().any(|property| property.name
             == "omg:advisory:published-severity"
             && property.value == "Important"));

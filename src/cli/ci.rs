@@ -121,15 +121,7 @@ pub fn cache() -> Result<()> {
 
 /// Write a generated config file, previewing instead of overwriting.
 fn write_config_file(path: &str, config: &str) -> Result<()> {
-    // Pin the installer bootstrap to this release tag. A mutable `main`
-    // reference would let a future commit change what new pipelines execute.
-    let config = config.replace(
-        "raw.githubusercontent.com/PyRo1121/omg/main/install.sh",
-        &format!(
-            "raw.githubusercontent.com/PyRo1121/omg/v{}/install.sh",
-            env!("CARGO_PKG_VERSION")
-        ),
-    );
+    let config = render_ci_config(config);
     let config = config.as_str();
     ensure_safe_config_parent(std::path::Path::new(path))?;
 
@@ -151,6 +143,10 @@ fn write_config_file(path: &str, config: &str) -> Result<()> {
         println!("{}", style::dim(config));
     }
     Ok(())
+}
+
+fn render_ci_config(config: &str) -> String {
+    config.replace("__OMG_VERSION__", env!("CARGO_PKG_VERSION"))
 }
 
 fn create_new_config_file(path: &std::path::Path, config: &str) -> Result<bool> {
@@ -200,399 +196,378 @@ fn ensure_safe_config_parent(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn generate_github_actions(advanced: bool) -> Result<()> {
-    let config = if advanced {
-        r#"name: CI (Advanced)
+// CI build/test jobs run project-defined OMG tasks. The advanced security job
+// inventories Cargo dependencies, never packages installed on the CI runner.
+fn github_actions_config(advanced: bool) -> &'static str {
+    if advanced {
+        r#"name: CI
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+on: [push, pull_request]
+
+permissions:
+  contents: read
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }}, features=[${{ matrix.features }}])
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
-        features: ["arch", "debian", "license,pgp", "arch,debian,license,pgp"]
-        include:
-          - os: ubuntu-latest
-            container: archlinux:latest
-            features: "arch"
-
-    container: ${{ matrix.container }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies (Arch)
-        if: matrix.container == 'archlinux:latest'
-        run: |
-          pacman -Syu --noconfirm rustup base-devel git
-          rustup default stable
-
-      - name: Cache Cargo & OMG
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.local/share/omg
-            target
-          key: omg-${{ runner.os }}-${{ matrix.features }}-${{ hashFiles('Cargo.lock', 'omg.lock') }}
-          restore-keys: |
-            omg-${{ runner.os }}-${{ matrix.features }}-
-            omg-${{ runner.os }}-
-
-      - name: Install OMG
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/PyRo1121/omg/main/install.sh | sh
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Lint
-        run: |
-          cargo fmt --check
-          cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Mock Enterprise License (for SBOM/Security)
-        run: |
-          mkdir -p ~/.local/share/omg
-          echo '{"key":"CI-MOCK-KEY","tier":"enterprise","features":["sbom","audit","secrets","slsa","policy"],"validated_at":9999999999}' > ~/.local/share/omg/license.json
-
-      - name: Sync environment
-        run: |
-          omg env check || omg env sync omg.lock
-
-      - name: Build
-        run: cargo build --release --features ${{ matrix.features }}
-
-      - name: Test
-        run: cargo test --features ${{ matrix.features }}
-
-  security:
-    name: Security Audit & SBOM
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-        
-      - name: Audit dependencies
-        run: cargo audit
-
-      - name: Install OMG
+      - name: Require GitHub CLI for OMG provenance verification
         run: |
-          curl -fsSL https://raw.githubusercontent.com/PyRo1121/omg/main/install.sh | sh
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          command -v gh >/dev/null || {
+            echo "::error::Install GitHub CLI (gh) to verify OMG release provenance"
+            exit 1
+          }
+      - name: Install verified OMG release
+        run: |
+          curl -fsSLo omg-install.sh https://raw.githubusercontent.com/omg-cli/omg/v__OMG_VERSION__/install.sh
+          OMG_VERSION=v__OMG_VERSION__ OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 bash omg-install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check committed OMG environment
+        run: |
+          if test -f omg.lock; then omg env check; else echo "No omg.lock; skipping environment check"; fi
+      - name: Build project
+        run: omg run build
+      - name: Test project
+        run: omg run test
 
-      - name: Generate SBOM
-        run: omg audit sbom --output sbom.json
-
-      - name: Upload SBOM
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom
-          path: sbom.json
-"#
-    } else {
-        r"name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-jobs:
-  lint:
-    name: Lint
+  security:
+    name: Rust dependency audit and SBOM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Require Rust project
+        run: test -f Cargo.toml || { echo "::error::Advanced security requires Cargo.toml"; exit 1; }
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      # This describes Cargo dependencies, not packages installed on the runner.
+      - name: Generate Rust dependency SBOM
+        run: |
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo metadata --locked --format-version 1 > /dev/null
+          sbom_name="rust-dependencies-$(cat /proc/sys/kernel/random/uuid).cdx"
+          cargo cyclonedx --format json --all --override-filename "$sbom_name"
+          mkdir -p security-sboms
+          find . -type f -name "$sbom_name.json" -not -path './target/*' -not -path './security-sboms/*' -exec cp --parents {} security-sboms/ \;
+          test -n "$(find security-sboms -type f -name "$sbom_name.json" -print -quit)"
+          git diff --exit-code -- Cargo.lock
+      - name: Upload Rust dependency SBOM
+        uses: actions/upload-artifact@v4
         with:
-          components: rustfmt, clippy
-      
-      - name: Formatting
-        run: cargo fmt --all -- --check
-        
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+          name: rust-dependencies-sbom
+          path: security-sboms/
+          if-no-files-found: error
+"#
+    } else {
+        r#"name: CI
 
-  test:
-    name: Test
-    needs: [lint]
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Cache Cargo & OMG
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.local/share/omg
-            target
-          key: omg-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'omg.lock') }}
-          restore-keys: |
-            omg-${{ runner.os }}-
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
-      - name: Build
-        run: cargo build --release
-      
-      - name: Run Tests
-        run: cargo test --all-features
-"
-    };
+      - name: Require GitHub CLI for OMG provenance verification
+        run: |
+          command -v gh >/dev/null || {
+            echo "::error::Install GitHub CLI (gh) to verify OMG release provenance"
+            exit 1
+          }
+      - name: Install verified OMG release
+        run: |
+          curl -fsSLo omg-install.sh https://raw.githubusercontent.com/omg-cli/omg/v__OMG_VERSION__/install.sh
+          OMG_VERSION=v__OMG_VERSION__ OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 bash omg-install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check committed OMG environment
+        run: |
+          if test -f omg.lock; then omg env check; else echo "No omg.lock; skipping environment check"; fi
+      - name: Build project
+        run: omg run build
+      - name: Test project
+        run: omg run test
+"#
+    }
+}
 
-    write_config_file(".github/workflows/ci.yml", config)?;
-
+fn generate_github_actions(advanced: bool) -> Result<()> {
+    write_config_file(".github/workflows/ci.yml", github_actions_config(advanced))?;
     println!();
     println!(
         "  {}",
         style::maybe_color("Next steps:", |t| t.bold().to_string())
     );
-    println!("    1. Commit the workflow file");
-    println!("    2. Ensure omg.lock is committed");
+    println!("    1. Review and commit the workflow file");
+    println!("    2. Ensure your project defines build and test tasks");
     println!("    3. Push to trigger the workflow");
-
     Ok(())
 }
 
-fn generate_gitlab_ci(advanced: bool) -> Result<()> {
-    let config = if advanced {
-        r#"stages:
-  - lint
-  - test
+fn gitlab_ci_config(advanced: bool) -> &'static str {
+    if advanced {
+        r#"# Use a runner or image with a verified OMG release preinstalled.
+# Advanced security also requires Cargo.toml and a committed Cargo.lock.
+stages:
   - build
+  - test
   - security
 
-variables:
-  CARGO_HOME: $CI_PROJECT_DIR/.cargo
-  OMG_CACHE_DIR: $CI_PROJECT_DIR/.omg-cache
-
-.omg_template: &omg_definition
-  image: rust:latest
+default:
   before_script:
-    - curl -fsSL https://raw.githubusercontent.com/PyRo1121/omg/main/install.sh | sh
-    - export PATH="$HOME/.local/bin:$PATH"
-    - omg env check || omg env sync omg.lock
-  cache:
-    key: omg-$CI_COMMIT_REF_SLUG
-    paths:
-      - .cargo/
-      - .omg-cache/
-      - target/
-
-lint:
-  stage: lint
-  <<: *omg_definition
-  script:
-    - cargo fmt --check
-    - cargo clippy -- -D warnings
-
-test:
-  stage: test
-  <<: *omg_definition
-  parallel:
-    matrix:
-      - FEATURES: ["arch", "debian", "license,pgp", "arch,debian,license,pgp"]
-  script:
-    - cargo test --features $FEATURES
-
-build:
-  stage: build
-  <<: *omg_definition
-  script:
-    - cargo build --release --all-features
-  artifacts:
-    paths:
-      - target/release/omg
-      - target/release/omgd
-
-security:
-  stage: security
-  <<: *omg_definition
-  script:
-    - cargo install cargo-audit
-    - cargo audit
-    - omg audit sbom --output sbom.json
-  artifacts:
-    reports:
-      cyclonedx: sbom.json
-"#
-    } else {
-        r#"stages:
-  - build
-  - test
-
-variables:
-  OMG_CACHE_DIR: $CI_PROJECT_DIR/.omg-cache
-
-cache:
-  key: omg-$CI_COMMIT_REF_SLUG
-  paths:
-    - .omg-cache/
-    - .cargo/
-
-before_script:
-  - curl -fsSL https://raw.githubusercontent.com/PyRo1121/omg/main/install.sh | sh
-  - export PATH="$HOME/.local/bin:$PATH"
-  - omg env check || omg env sync omg.lock
+    - |
+      if ! command -v omg >/dev/null 2>&1; then
+        echo "OMG is missing. Configure a runner/image with a verified OMG release; install with gh attestation verification." >&2
+        exit 1
+      fi
+    - |
+      if test -f omg.lock; then omg env check; else echo "No omg.lock; skipping environment check"; fi
 
 build:
   stage: build
   script:
     - omg run build
+
+test:
+  stage: test
+  script:
+    - omg run test
+
+security:
+  stage: security
+  image: rust:latest
+  before_script: []
+  script:
+    - test -f Cargo.toml || { echo "Advanced security requires Cargo.toml" >&2; exit 1; }
+    - cargo install cargo-audit --locked
+    - cargo audit
+    # This describes Cargo dependencies, not packages installed on the runner.
+    - cargo install cargo-cyclonedx --version 0.5.9 --locked
+    - cargo metadata --locked --format-version 1 > /dev/null
+    - |
+      sbom_name="rust-dependencies-$(cat /proc/sys/kernel/random/uuid).cdx"
+      cargo cyclonedx --format json --all --override-filename "$sbom_name"
+      mkdir -p security-sboms
+      find . -type f -name "$sbom_name.json" -not -path './target/*' -not -path './security-sboms/*' -exec cp --parents {} security-sboms/ \;
+      test -n "$(find security-sboms -type f -name "$sbom_name.json" -print -quit)"
+    - git diff --exit-code -- Cargo.lock
   artifacts:
     paths:
-      - target/
+      - security-sboms/
+"#
+    } else {
+        r#"# Use a runner or image with a verified OMG release preinstalled.
+stages:
+  - build
+  - test
+
+default:
+  before_script:
+    - |
+      if ! command -v omg >/dev/null 2>&1; then
+        echo "OMG is missing. Configure a runner/image with a verified OMG release; install with gh attestation verification." >&2
+        exit 1
+      fi
+    - |
+      if test -f omg.lock; then omg env check; else echo "No omg.lock; skipping environment check"; fi
+
+build:
+  stage: build
+  script:
+    - omg run build
 
 test:
   stage: test
   script:
     - omg run test
 "#
-    };
-
-    write_config_file(".gitlab-ci.yml", config)
+    }
 }
 
-fn generate_circleci(advanced: bool) -> Result<()> {
-    let config = if advanced {
+fn generate_gitlab_ci(advanced: bool) -> Result<()> {
+    write_config_file(".gitlab-ci.yml", gitlab_ci_config(advanced))
+}
+
+fn circleci_config(advanced: bool) -> &'static str {
+    if advanced {
         r#"version: 2.1
 
-orbs:
-  rust: circleci/rust@1.6.0
-
 jobs:
-  test:
+  build-and-test:
     docker:
-      - image: cimg/rust:1.82
-    parameters:
-      features:
-        type: string
-        default: ""
+      # Replace this with an image containing a verified OMG release.
+      - image: cimg/base:stable
     steps:
       - checkout
-      - rust/install
-      - restore_cache:
-          keys:
-            - omg-v2-{{ checksum "Cargo.lock" }}-{{ checksum "omg.lock" }}
-            - omg-v2-{{ checksum "Cargo.lock" }}-
-            - omg-v2-
       - run:
-          name: Install OMG
+          name: Require verified OMG on this runner
           command: |
-            curl -fsSL https://raw.githubusercontent.com/PyRo1121/omg/main/install.sh | sh
-            echo 'export PATH="$HOME/.local/bin:$PATH"' >> $BASH_ENV
+            if ! command -v omg >/dev/null 2>&1; then
+              echo "OMG is missing. Use an image with a verified OMG release; install with gh attestation verification." >&2
+              exit 1
+            fi
       - run:
-          name: Sync environment
-          command: omg env check || omg env sync omg.lock
-      - run:
-          name: Build & Test
+          name: Check committed OMG environment
           command: |
-            cargo test --features << parameters.features >>
-      - save_cache:
-          key: omg-v2-{{ checksum "Cargo.lock" }}-{{ checksum "omg.lock" }}
-          paths:
-            - "~/.cargo"
-            - "~/.local/share/omg"
-            - "target"
+            if test -f omg.lock; then omg env check; else echo "No omg.lock; skipping environment check"; fi
+      - run:
+          name: Build and test project
+          command: |
+            omg run build
+            omg run test
 
   security:
     docker:
-      - image: cimg/rust:1.82
+      - image: cimg/rust:1.97.1
     steps:
       - checkout
       - run:
-          name: Security Audit
+          name: Require Rust project
+          command: test -f Cargo.toml || { echo "Advanced security requires Cargo.toml" >&2; exit 1; }
+      - run:
+          name: Audit Rust dependencies
           command: |
-            cargo install cargo-audit
+            cargo install cargo-audit --locked
             cargo audit
       - run:
-          name: Generate SBOM
+          name: Generate Rust dependency SBOM
           command: |
-            curl -fsSL https://raw.githubusercontent.com/PyRo1121/omg/main/install.sh | sh
-            export PATH="$HOME/.local/bin:$PATH"
-            omg audit sbom --output sbom.json
+            # This describes Cargo dependencies, not packages installed on the runner.
+            cargo install cargo-cyclonedx --version 0.5.9 --locked
+            cargo metadata --locked --format-version 1 > /dev/null
+            sbom_name="rust-dependencies-$(cat /proc/sys/kernel/random/uuid).cdx"
+            cargo cyclonedx --format json --all --override-filename "$sbom_name"
+            mkdir -p security-sboms
+            find . -type f -name "$sbom_name.json" -not -path './target/*' -not -path './security-sboms/*' -exec cp --parents {} security-sboms/ \;
+            test -n "$(find security-sboms -type f -name "$sbom_name.json" -print -quit)"
+            git diff --exit-code -- Cargo.lock
       - store_artifacts:
-          path: sbom.json
+          path: security-sboms/
 
 workflows:
   build-and-test:
     jobs:
-      - test:
-          name: test-arch
-          features: "arch"
-      - test:
-          name: test-debian
-          features: "debian"
-      - test:
-          name: test-all
-          features: "arch,debian,license,pgp"
-      - security:
-          requires:
-            - test-all
+      - build-and-test
+      - security
 "#
     } else {
         r#"version: 2.1
 
-executors:
-  linux:
-    docker:
-      - image: cimg/base:stable
-
 jobs:
-  build:
-    executor: linux
+  build-and-test:
+    docker:
+      # Replace this with an image containing a verified OMG release.
+      - image: cimg/base:stable
     steps:
       - checkout
-      - restore_cache:
-          keys:
-            - omg-{{ checksum "omg.lock" }}
-            - omg-
       - run:
-          name: Install OMG
+          name: Require verified OMG on this runner
           command: |
-            curl -fsSL https://raw.githubusercontent.com/PyRo1121/omg/main/install.sh | sh
-            echo 'export PATH="$HOME/.local/bin:$PATH"' >> $BASH_ENV
+            if ! command -v omg >/dev/null 2>&1; then
+              echo "OMG is missing. Use an image with a verified OMG release; install with gh attestation verification." >&2
+              exit 1
+            fi
       - run:
-          name: Sync environment
-          command: omg env check || omg env sync omg.lock
-      - save_cache:
-          key: omg-{{ checksum "omg.lock" }}
-          paths:
-            - ~/.local/share/omg
+          name: Check committed OMG environment
+          command: |
+            if test -f omg.lock; then omg env check; else echo "No omg.lock; skipping environment check"; fi
       - run:
-          name: Build
-          command: omg run build
-      - run:
-          name: Test
-          command: omg run test
+          name: Build and test project
+          command: |
+            omg run build
+            omg run test
 
 workflows:
   build-and-test:
     jobs:
-      - build
+      - build-and-test
 "#
-    };
-
-    write_config_file(".circleci/config.yml", config)
+    }
 }
 
+fn generate_circleci(advanced: bool) -> Result<()> {
+    write_config_file(".circleci/config.yml", circleci_config(advanced))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_ci_templates_keep_project_tasks_and_truthful_security_scope() {
+        for (provider, advanced, config) in [
+            ("github", false, github_actions_config(false)),
+            ("github", true, github_actions_config(true)),
+            ("gitlab", false, gitlab_ci_config(false)),
+            ("gitlab", true, gitlab_ci_config(true)),
+            ("circleci", false, circleci_config(false)),
+            ("circleci", true, circleci_config(true)),
+        ] {
+            for forbidden in [
+                "PyRo1121",
+                "CI-MOCK-KEY",
+                "license.json",
+                "omg audit sbom",
+                "omg env check ||",
+            ] {
+                assert!(
+                    !config.contains(forbidden),
+                    "{provider} advanced={advanced} unexpectedly contains {forbidden}"
+                );
+            }
+            assert!(config.contains("omg run build"));
+            assert!(config.contains("omg run test"));
+            assert!(config.contains("if test -f omg.lock; then omg env check"));
+            if provider == "github" {
+                let rendered = render_ci_config(config);
+                let pinned_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+                assert!(rendered.contains(&format!(
+                    "https://raw.githubusercontent.com/omg-cli/omg/{pinned_tag}/install.sh"
+                )));
+                assert!(rendered.contains(&format!("OMG_VERSION={pinned_tag}")));
+                assert!(!rendered.contains("__OMG_VERSION__"));
+                assert!(config.contains("command -v gh"));
+                assert!(config.contains("bash omg-install.sh"));
+            } else {
+                assert!(config.contains("command -v omg"));
+                assert!(config.contains("verified OMG release"));
+                assert!(!config.contains("install.sh"));
+            }
+            if advanced {
+                assert!(config.contains("cargo audit"));
+                assert!(config.contains(
+                    "sbom_name=\"rust-dependencies-$(cat /proc/sys/kernel/random/uuid).cdx\""
+                ));
+                assert!(config.contains(
+                    "cargo cyclonedx --format json --all --override-filename \"$sbom_name\""
+                ));
+                assert!(config.contains("-name \"$sbom_name.json\""));
+                assert!(config.contains("cp --parents {} security-sboms/"));
+                let artifact_path = if provider == "gitlab" {
+                    "- security-sboms/"
+                } else {
+                    "path: security-sboms/"
+                };
+                assert!(config.contains(artifact_path));
+                assert!(config.contains("not packages installed on the runner"));
+                assert!(config.contains("git diff --exit-code -- Cargo.lock"));
+                let artifact_step = match provider {
+                    "github" => "actions/upload-artifact@v4",
+                    "gitlab" => "artifacts:",
+                    "circleci" => "store_artifacts:",
+                    _ => unreachable!("only known providers are in this fixture"),
+                };
+                assert!(config.contains(artifact_step));
+            } else {
+                assert!(!config.contains("cargo cyclonedx"));
+                assert!(!config.contains("cargo audit"));
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]

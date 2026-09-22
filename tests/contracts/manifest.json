@@ -3785,7 +3785,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "7d58fe7cde07921f1b187eb935138afd4c18b1ea409611c362a9366c56505579"
+      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
     },
     {
       "binary": "omgd",
@@ -3805,7 +3805,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "7d58fe7cde07921f1b187eb935138afd4c18b1ea409611c362a9366c56505579"
+      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
     },
     {
       "binary": "omgd",
@@ -3825,7 +3825,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "7d58fe7cde07921f1b187eb935138afd4c18b1ea409611c362a9366c56505579"
+      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
     },
     {
       "binary": "omgd",
@@ -3845,7 +3845,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "7d58fe7cde07921f1b187eb935138afd4c18b1ea409611c362a9366c56505579"
+      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
     },
     {
       "binary": "omgd",
@@ -3865,7 +3865,7 @@
         "macos",
         "pgp"
       ],
-      "sha256": "7d58fe7cde07921f1b187eb935138afd4c18b1ea409611c362a9366c56505579"
+      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
     },
     {
       "binary": "omgd",
@@ -3883,7 +3883,7 @@
       "features": [
         "debian-pure"
       ],
-      "sha256": "92fe293dbb2f23f725c27e2f857ad3b8b52c12089db27a2b0e70d121171c1de0"
+      "sha256": "290cccb9dd58c954a47da0e612cdfb65068f785d206241685ba18d1c8d6352b4"
     },
     {
       "binary": "omgd",
@@ -3900,7 +3900,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "7d58fe7cde07921f1b187eb935138afd4c18b1ea409611c362a9366c56505579"
+      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
     },
     {
       "binary": "omgd",
@@ -3919,7 +3919,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "7d58fe7cde07921f1b187eb935138afd4c18b1ea409611c362a9366c56505579"
+      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
     },
     {
       "binary": "omgd",
