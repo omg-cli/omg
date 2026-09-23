@@ -106,7 +106,7 @@ case "${1:-}" in
   image)
     case "${2:-}" in
       inspect) exit "${FAKE_INSPECT_EXIT:-0}" ;;
-      rm) exit 0 ;;
+      rm) exit "${FAKE_IMAGE_RM_EXIT:-0}" ;;
       *) exit 2 ;;
     esac
     ;;
@@ -299,6 +299,11 @@ export FAKE_INSPECT_EXIT=7
 assert_rc 3 "$runner" "${fedora_family_args[@]}" --evidence-dir "$scratch/fedora-image-missing"
 unset FAKE_INSPECT_EXIT
 [[ "$(grep -c '"result":"HARNESS_ERROR"' "$(results_file "$scratch/fedora-image-missing")")" -eq 3 ]] || fail 'Unloaded Fedora seed image was blamed on the product'
+export FAKE_IMAGE_RM_EXIT=7
+assert_rc 3 "$runner" "${fedora_family_args[@]}" --evidence-dir "$scratch/fedora-cleanup-error"
+unset FAKE_IMAGE_RM_EXIT
+grep -q '"case_id":"release-harness-cleanup".*"result":"HARNESS_ERROR"' "$(results_file "$scratch/fedora-cleanup-error")" || fail 'Fedora seed cleanup failure left aggregate evidence green'
+[[ "$(grep -c '"result":"PASS"' "$(results_file "$scratch/fedora-cleanup-error")")" -eq 3 ]] || fail 'Fedora cleanup failure rewrote real package results'
 fedora_args=(--release v9.9.9 --distro fedora --case release-package-search-tree --container-engine fake-engine --staged-dir "$scratch/fedora")
 assert_rc 0 "$runner" "${fedora_args[@]}" --evidence-dir "$scratch/fixed-defect"
 grep -q '"result":"PASS"' "$(results_file "$scratch/fixed-defect")" || fail "fixed defect was forced to fail"

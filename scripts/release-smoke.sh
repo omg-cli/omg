@@ -394,6 +394,24 @@ record_harness_error() {
   record_nonexecution "$1" "HARNESS_ERROR" "$2"
 }
 
+record_cleanup_error() {
+  local distro=$1 message=$2 case_id=release-harness-cleanup
+  local evidence_dir="$run_evidence/${distro}-${case_id}"
+  mkdir -p "$evidence_dir"
+  printf 'HARNESS_ERROR: %s\n' "$message" > "$evidence_dir/transcript.txt"
+  {
+    printf 'case_id=%s\n' "$case_id"
+    printf 'distro=%s\n' "$distro"
+    printf 'result=HARNESS_ERROR\n'
+    printf 'release=%s\n' "$tag"
+    printf 'engine=%s\n' "$engine"
+    if [[ -f "$run_evidence/fedora-cache-seed-cleanup.log" ]]; then
+      printf 'cleanup_log=%s\n' "$run_evidence/fedora-cache-seed-cleanup.log"
+    fi
+  } > "$evidence_dir/metadata.txt"
+  write_result "$evidence_dir" "$case_id" "$distro" HARNESS_ERROR 3 0 required-harness
+}
+
 resolve_artifact() {
   local workdir=$1
   version="${tag#v}"
@@ -606,13 +624,17 @@ run_distro() (
   mkdir -p "$work_root" || return 3
   workdir="$(mktemp -d "$work_root/${distro}.XXXXXX")" || return 3
   cleanup_distro() {
-    local status=$?
+    local status=$? cleanup_error=""
     trap - EXIT
     if [[ -n "$prepared_image" ]]; then
       "$TIMEOUT_BIN" --kill-after=5s 20s "$engine" image rm "$prepared_image" \
-        > "$run_evidence/fedora-cache-seed-cleanup.log" 2>&1 || status=3
+        > "$run_evidence/fedora-cache-seed-cleanup.log" 2>&1 || cleanup_error="prepared Fedora image removal failed"
     fi
-    rm -rf "$workdir" || status=3
+    rm -rf "$workdir" || cleanup_error="${cleanup_error:+$cleanup_error; }temporary workdir removal failed"
+    if [[ -n "$cleanup_error" ]]; then
+      record_cleanup_error "$distro" "$cleanup_error"
+      status=3
+    fi
     exit "$status"
   }
   trap cleanup_distro EXIT
