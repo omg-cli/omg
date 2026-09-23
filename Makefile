@@ -275,6 +275,7 @@ check-shell-syntax:
 ci-workflow-quick: check-shell-syntax
 	cargo fmt --all -- --check
 	python3 -m unittest discover -s scripts -p 'test_*.py'
+	python3 tests/test_benchmark_records.py
 	python3 tests/test_terminal_update_notice.py
 
 ci-local-quick: ci-workflow-quick

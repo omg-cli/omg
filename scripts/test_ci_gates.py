@@ -161,6 +161,7 @@ class CiDeduplicationTests(unittest.TestCase):
         for command in [
             "cargo fmt --all -- --check",
             "python3 -m unittest discover -s scripts -p 'test_*.py'",
+            "python3 tests/test_benchmark_records.py",
         ]:
             with self.subTest(command=command):
                 self.assertNotIn(command, gate)
@@ -206,9 +207,10 @@ class CiDeduplicationTests(unittest.TestCase):
         commands = [
             ["cargo", "fmt", "--all", "--", "--check"],
             ["python3", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"],
+            ["python3", "tests/test_benchmark_records.py"],
             ["python3", "tests/test_terminal_update_notice.py"],
         ]
-        for failed in (0, 1, 2, 3):
+        for failed in (0, 1, 2, 3, 4):
             with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / "Makefile").write_bytes((CI_YML.parents[2] / "Makefile").read_bytes())
@@ -245,7 +247,7 @@ class CiDeduplicationTests(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, failed == 0, result.stderr)
                 self.assertTrue(log.exists(), result.stderr)
                 recorded = [json.loads(line) for line in log.read_text().splitlines()]
-                self.assertEqual(recorded, commands[:failed or 3])
+                self.assertEqual(recorded, commands[:failed or len(commands)])
 
     def test_arch_combination_has_one_platform_lane(self) -> None:
         text = CI_YML.read_text(encoding="utf-8")
