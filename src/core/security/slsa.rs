@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::core::http::shared_client;
+use crate::core::http::{BoundedResponseExt, shared_client};
 
 /// Failures when talking to Rekor or parsing a log entry.
 #[derive(Debug, Error)]
@@ -52,7 +52,7 @@ pub enum SlsaError {
     #[error("Invalid Rekor index JSON")]
     RekorIndexJson {
         #[source]
-        source: reqwest::Error,
+        source: anyhow::Error,
     },
     #[error("Failed to get Rekor entry")]
     RekorEntryRequest {
@@ -62,7 +62,7 @@ pub enum SlsaError {
     #[error("Invalid Rekor entry JSON")]
     RekorEntryJson {
         #[source]
-        source: reqwest::Error,
+        source: anyhow::Error,
     },
     #[error("Malformed Rekor entry body")]
     RekorBodyDecode {
@@ -700,7 +700,7 @@ impl SlsaVerifier {
         rekor_http_must_succeed(response.status())?;
 
         let uuids: Vec<String> = response
-            .json()
+            .bounded_json()
             .await
             .map_err(|source| SlsaError::RekorIndexJson { source })?;
 
@@ -730,7 +730,7 @@ impl SlsaVerifier {
         rekor_http_must_succeed(response.status())?;
 
         let entry_map: HashMap<String, Value> = response
-            .json()
+            .bounded_json()
             .await
             .map_err(|source| SlsaError::RekorEntryJson { source })?;
         Ok(parse_rekor_entry(uuid, entry_map)?)
@@ -1056,6 +1056,49 @@ mod tests {
 
     use std::collections::HashMap;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn rekor_index_applies_body_limit_before_json_and_accepts_small_results() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            for response in [
+                b"HTTP/1.1 200 OK\r\nContent-Length: 16777217\r\nConnection: close\r\n\r\n"
+                    .as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]".as_slice(),
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("fixture connection");
+                let mut request = [0; 2048];
+                let bytes_read = stream.read(&mut request).await.expect("read request");
+                assert!(bytes_read > 0, "empty request");
+                stream.write_all(response).await.expect("write response");
+            }
+        });
+        let verifier = SlsaVerifier {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("fixture client"),
+            rekor_url: format!("http://{address}"),
+        };
+        let error = verifier
+            .query_rekor(&"a".repeat(64))
+            .await
+            .expect_err("oversized index");
+        assert!(matches!(error, SlsaError::RekorIndexJson { .. }));
+        assert!(
+            verifier
+                .query_rekor(&"a".repeat(64))
+                .await
+                .expect("small index")
+                .is_empty()
+        );
+        server.await.expect("fixture server");
+    }
 
     #[test]
     fn pem_boundaries_never_strip_begin_or_end_from_encoded_data() {

@@ -6,11 +6,47 @@
 use crate::package_managers::types::Version;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use thiserror::Error;
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use crate::core::paths;
+
+const MAX_POLICY_BYTES: u64 = 1024 * 1024;
+
+fn read_policy_file(path: &Path) -> io::Result<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Security policy must be a regular file",
+        ));
+    }
+    if metadata.len() > MAX_POLICY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Security policy exceeds 1 MiB limit",
+        ));
+    }
+    let mut content = String::new();
+    file.take(MAX_POLICY_BYTES + 1)
+        .read_to_string(&mut content)?;
+    if content.len() as u64 > MAX_POLICY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Security policy exceeds 1 MiB limit",
+        ));
+    }
+    Ok(content)
+}
 
 /// Failures from loading a security policy or checking a package against it.
 #[derive(Debug, Error)]
@@ -169,7 +205,7 @@ impl SecurityPolicy {
     /// [`PolicyError::Parse`] for malformed TOML or unsupported policy fields.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, PolicyError> {
         let path = path.as_ref();
-        let content = fs::read_to_string(path).map_err(|source| PolicyError::Read {
+        let content = read_policy_file(path).map_err(|source| PolicyError::Read {
             path: path.display().to_string(),
             source,
         })?;
@@ -721,6 +757,43 @@ mod tests {
                 .to_string()
                 .contains("Failed to parse security policy")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_loader_rejects_symlinks_fifos_and_oversized_files() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("policy fixture");
+        let valid = temp.path().join("valid.toml");
+        fs::write(&valid, "allow_aur = false\n").expect("write valid policy");
+        assert!(
+            !SecurityPolicy::load(&valid)
+                .expect("regular policy")
+                .allow_aur
+        );
+
+        let linked = temp.path().join("linked.toml");
+        symlink(&valid, &linked).expect("create policy symlink");
+        assert!(matches!(
+            SecurityPolicy::load(&linked),
+            Err(PolicyError::Read { .. })
+        ));
+
+        let fifo = temp.path().join("fifo.toml");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).expect("create policy FIFO");
+        assert!(matches!(
+            SecurityPolicy::load(&fifo),
+            Err(PolicyError::Read { .. })
+        ));
+
+        let oversized = temp.path().join("oversized.toml");
+        fs::write(&oversized, vec![b' '; MAX_POLICY_BYTES as usize + 1])
+            .expect("write oversized policy");
+        assert!(matches!(
+            SecurityPolicy::load(&oversized),
+            Err(PolicyError::Read { .. })
+        ));
     }
 
     struct EmptyVulns;

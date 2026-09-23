@@ -238,19 +238,19 @@ fn deno_target() -> Result<&'static str> {
 /// The sidecar is a `sha256sum`-style manifest (`<hex>  <filename>`); only
 /// the line naming the vendor ZIP may contribute a digest.
 async fn fetch_checksum_sidecar(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     url: &str,
     filename: &str,
 ) -> Result<String> {
-    let response = client
-        .get(url)
-        .header("User-Agent", GITHUB_USER_AGENT)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .with_context(|| format!("Failed to fetch Deno checksum sidecar from {url}"))?
-        .error_for_status()
-        .with_context(|| format!("Deno checksum sidecar request failed: {url}"))?;
+    let response = crate::core::http::fetch_public_download_with_timeout(
+        url,
+        GITHUB_USER_AGENT,
+        Some(std::time::Duration::from_secs(30)),
+    )
+    .await
+    .with_context(|| format!("Failed to fetch Deno checksum sidecar from {url}"))?
+    .error_for_status()
+    .with_context(|| format!("Deno checksum sidecar request failed: {url}"))?;
 
     let length = response.content_length().unwrap_or(0);
     anyhow::ensure!(
@@ -343,6 +343,18 @@ fn available_version_names(versions: &[DenoVersion]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn checksum_sidecar_rejects_plain_http_before_request() {
+        let error = fetch_checksum_sidecar(
+            download_client(),
+            "http://192.0.2.1/checksums.sha256sum",
+            "deno.zip",
+        )
+        .await
+        .expect_err("plain HTTP sidecar must be rejected");
+        assert!(format!("{error:#}").contains("HTTPS"));
+    }
 
     fn ver(version: &str, prerelease: bool) -> DenoVersion {
         DenoVersion {

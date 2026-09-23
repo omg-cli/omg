@@ -16,8 +16,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::runtimes::common::{BudgetedReader, BudgetedWriter};
+
 const MAX_DECLARED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_MEMBERS: u64 = 100_000;
+// Tar headers, padding, and extended metadata need room beyond member data.
+const MAX_ARCHIVE_STREAM_BYTES: u64 = MAX_DECLARED_BYTES + MAX_MEMBERS * 1024;
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PRIVILEGED_FILES: usize = 256;
@@ -114,6 +118,10 @@ fn archive_sha256(path: &Path) -> Result<String> {
 }
 
 fn archive_reader(path: &Path) -> Result<Box<dyn Read>> {
+    archive_reader_with_limit(path, MAX_ARCHIVE_STREAM_BYTES)
+}
+
+fn archive_reader_with_limit(path: &Path, limit: u64) -> Result<Box<dyn Read>> {
     let mut file = File::open(path)?;
     let mut magic = [0_u8; 6];
     let magic_len = file.read(&mut magic)?;
@@ -122,19 +130,22 @@ fn archive_reader(path: &Path) -> Result<Box<dyn Read>> {
     if magic.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         let decoder = ruzstd::decoding::StreamingDecoder::new(file)
             .map_err(|error| anyhow::anyhow!("invalid zstd AUR archive: {error}"))?;
-        Ok(Box::new(decoder))
+        Ok(Box::new(BudgetedReader::new(decoder, limit)))
     } else if magic.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
         let temporary = tempfile::tempfile()?;
-        let mut output = std::io::BufWriter::new(temporary);
+        let mut output = BudgetedWriter::new(std::io::BufWriter::new(temporary), limit);
         lzma_rs::xz_decompress(&mut BufReader::new(file), &mut output)
-            .map_err(|error| anyhow::anyhow!("invalid xz AUR archive: {error}"))?;
-        let mut output = output.into_inner()?;
+            .map_err(|error| anyhow::anyhow!("invalid or oversized xz AUR archive: {error}"))?;
+        let mut output = output.into_inner().into_inner()?;
         output.rewind()?;
         Ok(Box::new(output))
     } else if magic.starts_with(&[0x1f, 0x8b]) {
-        Ok(Box::new(flate2::read::GzDecoder::new(file)))
+        Ok(Box::new(BudgetedReader::new(
+            flate2::read::GzDecoder::new(file),
+            limit,
+        )))
     } else {
-        Ok(Box::new(file))
+        Ok(Box::new(BudgetedReader::new(file, limit)))
     }
 }
 
@@ -396,6 +407,45 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_reader_bounds_expansion_for_each_compression_format() -> Result<()> {
+        let raw = vec![b'x'; 4096];
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&raw), &mut xz)?;
+        let mut gzip = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut encoder = flate2::write::GzEncoder::new(&mut gzip, flate2::Compression::fast());
+            encoder.write_all(&raw)?;
+            encoder.finish()?;
+        }
+        let zstd = zstd::stream::encode_all(&raw[..], 1)?;
+        for (kind, compressed) in [
+            ("xz", xz),
+            ("gzip", gzip),
+            ("zstd", zstd),
+            ("raw", raw.clone()),
+        ] {
+            let file = tempfile::NamedTempFile::new()?;
+            std::fs::write(file.path(), compressed)?;
+            let rejected = archive_reader_with_limit(file.path(), 1024);
+            match rejected {
+                Err(_) => {}
+                Ok(mut reader) => {
+                    let mut output = Vec::new();
+                    assert!(
+                        reader.read_to_end(&mut output).is_err(),
+                        "{kind} expansion must be bounded"
+                    );
+                }
+            }
+            let mut accepted = Vec::new();
+            archive_reader_with_limit(file.path(), 4096)?.read_to_end(&mut accepted)?;
+            assert_eq!(accepted, raw, "{kind} ordinary archive stream must survive");
+        }
+        Ok(())
+    }
 
     fn append_file(
         builder: &mut tar::Builder<flate2::write::GzEncoder<File>>,
