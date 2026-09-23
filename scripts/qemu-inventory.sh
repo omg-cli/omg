@@ -796,14 +796,19 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
     fi
   fi
-  start=$SECONDS
+  # Bash SECONDS follows wall-clock adjustments; WSL can step that clock
+  # backwards while a guest case runs. /proc/uptime uses boot-time monotonic
+  # time, so a passing case cannot acquire a negative elapsed duration.
+  read -r uptime _ < /proc/uptime
+  start_centis=${uptime/./}
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
   if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then budget=$((budget + 74)); fi
   if [[ "$case" == runtime-go-install ]]; then budget=$((budget + 210)); fi
   timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
-  elapsed=$((SECONDS - start))
+  read -r uptime _ < /proc/uptime
+  elapsed=$(( (10#${uptime/./} - 10#$start_centis) / 100 ))
   verdict=HARNESS_ERROR; rc=$transport
   receipt=$(tail -n 1 "$out/rows/$case.stdout.log")
   if [[ "$transport" == 0 && "$receipt" =~ ^OMG_QEMU_RECEIPT:(product|executor|dependency):([0-9]{1,3}):([01])$ ]]; then
