@@ -11,7 +11,13 @@ use common::TestProject;
 #[test]
 fn slsa_check_names_a_missing_file() {
     let project = TestProject::new();
-    let result = project.run(&["audit", "slsa", "ghost.bin"]);
+    let result = project.run(&[
+        "audit",
+        "slsa",
+        "--certificate-identity",
+        "release@example.invalid",
+        "ghost.bin",
+    ]);
     result.assert_failure();
     let output = result.combined_output();
     assert!(
@@ -30,12 +36,16 @@ fn slsa_check_attempts_verification_on_an_existing_file() {
     let project = TestProject::new();
     project.create_file("artifact.bin", "not-a-real-attestation\n");
 
-    let result = project.run(&["audit", "slsa", "artifact.bin"]);
+    let result = project.run(&[
+        "audit",
+        "slsa",
+        "--certificate-identity",
+        "release@example.invalid",
+        "artifact.bin",
+    ]);
     let output = result.combined_output();
     assert!(
-        output.contains("Checking SLSA provenance")
-            || output.contains("SLSA")
-            || output.contains("verification"),
+        output.contains("Verifying artifact signature for artifact.bin"),
         "existing artifact must reach verification, got:\n{output}"
     );
     assert!(
@@ -63,10 +73,16 @@ fn forged_self_asserted_account_does_not_paywall_slsa() {
     )
     .expect("write forged license fixture");
 
-    let result = project.run(&["audit", "slsa", "artifact.bin"]);
+    let result = project.run(&[
+        "audit",
+        "slsa",
+        "--certificate-identity",
+        "release@example.invalid",
+        "artifact.bin",
+    ]);
     let out = result.combined_output();
     assert!(
-        out.contains("SLSA verification failed") || out.contains("certificate-identity"),
+        out.contains("Verifying artifact signature for artifact.bin"),
         "a forged token must fail before any upgrade offer, got:\n{out}"
     );
     assert!(

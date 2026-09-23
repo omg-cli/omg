@@ -17801,7 +17801,7 @@
         }
       ]
     },
-    "35758a1d043ef2ee04179384736a60a789cf607424bcee808b4f2081a2bb6ff6": {
+    "43baa16302c229087adf3160c1d1846f79ea51d42eac7f9d12a4338e14070e7d": {
       "releases": [],
       "cases": [
         {
@@ -18295,7 +18295,23 @@
           "network_scope": "offline"
         },
         {
+          "id": "audit-scan-fail-on-findings",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
           "id": "audit-sbom-offline",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-sbom-inventory-only",
           "tiers": [
             "hermetic"
           ],

@@ -1249,7 +1249,9 @@ fn behavior_inventory_runs_in_hermetic_state() {
             issues.push("failure did not explain itself on stderr".to_string());
         }
         let audit_success = match case.id.as_str() {
-            "audit" | "audit-scan" => Some("No vulnerabilities found in scanned packages."),
+            "audit" | "audit-scan" | "audit-scan-fail-on-findings" => {
+                Some("No vulnerabilities found in scanned packages.")
+            }
             "audit-fix" | "audit-fix-flags" => Some("No vulnerabilities found!"),
             _ => None,
         };
@@ -1334,17 +1336,33 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 }
                 Assertion::Artifact(relative) => {
                     let path = project.path().join(relative);
-                    if std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|contents| {
-                            serde_json::from_str::<serde_json::Value>(&contents).ok()
-                        })
-                        .is_none()
-                    {
+                    let artifact = std::fs::read_to_string(&path).ok().and_then(|contents| {
+                        serde_json::from_str::<serde_json::Value>(&contents).ok()
+                    });
+                    if artifact.is_none() {
                         issues.push(format!(
                             "artifact {relative} was not written as valid JSON at {}",
                             path.display()
                         ));
+                    }
+                    if case.id == "audit-sbom-inventory-only" {
+                        let marked = artifact.as_ref().is_some_and(|report| {
+                            report["bomFormat"] == "CycloneDX"
+                                && report["metadata"]["component"]["properties"]
+                                    .as_array()
+                                    .is_some_and(|properties| {
+                                        properties.iter().any(|property| {
+                                            property["name"] == "omg:advisory-scan"
+                                                && property["value"] == "not-performed"
+                                        })
+                                    })
+                        });
+                        if !marked || !result.stdout.contains("advisory matching was skipped") {
+                            issues.push(
+                                "inventory-only SBOM did not label skipped advisory matching"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
                 Assertion::UpdateFastOutput
