@@ -222,6 +222,22 @@ printf '[package]\nname = "omg"\n' > "$task_dir/ambient/Cargo.toml"
   grep -Fqx -- 'export PATH="keep:$PATH"' "$HOME/.bashrc"
   [[ ! -e "$marker" ]]
 
+  legacy_line="export PATH=\"$INSTALL_DIR:\$PATH\""
+  printf '%s\n' "$legacy_line" >> "$HOME/.bashrc"
+  setup_shell
+  if grep -Fqx -- "$legacy_line" "$HOME/.bashrc"; then
+    printf 'Reinstall left unsafe legacy PATH line in bashrc\n' >&2
+    exit 1
+  fi
+  grep -Fqx -- "$path_line" "$HOME/.bashrc"
+  [[ ! -e "$marker" ]]
+  uninstall_omg
+  if grep -Fq -- "$INSTALL_DIR" "$HOME/.bashrc"; then
+    printf 'Uninstall left the migrated PATH line in bashrc\n' >&2
+    exit 1
+  fi
+  grep -Fqx -- 'export PATH="keep:$PATH"' "$HOME/.bashrc"
+
   INSTALL_DIR=bin
   if (setup_shell >/dev/null 2>&1); then
     printf 'relative INSTALL_DIR unexpectedly accepted\n' >&2
@@ -243,6 +259,7 @@ printf '[package]\nname = "omg"\n' > "$task_dir/ambient/Cargo.toml"
   set -e
   HOME="$task_dir/legacy-shell-home"
   INSTALL_DIR="$task_dir/legacy-bin"
+  PATH="$INSTALL_DIR:$PATH"
   mkdir -p "$HOME/.config/fish"
   header() { :; }
   info() { :; }
@@ -261,11 +278,13 @@ printf '[package]\nname = "omg"\n' > "$task_dir/ambient/Cargo.toml"
     printf '%s\n%s\n' "$legacy_line" 'export PATH="keep:$PATH"' > "$rc_file"
     SHELL="/bin/$shell_type"
     setup_shell
-    [[ $(grep -Fc -- "$legacy_line" "$rc_file") == 1 ]]
-    if grep -Fqx -- "$(shell_path_line "$shell_type")" "$rc_file"; then
-      printf 'Reinstall duplicated the legacy %s PATH entry\n' "$shell_type" >&2
+    if grep -Fqx -- "$legacy_line" "$rc_file"; then
+      printf 'Reinstall left the legacy %s PATH entry\n' "$shell_type" >&2
       exit 1
     fi
+    [[ $(grep -Fxc -- "$(shell_path_line "$shell_type")" "$rc_file") == 1 ]]
+    grep -Fqx -- "$legacy_line" "$rc_file.omg-backup"
+    printf '%s\n' "$legacy_line" >> "$rc_file"
   done
   uninstall_omg
   for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.config/fish/config.fish"; do

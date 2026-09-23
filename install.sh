@@ -1134,17 +1134,33 @@ setup_shell() {
     ;;
   esac
 
-  # Ensure PATH
-  if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    if [[ -f "$rc_file" ]]; then
-      local path_line legacy_path_line
-      path_line=$(shell_path_line "$shell_type")
-      legacy_path_line=$(legacy_shell_path_line "$shell_type")
-      if ! grep -Fqx -- "$path_line" "$rc_file" &&
-        ! grep -Fqx -- "$legacy_path_line" "$rc_file"; then
-        printf '%s\n' "$path_line" >>"$rc_file"
-        success "Added $INSTALL_DIR to PATH in $rc_file"
-      fi
+  # Ensure PATH. Upgrade the exact line written by older installers even if
+  # this process already has INSTALL_DIR in PATH: that line was not shell-quoted.
+  if [[ -f "$rc_file" ]]; then
+    local path_line legacy_path_line
+    path_line=$(shell_path_line "$shell_type")
+    legacy_path_line=$(legacy_shell_path_line "$shell_type")
+    if grep -Fqx -- "$legacy_path_line" "$rc_file"; then
+      cp "$rc_file" "$rc_file.omg-backup" || error "Failed to back up shell configuration"
+      local migrated
+      migrated=$(mktemp "${rc_file}.omg-upgrade.XXXXXX") || error "Failed to stage shell upgrade"
+      cp -p "$rc_file" "$migrated" || error "Failed to preserve shell file permissions"
+      OMG_PATH_LINE="$path_line" OMG_LEGACY_PATH_LINE="$legacy_path_line" awk '
+        $0 == ENVIRON["OMG_LEGACY_PATH_LINE"] {
+          if (!seen) { print ENVIRON["OMG_PATH_LINE"]; seen = 1 }
+          next
+        }
+        $0 == ENVIRON["OMG_PATH_LINE"] {
+          if (seen) next
+          seen = 1
+        }
+        { print }
+      ' "$rc_file" >"$migrated" || error "Failed to upgrade shell PATH entry"
+      mv "$migrated" "$rc_file" || error "Failed to update shell PATH entry"
+      success "Upgraded $INSTALL_DIR PATH entry in $rc_file (backup at $rc_file.omg-backup)"
+    elif [[ ":$PATH:" != *":$INSTALL_DIR:"* ]] && ! grep -Fqx -- "$path_line" "$rc_file"; then
+      printf '%s\n' "$path_line" >>"$rc_file"
+      success "Added $INSTALL_DIR to PATH in $rc_file"
     fi
   fi
 
