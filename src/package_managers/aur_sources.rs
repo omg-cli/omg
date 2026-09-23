@@ -4,8 +4,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
 
 const MAX_AUR_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_GIT_MIRROR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_GIT_MIRROR_ENTRIES: usize = 200_000;
+const MAX_GIT_STDERR_BYTES: u64 = 1024 * 1024;
+const MAX_GIT_CLONE_DURATION: Duration = Duration::from_secs(15 * 60);
 
 use alpm_srcinfo::SourceInfoV1;
 use anyhow::{Context, Result};
@@ -235,11 +241,11 @@ pub async fn prefetch_vcs_sources(sources: &[VcsSource], srcdest: &Path) -> VcsP
         }
 
         let destination = srcdest.join(&source.filename);
-        if is_populated_directory(&destination).await {
+        // Reusing an existing mirror never invokes the unsandboxed host fetch.
+        if source.protocol == "git" && is_populated_directory(&destination).await {
             summary.cached.push(source.raw.clone());
             continue;
         }
-
         if source.protocol != "git" || !is_prefetchable_git_url(&source.url) {
             summary.needs_network.push(source.raw.clone());
             continue;
@@ -282,15 +288,197 @@ async fn is_populated_directory(path: &Path) -> bool {
 
 /// Schemes omg is willing to mirror on its own.
 ///
-/// Plain `http://` and `git://` are excluded because the transport is
-/// unauthenticated; those keep requiring the explicit `aur.allow_network`
-/// opt-in (makepkg then fetches them inside the sandbox).
+/// Only public HTTPS sources may be fetched by the unsandboxed host helper.
+/// Other transports require the explicit build-network opt-in.
 fn is_prefetchable_git_url(url: &str) -> bool {
-    url.starts_with("https://") || url.starts_with("ssh://") || url.starts_with("file://")
+    reqwest::Url::parse(url).is_ok_and(|parsed| {
+        parsed.scheme() == "https"
+            && parsed.host_str().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && !crate::core::http::is_private_or_local_host(parsed.host_str())
+    })
+}
+
+#[derive(Clone, Copy)]
+struct GitCloneLimits {
+    output_bytes: u64,
+    staging_bytes: u64,
+    duration: Duration,
+    poll_interval: Duration,
+}
+
+fn check_git_staging_budget(path: &Path, byte_limit: u64) -> Result<()> {
+    let mut pending = vec![path.to_path_buf()];
+    let mut entries = 0usize;
+    let mut total = 0u64;
+    while let Some(path) = pending.pop() {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Inspecting {}", path.display()));
+            }
+        };
+        entries += 1;
+        anyhow::ensure!(
+            entries <= MAX_GIT_MIRROR_ENTRIES,
+            "AUR Git mirror has too many staged entries"
+        );
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        } else {
+            total = total
+                .checked_add(metadata.len())
+                .context("AUR Git mirror size overflowed")?;
+            anyhow::ensure!(
+                total <= byte_limit,
+                "AUR Git mirror exceeded the staged-byte limit"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn monitor_git_staging(path: &Path, limits: GitCloneLimits) -> Result<()> {
+    loop {
+        tokio::time::sleep(limits.poll_interval).await;
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || check_git_staging_budget(&path, limits.staging_bytes))
+            .await??;
+    }
+}
+
+fn terminate_git_clone_group(process_group: u32) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    let process_group = i32::try_from(process_group).context("Git process ID exceeded i32")?;
+    match killpg(Pid::from_raw(process_group), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error).context("Failed to terminate AUR Git clone process group"),
+    }
+}
+
+struct GitCloneGroupGuard(Option<u32>);
+
+impl GitCloneGroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GitCloneGroupGuard {
+    fn drop(&mut self) {
+        if let Some(process_group) = self.0 {
+            let _ = terminate_git_clone_group(process_group);
+        }
+    }
+}
+
+async fn run_bounded_git_clone(
+    command: &mut tokio::process::Command,
+    staging_path: &Path,
+    limits: GitCloneLimits,
+) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
+
+    command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    let mut child = command
+        .spawn()
+        .context("Failed to run git clone --mirror")?;
+    let process_group = child.id().context("Git clone has no process ID")?;
+    // A cancelled prefetch drops this guard and kills Git's helpers too;
+    // kill_on_drop alone only terminates the direct child.
+    let mut group_guard = GitCloneGroupGuard(Some(process_group));
+    let stderr = child
+        .stderr
+        .take()
+        .context("Git clone has no stderr pipe")?;
+    let result = tokio::time::timeout(limits.duration, async {
+        tokio::select! {
+            completed = async {
+                let wait = async { Ok::<_, anyhow::Error>(child.wait().await?) };
+                let capture = async {
+                    let mut output = Vec::new();
+                    stderr.take(limits.output_bytes + 1).read_to_end(&mut output).await?;
+                    anyhow::ensure!(
+                        output.len() as u64 <= limits.output_bytes,
+                        "AUR Git clone exceeded its captured-output limit"
+                    );
+                    Ok::<_, anyhow::Error>(output)
+                };
+                tokio::try_join!(wait, capture)
+            } => completed,
+            monitored = monitor_git_staging(staging_path, limits) => {
+                monitored?;
+                anyhow::bail!("AUR Git mirror monitor stopped unexpectedly")
+            },
+        }
+    })
+    .await;
+    let (status, output) = match result {
+        Ok(Ok(completed)) => completed,
+        Ok(Err(error)) => {
+            terminate_git_clone_group(process_group)?;
+            child.wait().await.context("Failed to reap AUR Git clone")?;
+            group_guard.disarm();
+            return Err(error);
+        }
+        Err(_) => {
+            terminate_git_clone_group(process_group)?;
+            child
+                .wait()
+                .await
+                .context("Failed to reap timed-out AUR Git clone")?;
+            group_guard.disarm();
+            anyhow::bail!("AUR Git clone exceeded its duration limit");
+        }
+    };
+    check_git_staging_budget(staging_path, limits.staging_bytes)?;
+    group_guard.disarm();
+    Ok((status, output))
 }
 
 /// `git clone --mirror` a source into its SRCDEST entry, atomically.
 async fn mirror_git_repository(url: &str, destination: &Path) -> Result<()> {
+    anyhow::ensure!(
+        is_prefetchable_git_url(url),
+        "AUR VCS prefetch requires a public HTTPS URL"
+    );
+    let parsed = reqwest::Url::parse(url)?;
+    let host = parsed
+        .host_str()
+        .context("AUR Git URL has no host")?
+        .to_owned();
+    let port = parsed
+        .port_or_known_default()
+        .context("AUR Git URL has no port")?;
+    let addresses: Vec<_> = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await??
+    .collect();
+    anyhow::ensure!(
+        !addresses.is_empty()
+            && addresses
+                .iter()
+                .all(|address| crate::core::http::is_public_address(address.ip())),
+        "AUR Git source resolves to a non-public address"
+    );
+    let address = match addresses[0].ip() {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    let pinned_address = format!("{host}:{port}:{address}");
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     tokio::fs::create_dir_all(parent).await.ok();
 
@@ -330,6 +518,20 @@ async fn mirror_git_repository(url: &str, destination: &Path) -> Result<()> {
 
     let mut command = tokio::process::Command::new("git");
     command
+        .arg("-c")
+        .arg(format!("http.curloptResolve={pinned_address}"))
+        .arg("-c")
+        .arg("http.followRedirects=false")
+        .arg("-c")
+        .arg("http.proxy=")
+        .arg("-c")
+        .arg("protocol.file.allow=never")
+        .arg("-c")
+        .arg("protocol.ssh.allow=never")
+        .arg("-c")
+        .arg("protocol.git.allow=never")
+        .arg("-c")
+        .arg("protocol.ext.allow=never")
         .arg("clone")
         .arg("--mirror")
         .arg("--origin=origin")
@@ -338,24 +540,27 @@ async fn mirror_git_repository(url: &str, destination: &Path) -> Result<()> {
         .arg(&staging_path)
         // The URL comes from an untrusted PKGBUILD: never read ambient or
         // repository configuration and never prompt for credentials.
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_ASKPASS")
-        .env_remove("SSH_ASKPASS");
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
 
-    let output = command
-        .output()
-        .await
-        .context("Failed to run git clone --mirror")?;
-    let stderr =
-        crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));
+    let (status, output) = run_bounded_git_clone(
+        &mut command,
+        &staging_path,
+        GitCloneLimits {
+            output_bytes: MAX_GIT_STDERR_BYTES,
+            staging_bytes: MAX_GIT_MIRROR_BYTES,
+            duration: MAX_GIT_CLONE_DURATION,
+            poll_interval: Duration::from_millis(250),
+        },
+    )
+    .await?;
+    let stderr = crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output));
     anyhow::ensure!(
-        output.status.success(),
+        status.success(),
         "git clone --mirror failed for {url}: {}",
         stderr.trim()
     );
@@ -519,32 +724,6 @@ pub async fn download_sources(sources: Vec<SourceFile>, srcdest: &Path) -> Sourc
 
 /// Resolve and pin public addresses on every hop. Disable ambient proxies and
 /// automatic redirects so neither DNS rebinding nor a redirect reaches the LAN.
-fn public_source_address(address: std::net::IpAddr) -> bool {
-    match address {
-        std::net::IpAddr::V4(ip) => {
-            let [a, b, _, _] = ip.octets();
-            !ip.is_private()
-                && !ip.is_loopback()
-                && !ip.is_link_local()
-                && !ip.is_unspecified()
-                && !ip.is_documentation()
-                && !ip.is_broadcast()
-                && a != 0
-                && a < 224
-                && !(a == 100 && (64..=127).contains(&b))
-                && !(a == 192 && b == 0)
-                && !(a == 198 && (18..=19).contains(&b))
-        }
-        std::net::IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            segments[0] & 0xe000 == 0x2000
-                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
-                && !(segments[0] == 0x2001 && segments[1] == 0)
-                && segments[0] != 0x2002
-        }
-    }
-}
-
 async fn fetch_public_source(value: &str) -> Result<reqwest::Response> {
     let mut url = reqwest::Url::parse(value)?;
     for _ in 0..=10 {
@@ -566,7 +745,7 @@ async fn fetch_public_source(value: &str) -> Result<reqwest::Response> {
             !addresses.is_empty()
                 && addresses
                     .iter()
-                    .all(|address| public_source_address(address.ip())),
+                    .all(|address| crate::core::http::is_public_address(address.ip())),
             "AUR source resolves to a non-public address"
         );
         // Redirects stay manual (Policy::none): each hop must re-resolve and
@@ -787,10 +966,16 @@ mod public_source_tests {
             "2002:7f00:1::",
             "2001:db8::1",
         ] {
-            assert!(!public_source_address(value.parse().unwrap()), "{value}");
+            assert!(
+                !crate::core::http::is_public_address(value.parse().unwrap()),
+                "{value}"
+            );
         }
         for value in ["1.1.1.1", "2606:4700:4700::1111"] {
-            assert!(public_source_address(value.parse().unwrap()), "{value}");
+            assert!(
+                crate::core::http::is_public_address(value.parse().unwrap()),
+                "{value}"
+            );
         }
     }
     #[tokio::test]
@@ -869,11 +1054,14 @@ mod public_source_tests {
     }
 
     #[test]
-    fn only_authenticated_transports_are_mirrored_by_omg() {
+    fn only_public_https_git_urls_are_eligible_for_host_prefetch() {
         assert!(is_prefetchable_git_url("https://example.com/repo.git"));
-        assert!(is_prefetchable_git_url("ssh://git@example.com/repo.git"));
-        assert!(is_prefetchable_git_url("file:///srv/repo.git"));
-        // Unauthenticated transports keep requiring `aur.allow_network`.
+        assert!(!is_prefetchable_git_url("ssh://git@example.com/repo.git"));
+        assert!(!is_prefetchable_git_url("file:///srv/repo.git"));
+        assert!(!is_prefetchable_git_url("https://127.0.0.1/repo.git"));
+        assert!(!is_prefetchable_git_url(
+            "https://user:secret@example.com/repo.git"
+        ));
         assert!(!is_prefetchable_git_url("http://example.com/repo.git"));
         assert!(!is_prefetchable_git_url("git://example.com/repo.git"));
     }
@@ -895,7 +1083,7 @@ mod public_source_tests {
     }
 
     #[tokio::test]
-    async fn git_sources_are_mirrored_into_srcdest_and_then_cached() {
+    async fn prepopulated_git_mirror_is_reused_without_network_for_any_transport() {
         let temp = tempfile::tempdir().expect("tempdir");
         let origin = temp.path().join("origin");
         std::fs::create_dir_all(&origin).expect("create origin");
@@ -927,27 +1115,121 @@ mod public_source_tests {
 
         let srcdest = temp.path().join("srcdest");
         std::fs::create_dir_all(&srcdest).expect("create srcdest");
-        let source = VcsSource {
-            protocol: "git".to_string(),
-            url: format!("file://{}", origin.display()),
-            filename: "mirror".to_string(),
-            raw: "git+file:///origin#tag=v1".to_string(),
+        let status = std::process::Command::new("git")
+            .args(["clone", "--mirror", "--"])
+            .arg(format!("file://{}", origin.display()))
+            .arg(srcdest.join("mirror"))
+            .status()
+            .expect("git clone fixture");
+        assert!(status.success());
+        for url in [
+            "https://example.com/repo.git",
+            "ssh://git@example.com/repo.git",
+            "file:///srv/private.git",
+        ] {
+            let source = VcsSource {
+                protocol: "git".to_string(),
+                url: url.to_string(),
+                filename: "mirror".to_string(),
+                raw: format!("git+{url}#tag=v1"),
+            };
+            let summary = prefetch_vcs_sources(std::slice::from_ref(&source), &srcdest).await;
+            assert_eq!(
+                summary.cached.len(),
+                1,
+                "mirror must be reused: {summary:?}"
+            );
+            assert!(summary.prefetched.is_empty(), "{summary:?}");
+            assert!(summary.needs_network.is_empty(), "{summary:?}");
+        }
+        assert!(srcdest.join("mirror").join("objects").is_dir());
+    }
+
+    #[tokio::test]
+    async fn host_git_clone_has_output_duration_and_staging_budgets() {
+        let temp = tempfile::tempdir().expect("isolated Git staging");
+        let staging = temp.path().join("mirror");
+        std::fs::create_dir(&staging).expect("staging directory");
+        let limits = GitCloneLimits {
+            output_bytes: 64,
+            staging_bytes: 64,
+            duration: Duration::from_millis(500),
+            poll_interval: Duration::from_millis(10),
         };
 
-        let first = prefetch_vcs_sources(std::slice::from_ref(&source), &srcdest).await;
-        assert_eq!(
-            first.prefetched.len(),
-            1,
-            "mirror must be created: {first:?}"
-        );
-        assert!(first.needs_network.is_empty(), "{first:?}");
-        // A bare mirror keeps the tag makepkg checks out for `#tag=`.
-        assert!(srcdest.join("mirror").join("objects").is_dir());
+        let mut noisy = tokio::process::Command::new("sh");
+        noisy.args(["-c", "head -c 4096 /dev/zero >&2"]);
+        let error = run_bounded_git_clone(&mut noisy, &staging, limits)
+            .await
+            .expect_err("excessive Git output must fail");
+        assert!(format!("{error:#}").contains("captured-output limit"));
 
-        // A second pass must reuse the mirror instead of re-cloning.
-        let second = prefetch_vcs_sources(std::slice::from_ref(&source), &srcdest).await;
-        assert_eq!(second.cached.len(), 1, "mirror must be reused: {second:?}");
-        assert!(second.prefetched.is_empty(), "{second:?}");
+        let mut stalled = tokio::process::Command::new("sh");
+        stalled.args(["-c", "sleep 10"]);
+        let error = run_bounded_git_clone(&mut stalled, &staging, limits)
+            .await
+            .expect_err("stalled Git clone must fail");
+        assert!(format!("{error:#}").contains("duration limit"));
+
+        let mut oversized = tokio::process::Command::new("sh");
+        oversized
+            .current_dir(&staging)
+            .args(["-c", "head -c 4096 /dev/zero > payload; sleep 10"]);
+        let error = run_bounded_git_clone(&mut oversized, &staging, limits)
+            .await
+            .expect_err("oversized Git mirror must fail");
+        assert!(format!("{error:#}").contains("staged-byte limit"));
+
+        let normal_staging = temp.path().join("normal");
+        std::fs::create_dir(&normal_staging).expect("normal staging directory");
+        let mut normal = tokio::process::Command::new("sh");
+        normal
+            .current_dir(&normal_staging)
+            .args(["-c", "printf ok >&2; printf x > payload"]);
+        let (status, stderr) = run_bounded_git_clone(&mut normal, &normal_staging, limits)
+            .await
+            .expect("small Git output and mirror must be accepted");
+        assert!(status.success());
+        assert_eq!(stderr, b"ok");
+    }
+
+    #[tokio::test]
+    async fn cancelling_host_git_clone_terminates_descendants() {
+        let temp = tempfile::tempdir().expect("isolated Git staging");
+        let staging = temp.path().join("mirror");
+        std::fs::create_dir(&staging).expect("staging directory");
+        let ready = staging.join("ready");
+        let survived = staging.join("survived");
+        let task_staging = staging.clone();
+        let worker = tokio::spawn(async move {
+            let mut command = tokio::process::Command::new("sh");
+            command.current_dir(&task_staging).args([
+                "-c",
+                "printf ready > ready; (sleep 1; printf survived > survived) & wait",
+            ]);
+            run_bounded_git_clone(
+                &mut command,
+                &task_staging,
+                GitCloneLimits {
+                    output_bytes: 64,
+                    staging_bytes: 1024,
+                    duration: Duration::from_secs(10),
+                    poll_interval: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("clone fixture started");
+        worker.abort();
+        let _ = worker.await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!survived.exists(), "cancelled Git descendants must not run");
     }
 
     #[tokio::test]
@@ -969,10 +1251,16 @@ mod public_source_tests {
                 filename: "repo".to_string(),
                 raw: "git+http://example.com/repo.git".to_string(),
             },
+            VcsSource {
+                protocol: "git".to_string(),
+                url: "file:///srv/private.git".to_string(),
+                filename: "private".to_string(),
+                raw: "git+file:///srv/private.git".to_string(),
+            },
         ];
 
         let summary = prefetch_vcs_sources(&sources, &srcdest).await;
-        assert_eq!(summary.needs_network.len(), 2, "{summary:?}");
+        assert_eq!(summary.needs_network.len(), 3, "{summary:?}");
         assert!(summary.prefetched.is_empty(), "{summary:?}");
     }
 }

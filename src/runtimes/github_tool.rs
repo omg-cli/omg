@@ -484,19 +484,18 @@ impl GenericToolManager {
             .browser_download_url
             .clone()
             .with_context(|| format!("Checksum sidecar has no download URL: {sidecar_name}"))?;
-        let text = self
-            .client
-            .get(&url)
-            .header("User-Agent", GITHUB_USER_AGENT)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .with_context(|| format!("Failed to fetch checksum sidecar {sidecar_name}"))?
-            .error_for_status()
-            .with_context(|| format!("Checksum sidecar request failed: {sidecar_name}"))?
-            .bounded_text()
-            .await
-            .with_context(|| format!("Failed to read checksum sidecar {sidecar_name}"))?;
+        let text = crate::core::http::fetch_public_download_with_timeout(
+            &url,
+            GITHUB_USER_AGENT,
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .await
+        .with_context(|| format!("Failed to fetch checksum sidecar {sidecar_name}"))?
+        .error_for_status()
+        .with_context(|| format!("Checksum sidecar request failed: {sidecar_name}"))?
+        .bounded_text()
+        .await
+        .with_context(|| format!("Failed to read checksum sidecar {sidecar_name}"))?;
         checksum_document(&text, &asset.name, asset_specific)
     }
 

@@ -61,6 +61,8 @@ static PAIRED_BUILD_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 const MAX_PKGBUILD_REVIEW_BYTES: usize = 1024 * 1024;
 const SANDBOX_FAKEROOT_ENV: (&str, &str) = ("FAKEROOTDONTTRYCHOWN", "1");
 const MAX_PKGINFO_BYTES: u64 = 128 * 1024;
+const MAX_AUR_BUILD_LOG_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_AUR_BUILD_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 /// Pre-computed length of the AUR RPC info base URL (47 bytes)
 const AUR_RPC_INFO_BASE_LEN: usize = 47;
 
@@ -1002,9 +1004,27 @@ async fn confirm_prompt(prompt: String, default: bool) -> Result<bool> {
     .context("PKGBUILD review prompt task failed")??)
 }
 
+struct BuildLog {
+    file: tokio::fs::File,
+    bytes: u64,
+    limit: u64,
+}
+
+fn terminate_build_group(group: u32) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    let group = i32::try_from(group).context("AUR build process ID exceeded i32")?;
+    match killpg(Pid::from_raw(group), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error).context("Failed to terminate AUR build process group"),
+    }
+}
+
 async fn drain_build_output<R>(
     mut reader: R,
-    log: Arc<tokio::sync::Mutex<tokio::fs::File>>,
+    log: Arc<tokio::sync::Mutex<BuildLog>>,
     stream: BuildOutputStream,
     verbose: bool,
 ) -> std::io::Result<()>
@@ -1012,8 +1032,6 @@ where
     R: AsyncRead + Unpin,
 {
     let mut buffer = [0_u8; 16 * 1024];
-    let mut log_error = None;
-    let mut log_writable = true;
     let mut terminal_writable = verbose;
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
@@ -1025,12 +1043,19 @@ where
         }
         let chunk = &buffer[..read];
 
-        if log_writable {
-            let result = log.lock().await.write_all(chunk).await;
-            if let Err(error) = result {
-                log_writable = false;
-                log_error = Some(error);
+        {
+            let mut log = log.lock().await;
+            let next = log
+                .bytes
+                .checked_add(read as u64)
+                .ok_or_else(|| std::io::Error::other("AUR build log byte count overflowed"))?;
+            if next > log.limit {
+                return Err(std::io::Error::other(
+                    "AUR build log exceeded its byte limit",
+                ));
             }
+            log.file.write_all(chunk).await?;
+            log.bytes = next;
         }
 
         if terminal_writable {
@@ -1045,11 +1070,7 @@ where
         }
     }
 
-    if let Some(error) = log_error {
-        Err(error)
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3819,6 +3840,22 @@ impl AurClient {
         command: &mut Command,
         package: &str,
     ) -> Result<std::process::ExitStatus> {
+        self.run_logged_build_command_with_limits(
+            command,
+            package,
+            MAX_AUR_BUILD_LOG_BYTES,
+            MAX_AUR_BUILD_DURATION,
+        )
+        .await
+    }
+
+    async fn run_logged_build_command_with_limits(
+        &self,
+        command: &mut Command,
+        package: &str,
+        max_log_bytes: u64,
+        max_duration: Duration,
+    ) -> Result<std::process::ExitStatus> {
         let log_path = self.build_log_path(package);
         let log_dir = log_path
             .parent()
@@ -3837,7 +3874,11 @@ impl AurClient {
             .open(&log_path)
             .await
             .with_context(|| format!("Failed to create build log: {}", log_path.display()))?;
-        let log = Arc::new(tokio::sync::Mutex::new(log));
+        let log = Arc::new(tokio::sync::Mutex::new(BuildLog {
+            file: log,
+            bytes: 0,
+            limit: max_log_bytes,
+        }));
 
         let progress = crate::cli::modern_ui::aur_build_progress(package, &log_path);
         let verbose =
@@ -3847,9 +3888,11 @@ impl AurClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        command.process_group(0);
         let mut child = command
             .spawn()
             .with_context(|| format!("Failed to start AUR build for '{package}'"))?;
+        let process_group = child.id().context("AUR build has no process ID")?;
         let stdout = child
             .stdout
             .take()
@@ -3871,21 +3914,39 @@ impl AurClient {
             BuildOutputStream::Stderr,
             verbose,
         ));
-        let (status, stdout_result, stderr_result) =
-            tokio::join!(child.wait(), stdout_capture, stderr_capture);
+        let result = tokio::time::timeout(max_duration, async {
+            tokio::try_join!(child.wait(), stdout_capture, stderr_capture)
+        })
+        .await;
 
-        let status = match status {
-            Ok(status) => status,
-            Err(error) => {
+        let status = match result {
+            Ok(Ok((status, (), ()))) => status,
+            Ok(Err(error)) => {
+                terminate_build_group(process_group)?;
+                child
+                    .wait()
+                    .await
+                    .context("Failed to reap AUR build after output error")?;
                 progress.finish(false);
-                return Err(error).context("Failed while waiting for AUR build");
+                return Err(error).context("AUR build output capture failed");
+            }
+            Err(_) => {
+                terminate_build_group(process_group)?;
+                child
+                    .wait()
+                    .await
+                    .context("Failed to reap timed-out AUR build")?;
+                progress.finish(false);
+                anyhow::bail!(
+                    "AUR build exceeded the {}-second duration limit",
+                    max_duration.as_secs()
+                );
             }
         };
         let capture_result: Result<()> = async {
-            stdout_result.context("Failed to capture AUR build stdout")?;
-            stderr_result.context("Failed to capture AUR build stderr")?;
             log.lock()
                 .await
+                .file
                 .flush()
                 .await
                 .context("Failed to flush AUR build log")?;
@@ -5567,7 +5628,11 @@ mod tests {
         let log = tokio::fs::File::create(&log_path)
             .await
             .expect("create build log");
-        let log = Arc::new(tokio::sync::Mutex::new(log));
+        let log = Arc::new(tokio::sync::Mutex::new(BuildLog {
+            file: log,
+            bytes: 0,
+            limit: MAX_AUR_BUILD_LOG_BYTES,
+        }));
         let (mut writer, reader) = tokio::io::duplex(128);
 
         writer
@@ -5584,7 +5649,12 @@ mod tests {
         ))
         .await
         .expect("drain output");
-        log.lock().await.flush().await.expect("flush build log");
+        log.lock()
+            .await
+            .file
+            .flush()
+            .await
+            .expect("flush build log");
 
         assert_eq!(
             tokio::fs::read_to_string(log_path)
@@ -5592,6 +5662,53 @@ mod tests {
                 .expect("read build log"),
             "compiler output\n"
         );
+    }
+
+    #[tokio::test]
+    async fn build_runner_stops_unbounded_output_and_duration() {
+        let directory = tempfile::tempdir().expect("isolated build logs");
+        let client = AurClient {
+            build_dir: directory.path().to_path_buf(),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut noisy = Command::new("sh");
+        noisy.args(["-c", "head -c 4096 /dev/zero"]);
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.run_logged_build_command_with_limits(
+                &mut noisy,
+                "noisy",
+                64,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("noisy build must stop promptly")
+        .expect_err("oversized output must fail");
+        assert!(format!("{error:#}").contains("log exceeded its byte limit"));
+        assert!(
+            std::fs::metadata(client.build_log_path("noisy"))
+                .expect("bounded log")
+                .len()
+                <= 64
+        );
+
+        let mut stalled = Command::new("sh");
+        stalled.args(["-c", "sleep 10"]);
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.run_logged_build_command_with_limits(
+                &mut stalled,
+                "stalled",
+                64,
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("stalled build must stop promptly")
+        .expect_err("stalled build must fail");
+        assert!(format!("{error:#}").contains("duration limit"));
     }
 
     #[test]

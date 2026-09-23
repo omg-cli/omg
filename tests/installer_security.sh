@@ -44,13 +44,12 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
       fi
     }
     calculate_sha256() { printf '%064d\n' 0; }
-    command() {
-      if [[ "$scenario" == missing && "$*" == '-v gh' ]]; then return 1; fi
-      builtin command "$@"
-    }
-    gh() {
-      printf '%s\n' "$@" > "$scenario_dir/gh-args"
-      [[ "$scenario" != rejected ]]
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "%s/gh-args"\n[[ "%s" != rejected ]]\n' \
+      "$scenario_dir" "$scenario" > "$scenario_dir/gh"
+    chmod +x "$scenario_dir/gh"
+    trusted_gh() {
+      [[ "$scenario" != missing ]] || return 1
+      printf '%s\n' "$scenario_dir/gh"
     }
     tar() {
       touch "$scenario_dir/extracted"
@@ -188,4 +187,61 @@ done
 mkdir -p "$task_dir/ambient"
 printf '[package]\nname = "omg"\n' > "$task_dir/ambient/Cargo.toml"
 { cat "$task_dir/functions.sh"; printf '\n[[ "$IS_SOURCE_INSTALL" == false ]]\n'; } | (cd "$task_dir/ambient"; bash)
+
+# A custom install path is data, even when it contains shell syntax and
+# regular-expression metacharacters. Shell setup and uninstall must round-trip
+# the exact line without executing or matching another rc entry.
+(
+  set --
+  source "$task_dir/functions.sh"
+  trap - EXIT
+  HOME="$task_dir/shell-home"
+  SHELL=/bin/bash
+  mkdir -p "$HOME"
+  marker="$task_dir/injected"
+  INSTALL_DIR="$task_dir/bin'\";touch $marker;#[.*]"
+  printf '# omg hook already configured\nexport PATH="keep:$PATH"\n' > "$HOME/.bashrc"
+  header() { :; }
+  info() { :; }
+  success() { :; }
+  setup_shell
+  path_line=$(shell_path_line bash)
+  grep -Fqx -- "$path_line" "$HOME/.bashrc"
+  restored_path=$(bash --noprofile --rcfile "$HOME/.bashrc" -ic 'printf "%s" "$PATH"' 2>/dev/null)
+  [[ "$restored_path" == "$INSTALL_DIR:"* ]]
+  [[ ! -e "$marker" ]]
+  uninstall_omg
+  ! grep -Fqx -- "$path_line" "$HOME/.bashrc"
+  grep -Fqx -- 'export PATH="keep:$PATH"' "$HOME/.bashrc"
+  [[ ! -e "$marker" ]]
+
+  INSTALL_DIR=bin
+  if (setup_shell >/dev/null 2>&1); then
+    printf 'relative INSTALL_DIR unexpectedly accepted\n' >&2
+    exit 1
+  fi
+  ! grep -Fq -- 'export PATH='"'bin'" "$HOME/.bashrc"
+)
+
+# A fixed location is not sufficient if the selected binary or a directory
+# leading to it can be replaced by another user.
+if [[ "$EUID" == 0 ]]; then
+  (
+    source "$task_dir/functions.sh"
+    trap - EXIT
+    gh_candidate_is_trusted /usr/bin/true >/dev/null
+    if [[ -L /bin ]]; then
+      [[ "$(gh_candidate_is_trusted /bin/true)" == /bin/true ]]
+    fi
+    if [[ -L /usr/bin/sh ]]; then
+      [[ -n "$(gh_candidate_is_trusted /usr/bin/sh)" ]]
+    fi
+    mkdir -p "$task_dir/untrusted-gh"
+    cp /usr/bin/true "$task_dir/untrusted-gh/gh"
+    chmod 777 "$task_dir/untrusted-gh/gh"
+    ! gh_candidate_is_trusted "$task_dir/untrusted-gh/gh"
+    ln -s /usr/bin/true "$task_dir/untrusted-gh/link"
+    ! gh_candidate_is_trusted "$task_dir/untrusted-gh/link"
+  )
+fi
 printf 'Installer security scenarios passed\n'
