@@ -505,6 +505,7 @@ impl TargetExpectations {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Assertion {
     AuditSourceFailure,
+    AuditFixRefusal,
     SbomSourceFailure,
     JsonStdout,
     Artifact(String),
@@ -522,6 +523,7 @@ impl Assertion {
     fn parse(raw: &str, line_number: usize) -> Self {
         match raw {
             "audit-source-failure" => Self::AuditSourceFailure,
+            "audit-fix-refusal" => Self::AuditFixRefusal,
             "sbom-source-failure" => Self::SbomSourceFailure,
             "json-stdout" => Self::JsonStdout,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
@@ -1206,6 +1208,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
         // unavailable advisory source. This fixture has an empty mock inventory,
         // so its distinct contract is a completed empty scan with exit zero.
         let expected_exit = if case.assertions.contains(&Assertion::AuditSourceFailure)
+            || case.assertions.contains(&Assertion::AuditFixRefusal)
             || case.assertions.contains(&Assertion::SbomSourceFailure)
         {
             0
@@ -1280,7 +1283,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         );
                     }
                 }
-                Assertion::AuditSourceFailure => {
+                Assertion::AuditSourceFailure | Assertion::AuditFixRefusal => {
                     assert!(
                         audit_success.is_some(),
                         "audit assertion requires an explicit empty-inventory oracle"
