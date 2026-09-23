@@ -85,6 +85,11 @@ evidence=$(realpath "$2")
 [[ -x "$bin" && -x "$daemon" && -d "$evidence" ]] || exit 1
 export LC_ALL=C NO_COLOR=1
 unset OMG_DISABLE_DAEMON OMG_NO_DAEMON
+case "${OMG_QEMU_ACCEL:-kvm}" in
+  kvm) readiness_attempts=30; child_attempts=100; command_timeout=15; status_timeout=5 ;;
+  tcg) readiness_attempts=300; child_attempts=300; command_timeout=60; status_timeout=30 ;;
+  *) printf 'Unsupported QEMU acceleration mode: %s\n' "$OMG_QEMU_ACCEL" >&2; exit 2 ;;
+esac
 state=$(mktemp -d "$HOME/omg-daemon-check.XXXXXX")
 chmod 700 "$state"
 export OMG_SOCKET_PATH="$state/omg.sock"
@@ -92,10 +97,10 @@ export OMG_DATA_DIR="$state/data" OMG_DAEMON_DATA_DIR="$state/daemon"
 export OMG_CACHE_DIR="$state/cache" OMG_CONFIG_DIR="$state/config"
 query_cli() {
   local label=$1
-  timeout 15 "$bin" --json explicit > "$evidence/$label-explicit.json"
-  timeout 15 "$bin" explicit --count > "$evidence/$label-count.txt"
-  timeout 15 "$bin" ec > "$evidence/$label-shortcut.txt"
-  timeout 15 "$bin" --json explicit --count > "$evidence/$label-count.json"
+  timeout "$command_timeout" "$bin" --json explicit > "$evidence/$label-explicit.json"
+  timeout "$command_timeout" "$bin" explicit --count > "$evidence/$label-count.txt"
+  timeout "$command_timeout" "$bin" ec > "$evidence/$label-shortcut.txt"
+  timeout "$command_timeout" "$bin" --json explicit --count > "$evidence/$label-count.json"
   if ! check_explicit_query_outputs "$evidence/native-explicit.json" \
     "$evidence/$label-explicit.json" "$evidence/$label-count.txt" \
     "$evidence/$label-shortcut.txt" "$evidence/$label-count.json"; then
@@ -146,7 +151,7 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   else
     "$bin" daemon --foreground > "$evidence/daemon-$mode.log" 2>&1 &
     launcher_pid=$!
-    for _ in {1..100}; do
+    for ((attempt=0; attempt<child_attempts; attempt++)); do
       kill -0 "$launcher_pid"
       # Tokio may spawn from a worker thread; inspect every thread's children.
       for children_file in /proc/"$launcher_pid"/task/*/children; do
@@ -162,14 +167,22 @@ for mode in direct foreground direct-sigint foreground-sigint; do
     [[ -n "$daemon_pid" ]]
   fi
   ready=false
-  for _ in {1..30}; do
-    kill -0 "$daemon_pid"
-    if [[ -S "$OMG_SOCKET_PATH" ]] && timeout 5 "$bin" daemon-status > "$evidence/daemon-$mode-status.txt" 2>&1 \
+  for ((attempt=0; attempt<readiness_attempts; attempt++)); do
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+      printf 'assertion failed: %s daemon exited before its socket was ready\n' "$mode" >&2
+      tail -n 25 "$evidence/daemon-$mode.log" >&2
+      exit 1
+    fi
+    if [[ -S "$OMG_SOCKET_PATH" ]] && timeout "$status_timeout" "$bin" daemon-status > "$evidence/daemon-$mode-status.txt" 2>&1 \
       && grep -Fq 'Daemon is running' "$evidence/daemon-$mode-status.txt" \
       && grep -Fq 'Requests total:' "$evidence/daemon-$mode-status.txt"; then ready=true; break; fi
     sleep 0.2
   done
-  [[ "$ready" == true ]]
+  if [[ "$ready" != true ]]; then
+    printf 'assertion failed: %s daemon did not become ready within the %s-mode budget\n' "$mode" "${OMG_QEMU_ACCEL:-kvm}" >&2
+    tail -n 25 "$evidence/daemon-$mode.log" >&2
+    exit 1
+  fi
   [[ $(readlink "/proc/$daemon_pid/exe") == "$daemon" ]]
   [[ $(stat -c '%u' "$OMG_SOCKET_PATH") == "$(id -u)" ]]
   [[ $(stat -c '%a' "$OMG_SOCKET_PATH") == 600 ]]
@@ -189,7 +202,7 @@ for mode in direct foreground direct-sigint foreground-sigint; do
     for index in "${!invalid_invocations[@]}"; do
       read -r -a invalid_args <<< "${invalid_invocations[$index]}"
       status=0
-      timeout 15 "$bin" "${invalid_args[@]}" > "$evidence/daemon-invalid-$index.stdout" \
+      timeout "$command_timeout" "$bin" "${invalid_args[@]}" > "$evidence/daemon-invalid-$index.stdout" \
         2> "$evidence/daemon-invalid-$index.stderr" || status=$?
       if [[ "$status" != 2 || -s "$evidence/daemon-invalid-$index.stdout" ]] \
         || ! grep -Fq 'cannot be used multiple times' "$evidence/daemon-invalid-$index.stderr"; then
@@ -202,7 +215,7 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   requests_before=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-status.txt")
   [[ "$requests_before" =~ ^[0-9]+$ ]]
   query_cli "daemon-$mode"
-  timeout 5 "$bin" daemon-status > "$evidence/daemon-$mode-after-queries.txt" 2>&1
+  timeout "$status_timeout" "$bin" daemon-status > "$evidence/daemon-$mode-after-queries.txt" 2>&1
   requests_after=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
   failed_after=$(awk '/Requests failed:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
   [[ "$requests_after" =~ ^[0-9]+$ && "$failed_after" == 0 ]]
@@ -218,11 +231,11 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   inode=$(stat -c '%i' "$OMG_SOCKET_PATH")
   # A second direct daemon must fail, not replace the live socket or hang.
   duplicate_status=0
-  timeout 5 "$daemon" > "$evidence/daemon-$mode-duplicate.txt" 2>&1 || duplicate_status=$?
+  timeout "$status_timeout" "$daemon" > "$evidence/daemon-$mode-duplicate.txt" 2>&1 || duplicate_status=$?
   [[ "$duplicate_status" != 0 && "$duplicate_status" != 124 && "$duplicate_status" != 137 ]]
   grep -Fq 'Another omgd daemon owns' "$evidence/daemon-$mode-duplicate.txt"
   [[ $(stat -c '%i' "$OMG_SOCKET_PATH") == "$inode" ]]
-  timeout 5 "$bin" daemon > "$evidence/daemon-$mode-launcher.txt" 2>&1
+  timeout "$status_timeout" "$bin" daemon > "$evidence/daemon-$mode-launcher.txt" 2>&1
   grep -Fq 'already running' "$evidence/daemon-$mode-launcher.txt"
   if [[ "$mode" == *-sigint ]]; then
     kill -INT "$daemon_pid"

@@ -37,7 +37,7 @@ class DaemonContractTests(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'guest dependency setup requires POSIX bash')
     def test_guest_query_tools_are_installed_with_benchmarks_disabled(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
-        setup = source.split('guest_tools=(jq)', 1)[1].split('timeout --kill-after=5s 240s', 1)[0]
+        setup = source.split('guest_tools=(jq)', 1)[1].split("printf 'daemon lifecycle start", 1)[0]
         setup = 'guest_tools=(jq)' + setup
         for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
             for benchmark in ('true', 'false'):
@@ -177,7 +177,7 @@ class DaemonContractTests(unittest.TestCase):
     def test_lifecycle_is_unconditional_and_receipt_is_exported(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         guest = source.split("<<'GUEST'", 1)[1].split('\nGUEST', 1)[0]
-        probe = 'timeout --kill-after=5s 240s bash "$HOME/qemu-daemon-check.sh"'
+        probe = 'OMG_QEMU_ACCEL="$accel" timeout --kill-after=5s "$daemon_timeout" bash "$HOME/qemu-daemon-check.sh"'
         self.assertIn(probe, guest)
         self.assertLess(guest.index(probe), guest.index('if [[ "$benchmark" == true ]]'))
         export = (ROOT / 'scripts/export-qemu-evidence.py').read_text(encoding='utf-8')

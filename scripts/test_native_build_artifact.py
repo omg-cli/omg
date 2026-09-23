@@ -197,6 +197,84 @@ class NativeBuildAdmission(unittest.TestCase):
                             BUILD.reuse(root, 'debian', expected['image'], 'debian,pgp,license', destination, context, event)
                         self.assertFalse(destination.exists())
 
+    def test_partial_rerun_reuses_only_successful_unrerun_native_owner(self):
+        expected, provenance, payload = fixture()
+        data = bundle(provenance, payload)
+        run = dict(id=123, run_attempt=2, repository={'full_name': 'omg-cli/omg'},
+                   path='.github/workflows/ci.yml', workflow_id=42, event='pull_request',
+                   head_sha='c'*40, pull_requests=[{'number': 440}],
+                   run_started_at='2026-09-20T10:00:00Z', status='completed', conclusion='failure')
+        prior_run = dict(run, run_attempt=1, run_started_at='2026-09-20T09:00:00Z')
+        job = dict(id=17, name='Linux (debian)', run_id=123, run_attempt=1,
+                   head_sha='c'*40, status='completed', conclusion='success',
+                   started_at='2026-09-20T09:00:30Z', completed_at='2026-09-20T09:02:00Z')
+        artifact = dict(id=9, name='native-release-debian-1', size_in_bytes=len(data),
+                        expired=False, created_at='2026-09-20T09:01:00Z',
+                        digest='sha256:' + hashlib.sha256(data).hexdigest())
+        for mode in ('valid', 'reran-owner', 'failed-owner', 'wrong-head',
+                     'late-artifact', 'intermediate-reran-owner'):
+            selected_run = dict(run, run_attempt=3,
+                                run_started_at='2026-09-20T11:00:00Z') \
+                if mode == 'intermediate-reran-owner' else run
+            native_job = dict(job)
+            candidate_artifact = dict(artifact)
+            # GitHub includes the carried job in attempt 2 and rewrites its
+            # run_attempt field, but its start time remains in attempt 1.
+            current_jobs = [dict(job, run_attempt=2)]
+            if mode == 'reran-owner':
+                current_jobs.append(dict(job, id=18, run_attempt=2,
+                                         started_at='2026-09-20T10:00:30Z'))
+            if mode == 'failed-owner':
+                native_job['conclusion'] = 'failure'
+            if mode == 'wrong-head':
+                native_job['head_sha'] = 'd'*40
+            if mode == 'late-artifact':
+                candidate_artifact['created_at'] = '2026-09-20T09:03:00Z'
+            def lookup(path):
+                if path.endswith('/workflows/ci.yml'):
+                    return {'id': 42, 'path': '.github/workflows/ci.yml'}
+                if '/ci.yml/runs?' in path:
+                    return {'workflow_runs': [selected_run]}
+                if path.endswith('/runs/123'):
+                    return selected_run
+                if path.endswith('/attempts/1'):
+                    return prior_run
+                if path.endswith('/attempts/1/jobs?per_page=100'):
+                    return {'total_count': 1, 'jobs': [native_job]}
+                if path.endswith('/attempts/2'):
+                    return dict(run, run_started_at='2026-09-20T10:00:00Z')
+                if path.endswith('/attempts/2/jobs?per_page=100'):
+                    if mode == 'intermediate-reran-owner':
+                        return {'total_count': 1, 'jobs': [dict(job, id=18, run_attempt=2,
+                            started_at='2026-09-20T10:00:30Z', conclusion='failure')]}
+                    return {'total_count': len(current_jobs), 'jobs': current_jobs}
+                if path.endswith('/attempts/3/jobs?per_page=100'):
+                    return {'total_count': len(current_jobs), 'jobs': current_jobs}
+                if '/artifacts?' in path:
+                    return {'total_count': 1, 'artifacts': [candidate_artifact]}
+                self.fail('unexpected API request: ' + path)
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'Cargo.toml').write_text('[package]\nversion="1.2.3"\n')
+                (root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel="1.95.0"\n')
+                destination = root / 'staged'
+                context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a'*40,
+                               GITHUB_EVENT_NAME='pull_request')
+                event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
+                with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=data), \
+                        patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
+                        patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
+                    if mode == 'valid':
+                        result = BUILD.reuse(root, 'debian', expected['image'], 'debian,pgp,license',
+                                             destination, context, event)
+                        self.assertEqual(result, provenance)
+                        self.assertEqual((destination / provenance['archive']).read_bytes(), payload)
+                    else:
+                        with self.assertRaises((ValueError, BUILD.ArtifactUnavailable)):
+                            BUILD.reuse(root, 'debian', expected['image'], 'debian,pgp,license',
+                                        destination, context, event)
+                        self.assertFalse(destination.exists())
+
     def test_producer_run_identity_uses_api_head_but_archive_uses_checkout_sha(self):
         expected = dict(repository='omg-cli/omg', workflow_id=42, event='pull_request',
                         head_sha='c' * 40, pr_number=440)
