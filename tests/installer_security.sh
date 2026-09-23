@@ -10,6 +10,7 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
     set --
     source "$task_dir/functions.sh"
     trap - EXIT
+    set -e
     scenario_dir="$task_dir/$scenario"
     mkdir -p "$scenario_dir"
     INSTALL_DIR="$scenario_dir/bin"
@@ -44,13 +45,12 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
       fi
     }
     calculate_sha256() { printf '%064d\n' 0; }
-    command() {
-      if [[ "$scenario" == missing && "$*" == '-v gh' ]]; then return 1; fi
-      builtin command "$@"
-    }
-    gh() {
-      printf '%s\n' "$@" > "$scenario_dir/gh-args"
-      [[ "$scenario" != rejected ]]
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "%s/gh-args"\n[[ "%s" != rejected ]]\n' \
+      "$scenario_dir" "$scenario" > "$scenario_dir/gh"
+    chmod +x "$scenario_dir/gh"
+    trusted_gh() {
+      [[ "$scenario" != missing ]] || return 1
+      printf '%s\n' "$scenario_dir/gh"
     }
     tar() {
       touch "$scenario_dir/extracted"
@@ -133,6 +133,7 @@ for rename_platform in native darwin; do
     set --
     source "$task_dir/functions.sh"
     trap - EXIT
+    set -e
     INSTALL_DIR="$task_dir/raced-$rename_platform"
     mkdir -p "$INSTALL_DIR"
     printf 'new binary\n' > "$INSTALL_DIR/source"
@@ -165,6 +166,7 @@ done
   set --
   source "$task_dir/functions.sh"
   trap - EXIT
+  set -e
   INSTALL_DIR="$task_dir/atomic-bin"
   mkdir -p "$INSTALL_DIR" "$task_dir/outside"
   printf 'new binary\n' > "$task_dir/source"
@@ -188,4 +190,114 @@ done
 mkdir -p "$task_dir/ambient"
 printf '[package]\nname = "omg"\n' > "$task_dir/ambient/Cargo.toml"
 { cat "$task_dir/functions.sh"; printf '\n[[ "$IS_SOURCE_INSTALL" == false ]]\n'; } | (cd "$task_dir/ambient"; bash)
+
+# A custom install path is data, even when it contains shell syntax and
+# regular-expression metacharacters. Shell setup and uninstall must round-trip
+# the exact line without executing or matching another rc entry.
+(
+  set --
+  source "$task_dir/functions.sh"
+  trap - EXIT
+  set -e
+  HOME="$task_dir/shell-home"
+  SHELL=/bin/bash
+  mkdir -p "$HOME"
+  marker="$task_dir/injected"
+  INSTALL_DIR="$task_dir/bin'\";touch $marker;#[.*]"
+  printf '# omg hook already configured\nexport PATH="keep:$PATH"\n' > "$HOME/.bashrc"
+  header() { :; }
+  info() { :; }
+  success() { :; }
+  setup_shell
+  path_line=$(shell_path_line bash)
+  grep -Fqx -- "$path_line" "$HOME/.bashrc"
+  restored_path=$(bash --noprofile --rcfile "$HOME/.bashrc" -ic 'printf "%s" "$PATH"' 2>/dev/null)
+  [[ "$restored_path" == "$INSTALL_DIR:"* ]]
+  [[ ! -e "$marker" ]]
+  uninstall_omg
+  if grep -Fqx -- "$path_line" "$HOME/.bashrc"; then
+    printf 'Uninstall left its PATH line in bashrc\n' >&2
+    exit 1
+  fi
+  grep -Fqx -- 'export PATH="keep:$PATH"' "$HOME/.bashrc"
+  [[ ! -e "$marker" ]]
+
+  INSTALL_DIR=bin
+  if (setup_shell >/dev/null 2>&1); then
+    printf 'relative INSTALL_DIR unexpectedly accepted\n' >&2
+    exit 1
+  fi
+  if grep -Fq -- 'export PATH='"'bin'" "$HOME/.bashrc"; then
+    printf 'Invalid INSTALL_DIR changed bashrc\n' >&2
+    exit 1
+  fi
+)
+
+# Upgrades must recognize the PATH lines emitted by earlier installer releases.
+# Reinstall must not duplicate them, and uninstall must remove only OMG's exact
+# lines while retaining unrelated shell configuration.
+(
+  set --
+  source "$task_dir/functions.sh"
+  trap - EXIT
+  set -e
+  HOME="$task_dir/legacy-shell-home"
+  INSTALL_DIR="$task_dir/legacy-bin"
+  mkdir -p "$HOME/.config/fish"
+  header() { :; }
+  info() { :; }
+  success() { :; }
+  for shell_type in bash zsh fish; do
+    case "$shell_type" in
+      bash) rc_file="$HOME/.bashrc" ;;
+      zsh) rc_file="$HOME/.zshrc" ;;
+      fish) rc_file="$HOME/.config/fish/config.fish" ;;
+    esac
+    if [[ "$shell_type" == fish ]]; then
+      legacy_line="fish_add_path $INSTALL_DIR"
+    else
+      legacy_line="export PATH=\"$INSTALL_DIR:\$PATH\""
+    fi
+    printf '%s\n%s\n' "$legacy_line" 'export PATH="keep:$PATH"' > "$rc_file"
+    SHELL="/bin/$shell_type"
+    setup_shell
+    [[ $(grep -Fc -- "$legacy_line" "$rc_file") == 1 ]]
+    if grep -Fqx -- "$(shell_path_line "$shell_type")" "$rc_file"; then
+      printf 'Reinstall duplicated the legacy %s PATH entry\n' "$shell_type" >&2
+      exit 1
+    fi
+  done
+  uninstall_omg
+  for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.config/fish/config.fish"; do
+    if grep -Fq -- "$INSTALL_DIR" "$rc_file"; then
+      printf 'Uninstall left a legacy PATH entry in %s\n' "$rc_file" >&2
+      exit 1
+    fi
+    grep -Fqx -- 'export PATH="keep:$PATH"' "$rc_file"
+    [[ -f "$rc_file.omg-backup" ]]
+  done
+)
+
+# A fixed location is not sufficient if the selected binary or a directory
+# leading to it can be replaced by another user.
+if [[ "$EUID" == 0 ]]; then
+  (
+    source "$task_dir/functions.sh"
+    trap - EXIT
+    set -e
+    gh_candidate_is_trusted /usr/bin/true >/dev/null
+    if [[ -L /bin ]]; then
+      [[ "$(gh_candidate_is_trusted /bin/true)" == /bin/true ]]
+    fi
+    if [[ -L /usr/bin/sh ]]; then
+      [[ -n "$(gh_candidate_is_trusted /usr/bin/sh)" ]]
+    fi
+    mkdir -p "$task_dir/untrusted-gh"
+    cp /usr/bin/true "$task_dir/untrusted-gh/gh"
+    chmod 777 "$task_dir/untrusted-gh/gh"
+    ! gh_candidate_is_trusted "$task_dir/untrusted-gh/gh"
+    ln -s /usr/bin/true "$task_dir/untrusted-gh/link"
+    ! gh_candidate_is_trusted "$task_dir/untrusted-gh/link"
+  )
+fi
 printf 'Installer security scenarios passed\n'

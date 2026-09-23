@@ -88,6 +88,122 @@ pub fn is_private_or_local_host(host: Option<&str>) -> bool {
     }
 }
 
+/// Require a globally routable address after DNS resolution, not just a
+/// public-looking hostname. Used by downloads of metadata-selected URLs.
+#[must_use]
+pub(crate) fn is_public_address(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_documentation()
+                && !ip.is_broadcast()
+                && a != 0
+                && a < 224
+                && !(a == 100 && (64..=127).contains(&b))
+                && !(a == 192 && b == 0)
+                && !(a == 198 && (18..=19).contains(&b))
+        }
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            segments[0] & 0xe000 == 0x2000
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                && !(segments[0] == 0x2001 && segments[1] == 0)
+                && segments[0] != 0x2002
+        }
+    }
+}
+
+fn validate_resolved_addresses(
+    addresses: &[std::net::SocketAddr],
+    loopback_fixture: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !addresses.is_empty()
+            && addresses.iter().all(|address| {
+                is_public_address(address.ip()) || (loopback_fixture && address.ip().is_loopback())
+            }),
+        "Download resolves to a non-public address"
+    );
+    Ok(())
+}
+
+/// Connect to a metadata-selected URL only after resolving and pinning every
+/// address on every redirect. The caller's ordinary client cannot enforce
+/// this per-request DNS policy, so use a fresh, proxy-free client per hop.
+pub(crate) async fn fetch_public_download(
+    raw: &str,
+    user_agent: &str,
+) -> anyhow::Result<reqwest::Response> {
+    fetch_public_download_with_timeout(raw, user_agent, None).await
+}
+
+pub(crate) async fn fetch_public_download_with_timeout(
+    raw: &str,
+    user_agent: &str,
+    total_timeout: Option<Duration>,
+) -> anyhow::Result<reqwest::Response> {
+    let mut url = Url::parse(raw).map_err(|_| anyhow::anyhow!("Invalid download URL"))?;
+    for hop in 0..=MAX_REDIRECTS {
+        validate_download_url(url.as_str())?;
+        anyhow::ensure!(
+            url.username().is_empty() && url.password().is_none(),
+            "Download URL must not contain credentials"
+        );
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("Download URL has no host"))?
+            .to_owned();
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!("Download URL has no port"))?;
+        let addresses: Vec<_> = tokio::time::timeout(
+            DOWNLOAD_CONNECT_TIMEOUT,
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await??
+        .collect();
+        let loopback_fixture = url.scheme() == "http"
+            && is_loopback_host(url.host_str())
+            && crate::core::paths::test_mode();
+        validate_resolved_addresses(&addresses, loopback_fixture)?;
+        let mut builder = Client::builder()
+            .no_proxy()
+            .redirect(redirect::Policy::none())
+            .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+            .read_timeout(DOWNLOAD_READ_TIMEOUT)
+            .resolve_to_addrs(&host, &addresses);
+        if let Some(timeout) = total_timeout {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder.build()?;
+        let response = client
+            .get(url.clone())
+            .header(reqwest::header::USER_AGENT, user_agent)
+            .send()
+            .await?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        anyhow::ensure!(hop < MAX_REDIRECTS, "Too many download redirects");
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| anyhow::anyhow!("Download redirect has no location"))?
+            .to_str()?;
+        let next = url.join(location)?;
+        anyhow::ensure!(
+            url.scheme() != "https" || next.scheme() == "https",
+            "Refusing HTTPS-to-HTTP download redirect"
+        );
+        url = next;
+    }
+    unreachable!("bounded redirect loop returns or errors")
+}
+
 /// Pin a downloader entry-point URL: HTTPS only, on a routable host.
 ///
 /// Vendor metadata (release manifests, channel manifests, package indexes)
@@ -238,6 +354,20 @@ pub fn download_client() -> &'static Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_download_addresses_must_all_be_public() {
+        use std::net::SocketAddr;
+
+        let public: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        let private: SocketAddr = "10.0.0.7:443".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        assert!(validate_resolved_addresses(&[public], false).is_ok());
+        assert!(validate_resolved_addresses(&[public, private], false).is_err());
+        assert!(validate_resolved_addresses(&[loopback], false).is_err());
+        assert!(validate_resolved_addresses(&[loopback], true).is_ok());
+        assert!(validate_resolved_addresses(&[], false).is_err());
+    }
 
     #[tokio::test]
     async fn download_client_allows_long_transfers_that_keep_progressing() {

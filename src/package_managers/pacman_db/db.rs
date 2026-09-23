@@ -15,7 +15,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Cursor, Read, Seek, Write};
-use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::{MetadataExt, OpenOptionsExt},
+};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::RwLock;
@@ -28,6 +31,8 @@ use crate::runtimes::common::{BudgetedReader, BudgetedSink, BudgetedWriter};
 
 /// TTL for cache eviction safety net (30 minutes)
 const CACHE_TTL_SECS: u64 = 30 * 60;
+const MAX_DESC_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SYNC_ENTRIES: usize = 100_000;
 
 /// Sync database cache, validated against its source identity on reuse.
 static SYNC_DB_CACHE: std::sync::LazyLock<RwLock<DbCache>> =
@@ -256,6 +261,7 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
 
     let mut archive = tar::Archive::new(reader);
     let mut packages = HashMap::new();
+    let mut entry_count = 0usize;
 
     for entry in archive.entries().with_context(|| {
         format!(
@@ -264,21 +270,37 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
             repo_name
         )
     })? {
-        let mut entry = entry?;
+        entry_count += 1;
+        anyhow::ensure!(
+            entry_count <= MAX_SYNC_ENTRIES,
+            "Pacman sync database has too many entries"
+        );
+        let entry = entry?;
         let entry_path = entry.path()?.to_path_buf();
         let path_str = entry_path.to_string_lossy();
 
         if path_str.ends_with("/desc") {
+            anyhow::ensure!(
+                entry.size() <= MAX_DESC_BYTES,
+                "Pacman sync database desc exceeds the {MAX_DESC_BYTES}-byte limit"
+            );
             // The db is a tar stream; a desc can legitimately be arbitrary
             // bytes on a damaged mirror. Lossy-decode instead of failing the
             // whole repository read (matches pacman's tolerant reader).
             let mut raw = Vec::new();
-            entry.read_to_end(&mut raw).with_context(|| {
-                format!(
-                    "Failed to read desc {} from repo {repo_name}",
-                    entry_path.display()
-                )
-            })?;
+            entry
+                .take(MAX_DESC_BYTES + 1)
+                .read_to_end(&mut raw)
+                .with_context(|| {
+                    format!(
+                        "Failed to read desc {} from repo {repo_name}",
+                        entry_path.display()
+                    )
+                })?;
+            anyhow::ensure!(
+                raw.len() as u64 <= MAX_DESC_BYTES,
+                "Pacman sync database desc exceeds the {MAX_DESC_BYTES}-byte limit"
+            );
             let content = String::from_utf8_lossy(&raw).into_owned();
 
             match parse_desc_content(&content, repo_name) {
@@ -545,8 +567,30 @@ fn require_package_version(raw: &str) -> Result<Version> {
 }
 
 fn parse_local_desc(path: &Path) -> Result<LocalDbPackage> {
-    let content = std::fs::read_to_string(path)
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    let file = options
+        .open(path)
+        .with_context(|| format!("Failed to open local package desc {}", path.display()))?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "Local package desc must be a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_DESC_BYTES,
+        "Local package desc exceeds the {MAX_DESC_BYTES}-byte limit"
+    );
+    let mut content = String::new();
+    file.take(MAX_DESC_BYTES + 1)
+        .read_to_string(&mut content)
         .with_context(|| format!("Failed to read local package desc {}", path.display()))?;
+    anyhow::ensure!(
+        content.len() as u64 <= MAX_DESC_BYTES,
+        "Local package desc exceeds the {MAX_DESC_BYTES}-byte limit"
+    );
 
     // Modern pacman never writes `%REQUIREDBY%`/`%OPTFOR%` sections into local
     // desc files, so reverse dependencies cannot be read from disk. They are
@@ -1517,14 +1561,47 @@ mod tests {
         }
         let raw = tar.into_inner().unwrap();
         let mut compressed = Vec::new();
-        flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::fast())
-            .write_all(&raw)
-            .unwrap();
+        {
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::fast());
+            encoder.write_all(&raw).unwrap();
+            encoder.finish().unwrap();
+        }
         std::fs::write(&path, compressed).unwrap();
 
         let packages = parse_sync_db(&path, "custom").unwrap();
         assert!(packages.contains_key("good"));
         assert!(!packages.contains_key("broken"));
+    }
+
+    #[test]
+    fn oversized_sync_and_local_desc_are_rejected_before_materialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let oversized = vec![b'a'; MAX_DESC_BYTES as usize + 1];
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(oversized.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "oversized-1/desc", oversized.as_slice())
+            .unwrap();
+        let raw = tar.into_inner().unwrap();
+        let mut compressed = Vec::new();
+        flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::fast())
+            .write_all(&raw)
+            .unwrap();
+        let sync_path = temp.path().join("oversized.db");
+        std::fs::write(&sync_path, compressed).unwrap();
+        assert!(
+            format!("{:#}", parse_sync_db(&sync_path, "oversized").unwrap_err())
+                .contains("desc exceeds")
+        );
+
+        let local_path = temp.path().join("desc");
+        std::fs::write(&local_path, oversized).unwrap();
+        assert!(
+            format!("{:#}", parse_local_desc(&local_path).unwrap_err()).contains("desc exceeds")
+        );
     }
 
     #[test]

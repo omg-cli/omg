@@ -353,22 +353,33 @@ pub(crate) fn validate_download_filename(filename: &str) -> Result<&str> {
 // Callers validate the vendor URL before entering this helper. Only the GET
 // before response headers is retried; no partial file or checksum is reused.
 async fn request_runtime_download(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     url: &str,
-) -> Result<reqwest::Response, reqwest::Error> {
+) -> Result<reqwest::Response> {
+    retry_runtime_request(url, || {
+        crate::core::http::fetch_public_download(url, GITHUB_USER_AGENT)
+    })
+    .await
+}
+
+async fn retry_runtime_request<F, Fut>(url: &str, mut request: F) -> Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response>>,
+{
     let parsed_url = reqwest::Url::parse(url).ok();
     let host = parsed_url
         .as_ref()
         .and_then(reqwest::Url::host_str)
         .unwrap_or("unknown");
     for attempt in 0..3 {
-        match client
-            .get(url)
-            .header("User-Agent", GITHUB_USER_AGENT)
-            .send()
-            .await
-        {
-            Err(error) if attempt < 2 && crate::core::http::is_retryable_error(&error) => {
+        match request().await {
+            Err(error)
+                if attempt < 2
+                    && error
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(crate::core::http::is_retryable_error) =>
+            {
                 tracing::warn!(
                     attempt = attempt + 1,
                     host,
@@ -1801,7 +1812,12 @@ mod tests {
                 Ok::<_, anyhow::Error>(held)
             };
             let request = async {
-                let response = super::request_runtime_download(&client, &url).await?;
+                let response = super::retry_runtime_request(&url, || {
+                    let client = &client;
+                    let url = &url;
+                    async move { Ok(client.get(url).send().await?) }
+                })
+                .await?;
                 assert_eq!(response.status().as_u16(), status[..3].parse::<u16>()?);
                 assert_eq!(response.text().await?, "fixture");
                 Ok::<_, anyhow::Error>(())
@@ -1818,38 +1834,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_download_request_stops_after_three_proxy_connect_failures()
+    async fn runtime_download_request_ignores_caller_proxy_and_rejects_private_target()
     -> anyhow::Result<()> {
-        use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let proxy = reqwest::Proxy::all(format!("http://{}", listener.local_addr()?))?;
         let client = reqwest::Client::builder()
             .proxy(proxy)
             .timeout(std::time::Duration::from_secs(1))
             .build()?;
-        let server = async {
-            for _ in 0..3 {
-                let (mut stream, _) = listener.accept().await?;
-                let mut request = [0; 4096];
-                let length = stream.read(&mut request).await?;
-                anyhow::ensure!(
-                    request[..length].starts_with(b"CONNECT example.com:443 HTTP/1.1\r\n")
-                );
-                // Close before the tunnel is established, matching a connect-stage failure.
-            }
-            Ok::<_, anyhow::Error>(())
-        };
-        let request = async {
-            let error = super::request_runtime_download(&client, "https://example.com/archive")
+        let error = super::request_runtime_download(&client, "https://127.0.0.1/archive")
+            .await
+            .expect_err("private target must be rejected before any connection");
+        assert!(format!("{error:#}").contains("private or local"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
                 .await
-                .expect_err("exhausted connection attempts must fail");
-            assert!(error.is_connect(), "{error:?}");
-        };
-        let (server, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(server, request)
-        })
-        .await?;
-        server?;
+                .is_err(),
+            "the caller's proxy must never see the request"
+        );
         Ok(())
     }
     use super::*;

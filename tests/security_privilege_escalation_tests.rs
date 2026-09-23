@@ -296,7 +296,7 @@ install_from_release
     fn installer_requires_gh_for_provenance_and_fails_closed() {
         let installer = include_str!("../install.sh");
         let start = installer
-            .find("  if command -v gh >/dev/null 2>&1; then")
+            .find("  if gh_bin=$(trusted_gh); then")
             .expect("provenance gate");
         let (gate, _) = installer[start..]
             .split_once("  start_spinner \"Extracting binaries\"")
@@ -304,8 +304,8 @@ install_from_release
         for (present, status) in [(false, 0), (true, 0), (true, 1)] {
             let output = run_installer_functions(
                 &format!(
-                    "command() {{ return {}; }}\ngh() {{ return {status}; }}\nstart_spinner() {{ :; }}\nstop_spinner() {{ :; }}\nfail_spinner() {{ :; }}\nREPO_OWNER=owner\nREPO_NAME=name\nactual_version=v1.0.0\ndownload_file=fixture\nartifact_name=fixture\nverify_fixture() {{\n{gate}\n}}\nverify_fixture\n",
-                    i32::from(!present)
+                    "trusted_gh() {{ if [[ {present} == true ]]; then printf '/usr/bin/{binary}\\n'; else return 1; fi; }}\nstart_spinner() {{ :; }}\nstop_spinner() {{ :; }}\nfail_spinner() {{ :; }}\nREPO_OWNER=owner\nREPO_NAME=name\nactual_version=v1.0.0\ndownload_file=fixture\nartifact_name=fixture\nverify_fixture() {{\n{gate}\n}}\nverify_fixture\n",
+                    binary = if status == 0 { "true" } else { "false" }
                 ),
                 &[],
             );
@@ -370,7 +370,7 @@ install_from_release
             "a missing checksum must fail closed"
         );
         assert!(
-            installer.contains("gh attestation verify \"$download_file\"")
+            installer.contains("\"$gh_bin\" attestation verify \"$download_file\"")
                 && installer.contains("Build provenance verification failed"),
             "the installer must fail closed on rejected provenance when GitHub CLI is available"
         );
