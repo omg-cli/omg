@@ -1,6 +1,6 @@
 [package]
 name = "omg"
-version = "0.1.223"
+version = "0.1.224"
 edition = "2024"
 rust-version = "1.95.0"
 description = "The Fastest Unified Package Manager for Arch Linux + All Language Runtimes"
