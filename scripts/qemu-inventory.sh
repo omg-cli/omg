@@ -344,10 +344,10 @@ check_product_output() {
       search-official-limit-three)
         if ! awk '
           /^  \| Search$/ { headings++; next }
-          /^    git$/ { queries++; next }
+          /^    git-$/ { queries++; next }
           /^  [^[:space:]]+ [^[:space:]]+  / {
             results++
-            if ($1 !~ /git/ || $3 != "Official" || NF != 3) bad=1
+            if ($1 !~ /^git-/ || $3 != "Official" || NF != 3) bad=1
             if (seen[$1]++) bad=1
             next
           }
@@ -357,7 +357,7 @@ check_product_output() {
           { bad=1 }
           END { exit !(headings == 1 && queries == 1 && results == 3 && more == 1 && !bad) }
         ' "$stdout"; then
-          printf 'assertion failed: official git search lacks three results and a positive remainder\n' >&2; return 1
+          printf 'assertion failed: official git- prefix search lacks three results and a positive remainder\n' >&2; return 1
         fi ;;
       artifact:*)
         local artifact=${assertion#artifact:}
