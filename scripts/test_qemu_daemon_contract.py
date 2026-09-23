@@ -100,6 +100,104 @@ class DaemonContractTests(unittest.TestCase):
             self.assertIn('omg_only=["omg-only"]', result.stderr)
             self.assertIn('omg_duplicates=["omg-only"]', result.stderr)
 
+    @unittest.skipIf(os.name == 'nt', 'package query oracle requires POSIX jq')
+    def test_daemon_and_direct_package_queries_must_agree_on_a_real_installed_name(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        self.assertIn('# BEGIN PACKAGE QUERY ORACLE', source)
+        begin = source.index('# BEGIN PACKAGE QUERY ORACLE')
+        end = source.index('# END PACKAGE QUERY ORACLE', begin)
+        function = source[begin:end]
+        search = [{'name': 'bash', 'version': '5.3', 'description': 'Shell', 'source': 'Official'}]
+        info = {'name': 'bash', 'version': '5.3', 'description': 'Shell', 'installed': True}
+        cases = [(search, info, search, info, True)]
+        cases += [
+            ([], info, search, info, False),
+            (search, dict(info, version='wrong'), search, info, False),
+            (search, info, search, dict(info, installed=False), False),
+            (search + search, info, search, info, False),
+            ([dict(search[0], source='AUR')], info, search, info, False),
+            (search, info, [dict(search[0], description='')], info, False),
+            (search, info, search, {'name': 'other', **{key: value for key, value in info.items() if key != 'name'}}, False),
+        ]
+        for daemon_search, daemon_info, direct_search, direct_info, passed in cases:
+            with self.subTest(daemon_search=daemon_search, daemon_info=daemon_info,
+                              direct_search=direct_search, direct_info=direct_info), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name, value in [('daemon-search', daemon_search), ('daemon-info', daemon_info),
+                                    ('direct-search', direct_search), ('direct-info', direct_info)]:
+                    (root / name).write_text(json.dumps(value))
+                result = subprocess.run(
+                    [BASH, '-c', function + '\ncheck_package_query_outputs bash daemon-search daemon-info direct-search direct-info'],
+                    cwd=root, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'text info oracle requires POSIX bash')
+    def test_text_info_requires_true_native_installation_in_both_modes(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        self.assertIn('# BEGIN TEXT INFO ORACLE', source)
+        function = source.split('# BEGIN TEXT INFO ORACLE', 1)[1].split('# END TEXT INFO ORACLE', 1)[0]
+        good = '\n  | Info\n    bash\n          Name: bash\n     Installed: yes\n'
+        for daemon, direct, passed in [(good, good, True),
+                                       (good.replace('yes', 'no'), good, False),
+                                       (good, good.replace('yes', 'no'), False),
+                                       (good.replace('Name: bash', 'Name: wrong'), good, False)]:
+            with self.subTest(daemon=daemon, direct=direct), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'daemon').write_text(daemon)
+                (root / 'direct').write_text(direct)
+                result = subprocess.run([BASH, '-c', function + '\ncheck_text_info_outputs bash daemon direct'],
+                                        cwd=root, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'daemon IPC counters require POSIX bash')
+    def test_package_ipc_oracle_rejects_native_fallback_and_unrelated_requests(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        function = source.split('# BEGIN PACKAGE IPC ORACLE', 1)[1].split('# END PACKAGE IPC ORACLE', 1)[0]
+        before = 'omg_search_requests_total 4\nomg_info_requests_total 8\n'
+        cases = [
+            ('omg_search_requests_total 5\nomg_info_requests_total 8\n', 1, 0, True),
+            ('omg_search_requests_total 4\nomg_info_requests_total 9\n', 0, 1, True),
+            ('omg_search_requests_total 4\nomg_info_requests_total 8\n', 1, 0, False),
+            ('omg_search_requests_total 5\nomg_info_requests_total 8\n', 0, 1, False),
+            ('omg_search_requests_total 5\nomg_info_requests_total 9\n', 1, 0, False),
+            ('omg_search_requests_total 5\nomg_info_requests_total 9\n', 0, 1, False),
+            ('omg_search_requests_total 5\n', 1, 0, False),
+            ('omg_search_requests_total 5\nomg_search_requests_total 5\nomg_info_requests_total 8\n', 1, 0, False),
+        ]
+        for after, expected_search, expected_info, passed in cases:
+            with self.subTest(after=after, search=expected_search, info=expected_info), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'before').write_text(before)
+                (root / 'after').write_text(after)
+                result = subprocess.run(
+                    [BASH, '-c', function + f'\ncheck_package_ipc_delta before after {expected_search} {expected_info}'],
+                    cwd=root, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'daemon JSON provenance oracle requires POSIX bash')
+    def test_daemon_info_provenance_rejects_native_fallback_after_ipc_attempt(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        function = source.split('# BEGIN INFO PROVENANCE ORACLE', 1)[1].split('# END INFO PROVENANCE ORACLE', 1)[0]
+        native = {'name': 'bash', 'version': '1', 'description': 'shell', 'installed': True}
+        fedora_native = {**native, 'source': 'Official'}
+        daemon = {**native, 'source': 'Official', 'repo': 'core', 'download_size': 0}
+        for daemon_output, native_output, passed in [
+            (daemon, native, True),
+            (daemon, fedora_native, True),
+            (native, native, False),
+            (fedora_native, fedora_native, False),
+            (daemon, daemon, False),
+            ({**daemon, 'source': 'AUR'}, native, False),
+        ]:
+            with self.subTest(daemon=daemon_output, native=native_output), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'daemon.json').write_text(json.dumps(daemon_output))
+                (root / 'native.json').write_text(json.dumps(native_output))
+                result = subprocess.run(
+                    [BASH, '-c', function + '\ncheck_daemon_info_provenance daemon.json native.json'],
+                    cwd=root, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
     def test_shell_startup_does_not_skip_this_users_ipc_check_for_another_process(self):
         source = (ROOT / 'src/cli/init.rs').read_text(encoding='utf-8')
         command = re.search(r'const DAEMON_SHELL_START: &str = "([^"]+)";', source).group(1)
