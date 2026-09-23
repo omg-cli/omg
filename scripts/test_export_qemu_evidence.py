@@ -29,6 +29,17 @@ TRANSACTION_PRIVATE = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_aur_flag_evidence_exports_without_ephemeral_keys(self):
+        for name in ("aur-search-flags.json", "aur-fixture-events.jsonl",
+                     "aur-detailed.json", "aur-no-aur.json", "aur-basic.json",
+                     "aur-cert.log", "aur-fixture-preflight.log",
+                     "aur-fixture.stdout", "aur-fixture.stderr"):
+            with self.subTest(name=name):
+                self.assertTrue(exporter.allowed_file(("run-test", "guest", "evidence", name)))
+                self.assertFalse(exporter.allowed_file(("run-test", name)))
+        for name in ("ca.key", "ca.pem", "server.key", "server.pem", "server.csr"):
+            self.assertFalse(exporter.allowed_file(("run-test", "guest", "evidence", name)))
+
     def test_native_query_diagnostics_are_confined_to_guest_evidence(self):
         names = ["native-explicit.txt", "native-explicit.json",
                  "dnf-reason-fault.stdout.log", "dnf-reason-fault.stderr.log",

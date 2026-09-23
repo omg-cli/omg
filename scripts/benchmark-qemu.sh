@@ -585,6 +585,7 @@ if [[ "$benchmark" == true ]]; then
   sha256sum "$work/benchmark-hyperfine.sh" "$work/record-benchmark-run.py" > "$work/benchmark-driver-sha256.txt"
 fi
 cp "$here/qemu-daemon-check.sh" "$work/qemu-daemon-check.sh"
+cp "$here/qemu-aur-check.sh" "$here/qemu-aur-fixture.py" "$work/"
 cp "$here/../tests/daemon_advisory_shutdown.sh" "$work/daemon-advisory-shutdown.sh"
 cat > "$work/guest-check.sh" <<'GUEST'
 #!/usr/bin/env bash
@@ -653,6 +654,7 @@ version=$("${version_cmd[@]}")
 # Exercise both direct daemon startup and the actual CLI foreground launcher
 # while the package databases and installed fixture are available.
 guest_tools=(jq)
+[[ "$distro" != arch ]] || guest_tools+=(python openssl)
 [[ "$benchmark" != true ]] || guest_tools+=(hyperfine)
 case "$distro" in
   arch) sudo -n pacman -S --noconfirm --needed "${guest_tools[@]}" || exit 120 ;;
@@ -661,6 +663,9 @@ case "$distro" in
 esac
 printf 'daemon lifecycle start accel=%s timeout=%s\n' "$accel" "$daemon_timeout"
 OMG_QEMU_ACCEL="$accel" timeout --kill-after=5s "$daemon_timeout" bash "$HOME/qemu-daemon-check.sh" "$bin" "$HOME/evidence"
+if [[ "$distro" == arch ]]; then
+  timeout --kill-after=5s 120s bash "$HOME/qemu-aur-check.sh" "$bin" "$HOME/evidence"
+fi
 # BEGIN ADVISORY SHUTDOWN REGRESSION
 if [[ "$distro" == fedora ]]; then
   sudo -n bash "$HOME/daemon-advisory-shutdown.sh" "${bin%/*}/omgd" "$(id -un)" \
@@ -724,6 +729,9 @@ opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHo
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
+if [[ "$distro" == arch ]]; then
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-aur-check.sh /work/qemu-aur-fixture.py bench@127.0.0.1:
+fi
 if [[ -n "$inventory_tiers" ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fedora-update-fixture.sh bench@127.0.0.1:qemu-fedora-update-fixture.sh
 fi
@@ -754,6 +762,25 @@ if [[ "$rc" == 0 ]]; then
   ' "$daemon_receipt" >/dev/null; then
     printf 'Missing or incomplete daemon lifecycle evidence\n' >&2
     exit 1
+  fi
+  if [[ "$distro" == arch ]]; then
+    aur_receipt="$work/guest/evidence/aur-search-flags.json"
+    aur_events="$work/guest/evidence/aur-fixture-events.jsonl"
+    if ! [[ -f "$aur_receipt" && $(wc -c < "$aur_receipt") -le 4096 && -f "$aur_events" && $(wc -c < "$aur_events") -le 8192 ]] \
+      || ! jq -e -s 'length == 1 and (.[0] | .schema_version == 1 and .arch == true and
+        .real_cli == true and .tls_fixture == true and .detailed_metadata == true and
+        .no_aur_suppressed == true and .basic_metadata_absent == true and
+        .expected_connects == 2 and .expected_requests == 2 and .unexpected_events == 0)' \
+        "$aur_receipt" >/dev/null \
+      || ! jq -e -s 'length == 4 and
+        .[0] == {event:"connect",value:"aur.archlinux.org:443"} and
+        .[1] == {event:"request",value:"/rpc?v=5&type=search&arg=omgqemuaurprobe"} and
+        .[2] == {event:"connect",value:"aur.archlinux.org:443"} and
+        .[3] == {event:"request",value:"/rpc?v=5&type=search&arg=omgqemuaurprobe"}' \
+        "$aur_events" >/dev/null; then
+      printf 'Missing or incomplete Arch AUR flag evidence\n' >&2
+      exit 1
+    fi
   fi
 fi
 if [[ "$benchmark" == true && "$rc" == 0 ]]; then
