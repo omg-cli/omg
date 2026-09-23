@@ -62,7 +62,7 @@ const MAX_PKGBUILD_REVIEW_BYTES: usize = 1024 * 1024;
 const SANDBOX_FAKEROOT_ENV: (&str, &str) = ("FAKEROOTDONTTRYCHOWN", "1");
 const MAX_PKGINFO_BYTES: u64 = 128 * 1024;
 const MAX_AUR_BUILD_LOG_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_AUR_BUILD_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+const MAX_AUR_BUILD_DURATION: Duration = Duration::from_hours(2);
 /// Pre-computed length of the AUR RPC info base URL (47 bytes)
 const AUR_RPC_INFO_BASE_LEN: usize = 47;
 

@@ -1072,7 +1072,8 @@ mod tests {
             ] {
                 let (mut stream, _) = listener.accept().await.expect("fixture connection");
                 let mut request = [0; 2048];
-                stream.read(&mut request).await.expect("read request");
+                let bytes_read = stream.read(&mut request).await.expect("read request");
+                assert!(bytes_read > 0, "empty request");
                 stream.write_all(response).await.expect("write response");
             }
         });

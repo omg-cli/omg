@@ -11,7 +11,7 @@ const MAX_AUR_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_GIT_MIRROR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_GIT_MIRROR_ENTRIES: usize = 200_000;
 const MAX_GIT_STDERR_BYTES: u64 = 1024 * 1024;
-const MAX_GIT_CLONE_DURATION: Duration = Duration::from_secs(15 * 60);
+const MAX_GIT_CLONE_DURATION: Duration = Duration::from_mins(15);
 
 use alpm_srcinfo::SourceInfoV1;
 use anyhow::{Context, Result};
