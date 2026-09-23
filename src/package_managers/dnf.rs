@@ -374,6 +374,21 @@ impl DnfPackageManager {
         Ok(packages)
     }
 
+    pub(crate) fn is_installed_fast(&self, package: &str) -> Result<bool> {
+        let cached = self
+            .cache_read()
+            .as_ref()
+            .filter(|snapshot| snapshot.observation.is_current(&self.rpm_db_path))
+            .map(|snapshot| snapshot.packages.contains_key(package));
+        if let Some(installed) = cached {
+            return Ok(installed);
+        }
+        Ok(self
+            .load_installed_packages_blocking()?
+            .iter()
+            .any(|installed| installed.name == package))
+    }
+
     async fn apply_current_install_reasons(packages: &mut [InstalledPackage]) -> Result<()> {
         let user_installed = tokio::task::spawn_blocking(Self::read_user_installed_names)
             .await
@@ -1659,19 +1674,7 @@ impl PackageManager for DnfPackageManager {
         let package = package.to_string();
         let manager = self.cache_handle();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let cached = manager
-                    .cache_read()
-                    .as_ref()
-                    .filter(|snapshot| snapshot.observation.is_current(&manager.rpm_db_path))
-                    .map(|snapshot| snapshot.packages.contains_key(&package));
-                if let Some(installed) = cached {
-                    return Ok(installed);
-                }
-                let packages = manager.load_installed_packages_blocking()?;
-                Ok(packages.iter().any(|p| p.name == package))
-            })
-            .await?
+            tokio::task::spawn_blocking(move || manager.is_installed_fast(&package)).await?
         })
     }
 }
@@ -2452,6 +2455,8 @@ mod tests {
         let mut manager = DnfPackageManager::new();
         manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
         assert_eq!(manager.list_installed().await?.len(), 1);
+        assert!(manager.is_installed_fast("publicsuffix-list-dafsa")?);
+        assert!(!manager.is_installed_fast("definitely-not-installed")?);
         let database = Connection::open(&manager.rpm_db_path)?;
         database.execute("DELETE FROM Packages", [])?;
 
@@ -2459,6 +2464,7 @@ mod tests {
             !manager.is_installed("publicsuffix-list-dafsa").await?,
             "a cached positive must not survive an external RPM removal"
         );
+        assert!(!manager.is_installed_fast("publicsuffix-list-dafsa")?);
         assert!(manager.list_installed().await?.is_empty());
         Ok(())
     }

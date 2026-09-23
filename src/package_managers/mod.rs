@@ -181,6 +181,14 @@ pub fn is_installed_fast(name: &str) -> anyhow::Result<bool> {
         return debian_db::is_installed_fast(name);
     }
 
+    #[cfg(feature = "fedora")]
+    if matches!(
+        crate::core::env::distro::detect_distro(),
+        crate::core::env::distro::Distro::Fedora
+    ) {
+        return dnf::DnfPackageManager::new().is_installed_fast(name);
+    }
+
     #[cfg(feature = "arch")]
     return alpm_direct::is_installed_fast(name);
 
