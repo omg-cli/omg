@@ -208,7 +208,7 @@ def unexecuted_inventory_distros(rows):
     }
 
 
-def projection(rows, successful_main):
+def projection(rows, verified_published):
     placeholders = unexecuted_inventory_distros(rows)
     selected = {}
     for row in rows:
@@ -220,7 +220,7 @@ def projection(rows, successful_main):
             # The existing issue helper treats BLOCKED as context rather than
             # an issue. A failed prerequisite still needs a tracked diagnosis.
             selected[key] = dict(row, result="HARNESS_ERROR" if row["result"] == "BLOCKED" else row["result"])
-        elif successful_main and row["result"] == "PASS" and key not in selected:
+        elif verified_published and row["result"] == "PASS" and key not in selected:
             selected[key] = row
     # The matrix job emits an aggregate receipt whenever a lane fails. Once
     # detailed evidence identifies that failure, filing both adds no diagnosis.
@@ -230,6 +230,30 @@ def projection(rows, successful_main):
         selected = {key: row for key, row in selected.items()
                     if row["case_id"] != "qemu-matrix-workflow" or row["result"] not in FAILURES}
     return list(selected.values())
+
+
+def published_provenance(content, distro, revision):
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        members = [member for member in archive.infolist()
+                   if member.filename == "provenance.json"]
+        if len(members) != 1 or members[0].file_size > 4096:
+            raise ValueError("missing or oversized published provenance")
+        provenance = json.loads(archive.read(members[0]), object_pairs_hook=unique_object)
+    if (not isinstance(provenance, dict)
+            or type(provenance.get("staged")) is not bool
+            or provenance.get("harness_revision") != revision
+            or provenance.get("distro") != distro
+            or provenance.get("arch") != "x86_64"):
+        raise ValueError("published evidence provenance mismatch")
+    if provenance["staged"]:
+        return None
+    if (provenance.get("artifact_attestation_verified") is not True
+            or not isinstance(provenance.get("artifact_tag"), str)
+            or not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", provenance["artifact_tag"])
+            or not isinstance(provenance.get("inventory_revision"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", provenance["inventory_revision"])):
+        raise ValueError("published evidence provenance mismatch")
+    return provenance["artifact_tag"], provenance["inventory_revision"]
 
 
 def workflow_receipt(jobs, conclusion):
@@ -301,10 +325,13 @@ def main():
     if run["conclusion"] in ("cancelled", "skipped"):
         print("Cancelled/skipped run retained in Actions; no failure issue generated")
         return 0
-    successful_main = False
-    if run["conclusion"] == "success" and run["event"] == "push" and run["head_branch"] == "main":
-        main_ref = json.loads(api(f"repos/{repository}/git/ref/heads/main"))
-        successful_main = main_ref["object"]["sha"] == run["head_sha"]
+    published_candidate = (run["conclusion"] == "success"
+                           and run["path"] == ".github/workflows/qemu-matrix.yml"
+                           and run["event"] in ("schedule", "workflow_dispatch")
+                           and run["head_branch"] == "main")
+    verified_published = False
+    published_tag = None
+    published_revision = None
     rows = []
     diagnostics = {}
     evidence_error = False
@@ -313,6 +340,7 @@ def main():
         if listing["total_count"] > 100:
             raise ValueError("too many artifacts")
         guest_artifacts = set()
+        published_artifacts = {}
         for artifact in listing["artifacts"]:
             if not re.fullmatch(r"qemu-(?:arm-)?evidence-(?:arch|debian|ubuntu|fedora)|qemu-workflow-report", artifact["name"]):
                 continue
@@ -322,16 +350,37 @@ def main():
                 raise ValueError("stale or expired artifact")
             if type(artifact["id"]) is not int or artifact["size_in_bytes"] > MAX_DOWNLOAD:
                 raise ValueError("invalid artifact identity or size")
-            rows.extend(archive_rows(
-                api(f"repos/{repository}/actions/artifacts/{artifact['id']}/zip", MAX_DOWNLOAD),
-                allowed_cases, diagnostics,
-            ))
+            content = api(f"repos/{repository}/actions/artifacts/{artifact['id']}/zip", MAX_DOWNLOAD)
+            rows.extend(archive_rows(content, allowed_cases, diagnostics))
             guest_artifacts.add(artifact["name"])
+            if published_candidate and artifact["name"].startswith("qemu-evidence-"):
+                if artifact["name"] in published_artifacts:
+                    raise ValueError("duplicate published guest artifact")
+                published_artifacts[artifact["name"]] = content
         if run["path"] == ".github/workflows/ci.yml" and run["conclusion"] == "success":
             if (not {f"qemu-evidence-{distro}" for distro in DISTROS} <= guest_artifacts
                     or not set(DISTROS) <= {row["distro"] for row in rows}):
                 raise ValueError("successful CI is missing required Linux guest evidence")
-        selected = projection(rows, successful_main)
+        if published_candidate:
+            required = {f"qemu-evidence-{distro}" for distro in DISTROS}
+            if (set(published_artifacts) == required
+                    and set(DISTROS) <= {row["distro"] for row in rows}):
+                sources = {published_provenance(published_artifacts[f"qemu-evidence-{distro}"],
+                                                distro, run["head_sha"]) for distro in DISTROS}
+                if None in sources and len(sources) > 1:
+                    raise ValueError("mixed staged and published guest artifacts")
+                if None not in sources:
+                    if len(sources) != 1:
+                        raise ValueError("published guest artifacts disagree on release tag")
+                    source_tag, source_revision = next(iter(sources))
+                    release_commit = json.loads(api(f"repos/{repository}/commits/{source_tag}"))
+                    if release_commit.get("sha") != source_revision:
+                        raise ValueError("published inventory revision does not match release tag")
+                    latest = json.loads(api(f"repos/{repository}/releases/latest"))
+                    verified_published = latest.get("tag_name") == source_tag
+                    published_tag = source_tag if verified_published else None
+                    published_revision = source_revision if verified_published else None
+        selected = projection(rows, verified_published)
     except (ValueError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError):
         selected = []
         evidence_error = True
@@ -348,12 +397,20 @@ def main():
         return 0
     # Recheck after downloads: an operator may have rerun this ID meanwhile.
     identity(event, json.loads(api(f"repos/{repository}/actions/runs/{run_id}")), repository)
-    if successful_main:
+    if verified_published:
         current = json.loads(api(f"repos/{repository}/git/ref/heads/main"))
-        if current["object"]["sha"] != run["head_sha"]:
+        latest = json.loads(api(f"repos/{repository}/releases/latest"))
+        release_commit = json.loads(api(f"repos/{repository}/commits/{published_tag}"))
+        if (current["object"]["sha"] != run["head_sha"]
+                or latest.get("tag_name") != published_tag
+                or release_commit.get("sha") != published_revision):
             selected = [row for row in selected if row["result"] != "PASS"]
+            verified_published = False
         elif not evidence_error:
             selected.append(receipt)
+    if not selected:
+        print("No authoritative case updates to report")
+        return 0
     details = []
     for job in jobs["jobs"][:100]:
         if job["conclusion"] not in ("success", "skipped"):
@@ -394,8 +451,11 @@ def main():
                     + diagnostics.get((row["case_id"], row["distro"]), "No case log available; inspect linked artifacts.")
                     + "\n" + catalog_note)
         run_url = f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}"
-        subprocess.run(["bash", "scripts/qa-file-issue.sh", str(results), "--repo", repository,
-                        "--source", "qemu-matrix", "--run-url", run_url], check=True, timeout=180)
+        helper = ["bash", "scripts/qa-file-issue.sh", str(results), "--repo", repository,
+                  "--source", "qemu-matrix", "--run-url", run_url]
+        if not verified_published:
+            helper.append("--failures-only")
+        subprocess.run(helper, check=True, timeout=180)
         if run["event"] == "pull_request" or evidence_error:
             subprocess.run(["bash", "scripts/report-smoke-sentry.sh", str(results)], check=True, timeout=20)
     print(f"Reported run {run_id}, attempt {run['run_attempt']}, commit {run['head_sha']}")
