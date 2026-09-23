@@ -68,6 +68,45 @@ check_package_query_outputs() {
   ' "$daemon_search" "$daemon_info" "$direct_search" "$direct_info" >/dev/null
 }
 # END PACKAGE QUERY ORACLE
+# BEGIN PACKAGE IPC ORACLE
+metric_counter() {
+  local file=$1 metric=$2
+  awk -v metric="$metric" '
+    $1 == metric {
+      found++
+      if (NF == 2 && $2 ~ /^(0|[1-9][0-9]*)$/) value=$2
+      else invalid=1
+    }
+    END {
+      if (found != 1 || invalid) exit 1
+      print value
+    }
+  ' "$file"
+}
+check_package_ipc_delta() {
+  local before=$1 after=$2 expected_search=$3 expected_info=$4
+  local search_before search_after info_before info_after
+  [[ "$expected_search" == 0 || "$expected_search" == 1 ]] || return 2
+  [[ "$expected_info" == 0 || "$expected_info" == 1 ]] || return 2
+  search_before=$(metric_counter "$before" omg_search_requests_total) || return 1
+  search_after=$(metric_counter "$after" omg_search_requests_total) || return 1
+  info_before=$(metric_counter "$before" omg_info_requests_total) || return 1
+  info_after=$(metric_counter "$after" omg_info_requests_total) || return 1
+  (( search_after - search_before == expected_search && info_after - info_before == expected_info ))
+}
+# END PACKAGE IPC ORACLE
+# BEGIN INFO PROVENANCE ORACLE
+check_daemon_info_provenance() {
+  local daemon_info=$1 native_info=$2
+  jq -e -s '
+    length == 2 and
+    (.[0] | type) == "object" and (.[1] | type) == "object" and
+    .[0].source == "Official" and
+    (.[0].download_size | type) == "number" and
+    (.[1].source != "Official" or (.[1].download_size | type) != "number")
+  ' "$daemon_info" "$native_info" >/dev/null
+}
+# END INFO PROVENANCE ORACLE
 # BEGIN TEXT INFO ORACLE
 check_text_info_outputs() {
   local name=$1 daemon_output=$2 direct_output=$3 output
@@ -152,8 +191,27 @@ query_cli() {
 }
 query_package_cli() {
   local label=$1
+  if [[ "$label" == daemon-direct ]]; then
+    timeout 5 "$bin" metrics > "$evidence/$label-before-search.prom"
+  fi
   timeout 15 "$bin" --json search --no-aur --limit 50 bash > "$evidence/$label-search.json"
+  if [[ "$label" == daemon-direct ]]; then
+    timeout 5 "$bin" metrics > "$evidence/$label-after-search.prom"
+    if ! check_package_ipc_delta "$evidence/$label-before-search.prom" \
+      "$evidence/$label-after-search.prom" 1 0; then
+      printf 'assertion failed: daemon search did not use one Search IPC request\n' >&2
+      return 1
+    fi
+  fi
   timeout 15 "$bin" --json info bash > "$evidence/$label-info.json"
+  if [[ "$label" == daemon-direct ]]; then
+    timeout 5 "$bin" metrics > "$evidence/$label-after-info.prom"
+    if ! check_package_ipc_delta "$evidence/$label-after-search.prom" \
+      "$evidence/$label-after-info.prom" 0 1; then
+      printf 'assertion failed: daemon JSON info did not use one Info IPC request\n' >&2
+      return 1
+    fi
+  fi
   timeout 15 "$bin" info bash > "$evidence/$label-info.txt"
 }
 daemon_pid= launcher_pid=
@@ -305,6 +363,11 @@ for mode in direct foreground direct-sigint foreground-sigint; do
 done
 OMG_DISABLE_DAEMON=1 query_cli daemon-stopped
 OMG_DISABLE_DAEMON=1 query_package_cli daemon-stopped
+if ! check_daemon_info_provenance "$evidence/daemon-direct-info.json" \
+  "$evidence/daemon-stopped-info.json"; then
+  printf 'assertion failed: daemon JSON info lacks IPC response provenance\n' >&2
+  exit 1
+fi
 if ! check_package_query_outputs bash \
   "$evidence/daemon-direct-search.json" "$evidence/daemon-direct-info.json" \
   "$evidence/daemon-stopped-search.json" "$evidence/daemon-stopped-info.json"; then

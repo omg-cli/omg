@@ -620,6 +620,16 @@ pub async fn metrics() -> Result<()> {
                 snapshot.security_audit_requests
             );
 
+            println!(
+                "# HELP omg_search_requests_total Package search requests handled by the daemon"
+            );
+            println!("# TYPE omg_search_requests_total counter");
+            println!("omg_search_requests_total {}", snapshot.search_requests);
+
+            println!("# HELP omg_info_requests_total Package info requests handled by the daemon");
+            println!("# TYPE omg_info_requests_total counter");
+            println!("omg_info_requests_total {}", snapshot.info_requests);
+
             println!("# HELP omg_bytes_received_total Total bytes received by daemon");
             println!("# TYPE omg_bytes_received_total counter");
             println!("omg_bytes_received_total {}", snapshot.bytes_received);

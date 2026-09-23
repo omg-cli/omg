@@ -33,6 +33,8 @@ HOST_FILES = {
 }
 GUEST_FILES = {
     "daemon-advisory-shutdown.log",
+    "daemon-direct-before-search.prom", "daemon-direct-after-search.prom",
+    "daemon-direct-after-info.prom",
     "dnf-reason-fault.stdout.log", "dnf-reason-fault.stderr.log",
     "native-explicit.txt", "native-explicit.json",
     "daemon-direct-after-queries.txt", "daemon-foreground-after-queries.txt",

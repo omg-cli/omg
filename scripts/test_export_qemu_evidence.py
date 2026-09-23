@@ -32,7 +32,9 @@ class AllowlistTests(unittest.TestCase):
     def test_native_query_diagnostics_are_confined_to_guest_evidence(self):
         names = ["native-explicit.txt", "native-explicit.json",
                  "dnf-reason-fault.stdout.log", "dnf-reason-fault.stderr.log",
-                 "daemon-direct-after-queries.txt", "daemon-foreground-after-queries.txt"]
+                 "daemon-direct-after-queries.txt", "daemon-foreground-after-queries.txt",
+                 "daemon-direct-before-search.prom", "daemon-direct-after-search.prom",
+                 "daemon-direct-after-info.prom"]
         names += [f"daemon-invalid-{index}.{stream}"
                   for index in range(7) for stream in ("stdout", "stderr")]
         names += [f"{label}-{suffix}"
@@ -138,6 +140,26 @@ class DescriptorTests(unittest.TestCase):
                              ("diagnostic:" + name).encode())
         for name in TRANSACTION_PRIVATE:
             self.assertFalse((self.destination / (prefix + name)).exists())
+
+    def test_daemon_ipc_snapshots_survive_export(self):
+        prefix = "run-test/guest/evidence/"
+        names = (
+            "daemon-direct-before-search.prom",
+            "daemon-direct-after-search.prom",
+            "daemon-direct-after-info.prom",
+        )
+        for index, name in enumerate(names):
+            self.fixture(prefix + name, f"omg_info_requests_total {index}\n".encode())
+        self.fixture(prefix + "daemon-direct-private.prom", b"private")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(set(report["copied"]), {prefix + name for name in names})
+        for index, name in enumerate(names):
+            self.assertEqual(
+                (self.destination / (prefix + name)).read_bytes(),
+                f"omg_info_requests_total {index}\n".encode(),
+            )
+        self.assertFalse((self.destination / (prefix + "daemon-direct-private.prom")).exists())
 
     def test_symlink_hardlink_and_fifo_cannot_export_external_bytes(self):
         external = self.root / "private"
