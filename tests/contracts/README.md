@@ -181,6 +181,16 @@ processes, verifies successful termination and socket removal, and starts the
 next lifecycle against the same private state. Admission requires `sigint: true`;
 signal-specific logs and query outputs remain separate exported artifacts.
 
+The Arch QEMU lifecycle also runs its submitted OMG binary against a loopback,
+TLS-verified AUR RPC fixture. A unique search must return exact detailed votes,
+popularity, maintainer and out-of-date metadata. The same query with `--no-aur`
+must return no AUR package and make no extra proxy connection; a basic search
+must omit detailed fields. The guest emits an evidence receipt only after these
+checks, and the host independently requires the expected AUR connection log.
+This proves the two flag effects for the controlled response, not live AUR
+availability or every upstream response shape. Native contract-manifest gaps
+remain separate from this QEMU evidence.
+
 QEMU's `runtime-python-install` row requires a numeric requested version, uses
 private runtime state, checks the active link and executable stay inside the
 installed version, and runs that interpreter to verify its exact version.
