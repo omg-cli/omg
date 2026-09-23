@@ -405,6 +405,21 @@ case "$1" in
           invalid) printf '%s\n' '{"schema_version":1,"ipc":false}' > "$work/guest/evidence/daemon-lifecycle.json" ;;
           missing) ;;
         esac
+        case ${FAKE_QEMU_AUR_RECEIPT:-valid} in
+          valid|wrong-events)
+            printf '%s\n' '{"schema_version":1,"arch":true,"real_cli":true,"tls_fixture":true,"detailed_metadata":true,"no_aur_suppressed":true,"basic_metadata_absent":true,"expected_connects":2,"expected_requests":2,"unexpected_events":0}' > "$work/guest/evidence/aur-search-flags.json"
+            printf '%s\n' \
+              '{"event":"connect","value":"aur.archlinux.org:443"}' \
+              '{"event":"request","value":"/rpc?v=5&type=search&arg=omgqemuaurprobe"}' \
+              '{"event":"connect","value":"aur.archlinux.org:443"}' \
+              '{"event":"request","value":"/rpc?v=5&type=search&arg=omgqemuaurprobe"}' \
+              > "$work/guest/evidence/aur-fixture-events.jsonl"
+            if [[ ${FAKE_QEMU_AUR_RECEIPT:-valid} == wrong-events ]]; then
+              printf '%s\n' '{"event":"connect","value":"aur.archlinux.org:443"}' >> "$work/guest/evidence/aur-fixture-events.jsonl"
+            fi ;;
+          invalid) printf '%s\n' '{"schema_version":1,"no_aur_suppressed":false}' > "$work/guest/evidence/aur-search-flags.json" ;;
+          missing) ;;
+        esac
         if [[ ${FAKE_QEMU_BENCHMARK:-0} == 1 ]]; then
           benchmark="$work/guest/evidence/benchmarks"
           mkdir -p "$benchmark"
@@ -448,9 +463,10 @@ done
 [[ -n "$child_result" ]] || fail 'interrupted QEMU child did not record its exit'
 
 export FAKE_QEMU_INFO_EXIT=0 FAKE_QEMU_STATE="$scratch/qemu-controller"
-for scenario in pass pull-failure product-failure product-exit-three timeout cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon kernel-crash controller-oom missing-health; do
+for scenario in pass pull-failure product-failure product-exit-three timeout cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-aur invalid-aur wrong-aur-events kernel-crash controller-oom missing-health; do
   export FAKE_QEMU_PULL_EXIT=0
   export FAKE_QEMU_DAEMON_RECEIPT=valid
+  export FAKE_QEMU_AUR_RECEIPT=valid
   export FAKE_QEMU_GUEST_EXIT=0 FAKE_QEMU_CLEANUP_FAIL=0 FAKE_QEMU_MISSING_RECEIPT=0
   export FAKE_QEMU_SERIAL='Linux version 6.12 fixture' FAKE_QEMU_OOM=false FAKE_QEMU_HEALTH_MISSING=0
   unset FAKE_QEMU_TRANSPORT_EXIT
@@ -460,6 +476,9 @@ for scenario in pass pull-failure product-failure product-exit-three timeout cle
     pull-failure) export FAKE_QEMU_PULL_EXIT=1; expected_rc=3; expected_result=HARNESS_ERROR ;;
     missing-daemon) export FAKE_QEMU_DAEMON_RECEIPT=missing; expected_rc=1; expected_result=HARNESS_ERROR ;;
     invalid-daemon) export FAKE_QEMU_DAEMON_RECEIPT=invalid; expected_rc=1; expected_result=HARNESS_ERROR ;;
+    missing-aur) export FAKE_QEMU_AUR_RECEIPT=missing; expected_rc=1; expected_result=HARNESS_ERROR ;;
+    invalid-aur) export FAKE_QEMU_AUR_RECEIPT=invalid; expected_rc=1; expected_result=HARNESS_ERROR ;;
+    wrong-aur-events) export FAKE_QEMU_AUR_RECEIPT=wrong-events; expected_rc=1; expected_result=HARNESS_ERROR ;;
     kernel-crash) export FAKE_QEMU_SERIAL='Kernel panic - not syncing: fixture'; expected_rc=120; expected_result=HARNESS_ERROR ;;
     controller-oom) export FAKE_QEMU_OOM=true; expected_rc=120; expected_result=HARNESS_ERROR ;;
     missing-health) export FAKE_QEMU_HEALTH_MISSING=1; expected_rc=120; expected_result=HARNESS_ERROR ;;

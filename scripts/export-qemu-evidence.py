@@ -32,6 +32,9 @@ HOST_FILES = {
     "benchmark-driver-sha256.txt", "cases.tsv", "controller-id.txt", "release-checksum.txt",
 }
 GUEST_FILES = {
+    "aur-search-flags.json", "aur-fixture-events.jsonl", "aur-detailed.json",
+    "aur-no-aur.json", "aur-basic.json", "aur-cert.log", "aur-fixture-preflight.log",
+    "aur-fixture.stdout", "aur-fixture.stderr",
     "daemon-advisory-shutdown.log",
     "dnf-reason-fault.stdout.log", "dnf-reason-fault.stderr.log",
     "native-explicit.txt", "native-explicit.json",
