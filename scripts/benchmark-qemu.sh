@@ -388,6 +388,7 @@ if [[ "$restrict_egress" == true ]]; then
 fi
 timeout --kill-after=5s 600 docker exec "$controller" sh -c "apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends $qemu_pkg qemu-utils cloud-image-utils openssh-client curl ca-certificates $firmware_pkg jq" > "$work/controller-setup.log" 2>&1
 cp "$here/check-qemu-controller.sh" "$work/check-qemu-controller.sh"
+cp "$here/check-qemu-cloud-init.sh" "$work/check-qemu-cloud-init.sh"
 timeout 30 docker exec "$controller" bash /work/check-qemu-controller.sh "$qemu_pkg" > "$work/controller-security.log" 2>&1
 # A cache hit is only a transport optimization: copy and hash the bytes before
 # handing them to the controller, then verify again there and against policy.
@@ -533,9 +534,10 @@ wait_ssh() {
   return 1
 }
 wait_ssh
-# Exit 2 means recoverable initialization errors, not a clean boot. Keep all
-# nonzero statuses fatal, but include the detailed errors in boot.log.
-timeout 180 ssh "${opts[@]}" bench@127.0.0.1 'cloud-init status --wait --long && cat /etc/os-release && uname -r && sudo -n true'
+# The controller checks cloud-init's authoritative runtime records and
+# systemd target without starting a second Python process inside the guest.
+bash /work/check-qemu-cloud-init.sh bench@127.0.0.1 "${opts[@]}"
+timeout 15 ssh "${opts[@]}" bench@127.0.0.1 'cat /etc/os-release && uname -r && sudo -n true'
 if [[ "$initial" == false ]]; then exit 0; fi
 # Arm diagnostics before the first reboot and every subsequent disk clone.
 # The timer has no network-online dependency, so failed DHCP/SSH cannot hide it.
