@@ -133,7 +133,7 @@ jobs:
                 "distro": "fedora",
                 "image": "fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
                 "features": "fedora,pgp,license",
-                "setup": "dnf install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\ndnf makecache --refresh\n"
+                "setup": "timeout -k 10s 12m dnf \\\n  --setopt=fedora.metalink= \\\n  --setopt=fedora.baseurl='https://dl.fedoraproject.org/pub/fedora/linux/releases/$releasever/Everything/$basearch/os/' \\\n  --setopt=updates.metalink= \\\n  --setopt=updates.baseurl='https://dl.fedoraproject.org/pub/fedora/linux/updates/$releasever/Everything/$basearch/' \\\n  install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\n"
               }
             ]
           BUILD_ARM64: |
@@ -148,7 +148,7 @@ jobs:
                 "distro": "fedora",
                 "image": "fedora:latest@sha256:e402cca673711fee025f9ce21c6c08b1bd25ee26b3c482119c8675fbaaedbc85",
                 "features": "fedora,pgp,license",
-                "setup": "dnf install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\ndnf makecache --refresh\n"
+                "setup": "timeout -k 10s 12m dnf \\\n  --setopt=fedora.metalink= \\\n  --setopt=fedora.baseurl='https://dl.fedoraproject.org/pub/fedora/linux/releases/$releasever/Everything/$basearch/os/' \\\n  --setopt=updates.metalink= \\\n  --setopt=updates.baseurl='https://dl.fedoraproject.org/pub/fedora/linux/updates/$releasever/Everything/$basearch/' \\\n  install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\n"
               }
             ]
           REQUESTED_RELEASE_TAG: ${{ inputs.tag }}
