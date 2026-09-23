@@ -564,6 +564,7 @@ if [[ -n "$inventory_tiers" ]]; then
   # The inventory executor runs inside the controller (same netns as the
   # guest); /work is bind-mounted there.
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
+  cp "$here/qemu-fedora-update-fixture.sh" "$work/qemu-fedora-update-fixture.sh"
   cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"
   cp "$tsv" "$work/cases.tsv"
   if [[ "$inventory_isolation" == true ]]; then
@@ -697,7 +698,7 @@ if [[ -n "$inventory_tiers" ]]; then
   case "$distro" in
     arch) sudo -n pacman -S --noconfirm --needed git make curl python strace ;;
     debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace ;;
-    fedora) sudo -n dnf install -y git make curl python3 strace podman ;;
+    fedora) sudo -n dnf install -y git make curl python3 strace podman rpm-build createrepo_c ;;
   esac > evidence/inventory-setup.txt 2>&1 || exit 120
   # The hermetic `new` row exercises the missing-toolchain refusal. A guest
   # with Cargo installed is a different fixture, not a product failure.
@@ -720,6 +721,9 @@ opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHo
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
+if [[ -n "$inventory_tiers" ]]; then
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fedora-update-fixture.sh bench@127.0.0.1:qemu-fedora-update-fixture.sh
+fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/daemon-advisory-shutdown.sh bench@127.0.0.1:daemon-advisory-shutdown.sh
 if [[ "$benchmark" == true ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/benchmark-hyperfine.sh bench@127.0.0.1:benchmark-hyperfine.sh

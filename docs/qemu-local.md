@@ -171,6 +171,17 @@ when the command succeeds. A known defect remains a failure, not a pass.
 The guest fixture provides Podman on Fedora and requires no container engine on
 the other three images. Container command exit expectations reflect that fixture.
 An unexpected engine configuration fails setup rather than changing expectations.
+Fedora's `update --fast` and `update --turbo` rows build a two-version RPM in
+the disposable guest and temporarily restrict DNF to one local repository.
+The fast row begins with stale cached metadata and requires a refreshed upgrade;
+the turbo row begins with cached metadata and RPM content. Both require the
+native RPM version to change from 1 to 2, a matching DNF upgrade history entry,
+and no unrelated installed-package changes. The fixture restores DNF policy and
+removes its package after each row. See the [DNF5 cache rules](https://dnf5.readthedocs.io/en/latest/misc/caching.7.html).
+The offline daemon row runs first because switching repository policy expires
+DNF's warm user cache even after the original policy is restored. The turbo
+fixture publishes version 3 after caching version 2, so an online upgrade
+cannot satisfy its version-2 oracle.
 Gated or failed prerequisites block their dependents. Missing receipts,
 transport failures, and empty execution selections fail the harness.
 

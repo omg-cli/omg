@@ -1545,19 +1545,25 @@ impl PackageManager for DnfPackageManager {
 
     fn sync(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            // Clear caches and let the dnf CLI refresh its metadata
+            // Force fresh repository metadata in the caller's cache before
+            // list_updates() reads it with --cacheonly. A root-only refresh
+            // leaves an unprivileged caller's existing cache stale.
             self.invalidate_installed_cache();
-
-            if !is_root() {
-                crate::core::privilege::run_privileged_program("dnf", &["makecache", "-y"]).await?;
-                return Ok(());
-            }
 
             tokio::task::spawn_blocking({
                 let manager = self.cache_handle();
-                move || manager.run_dnf(&["makecache", "-y"])
+                move || manager.run_dnf(&["--refresh", "makecache", "-y"])
             })
-            .await?
+            .await??;
+
+            if !is_root() {
+                crate::core::privilege::run_privileged_program(
+                    "dnf",
+                    &["--refresh", "makecache", "-y"],
+                )
+                .await?;
+            }
+            Ok(())
         })
     }
 
