@@ -376,6 +376,18 @@ check_product_output() {
         if [[ ! -f "$artifact" || -L "$artifact" ]] || ! jq -e -s 'length == 1' "$artifact" >/dev/null 2>&1; then
           printf 'assertion failed: artifact %s is not a regular JSON document\n' "$artifact" >&2; return 1
         fi ;;
+      sbom-inventory-only)
+        if [[ ! -f sbom.json || -L sbom.json ]] || ! jq -e -s '
+          length == 1 and (.[0] |
+            .bomFormat == "CycloneDX" and
+            (.components | type == "array" and length > 0) and
+            ((.metadata.component.properties // []) |
+              any(.[]; .name == "omg:advisory-scan" and .value == "not-performed")) and
+            ((.vulnerabilities // []) | type == "array" and length == 0))
+        ' sbom.json >/dev/null 2>&1 \
+          || ! grep -Fq 'Inventory only: advisory matching was skipped' "$stdout"; then
+          printf 'assertion failed: inventory-only SBOM lacks the advisory-scan marker or warning\n' >&2; return 1
+        fi ;;
       update-fast-output)
         if ! grep -Fq 'Fast System Update' "$stdout" \
           || ! grep -Eqi 'Syncing package|Synced' "$stdout" \
@@ -563,7 +575,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three) ;; *) exit 2 ;; esac
+  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three) ;; *) exit 2 ;; esac
   case "$cleanup" in tempdir-drop|none|container-prune|host-state-restore|vm-revert|daemon-stop) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"

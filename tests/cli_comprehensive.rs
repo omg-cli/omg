@@ -507,6 +507,7 @@ enum Assertion {
     AuditSourceFailure,
     AuditFixRefusal,
     SbomSourceFailure,
+    SbomInventoryOnly,
     JsonStdout,
     Artifact(String),
     WorkspaceFilteredOutput,
@@ -525,6 +526,7 @@ impl Assertion {
             "audit-source-failure" => Self::AuditSourceFailure,
             "audit-fix-refusal" => Self::AuditFixRefusal,
             "sbom-source-failure" => Self::SbomSourceFailure,
+            "sbom-inventory-only" => Self::SbomInventoryOnly,
             "json-stdout" => Self::JsonStdout,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
@@ -1283,6 +1285,32 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         );
                     }
                 }
+                Assertion::SbomInventoryOnly => {
+                    let report = std::fs::read_to_string(project.path().join("sbom.json"))
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+                    let marked = report.as_ref().is_some_and(|report| {
+                        report["bomFormat"] == "CycloneDX"
+                            && report["components"].as_array().is_some()
+                            && report
+                                .get("vulnerabilities")
+                                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+                            && report["metadata"]["component"]["properties"]
+                                .as_array()
+                                .is_some_and(|properties| {
+                                    properties.iter().any(|property| {
+                                        property["name"] == "omg:advisory-scan"
+                                            && property["value"] == "not-performed"
+                                    })
+                                })
+                    });
+                    if !marked || !result.stdout.contains("advisory matching was skipped") {
+                        issues.push(
+                            "inventory-only SBOM did not label skipped advisory matching"
+                                .to_string(),
+                        );
+                    }
+                }
                 Assertion::AuditSourceFailure | Assertion::AuditFixRefusal => {
                     assert!(
                         audit_success.is_some(),
@@ -1349,25 +1377,6 @@ fn behavior_inventory_runs_in_hermetic_state() {
                             "artifact {relative} was not written as valid JSON at {}",
                             path.display()
                         ));
-                    }
-                    if case.id == "audit-sbom-inventory-only" {
-                        let marked = artifact.as_ref().is_some_and(|report| {
-                            report["bomFormat"] == "CycloneDX"
-                                && report["metadata"]["component"]["properties"]
-                                    .as_array()
-                                    .is_some_and(|properties| {
-                                        properties.iter().any(|property| {
-                                            property["name"] == "omg:advisory-scan"
-                                                && property["value"] == "not-performed"
-                                        })
-                                    })
-                        });
-                        if !marked || !result.stdout.contains("advisory matching was skipped") {
-                            issues.push(
-                                "inventory-only SBOM did not label skipped advisory matching"
-                                    .to_string(),
-                            );
-                        }
                     }
                 }
                 Assertion::UpdateFastOutput

@@ -311,7 +311,8 @@ fn generate_github_actions(advanced: bool) -> Result<()> {
 
 fn gitlab_ci_config(advanced: bool) -> &'static str {
     if advanced {
-        r#"# Use a runner or image with a verified OMG release preinstalled.
+        r#"# Provision a runner or image from a verified OMG release before using this template.
+# This preflight checks executable health, not release provenance.
 # Advanced security also requires Cargo.toml and a committed Cargo.lock.
 stages:
   - build
@@ -325,6 +326,7 @@ default:
         echo "OMG is missing. Configure a runner/image with a verified OMG release; install with gh attestation verification." >&2
         exit 1
       fi
+      omg --version >/dev/null || { echo "OMG is present but cannot execute" >&2; exit 1; }
     - |
       if test -f omg.lock; then omg env check; else echo "No omg.lock; skipping environment check"; fi
 
@@ -361,7 +363,8 @@ security:
       - security-sboms/
 "#
     } else {
-        r#"# Use a runner or image with a verified OMG release preinstalled.
+        r#"# Provision a runner or image from a verified OMG release before using this template.
+# This preflight checks executable health, not release provenance.
 stages:
   - build
   - test
@@ -373,6 +376,7 @@ default:
         echo "OMG is missing. Configure a runner/image with a verified OMG release; install with gh attestation verification." >&2
         exit 1
       fi
+      omg --version >/dev/null || { echo "OMG is present but cannot execute" >&2; exit 1; }
     - |
       if test -f omg.lock; then omg env check; else echo "No omg.lock; skipping environment check"; fi
 
@@ -400,17 +404,18 @@ fn circleci_config(advanced: bool) -> &'static str {
 jobs:
   build-and-test:
     docker:
-      # Replace this with an image containing a verified OMG release.
+      # Replace this with an image built from a verified OMG release.
       - image: cimg/base:stable
     steps:
       - checkout
       - run:
-          name: Require verified OMG on this runner
+          name: Require working OMG on this runner
           command: |
             if ! command -v omg >/dev/null 2>&1; then
               echo "OMG is missing. Use an image with a verified OMG release; install with gh attestation verification." >&2
               exit 1
             fi
+            omg --version >/dev/null || { echo "OMG is present but cannot execute" >&2; exit 1; }
       - run:
           name: Check committed OMG environment
           command: |
@@ -461,17 +466,18 @@ workflows:
 jobs:
   build-and-test:
     docker:
-      # Replace this with an image containing a verified OMG release.
+      # Replace this with an image built from a verified OMG release.
       - image: cimg/base:stable
     steps:
       - checkout
       - run:
-          name: Require verified OMG on this runner
+          name: Require working OMG on this runner
           command: |
             if ! command -v omg >/dev/null 2>&1; then
               echo "OMG is missing. Use an image with a verified OMG release; install with gh attestation verification." >&2
               exit 1
             fi
+            omg --version >/dev/null || { echo "OMG is present but cannot execute" >&2; exit 1; }
       - run:
           name: Check committed OMG environment
           command: |
@@ -534,6 +540,8 @@ mod tests {
                 assert!(config.contains("bash omg-install.sh"));
             } else {
                 assert!(config.contains("command -v omg"));
+                assert!(config.contains("omg --version"));
+                assert!(!config.contains("Require verified OMG on this runner"));
                 assert!(config.contains("verified OMG release"));
                 assert!(!config.contains("install.sh"));
             }
