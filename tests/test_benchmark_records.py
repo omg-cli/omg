@@ -478,30 +478,28 @@ class QemuCloudInitTests(unittest.TestCase):
                 "[127.0.0.1]:2222 ssh-ed25519 fixture-host\n",
             )
 
-    def test_cloud_init_gate_keeps_all_errors_fatal_and_reports_details(self) -> None:
-        gate = next(line for line in self.text.splitlines() if line.startswith("timeout 180 ssh "))
-        remote = shlex.split(gate)[-1]
+    def test_guest_probe_runs_after_cloud_init_gate_and_keeps_failures_fatal(self) -> None:
+        gate = 'bash /work/check-qemu-cloud-init.sh bench@127.0.0.1 "${opts[@]}"'
+        probe = next(line for line in self.text.splitlines()
+                     if line.startswith("timeout 15 ssh ") and "os-release" in line)
+        self.assertLess(self.text.index(gate), self.text.index(probe))
+        remote = shlex.split(probe)[-1]
         mocks = """
-cloud-init() {
-  [[ "$*" == 'status --wait --long' ]] || return 99
-  printf 'status: done\nrecoverable_errors: fixture-details\n'
-  return "$CLOUD_INIT_STATUS"
-}
 cat() { printf 'guest-os\n'; }
 uname() { printf 'guest-kernel\n'; }
-sudo() { printf 'sudo-ok\n'; }
+sudo() { printf 'sudo-ok\n'; return "$SUDO_STATUS"; }
 """
-        for status in (0, 1, 2, 124):
+        for status in (0, 1):
             with self.subTest(status=status):
                 result = subprocess.run(
                     [self.bash, "-c", mocks + remote],
-                    env=dict(os.environ, CLOUD_INIT_STATUS=str(status)),
+                    env=dict(os.environ, SUDO_STATUS=str(status)),
                     capture_output=True, text=True, timeout=10,
                 )
                 self.assertEqual(result.returncode, status, result.stderr)
-                self.assertIn("recoverable_errors: fixture-details", result.stdout)
-                self.assertEqual("sudo-ok" in result.stdout, status == 0)
-                self.assertEqual("guest-os" in result.stdout, status == 0)
+                self.assertIn("guest-os", result.stdout)
+                self.assertIn("guest-kernel", result.stdout)
+                self.assertIn("sudo-ok", result.stdout)
 
 
 class HeadlineResolutionTests(unittest.TestCase):
