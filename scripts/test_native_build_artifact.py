@@ -143,12 +143,14 @@ class NativeBuildAdmission(unittest.TestCase):
 
     def test_reuse_checks_live_attempt_and_writes_only_validated_files(self):
         for mode in ('valid', 'in-progress', 'queued', 'queued-artifact', 'waiting-artifact',
-                     'changed-attempt', 'expired', 'older-attempt', 'missing'):
+                     'rerun-artifact', 'changed-attempt', 'expired', 'older-attempt',
+                     'invalid-artifact-timestamp', 'future-attempt', 'missing'):
             expected, provenance, payload = fixture()
             data = bundle(provenance, payload)
             run = dict(id=123, run_attempt=1, repository={'full_name': 'omg-cli/omg'},
                        path='.github/workflows/ci.yml', workflow_id=42, event='pull_request',
                        head_sha='c'*40, pull_requests=[{'number': 440}],
+                       created_at='2026-09-20T08:55:00Z',
                        run_started_at='2026-09-20T09:00:00Z', status='completed', conclusion='success')
             if mode == 'in-progress':
                 # Main CI's release job waits for QEMU; requiring workflow
@@ -156,12 +158,19 @@ class NativeBuildAdmission(unittest.TestCase):
                 run.update(status='in_progress', conclusion=None)
             if mode in ('queued-artifact', 'waiting-artifact'):
                 run.update(status=mode.split('-')[0], conclusion=None)
+            if mode == 'rerun-artifact':
+                run.update(run_attempt=2, run_started_at='2026-09-20T09:20:00Z',
+                           status='in_progress', conclusion=None)
             artifact = dict(id=9, name='native-release-debian-1', size_in_bytes=len(data), expired=False,
                             created_at='2026-09-20T09:01:00Z', digest='sha256:' + hashlib.sha256(data).hexdigest())
             if mode == 'expired':
                 artifact['expired'] = True
             if mode == 'older-attempt':
-                artifact['created_at'] = '2026-09-20T08:59:59Z'
+                artifact['created_at'] = '2026-09-20T08:54:59Z'
+            if mode == 'invalid-artifact-timestamp':
+                artifact['created_at'] = 'later'
+            if mode == 'future-attempt':
+                artifact['name'] = 'native-release-debian-2'
             def lookup(path):
                 if path.endswith('/workflows/ci.yml'):
                     return {'id': 42, 'path': '.github/workflows/ci.yml'}
@@ -173,6 +182,12 @@ class NativeBuildAdmission(unittest.TestCase):
                             'artifacts': [] if mode == 'missing' else [artifact]}
                 if path.endswith('/runs/123'):
                     return dict(run, run_attempt=2) if mode == 'changed-attempt' else run
+                if mode == 'rerun-artifact' and path.endswith('/attempts/2/jobs?per_page=100'):
+                    return {'total_count': 0, 'jobs': []}
+                if mode == 'rerun-artifact' and path.endswith('/attempts/1'):
+                    return dict(run, run_attempt=1, run_started_at='2026-09-20T09:00:00Z')
+                if mode == 'rerun-artifact' and path.endswith('/attempts/1/jobs?per_page=100'):
+                    return {'total_count': 0, 'jobs': []}
                 self.fail('unexpected API request: ' + path)
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -185,24 +200,58 @@ class NativeBuildAdmission(unittest.TestCase):
                 with patch.object(BUILD, 'api_json', side_effect=lookup), patch.object(BUILD, 'api', return_value=data), \
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
                         patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
-                    if mode in ('valid', 'in-progress', 'queued', 'queued-artifact', 'waiting-artifact'):
+                    if mode in ('valid', 'in-progress', 'queued', 'queued-artifact',
+                                'waiting-artifact'):
                         result = BUILD.reuse(root, 'debian', expected['image'], 'debian,pgp,license', destination, context, event)
                         self.assertEqual(result, provenance)
                         self.assertEqual({path.name for path in destination.iterdir()},
                                          {provenance['archive'], provenance['archive']+'.sha256', 'native-build.json'})
                         self.assertEqual((destination / provenance['archive']).read_bytes(), payload)
                     else:
-                        error_type = BUILD.ArtifactUnavailable if mode == 'missing' else ValueError
+                        error_type = BUILD.ArtifactUnavailable if mode in ('missing', 'future-attempt') else ValueError
                         with self.assertRaises(error_type):
                             BUILD.reuse(root, 'debian', expected['image'], 'debian,pgp,license', destination, context, event)
                         self.assertFalse(destination.exists())
 
+    def test_rerun_prefers_current_attempt_and_rejects_duplicate_current_artifact(self):
+        run = dict(id=123, run_attempt=3, repository={'full_name': 'omg-cli/omg'},
+                   path='.github/workflows/ci.yml', workflow_id=42, event='pull_request',
+                   head_sha='c'*40, pull_requests=[{'number': 440}],
+                   created_at='2026-09-20T08:55:00Z',
+                   run_started_at='2026-09-20T09:30:00Z', status='in_progress', conclusion=None)
+        artifacts = [dict(id=attempt, name=f'native-release-debian-{attempt}',
+                          size_in_bytes=10, expired=False,
+                          created_at=('2026-09-20T09:31:00Z' if attempt == 3 else
+                                      f'2026-09-20T09:{attempt:02d}:00Z')) for attempt in (1, 2, 3)]
+        context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a'*40,
+                       GITHUB_EVENT_NAME='pull_request')
+        event = {'number': 440, 'pull_request': {'head': {'sha': 'c'*40}}}
+
+        def lookup(path):
+            if path.endswith('/workflows/ci.yml'):
+                return {'id': 42, 'path': '.github/workflows/ci.yml'}
+            if '/ci.yml/runs?' in path:
+                return {'workflow_runs': [run]}
+            if '/artifacts?' in path:
+                return {'total_count': len(artifacts), 'artifacts': artifacts}
+            self.fail('unexpected API request: ' + path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(BUILD, 'api_json', side_effect=lookup), \
+                    patch.object(BUILD, 'command_output', return_value='a'*40):
+                selected, _, _, attempt = BUILD.find_native_artifact(
+                    Path(directory), 'debian', context, event)
+                self.assertEqual((selected['id'], attempt), (3, 3))
+                artifacts.append(dict(artifacts[2], id=99))
+                with self.assertRaisesRegex(ValueError, 'ambiguous native artifact'):
+                    BUILD.find_native_artifact(Path(directory), 'debian', context, event)
     def test_partial_rerun_reuses_only_successful_unrerun_native_owner(self):
         expected, provenance, payload = fixture()
         data = bundle(provenance, payload)
         run = dict(id=123, run_attempt=2, repository={'full_name': 'omg-cli/omg'},
                    path='.github/workflows/ci.yml', workflow_id=42, event='pull_request',
                    head_sha='c'*40, pull_requests=[{'number': 440}],
+                   created_at='2026-09-20T08:55:00Z',
                    run_started_at='2026-09-20T10:00:00Z', status='completed', conclusion='failure')
         prior_run = dict(run, run_attempt=1, run_started_at='2026-09-20T09:00:00Z')
         job = dict(id=17, name='Linux (debian)', run_id=123, run_attempt=1,
@@ -281,15 +330,29 @@ class NativeBuildAdmission(unittest.TestCase):
         run = dict(id=123, run_attempt=1, repository={'full_name': 'omg-cli/omg'},
                    path='.github/workflows/ci.yml', workflow_id=42, event='pull_request',
                    head_sha='c' * 40, pull_requests=[{'number': 440}],
+                   created_at='2026-09-20T08:55:00Z',
                    run_started_at='2026-09-20T09:00:00Z', status='in_progress', conclusion=None)
         BUILD.validate_producer_run(run, expected)
         for key, value in [('id', True), ('run_attempt', 0), ('workflow_id', 99),
                            ('path', '.github/workflows/other.yml'), ('event', 'workflow_dispatch'),
                            ('head_sha', 'a'*40), ('pull_requests', [{'number': 441}]),
-                           ('repository', {'full_name': 'foreign/repo'})]:
+                           ('repository', {'full_name': 'foreign/repo'}),
+                           ('created_at', 'invalid')]:
             candidate = dict(run, **{key: value})
             with self.subTest(key=key), self.assertRaises(ValueError):
                 BUILD.validate_producer_run(candidate, expected)
+
+    def test_rerun_creation_timestamp_may_follow_start_by_one_second(self):
+        # Observed in GitHub's attempt-4 API response for run 35808194836.
+        expected = dict(repository='omg-cli/omg', workflow_id=42, event='pull_request',
+                        head_sha='c' * 40, pr_number=440)
+        run = dict(id=123, run_attempt=4, repository={'full_name': 'omg-cli/omg'},
+                   path='.github/workflows/ci.yml', workflow_id=42, event='pull_request',
+                   head_sha='c' * 40, pull_requests=[{'number': 440}],
+                   created_at='2026-09-23T03:26:12Z',
+                   run_started_at='2026-09-23T03:26:11Z',
+                   status='completed', conclusion='failure')
+        BUILD.validate_producer_run(run, expected)
 
     def test_packager_proves_build_invocation_and_exact_pair_before_admission(self):
         with tempfile.TemporaryDirectory() as directory:

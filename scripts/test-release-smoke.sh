@@ -859,6 +859,17 @@ case "$1" in
   json) printf '{"ok":true}\n' ;;
   bad-json) printf 'not json\n' ;;
   artifact) printf '{}\n' > "$2" ;;
+  sbom-marked)
+    printf '{"bomFormat":"CycloneDX","components":[{"name":"fixture"}],"metadata":{"component":{"properties":[{"name":"omg:advisory-scan","value":"not-performed"}]}}}\n' > "$2"
+    printf 'Inventory only: advisory matching was skipped\n'
+    ;;
+  sbom-unmarked)
+    printf '{"bomFormat":"CycloneDX","components":[{"name":"fixture"}],"metadata":{"component":{"properties":[]}}}\n' > "$2"
+    printf 'Inventory only: advisory matching was skipped\n'
+    ;;
+  sbom-silent)
+    printf '{"bomFormat":"CycloneDX","components":[{"name":"fixture"}],"metadata":{"component":{"properties":[{"name":"omg:advisory-scan","value":"not-performed"}]}}}\n' > "$2"
+    ;;
   require) test -s "$2" ;;
   missing) exit 0 ;;
   hang) sleep 30 ;;
@@ -929,6 +940,14 @@ inv_verdict assertions missing-child BLOCKED
 inv_verdict assertions export PASS
 inv_verdict assertions import PASS
 inv_verdict assertions literal PASS
+run_inventory sbom-inventory-only 0 \
+  "$(inv_row sbom-marked '["sbom-marked","${ROOT}/sbom.json"]' 0 - sbom-inventory-only)"
+inv_verdict sbom-inventory-only sbom-marked PASS
+run_inventory sbom-inventory-lies 1 \
+  "$(inv_row sbom-unmarked '["sbom-unmarked","${ROOT}/sbom.json"]' 0 - sbom-inventory-only)" \
+  "$(inv_row sbom-silent '["sbom-silent","${ROOT}/sbom.json"]' 0 - sbom-inventory-only)"
+inv_verdict sbom-inventory-lies sbom-unmarked FAIL
+inv_verdict sbom-inventory-lies sbom-silent FAIL
 export FAKE_INVENTORY_ALLOW_MUTATIONS=1
 run_inventory update-modes 0 \
   "$(inv_row update-fast '["update","--fast"]' 0 - update-fast-output package-mutation)" \
