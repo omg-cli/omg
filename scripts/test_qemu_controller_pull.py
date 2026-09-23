@@ -8,6 +8,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
 IMAGE = 'debian:trixie@sha256:' + 'a' * 64
+TCG_IMAGE = 'debian:sid@sha256:' + 'b' * 64
 
 
 class ControllerPullTests(unittest.TestCase):
@@ -28,13 +29,18 @@ sleep() { printf 'sleep %s\n' "$1" >> "$CALLS"; }
             calls = Path(directory) / 'calls'
             result = subprocess.run([BASH, '-c', mocks + script, '_', image,
                                      str(Path(directory) / 'attempt.log')],
-                env=dict(os.environ, EXPECTED_IMAGE=IMAGE, CALLS=str(calls),
+                env=dict(os.environ, EXPECTED_IMAGE=image, CALLS=str(calls),
                          FAILURES=str(failures), ERROR_MESSAGE=message, ERROR_STATUS=str(status)),
                 capture_output=True, text=True, timeout=10)
             return result, calls.read_text().splitlines() if calls.exists() else []
 
     def test_success_does_not_retry(self):
         result, calls = self.run_pull()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ['pull 1'])
+
+    def test_digest_pinned_sid_controller_for_local_tcg(self):
+        result, calls = self.run_pull(image=TCG_IMAGE)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, ['pull 1'])
 
@@ -65,7 +71,7 @@ sleep() { printf 'sleep %s\n' "$1" >> "$CALLS"; }
                 self.assertEqual(calls, ['pull 1'])
 
     def test_unpinned_or_invalid_image_is_rejected_before_docker(self):
-        for image in ('debian:trixie', IMAGE[:-1], IMAGE + ';false'):
+        for image in ('debian:trixie', 'debian:sid', IMAGE[:-1], TCG_IMAGE[:-1], IMAGE + ';false'):
             with self.subTest(image=image):
                 result, calls = self.run_pull(image=image)
                 self.assertNotEqual(result.returncode, 0)

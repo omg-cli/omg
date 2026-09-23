@@ -174,9 +174,9 @@ rollback-yes	["rollback","--yes"]	controlled-error	1	pass	-	hermetic	hermetic:pa
 release-package-search-tree	["search","tree"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:known-defect	-	none
 release-package-install-tree	["install","--yes","tree"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:known-defect	-	container-prune
 release-package-remove-tree	["remove","--yes","tree"]	package-mutation	0	pass	release-package-install-tree	container	arch:pass,debian:pass,ubuntu:pass,fedora:known-defect	-	container-prune
+daemon-foreground	["daemon","--foreground"]	service-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	daemon-foreground-lifecycle	daemon-stop
 update-turbo	["update","--turbo"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-turbo-output	none
 update-fast	["update","--fast"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-fast-output	none
-daemon-foreground	["daemon","--foreground"]	service-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	daemon-foreground-lifecycle	daemon-stop
 doctor-network	["doctor","--network"]	read	-	declared	-	network	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
 doctor-eol	["doctor","--eol"]	read	-	declared	-	network	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
 doctor-turbo	["doctor","--turbo"]	read	-	declared	-	qemu	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none

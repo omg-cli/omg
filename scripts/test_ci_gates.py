@@ -67,6 +67,26 @@ class QuickGateOfflineTests(unittest.TestCase):
         )
 
 
+class FedoraSetupSourceTests(unittest.TestCase):
+    def test_fedora_build_setup_uses_bounded_canonical_repositories_once(self) -> None:
+        workflows = [
+            CI_YML,
+            CI_YML.with_name("qemu-matrix.yml"),
+            CI_YML.with_name("release.yml"),
+        ]
+        for workflow in workflows:
+            with self.subTest(workflow=workflow.name):
+                source = workflow.read_text(encoding="utf-8")
+                expected = 2 if workflow.name == "qemu-matrix.yml" else 1
+                self.assertEqual(source.count("--setopt=fedora.metalink="), expected)
+                self.assertEqual(source.count("--setopt=updates.metalink="), expected)
+                self.assertEqual(source.count("https://dl.fedoraproject.org/pub/fedora/linux/releases/"), expected)
+                self.assertEqual(source.count("https://dl.fedoraproject.org/pub/fedora/linux/updates/"), expected)
+                self.assertEqual(source.count("timeout -k 10s 12m dnf"), expected)
+                self.assertNotIn("dnf makecache --refresh", source)
+                self.assertNotIn("--nogpgcheck", source)
+
+
 class QemuConcurrencyTests(unittest.TestCase):
     def test_matrix_jobs_have_distinct_concurrency_groups(self) -> None:
         workflow = CI_YML.with_name("qemu-matrix.yml").read_text(encoding="utf-8")

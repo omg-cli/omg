@@ -19459,9 +19459,25 @@
         }
       ]
     },
-    "c5ca02a70d771ef3f3b404ecc2ca87fbcc9872963e6021001d645635a85d6c1a": {
+    "054a6932258604b8367a0addde98e96cc3b77ca45a04b0db18b407d4bb764db8": {
       "releases": [],
       "cases": [
+        {
+          "id": "audit-scan-fail-on-findings-offline",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-sbom-inventory-only",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
         {
           "id": "search",
           "tiers": [

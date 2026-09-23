@@ -18,6 +18,7 @@ inventory_mutations=false
 inventory_isolation=false
 storage_faults=false
 restrict_egress=false
+allow_tcg=false
 report_inventory='[]'
 inventory_product_failure=false
 root="$HOME/.cache/build-targets/omg-qemu-benchmark"
@@ -44,6 +45,7 @@ while (($#)); do
     --inventory-isolate-hermetic) inventory_isolation=true; shift ;;
     --storage-faults) storage_faults=true; shift ;;
     --restrict-egress) restrict_egress=true; shift ;;
+    --allow-tcg) allow_tcg=true; shift ;;
     --help)
       cat <<'HELP'
 Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|ubuntu|fedora]
@@ -54,10 +56,13 @@ Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|ubuntu|fedora]
   [--inventory-policy JSON]
   [--image-policy JSON] [--image-cache DIR]
   [--inventory-isolate-hermetic]
+  [--allow-tcg]
 
-Runs disposable KVM guests with pinned images, reboot, sudo, package lifecycle,
-and optional warm read-query timing. Host and guest architecture must match;
-there is no TCG fallback. --print-pins lists images without booting guests.
+Runs disposable guests with pinned images, reboot, sudo, package lifecycle,
+and optional warm read-query timing. KVM with matching host/guest architecture
+is required by default. --allow-tcg explicitly enables a slower local
+correctness audit, including cross-architecture ARM emulation. TCG timing is
+not valid benchmark evidence. --print-pins lists images without booting guests.
 
 --staged-dir uses locally built archives and the current source inventory.
 --release-dir uses downloaded published archives without a GitHub token in the
@@ -71,7 +76,7 @@ CI requires --inventory-policy to pin the selection and permitted skips.
 --benchmark-transactions COUNT runs independently reset install/remove trials
 (1-100 per tool). Requires Docker, KVM, jq, and coreutils. Direct published
 downloads need gh; release preparation and benchmarks need Python 3.
-No compilation or host package changes.
+No compilation or host package changes. ARM still requires staged ARM binaries.
 HELP
       exit 0 ;;
     *) printf 'error: unknown argument %s\n' "$1" >&2; exit 2 ;;
@@ -111,6 +116,9 @@ source_kind=published
 [[ -z "$staged_dir" ]] || source_kind=staged
 mkdir -p "$root"
 root=$(cd "$root" && pwd)
+controller_image_x86_64=debian:trixie@sha256:6788062a1b42ac281f053ac876170b79a3eaed5d61383b8ed7eaca6c6965f3b1
+controller_image_aarch64=debian:trixie@sha256:0aa0908407cce3da2a90c1d80acc6ca5ca57401ed63eecfa8149b7ba3cc40829
+controller_image_tcg=debian:sid@sha256:a2aa46262453eba3f464d8b1c7a8c31db85eb15af180ae34dd400615d7208547
 # Pinned guest images per distro+arch. Hashes are verified against the
 # publisher checksum files (Debian SHA512SUMS, Ubuntu SHA256SUMS, Fedora
 # CHECKSUM, Arch .SHA256 sidecar). Arch publishes x86_64 cloud images
@@ -127,7 +135,7 @@ pins_for() {
   firmware_code=/usr/share/OVMF/OVMF_CODE_4M.fd
   firmware_vars_src=/usr/share/OVMF/OVMF_VARS_4M.fd
   guest_uname=x86_64
-  controller_image=debian:trixie@sha256:6788062a1b42ac281f053ac876170b79a3eaed5d61383b8ed7eaca6c6965f3b1
+  controller_image=$controller_image_x86_64
   case "$pin_distro-$pin_arch" in
     arch-x86_64)
       image_url=https://geo.mirror.pkgbuild.com/images/v20260901.583572/Arch-Linux-x86_64-cloudimg-20260901.583572.qcow2
@@ -175,7 +183,7 @@ pins_for() {
     firmware_code=/usr/share/AAVMF/AAVMF_CODE.fd
     firmware_vars_src=/usr/share/AAVMF/AAVMF_VARS.fd
     guest_uname=aarch64
-    controller_image=debian:trixie@sha256:0aa0908407cce3da2a90c1d80acc6ca5ca57401ed63eecfa8149b7ba3cc40829
+    controller_image=$controller_image_aarch64
   fi
 }
 
@@ -216,6 +224,7 @@ if [[ "$distro" == all ]]; then
   [[ "$inventory_isolation" == false ]] || args+=(--inventory-isolate-hermetic)
   [[ "$storage_faults" == false ]] || args+=(--storage-faults)
   [[ "$restrict_egress" == false ]] || args+=(--restrict-egress)
+  [[ "$allow_tcg" == false ]] || args+=(--allow-tcg)
   jq -n --arg source "$source_kind" --arg suffix "$case_suffix" '["arch", "debian", "ubuntu", "fedora"] | map({case_id:("qemu-"+.+$suffix+"-lifecycle"), distro:., result:"NOT_RUN", artifact_source:$source, exit_code:null, elapsed_seconds:0})' > "$suite/results.json"
   for target in arch debian ubuntu fedora; do
     jq --arg target "$target" 'map(if .distro == $target then .result = "INCOMPLETE" else . end)' "$suite/results.json" > "$suite/results.next.json"
@@ -292,31 +301,53 @@ trap 'exit 143' TERM
 mkdir -p "$work/release" "$work/guest"
 : > "$work/guest/serial.log"
 # Preflight probes. Each fails closed to HARNESS_ERROR (exit 3 lands in
-# the EXIT trap, which records the result): a missing pin, missing KVM,
-# or a host/guest arch mismatch must never silently fall back to TCG.
+# the EXIT trap, which records the result). TCG is only selected by the
+# explicit --allow-tcg local-audit option; CI and default runs stay on KVM.
 pins_for "$distro" "$arch" || exit 3
 kvm_device="${OMG_QEMU_KVM_DEVICE:-/dev/kvm}"
-if [[ "${OMG_QEMU_ALLOW_NO_KVM:-0}" != 1 ]]; then
-  if [[ ! -c "$kvm_device" ]]; then
-    printf 'error: KVM device %s is missing; refusing TCG fallback\n' "$kvm_device" >&2
-    printf 'kvm=missing device=%s\n' "$kvm_device" > "$work/kvm-probe.log"
-    exit 3
-  fi
-  if [[ ! -r "$kvm_device" || ! -w "$kvm_device" ]]; then
-    printf 'error: KVM device %s is not accessible\n' "$kvm_device" >&2
-    printf 'kvm=inaccessible device=%s\n' "$kvm_device" > "$work/kvm-probe.log"
-    exit 3
-  fi
-  printf 'kvm=ok device=%s\n' "$kvm_device" > "$work/kvm-probe.log"
-else
-  printf 'kvm=skipped device=%s (OMG_QEMU_ALLOW_NO_KVM=1; tests only)\n' "$kvm_device" > "$work/kvm-probe.log"
-fi
 host_arch=x86_64
 case "$(uname -m)" in aarch64|arm64) host_arch=aarch64 ;; esac
+qemu_accel=kvm
+qemu_cpu=host
+docker_device_args=(--device "$kvm_device")
 if [[ "$host_arch" != "$arch" ]]; then
-  printf 'error: guest arch %s needs a %s host with KVM; refusing cross-architecture emulation\n' "$arch" "$arch" >&2
+  if [[ "$allow_tcg" == false ]]; then
+    printf 'error: guest arch %s needs a %s host with KVM; pass --allow-tcg for a local correctness audit\n' "$arch" "$arch" >&2
+    exit 3
+  fi
+  qemu_accel=tcg
+  docker_device_args=()
+elif [[ -c "$kvm_device" && -r "$kvm_device" && -w "$kvm_device" ]]; then
+  printf 'kvm=ok device=%s\n' "$kvm_device" > "$work/kvm-probe.log"
+elif [[ "$allow_tcg" == true ]]; then
+  qemu_accel=tcg
+  docker_device_args=()
+elif [[ "${OMG_QEMU_ALLOW_NO_KVM:-0}" == 1 ]]; then
+  # Test fixtures stub the launch itself; production has no implicit fallback.
+  docker_device_args=()
+  printf 'kvm=skipped device=%s (OMG_QEMU_ALLOW_NO_KVM=1; tests only)\n' "$kvm_device" > "$work/kvm-probe.log"
+elif [[ ! -c "$kvm_device" ]]; then
+  printf 'error: KVM device %s is missing; refusing TCG fallback\n' "$kvm_device" >&2
+  printf 'kvm=missing device=%s\n' "$kvm_device" > "$work/kvm-probe.log"
+  exit 3
+else
+  printf 'error: KVM device %s is not accessible\n' "$kvm_device" >&2
+  printf 'kvm=inaccessible device=%s\n' "$kvm_device" > "$work/kvm-probe.log"
   exit 3
 fi
+if [[ "$qemu_accel" == tcg ]]; then
+  case "$arch" in aarch64) qemu_cpu=cortex-a72 ;; x86_64) qemu_cpu=max ;; esac
+  if [[ "$benchmark" == true || "$transaction_samples" != 0 ]]; then
+    printf 'error: TCG is correctness-only; timing and transaction benchmarks require KVM\n' >&2
+    exit 3
+  fi
+fi
+if [[ "$qemu_accel" == tcg && "$host_arch" != "$arch" ]]; then
+  # Keep the controller native to this x86 host. Local cross-arch TCG audits
+  # use QEMU 11.1; trixie's 10.0.13 aborted this Ubuntu ARM guest.
+  controller_image=$controller_image_tcg
+fi
+printf 'accel=%s host_arch=%s guest_arch=%s device=%s\n' "$qemu_accel" "$host_arch" "$arch" "${kvm_device:-none}" > "$work/kvm-probe.log"
 if [[ "$arch" == aarch64 && -z "$staged_dir" ]]; then
   # The release workflow publishes x86_64-linux archives (plus
   # aarch64-darwin for macOS) but no aarch64-linux archives, so a
@@ -342,11 +373,11 @@ read -r digest filename extra < "$work/release/$archive.sha256"
 [[ "$digest" =~ ^[0-9a-f]{64}$ && "$filename" == "$archive" && -z "${extra:-}" ]]
 [[ $(wc -l < "$work/release/$archive.sha256") -eq 1 ]]
 (cd "$work/release" && sha256sum -c "$archive.sha256") > "$work/release-checksum.txt"
-printf 'distro=%s\narch=%s\nrelease=%s\nartifact_source=%s\nimage_url=%s\nimage_digest=%s\nfirmware=%s\nqemu=%s -machine %s\ncontroller=%s\ncase_id=%s\n' "$distro" "$arch" "$tag" "$source_kind" "$image_url" "$image_hash" "$firmware" "$qemu_bin" "$qemu_machine" "$controller_image" "$case_id" > "$work/metadata.txt"
+printf 'distro=%s\narch=%s\nhost_arch=%s\naccel=%s\ntiming_scope=%s\nrelease=%s\nartifact_source=%s\nimage_url=%s\nimage_digest=%s\nfirmware=%s\nqemu=%s -machine %s\ncontroller=%s\ncase_id=%s\n' "$distro" "$arch" "$host_arch" "$qemu_accel" "$([[ "$qemu_accel" == kvm ]] && printf benchmark || printf correctness-only)" "$tag" "$source_kind" "$image_url" "$image_hash" "$firmware" "$qemu_bin" "$qemu_machine" "$controller_image" "$case_id" > "$work/metadata.txt"
 bash "$here/pull-qemu-controller.sh" "$controller_image" "$work/controller-pull-attempt.log" \
   > "$work/controller-pull.log" 2>&1 || exit 3
 started=true
-timeout 120 docker run --pull=never -d --name "$controller" --cpus 2 --memory 3g --memory-swap 3g --pids-limit 512 --log-opt max-size=10m --log-opt max-file=2 --device /dev/kvm \
+timeout 120 docker run --pull=never -d --name "$controller" --cpus 2 --memory 3g --memory-swap 3g --pids-limit 512 --log-opt max-size=10m --log-opt max-file=2 "${docker_device_args[@]}" \
   --cap-drop NET_RAW --cap-drop NET_ADMIN --dns 1.1.1.1 --dns 9.9.9.9 \
   --mount "type=bind,src=$work,dst=/work" --workdir /work \
   "$controller_image" sleep infinity > "$work/controller-id.txt"
@@ -371,7 +402,10 @@ if [[ -n "$image_cache" ]]; then
     printf 'cache miss; downloading pinned image\n' >> "$work/image-cache.log"
   fi
 fi
-timeout 360 docker exec "$controller" bash -c 'set -e; cd /work/guest; if [[ ! -f base.qcow2 ]]; then curl --fail --location --max-time 300 -o base.qcow2 "$1"; fi; printf "%s  base.qcow2\n" "$2" | "$3" -c -' _ "$image_url" "$image_hash" "$hash_tool" > "$work/image-setup.log" 2>&1
+# Fedora's pinned cloud image is 556 MiB: a valid mirror delivering about
+# 1 MiB/s needs more than five minutes. Keep a finite transfer deadline and
+# verify the complete image digest before any guest boot or cache write.
+timeout 960 docker exec "$controller" bash -c 'set -e; cd /work/guest; if [[ ! -f base.qcow2 ]]; then curl --fail --location --max-time 900 -o base.qcow2 "$1"; fi; printf "%s  base.qcow2\n" "$2" | "$3" -c -' _ "$image_url" "$image_hash" "$hash_tool" > "$work/image-setup.log" 2>&1
 if [[ -n "$cache_file" && "$cache_hit" == false ]]; then
   timeout 90 python3 "$here/qemu-image-cache.py" "$work/guest/base.qcow2" "$cache_file" --algorithm "${hash_tool%sum}" --digest "$image_hash" >> "$work/image-cache.log" 2>&1
 fi
@@ -386,13 +420,13 @@ set -euo pipefail
 cd /work/guest
 initial=true
 vm_disk=overlay.qcow2; vm_vars=vars.fd; vm_serial=serial.log
-if [[ $# == 9 ]]; then
+if [[ $# == 11 ]]; then
   initial=false
-  vm_disk=$7; vm_vars=$8; vm_serial=$9
+  vm_disk=$9; vm_vars=${10}; vm_serial=${11}
   [[ "$vm_disk" =~ ^/work/guest/transaction-disks/[a-z0-9-]+\.qcow2$ && -f "$vm_disk" ]] || exit 2
   [[ "$vm_vars" =~ ^/work/guest/transaction-disks/[a-z0-9-]+\.fd$ ]] || exit 2
   [[ "$vm_serial" == /work/transactions/* && "$vm_serial" != *'/../'* ]] || exit 2
-elif [[ $# != 6 ]]; then exit 2; fi
+elif [[ $# != 8 ]]; then exit 2; fi
 [[ ! -e qemu.pid ]] || exit 2
 if [[ "$initial" == true ]]; then
 ssh-keygen -q -t ed25519 -N '' -f client-key
@@ -457,13 +491,15 @@ if [[ "$1" == uefi ]]; then
   [[ -f "$vm_vars" ]] || exit 2
   firmware=(-drive if=pflash,format=raw,readonly=on,file="$3" -drive if=pflash,format=raw,file="$vm_vars")
 fi
-nohup "$5" -machine "$6,accel=kvm" -cpu host -smp 2 -m 1536 \
+accel=$7
+[[ "$accel" != tcg ]] || accel=tcg,thread=multi
+nohup "$5" -machine "$6" -accel "$accel" -cpu "$8" -smp 2 -m 1536 \
   -run-with user=65534:65534 \
   -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny \
   -monitor none \
   "${firmware[@]}" -display none -serial "file:$vm_serial" \
   -drive "file=$vm_disk,if=virtio,format=qcow2" -drive file=seed.img,if=virtio,format=raw \
-  -netdev user,id=n,ipv6=off,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n \
+  -netdev user,id=n,ipv6=off,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n,romfile= \
   -pidfile qemu.pid > qemu-startup.log 2>&1 < /dev/null &
 # Launch from the controller instead of QEMU's daemonize fork, which would
 # conflict with spawn=deny. The controller teardown owns the background process.
@@ -491,7 +527,7 @@ opts=(-i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=2 -o ServerAliveI
 wait_ssh() {
   for attempt in {1..120}; do
     kill -0 "$(<qemu.pid)"
-    if ssh "${opts[@]}" bench@127.0.0.1 true 2>/dev/null; then return 0; fi
+    if timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 true 2>/dev/null; then return 0; fi
     sleep 2
   done
   return 1
@@ -505,10 +541,10 @@ if [[ "$initial" == false ]]; then exit 0; fi
 # The timer has no network-online dependency, so failed DHCP/SSH cannot hide it.
 ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl daemon-reload && sudo -n systemctl enable omg-boot-network.timer'
 ssh "${opts[@]}" bench@127.0.0.1 "sudo -n systemctl enable '$2'"
-before=$(ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id)
-ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl reboot' || true
+before=$(timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id)
+timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl reboot' || true
 for attempt in {1..120}; do
-  if after=$(ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id 2>/dev/null) && [[ "$after" != "$before" ]]; then
+  if after=$(timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id 2>/dev/null) && [[ "$after" != "$before" ]]; then
     printf 'reboot verified: %s -> %s\n' "$before" "$after"
     ssh "${opts[@]}" bench@127.0.0.1 "sudo -n true; systemctl is-active '$2'"
     exit 0
@@ -517,11 +553,21 @@ for attempt in {1..120}; do
 done
 exit 1
 BOOT
-timeout 700 docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" > "$work/boot.log" 2>&1
+boot_timeout=700
+guest_timeout=600
+if [[ "$qemu_accel" == tcg ]]; then
+  # Emulation is an explicit local correctness audit. Keep it bounded without
+  # imposing native KVM startup deadlines on a software-emulated guest.
+  boot_timeout=1800
+  guest_timeout=2400
+fi
+printf 'boot_timeout=%s guest_timeout=%s\n' "$boot_timeout" "$guest_timeout" >> "$work/metadata.txt"
+timeout "$boot_timeout" docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1
 if [[ -n "$inventory_tiers" ]]; then
   # The inventory executor runs inside the controller (same netns as the
   # guest); /work is bind-mounted there.
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
+  cp "$here/qemu-fedora-update-fixture.sh" "$work/qemu-fedora-update-fixture.sh"
   cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"
   cp "$tsv" "$work/cases.tsv"
   if [[ "$inventory_isolation" == true ]]; then
@@ -545,7 +591,8 @@ cat > "$work/guest-check.sh" <<'GUEST'
 set -euo pipefail
 export LC_ALL=C NO_COLOR=1
 cd "$HOME"
-distro=$1; tag=$2; digest=$3; benchmark=$4; guest_arch=$5; expected_uname=$6; inventory_tiers=$7
+distro=$1; tag=$2; digest=$3; benchmark=$4; guest_arch=$5; expected_uname=$6; inventory_tiers=$7; accel=$8
+case "$accel" in kvm) daemon_timeout=240 ;; tcg) daemon_timeout=900 ;; *) exit 120 ;; esac
 actual_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)
 [[ "$actual_id" == "$distro" && $(uname -m) == "$expected_uname" ]] || exit 120
 mkdir -p evidence
@@ -612,7 +659,8 @@ case "$distro" in
   debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${guest_tools[@]}" || exit 120 ;;
   fedora) sudo -n dnf install -y "${guest_tools[@]}" || exit 120 ;;
 esac
-timeout --kill-after=5s 240s bash "$HOME/qemu-daemon-check.sh" "$bin" "$HOME/evidence"
+printf 'daemon lifecycle start accel=%s timeout=%s\n' "$accel" "$daemon_timeout"
+OMG_QEMU_ACCEL="$accel" timeout --kill-after=5s "$daemon_timeout" bash "$HOME/qemu-daemon-check.sh" "$bin" "$HOME/evidence"
 # BEGIN ADVISORY SHUTDOWN REGRESSION
 if [[ "$distro" == fedora ]]; then
   sudo -n bash "$HOME/daemon-advisory-shutdown.sh" "${bin%/*}/omgd" "$(id -un)" \
@@ -653,7 +701,7 @@ if [[ -n "$inventory_tiers" ]]; then
   case "$distro" in
     arch) sudo -n pacman -S --noconfirm --needed git make curl python strace ;;
     debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace ;;
-    fedora) sudo -n dnf install -y git make curl python3 strace podman ;;
+    fedora) sudo -n dnf install -y git make curl python3 strace podman rpm-build createrepo_c ;;
   esac > evidence/inventory-setup.txt 2>&1 || exit 120
   # The hermetic `new` row exercises the missing-toolchain refusal. A guest
   # with Cargo installed is a different fixture, not a product failure.
@@ -676,12 +724,15 @@ opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHo
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
+if [[ -n "$inventory_tiers" ]]; then
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fedora-update-fixture.sh bench@127.0.0.1:qemu-fedora-update-fixture.sh
+fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/daemon-advisory-shutdown.sh bench@127.0.0.1:daemon-advisory-shutdown.sh
 if [[ "$benchmark" == true ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/benchmark-hyperfine.sh bench@127.0.0.1:benchmark-hyperfine.sh
 fi
 rc=0
-timeout 600 docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 "bash guest-check.sh '$distro' '$tag' '$digest' '$benchmark' '$arch' '$guest_uname' '$inventory_tiers'" > "$work/guest-check.log" 2>&1 || rc=$?
+timeout "$guest_timeout" docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 "bash guest-check.sh '$distro' '$tag' '$digest' '$benchmark' '$arch' '$guest_uname' '$inventory_tiers' '$qemu_accel'" > "$work/guest-check.log" 2>&1 || rc=$?
 timeout 60 docker exec -w /work/guest "$controller" scp -r "${opts[@]}" -P 2222 bench@127.0.0.1:evidence /work/guest/ > "$work/evidence-copy.log" 2>&1
 if [[ ! -f "$work/guest/evidence/exit-code" ]]; then
   printf 'Guest evidence receipt is missing (transport exit %s); see %s/evidence-copy.log and %s/guest-check.log\n' "$rc" "$work" "$work" >&2
@@ -742,7 +793,7 @@ if [[ "$transaction_samples" != 0 && "$rc" == 0 ]]; then
   transaction_rc=0
   timeout --kill-after=10s 21600 docker exec -w /work "$controller" bash /work/qemu-transactions.sh \
     "$distro" "$tag" "$arch" "$transaction_samples" "$firmware" "$ssh_service" \
-    "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" \
+    "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" \
     > "$work/transactions.log" 2>&1 || transaction_rc=$?
   if [[ "$transaction_rc" != 0 ]]; then
     rc=120
