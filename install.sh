@@ -1097,6 +1097,14 @@ shell_path_line() {
   fi
 }
 
+legacy_shell_path_line() {
+  if [[ "$1" == fish ]]; then
+    printf 'fish_add_path %s\n' "$INSTALL_DIR"
+  else
+    printf 'export PATH="%s:$PATH"\n' "$INSTALL_DIR"
+  fi
+}
+
 validate_install_dir_path() {
   if [[ "$INSTALL_DIR" != /* || "$INSTALL_DIR" == *:* || "$INSTALL_DIR" == *$'\n'* || "$INSTALL_DIR" == *$'\r'* ]]; then
     error "INSTALL_DIR must be an absolute path without PATH separators or newlines"
@@ -1129,9 +1137,11 @@ setup_shell() {
   # Ensure PATH
   if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     if [[ -f "$rc_file" ]]; then
-      local path_line
+      local path_line legacy_path_line
       path_line=$(shell_path_line "$shell_type")
-      if ! grep -Fqx -- "$path_line" "$rc_file"; then
+      legacy_path_line=$(legacy_shell_path_line "$shell_type")
+      if ! grep -Fqx -- "$path_line" "$rc_file" &&
+        ! grep -Fqx -- "$legacy_path_line" "$rc_file"; then
         printf '%s\n' "$path_line" >>"$rc_file"
         success "Added $INSTALL_DIR to PATH in $rc_file"
       fi
@@ -1176,21 +1186,25 @@ uninstall_omg() {
     fi
   done
 
-  # Remove the exact lines setup_shell appends. Each rc file is backed up
-  # first; only OMG's own marker, hook, and PATH lines are deleted.
+  # Remove exact PATH lines written by current and earlier installers. Each rc
+  # file is backed up first; unrelated shell configuration is retained.
   for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.config/fish/config.fish"; do
     [[ -f "$rc_file" ]] || continue
     local shell_type=bash
     [[ "$rc_file" == */config.fish ]] && shell_type=fish
-    local path_line
+    local path_line legacy_path_line
     path_line=$(shell_path_line "$shell_type")
-    if grep -Fqx -- "$path_line" "$rc_file" || grep -qE "# OMG Package Manager|omg hook" "$rc_file"; then
+    legacy_path_line=$(legacy_shell_path_line "$shell_type")
+    if grep -Fqx -- "$path_line" "$rc_file" ||
+      grep -Fqx -- "$legacy_path_line" "$rc_file" ||
+      grep -qE "# OMG Package Manager|omg hook" "$rc_file"; then
       cp "$rc_file" "$rc_file.omg-backup"
       local filtered
       filtered=$(mktemp "${rc_file}.omg-remove.XXXXXX") || error "Failed to stage shell cleanup"
       cp -p "$rc_file" "$filtered" || error "Failed to preserve shell file permissions"
-      OMG_PATH_LINE="$path_line" awk '
+      OMG_PATH_LINE="$path_line" OMG_LEGACY_PATH_LINE="$legacy_path_line" awk '
         $0 != ENVIRON["OMG_PATH_LINE"] &&
+        $0 != ENVIRON["OMG_LEGACY_PATH_LINE"] &&
         $0 != "# OMG Package Manager" &&
         $0 != "omg hook fish | source" &&
         $0 != "eval \"$(omg hook bash)\"" &&
