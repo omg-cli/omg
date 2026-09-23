@@ -263,13 +263,36 @@ fn security_scan_without_daemon_preserves_inventory_errors_and_recovers() -> any
         1,
         "successful CLI exit must include its persisted completion record"
     );
-    project.run(&["audit", "fix", "--dry-run"]).assert_success();
-    assert_eq!(
-        std::fs::read(&path)?,
-        clean,
-        "dry-run changed the inventory"
-    );
-    for args in [vec!["audit", "scan"], vec!["audit", "fix", "--dry-run"]] {
+    #[cfg(feature = "arch")]
+    {
+        project.run(&["audit", "fix", "--dry-run"]).assert_success();
+        assert_eq!(
+            std::fs::read(&path)?,
+            clean,
+            "dry-run changed the inventory"
+        );
+    }
+    #[cfg(not(feature = "arch"))]
+    {
+        let unsupported = project.run(&["audit", "fix", "--dry-run"]);
+        unsupported.assert_failure();
+        assert!(
+            unsupported.stderr.contains("without the Arch backend"),
+            "{}",
+            unsupported.stderr
+        );
+        assert_eq!(
+            std::fs::read(&path)?,
+            clean,
+            "unsupported fix changed inventory"
+        );
+    }
+    let commands = if cfg!(feature = "arch") {
+        vec![vec!["audit", "scan"], vec!["audit", "fix", "--dry-run"]]
+    } else {
+        vec![vec!["audit", "scan"]]
+    };
+    for args in commands {
         std::fs::write(&path, b"{broken")?;
         let failed = project.run(&args);
         failed.assert_failure();
@@ -292,7 +315,10 @@ fn security_scan_without_daemon_preserves_inventory_errors_and_recovers() -> any
     let logger = omg_lib::core::security::AuditLogger::new_in(&audit_path)?;
     let integrity = logger.verify_integrity()?;
     assert!(integrity.is_valid());
-    assert_eq!(integrity.total_entries, 4);
+    assert_eq!(
+        integrity.total_entries,
+        if cfg!(feature = "arch") { 4 } else { 2 }
+    );
     let original_log = std::fs::read(&audit_path)?;
     let lock_path = audit_path.with_extension("lock");
     std::fs::remove_file(&lock_path)?;

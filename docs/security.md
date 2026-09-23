@@ -46,6 +46,7 @@ Report vulnerabilities privately using [SECURITY.md](../SECURITY.md).
 
 ```bash
 omg audit scan
+omg audit scan --fail-on-findings # CI gate: nonzero when findings exist
 ```
 
 Published v0.1.223 requires a running `omgd` for `omg audit scan`. The newer main checkout
@@ -56,7 +57,7 @@ query OSV using their distribution release as the ecosystem. Missing findings ar
 proof that a package is free of vulnerabilities. Do not treat one distribution's
 advisories as coverage for another.
 
-The scan prints findings but does not return a failing exit status merely because it found vulnerabilities. Its human-readable output is not a documented JSON alert interface. `omg audit fix --dry-run` previews available package updates on the Arch backend; an available update is not proof that every advisory is fixed.
+The default scan reports findings without failing solely because it found them. Use `--fail-on-findings` when a CI job must fail on any finding. This does not make its human-readable output a documented JSON alert interface. `omg audit fix --dry-run` previews available package updates on the Arch backend; an available update is not proof that every advisory is fixed.
 
 ## Security grades
 
@@ -74,6 +75,8 @@ omg audit policy
 
 The policy supports minimum grades, AUR restrictions, package bans, PGP requirements, and license allowlists. See [configuration](./configuration.md).
 
+`omg audit licenses --check-policy` is available with the Arch backend. It evaluates the full installed-package license inventory against a configured allowlist and exits nonzero on violations, even when `--filter` limits displayed rows. Native Debian, Ubuntu, and Fedora inventories do not yet provide reliable license metadata for this command.
+
 Explicit package policies are checked against ALPM's prepared transaction, including dependencies. Native APT, DNF, and Homebrew install and upgrade paths refuse explicit policies because a separate precheck cannot guarantee the final native transaction. Do not assume that a policy enforced on Arch is enforced identically elsewhere. A build with only the `debian-pure` indexing feature refuses live Debian package mutations; use an APT-backed build for those operations.
 
 ## Package and runtime verification
@@ -84,18 +87,18 @@ Runtime downloads trust their upstream publishers. Publisher-provided checksums 
 
 AUR builds execute community-maintained code. Review PKGBUILDs, sources, and install hooks. Bubblewrap builds are offline by default. Enabling `[aur] allow_network = true` exposes reachable services to build code. Native builds are an explicit unsafe choice. See the [retained trust boundaries](../SECURITY.md#security-boundaries-and-retained-trust).
 
-## SLSA provenance
+## Artifact signature verification
 
-Despite its command name and success label, `omg audit slsa` is currently a limited artifact-signature verifier, not a SLSA build-provenance verifier.
+Despite its command name, `omg audit slsa` verifies a Sigstore artifact signature against a trusted identity. It does not verify SLSA build provenance or assign a SLSA level.
 
 ```bash
 omg audit slsa ./package.pkg.tar.zst \
   --certificate-identity "$EXPECTED_SIGNER_IDENTITY"
 ```
 
-Set `EXPECTED_SIGNER_IDENTITY` to the exact trusted publisher email or OIDC URI obtained independently. The current verifier rejects a missing or empty identity, so supply one even though the parser accepts the option as optional. Use an existing artifact path without parent-directory traversal.
+Set `EXPECTED_SIGNER_IDENTITY` to the exact trusted publisher email or OIDC URI obtained independently. The CLI requires this option and rejects an empty identity. Use an existing artifact path without parent-directory traversal.
 
-The verifier hashes the artifact, queries Rekor, checks the log's signed entry timestamp against a pinned key, and handles supported `hashedrekord` signatures. A successful result requires a supported artifact signature and a Fulcio certificate chain. The required identity must match exactly.
+The verifier hashes the artifact, queries Rekor, checks the entry's signed entry timestamp (SET) against a pinned log key, and handles supported `hashedrekord` signatures. A successful result requires a supported artifact signature and a Fulcio certificate chain. The required identity must match exactly. It does not independently verify a Merkle inclusion proof or a log checkpoint.
 
 Current limits:
 
@@ -119,13 +122,14 @@ The local command emits an installed-package CycloneDX 1.5 JSON inventory:
 
 ```bash
 omg audit sbom --output ./sbom.json
+omg audit sbom --inventory-only --output ./offline-inventory.json
 ```
 
-The CLI always includes a vulnerability scan; there is no flag to turn it off. In published v0.1.223, the command succeeds on Arch when inventory and advisory data are available. Debian and Ubuntu have inventory code but fail at the required vulnerability scan; Fedora has no system SBOM backend. The newer main checkout supports Arch, Debian, Ubuntu, and Fedora when their inventory and advisory sources are available. It uses Arch advisories, DNF advisories on Fedora, and OSV on Debian and Ubuntu. macOS has no system SBOM backend. An inventory or advisory failure stops generation instead of producing a partial success.
+By default, the CLI includes vulnerability matching. In published v0.1.223, the command succeeds on Arch when inventory and advisory data are available. Debian and Ubuntu have inventory code but fail at the required vulnerability scan; Fedora has no system SBOM backend. The newer CLI supports Arch, Debian, Ubuntu, and Fedora when their inventory and advisory sources are available. It uses Arch advisories, DNF advisories on Fedora, and OSV on Debian and Ubuntu. macOS has no system SBOM backend. An inventory or advisory failure stops the default command instead of producing a partial success. `--inventory-only` skips advisory matching for an offline package inventory and marks that omission in the SBOM; an empty vulnerability list in that mode is not a clean scan.
 
 The inventory contains package names, versions, descriptions when available, PURLs, available license metadata, and matched vulnerability findings. Fedora's native inventory does not currently supply descriptions or licenses. The generator compares installed identities before and after the scan and refuses a changed inventory. It does not resolve dependency edges or populate component file hashes. It is not an application dependency inventory, a complete supply-chain graph, or proof of regulatory compliance. An advisory fetch failure must not be read as a clean report.
 
-The default location is `~/.local/share/omg/sbom/`. SBOM files are plaintext. Use a restricted destination and inspect permissions before sharing them.
+The default location is `~/.local/share/omg/sbom/`. SBOM files are plaintext. The newer exporter writes owner-only files on Unix, including when replacing an existing permissive file. Restrict destination directories and inspect permissions before sharing reports.
 
 ## Secret scanning
 
@@ -164,7 +168,7 @@ Only `soc2` generates files on this command path. It exports up to 1,000 recent 
 
 `--period` is metadata, not a time-range filter. The separate `omg enterprise audit-export` command produces a generic inventory bundle, not framework-specific controls. See [enterprise limits](./enterprise.md).
 
-Audit and enterprise evidence files are plaintext JSON or CSV. Private writers protect selected exports with owner-only permissions; permissions are not encryption. SBOM and other report writers do not all use that private writer. Restrict the destination directory, inspect every file, and encrypt externally before transport when required. Reports can disclose package inventory, paths, and activity.
+Audit and enterprise evidence files are plaintext JSON or CSV. Private writers protect audit exports and the newer SBOM exporter with owner-only file permissions on Unix; permissions are not encryption, and a caller-selected directory may still be accessible to others. Restrict the destination directory, inspect every file, and encrypt externally before transport when required. Reports can disclose package inventory, paths, and activity.
 
 OMG does not implement HIPAA controls or certify SOC 2, ISO 27001, FedRAMP, PCI DSS, or HIPAA compliance.
 

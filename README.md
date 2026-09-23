@@ -34,7 +34,7 @@ requires `omgd`; the current main checkout adds direct scanning when the daemon 
 
 | | What you get |
 | :--- | :--- |
-| **One workflow across systems** | Use the same commands on Arch, Debian, Ubuntu, Fedora, macOS, and supported Linux distributions inside WSL. |
+| **One workflow across systems** | Manage packages and project tasks through a common CLI on Arch, Debian, Ubuntu, Fedora, macOS, and supported Linux distributions inside WSL. [Security capabilities vary by backend](docs/security.md). |
 | **Security during the operation** | Verify downloads, constrain developer-tool installers, review and sandbox AUR builds, inspect produced archives, and record mutations as they happen. |
 | **The whole development environment** | Manage system packages, 14 native runtime managers, 54 curated developer tools, project tasks, environment records, and security evidence from one CLI. |
 | **Fast paths without a hard daemon dependency** | Read ALPM, APT, and RPM state in process where supported. Run `omgd` for warm caches and background refreshes, or leave it off. |
@@ -168,7 +168,7 @@ omg run test
 
 # Inspect the machine
 omg audit scan
-omg audit sbom                  # system-package inventory and vulnerability evidence on supported Linux backends
+omg audit sbom                  # system-package inventory; Arch in v0.1.223
 omg history
 ```
 
