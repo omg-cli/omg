@@ -63,7 +63,7 @@ status	["status","--fast"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 doctor	["doctor"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit	["audit"]	read	1	pass	-	hermetic	hermetic:pass	audit-source-failure	tempdir-drop
 audit-scan	["audit","scan"]	read	1	pass	-	hermetic	hermetic:pass	audit-source-failure	tempdir-drop
-audit-scan-fail-on-findings	["audit","scan","--fail-on-findings"]	read	1	pass	-	hermetic	hermetic:pass	audit-source-failure	tempdir-drop
+audit-scan-fail-on-findings-offline	["audit","scan","--fail-on-findings"]	read	1	pass	-	hermetic	hermetic:pass	audit-source-failure	tempdir-drop
 audit-sbom-offline	["audit","sbom","--output","${ROOT}/sbom.json"]	isolated-write	1	pass	-	hermetic	hermetic:pass	sbom-source-failure	tempdir-drop
 audit-sbom-inventory-only	["audit","sbom","--inventory-only","--output","${ROOT}/sbom.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	artifact:sbom.json	tempdir-drop
 audit-secrets	["audit","secrets","--path","project"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop

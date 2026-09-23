@@ -1249,7 +1249,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
             issues.push("failure did not explain itself on stderr".to_string());
         }
         let audit_success = match case.id.as_str() {
-            "audit" | "audit-scan" | "audit-scan-fail-on-findings" => {
+            "audit" | "audit-scan" | "audit-scan-fail-on-findings-offline" => {
                 Some("No vulnerabilities found in scanned packages.")
             }
             "audit-fix" | "audit-fix-flags" => Some("No vulnerabilities found!"),

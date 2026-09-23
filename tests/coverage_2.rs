@@ -30,11 +30,12 @@ fn slsa_check_names_a_missing_file() {
     );
 }
 
-/// Contract: an existing artifact reaches provenance verification.
+/// Contract: an existing but unreadable artifact reaches the verifier's local
+/// read boundary without depending on the live Rekor service.
 #[test]
-fn slsa_check_attempts_verification_on_an_existing_file() {
+fn slsa_check_rejects_unreadable_artifact_before_network() {
     let project = TestProject::new();
-    project.create_file("artifact.bin", "not-a-real-attestation\n");
+    project.create_dir("artifact.bin");
 
     let result = project.run(&[
         "audit",
@@ -43,10 +44,15 @@ fn slsa_check_attempts_verification_on_an_existing_file() {
         "release@example.invalid",
         "artifact.bin",
     ]);
+    result.assert_failure();
     let output = result.combined_output();
     assert!(
         output.contains("Verifying artifact signature for artifact.bin"),
         "existing artifact must reach verification, got:\n{output}"
+    );
+    assert!(
+        output.contains("Failed to read 'artifact.bin'"),
+        "unreadable artifact must fail locally before a Rekor query, got:\n{output}"
     );
     assert!(
         !output.contains("/pricing"),
@@ -58,7 +64,7 @@ fn slsa_check_attempts_verification_on_an_existing_file() {
 #[test]
 fn forged_self_asserted_account_does_not_paywall_slsa() {
     let project = TestProject::new();
-    project.create_file("artifact.bin", "payload\n");
+    project.create_dir("artifact.bin");
 
     std::fs::write(
         project.data_dir.path().join("license.json"),
@@ -80,10 +86,16 @@ fn forged_self_asserted_account_does_not_paywall_slsa() {
         "release@example.invalid",
         "artifact.bin",
     ]);
+    result.assert_failure();
     let out = result.combined_output();
     assert!(
         out.contains("Verifying artifact signature for artifact.bin"),
         "a forged token must fail before any upgrade offer, got:\n{out}"
+    );
+    assert!(
+        out.contains("Failed to read 'artifact.bin'")
+            && !out.contains("Artifact signature verified"),
+        "a forged token must not turn an unsigned artifact into a verified signature, got:\n{out}"
     );
     assert!(
         !out.contains("/pricing"),
