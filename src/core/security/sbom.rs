@@ -168,7 +168,16 @@ pub struct SbomVulnerability {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub references: Vec<SbomVulnReference>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub advisories: Vec<SbomVulnAdvisory>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub properties: Vec<SbomProperty>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SbomVulnAdvisory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -219,7 +228,7 @@ impl SbomGenerator {
         }
     }
 
-    /// Include vulnerability matching from Arch Linux security advisory data.
+    /// Include vulnerability matching from the selected backend's advisory source.
     #[must_use]
     pub const fn with_vulnerabilities(mut self, include: bool) -> Self {
         self.include_vulns = include;
@@ -237,12 +246,11 @@ impl SbomGenerator {
         let path_str = path.as_ref().display().to_string();
         let json =
             serde_json::to_string_pretty(sbom).map_err(|source| SbomError::Serialize { source })?;
-        crate::core::safe_ops::atomic_write_file_sync(path.as_ref(), json.as_bytes()).map_err(
-            |error| SbomError::Write {
+        crate::core::safe_ops::atomic_write_file_sync_private(path.as_ref(), json.as_bytes())
+            .map_err(|error| SbomError::Write {
                 path: path_str,
                 source: io::Error::other(error),
-            },
-        )?;
+            })?;
         Ok(())
     }
 
@@ -305,5 +313,27 @@ mod tests {
             .export_json(&sample_sbom(), temp.path())
             .expect_err("writing an SBOM over a directory must fail");
         assert!(matches!(error, SbomError::Write { .. }), "got: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_json_replaces_permissive_file_with_owner_only_report() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("sbom.json");
+        std::fs::write(&path, b"previous report").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        SbomGenerator::new()
+            .export_json(&sample_sbom(), &path)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let report: Sbom = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(report.bom_format, "CycloneDX");
     }
 }

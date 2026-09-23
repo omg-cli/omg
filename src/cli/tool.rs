@@ -1702,8 +1702,10 @@ mod tests {
         fs::create_dir_all(executable.parent().expect("manager parent"))
             .expect("manager directory");
         fs::write(&executable, b"fixture").expect("manager fixture");
-        let command = secured_manager_command(&executable, staging.path(), "npm", "eslint")
-            .expect("secured command");
+        // Use a distinct package from the parallel host-environment opt-out test.
+        let command =
+            secured_manager_command(&executable, staging.path(), "npm", "isolated-fixture")
+                .expect("secured command");
         let variables: std::collections::HashMap<_, _> = command
             .get_envs()
             .filter_map(|(name, value)| value.map(|value| (name.to_owned(), value.to_owned())))

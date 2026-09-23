@@ -284,7 +284,7 @@ check_hook_lifecycle() (
   expect_notice no 'Environment changed after merge' merge --ff-only changed || exit 1
 )
 check_product_output() {
-  local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5
+  local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
   if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
     printf 'assertion failed: product emitted a panic report\n' >&2; return 1
   fi
@@ -293,6 +293,18 @@ check_product_output() {
   fi
   if [[ "$code" != 0 ]] && ! grep -q '[^[:space:]]' "$stderr"; then
     printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
+  fi
+  if [[ "$assertion" == audit-fix-refusal ]]; then
+    case "$distro" in
+      arch) assertion=audit-source-failure ;;
+      debian|ubuntu|fedora)
+        if [[ "$code" != 1 ]] \
+          || ! grep -Fxq 'Error: Vulnerability auto-fix is not available without the Arch backend; upgrade the affected packages manually' "$stderr" \
+          || grep -Eq 'Scanning for fixable vulnerabilities|No vulnerabilities found|Security audit completed' "$stdout"; then
+          printf 'assertion failed: unsupported backend did not refuse auto-fix before scanning\n' >&2; return 1
+        fi ;;
+      *) printf 'assertion failed: unknown auto-fix backend %s\n' "$distro" >&2; return 1 ;;
+    esac
   fi
   if [[ "$assertion" == audit-source-failure ]]; then
     if [[ "$code" != 1 ]] \
@@ -363,6 +375,18 @@ check_product_output() {
         local artifact=${assertion#artifact:}
         if [[ ! -f "$artifact" || -L "$artifact" ]] || ! jq -e -s 'length == 1' "$artifact" >/dev/null 2>&1; then
           printf 'assertion failed: artifact %s is not a regular JSON document\n' "$artifact" >&2; return 1
+        fi ;;
+      sbom-inventory-only)
+        if [[ ! -f sbom.json || -L sbom.json ]] || ! jq -e -s '
+          length == 1 and (.[0] |
+            .bomFormat == "CycloneDX" and
+            (.components | type == "array" and length > 0) and
+            ((.metadata.component.properties // []) |
+              any(.[]; .name == "omg:advisory-scan" and .value == "not-performed")) and
+            ((.vulnerabilities // []) | type == "array" and length == 0))
+        ' sbom.json >/dev/null 2>&1 \
+          || ! grep -Fq 'Inventory only: advisory matching was skipped' "$stdout"; then
+          printf 'assertion failed: inventory-only SBOM lacks the advisory-scan marker or warning\n' >&2; return 1
         fi ;;
       update-fast-output)
         if ! grep -Fq 'Fast System Update' "$stdout" \
@@ -551,7 +575,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|audit-source-failure|sbom-source-failure|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three) ;; *) exit 2 ;; esac
+  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three) ;; *) exit 2 ;; esac
   case "$cleanup" in tempdir-drop|none|container-prune|host-state-restore|vm-revert|daemon-stop) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
@@ -684,7 +708,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg '$row_timeout' $quoted_binary $pargs > '$p.prereq.log' 2> '$p.prereq.stderr.log'"
     remote+="; printf 'prereq $p exit=%s\n' \"\$rc\" >&2; cat '$p.prereq.log' '$p.prereq.stderr.log' >&2"
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
-    remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
+    remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log' '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
   done
   if [[ "$case" == hooks-install-force ]]; then
     # An identical reinstall cannot prove --force is honored. Replace each
@@ -730,7 +754,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
-  remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log; then assertion=1; fi"
+  remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
   if [[ -n "$counter" ]]; then
     remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_native_counter '$distro' '$counter' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: counter fixture cleanup failed\\n' >&2; assertion=1; fi"
