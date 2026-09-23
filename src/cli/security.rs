@@ -1106,6 +1106,9 @@ pub async fn fix_vulnerabilities(
     min_severity: &str,
     _ctx: &CliContext,
 ) -> Result<()> {
+    #[cfg(not(feature = "arch"))]
+    fix_requires_arch()?;
+
     println!(
         "{} Scanning for fixable vulnerabilities...\n",
         style::runtime("OMG")
@@ -1889,6 +1892,18 @@ mod tests {
     fn auto_fix_upgrade_without_arch_fails() {
         let error = fix_requires_arch()
             .expect_err("auto-fix must not report success when it cannot upgrade");
+        assert!(
+            error.to_string().contains("without the Arch backend"),
+            "got: {error}"
+        );
+    }
+
+    #[cfg(not(feature = "arch"))]
+    #[tokio::test]
+    async fn auto_fix_without_arch_fails_before_scanning() {
+        let error = fix_vulnerabilities(true, true, "high", &CliContext { json: false })
+            .await
+            .expect_err("unsupported backend must fail before scanning");
         assert!(
             error.to_string().contains("without the Arch backend"),
             "got: {error}"

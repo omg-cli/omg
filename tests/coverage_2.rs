@@ -122,6 +122,7 @@ fn certificate_identity_flag_is_accepted() {
 }
 
 /// Contract: an empty-inventory `audit fix` needs neither daemon nor paid tier.
+#[cfg(feature = "arch")]
 #[test]
 fn audit_fix_is_not_paywalled() {
     let project = TestProject::new();
@@ -131,6 +132,22 @@ fn audit_fix_is_not_paywalled() {
     assert!(
         out.contains("No vulnerabilities found!"),
         "audit fix must complete the empty-inventory scan, got:\n{out}"
+    );
+    project.close_checked();
+}
+
+#[cfg(not(feature = "arch"))]
+#[test]
+fn audit_fix_rejects_an_unsupported_backend() {
+    let project = TestProject::new();
+    let result = project.run(&["audit", "fix"]);
+    result.assert_failure();
+    assert!(
+        result
+            .combined_output()
+            .contains("without the Arch backend"),
+        "unsupported backend must fail before scanning: {}",
+        result.combined_output()
     );
     project.close_checked();
 }

@@ -3322,11 +3322,7 @@
       "binary": "omg",
       "surface": "omg audit fix",
       "platforms": [
-        "arch",
-        "debian",
-        "debian-trixie",
-        "ubuntu",
-        "fedora"
+        "arch"
       ],
       "requires": [
         "success",
@@ -3348,7 +3344,7 @@
           "failure-does-not-report-clean"
         ]
       },
-      "scope": "Daemon-disabled debug CLI with isolated empty mock package inventory; audit fix --dry-run succeeds, rejects corrupt inventory without claiming a clean scan, preserves corrupt state, and recovers after repair. Does not certify populated native advisory matching, fetching, scoring, or actual remediation. This is not native package transactions evidence.",
+      "scope": "Arch backend with daemon-disabled debug CLI and isolated empty mock package inventory; audit fix --dry-run succeeds, rejects corrupt inventory without claiming a clean scan, preserves corrupt state, and recovers after repair. Other backends reject audit fix before scanning. Does not certify populated native advisory matching, fetching, scoring, or actual remediation. This is not native package transactions evidence.",
       "tests": [
         {
           "lane": "native-cli-fixture",
