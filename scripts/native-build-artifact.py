@@ -154,6 +154,80 @@ class ArtifactUnavailable(ValueError):
     """Scheduling absence; each guest must still enforce full admission."""
 
 
+def prior_successful_artifact(repository, run, expected_run, distro, artifacts):
+    """Admit a carried build only when this attempt did not rerun its owner."""
+    current_attempt = run['run_attempt']
+    owner = f'Linux ({distro})'
+    jobs = api_json(f'repos/{repository}/actions/runs/{run["id"]}/attempts/{current_attempt}/jobs?per_page=100')
+    require(type(jobs.get('total_count')) is int and jobs['total_count'] <= 100
+            and isinstance(jobs.get('jobs'), list) and len(jobs['jobs']) == jobs['total_count'],
+            'incomplete current-attempt job listing')
+    # GitHub includes carried jobs in an attempt's listing and relabels their
+    # run_attempt. Their original start time distinguishes them from reruns.
+    current_owners = [job for job in jobs['jobs'] if job.get('name') == owner]
+    require(all(isinstance(job.get('started_at'), str) for job in current_owners),
+            'native owner start time is unavailable')
+    if any(job['started_at'] >= run['run_started_at'] for job in current_owners):
+        return None
+    prefix = f'native-release-{distro}-'
+    candidates = []
+    for artifact in artifacts:
+        name = artifact.get('name')
+        if not isinstance(name, str) or not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix):]
+        if re.fullmatch(r'[0-9]+', suffix) and 0 < int(suffix) < current_attempt:
+            candidates.append((int(suffix), artifact))
+    require(len({attempt for attempt, _ in candidates}) == len(candidates),
+            'ambiguous prior native artifact')
+    for attempt, artifact in sorted(candidates, reverse=True):
+        for later in range(current_attempt - 1, attempt, -1):
+            later_run = api_json(f'repos/{repository}/actions/runs/{run["id"]}/attempts/{later}')
+            validate_producer_run(later_run, expected_run)
+            require(later_run['id'] == run['id'] and later_run['run_attempt'] == later
+                    and later_run['status'] == 'completed'
+                    and isinstance(later_run.get('run_started_at'), str),
+                    'invalid intermediate producer attempt')
+            later_jobs = api_json(f'repos/{repository}/actions/runs/{run["id"]}/attempts/{later}/jobs?per_page=100')
+            require(type(later_jobs.get('total_count')) is int and later_jobs['total_count'] <= 100
+                    and isinstance(later_jobs.get('jobs'), list)
+                    and len(later_jobs['jobs']) == later_jobs['total_count'],
+                    'incomplete intermediate-attempt job listing')
+            later_owners = [job for job in later_jobs['jobs'] if job.get('name') == owner]
+            require(all(isinstance(job.get('started_at'), str) for job in later_owners),
+                    'intermediate native owner start time is unavailable')
+            require(not any(job['started_at'] >= later_run['run_started_at'] for job in later_owners),
+                    'newer native owner reran without an admissible artifact')
+        prior_run = api_json(f'repos/{repository}/actions/runs/{run["id"]}/attempts/{attempt}')
+        validate_producer_run(prior_run, expected_run)
+        require(prior_run['id'] == run['id'] and prior_run['run_attempt'] == attempt
+                and prior_run['status'] == 'completed'
+                and isinstance(prior_run.get('run_started_at'), str), 'invalid prior producer attempt')
+        listing = api_json(f'repos/{repository}/actions/runs/{run["id"]}/attempts/{attempt}/jobs?per_page=100')
+        require(type(listing.get('total_count')) is int and listing['total_count'] <= 100
+                and isinstance(listing.get('jobs'), list) and len(listing['jobs']) == listing['total_count'],
+                'incomplete prior-attempt job listing')
+        owners = [job for job in listing['jobs'] if job.get('name') == owner]
+        require(len(owners) == 1, 'ambiguous prior native owner')
+        job = owners[0]
+        require(type(job.get('id')) is int and job['id'] > 0
+                and job.get('run_id') == run['id'] and job.get('run_attempt') == attempt
+                and job.get('head_sha') == expected_run['head_sha']
+                and job.get('status') == 'completed' and job.get('conclusion') == 'success'
+                and isinstance(job.get('started_at'), str)
+                and isinstance(job.get('completed_at'), str)
+                and isinstance(artifact.get('created_at'), str)
+                and prior_run['run_started_at'] <= job['started_at'] <= artifact['created_at']
+                <= job['completed_at'] < run['run_started_at'],
+                'prior native artifact lacks a successful exact-attempt owner')
+        require(type(artifact.get('id')) is int and artifact['id'] > 0
+                and type(artifact.get('size_in_bytes')) is int
+                and 0 < artifact['size_in_bytes'] <= MAX_DOWNLOAD
+                and artifact.get('expired') is False, 'stale or invalid prior native artifact')
+        return artifact, attempt
+    return None
+
+
 def find_native_artifact(root, distro, context, event, timeout=1500):
     require(distro in FEATURES, 'unsupported native owner')
     repository = context['GITHUB_REPOSITORY']
@@ -209,7 +283,15 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
                         and artifact.get('expired') is False
                         and isinstance(artifact.get('created_at'), str)
                         and artifact['created_at'] >= run['run_started_at'], 'stale or invalid native artifact')
-                return artifact, run, expected_run
+                return artifact, run, expected_run, attempt
+            if attempt > 1:
+                prior = prior_successful_artifact(repository, run, expected_run, distro,
+                                                  listing['artifacts'])
+                if prior is not None:
+                    artifact, producer_attempt = prior
+                    print(f'Using successful native owner from attempt {producer_attempt}; '
+                          f'current attempt {attempt} did not rerun {distro}', flush=True)
+                    return artifact, run, expected_run, producer_attempt
             if run.get('status') == 'completed':
                 raise ArtifactUnavailable('CI finished without the required native artifact')
         time.sleep(delay)
@@ -220,8 +302,8 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
 def reuse(root, distro, image, features, destination, context, event, timeout=1500):
     build_command(distro, features, {})
     started = time.monotonic()
-    artifact, run, expected_run = find_native_artifact(root, distro, context, event, timeout)
-    repository, selected_id, attempt = expected_run['repository'], run['id'], run['run_attempt']
+    artifact, run, expected_run, attempt = find_native_artifact(root, distro, context, event, timeout)
+    repository, selected_id = expected_run['repository'], run['id']
     expected = {
         'repository': repository, 'source_sha': context['GITHUB_SHA'], 'run_id': str(selected_id),
         'run_attempt': attempt, 'workflow_path': '.github/workflows/ci.yml',
@@ -235,7 +317,7 @@ def reuse(root, distro, image, features, destination, context, event, timeout=15
     provenance, files = validate_bundle(content, artifact.get('digest'), expected)
     refreshed = api_json(f'repos/{repository}/actions/runs/{selected_id}')
     validate_producer_run(refreshed, expected_run)
-    require(refreshed['id'] == selected_id and refreshed['run_attempt'] == attempt,
+    require(refreshed['id'] == selected_id and refreshed['run_attempt'] == run['run_attempt'],
             'producer attempt changed during download')
     destination.mkdir(parents=True, exist_ok=False)
     for name, data in files.items():
