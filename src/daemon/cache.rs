@@ -232,6 +232,7 @@ impl PackageCache {
     /// construction, not a global budget.
     #[must_use]
     pub fn stats(&self) -> CacheStats {
+        self.sync();
         let total = self
             .cache
             .entry_count()
@@ -261,7 +262,8 @@ impl PackageCache {
 
     /// Sync pending cache operations
     /// Moka cache is eventually consistent, this ensures all pending operations complete.
-    /// Primarily used in tests to ensure cache state is synchronized before assertions.
+    /// Also used before reporting cache statistics so the returned count
+    /// reflects completed writes and invalidations.
     pub fn sync(&self) {
         self.cache.run_pending_tasks();
         self.debian_cache.run_pending_tasks();

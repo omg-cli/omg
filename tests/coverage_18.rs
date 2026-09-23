@@ -414,6 +414,64 @@ async fn clearing_search_cache_forces_a_new_lookup_over_real_ipc() -> Result<()>
 
 #[tokio::test]
 #[serial]
+async fn cache_stats_reports_live_entries_and_capacity_over_real_ipc() -> Result<()> {
+    async fn stats(fixture: &RealServerFixture, id: u64) -> Result<(usize, usize)> {
+        match request_on_wire(fixture, Request::CacheStats { id }).await? {
+            Response::Success {
+                id: response_id,
+                result: ResponseResult::CacheStats { size, max_size },
+            } => {
+                assert_eq!(response_id, id);
+                Ok((size, max_size))
+            }
+            other => panic!("cache stats returned {other:?}"),
+        }
+    }
+
+    let fixture = RealServerFixture::new().await?;
+    match request_on_wire(&fixture, Request::CacheClear { id: 610 }).await? {
+        Response::Success {
+            id: 610,
+            result: ResponseResult::Message(message),
+        } => assert_eq!(message, "cleared"),
+        other => panic!("initial cache clear returned {other:?}"),
+    }
+    assert_eq!(stats(&fixture, 611).await?, (0, 1000));
+
+    match request_on_wire(
+        &fixture,
+        Request::Search {
+            id: 612,
+            query: "cov18-cache-stats-unique-query".into(),
+            limit: Some(2),
+        },
+    )
+    .await?
+    {
+        Response::Success {
+            id: 612,
+            result: ResponseResult::Search(result),
+        } => {
+            assert!(result.packages.is_empty());
+            assert_eq!(result.total, 0);
+        }
+        other => panic!("fixture search returned {other:?}"),
+    }
+    assert_eq!(stats(&fixture, 613).await?, (1, 1000));
+
+    match request_on_wire(&fixture, Request::CacheClear { id: 614 }).await? {
+        Response::Success {
+            id: 614,
+            result: ResponseResult::Message(message),
+        } => assert_eq!(message, "cleared"),
+        other => panic!("final cache clear returned {other:?}"),
+    }
+    assert_eq!(stats(&fixture, 615).await?, (0, 1000));
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
 async fn package_info_cache_preserves_metadata_and_missing_package_identity() -> Result<()> {
     let fixture = RealServerFixture::new().await?;
     let baseline = metrics_probe(&fixture).await?;
