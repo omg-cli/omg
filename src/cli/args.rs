@@ -1071,13 +1071,20 @@ pub enum AccountCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum AuditCommands {
-    /// Scan for vulnerabilities in installed packages (default)
-    Scan,
+    /// Scan installed packages; optionally fail when findings are reported
+    Scan {
+        /// Exit nonzero when the scan reports any vulnerabilities
+        #[arg(long)]
+        fail_on_findings: bool,
+    },
     /// Generate Software Bill of Materials (SBOM) in `CycloneDX` format
     Sbom {
         /// Output file path (default: ~/.local/share/omg/sbom/sbom-`<timestamp>`.json)
         #[arg(short, long)]
         output: Option<String>,
+        /// Generate an installed-package inventory without advisory matching
+        #[arg(long)]
+        inventory_only: bool,
     },
     /// Scan for leaked secrets and credentials
     Secrets {
@@ -1101,16 +1108,16 @@ pub enum AuditCommands {
     Verify,
     /// Show security policy status
     Policy,
-    /// Check SLSA provenance for a package
+    /// Verify an artifact signature against a trusted Sigstore identity
     Slsa {
         /// Package file to verify
         package: String,
         /// Require the Fulcio certificate SAN to match this identity
-        /// (email or OIDC URI). Verification rejects a missing identity.
-        #[arg(long)]
-        certificate_identity: Option<String>,
+        /// (email or OIDC URI); required for a meaningful trust decision
+        #[arg(long, required = true)]
+        certificate_identity: String,
     },
-    /// Scan for software license compliance issues
+    /// Scan installed package licenses (Arch backend only)
     Licenses {
         /// Output format (table, json, csv)
         #[arg(short, long, value_enum, default_value_t = LicenseOutputFormat::Table)]
@@ -1121,11 +1128,11 @@ pub enum AuditCommands {
         /// Show only packages with specific license types (comma-separated)
         #[arg(long)]
         filter: Option<String>,
-        /// Check against policy (warn on restricted licenses)
+        /// Check all installed packages against policy; fail on violations
         #[arg(long)]
         check_policy: bool,
     },
-    /// Auto-fix vulnerabilities by upgrading packages
+    /// Upgrade vulnerable packages when an update is available (Arch only)
     Fix {
         /// Show what would be fixed without making changes
         #[arg(long)]
@@ -1273,6 +1280,55 @@ mod tests {
     #[test]
     fn verify_cli() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn security_cli_requires_slsa_identity_and_accepts_explicit_scan_gate() {
+        assert!(Cli::try_parse_from(["omg", "audit", "slsa", "artifact.tar.gz"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "omg",
+                "audit",
+                "slsa",
+                "artifact.tar.gz",
+                "--certificate-identity",
+                "builder@example.com"
+            ])
+            .is_ok()
+        );
+        let parsed = Cli::try_parse_from(["omg", "audit", "scan", "--fail-on-findings"])
+            .expect("explicit finding gate must parse");
+        assert!(matches!(
+            parsed.command,
+            Commands::Audit {
+                command: Some(AuditCommands::Scan {
+                    fail_on_findings: true
+                })
+            }
+        ));
+
+        let inventory = Cli::try_parse_from(["omg", "audit", "sbom", "--inventory-only"])
+            .expect("offline inventory mode must parse");
+        assert!(matches!(
+            inventory.command,
+            Commands::Audit {
+                command: Some(AuditCommands::Sbom {
+                    inventory_only: true,
+                    ..
+                })
+            }
+        ));
+        let default_sbom =
+            Cli::try_parse_from(["omg", "audit", "sbom"]).expect("default SBOM must parse");
+        assert!(matches!(
+            default_sbom.command,
+            Commands::Audit {
+                command: Some(AuditCommands::Sbom {
+                    inventory_only: false,
+                    ..
+                })
+            }
+        ));
     }
 
     #[test]

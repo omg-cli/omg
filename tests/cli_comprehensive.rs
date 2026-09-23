@@ -505,7 +505,9 @@ impl TargetExpectations {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Assertion {
     AuditSourceFailure,
+    AuditFixRefusal,
     SbomSourceFailure,
+    SbomInventoryOnly,
     JsonStdout,
     Artifact(String),
     WorkspaceFilteredOutput,
@@ -522,7 +524,9 @@ impl Assertion {
     fn parse(raw: &str, line_number: usize) -> Self {
         match raw {
             "audit-source-failure" => Self::AuditSourceFailure,
+            "audit-fix-refusal" => Self::AuditFixRefusal,
             "sbom-source-failure" => Self::SbomSourceFailure,
+            "sbom-inventory-only" => Self::SbomInventoryOnly,
             "json-stdout" => Self::JsonStdout,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
@@ -1206,6 +1210,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
         // unavailable advisory source. This fixture has an empty mock inventory,
         // so its distinct contract is a completed empty scan with exit zero.
         let expected_exit = if case.assertions.contains(&Assertion::AuditSourceFailure)
+            || case.assertions.contains(&Assertion::AuditFixRefusal)
             || case.assertions.contains(&Assertion::SbomSourceFailure)
         {
             0
@@ -1251,7 +1256,9 @@ fn behavior_inventory_runs_in_hermetic_state() {
             issues.push("failure did not explain itself on stderr".to_string());
         }
         let audit_success = match case.id.as_str() {
-            "audit" | "audit-scan" => Some("No vulnerabilities found in scanned packages."),
+            "audit" | "audit-scan" | "audit-scan-fail-on-findings-offline" => {
+                Some("No vulnerabilities found in scanned packages.")
+            }
             "audit-fix" | "audit-fix-flags" => Some("No vulnerabilities found!"),
             _ => None,
         };
@@ -1278,7 +1285,33 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         );
                     }
                 }
-                Assertion::AuditSourceFailure => {
+                Assertion::SbomInventoryOnly => {
+                    let report = std::fs::read_to_string(project.path().join("sbom.json"))
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+                    let marked = report.as_ref().is_some_and(|report| {
+                        report["bomFormat"] == "CycloneDX"
+                            && report["components"].as_array().is_some()
+                            && report
+                                .get("vulnerabilities")
+                                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+                            && report["metadata"]["component"]["properties"]
+                                .as_array()
+                                .is_some_and(|properties| {
+                                    properties.iter().any(|property| {
+                                        property["name"] == "omg:advisory-scan"
+                                            && property["value"] == "not-performed"
+                                    })
+                                })
+                    });
+                    if !marked || !result.stdout.contains("advisory matching was skipped") {
+                        issues.push(
+                            "inventory-only SBOM did not label skipped advisory matching"
+                                .to_string(),
+                        );
+                    }
+                }
+                Assertion::AuditSourceFailure | Assertion::AuditFixRefusal => {
                     assert!(
                         audit_success.is_some(),
                         "audit assertion requires an explicit empty-inventory oracle"
@@ -1336,13 +1369,10 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 }
                 Assertion::Artifact(relative) => {
                     let path = project.path().join(relative);
-                    if std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|contents| {
-                            serde_json::from_str::<serde_json::Value>(&contents).ok()
-                        })
-                        .is_none()
-                    {
+                    let artifact = std::fs::read_to_string(&path).ok().and_then(|contents| {
+                        serde_json::from_str::<serde_json::Value>(&contents).ok()
+                    });
+                    if artifact.is_none() {
                         issues.push(format!(
                             "artifact {relative} was not written as valid JSON at {}",
                             path.display()
