@@ -248,11 +248,15 @@ jobs:
             image: fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
             features: fedora,pgp,license
             setup: |
-              dnf install -y --setopt=install_weak_deps=False \
+              timeout -k 10s 12m dnf \
+                --setopt=fedora.metalink= \
+                --setopt=fedora.baseurl='https://dl.fedoraproject.org/pub/fedora/linux/releases/$releasever/Everything/$basearch/os/' \
+                --setopt=updates.metalink= \
+                --setopt=updates.baseurl='https://dl.fedoraproject.org/pub/fedora/linux/updates/$releasever/Everything/$basearch/' \
+                install -y --setopt=install_weak_deps=False \
                 git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 \
                 rpm dnf sqlite yum-utils fedora-release
               rpm --initdb
-              dnf makecache --refresh
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
                 -o /tmp/rustup-init

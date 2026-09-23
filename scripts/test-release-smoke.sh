@@ -81,11 +81,36 @@ assert_rc() {
 cat > "$scratch/bin/fake-engine" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n "${FAKE_ENGINE_ARGS:-}" ]]; then printf '%s\n' "$@" >> "$FAKE_ENGINE_ARGS"; fi
+if [[ "${1:-}" == buildx ]]; then
+  case "${2:-}" in
+    version) [[ "${FAKE_BUILDX_AVAILABLE:-0}" == 1 ]]; exit $? ;;
+    build) shift ;;
+    *) exit 2 ;;
+  esac
+fi
 case "${1:-}" in
   info) exit "${FAKE_INFO_EXIT:-0}" ;;
   pull) exit 0 ;;
+  build)
+    [[ "${FAKE_BUILD_EXIT:-0}" == 0 ]] || exit "$FAKE_BUILD_EXIT"
+    iidfile=""
+    while (($#)); do
+      if [[ "$1" == --iidfile ]]; then iidfile=$2; break; fi
+      shift
+    done
+    [[ -n "$iidfile" ]] || exit 2
+    # Docker --iidfile has no trailing newline.
+    printf 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' > "$iidfile"
+    ;;
+  image)
+    case "${2:-}" in
+      inspect) exit "${FAKE_INSPECT_EXIT:-0}" ;;
+      rm) exit "${FAKE_IMAGE_RM_EXIT:-0}" ;;
+      *) exit 2 ;;
+    esac
+    ;;
   run)
-    if [[ -n "${FAKE_ENGINE_ARGS:-}" ]]; then printf '%s\n' "$@" >> "$FAKE_ENGINE_ARGS"; fi
     if [[ "${FAKE_HANG:-0}" == 1 ]]; then
       touch "$FAKE_CONTAINER_STATE"
       sleep 30
@@ -104,6 +129,7 @@ case "${1:-}" in
 esac
 EOF
 chmod 700 "$scratch/bin/fake-engine"
+ln -s fake-engine "$scratch/bin/docker"
 cat > "$scratch/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -249,6 +275,35 @@ work_root="$HOME/.cache/build-targets/omg-release-smoke"
 grep -q '"result":"PRODUCT_FAIL"' "$(results_file "$scratch/failing-evidence")" || fail "failing case was not a product failure"
 
 make_stage "$scratch/fedora" fedora
+export FAKE_ENGINE_ARGS="$scratch/fedora-family-engine"
+fedora_family_args=(--release v9.9.9 --distro fedora --family package --container-engine fake-engine --staged-dir "$scratch/fedora")
+assert_rc 0 "$runner" "${fedora_family_args[@]}" --evidence-dir "$scratch/fedora-family"
+[[ "$(grep -c '^build$' "$FAKE_ENGINE_ARGS")" -eq 1 ]] || fail 'Fedora metadata seed did not build exactly once'
+[[ "$(grep -c '^run$' "$FAKE_ENGINE_ARGS")" -eq 3 ]] || fail 'Fedora cases did not run in three fresh containers'
+[[ "$(grep -c '^image$' "$FAKE_ENGINE_ARGS")" -eq 2 ]] || fail 'Fedora prepared image was not inspected and cleaned up'
+grep -Fxq -- '--no-cache' "$FAKE_ENGINE_ARGS" || fail 'Fedora metadata seed reused an unproven old build cache'
+[[ "$(grep -c '^sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$' "$FAKE_ENGINE_ARGS")" -eq 5 ]] || fail 'Fedora cases did not inspect, use and clean up the exact prepared image'
+grep -Fxq 'OMG_PROBE_INDEX_CMD=dnf --cacheonly repoquery tree' "$FAKE_ENGINE_ARGS" || fail 'Fedora cases did not assert the seeded metadata cache'
+grep -Fq 'fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898' "$(dirname "$(results_file "$scratch/fedora-family")")/fedora-cache-seed.Dockerfile" || fail 'Fedora metadata seed lost its pinned base'
+unset FAKE_ENGINE_ARGS
+export FAKE_BUILDX_AVAILABLE=1 FAKE_ENGINE_ARGS="$scratch/fedora-buildx-engine"
+assert_rc 0 "$runner" "${fedora_family_args[@]}" --container-engine docker --evidence-dir "$scratch/fedora-buildx"
+grep -Fxq -- '--load' "$FAKE_ENGINE_ARGS" || fail 'Buildx Fedora seed image was not loaded for fresh containers'
+[[ "$(grep -c '^buildx$' "$FAKE_ENGINE_ARGS")" -eq 2 ]] || fail 'Buildx availability and build were not both verified'
+unset FAKE_BUILDX_AVAILABLE FAKE_ENGINE_ARGS
+export FAKE_BUILD_EXIT=7
+assert_rc 3 "$runner" "${fedora_family_args[@]}" --evidence-dir "$scratch/fedora-seed-error"
+unset FAKE_BUILD_EXIT
+[[ "$(grep -c '"result":"HARNESS_ERROR"' "$(results_file "$scratch/fedora-seed-error")")" -eq 3 ]] || fail 'Fedora metadata seed failure was blamed on the product or skipped cases'
+export FAKE_INSPECT_EXIT=7
+assert_rc 3 "$runner" "${fedora_family_args[@]}" --evidence-dir "$scratch/fedora-image-missing"
+unset FAKE_INSPECT_EXIT
+[[ "$(grep -c '"result":"HARNESS_ERROR"' "$(results_file "$scratch/fedora-image-missing")")" -eq 3 ]] || fail 'Unloaded Fedora seed image was blamed on the product'
+export FAKE_IMAGE_RM_EXIT=7
+assert_rc 3 "$runner" "${fedora_family_args[@]}" --evidence-dir "$scratch/fedora-cleanup-error"
+unset FAKE_IMAGE_RM_EXIT
+grep -q '"case_id":"release-harness-cleanup".*"result":"HARNESS_ERROR"' "$(results_file "$scratch/fedora-cleanup-error")" || fail 'Fedora seed cleanup failure left aggregate evidence green'
+[[ "$(grep -c '"result":"PASS"' "$(results_file "$scratch/fedora-cleanup-error")")" -eq 3 ]] || fail 'Fedora cleanup failure rewrote real package results'
 fedora_args=(--release v9.9.9 --distro fedora --case release-package-search-tree --container-engine fake-engine --staged-dir "$scratch/fedora")
 assert_rc 0 "$runner" "${fedora_args[@]}" --evidence-dir "$scratch/fixed-defect"
 grep -q '"result":"PASS"' "$(results_file "$scratch/fixed-defect")" || fail "fixed defect was forced to fail"
@@ -737,9 +792,20 @@ assert_rc 1 "$runner" --release v9.9.9 --distro macos --executor native --case r
 grep -q '"result":"PRODUCT_FAIL"' "$(results_file "$scratch/native-version-fail")" || fail "native version mismatch was not blamed on the product"
 
 mkdir -p "$scratch/macbin"
-for tool in awk basename bash cat chmod cp date dirname env find grep gzip head mktemp mkdir mv rm shasum tail tar tee tr wc; do
+for tool in awk basename bash cat chmod cp date dirname env find grep gzip head mktemp mkdir mv rm tail tar tee tr wc; do
   ln -sf "$(command -v "$tool")" "$scratch/macbin/$tool"
 done
+if command -v shasum >/dev/null 2>&1; then
+  ln -sf "$(command -v shasum)" "$scratch/macbin/shasum"
+else
+  cat > "$scratch/macbin/shasum" <<EOF
+#!/usr/bin/env bash
+[[ "\${1:-}" == -a && "\${2:-}" == 256 ]] || exit 2
+shift 2
+exec "$(command -v sha256sum)" "\$@"
+EOF
+  chmod 700 "$scratch/macbin/shasum"
+fi
 cat > "$scratch/macbin/gtimeout" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail

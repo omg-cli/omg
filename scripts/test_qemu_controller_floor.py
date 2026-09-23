@@ -50,7 +50,8 @@ dpkg() { [[ "$1" == --compare-versions && "$3" == ge && "$4" == '1:10.0.11+ds-0+
         check = source.index('bash /work/check-qemu-controller.sh')
         self.assertLess(check, source.index('qemu-img info base.qcow2'))
         self.assertNotIn('controller_image=debian:bookworm', source)
-        self.assertEqual(source.count('controller_image=debian:trixie@sha256:'), 2)
+        self.assertEqual(source.count('controller_image_x86_64=debian:trixie@sha256:'), 1)
+        self.assertEqual(source.count('controller_image_aarch64=debian:trixie@sha256:'), 1)
 
 
 if __name__ == '__main__':

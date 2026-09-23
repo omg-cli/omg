@@ -4,8 +4,8 @@ set -euo pipefail
 
 image=${1:?pinned controller image required}
 attempt_log=${2:?attempt log path required}
-[[ "$image" =~ ^debian:trixie@sha256:[0-9a-f]{64}$ ]] || {
-  printf 'error: expected a digest-pinned Debian trixie controller\n' >&2
+[[ "$image" =~ ^debian:(trixie|sid)@sha256:[0-9a-f]{64}$ ]] || {
+  printf 'error: expected a digest-pinned Debian trixie or sid controller\n' >&2
   exit 2
 }
 

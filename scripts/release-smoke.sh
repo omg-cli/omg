@@ -75,7 +75,9 @@ load_distro() {
     fedora)
       distro_suffix="-x86_64-linux-fedora"
       distro_image="fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898"
-      distro_index_cmd="dnf -y makecache"
+      # Fedora's metadata is seeded once into a disposable image before any
+      # case. This cache-only query proves each fresh container can read it.
+      distro_index_cmd="dnf --cacheonly repoquery tree"
       distro_installed_assert="rpm -q tree"
       distro_removed_assert="! rpm -q tree"
       ;;
@@ -392,6 +394,24 @@ record_harness_error() {
   record_nonexecution "$1" "HARNESS_ERROR" "$2"
 }
 
+record_cleanup_error() {
+  local distro=$1 message=$2 case_id=release-harness-cleanup
+  local evidence_dir="$run_evidence/${distro}-${case_id}"
+  mkdir -p "$evidence_dir"
+  printf 'HARNESS_ERROR: %s\n' "$message" > "$evidence_dir/transcript.txt"
+  {
+    printf 'case_id=%s\n' "$case_id"
+    printf 'distro=%s\n' "$distro"
+    printf 'result=HARNESS_ERROR\n'
+    printf 'release=%s\n' "$tag"
+    printf 'engine=%s\n' "$engine"
+    if [[ -f "$run_evidence/fedora-cache-seed-cleanup.log" ]]; then
+      printf 'cleanup_log=%s\n' "$run_evidence/fedora-cache-seed-cleanup.log"
+    fi
+  } > "$evidence_dir/metadata.txt"
+  write_result "$evidence_dir" "$case_id" "$distro" HARNESS_ERROR 3 0 required-harness
+}
+
 resolve_artifact() {
   local workdir=$1
   version="${tag#v}"
@@ -434,6 +454,7 @@ resolve_artifact() {
 run_case() (
   local distro=$1 case_id=$2 stage=$3
   local expectation evidence_dir started elapsed probe_bin probe_kind observed_exit result
+  local runtime_image="${prepared_image:-$distro_image}"
   # $BASHPID is bash 4.0+; $$ plus distro+case (cases run sequentially)
   # is unique here on bash 3.2 as well.
   local container_name="omg-smoke-$$-${distro}-${case_id}" cleanup_ok=true
@@ -493,7 +514,7 @@ run_case() (
       -e OMG_PROBE_REMOVED_ASSERT="$distro_removed_assert" \
       -e OMG_PROBE_ROOT=/probe \
       -v "$stage:/probe:ro" \
-      "$distro_image" bash -x "/probe/probe-${case_id}.sh" || observed_exit=$?
+      "$runtime_image" bash -x "/probe/probe-${case_id}.sh" || observed_exit=$?
     cleanup_container || cleanup_ok=false
     trap - EXIT INT TERM
   fi
@@ -544,6 +565,9 @@ run_case() (
     printf 'expectation=%s\n' "$expectation"
     printf 'release=%s\n' "$tag"
     printf 'image=%s\n' "$image_label"
+    if [[ -n "${prepared_image:-}" ]]; then
+      printf 'prepared_image_id=%s\n' "$prepared_image"
+    fi
     printf 'archive=%s\n' "$archive"
     printf 'archive_sha256=%s\n' "$digest"
     printf 'engine=%s\n' "$engine_label"
@@ -558,14 +582,62 @@ run_case() (
   esac
 )
 
+prepare_fedora_cache_image() {
+  local workdir=$1 context="$1/fedora-cache-seed-context" recipe
+  local -a build_args=(build --no-cache)
+  recipe="$context/Dockerfile"
+  mkdir -p "$context" || return 1
+  printf 'FROM %s\n' "$distro_image" > "$recipe" || return 1
+  cat >> "$recipe" <<'DOCKERFILE' || return 1
+RUN dnf config-manager setopt \
+  'fedora.metalink=' \
+  'fedora.baseurl=https://dl.fedoraproject.org/pub/fedora/linux/releases/$releasever/Everything/$basearch/os/' \
+  'updates.metalink=' \
+  'updates.baseurl=https://dl.fedoraproject.org/pub/fedora/linux/updates/$releasever/Everything/$basearch/'
+RUN dnf makecache --refresh
+DOCKERFILE
+  cp "$recipe" "$run_evidence/fedora-cache-seed.Dockerfile" || return 1
+  # Buildx drivers need --load before the image is available to run. The
+  # legacy Docker builder does not support that flag, so select Buildx only
+  # when its plugin is installed.
+  if [[ "$engine" == docker ]] && "$engine" buildx version >/dev/null 2>&1; then
+    build_args=(buildx build --no-cache --load)
+  fi
+  if ! "$TIMEOUT_BIN" --kill-after=5s 180s "$engine" "${build_args[@]}" \
+    --iidfile "$workdir/fedora-cache-seed.id" -f "$recipe" "$context" \
+    > "$run_evidence/fedora-cache-seed.log" 2>&1; then
+    return 1
+  fi
+  prepared_image=$(cat "$workdir/fedora-cache-seed.id") || return 1
+  [[ "$prepared_image" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  "$engine" image inspect "$prepared_image" \
+    > "$run_evidence/fedora-cache-seed-inspect.json" 2>&1 || return 1
+  cp "$workdir/fedora-cache-seed.id" "$run_evidence/fedora-cache-seed-image.txt" || return 1
+}
+
 run_distro() (
   set -euo pipefail
   local distro=$1 workdir stage case_id rc case_rc=0
+  local prepared_image=""
   load_distro "$distro" || return 2
   local work_root="$HOME/.cache/build-targets/omg-release-smoke"
   mkdir -p "$work_root" || return 3
   workdir="$(mktemp -d "$work_root/${distro}.XXXXXX")" || return 3
-  trap 'rm -rf "$workdir"' EXIT
+  cleanup_distro() {
+    local status=$? cleanup_error=""
+    trap - EXIT
+    if [[ -n "$prepared_image" ]]; then
+      "$TIMEOUT_BIN" --kill-after=5s 20s "$engine" image rm "$prepared_image" \
+        > "$run_evidence/fedora-cache-seed-cleanup.log" 2>&1 || cleanup_error="prepared Fedora image removal failed"
+    fi
+    rm -rf "$workdir" || cleanup_error="${cleanup_error:+$cleanup_error; }temporary workdir removal failed"
+    if [[ -n "$cleanup_error" ]]; then
+      record_cleanup_error "$distro" "$cleanup_error"
+      status=3
+    fi
+    exit "$status"
+  }
+  trap cleanup_distro EXIT
   stage="$workdir/stage"
   mkdir -p "$stage"
 
@@ -585,6 +657,10 @@ run_distro() (
     [[ -z "$distro_image" ]] || { record_harness_error "$distro" "native executor needs an imageless distro"; return 3; }
   elif ! "$engine" pull "$distro_image"; then
     record_harness_error "$distro" "failed to pull the pinned container image"
+    return 3
+  fi
+  if [[ "$distro" == fedora ]] && ! prepare_fedora_cache_image "$workdir"; then
+    record_harness_error "$distro" "failed to seed bounded Fedora metadata cache; see fedora-cache-seed.log"
     return 3
   fi
 
