@@ -36,6 +36,8 @@ GUEST_FILES = {
     "aur-no-aur.json", "aur-basic.json", "aur-cert.log", "aur-fixture-preflight.log",
     "aur-fixture.stdout", "aur-fixture.stderr",
     "daemon-advisory-shutdown.log",
+    "daemon-direct-before-search.prom", "daemon-direct-after-search.prom",
+    "daemon-direct-after-info.prom",
     "dnf-reason-fault.stdout.log", "dnf-reason-fault.stderr.log",
     "native-explicit.txt", "native-explicit.json",
     "daemon-direct-after-queries.txt", "daemon-foreground-after-queries.txt",
@@ -59,6 +61,11 @@ GUEST_FILES.update(
     f"{label}-{suffix}"
     for label in ("daemon-direct", "daemon-foreground", "daemon-stopped")
     for suffix in ("explicit.json", "count.txt", "shortcut.txt", "count.json")
+)
+GUEST_FILES.update(
+    f"{label}-{suffix}"
+    for label in ("daemon-direct", "daemon-stopped")
+    for suffix in ("search.json", "info.json", "info.txt")
 )
 GUEST_FILES.update(
     f"{label}{suffix}"
