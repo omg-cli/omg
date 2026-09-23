@@ -15,6 +15,11 @@ archive as separate evidence. Publication waits for the latest successful push
 runs of CI, Benchmark, Security Audit, Secret Scanning, CodeQL, Coverage, Docker
 E2E and QEMU for the exact source commit.
 
+The trusted-main Fedora x86_64 QEMU guest can use the
+[restricted local runner](local-ci-runner.md). All other jobs remain on
+GitHub-hosted runners. Clearing the runner variable restores hosted Fedora
+QEMU without changing the evidence gates below.
+
 ## Repository enforcement
 
 The checked-in ruleset definitions are recorded in `.github/security-rules/`. Confirm their

@@ -188,7 +188,8 @@ jobs:
        (inputs.staged && inputs.reuse-ci && needs.build-staged.result == 'skipped' && needs.build-staged-ubuntu.result == 'skipped') ||
        (inputs.staged && inputs.distro != 'ubuntu' && needs.build-staged.result == 'success' && needs.build-staged-ubuntu.result == 'skipped') ||
        (inputs.staged && inputs.distro == 'ubuntu' && needs.build-staged-ubuntu.result == 'success' && needs.build-staged.result == 'skipped'))
-    runs-on: ubuntu-24.04
+    # Pilot one trusted lane so the single WSL runner does not serialize the matrix.
+    runs-on: ${{ inputs.distro == 'fedora' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.OMG_CI_LINUX_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 90
     permissions:
       contents: read
