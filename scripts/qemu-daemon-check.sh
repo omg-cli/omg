@@ -37,6 +37,46 @@ report_explicit_query_difference() {
   ' "$listing" >&2
 }
 # END EXPLICIT QUERY ORACLE
+# BEGIN PACKAGE QUERY ORACLE
+check_package_query_outputs() {
+  local name=$1 daemon_search=$2 daemon_info=$3 direct_search=$4 direct_info=$5
+  jq -e -s --arg name "$name" '
+    def match_package($rows): $rows | map(select(.name == $name)) | .[0];
+    def valid_search($rows):
+      if ($rows | type) != "array" then false
+      else ($rows | length) <= 50 and
+        ([$rows[] | select(.name == $name)] | length) == 1 and
+        (match_package($rows) |
+          (.version | type) == "string" and (.version | length) > 0 and
+          (.description | type) == "string" and (.description | length) > 0 and
+          (.source | type) == "string" and
+          (.source as $source | (["official", "apt"] | index($source | ascii_downcase)) != null))
+      end;
+    def valid_info($record):
+      ($record | type) == "object" and $record.name == $name and
+      ($record.version | type) == "string" and ($record.version | length) > 0 and
+      ($record.description | type) == "string" and ($record.description | length) > 0 and
+      $record.installed == true;
+    length == 4 and
+    (.[0] as $daemon_search | .[1] as $daemon_info |
+     .[2] as $direct_search | .[3] as $direct_info |
+     valid_search($daemon_search) and valid_search($direct_search) and
+     valid_info($daemon_info) and valid_info($direct_info) and
+     (match_package($daemon_search).version == $daemon_info.version) and
+     (match_package($direct_search).version == $direct_info.version) and
+     ($daemon_info.version == $direct_info.version))
+  ' "$daemon_search" "$daemon_info" "$direct_search" "$direct_info" >/dev/null
+}
+# END PACKAGE QUERY ORACLE
+# BEGIN TEXT INFO ORACLE
+check_text_info_outputs() {
+  local name=$1 daemon_output=$2 direct_output=$3 output
+  for output in "$daemon_output" "$direct_output"; do
+    grep -Eq "^[[:space:]]+Name: ${name}$" "$output" || return 1
+    grep -Eq '^[[:space:]]+Installed: yes$' "$output" || return 1
+  done
+}
+# END TEXT INFO ORACLE
 # BEGIN BACKEND FAULT ORACLE
 check_backend_refusal() {
   local status=$1 stdout=$2 stderr=$3
@@ -110,6 +150,12 @@ query_cli() {
     return 1
   fi
 }
+query_package_cli() {
+  local label=$1
+  timeout 15 "$bin" --json search --no-aur --limit 50 bash > "$evidence/$label-search.json"
+  timeout 15 "$bin" --json info bash > "$evidence/$label-info.json"
+  timeout 15 "$bin" info bash > "$evidence/$label-info.txt"
+}
 daemon_pid= launcher_pid=
 cleanup() {
   local status=$?
@@ -138,9 +184,9 @@ trap 'exit 130' INT
 # These commands query package state; none installs or removes packages.
 source /etc/os-release
 case "$ID" in
-  arch) timeout 30 pacman -Qqe > "$evidence/native-explicit.txt" ;;
-  debian|ubuntu) timeout 30 apt-mark showmanual > "$evidence/native-explicit.txt" ;;
-  fedora) timeout 30 dnf --cacheonly repoquery --userinstalled --qf '%{name}\n' > "$evidence/native-explicit.txt" ;;
+  arch) timeout 30 pacman -Qq bash >/dev/null; timeout 30 pacman -Qqe > "$evidence/native-explicit.txt" ;;
+  debian|ubuntu) timeout 30 dpkg-query -W bash >/dev/null; timeout 30 apt-mark showmanual > "$evidence/native-explicit.txt" ;;
+  fedora) timeout 30 rpm -q bash >/dev/null; timeout 30 dnf --cacheonly repoquery --userinstalled --qf '%{name}\n' > "$evidence/native-explicit.txt" ;;
   *) printf 'Unsupported native query fixture: %s\n' "$ID" >&2; exit 2 ;;
 esac
 jq -Rn '[inputs | select(length > 0)] | sort | unique' < "$evidence/native-explicit.txt" > "$evidence/native-explicit.json"
@@ -215,6 +261,9 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   requests_before=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-status.txt")
   [[ "$requests_before" =~ ^[0-9]+$ ]]
   query_cli "daemon-$mode"
+  if [[ "$mode" == direct ]]; then
+    query_package_cli daemon-direct
+  fi
   timeout "$status_timeout" "$bin" daemon-status > "$evidence/daemon-$mode-after-queries.txt" 2>&1
   requests_after=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
   failed_after=$(awk '/Requests failed:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
@@ -224,7 +273,9 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   # forms use IPC; ec can legitimately read the daemon's binary status cache.
   # Do not count diagnostic traffic as query coverage or require ec to lose
   # its zero-IPC fast path once the background worker publishes that cache.
-  if [[ "$requests_after" -lt $((requests_before + 6)) ]]; then
+  minimum_requests=6
+  [[ "$mode" != direct ]] || minimum_requests=8
+  if [[ "$requests_after" -lt $((requests_before + minimum_requests)) ]]; then
     printf 'assertion failed: %s queries did not produce enough daemon requests (%s -> %s requests)\n' "$mode" "$requests_before" "$requests_after" >&2
     exit 1
   fi
@@ -253,6 +304,18 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   [[ ! -e "$OMG_SOCKET_PATH" && ! -L "$OMG_SOCKET_PATH" ]]
 done
 OMG_DISABLE_DAEMON=1 query_cli daemon-stopped
+OMG_DISABLE_DAEMON=1 query_package_cli daemon-stopped
+if ! check_package_query_outputs bash \
+  "$evidence/daemon-direct-search.json" "$evidence/daemon-direct-info.json" \
+  "$evidence/daemon-stopped-search.json" "$evidence/daemon-stopped-info.json"; then
+  printf 'assertion failed: daemon-backed search/info differs from direct native package data\n' >&2
+  exit 1
+fi
+if ! check_text_info_outputs bash \
+  "$evidence/daemon-direct-info.txt" "$evidence/daemon-stopped-info.txt"; then
+  printf 'assertion failed: daemon-backed text info concealed native installation state\n' >&2
+  exit 1
+fi
 backend_faults='[]'
 if [[ "$ID" == fedora ]]; then
   check_fedora_reason_refusal "$bin" "$state" "$evidence" "$(id -u)" "$(id -g)"

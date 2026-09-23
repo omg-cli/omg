@@ -58,6 +58,11 @@ GUEST_FILES.update(
     for suffix in ("explicit.json", "count.txt", "shortcut.txt", "count.json")
 )
 GUEST_FILES.update(
+    f"{label}-{suffix}"
+    for label in ("daemon-direct", "daemon-stopped")
+    for suffix in ("search.json", "info.json", "info.txt")
+)
+GUEST_FILES.update(
     f"{label}{suffix}"
     for label in ("daemon-direct-sigint", "daemon-foreground-sigint")
     for suffix in (".log", "-status.txt", "-duplicate.txt", "-launcher.txt",

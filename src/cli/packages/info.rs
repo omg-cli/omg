@@ -60,7 +60,7 @@ pub fn info_sync(package: &str) -> Result<bool> {
     if let Ok(mut client) = SyncDaemonClient::acquire_with_timeout(DAEMON_INFO_TIMEOUT)
         && let Ok(info) = client.info(package)
     {
-        display_detailed_info(&info);
+        display_detailed_info(&info)?;
 
         // Track usage
         crate::core::usage::track_info();
@@ -92,12 +92,16 @@ pub fn info_sync(package: &str) -> Result<bool> {
 
 /// Helper to display detailed info from daemon
 #[cfg(unix)]
-fn display_detailed_info(info: &crate::daemon::protocol::DetailedPackageInfo) {
+fn display_detailed_info(info: &crate::daemon::protocol::DetailedPackageInfo) -> Result<()> {
     let source_label = if info.source == WirePackageSource::Official {
         format!("Official repository ({})", style::info(&info.repo))
     } else {
         style::warning("AUR (Arch User Repository)")
     };
+    #[cfg(not(target_os = "macos"))]
+    let installed = crate::package_managers::is_installed_fast(&info.name)
+        .context("Failed to query local package installation state")?;
+    #[cfg(target_os = "macos")]
     let installed = crate::package_managers::is_installed_fast(&info.name).unwrap_or(false);
     ui::print_package_info(
         &ui::InfoCore {
@@ -119,6 +123,21 @@ fn display_detailed_info(info: &crate::daemon::protocol::DetailedPackageInfo) {
             out_of_date: false,
         },
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn daemon_info_json(
+    info: &crate::daemon::protocol::DetailedPackageInfo,
+    installed: bool,
+) -> Result<serde_json::Value> {
+    let mut value =
+        serde_json::to_value(info).context("Failed to serialize daemon package info")?;
+    value
+        .as_object_mut()
+        .context("Daemon package info must serialize as an object")?
+        .insert("installed".into(), serde_json::Value::Bool(installed));
+    Ok(value)
 }
 
 pub async fn info(package: &str) -> Result<()> {
@@ -145,7 +164,13 @@ async fn info_json(package: &str) -> Result<()> {
     })
     .await
     {
-        let json_str = serde_json::to_string_pretty(&info)
+        // Installation state belongs to the local package database, not the
+        // daemon's warm repository record.
+        let installed = get_package_manager()?
+            .is_installed(&info.name)
+            .await
+            .context("Failed to query local package installation state")?;
+        let json_str = serde_json::to_string_pretty(&daemon_info_json(&info, installed)?)
             .context("Failed to serialize package info as JSON")?;
         println!("{json_str}");
         return Ok(());
@@ -331,6 +356,30 @@ fn display_package_info(info: &crate::package_managers::types::PackageInfo) {
 #[cfg(test)]
 mod tests {
     use super::info_with_json;
+    #[cfg(unix)]
+    use crate::daemon::protocol::{DetailedPackageInfo, WirePackageSource};
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_json_info_reports_local_installation_state() {
+        let info = DetailedPackageInfo {
+            name: "bash".into(),
+            version: "5.3".into(),
+            description: "Shell".into(),
+            url: String::new(),
+            size: 0,
+            download_size: 0,
+            repo: "core".into(),
+            depends: Vec::new(),
+            licenses: Vec::new(),
+            source: WirePackageSource::Official,
+        };
+        for installed in [true, false] {
+            let value = super::daemon_info_json(&info, installed).expect("daemon JSON info");
+            assert_eq!(value["name"], "bash");
+            assert_eq!(value["installed"], installed);
+        }
+    }
 
     #[tokio::test]
     async fn info_validates_names_before_every_output_path() {

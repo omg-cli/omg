@@ -38,6 +38,9 @@ class AllowlistTests(unittest.TestCase):
         names += [f"{label}-{suffix}"
                   for label in ("daemon-direct", "daemon-foreground", "daemon-stopped")
                   for suffix in ("explicit.json", "count.txt", "shortcut.txt", "count.json")]
+        names += [f"{label}-{suffix}"
+                  for label in ("daemon-direct", "daemon-stopped")
+                  for suffix in ("search.json", "info.json", "info.txt")]
         names += [f"{label}{suffix}"
                   for label in ("daemon-direct-sigint", "daemon-foreground-sigint")
                   for suffix in (".log", "-status.txt", "-duplicate.txt", "-launcher.txt",
