@@ -7,10 +7,24 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
 CI_YML = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
+
+
+class ReleaseLockstepTests(unittest.TestCase):
+    def test_fuzz_lock_tracks_root_crate_version(self) -> None:
+        root = CI_YML.parents[2]
+        manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+        fuzz_lock = tomllib.loads((root / "fuzz" / "Cargo.lock").read_text(encoding="utf-8"))
+        local_omg = [
+            package["version"]
+            for package in fuzz_lock["package"]
+            if package["name"] == "omg" and "source" not in package
+        ]
+        self.assertEqual(local_omg, [manifest["package"]["version"]])
 
 
 def job_block(text: str, job: str) -> str:
