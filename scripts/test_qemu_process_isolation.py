@@ -38,6 +38,26 @@ class QemuProcessIsolationTests(unittest.TestCase):
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, index == 0, result.stderr)
 
+    @unittest.skipIf(os.name == 'nt', 'SSH timeout regression needs POSIX timeout and process signals')
+    def test_guest_readiness_probe_cannot_hang_on_an_ssh_banner(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        self.assertIn('after=$(timeout --kill-after=2s 12s ssh', source)
+        start = source.index('wait_ssh() {')
+        end = source.index('\nwait_ssh\n', start)
+        function = source[start:end].replace('{1..120}', '{1..2}').replace('sleep 2', 'sleep 0')
+        function = function.replace('12s ssh', '1s ssh')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ssh = root / 'ssh'
+            ssh.write_text('#!/usr/bin/env bash\nsleep 5\n', encoding='utf-8')
+            ssh.chmod(0o755)
+            (root / 'qemu.pid').write_text(str(os.getpid()))
+            result = subprocess.run(
+                [BASH, '-c', 'opts=(); ' + function + '\nwait_ssh'],
+                cwd=root, env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH']),
+                capture_output=True, text=True, timeout=4)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

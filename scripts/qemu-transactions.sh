@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs inside the existing QEMU controller; measurement stays in the root driver.
 set -euo pipefail
-[[ $# == 10 ]] || exit 2
+[[ $# == 12 ]] || exit 2
 distro=$1; tag=$2; arch=$3; samples=$4
 shift 4
 boot_args=("$@")
