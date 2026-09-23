@@ -90,10 +90,11 @@ class NativeBuildAdmission(unittest.TestCase):
             '''
             result = subprocess.run([BASH, '-e', '-o', 'pipefail', '-c', mock + script],
                                     env=dict(os.environ, RUNNER_TEMP=root.as_posix(), DISTRO='debian',
-                                             BUILD_IMAGE='fixture', BUILD_FEATURES='debian,pgp,license'),
+                                             BUILD_IMAGE='fixture', BUILD_FEATURES='debian,pgp,license',
+                                             QEMU_EVIDENCE_NAME='qemu-evidence-123-1-debian'),
                                     capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 23, result.stderr)
-            log = root / 'qemu-evidence/run-native-build/guest-check.log'
+            log = root / 'qemu-evidence-123-1-debian/run-native-build/guest-check.log'
             self.assertIn('archive checksum mismatch', log.read_text())
             self.assertIn('status --distro debian --case-id qemu-debian-lifecycle --status failure',
                           (root / 'report-call').read_text())
