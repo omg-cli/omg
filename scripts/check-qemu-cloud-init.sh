@@ -31,7 +31,7 @@ if ! jq -e '
     ($entry | type == "object") and
     ($entry.finished | type == "number") and
     ($entry.errors == []) and
-    ($entry.recoverable_errors == {}))
+    (($entry | has("recoverable_errors") | not) or ($entry.recoverable_errors == {})))
 ' <<< "$status" >/dev/null; then
   echo 'cloud-init status is incomplete, errored, or degraded:' >&2
   printf '%s\n' "$status" | head -c 4096 >&2

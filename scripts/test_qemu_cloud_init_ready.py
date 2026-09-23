@@ -77,6 +77,13 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, 3)
 
+    def test_legacy_cloud_init_without_recoverable_errors_field_passes(self):
+        status = healthy_status()
+        for stage in ("init-local", "init", "modules-config", "modules-final"):
+            del status["v1"][stage]["recoverable_errors"]
+        result, _ = self.check(status)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_missing_result_or_failed_unit_rejects_boot(self):
         missing, _ = self.check(healthy_status(), result=False)
         self.assertNotEqual(missing.returncode, 0)
