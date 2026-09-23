@@ -725,7 +725,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; umask 0002; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install"); $(declare -f check_runtime_usage)"
   fi
   if [[ "$distro" == fedora && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
-    # Keep the real OMG path, but bound native DNF to a local two-version RPM.
+    # Keep the real OMG path, but bound native DNF to a local versioned RPM.
     # The root-owned helper restores system repo policy and checks the RPMDB
     # plus native DNF history before it can report success.
     remote+="; run_omg '$command_timeout' sudo -n bash \"\$HOME/qemu-fedora-update-fixture.sh\" '${case#update-}' $quoted_binary '$ssh_user' > command.stdout.log 2> command.stderr.log; assertion=0"

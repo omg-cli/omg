@@ -171,7 +171,7 @@ when the command succeeds. A known defect remains a failure, not a pass.
 The guest fixture provides Podman on Fedora and requires no container engine on
 the other three images. Container command exit expectations reflect that fixture.
 An unexpected engine configuration fails setup rather than changing expectations.
-Fedora's `update --fast` and `update --turbo` rows build a two-version RPM in
+Fedora's `update --fast` and `update --turbo` rows build versioned RPMs in
 the disposable guest and temporarily restrict DNF to one local repository.
 The fast row begins with stale cached metadata and requires a refreshed upgrade;
 the turbo row begins with cached metadata and RPM content. Both require the
