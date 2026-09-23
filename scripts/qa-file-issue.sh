@@ -121,7 +121,12 @@ EOF
     if [[ -n "$excerpt" ]]; then
       body+=$(printf '\n\n### Failure excerpt (`%s`, tail)\n````log\n%s\n````' "$excerpt_source" "$excerpt")
     fi
-    body+=$(printf '\n\n### Agent runbook\n%s\nResolve criteria: this case reports PASS on a later scheduled run — automation comments here and closes this issue. A recurrence while open lands as a new comment; after a close it files a follow-up like this one.' "$(runbook_for "$distro" "$([[ "$distro" == macos ]] && printf ' --executor native' || printf '')")")
+    if [[ "$source" == qemu-matrix ]]; then
+      resolve_criteria='a later successful four-distro published QEMU run on current main verifies this case against the latest release'
+    else
+      resolve_criteria='this case reports PASS on a later scheduled run'
+    fi
+    body+=$(printf '\n\n### Agent runbook\n%s\nResolve criteria: %s; automation comments here and closes this issue. A recurrence while open lands as a new comment; after a close it files a follow-up like this one.' "$(runbook_for "$distro" "$([[ "$distro" == macos ]] && printf ' --executor native' || printf '')")" "$resolve_criteria")
     if [[ "$dry_run" == true ]]; then
       printf 'would create: %s\n' "$title"
     elif gh issue create --repo "$repo" --title "$title" --label "$label" --body "$body" >/dev/null; then

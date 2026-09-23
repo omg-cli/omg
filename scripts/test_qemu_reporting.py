@@ -273,7 +273,8 @@ class ReportingBoundaryTests(unittest.TestCase):
     def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
                            corrupt=False, expired=False, helper_fails=False, case_log=None,
                            log_case="search", main_shas=None, changed_attempt=False,
-                           workflow_path=".github/workflows/qemu-matrix.yml", all_distros=False):
+                           workflow_path=".github/workflows/qemu-matrix.yml", all_distros=False,
+                           latest_tag="v0.1.224", provenance_override=None, commit_shas=None):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -296,11 +297,18 @@ class ReportingBoundaryTests(unittest.TestCase):
                 with zipfile.ZipFile(output, "w") as archive:
                     archive.writestr("run/inventory/results.json",
                         json.dumps([row for row in rows if row["distro"] == distro]))
+                    provenance = dict(staged=False, artifact_attestation_verified=True,
+                                      artifact_tag="v0.1.224", harness_revision=run["head_sha"],
+                                      inventory_revision="c" * 40, distro=distro, arch="x86_64")
+                    if provenance_override:
+                        provenance.update(provenance_override)
+                    archive.writestr("provenance.json", json.dumps(provenance))
                 payloads[identifier] = output.getvalue()
                 artifacts.append(dict(artifact, id=identifier, name=f"qemu-evidence-{distro}",
                                       size_in_bytes=len(payloads[identifier])))
         calls = []
         main_refs = iter(main_shas or [run["head_sha"], run["head_sha"]])
+        tag_commits = iter(commit_shas or ["c" * 40, "c" * 40])
         run_reads = 0
         def api(path, *args):
             nonlocal run_reads
@@ -316,13 +324,17 @@ class ReportingBoundaryTests(unittest.TestCase):
                 return payloads[int(path.split('/')[-2])]
             if path.endswith("/git/ref/heads/main"):
                 return json.dumps(dict(object=dict(sha=next(main_refs))))
+            if path.endswith("/releases/latest"):
+                return json.dumps(dict(tag_name=latest_tag))
+            if path.endswith("/commits/v0.1.224"):
+                return json.dumps(dict(sha=next(tag_commits)))
             if "/jobs?" in path:
                 return json.dumps(dict(jobs=[]))
             self.fail(f"unexpected API request: {path}")
         def subprocess_run(argv, **kwargs):
             root = Path(argv[2]).parent
             transcripts = {path.parent.name: path.read_text() for path in root.glob("*/transcript.txt")}
-            calls.append((argv[1], json.loads(Path(argv[2]).read_text()), transcripts))
+            calls.append((argv[1], json.loads(Path(argv[2]).read_text()), transcripts, argv))
             if helper_fails and argv[1] == "scripts/qa-file-issue.sh":
                 raise REPORT.subprocess.CalledProcessError(1, argv)
         with tempfile.TemporaryDirectory() as directory:
@@ -345,27 +357,41 @@ class ReportingBoundaryTests(unittest.TestCase):
             catalog_path = path / "qemu-issue-report/failures.json"
             return calls, json.loads(catalog_path.read_text()) if catalog_path.exists() else None
 
-    def test_current_main_success_sends_case_and_workflow_recovery_to_helper(self):
-        row = self.row("PASS")
-        calls, catalog = self.run_report_fixture([row], conclusion="success")
+    def test_verified_published_success_sends_case_and_workflow_recovery_to_helper(self):
+        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
+                for distro in REPORT.DISTROS]
+        calls, catalog = self.run_report_fixture(rows, conclusion="success",
+            event_kind="workflow_dispatch", all_distros=True)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], "scripts/qa-file-issue.sh")
-        self.assertEqual(calls[0][1], [row, dict(
+        self.assertEqual(calls[0][1], rows + [dict(
             case_id="qemu-matrix-x86-workflow", distro="ubuntu", result="PASS",
             exit_code=0, elapsed_seconds=0)])
+        self.assertNotIn("--failures-only", calls[0][3])
         self.assertEqual(catalog["failures"], [])
 
+    def test_staged_main_success_never_closes_published_issue(self):
+        calls, catalog = self.run_report_fixture([self.row("PASS")], conclusion="success")
+        self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
+
     def test_stale_main_success_never_reaches_issue_helper(self):
+        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
+                for distro in REPORT.DISTROS]
         calls, catalog = self.run_report_fixture(
-            [self.row("PASS")], conclusion="success", main_shas=["b" * 40, "b" * 40])
+            rows, conclusion="success", event_kind="schedule",
+            all_distros=True, main_shas=["b" * 40])
         self.assertEqual(calls, [])
         self.assertIsNone(catalog)
 
     def test_main_advancing_during_download_keeps_failures_but_blocks_recovery(self):
         failure = self.row()
         passed = dict(self.row("PASS"), case_id="qemu-arch-other")
+        rows = [passed, failure] + [dict(passed, distro=distro,
+            case_id=f"qemu-{distro}-search") for distro in REPORT.DISTROS if distro != "arch"]
         calls, catalog = self.run_report_fixture(
-            [passed, failure], conclusion="success", main_shas=["a" * 40, "b" * 40])
+            rows, conclusion="success", event_kind="schedule", all_distros=True,
+            main_shas=["b" * 40])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][1], [failure])
         self.assertEqual(catalog["failures"], [failure])
@@ -465,17 +491,55 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertTrue(any(row["result"] == "HARNESS_ERROR" for row in reported))
         self.assertFalse(any(row["result"] == "PASS" for row in reported))
 
-    def test_complete_integrated_ci_preserves_exact_case_closures(self):
+    def test_complete_integrated_ci_cannot_close_published_issues(self):
         rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
                 for distro in REPORT.DISTROS]
         calls, catalog = self.run_report_fixture(rows, conclusion="success",
             workflow_path=".github/workflows/ci.yml", all_distros=True)
-        self.assertFalse(catalog["evidence_invalid_or_unavailable"])
-        reported = [row for call in calls for row in call[1]]
-        self.assertFalse(any(row["result"] in REPORT.FAILURES for row in reported))
-        self.assertEqual({(row["case_id"], row["distro"]) for row in reported
-                          if not row["case_id"].startswith("qemu-matrix-")},
-                         {(row["case_id"], row["distro"]) for row in rows})
+        self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
+
+    def test_published_provenance_mismatch_files_harness_error_without_closure(self):
+        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
+                for distro in REPORT.DISTROS]
+        for options in (dict(provenance_override={"artifact_attestation_verified": False}),
+                        dict(provenance_override={"inventory_revision": "d" * 40})):
+            with self.subTest(options=options):
+                all_distros = options.get("all_distros", True)
+                fixture_options = {key: value for key, value in options.items() if key != "all_distros"}
+                calls, catalog = self.run_report_fixture(rows, conclusion="success",
+                    event_kind="workflow_dispatch", all_distros=all_distros, **fixture_options)
+                self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+                self.assertEqual([row["result"] for row in calls[0][1]], ["HARNESS_ERROR"])
+                self.assertIn("--failures-only", calls[0][3])
+
+    def test_supported_staged_and_single_distro_dispatches_do_not_file_false_issues(self):
+        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
+                for distro in REPORT.DISTROS]
+        for options in (dict(all_distros=True, provenance_override={"staged": True}),
+                        dict(all_distros=False)):
+            with self.subTest(options=options):
+                calls, catalog = self.run_report_fixture(rows, conclusion="success",
+                    event_kind="workflow_dispatch", **options)
+                self.assertEqual(calls, [])
+                self.assertIsNone(catalog)
+
+    def test_superseded_release_does_not_close_or_file_an_issue(self):
+        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
+                for distro in REPORT.DISTROS]
+        calls, catalog = self.run_report_fixture(rows, conclusion="success",
+            event_kind="workflow_dispatch", all_distros=True, latest_tag="v0.1.225")
+        self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
+
+    def test_release_tag_moving_during_report_blocks_closure(self):
+        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
+                for distro in REPORT.DISTROS]
+        calls, catalog = self.run_report_fixture(rows, conclusion="success",
+            event_kind="schedule", all_distros=True,
+            commit_shas=["c" * 40, "d" * 40])
+        self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
 
     def test_privileged_report_job_excludes_pull_request_runs(self):
         text = (ROOT / ".github/workflows/qemu-report.yml").read_text()
