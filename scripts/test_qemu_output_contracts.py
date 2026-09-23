@@ -391,7 +391,7 @@ esac
         self.assertEqual([row['result'] for row in evidence], ['PASS', 'FAIL', 'BLOCKED'])
         self.assertIn('regular JSON document', logs['refuse.log'])
 
-    def run_oracle(self, safety='read', assertion='-', code=0, stdout='', stderr='', artifact=None, hooks=None):
+    def run_oracle(self, safety='read', assertion='-', code=0, stdout='', stderr='', artifact=None, hooks=None, distro='arch'):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('# BEGIN PRODUCT OUTPUT ORACLE')
         end = source.index('# END PRODUCT OUTPUT ORACLE', begin)
@@ -411,7 +411,7 @@ esac
             result = subprocess.run(
                 [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
                  function + '\ncheck_product_output "$@"', '_',
-                 safety, assertion, str(code), 'stdout', 'stderr'],
+                 safety, assertion, str(code), 'stdout', 'stderr', distro],
                 cwd=root, capture_output=True, text=True, timeout=10)
             return result
 
@@ -444,6 +444,18 @@ esac
             self.assertNotEqual(self.run_oracle(assertion='audit-source-failure', code=1, stderr=diagnostic, stdout='No vulnerabilities found!').returncode, 0)
         for diagnostic in ['unknown runtime', 'Daemon not running', 'Error: OSV has no configured ecosystem for the running package backend']:
             self.assertNotEqual(self.run_oracle(assertion='audit-source-failure', code=1, stderr=diagnostic).returncode, 0)
+
+    def test_auto_fix_refusal_matches_backend_before_scanning(self):
+        source_error = 'Error: Failed to query native security advisories\n'
+        unsupported = 'Error: Vulnerability auto-fix is not available without the Arch backend; upgrade the affected packages manually\n'
+        self.assertEqual(self.run_oracle(assertion='audit-fix-refusal', code=1, stderr=source_error, distro='arch').returncode, 0)
+        self.assertNotEqual(self.run_oracle(assertion='audit-fix-refusal', code=1, stderr=unsupported, distro='arch').returncode, 0)
+        for distro in ('debian', 'ubuntu', 'fedora'):
+            with self.subTest(distro=distro):
+                self.assertEqual(self.run_oracle(assertion='audit-fix-refusal', code=1, stderr=unsupported, distro=distro).returncode, 0)
+                self.assertNotEqual(self.run_oracle(assertion='audit-fix-refusal', code=0, stderr=unsupported, distro=distro).returncode, 0)
+                self.assertNotEqual(self.run_oracle(assertion='audit-fix-refusal', code=1, stderr=source_error, distro=distro).returncode, 0)
+                self.assertNotEqual(self.run_oracle(assertion='audit-fix-refusal', code=1, stderr=unsupported, stdout='Scanning for fixable vulnerabilities\n', distro=distro).returncode, 0)
 
     def test_panic_cannot_hide_behind_success_or_expected_failure(self):
         for code in (0, 1):

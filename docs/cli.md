@@ -93,13 +93,13 @@ command unless the parser disables a version flag for that command.
 | `omg config` | `get <key>`, `set <key> <value>`, `list`, `validate`, `path`; `reset` accepts `--yes`/`-y`. |
 | `omg privacy` | `status`, `opt-out`, and `opt-in`; `export` accepts `--output`/`-o`. |
 | `omg env capture` / `check` | No additional options. `share` accepts `--description`/`-d` and `--public`; `sync <url-or-id>` accepts the Gist URL or ID. |
-| `omg audit sbom` | `--output`/`-o`. `secrets` accepts `--path`/`-p`. `log` accepts `--limit`/`-l`, `--severity`/`-s`, and `--export`/`-e`. |
-| `omg audit slsa <package>` | `--certificate-identity <identity>` is required for verification and must match the signer identity in the certificate. Omission or an empty value fails. |
-| `omg audit licenses` | `--format`/`-f` (`table`, `json`, `csv`), `--export`/`-e`, `--filter`, and `--check-policy`. |
+| `omg audit scan` / `sbom` | `scan --fail-on-findings` fails when findings exist. `sbom` accepts `--output`/`-o` and `--inventory-only`; the latter skips advisory matching and marks it as not performed. `secrets` accepts `--path`/`-p`. `log` accepts `--limit`/`-l`, `--severity`/`-s`, and `--export`/`-e`. |
+| `omg audit slsa <package>` | `--certificate-identity` is required and must match the Fulcio certificate SAN. The command verifies a supported artifact signature, not SLSA build provenance. |
+| `omg audit licenses` | Arch only. `--format`/`-f` (`table`, `json`, `csv`), `--export`/`-e`, `--filter`, and `--check-policy`; the policy check covers the full inventory and fails on violations. |
 | `omg audit fix` | `--dry-run`, `--yes`/`-y`, and `--min-severity` (`low`, `medium`, `high`, `critical`). |
 | `omg audit export` | `--framework`/`-f` (`soc2`, `iso27001`, `fedramp`, `hipaa`, `pci-dss`), `--period`/`-p`, and `--output`/`-o`. |
 | `omg snapshot create` | Optional `--message`/`-m`. `restore <id>` accepts `--dry-run` and `--yes`/`-y`; `list` and `delete <id>` have no additional options. |
-| `omg ci init <provider>` | Provider is `github`, `gitlab`, or `circleci`; `--advanced` adds the advanced configuration. `validate` and `cache` have no additional options. |
+| `omg ci init <provider>` | Generate CI for `github`, `gitlab`, or `circleci`; `--advanced` adds a Rust dependency audit and SBOM, requiring a Cargo project. `validate` and `cache` have no additional options. |
 | `omg migrate export` / `import <manifest>` | Export accepts `--output`/`-o`; import accepts `--dry-run`. |
 | `omg team init <team-id>` | `--name`/`-n`. `roles list`, `golden-path list`, and `golden-path delete <name>` have no additional options. |
 | `omg team golden-path create <name>` | `--node`, `--python`, and `--packages`. `compliance` accepts `--export` and `--enforce`; `activity` accepts `--days`/`-d`. |
@@ -906,21 +906,21 @@ omg audit [SUBCOMMAND]
 
 | Subcommand | Description |
 | ------------ | ------------- |
-| `scan` | Scan for vulnerabilities (default) |
-| `sbom` | Generate a CycloneDX 1.5 inventory of installed packages and matching vulnerability evidence on supported Linux backends |
+| `scan` | Scan for vulnerabilities (default); add `--fail-on-findings` for a nonzero finding gate |
+| `sbom` | Generate a CycloneDX 1.5 installed-package inventory; add `--inventory-only` to mark advisory matching as skipped |
 | `secrets` | Scan for leaked credentials |
 | `log` | View audit log entries |
 | `verify` | Check local hash-chain consistency, not authenticity or completeness |
 | `policy` | Show security policy status |
-| `slsa <pkg>` | Check supported artifact signatures against the required `--certificate-identity`; this does not certify a SLSA build level |
-| `licenses` | Scan for software license compliance issues |
-| `fix` | Auto-fix vulnerabilities by upgrading packages |
-| `export` | Export compliance evidence for audit frameworks |
+| `slsa <pkg>` | Check a supported Sigstore artifact signature against a required `--certificate-identity`; no SLSA build level is established |
+| `licenses` | Report installed Arch package licenses; `--check-policy` fails on configured allowlist violations |
+| `fix` | Upgrade vulnerable Arch packages when updates are available; review the dry run |
+| `export` | Export SOC 2 evidence on a supported backend; other accepted framework labels are unimplemented |
 | `eol` | Check end-of-life status for installed Node.js, Python, Rust, Go, Ruby, Java, Bun, and Deno versions |
 
-In published v0.1.223, `scan` requires the Unix daemon, and `sbom` succeeds on Arch when its inventory and advisories are available. Debian and Ubuntu fail at the required SBOM vulnerability scan; Fedora has no system SBOM backend. The newer main checkout can scan directly when the daemon is unavailable and supports system SBOMs on Arch, Debian, Ubuntu, and Fedora. Neither version fails `scan` solely because findings exist. SBOMs do not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
+`scan` prefers the Unix daemon but falls back to the direct package backend and shared scanner; findings only make the command fail with `--fail-on-findings`. The published v0.1.223 scan still requires the daemon. The newer system SBOM supports Arch, Debian, Ubuntu, and Fedora, with native advisory or OSV matching by default; the published release only completes this command on Arch. `--inventory-only` avoids advisory requests and marks the omission in the SBOM, so an empty vulnerability list is not a clean scan. The SBOM does not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
 
-`omg audit export --framework soc2` uses the supported SBOM backend. Published v0.1.223 requires the daemon and can fail on Debian or Ubuntu at the SBOM step. The newer main checkout prefers the daemon and can scan directly when it is absent. The other accepted framework names return unimplemented errors. `--period` labels the export; it does not filter history. Output is plaintext and can be partial on failure. See [security limits](./security.md).
+`omg audit export --framework soc2` requires a supported SBOM backend and advisory source. The newer CLI can scan directly without a daemon; v0.1.223 requires one. Other accepted framework names return unimplemented errors. `--period` labels the export; it does not filter history. Output is plaintext and can be partial on failure. See [security limits](./security.md).
 
 **Options for `log`:**
 
@@ -936,9 +936,11 @@ In published v0.1.223, `scan` requires the Unix daemon, and `sbom` succeeds on A
 # Vulnerability scan (v0.1.223 requires omgd)
 omg audit
 omg audit scan
+omg audit scan --fail-on-findings # fail CI when any findings are reported
 
 # Generate SBOM (v0.1.223: Arch; newer main: Arch, Debian, Ubuntu, Fedora)
 omg audit sbom -o sbom.json
+omg audit sbom --inventory-only -o offline-inventory.json # advisories skipped
 
 # Scan for secrets
 omg audit secrets
@@ -1640,7 +1642,7 @@ omg container stop mycontainer
 
 ### omg ci
 
-Generate CI/CD configuration for your project.
+Generate CI/CD configuration that runs the project's `build` and `test` tasks through OMG. Those task names must exist in the project. The advanced security job additionally requires `Cargo.toml` and a committed `Cargo.lock`; it audits Rust dependencies, not arbitrary project dependencies.
 
 ```bash
 omg ci <SUBCOMMAND>
@@ -1650,7 +1652,7 @@ omg ci <SUBCOMMAND>
 
 | Subcommand | Description |
 | ------------ | ------------- |
-| `init <provider> [--advanced]` | Generate CI config (github, gitlab, circleci; optional `--advanced` matrix) |
+| `init <provider> [--advanced]` | Generate OMG task-based CI for GitHub, GitLab, or CircleCI; `--advanced` adds a Rust dependency audit and CycloneDX dependency SBOM for Cargo projects |
 | `validate` | Validate environment matches CI expectations |
 | `cache` | Show recommended cache paths |
 
@@ -1670,12 +1672,7 @@ omg ci validate
 omg ci cache
 ```
 
-**Generated config includes:**
-
-- OMG installation step
-- Cache configuration keyed to `omg.lock`
-- Environment validation
-- Task execution via `omg run`
+**Generated config:** GitHub Actions checks for `gh`, downloads the official OMG installer from the release tag matching the generating CLI, and pins `OMG_VERSION` to that tag. The installer verifies the release archive checksum and GitHub build attestation. GitLab and CircleCI expect OMG to be installed by the runner operator; their preflight checks that the binary exists and runs `--version`, but does not verify provenance. Build those runner images from a release whose provenance you verified separately. All templates check `omg.lock` when present, then run `omg run build` and `omg run test`. The advanced Rust-only security job also runs `cargo audit` and creates CycloneDX Cargo-dependency SBOMs with `cargo-cyclonedx --all`, collecting every workspace member's output in the `security-sboms` artifact. These include transitive dependencies for the runner's host target and the project's default Cargo features; they do not describe packages installed on the CI runner or all target and feature combinations.
 
 ---
 

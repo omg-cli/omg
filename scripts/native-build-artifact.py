@@ -130,10 +130,15 @@ def validate_producer_run(run, expected):
     if expected['event'] == 'pull_request':
         require(any(row.get('number') == expected['pr_number'] for row in run.get('pull_requests', [])),
                 'producer belongs to a different pull request')
+    created = run.get('created_at')
+    require(isinstance(created, str) and
+            re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', created),
+            'invalid producer creation timestamp')
     waiting = run.get('status') in ('queued', 'requested', 'waiting', 'pending')
     require((waiting and run.get('run_started_at') is None) or
             (isinstance(run.get('run_started_at'), str) and
-             re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', run['run_started_at'])), 'invalid producer timestamp')
+             re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', run['run_started_at'])),
+            'invalid producer timestamp')
     require(run.get('conclusion') not in ('cancelled', 'timed_out', 'action_required', 'stale'),
             'producer was cancelled or did not complete normally')
 
@@ -266,13 +271,13 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
         # A started attempt may already have uploaded a native lane's output
         # while another job is waiting. Keep timestamp and byte admission intact.
         if run and run.get('run_started_at') is not None:
-            attempt = run['run_attempt']
+            current_attempt = run['run_attempt']
             listing = api_json(f'repos/{repository}/actions/runs/{selected_id}/artifacts?per_page=100')
             require(type(listing.get('total_count')) is int and listing['total_count'] <= 100,
                     'excessive producer artifact list')
             artifacts = [row for row in listing['artifacts']
-                         if row.get('name') == f'native-release-{distro}-{attempt}']
-            print(f'Native artifact lookup: run={selected_id} attempt={attempt} '
+                         if row.get('name') == f'native-release-{distro}-{current_attempt}']
+            print(f'Native artifact lookup: run={selected_id} attempt={current_attempt} '
                   f'status={run.get("status")} distro={distro} matches={len(artifacts)}', flush=True)
             require(len(artifacts) <= 1, 'ambiguous native artifact')
             if artifacts:
@@ -282,15 +287,16 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
                         and 0 < artifact['size_in_bytes'] <= MAX_DOWNLOAD
                         and artifact.get('expired') is False
                         and isinstance(artifact.get('created_at'), str)
+                        and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', artifact['created_at'])
                         and artifact['created_at'] >= run['run_started_at'], 'stale or invalid native artifact')
-                return artifact, run, expected_run, attempt
-            if attempt > 1:
+                return artifact, run, expected_run, current_attempt
+            if current_attempt > 1:
                 prior = prior_successful_artifact(repository, run, expected_run, distro,
                                                   listing['artifacts'])
                 if prior is not None:
                     artifact, producer_attempt = prior
                     print(f'Using successful native owner from attempt {producer_attempt}; '
-                          f'current attempt {attempt} did not rerun {distro}', flush=True)
+                          f'current attempt {current_attempt} did not rerun {distro}', flush=True)
                     return artifact, run, expected_run, producer_attempt
             if run.get('status') == 'completed':
                 raise ArtifactUnavailable('CI finished without the required native artifact')
@@ -302,11 +308,11 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
 def reuse(root, distro, image, features, destination, context, event, timeout=1500):
     build_command(distro, features, {})
     started = time.monotonic()
-    artifact, run, expected_run, attempt = find_native_artifact(root, distro, context, event, timeout)
-    repository, selected_id = expected_run['repository'], run['id']
+    artifact, run, expected_run, artifact_attempt = find_native_artifact(root, distro, context, event, timeout)
+    repository, selected_id, current_attempt = expected_run['repository'], run['id'], run['run_attempt']
     expected = {
         'repository': repository, 'source_sha': context['GITHUB_SHA'], 'run_id': str(selected_id),
-        'run_attempt': attempt, 'workflow_path': '.github/workflows/ci.yml',
+        'run_attempt': artifact_attempt, 'workflow_path': '.github/workflows/ci.yml',
         'distro': distro, 'image': image, 'features': sorted(features.split(',')),
         'target': 'x86_64-unknown-linux-gnu', 'profile': 'release', 'instrumentation': 'none',
         'cpu': 'x86-64-v2' if distro == 'arch' else 'generic',
@@ -317,7 +323,7 @@ def reuse(root, distro, image, features, destination, context, event, timeout=15
     provenance, files = validate_bundle(content, artifact.get('digest'), expected)
     refreshed = api_json(f'repos/{repository}/actions/runs/{selected_id}')
     validate_producer_run(refreshed, expected_run)
-    require(refreshed['id'] == selected_id and refreshed['run_attempt'] == run['run_attempt'],
+    require(refreshed['id'] == selected_id and refreshed['run_attempt'] == current_attempt,
             'producer attempt changed during download')
     destination.mkdir(parents=True, exist_ok=False)
     for name, data in files.items():

@@ -17801,7 +17801,7 @@
         }
       ]
     },
-    "35758a1d043ef2ee04179384736a60a789cf607424bcee808b4f2081a2bb6ff6": {
+    "7b2caadc35e550486706a9002805c0088d04700ece58d6a6ed3019b81a29abf1": {
       "releases": [],
       "cases": [
         {
@@ -18295,7 +18295,23 @@
           "network_scope": "offline"
         },
         {
+          "id": "audit-scan-fail-on-findings-offline",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
           "id": "audit-sbom-offline",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-sbom-inventory-only",
           "tiers": [
             "hermetic"
           ],
@@ -18869,7 +18885,7 @@
         {
           "id": "search-flags",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -19443,9 +19459,25 @@
         }
       ]
     },
-    "ffac7ff1ab4be2fba15446c2da7ffd55cb3859d05cb3ff50b8f5f5273ef77de1": {
+    "054a6932258604b8367a0addde98e96cc3b77ca45a04b0db18b407d4bb764db8": {
       "releases": [],
       "cases": [
+        {
+          "id": "audit-scan-fail-on-findings-offline",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-sbom-inventory-only",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
         {
           "id": "search",
           "tiers": [

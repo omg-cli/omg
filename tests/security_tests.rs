@@ -602,7 +602,13 @@ mod sbom_compliance {
     #[test]
     fn test_slsa_check_is_not_paywalled() {
         let project = TestProject::new();
-        let result = project.run(&["audit", "slsa", "pacman"]);
+        let result = project.run(&[
+            "audit",
+            "slsa",
+            "--certificate-identity",
+            "release@example.invalid",
+            "pacman",
+        ]);
         let output = result.combined_output();
         assert!(
             !output.contains("tier") && !output.contains("/pricing"),
