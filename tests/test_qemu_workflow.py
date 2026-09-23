@@ -109,7 +109,8 @@ class QemuWorkflowTests(unittest.TestCase):
                               ('schedule', False)]:
             with self.subTest(event=event, staged=staged), tempfile.TemporaryDirectory() as tmp:
                 result, _ = self.run_script(script, {'STAGED': str(staged).lower(),
-                    'RUNNER_TEMP': tmp, 'GITHUB_EVENT_NAME': event}, Path(tmp))
+                    'RUNNER_TEMP': tmp, 'GITHUB_EVENT_NAME': event,
+                    'QEMU_EVIDENCE_NAME': 'qemu-evidence-123-1-arch'}, Path(tmp))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 args = result.stdout.splitlines()
                 self.assertEqual('--staged-dir' in args, staged)
@@ -161,16 +162,28 @@ class ReportingIntegrationTests(unittest.TestCase):
             body = TEXT.split('\n  ' + job + ':\n', 1)[1].split('\n  #', 1)[0]
             self.assertIn('run: python3 scripts/ci-smoke-report.py configure', body)
             self.assertIn('OMG_SMOKE_SENTRY_DSN: ${{ secrets.OMG_SMOKE_SENTRY_DSN }}', body)
-            self.assertIn('find "$RUNNER_TEMP/qemu-upload" -name reporting.log', body)
+            self.assertIn('find "$RUNNER_TEMP/$QEMU_UPLOAD_NAME" -name reporting.log', body)
             self.assertNotIn('${{ env.HOME }}', body)
             # Export only bounded diagnostics: guest-owned raw state may be
             # unreadable, and failed cleanup may retain keys or disk images.
             self.assertIn('sudo -n timeout --kill-after=5s 60s python3 scripts/export-qemu-evidence.py', body)
-            self.assertIn('--source "$RUNNER_TEMP/qemu-evidence" --destination "$RUNNER_TEMP/qemu-upload"', body)
-            self.assertIn('path: ${{ runner.temp }}/qemu-upload/', body)
+            self.assertIn('--source "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME" --destination "$RUNNER_TEMP/$QEMU_UPLOAD_NAME"', body)
+            self.assertIn('path: ${{ runner.temp }}/${{ env.QEMU_UPLOAD_NAME }}/', body)
             self.assertNotIn('qemu-evidence/**/*', body)
             self.assertIn('- name: Export allowlisted guest evidence\n        if: always()', body)
-            self.assertIn('- name: Upload guest evidence\n        if: always()', body)
+            self.assertIn('- name: Upload guest evidence\n        id: upload-evidence\n        if: always()', body)
+
+    def test_guest_evidence_paths_are_unique_per_run_attempt_and_distro(self):
+        for job, distro in (('guest', 'inputs.distro'), ('guest-arm', 'matrix.distro')):
+            body = TEXT.split('\n  ' + job + ':\n', 1)[1].split('\n  #', 1)[0]
+            for name in ('QEMU_EVIDENCE_NAME', 'QEMU_UPLOAD_NAME'):
+                self.assertRegex(body, rf'{name}: qemu-(?:evidence|upload)-\$\{{\{{ github.run_id \}}\}}-\$\{{\{{ github.run_attempt \}}\}}-\$\{{\{{ {distro} \}}\}}')
+            self.assertIn('mkdir -p "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME"', body)
+            self.assertIn('--evidence-root "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME"', body)
+            self.assertIn('--evidence-root "$RUNNER_TEMP/$QEMU_UPLOAD_NAME"', body)
+            self.assertIn('id: upload-evidence', body)
+            self.assertIn("if: always() && steps.upload-evidence.outcome == 'success'", body)
+            self.assertIn('run: sudo -n rm -rf -- "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME" "$RUNNER_TEMP/$QEMU_UPLOAD_NAME"', body)
 
     def test_workflow_failure_reports_even_when_guests_never_start(self):
         body = TEXT.split('\n  summary:\n', 1)[1]
@@ -273,7 +286,7 @@ class SecurityBoundaryTests(unittest.TestCase):
         for job in ('guest', 'guest-arm'):
             body = TEXT.split('\n  ' + job + ':\n', 1)[1].split('\n  #', 1)[0]
             self.assertIn('ci-smoke-report.py verify', body)
-            self.assertIn('--evidence-root "$RUNNER_TEMP/qemu-upload"', body)
+            self.assertIn('--evidence-root "$RUNNER_TEMP/$QEMU_UPLOAD_NAME"', body)
 
 
 if __name__ == '__main__':

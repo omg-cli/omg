@@ -194,6 +194,11 @@ jobs:
     permissions:
       contents: read
       actions: read
+    # RUNNER_TEMP can retain root-owned evidence on self-hosted runners.
+    # Run-scoped names preserve the exporter's no-overwrite guarantee.
+    env:
+      QEMU_EVIDENCE_NAME: qemu-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.distro }}
+      QEMU_UPLOAD_NAME: qemu-upload-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.distro }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -206,11 +211,11 @@ jobs:
           STAGED: ${{ inputs.staged }}
           DISTRO: ${{ inputs.distro }}
         run: |
-          mkdir -p "$RUNNER_TEMP/qemu-evidence"
+          mkdir -p "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME"
           jq -n --arg revision "$GITHUB_SHA" --arg tag "$ARTIFACT_TAG" --arg staged "$STAGED" \
             --arg distro "$DISTRO" --arg arch "$(uname -m)" \
             '{harness_revision:$revision,artifact_tag:$tag,staged:($staged == "true"),distro:$distro,arch:$arch}' \
-            > "$RUNNER_TEMP/qemu-evidence/provenance.json"
+            > "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.json"
 
       - name: Prepare published release
         if: ${{ !inputs.staged }}
@@ -220,8 +225,8 @@ jobs:
           DISTRO: ${{ inputs.distro }}
         run: |
           python3 scripts/prepare-qemu-release.py --tag "$ARTIFACT_TAG" --distro "$DISTRO" --destination published
-          jq -s '.[0] + .[1]' "$RUNNER_TEMP/qemu-evidence/provenance.json" published/inventory-provenance.json > "$RUNNER_TEMP/qemu-evidence/provenance.next.json"
-          mv "$RUNNER_TEMP/qemu-evidence/provenance.next.json" "$RUNNER_TEMP/qemu-evidence/provenance.json"
+          jq -s '.[0] + .[1]' "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.json" published/inventory-provenance.json > "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.next.json"
+          mv "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.next.json" "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.json"
 
       - name: Restore pinned guest image cache
         id: image-cache
@@ -279,14 +284,14 @@ jobs:
             :
           else
             rc=$?
-            evidence="$RUNNER_TEMP/qemu-evidence/run-native-build"
+            evidence="$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/run-native-build"
             mkdir -p "$evidence"
             cp "$RUNNER_TEMP/native-build.log" "$evidence/guest-check.log"
             python3 scripts/ci-smoke-report.py status --distro "$DISTRO" --case-id "qemu-$DISTRO-lifecycle" --status failure --evidence-dir "$evidence"
             exit "$rc"
           fi
-          jq -s '.[0] + {native_build:.[1]}' "$RUNNER_TEMP/qemu-evidence/provenance.json" staged/native-build.json > "$RUNNER_TEMP/qemu-evidence/provenance.next.json"
-          mv "$RUNNER_TEMP/qemu-evidence/provenance.next.json" "$RUNNER_TEMP/qemu-evidence/provenance.json"
+          jq -s '.[0] + {native_build:.[1]}' "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.json" staged/native-build.json > "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.next.json"
+          mv "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.next.json" "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.json"
 
       - name: Benchmark harness regression checks
         run: |
@@ -301,7 +306,7 @@ jobs:
         env:
           STAGED: ${{ inputs.staged }}
         run: |
-          args=(--distro "${{ inputs.distro }}" --release "${{ inputs.tag }}" --benchmark --evidence-dir "$RUNNER_TEMP/qemu-evidence" --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json)
+          args=(--distro "${{ inputs.distro }}" --release "${{ inputs.tag }}" --benchmark --evidence-dir "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME" --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json)
           if [[ "$STAGED" == 'true' ]]; then
             args+=(--staged-dir staged --inventory-tiers "hermetic,container" --inventory-allow-mutations)
           else
@@ -331,31 +336,36 @@ jobs:
         run: |
           python3 scripts/ci-smoke-report.py ensure-failure --distro "$DISTRO" \
             --case-id "qemu-$DISTRO-lifecycle" --status "$JOB_STATUS" \
-            --evidence-root "$RUNNER_TEMP/qemu-evidence"
+            --evidence-root "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME"
 
       - name: Export allowlisted guest evidence
         if: always()
         run: |
           sudo -n timeout --kill-after=5s 60s python3 scripts/export-qemu-evidence.py \
-            --source "$RUNNER_TEMP/qemu-evidence" --destination "$RUNNER_TEMP/qemu-upload" \
+            --source "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME" --destination "$RUNNER_TEMP/$QEMU_UPLOAD_NAME" \
             --uid "$(id -u)" --gid "$(id -g)"
 
       - name: Surface Sentry delivery evidence
         if: always()
         run: |
-          if [[ -d "$RUNNER_TEMP/qemu-upload" ]]; then
-            find "$RUNNER_TEMP/qemu-upload" -name reporting.log -type f -exec cat {} +
+          if [[ -d "$RUNNER_TEMP/$QEMU_UPLOAD_NAME" ]]; then
+            find "$RUNNER_TEMP/$QEMU_UPLOAD_NAME" -name reporting.log -type f -exec cat {} +
           fi
 
       - name: Verify Sentry delivery receipts
         if: always()
-        run: python3 scripts/ci-smoke-report.py verify --evidence-root "$RUNNER_TEMP/qemu-upload"
+        run: python3 scripts/ci-smoke-report.py verify --evidence-root "$RUNNER_TEMP/$QEMU_UPLOAD_NAME"
 
       - name: Upload guest evidence
+        id: upload-evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qemu-evidence-${{ inputs.distro }}
-          path: ${{ runner.temp }}/qemu-upload/
+          path: ${{ runner.temp }}/${{ env.QEMU_UPLOAD_NAME }}/
           if-no-files-found: error
           retention-days: 30
+
+      - name: Release uploaded local evidence
+        if: always() && steps.upload-evidence.outcome == 'success'
+        run: sudo -n rm -rf -- "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME" "$RUNNER_TEMP/$QEMU_UPLOAD_NAME"
