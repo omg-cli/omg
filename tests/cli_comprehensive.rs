@@ -515,6 +515,7 @@ enum Assertion {
     UpdateFastOutput,
     UpdateTurboOutput,
     DaemonForegroundLifecycle,
+    SearchOfficialLimitThree,
 }
 
 impl Assertion {
@@ -530,6 +531,7 @@ impl Assertion {
             "update-fast-output" => Self::UpdateFastOutput,
             "update-turbo-output" => Self::UpdateTurboOutput,
             "daemon-foreground-lifecycle" => Self::DaemonForegroundLifecycle,
+            "search-official-limit-three" => Self::SearchOfficialLimitThree,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1349,7 +1351,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 }
                 Assertion::UpdateFastOutput
                 | Assertion::UpdateTurboOutput
-                | Assertion::DaemonForegroundLifecycle => {
+                | Assertion::DaemonForegroundLifecycle
+                | Assertion::SearchOfficialLimitThree => {
                     unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
             }
