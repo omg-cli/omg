@@ -237,9 +237,14 @@ jobs:
         run: python3 scripts/ci-smoke-report.py configure
 
       - name: Open KVM device permissions
-        # Grant only this runner user access; the next step verifies it.
+        # The dedicated runner already has device access. Hosted runners may
+        # still need an ACL; the next step verifies access in either case.
         run: |
-          sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+          if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+            echo "/dev/kvm is already accessible"
+          else
+            sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+          fi
 
       - name: Fail fast without KVM
         run: |
