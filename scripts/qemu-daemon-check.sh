@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run as the unprivileged guest user against the binaries in the tested archive.
-set -euo pipefail
+set -Eeuo pipefail
 # BEGIN EXPLICIT QUERY ORACLE
 check_explicit_query_outputs() {
   local expected=$1 listing=$2 count=$3 shortcut=$4 jsoncount=$5 wanted output
@@ -235,6 +235,7 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+trap 'status=$?; printf "daemon lifecycle probe failed at line %s (exit %s)\n" "$LINENO" "$status" >&2' ERR
 trap 'exit 143' TERM
 trap 'exit 130' INT
 # Independent native inventory, captured before starting either daemon mode.

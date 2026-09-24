@@ -13,6 +13,17 @@ BASH = os.environ.get('OMG_TEST_BASH') or ('C:/Program Files/Git/bin/bash.exe' i
 
 
 class DaemonContractTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'guest failure diagnostics require POSIX bash')
+    def test_silent_probe_failure_reports_its_line_and_exit(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        trap = next(line for line in source.splitlines()
+                    if line.startswith("trap 'status=$?;") and line.endswith(" ERR"))
+        result = subprocess.run(
+            [BASH, '-Eeuo', 'pipefail', '-c', trap + '\nfalse'],
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertRegex(result.stderr, r'daemon lifecycle probe failed at line [0-9]+ \(exit 1\)')
+
     @unittest.skipIf(os.name == 'nt', 'guest fault oracle requires POSIX bash')
     def test_backend_refusal_requires_product_exit_cause_and_no_success_output(self):
         source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
