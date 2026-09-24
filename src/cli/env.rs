@@ -291,10 +291,10 @@ async fn sync_lockfile_with_api_base(url_or_id: &str, root: &Path, api_base: &st
     let api_url = format!("{api_base}/gists/{gist_id}");
 
     let mut req = client.get(&api_url);
-    if api_base == "https://api.github.com" {
-        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            req = req.header("Authorization", format!("token {token}"));
-        }
+    if api_base == "https://api.github.com"
+        && let Ok(token) = std::env::var("GITHUB_TOKEN")
+    {
+        req = req.header("Authorization", format!("token {token}"));
     }
 
     let response = req.send().await?.error_for_status()?;
