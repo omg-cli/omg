@@ -776,9 +776,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n' > Makefile"
   if [[ "$assertions" == audit-source-failure || "$assertions" == sbom-source-failure ]]; then
     # DNF5 can satisfy an offline advisory query from a previous row's cache.
-    # These rows prove failure when the source is unavailable, so give each a
-    # fresh cache as well as its own network namespace.
-    remote+="; export OMG_CACHE_DIR=\"\$rowdir/audit-cache\""
+    # A daemon launched by an earlier inventory row can also answer the audit
+    # using its own warm cache and network access, bypassing this row's offline
+    # namespace. Force the direct CLI path with a fresh cache for this oracle.
+    remote+="; export OMG_CACHE_DIR=\"\$rowdir/audit-cache\" OMG_DISABLE_DAEMON=1"
   fi
   remote+="; printf '%s' $overlap_fixture > workspace-overlap.sh"
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
