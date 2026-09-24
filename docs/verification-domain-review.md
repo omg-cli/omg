@@ -296,3 +296,20 @@ flag or 95% claim is changed.
 Added reporter-main fixtures that follow API identity checks, archive parsing, result projection and the actual issue-helper invocation boundary. Current-main success must deliver both the case PASS and workflow recovery; stale-main success delivers neither. Advancing main during download preserves an observed failure but removes all recovery claims. Changing the run attempt during download aborts before any helper mutation.
 
 All 31 reporting tests pass. In-memory negative controls disabled the main-SHA guards, the post-download SHA guard, and the post-download attempt validation separately; the corresponding three behavioral assertions failed (not fixture errors). Production reporting semantics are unchanged, including PASS with a nonzero observed exit for a verified expected-rejection case. These checks protect failure history but are not additional OMG CLI behavioral coverage.
+
+## Daemon inventory request fault and recovery evidence (2026-09-23)
+
+`Explicit`, `ExplicitCount`, and `ListUpdates` have exact seeded-success
+assertions through the production server over real Unix sockets. A second
+fixture corrupts the private mock package-state file, clears caches, and
+requires each request to return its own ID, an internal-error code, and an
+operation-specific parse failure. The failed requests must preserve the
+corrupt file. Restoring the original bytes must produce the exact package
+names, count, and outdated version again, followed by checked fixture cleanup.
+
+This supports success, backend-fault, and recovery claims for these three IPC
+request variants with an injected backend. It does not prove native package
+database access, standalone `omgd` startup, all repository policies, or
+concurrent inventory requests. Those need separate evidence. The grouped
+daemon gaps for other requests remain open; the global inventory review flag
+is unchanged.

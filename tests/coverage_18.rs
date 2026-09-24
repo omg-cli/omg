@@ -368,6 +368,97 @@ async fn package_inventory_and_updates_survive_the_production_transport() -> Res
 
 #[tokio::test]
 #[serial]
+async fn inventory_requests_report_backend_corruption_and_recover_over_real_ipc() -> Result<()> {
+    let fixture = RealServerFixture::with_packages(
+        &[("git", "2.0.0"), ("firefox", "122.0.0")],
+        &[("git", "2.1.0"), ("firefox", "122.0.0")],
+    )
+    .await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("missing fixture directory")?
+        .path()
+        .join("data/mock_state_pacman.json");
+    let original = std::fs::read(&state_path)?;
+    let broken = b"{invalid mock state";
+    std::fs::write(&state_path, broken)?;
+    match request_on_wire(&fixture, Request::CacheClear { id: 730 }).await? {
+        Response::Success {
+            id: 730,
+            result: ResponseResult::Message(message),
+        } => assert_eq!(message, "cleared"),
+        other => panic!("cache clear returned {other:?}"),
+    }
+
+    for (id, request, prefix) in [
+        (
+            731,
+            Request::Explicit { id: 731 },
+            "Failed to list explicit packages:",
+        ),
+        (
+            732,
+            Request::ExplicitCount { id: 732 },
+            "Failed to count explicit packages:",
+        ),
+        (
+            733,
+            Request::ListUpdates { id: 733 },
+            "Failed to list updates:",
+        ),
+    ] {
+        match request_on_wire(&fixture, request).await? {
+            Response::Error {
+                id: response_id,
+                code: error_codes::INTERNAL_ERROR,
+                message,
+            } => {
+                assert_eq!(response_id, id);
+                assert!(message.starts_with(prefix), "{message}");
+                assert!(message.contains("failed to parse mock state"), "{message}");
+            }
+            other => panic!("corrupt backend request {id} returned {other:?}"),
+        }
+        assert_eq!(std::fs::read(&state_path)?, broken);
+    }
+
+    std::fs::write(&state_path, &original)?;
+    match request_on_wire(&fixture, Request::Explicit { id: 734 }).await? {
+        Response::Success {
+            id: 734,
+            result: ResponseResult::Explicit(mut result),
+        } => {
+            result.packages.sort();
+            assert_eq!(result.packages, ["firefox", "git"]);
+        }
+        other => panic!("recovered explicit packages returned {other:?}"),
+    }
+    match request_on_wire(&fixture, Request::ExplicitCount { id: 735 }).await? {
+        Response::Success {
+            id: 735,
+            result: ResponseResult::ExplicitCount(2),
+        } => {}
+        other => panic!("recovered explicit count returned {other:?}"),
+    }
+    match request_on_wire(&fixture, Request::ListUpdates { id: 736 }).await? {
+        Response::Success {
+            id: 736,
+            result: ResponseResult::ListUpdates(updates),
+        } => {
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].name, "git");
+            assert_eq!(updates[0].old_version, "2.0.0");
+            assert_eq!(updates[0].new_version, "2.1.0");
+        }
+        other => panic!("recovered updates returned {other:?}"),
+    }
+    assert_eq!(std::fs::read(&state_path)?, original);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
 async fn clearing_search_cache_forces_a_new_lookup_over_real_ipc() -> Result<()> {
     let fixture = RealServerFixture::new().await?;
     let baseline = metrics_probe(&fixture).await?;
