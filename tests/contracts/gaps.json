@@ -2919,7 +2919,6 @@
       "surfaces": [
         "ipc:Search",
         "ipc:Info",
-        "ipc:Status",
         "ipc:SecurityAudit",
         "ipc:CacheClear",
         "ipc:RefreshIndex",
