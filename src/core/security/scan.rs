@@ -111,9 +111,18 @@ pub async fn scan_installed(
     manager: &dyn PackageManager,
     scanner: &dyn VulnerabilitySource,
 ) -> Result<SecurityAuditResult> {
+    let log_path = crate::core::paths::data_dir().join("audit/audit.jsonl");
+    scan_installed_in(manager, scanner, &log_path).await
+}
+
+pub(crate) async fn scan_installed_in(
+    manager: &dyn PackageManager,
+    scanner: &dyn VulnerabilitySource,
+    log_path: &std::path::Path,
+) -> Result<SecurityAuditResult> {
     if let Some(native) = manager.security_audit() {
         let result = native.await?;
-        log_completed_scan(&result).await?;
+        log_completed_scan(&result, log_path).await?;
         return Ok(result);
     }
     let installed = manager
@@ -174,14 +183,14 @@ pub async fn scan_installed(
     result
         .vulnerabilities
         .sort_by(|left, right| left.0.cmp(&right.0));
-    log_completed_scan(&result).await?;
+    log_completed_scan(&result, log_path).await?;
     Ok(result)
 }
 
-async fn log_completed_scan(result: &SecurityAuditResult) -> Result<()> {
+async fn log_completed_scan(result: &SecurityAuditResult, path: &std::path::Path) -> Result<()> {
     // A successful CLI/TUI/daemon scan must not outlive its completion record.
     // Capture the destination now and keep filesystem locking/fsync off Tokio.
-    let path = crate::core::paths::data_dir().join("audit/audit.jsonl");
+    let path = path.to_path_buf();
     let description = format!(
         "Security audit completed: {} vulnerabilities found ({} high severity)",
         result.total_vulnerabilities, result.high_severity

@@ -1,6 +1,6 @@
 //! Request handlers for the daemon
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -93,6 +93,8 @@ struct PublishedIndex {
 /// Fields are visible only to the daemon subtree (`server`, worker tasks);
 /// external consumers go through `DaemonState::new` and IPC responses.
 pub struct DaemonState {
+    pub(super) audit_log_path: PathBuf,
+    pub(super) runtime_data_dir: PathBuf,
     pub(super) cache: PackageCache,
     pub(super) persistent: super::db::PersistentCache,
     pub(super) package_manager: Arc<dyn PackageManager>,
@@ -272,6 +274,7 @@ impl DaemonState {
         let (index, system_backends) = load_catalog()?;
 
         Ok(Self::from_index(
+            crate::core::paths::data_dir(),
             persistent,
             index,
             package_manager,
@@ -293,6 +296,7 @@ impl DaemonState {
     ) -> anyhow::Result<Self> {
         let persistent = Self::open_persistent_cache(data_dir)?;
         Ok(Self::from_index(
+            data_dir.to_path_buf(),
             persistent,
             index,
             package_manager,
@@ -332,6 +336,7 @@ impl DaemonState {
     }
 
     fn from_index(
+        runtime_data_dir: PathBuf,
         persistent: super::db::PersistentCache,
         index: PackageIndex,
         package_manager: Arc<dyn PackageManager>,
@@ -370,6 +375,8 @@ impl DaemonState {
 
         let background_security_scans = system_backends.is_production();
         Self {
+            audit_log_path: runtime_data_dir.join("audit/audit.jsonl"),
+            runtime_data_dir,
             cache,
             persistent,
             package_manager,
@@ -411,9 +418,10 @@ impl DaemonState {
         // Serialize background and on-demand scans so warmed package results
         // are available before another scan starts fetching the same inventory.
         let _guard = self.security_scan_lock.lock().await;
-        crate::core::security::scan::scan_installed(
+        crate::core::security::scan::scan_installed_in(
             self.package_manager.as_ref(),
             self.vulnerability_scanner.as_ref(),
+            &self.audit_log_path,
         )
         .await
     }

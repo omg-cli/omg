@@ -8,6 +8,13 @@ use crate::runtimes::{
 };
 
 pub fn resolve_active_version(runtime: &str) -> Result<Option<String>> {
+    resolve_active_version_in(runtime, None)
+}
+
+pub(crate) fn resolve_active_version_in(
+    runtime: &str,
+    data_dir: Option<&std::path::Path>,
+) -> Result<Option<String>> {
     // File-based detection (.tool-versions, .nvmrc, ...) is keyed by canonical
     // tool names ("node", "python"), so aliases such as "nodejs" or "golang"
     // must be normalized before lookup.
@@ -19,7 +26,10 @@ pub fn resolve_active_version(runtime: &str) -> Result<Option<String>> {
     if SUPPORTED_RUNTIMES.contains(&runtime.as_str())
         || crate::runtimes::tool_registry::is_registry_tool(&runtime)
     {
-        return Ok(crate::runtimes::probe_version(&runtime));
+        return Ok(match data_dir {
+            Some(data_dir) => crate::runtimes::probe_version_in(&runtime, data_dir),
+            None => crate::runtimes::probe_version(&runtime),
+        });
     }
     Ok(None)
 }
@@ -29,6 +39,13 @@ pub fn ensure_active_version(runtime: &str) -> Result<Option<String>> {
         return Ok(Some(version));
     }
     Ok(None)
+}
+
+pub(crate) fn ensure_active_version_in(
+    runtime: &str,
+    data_dir: &std::path::Path,
+) -> Result<Option<String>> {
+    resolve_active_version_in(runtime, Some(data_dir))
 }
 
 pub fn known_runtimes() -> Result<Vec<String>> {

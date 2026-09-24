@@ -855,16 +855,22 @@ static AUDIT_QUEUE: std::sync::LazyLock<std::sync::mpsc::SyncSender<QueuedAuditE
 ///
 /// Quarantines corrupt audit logs rather than permanently wedging daemon startup.
 pub fn init_audit_logger() -> Result<(), AuditError> {
-    let logger = match AuditLogger::new() {
+    init_audit_logger_in(paths::data_dir().join("audit/audit.jsonl"))
+}
+
+/// Initialize the global audit logger at a daemon state's explicit location.
+/// Isolated daemon state must not recover an ambient process data directory.
+pub(crate) fn init_audit_logger_in(log_path: impl AsRef<Path>) -> Result<(), AuditError> {
+    let log_path = log_path.as_ref();
+    let logger = match AuditLogger::new_in(log_path) {
         Ok(l) => l,
         Err(AuditError::CorruptLine { .. } | AuditError::MissingHash { .. }) => {
-            let log_path = paths::data_dir().join("audit/audit.jsonl");
-            let quarantined = quarantine_corrupt_audit_log(&log_path)?;
+            let quarantined = quarantine_corrupt_audit_log(log_path)?;
             tracing::warn!(
                 "Audit log was corrupt; quarantined to {} and started fresh log",
                 quarantined.display()
             );
-            AuditLogger::new()?
+            AuditLogger::new_in(log_path)?
         }
         Err(e) => return Err(e),
     };
@@ -906,7 +912,7 @@ fn record_global(
                 }
             }
             Err(error) => {
-                mark_audit_incomplete();
+                mark_audit_incomplete_at_or_log(&paths::data_dir().join("audit/incomplete"));
                 tracing::warn!(
                     "Audit logger unavailable, dropping event {event} for {resource}: {error}"
                 );
@@ -915,11 +921,11 @@ fn record_global(
         }
     }
     let Some(logger) = guard.as_mut() else {
-        mark_audit_incomplete();
+        mark_audit_incomplete_at_or_log(&paths::data_dir().join("audit/incomplete"));
         return;
     };
     if let Err(error) = logger.log(event, severity, resource, description) {
-        mark_audit_incomplete();
+        mark_audit_incomplete_at_or_log(&logger.log_path.with_file_name("incomplete"));
         tracing::warn!("Failed to persist audit event {event} for {resource}: {error}");
     }
 }
@@ -1917,7 +1923,19 @@ pub fn ensure_complete_collection(marker: &Path) -> anyhow::Result<()> {
 }
 
 fn mark_audit_incomplete() {
-    if let Err(error) = mark_audit_incomplete_at(&paths::data_dir().join("audit/incomplete")) {
+    let guard = AUDIT_LOGGER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let marker = guard.as_ref().map_or_else(
+        || paths::data_dir().join("audit/incomplete"),
+        |logger| logger.log_path.with_file_name("incomplete"),
+    );
+    drop(guard);
+    mark_audit_incomplete_at_or_log(&marker);
+}
+
+fn mark_audit_incomplete_at_or_log(path: &Path) {
+    if let Err(error) = mark_audit_incomplete_at(path) {
         tracing::error!("Cannot persist audit incompleteness marker: {error}");
     }
 }
@@ -1942,6 +1960,25 @@ fn mark_audit_incomplete_at(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod completeness_tests {
+    #[test]
+    #[serial_test::serial]
+    fn failed_global_append_marks_its_explicit_collection_incomplete() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let log_path = directory.path().join("audit/audit.jsonl");
+        super::init_audit_logger_in(&log_path)?;
+        std::fs::create_dir(&log_path)?;
+        super::record_global(
+            super::AuditEventType::SecurityAudit,
+            super::AuditSeverity::Error,
+            "isolated-daemon",
+            "forced append failure",
+        );
+        let marker = log_path.with_file_name("incomplete");
+        assert!(super::ensure_complete_collection(&marker).is_err());
+        *super::AUDIT_LOGGER.lock().unwrap() = None;
+        Ok(())
+    }
+
     #[test]
     fn loss_marker_survives_repeated_failures_and_refuses_verification() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
