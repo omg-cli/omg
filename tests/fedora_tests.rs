@@ -352,7 +352,7 @@ mod dnf_integration {
         let selector = format!("glibc.{}", std::env::consts::ARCH);
         let invoke = || {
             std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
-                .env("OMG_TEST_MODE", "1")
+                .env("OMG_NATIVE_TEST_DATA_DIR", "1")
                 .env("OMG_DATA_DIR", fixture.path())
                 .env("NO_COLOR", "1")
                 .args(["blame", &selector])
