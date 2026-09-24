@@ -1,13 +1,14 @@
 #![cfg(any(feature = "debian", feature = "debian-pure"))]
 #![expect(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
-//! Hermetic Debian/Ubuntu CLI integration tests.
+//! Debian/Ubuntu CLI integration tests with mixed evidence boundaries.
 //!
-//! Commands run against isolated Debian or Ubuntu mock package data and never
-//! mutate the host. Enable the extended cases with:
+//! `TestProject` fixtures keep mock package operations in isolated state, but
+//! some CLI read paths query the host Debian database. Opt-in system cases are
+//! not hermetic and belong only in disposable environments. Enable them with:
 //! `OMG_RUN_SYSTEM_TESTS=1 OMG_TEST_DISTRO=debian cargo test --locked --no-default-features --features debian-pure --test debian_tests`.
 //!
-//! Real package-system coverage lives in `scripts/debian-smoke-test.sh` and
-//! must run inside a disposable container.
+//! Real package-system mutations run in disposable Docker/QEMU owners; see
+//! `scripts/debian-smoke-test.sh` and the QEMU inventory.
 
 pub mod common;
 pub mod platform_semantics;
@@ -54,61 +55,64 @@ mod docker_integration {
 mod apt_integration {
     use super::*;
 
+    fn search_rows(project: &TestProject, query: &str) -> Vec<serde_json::Value> {
+        let result = project.run(&["search", query, "--json"]);
+        result.assert_success();
+        serde_json::from_str(result.stdout.trim()).unwrap_or_else(|error| {
+            panic!(
+                "search {query} must return a JSON array, got {}: {error}",
+                result.stdout
+            )
+        })
+    }
+
+    fn assert_search_has_package(project: &TestProject, query: &str, package: &str) {
+        let rows = search_rows(project, query);
+        assert!(
+            rows.iter().any(|row| row["name"] == package),
+            "search {query} must return the exact package {package}, got {rows:?}"
+        );
+    }
+
     #[test]
     fn test_search_main_repo() {
-        require_system_tests!();
-
-        // In Debian, firefox is often firefox-esr
-        let result = run_omg(&["search", "bash"]);
-        result.assert_success();
-        assert!(
-            result.stdout_contains("bash") || result.stdout_contains("Bash"),
-            "Should find bash"
-        );
-        assert_no_arch_terms(&result.combined_output(), "Debian search main repo");
+        let project = TestProject::for_distro("debian");
+        assert!(search_rows(&project, "bash").is_empty());
+        project
+            .mock_available("bash", "5.2.15")
+            .expect("seed Debian repository package");
+        assert_search_has_package(&project, "bash", "bash");
     }
 
     #[test]
     fn test_search_essential_packages() {
-        require_system_tests!();
-
+        let project = TestProject::for_distro("debian");
         for pkg in &["apt", "dpkg", "bash", "coreutils"] {
-            let result = run_omg(&["search", pkg]);
-            result.assert_success();
-            assert!(result.stdout_contains(pkg), "Should find {pkg}");
-            assert_debian_platform_purity(&result, "Debian search essential packages");
+            project
+                .mock_available(pkg, "1.2.3")
+                .expect("seed essential package");
+            assert_search_has_package(&project, pkg, pkg);
         }
     }
 
     #[test]
     fn test_search_development_packages() {
-        require_system_tests!();
-
+        let project = TestProject::for_distro("debian");
         for pkg in &["build-essential", "git", "curl", "wget"] {
-            let result = run_omg(&["search", pkg]);
-            result.assert_success();
-            assert!(
-                result.stdout_contains(pkg),
-                "search '{pkg}' must list the package itself. Got:\n{}",
-                result.stdout
-            );
-            assert_debian_platform_purity(&result, "Debian search development packages");
+            project
+                .mock_available(pkg, "1.2.3")
+                .expect("seed development package");
+            assert_search_has_package(&project, pkg, pkg);
         }
     }
 
     #[test]
     fn test_search_with_architecture() {
-        require_system_tests!();
-
-        // Debian packages can have architecture suffixes
-        let result = run_omg(&["search", "libc6"]);
-        result.assert_success();
-        assert!(
-            result.stdout_contains("libc6"),
-            "search libc6 must list libc6 itself. Got:\n{}",
-            result.stdout
-        );
-        assert_debian_platform_purity(&result, "Debian search architecture handling");
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_available("libc6:amd64", "2.36.0")
+            .expect("seed architecture-qualified Debian package");
+        assert_search_has_package(&project, "libc6", "libc6:amd64");
     }
 
     #[test]
@@ -161,19 +165,29 @@ mod apt_integration {
 
     #[test]
     fn test_explicit_packages() {
-        require_system_tests!();
-
-        let result = run_omg(&["explicit"]);
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("apt", "2.6.1")
+            .expect("seed explicit apt package");
+        project
+            .mock_install("dpkg", "1.21.22")
+            .expect("seed explicit dpkg package");
+        let result = project.run(&["explicit", "--json"]);
         result.assert_success();
-        // Should list manually installed packages
+        let output: serde_json::Value = serde_json::from_str(result.stdout.trim())
+            .expect("explicit --json must return a JSON object");
+        assert_eq!(output["packages"], serde_json::json!(["apt", "dpkg"]));
+        assert_eq!(output["count"], 2);
         assert_debian_platform_purity(&result, "Debian explicit list");
     }
 
     #[test]
     fn test_explicit_packages_count() {
-        require_system_tests!();
-
-        let result = run_omg(&["explicit", "--count"]);
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("apt", "2.6.1")
+            .expect("seed explicitly installed package");
+        let result = project.run(&["explicit", "--count"]);
         result.assert_success();
         assert_debian_platform_purity(&result, "Debian explicit count");
         // Contract (src/cli/packages/explicit.rs print_count): plain-text mode
@@ -182,18 +196,25 @@ mod apt_integration {
         let count: usize = stdout.parse().unwrap_or_else(|error| {
             panic!("explicit --count must print an integer, got '{stdout}': {error}")
         });
-        assert!(
-            count > 0,
-            "a real Debian system always has explicit packages"
-        );
+        assert_eq!(count, 1, "only the seeded package may be counted");
     }
 
     #[test]
     fn test_update_check() {
-        require_system_tests!();
-
-        let result = run_omg(&["update", "--check"]);
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("apt", "2.6.1")
+            .expect("seed installed apt package");
+        project
+            .mock_available("apt", "2.7.0")
+            .expect("seed newer apt package");
+        let result = project.run(&["update", "--check"]);
         result.assert_success();
+        assert!(
+            result.stdout_contains("apt") && result.stdout_contains("2.7.0"),
+            "update --check must show the newer seeded apt version, got:\n{}",
+            result.stdout
+        );
         assert!(!result.stderr_contains("panicked at"), "Should not panic");
         assert_debian_platform_purity(&result, "Debian update check");
     }
