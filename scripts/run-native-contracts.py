@@ -68,6 +68,7 @@ CLI_FAULT_TESTS = frozenset({
 
 DAEMON_TESTS = frozenset('omg::coverage_18::' + name for name in (
     'security_audit_backend_failure_cannot_report_a_clean_scan',
+    'security_audit_fetches_all_osv_pages_and_refuses_partial_results_over_real_ipc',
     'debian_search_preserves_catalog_limits_cache_and_refusal_over_real_ipc',
     'version_mismatch_gets_exact_parse_error_then_connection_closes',
     'frame_too_short_for_header_gets_parse_error_then_connection_closes',

@@ -96,7 +96,7 @@ pub struct DaemonState {
     pub(super) cache: PackageCache,
     pub(super) persistent: super::db::PersistentCache,
     pub(super) package_manager: Arc<dyn PackageManager>,
-    vulnerability_scanner: Arc<crate::core::security::vulnerability::VulnerabilityScanner>,
+    vulnerability_scanner: Arc<dyn crate::core::security::vulnerability::VulnerabilitySource>,
     security_scan_lock: tokio::sync::Mutex<()>,
     pub(super) background_security_scans: bool,
     index: RwLock<PublishedIndex>,
@@ -300,6 +300,23 @@ impl DaemonState {
             #[cfg(feature = "arch")]
             crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
         ))
+    }
+
+    /// Initialize an isolated daemon with an explicit vulnerability source.
+    /// Production construction always uses the configured native source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the persistent cache cannot be opened at `data_dir`.
+    pub fn new_isolated_with_scanner(
+        data_dir: &Path,
+        index: PackageIndex,
+        package_manager: Arc<dyn PackageManager>,
+        scanner: Arc<dyn crate::core::security::vulnerability::VulnerabilitySource>,
+    ) -> anyhow::Result<Self> {
+        let mut state = Self::new_isolated(data_dir, index, package_manager)?;
+        state.vulnerability_scanner = scanner;
+        Ok(state)
     }
 
     fn open_persistent_cache(data_dir: &Path) -> anyhow::Result<super::db::PersistentCache> {

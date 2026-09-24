@@ -22,6 +22,7 @@ pub mod common;
 
 use anyhow::{Context, Result};
 use common::*;
+use omg_lib::core::security::vulnerability::{VulnerabilityScanner, VulnerabilitySource};
 use omg_lib::daemon::handlers::DaemonState;
 use omg_lib::daemon::index::PackageIndex;
 use omg_lib::daemon::protocol::{
@@ -36,7 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::time::timeout;
 
 /// Mirror of the private `MAX_REQUEST_SIZE` in `src/daemon/server.rs`
@@ -76,6 +77,15 @@ impl RealServerFixture {
         installed: &[(&str, &str)],
         available: &[(&str, &str)],
         indexed: bool,
+    ) -> Result<Self> {
+        Self::with_catalog_and_scanner(installed, available, indexed, None).await
+    }
+
+    async fn with_catalog_and_scanner(
+        installed: &[(&str, &str)],
+        available: &[(&str, &str)],
+        indexed: bool,
+        scanner: Option<Arc<dyn VulnerabilitySource>>,
     ) -> Result<Self> {
         init_test_env();
         let temp_dir = tempfile::Builder::new()
@@ -118,7 +128,12 @@ impl RealServerFixture {
             ],
             || -> anyhow::Result<_> {
                 omg_lib::core::security::init_audit_logger()?;
-                DaemonState::new_isolated(&data_dir, index, manager)
+                match scanner {
+                    Some(scanner) => {
+                        DaemonState::new_isolated_with_scanner(&data_dir, index, manager, scanner)
+                    }
+                    None => DaemonState::new_isolated(&data_dir, index, manager),
+                }
             },
         )?);
 
@@ -1534,6 +1549,160 @@ async fn security_audit_backend_failure_cannot_report_a_clean_scan() -> Result<(
             );
         }
     }
+    assert_eq!(
+        metrics_probe(&fixture).await?.security_audit_requests - baseline.security_audit_requests,
+        3
+    );
+    assert_eq!(std::fs::read(&state_path)?, original);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn security_audit_fetches_all_osv_pages_and_refuses_partial_results_over_real_ipc()
+-> Result<()> {
+    async fn read_query(stream: &mut tokio::net::TcpStream) -> Result<serde_json::Value> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            if let Some(start) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break start + 4;
+            }
+            anyhow::ensure!(
+                bytes.len() < 16 * 1024,
+                "OSV request header exceeded fixture bound"
+            );
+            let count = stream.read(&mut chunk).await?;
+            anyhow::ensure!(count > 0, "OSV request ended before its headers");
+            bytes.extend_from_slice(&chunk[..count]);
+        };
+        let headers = std::str::from_utf8(&bytes[..header_end])?;
+        anyhow::ensure!(
+            headers.starts_with("POST /v1/query HTTP/1.1\r\n"),
+            "unexpected OSV request: {headers}"
+        );
+        let body_len: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>())
+            })
+            .context("OSV request omitted Content-Length")??;
+        anyhow::ensure!(
+            body_len <= 16 * 1024,
+            "OSV request body exceeded fixture bound"
+        );
+        while bytes.len() - header_end < body_len {
+            let count = stream.read(&mut chunk).await?;
+            anyhow::ensure!(count > 0, "OSV request ended before its JSON body");
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        Ok(serde_json::from_slice(
+            &bytes[header_end..header_end + body_len],
+        )?)
+    }
+
+    let package = format!("audit-ipc-{}", uuid::Uuid::new_v4().simple());
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/v1/query", listener.local_addr()?);
+    let scanner: Arc<dyn VulnerabilitySource> = Arc::new(VulnerabilityScanner::with_osv_endpoint(
+        endpoint,
+        "Debian:12".into(),
+    ));
+    let expected_package = package.clone();
+    let osv_server = tokio::spawn(async move {
+        let first = r#"{"vulns":[{"id":"CVE-high","summary":"high fixture","severity":[{"score":"8.0"},{"score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}],"next_page_token":"page-two"}"#;
+        let empty = r#"{"vulns":[],"next_page_token":"page-three"}"#;
+        let last = r#"{"vulns":[{"id":"CVE-medium","summary":"medium fixture","severity":[{"score":"5.0"}]}]}"#;
+        for (token, status, body) in [
+            (None, "200 OK", first),
+            (Some("page-two"), "503 Service Unavailable", ""),
+            (None, "200 OK", first),
+            (Some("page-two"), "200 OK", empty),
+            (Some("page-three"), "200 OK", last),
+        ] {
+            let (mut stream, _) = timeout(Duration::from_secs(10), listener.accept()).await??;
+            let query = read_query(&mut stream).await?;
+            assert_eq!(query["package"]["name"], expected_package);
+            assert_eq!(query["package"]["ecosystem"], "Debian:12");
+            assert_eq!(query["version"], "1.0.0");
+            assert_eq!(
+                query.get("page_token").and_then(|value| value.as_str()),
+                token
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).await?;
+        }
+        anyhow::Ok(())
+    });
+
+    let fixture = RealServerFixture::with_catalog_and_scanner(
+        &[(package.as_str(), "1.0.0")],
+        &[],
+        false,
+        Some(scanner),
+    )
+    .await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("fixture directory")?
+        .path()
+        .join("data/mock_state_pacman.json");
+    let original = std::fs::read(&state_path)?;
+    let baseline = metrics_probe(&fixture).await?;
+    match request_on_wire(&fixture, Request::SecurityAudit { id: 9300 }).await? {
+        Response::Error { id, code, message } => {
+            assert_eq!(id, 9300);
+            assert_eq!(code, error_codes::INTERNAL_ERROR);
+            assert_eq!(
+                message,
+                format!(
+                    "Failed to scan package {package} for vulnerabilities: OSV vulnerability database returned an error status"
+                )
+            );
+        }
+        other @ Response::Success { .. } => {
+            anyhow::bail!("partial OSV pages produced a successful audit: {other:?}")
+        }
+    }
+    assert_eq!(std::fs::read(&state_path)?, original);
+
+    for id in [9301, 9302] {
+        match request_on_wire(&fixture, Request::SecurityAudit { id }).await? {
+            Response::Success {
+                id: actual,
+                result: ResponseResult::SecurityAudit(result),
+            } => {
+                assert_eq!(actual, id);
+                assert_eq!(result.total_vulnerabilities, 2);
+                assert_eq!(result.high_severity, 1);
+                assert_eq!(result.vulnerabilities.len(), 1);
+                let (name, findings) = &result.vulnerabilities[0];
+                assert_eq!(name, &package);
+                assert_eq!(findings.len(), 2);
+                assert_eq!(
+                    (findings[0].id.as_str(), findings[0].score.as_deref()),
+                    ("CVE-high", Some("9.8"))
+                );
+                assert_eq!(
+                    (findings[1].id.as_str(), findings[1].score.as_deref()),
+                    ("CVE-medium", Some("5"))
+                );
+                for finding in findings {
+                    assert_eq!(finding.affected_installed.len(), 1);
+                    assert_eq!(finding.affected_installed[0].name, package);
+                    assert_eq!(finding.affected_installed[0].version, "1.0.0");
+                }
+            }
+            other => anyhow::bail!("complete OSV audit returned {other:?}"),
+        }
+    }
+    timeout(Duration::from_secs(10), osv_server).await???;
     assert_eq!(
         metrics_probe(&fixture).await?.security_audit_requests - baseline.security_audit_requests,
         3
