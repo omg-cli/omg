@@ -678,8 +678,6 @@ mod dnf_integration {
 
     #[tokio::test]
     async fn test_search_common_package() {
-        require_system_tests!();
-
         let pm = DnfPackageManager::new();
 
         let results = pm.search("vim").await.unwrap();
@@ -691,17 +689,9 @@ mod dnf_integration {
         );
     }
 
-    /// Searches shell out to the host's dnf/rpm, so they require a real
-    /// Fedora-class system just like the other dnf_integration tests.
+    /// A missing name must stay absent when repository search is available.
     #[tokio::test]
     async fn test_search_nonexistent_package() -> Result<()> {
-        // Gate inline (instead of require_system_tests!, whose `return;` is
-        // incompatible with this test's Result signature).
-        if common::TestConfig::default().skip_if_no_system("dnf_search_nonexistent") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
-        }
-
         let pm = DnfPackageManager::new();
 
         let results = pm.search("nonexistent-package-xyz-12345").await?;
@@ -713,8 +703,6 @@ mod dnf_integration {
 
     #[tokio::test]
     async fn test_list_installed_packages() {
-        require_system_tests!();
-
         let pm = DnfPackageManager::new();
 
         let installed = pm.list_installed().await.unwrap();
@@ -722,6 +710,14 @@ mod dnf_integration {
         assert!(
             !installed.is_empty(),
             "Should have installed packages on Fedora system"
+        );
+        assert!(
+            installed.iter().any(|package| package.name == "bash"),
+            "RPM inventory must include the installed bash package"
+        );
+        assert!(
+            installed.iter().all(|package| package.installed),
+            "installed inventory must not contain available-only packages"
         );
     }
 
@@ -758,14 +754,18 @@ mod dnf_integration {
 
     #[tokio::test]
     async fn test_is_installed_check() {
-        require_system_tests!();
-
         let pm = DnfPackageManager::new();
 
         let is_bash_installed = pm.is_installed("bash").await.unwrap();
         assert!(
             is_bash_installed,
             "bash should be installed on Fedora system"
+        );
+        assert!(
+            !pm.is_installed("omg-no-such-package-xyz-12345")
+                .await
+                .unwrap(),
+            "unknown package must not be reported as installed"
         );
     }
 }
@@ -775,8 +775,6 @@ mod dnf_rpm_database {
 
     #[tokio::test]
     async fn test_rpm_database_query() {
-        require_system_tests!();
-
         let pm = DnfPackageManager::new();
 
         let installed = pm.list_installed().await.unwrap();
@@ -786,7 +784,7 @@ mod dnf_rpm_database {
             "Should read packages from RPM database"
         );
 
-        let has_rpm = installed.iter().any(|p| p.name.contains("rpm"));
+        let has_rpm = installed.iter().any(|p| p.name == "rpm" && p.installed);
         assert!(has_rpm, "Should find rpm package itself in database");
     }
 }

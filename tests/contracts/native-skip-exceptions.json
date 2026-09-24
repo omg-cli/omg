@@ -387,20 +387,6 @@
       ]
     },
     {
-      "test_id": "omg::fedora_tests::dnf_integration::test_is_installed_check",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_integration::test_list_installed_packages",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
       "test_id": "omg::fedora_tests::dnf_integration::test_list_updates",
       "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
       "platforms": [
@@ -408,28 +394,7 @@
       ]
     },
     {
-      "test_id": "omg::fedora_tests::dnf_integration::test_search_common_package",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_integration::test_search_nonexistent_package",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
       "test_id": "omg::fedora_tests::dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_rpm_database::test_rpm_database_query",
       "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
       "platforms": [
         "fedora"
