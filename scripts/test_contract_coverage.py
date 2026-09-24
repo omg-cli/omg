@@ -60,6 +60,62 @@ def fixture():
 
 
 class ContractAdmission(unittest.TestCase):
+    def test_native_owner_union_requires_every_reviewed_contract(self):
+        manifest, surfaces, receipts, provenance, required = fixture()
+        manifest['gaps'][0]['missing'] = ['help']
+        manifest['behavioral_inventory_reviewed'] = True
+        provenance['lane'] = 'native-cli-fixture'
+        manifest['contracts'][0]['tests'][0]['lane'] = 'native-cli-fixture'
+        receipts[0]['lane'] = 'native-cli-fixture'
+        report = COVERAGE.admit(manifest, surfaces, receipts, provenance, required)
+        admission = (provenance, report, required)
+        aggregate = COVERAGE.aggregate_admissions(manifest, [admission])
+        self.assertEqual(aggregate['contracts'], {'supported': 1, 'selected': 1, 'passed': 1})
+        self.assertEqual(aggregate['behavioral_progress']['covered'], 1)
+        self.assertTrue(aggregate['behavioral_progress']['target_met'])
+
+        with self.assertRaisesRegex(ValueError, 'missing contract owner'):
+            COVERAGE.aggregate_admissions(manifest, [])
+        with self.assertRaisesRegex(ValueError, 'duplicate lane'):
+            COVERAGE.aggregate_admissions(manifest, [admission, admission])
+        foreign = copy.deepcopy(provenance)
+        foreign['source_sha'] = 'f' * 40
+        with self.assertRaisesRegex(ValueError, 'source identity mismatch'):
+            COVERAGE.aggregate_admissions(manifest, [admission, (foreign, report, required)])
+
+    def test_native_owner_union_does_not_hide_retry_or_unreviewed_inventory(self):
+        manifest, surfaces, receipts, provenance, required = fixture()
+        manifest['gaps'][0]['missing'] = ['help']
+        provenance['lane'] = 'native-cli-fixture'
+        manifest['contracts'][0]['tests'][0]['lane'] = 'native-cli-fixture'
+        receipts[0]['lane'] = 'native-cli-fixture'
+        report = COVERAGE.admit(manifest, surfaces, receipts, provenance, required)
+        aggregate = COVERAGE.aggregate_admissions(manifest, [(provenance, report, required)])
+        self.assertFalse(aggregate['behavioral_progress']['target_met'])
+        retried = copy.deepcopy(report)
+        retried['counts']['retried'] = 1
+        with self.assertRaisesRegex(ValueError, 'retry'):
+            COVERAGE.aggregate_admissions(manifest, [(provenance, retried, required)])
+
+    def test_future_qemu_owner_is_visible_but_not_claimed_by_native_union(self):
+        manifest, surfaces, receipts, provenance, required = fixture()
+        manifest['gaps'][0]['missing'] = ['help']
+        manifest['behavioral_inventory_reviewed'] = True
+        provenance['lane'] = 'native-cli-fixture'
+        manifest['contracts'][0]['tests'][0]['lane'] = 'native-cli-fixture'
+        receipts[0]['lane'] = 'native-cli-fixture'
+        report = COVERAGE.admit(manifest, surfaces, receipts, provenance, required)
+        qemu = copy.deepcopy(manifest['contracts'][0])
+        qemu['id'] = 'omg.install.dry-run.qemu'
+        qemu['tests'][0]['lane'] = 'qemu'
+        qemu['tests'][0]['id'] = 'qemu-install-dry-run-state'
+        manifest['contracts'].append(qemu)
+        report = COVERAGE.admit(manifest, surfaces, receipts, provenance, required)
+        combined = COVERAGE.aggregate_admissions(manifest, [(provenance, report, required)])
+        self.assertEqual(combined['contracts'], {'supported': 2, 'selected': 1, 'passed': 1})
+        self.assertEqual(combined['behavioral_progress']['covered'], 0)
+        self.assertFalse(combined['behavioral_progress']['target_met'])
+
     def test_behavioral_progress_keeps_unmapped_and_partial_surfaces_uncovered(self):
         report = COVERAGE.admit(*fixture())
         progress = report['behavioral_progress']

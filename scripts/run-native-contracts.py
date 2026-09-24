@@ -285,7 +285,7 @@ def main():
     try:
         for name in ('recipe.json', 'list.json', 'provenance.json', 'junit.xml',
                      'selection.json', 'receipts.json', 'required.json', 'coverage.json',
-                     'admission-error.json'):
+                     'aggregate.json', 'admission-error.json'):
             (evidence / name).unlink(missing_ok=True)
         source = command_output(['git', 'rev-parse', 'HEAD'])
         require(source == os.environ['OMG_CONTRACT_SOURCE_SHA'], 'checkout source mismatch')
@@ -376,6 +376,7 @@ def main():
         write_json(evidence / 'coverage.json', report)
         summary = COVERAGE.render_markdown(report)
         passed = report['passed']
+        admissions = [(provenance, report, required)]
         if behavior_paths:
             require(all(sha256_file(path) == behavior_hashes[name]
                         for name, path in behavior_paths.items()), 'behavior executable changed during execution')
@@ -397,6 +398,7 @@ def main():
             write_json(behavior_directory / 'coverage.json', behavior_report)
             summary += '\n' + COVERAGE.render_markdown(behavior_report)
             passed = passed and behavior_report['passed']
+            admissions.append((behavior_provenance, behavior_report, behavior_required))
         service_provenance = daemon_provenance(provenance, recipe, daemon_path, daemon_hash)
         write_json(daemon_directory / 'provenance.json', service_provenance)
         daemon_rows, daemon_required = behavior_receipts(manifest, service_provenance, execution)
@@ -408,6 +410,16 @@ def main():
         write_json(daemon_directory / 'coverage.json', daemon_report)
         summary += '\n' + COVERAGE.render_markdown(daemon_report)
         passed = passed and daemon_report['passed']
+        admissions.append((service_provenance, daemon_report, daemon_required))
+        if passed:
+            aggregate = COVERAGE.aggregate_admissions(manifest, admissions)
+            write_json(evidence / 'aggregate.json', aggregate)
+            progress = aggregate['behavioral_progress']
+            summary += (f"\nNative owner union: {aggregate['contracts']['passed']}/"
+                        f"{aggregate['contracts']['supported']} reviewed contracts passed; "
+                        f"fully evidenced behavioral surfaces {progress['covered']}/"
+                        f"{progress['supported']}. Inventory review: "
+                        f"{'complete' if progress['inventory_reviewed'] else 'incomplete'}.\n")
         print(summary)
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as stream:

@@ -16,6 +16,7 @@ MAX_BYTES = 8 * 1024 * 1024
 KINDS = frozenset(('parser', 'help', 'refusal', 'success', 'state', 'fault', 'concurrency'))
 IDENTITY = ('source_sha', 'run_id', 'run_attempt', 'recipe_sha256',
             'platform', 'os', 'arch', 'features', 'lane')
+NATIVE_LANES = frozenset(('native-parser', 'native-cli-fixture', 'native-daemon-fixture'))
 
 
 def require(condition, message):
@@ -362,6 +363,60 @@ def behavioral_progress(contracts, gaps, passed_contracts, *, inventory_reviewed
             'percent': round(100 * len(covered) / total, 2) if total else None,
             'target_percent': 95,
             'target_met': bool(inventory_reviewed and total and len(covered) * 100 >= total * 95)}
+
+
+def aggregate_admissions(manifest, admissions):
+    """Combine already admitted owners from one run without merging their subjects.
+
+    Each lane retains its own executable and recipe identity. Only source, run,
+    platform, architecture and feature selection must agree across lanes.
+    """
+    schema(manifest)
+    require(isinstance(admissions, list), 'invalid admissions')
+    if not admissions:
+        raise ValueError('missing contract owner')
+    baseline = admissions[0][0]
+    shared = ('source_sha', 'run_id', 'run_attempt', 'platform', 'os', 'arch')
+    relevant = {record['id']: record for record in manifest['contracts'] if applies(record, baseline)}
+    expected = {}
+    for identity, contract in relevant.items():
+        for binding in contract['tests']:
+            if binding['lane'] in NATIVE_LANES:
+                expected.setdefault(binding['lane'], set()).add(identity)
+    observed = {}
+    for provenance, report, required in admissions:
+        require(all(provenance.get(key) == baseline.get(key) for key in shared)
+                and strings(provenance.get('features'), empty=True)
+                == strings(baseline.get('features'), empty=True), 'source identity mismatch')
+        lane = provenance.get('lane')
+        require(text(lane) and lane not in observed, 'duplicate lane')
+        selected = strings(required)
+        require(selected == expected.get(lane, set()), 'contract owner selection mismatch')
+        require(report.get('source_sha') == provenance['source_sha']
+                and report.get('platform') == provenance['platform']
+                and report.get('lane') == lane, 'admission identity mismatch')
+        counts = report.get('counts')
+        require(isinstance(counts, dict) and counts.get('supported') == len(relevant)
+                and counts.get('required') == len(selected)
+                and counts.get('passed') == len(selected)
+                and counts.get('failed') == 0 and counts.get('skipped') == 0
+                and report.get('passed') is True, 'incomplete owner admission')
+        require(counts.get('retried') == 0, 'retry cannot certify aggregate coverage')
+        observed[lane] = selected
+    require(set(observed) == set(expected), 'missing contract owner')
+    active_gaps = [gap for gap in expand_gaps(manifest.get('gaps', [])) if applies(gap, baseline)]
+    selected = set().union(*observed.values())
+    passed_contracts = {identity for identity in selected
+                        if all(binding['lane'] in observed for binding in relevant[identity]['tests'])}
+    progress = behavioral_progress(relevant, active_gaps, passed_contracts,
+                                   inventory_reviewed=manifest.get('behavioral_inventory_reviewed') is True)
+    progress['scope'] = 'admitted-native-owner-union'
+    return {'schema_version': 1, 'source_sha': baseline['source_sha'],
+            'platform': baseline['platform'], 'run_id': baseline['run_id'],
+            'run_attempt': baseline['run_attempt'], 'lanes': sorted(observed),
+            'contracts': {'supported': len(relevant), 'selected': len(selected),
+                          'passed': len(passed_contracts)},
+            'behavioral_progress': progress, 'passed': True}
 
 
 def render_markdown(report):
