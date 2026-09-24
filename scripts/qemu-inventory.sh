@@ -62,6 +62,31 @@ check_native_counter() {
   [[ "$actual" =~ ^[0-9]+$ && "$actual" == "$expected" ]]
 }
 
+check_native_tree_state() {
+  local distro=$1 expected=$2 tree_binary=${3:-/usr/bin/tree} installed=false
+  case "$distro" in
+    arch) pacman -Q tree >/dev/null 2>&1 && installed=true ;;
+    debian|ubuntu)
+      [[ $(dpkg-query -W '-f=${Status}' tree 2>/dev/null) == 'install ok installed' ]] && installed=true ;;
+    fedora) rpm -q tree >/dev/null 2>&1 && installed=true ;;
+    *) printf 'assertion failed: unknown package backend %s\n' "$distro" >&2; return 1 ;;
+  esac
+  if [[ "$expected" == installed ]]; then
+    if [[ "$installed" != true || ! -x "$tree_binary" ]] || ! "$tree_binary" --version >/dev/null 2>&1; then
+      printf 'assertion failed: native %s database or executable lacks installed tree\n' "$distro" >&2
+      return 1
+    fi
+  elif [[ "$expected" == absent ]]; then
+    if [[ "$installed" == true || -e "$tree_binary" || -L "$tree_binary" ]]; then
+      printf 'assertion failed: native %s database or executable still contains tree\n' "$distro" >&2
+      return 1
+    fi
+  else
+    printf 'assertion failed: unknown expected tree state %s\n' "$expected" >&2
+    return 1
+  fi
+}
+
 check_go_install() (
   local version=$1 base expected active executable fixture observed status
   base="$OMG_DATA_DIR/versions/go"
@@ -353,6 +378,10 @@ check_product_output() {
         if ! jq -e -s 'length == 1' "$stdout" >/dev/null 2>&1; then
           printf 'assertion failed: stdout is not exactly one JSON document\n' >&2; return 1
         fi ;;
+      native-tree-installed|native-tree-absent)
+        local expected=installed
+        [[ "$assertion" == native-tree-installed ]] || expected=absent
+        check_native_tree_state "$distro" "$expected" || return 1 ;;
       search-official-limit-three)
         if ! awk '
           /^  \| Search$/ { headings++; next }
@@ -575,7 +604,9 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three) ;; *) exit 2 ;; esac
+  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|native-tree-installed|native-tree-absent) ;; *) exit 2 ;; esac
+  if [[ "$a" == native-tree-installed ]]; then [[ "$id" == release-package-install-tree ]] || exit 2; fi
+  if [[ "$a" == native-tree-absent ]]; then [[ "$id" == release-package-remove-tree ]] || exit 2; fi
   case "$cleanup" in tempdir-drop|none|container-prune|host-state-restore|vm-revert|daemon-stop) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
@@ -703,6 +734,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')
   remote+="; status_file=\$(mktemp \"\$HOME/inventory-status.XXXXXX\"); trap 'rm -f \"\$status_file\"' EXIT"
   remote+="; run_omg() { local deadline=\$1; shift; execution_phase=executor; rc=0; timeout --kill-after=5s \"\$deadline\" bash -c $supervisor _ \"\$@\" 3>\"\$status_file\" || rc=\$?; if [ \"\$rc\" = 0 ]; then if IFS= read -r rc < \"\$status_file\"; then execution_phase=product; else rc=125; fi; fi; }"
+  if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree ]]; then
+    remote+="; $(declare -f check_native_tree_state)"
+  fi
+  if [[ "$case" == release-package-install-tree ]]; then
+    remote+="; if ! check_native_tree_state '$distro' absent; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+  fi
   for p in "${chain[@]}"; do
     pargs=$(quote_args "${row_args[$p]}")
     remote+="; run_omg '$row_timeout' $quoted_binary $pargs > '$p.prereq.log' 2> '$p.prereq.stderr.log'"

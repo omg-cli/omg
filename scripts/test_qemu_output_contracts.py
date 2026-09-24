@@ -391,11 +391,13 @@ esac
         self.assertEqual([row['result'] for row in evidence], ['PASS', 'FAIL', 'BLOCKED'])
         self.assertIn('regular JSON document', logs['refuse.log'])
 
-    def run_oracle(self, safety='read', assertion='-', code=0, stdout='', stderr='', artifact=None, hooks=None, distro='arch'):
+    def run_oracle(self, safety='read', assertion='-', code=0, stdout='', stderr='', artifact=None, hooks=None, distro='arch', tree_oracle_status=None):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('# BEGIN PRODUCT OUTPUT ORACLE')
         end = source.index('# END PRODUCT OUTPUT ORACLE', begin)
         function = source[begin:end]
+        if tree_oracle_status is not None:
+            function += f'\ncheck_native_tree_state() {{ return {tree_oracle_status}; }}\n'
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'stdout').write_text(stdout, encoding='utf-8', newline='\n')
@@ -420,6 +422,46 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('help', result.stderr)
         self.assertEqual(self.run_oracle(safety='help-boundary', stdout='Usage: omg search\n').returncode, 0)
+
+    def test_package_rows_bind_native_state_to_success(self):
+        for assertion in ('native-tree-installed', 'native-tree-absent'):
+            self.assertEqual(self.run_oracle(assertion=assertion, tree_oracle_status=0).returncode, 0)
+            self.assertNotEqual(self.run_oracle(assertion=assertion, tree_oracle_status=1).returncode, 0)
+
+    @unittest.skipIf(os.name == 'nt', 'Native package oracle fixtures require POSIX executables')
+    def test_native_tree_state_requires_database_and_payload_parity(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        function = source[source.index('check_native_tree_state() {'):source.index('check_go_install() (')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / 'commands'
+            commands.mkdir()
+            for name in ('pacman', 'dpkg-query', 'rpm'):
+                manager = commands / name
+                manager.write_text('#!/bin/sh\n[ "$OMG_TEST_PRESENT" = 1 ] || exit 1\n'
+                                   'printf "install ok installed"\n', encoding='utf-8')
+                manager.chmod(0o755)
+            tree = root / 'tree'
+            tree.write_text('#!/bin/sh\n[ "$1" = --version ] && echo "tree v2"\n', encoding='utf-8')
+            tree.chmod(0o755)
+            for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+                for present, payload, expected, accepted in (
+                    ('0', False, 'absent', True), ('0', False, 'installed', False),
+                    ('1', True, 'installed', True), ('1', True, 'absent', False),
+                    ('1', False, 'installed', False), ('0', True, 'absent', False)):
+                    with self.subTest(distro=distro, present=present, payload=payload, expected=expected):
+                        if not payload:
+                            tree.unlink(missing_ok=True)
+                        elif not tree.exists():
+                            tree.write_text('#!/bin/sh\n[ "$1" = --version ] && echo "tree v2"\n', encoding='utf-8')
+                            tree.chmod(0o755)
+                        environment = dict(os.environ, OMG_TEST_PRESENT=present,
+                                           PATH=str(commands) + os.pathsep + os.environ['PATH'])
+                        result = subprocess.run(
+                            [shutil.which('bash'), '-c', function + '\ncheck_native_tree_state "$@"',
+                             '_', distro, expected, str(tree)],
+                            env=environment, capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode == 0, accepted, result.stderr)
 
     def test_offline_sbom_requires_advisory_source_failure(self):
         prefix = 'Error: Failed to generate system SBOM: Failed to generate a complete security SBOM: '

@@ -518,6 +518,8 @@ enum Assertion {
     UpdateTurboOutput,
     DaemonForegroundLifecycle,
     SearchOfficialLimitThree,
+    NativeTreeInstalled,
+    NativeTreeAbsent,
 }
 
 impl Assertion {
@@ -536,6 +538,8 @@ impl Assertion {
             "update-turbo-output" => Self::UpdateTurboOutput,
             "daemon-foreground-lifecycle" => Self::DaemonForegroundLifecycle,
             "search-official-limit-three" => Self::SearchOfficialLimitThree,
+            "native-tree-installed" => Self::NativeTreeInstalled,
+            "native-tree-absent" => Self::NativeTreeAbsent,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1382,7 +1386,9 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 Assertion::UpdateFastOutput
                 | Assertion::UpdateTurboOutput
                 | Assertion::DaemonForegroundLifecycle
-                | Assertion::SearchOfficialLimitThree => {
+                | Assertion::SearchOfficialLimitThree
+                | Assertion::NativeTreeInstalled
+                | Assertion::NativeTreeAbsent => {
                     unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
             }
