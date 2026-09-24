@@ -32,6 +32,7 @@ class TestSelection(unittest.TestCase):
                                                passed=1, failed=0, skipped=1, filtered=0, retried=0))
         self.assertEqual(report['tests']['omg::cli_surface::parser']['attempts'],
                          [{'result': 'PASS', 'duration_ms': 1.0}])
+        self.assertEqual(report['tests']['omg::cli_surface::parser']['selection_state'], 'selected')
 
     def test_missing_native_binary_and_cfg_empty_binary_are_rejected(self):
         for mode in ('missing', 'empty', 'filtered'):

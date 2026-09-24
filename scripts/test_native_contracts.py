@@ -47,28 +47,51 @@ class WholeSuiteAdmission(unittest.TestCase):
         execution = NATIVE.SELECTION.reconcile(listing, xml, [binary])
         self.assertEqual(execution['counts']['selected'], 1)
         self.assertEqual(execution['counts']['skipped'], 1)
-        self.assertEqual(NATIVE.admission_exit_code(0, execution, True), 1)
+        with self.assertRaisesRegex(ValueError, 'unexplained selected native test skip'):
+            NATIVE.admission_exit_code(0, execution, True)
 
     def test_only_named_and_explained_host_skips_can_leave_native_contracts_green(self):
         known = 'omg::cli::self_update::tests::elevated_verifier_rejects_another_users_helper'
         reason = 'elevated verifier ownership test requires root'
         execution = {'counts': {'selected': 2, 'passed': 1, 'failed': 0, 'retried': 0},
-                     'tests': {known: {'runtime_skip': True, 'runtime_skip_reason': reason,
+                     'tests': {known: {'selection_state': 'selected', 'runtime_skip': True,
+                                       'runtime_skip_reason': reason,
                                        'attempts': [{'result': 'SKIPPED'}]}}}
-        if os.name == 'posix' and os.geteuid() != 0:
-            self.assertEqual(NATIVE.admission_exit_code(0, execution, True), 0)
-            self.assertEqual(NATIVE.explained_runtime_skips(execution),
-                             [{'test_id': known, 'reason': reason}])
-        for mutation in ('unknown-id', 'wrong-reason', 'unexpected-pass'):
-            invalid = copy.deepcopy(execution)
-            if mutation == 'unknown-id':
-                invalid['tests']['omg::unknown'] = invalid['tests'].pop(known)
-            elif mutation == 'wrong-reason':
-                invalid['tests'][known]['runtime_skip_reason'] = 'unexpected environment failure'
-            else:
-                invalid['counts']['passed'] = 2
-            with self.subTest(mutation=mutation):
-                self.assertEqual(NATIVE.admission_exit_code(0, invalid, True), 1)
+        with patch.dict(os.environ, {'OMG_CONTRACT_PLATFORM': 'portable'}):
+            if os.name == 'posix' and os.geteuid() != 0:
+                self.assertEqual(NATIVE.admission_exit_code(0, execution, True), 0)
+                self.assertEqual(NATIVE.explained_runtime_skips(execution),
+                                 [{'test_id': known, 'reason': reason}])
+            for mutation in ('unknown-id', 'wrong-reason', 'unexpected-pass'):
+                invalid = copy.deepcopy(execution)
+                if mutation == 'unknown-id':
+                    invalid['tests']['omg::unknown'] = invalid['tests'].pop(known)
+                elif mutation == 'wrong-reason':
+                    invalid['tests'][known]['runtime_skip_reason'] = 'unexpected environment failure'
+                else:
+                    invalid['counts']['passed'] = 2
+                with self.subTest(mutation=mutation):
+                    if mutation == 'unexpected-pass':
+                        self.assertEqual(NATIVE.admission_exit_code(0, invalid, True), 1)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'unexplained native runtime skip'):
+                            NATIVE.admission_exit_code(0, invalid, True)
+
+    def test_ignored_known_skip_cannot_offset_unexplained_selected_skip(self):
+        known = 'omg::e2e_runtime_management::test_use_node_lts'
+        execution = {'counts': {'selected': 2, 'passed': 1, 'failed': 0, 'retried': 0},
+                     'tests': {
+                         known: {'selection_state': 'ignored', 'runtime_skip': True,
+                                 'runtime_skip_reason': NATIVE.NETWORK_SKIP_REASON,
+                                 'attempts': [{'result': 'SKIPPED'}]},
+                         'omg::selected::unexpected': {'selection_state': 'selected',
+                                                       'runtime_skip': False,
+                                                       'runtime_skip_reason': None,
+                                                       'attempts': [{'result': 'SKIPPED'}]},
+                     }}
+        with patch.dict(os.environ, {'OMG_CONTRACT_PLATFORM': 'portable'}):
+            with self.assertRaisesRegex(ValueError, 'unselected native runtime skip marker'):
+                NATIVE.admission_exit_code(0, execution, True)
 
 
 @unittest.skipUnless(os.name == 'posix' and shutil.which('runuser'), 'requires Linux runuser')

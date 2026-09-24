@@ -117,6 +117,8 @@ def reconcile(listing, xml, required_binaries):
     selected = {identity for identity, case in tests.items() if case['state'] == 'selected'}
     require(set(observed) <= set(tests), 'foreign execution')
     require(selected <= set(observed), 'missing selected execution')
+    for identity, result in observed.items():
+        result['selection_state'] = tests[identity]['state']
     executed_binaries = set()
     counts = dict(discovered=len(tests), selected=len(selected), executed=0, passed=0,
                   failed=0, skipped=0, filtered=0, retried=0)

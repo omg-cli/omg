@@ -24,15 +24,7 @@ COVERAGE = SELECTION.COVERAGE
 require = COVERAGE.require
 
 NETWORK_SKIP_REASON = 'network tests disabled (set OMG_RUN_NETWORK_TESTS=1)'
-EXPLAINED_SKIP_REASONS = {
-    **{'omg::e2e_runtime_management::' + name: NETWORK_SKIP_REASON for name in (
-        'test_list_available_versions', 'test_use_node_latest', 'test_use_node_lts',
-        'test_use_node_with_version', 'test_use_python_with_version')},
-    'omg::cli::self_update::tests::attestation_ignores_path_hijacked_gh':
-        'PATH impostor test requires a host without a trusted gh binary',
-    'omg::cli::self_update::tests::elevated_verifier_rejects_another_users_helper':
-        'elevated verifier ownership test requires root',
-}
+SYSTEM_SKIP_REASON = 'system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)'
 
 
 BEHAVIOR_TESTS = frozenset({
@@ -275,21 +267,51 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n', encoding='utf-8')
 
 
+def native_skip_policy():
+    document = COVERAGE.read_json(Path(__file__).resolve().parents[1]
+                                  / 'tests/contracts/native-skip-exceptions.json')
+    require(isinstance(document, dict) and type(document.get('schema_version')) is int
+            and document['schema_version'] == 1
+            and isinstance(document.get('exceptions'), list), 'invalid native skip policy')
+    policy = {}
+    for row in document['exceptions']:
+        require(isinstance(row, dict) and set(row) == {'test_id', 'reason', 'platforms'}
+                and COVERAGE.text(row['test_id']) and COVERAGE.text(row['reason'])
+                and len(row['reason']) <= 200 and row['test_id'] not in policy,
+                'invalid or duplicate native skip exception')
+        platforms = COVERAGE.strings(row['platforms'])
+        policy[row['test_id']] = (row['reason'], platforms)
+    return policy
+
+
 def explained_runtime_skips(execution):
+    policy = native_skip_policy()
+    platform_id = os.environ.get('OMG_CONTRACT_PLATFORM')
     approved = []
     for identity, test in execution['tests'].items():
         if not test['runtime_skip']:
             continue
+        require(test['selection_state'] == 'selected',
+                'unselected native runtime skip marker: ' + identity)
         reason = test.get('runtime_skip_reason')
-        require(reason == EXPLAINED_SKIP_REASONS.get(identity)
+        expected = policy.get(identity)
+        require(expected is not None and reason == expected[0]
+                and platform_id in expected[1]
                 and [attempt['result'] for attempt in test['attempts']] == ['SKIPPED'],
                 'unexplained native runtime skip: ' + identity)
         require(reason != NETWORK_SKIP_REASON or os.environ.get('OMG_RUN_NETWORK_TESTS') != '1',
                 'network test skipped despite network opt-in: ' + identity)
+        require(reason != SYSTEM_SKIP_REASON or os.environ.get('OMG_RUN_SYSTEM_TESTS') != '1',
+                'system test skipped despite system opt-in: ' + identity)
         require(reason != 'elevated verifier ownership test requires root'
                 or not hasattr(os, 'geteuid') or os.geteuid() != 0,
                 'root-only test skipped on root runner: ' + identity)
         approved.append({'test_id': identity, 'reason': reason})
+    selected_skipped = {identity for identity, test in execution['tests'].items()
+                        if test['selection_state'] == 'selected'
+                        and any(attempt['result'] == 'SKIPPED' for attempt in test['attempts'])}
+    require({row['test_id'] for row in approved} == selected_skipped,
+            'unexplained selected native test skip')
     return sorted(approved, key=lambda row: row['test_id'])
 
 
@@ -298,10 +320,7 @@ def admission_exit_code(process_status, execution, contracts_passed):
     # failure remains fatal. Known host/network skips are recorded but never
     # become passing tests or contract evidence.
     counts = execution['counts']
-    try:
-        skips = explained_runtime_skips(execution)
-    except (ValueError, KeyError):
-        return 1
+    skips = explained_runtime_skips(execution)
     return int(bool(process_status or counts['failed'] or counts['retried']
                     or counts['passed'] + len(skips) != counts['selected']
                     or not contracts_passed))

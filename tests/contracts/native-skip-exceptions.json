@@ -1,0 +1,509 @@
+{
+  "schema_version": 1,
+  "exceptions": [
+    {
+      "test_id": "omg::cli::self_update::tests::attestation_ignores_path_hijacked_gh",
+      "reason": "PATH impostor test requires a host without a trusted gh binary",
+      "platforms": [
+        "debian-pure",
+        "portable",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::cli::self_update::tests::elevated_verifier_rejects_another_users_helper",
+      "reason": "elevated verifier ownership test requires root",
+      "platforms": [
+        "debian-pure",
+        "macos",
+        "portable",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::core::task_runner::tests::resolve_nvm_alias_unreadable_fails_closed",
+      "reason": "current user can read mode-000 alias; permission denial not exercised",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_clean_orphans",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_explicit_packages",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_explicit_packages_count",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_info_installed_package",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_info_package_details",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_install_remove_cycle",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_search_development_packages",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_search_essential_packages",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_search_main_repo",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_search_with_architecture",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_size_integration",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_update_check",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::apt_integration::test_why_integration",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::debian_specific::test_debian_backports_awareness",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::debian_specific::test_debian_security_repo",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::debian_specific::test_debian_stable_packages",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::new_features::test_blame_command",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::new_features::test_outdated_command",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::new_features::test_outdated_json_output",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::new_features::test_size_command",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::new_features::test_size_with_limit",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::new_features::test_why_command",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::new_features::test_why_reverse_dependencies",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::runtime_management::test_list_available_node",
+      "reason": "network tests disabled (set OMG_RUN_NETWORK_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::runtime_management::test_list_available_python",
+      "reason": "network tests disabled (set OMG_RUN_NETWORK_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::security::test_audit_sbom_generation",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::security::test_audit_scan_is_not_paywalled",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::security::test_gpg_verification_awareness",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::ubuntu_specific::test_ubuntu_main_repo",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::debian_tests::ubuntu_specific::test_ubuntu_universe_repo",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::e2e_runtime_management::test_list_available_versions",
+      "reason": "network tests disabled (set OMG_RUN_NETWORK_TESTS=1)",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "fedora",
+        "macos",
+        "portable",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::e2e_runtime_management::test_use_node_latest",
+      "reason": "network tests disabled (set OMG_RUN_NETWORK_TESTS=1)",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "fedora",
+        "macos",
+        "portable",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::e2e_runtime_management::test_use_node_lts",
+      "reason": "network tests disabled (set OMG_RUN_NETWORK_TESTS=1)",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "fedora",
+        "macos",
+        "portable",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::e2e_runtime_management::test_use_node_with_version",
+      "reason": "network tests disabled (set OMG_RUN_NETWORK_TESTS=1)",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "fedora",
+        "macos",
+        "portable",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::e2e_runtime_management::test_use_python_with_version",
+      "reason": "network tests disabled (set OMG_RUN_NETWORK_TESTS=1)",
+      "platforms": [
+        "arch",
+        "debian",
+        "debian-pure",
+        "debian-trixie",
+        "fedora",
+        "macos",
+        "portable",
+        "ubuntu"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::blame_cli_uses_native_details_and_canonical_omg_history",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::cleanup_preview_preserves_installed_packages",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::explicit_cli_matches_native_backend_without_a_daemon",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::installed_metadata_does_not_hide_excluded_packages",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::native_history_honors_custom_and_disabled_service_history",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::native_transactions_record_install_remove_and_ignore_noops",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::repository_lookup_finds_tree_before_installation",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::size_cli_matches_native_installed_packages",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::test_is_installed_check",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::test_list_installed_packages",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::test_list_updates",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::test_search_common_package",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::test_search_nonexistent_package",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    },
+    {
+      "test_id": "omg::fedora_tests::dnf_rpm_database::test_rpm_database_query",
+      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "platforms": [
+        "fedora"
+      ]
+    }
+  ]
+}
