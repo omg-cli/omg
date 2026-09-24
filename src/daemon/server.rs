@@ -18,9 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::handlers::{DaemonState, handle_request};
 use super::protocol::{Request, Response, error_codes};
 use crate::core::metrics::GLOBAL_METRICS;
-use crate::core::security::{
-    AuditEventType, AuditSeverity, audit_log_nonblocking, init_audit_logger,
-};
+use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
 
 /// Request handling timeout (30 seconds should be sufficient for most operations)
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -114,7 +112,7 @@ pub async fn run(
     state: Arc<DaemonState>,
     socket_path: PathBuf,
 ) -> Result<()> {
-    init_audit_logger()?;
+    crate::core::security::audit::init_audit_logger_in(&state.audit_log_path)?;
     let fast_status_path = socket_path.with_file_name("omg.status");
     run_with_status_path(listener, state, socket_path, fast_status_path).await
 }
@@ -175,14 +173,15 @@ async fn run_with_status_path(
             if shutdown.is_cancelled() {
                 return;
             }
-            let versions = match tokio::task::spawn_blocking(|| {
-                use crate::cli::runtimes::{ensure_active_version, known_runtimes};
+            let data_dir = state.runtime_data_dir.clone();
+            let versions = match tokio::task::spawn_blocking(move || {
+                use crate::cli::runtimes::{ensure_active_version_in, known_runtimes};
 
                 let mut versions = Vec::new();
                 match known_runtimes() {
                     Ok(runtimes) => {
                         for runtime in runtimes {
-                            match ensure_active_version(&runtime) {
+                            match ensure_active_version_in(&runtime, &data_dir) {
                                 Ok(Some(v)) => versions.push((runtime, v)),
                                 Ok(None) => {}
                                 Err(error) => tracing::warn!(
@@ -485,13 +484,20 @@ async fn run_with_status_path(
         Duration::from_secs(30),
     )
     .await;
+    let audit_result = crate::core::security::audit::drain_audit_queue().await;
     if intake_result.is_err()
         && let Err(error) = &shutdown_result
     {
         tracing::error!("Additional daemon shutdown failure: {error:#}");
     }
+    if (intake_result.is_err() || shutdown_result.is_err())
+        && let Err(error) = &audit_result
+    {
+        tracing::error!("Additional audit drain failure: {error:#}");
+    }
     intake_result?;
     shutdown_result?;
+    audit_result?;
     if internal_failure.is_none() {
         internal_failure = internal_failure_rx.try_recv().ok();
     }

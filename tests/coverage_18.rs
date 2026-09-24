@@ -153,8 +153,18 @@ impl RealServerFixture {
             server: Some(server),
         };
         // A bound socket alone does not prove the accept loop or signal
-        // listeners have been polled. Require a real production response.
+        // listeners have been polled. Require a real production response and
+        // the background worker's first completed status publication. A
+        // swallowed worker panic must not make this fixture appear healthy.
         metrics_probe(&fixture).await?;
+        let status_path = fixture.socket_path.with_file_name("omg.status");
+        timeout(READ_TIMEOUT, async {
+            while !status_path.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("daemon did not publish initial fast status")?;
         Ok(fixture)
     }
 

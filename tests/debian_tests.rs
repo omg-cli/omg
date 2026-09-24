@@ -906,7 +906,18 @@ mod runtime_management {
 
         let result = project.run(&["use", "python"]);
         result.assert_success();
-        // Should detect version from .python-version
+        assert!(
+            result.stdout_contains("Detected version 3.11.0 from file"),
+            "the project pin must select the requested Python version"
+        );
+        let mock_runtime = project
+            .data_dir
+            .path()
+            .join("versions/python/3.11.0/.omg-test-mock");
+        assert!(
+            mock_runtime.is_file(),
+            "synthetic Python runtime must remain inside the isolated test data directory"
+        );
     }
 
     #[test]

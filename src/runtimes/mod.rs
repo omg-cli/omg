@@ -65,5 +65,10 @@ pub(crate) fn resolve_version_request(names: &[String], requested: &str) -> Stri
 /// missing or external targets are not reported as active.
 #[must_use]
 pub(crate) fn probe_version(runtime: &str) -> Option<String> {
-    common::get_current_version(&DATA_DIR.join("versions").join(runtime))
+    probe_version_in(runtime, &DATA_DIR)
+}
+
+#[must_use]
+pub(crate) fn probe_version_in(runtime: &str, data_dir: &std::path::Path) -> Option<String> {
+    common::get_current_version(&data_dir.join("versions").join(runtime))
 }

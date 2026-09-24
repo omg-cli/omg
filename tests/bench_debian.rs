@@ -160,6 +160,7 @@ fn bench_debian_deterministic_matrix() {
         [
             ("OMG_TEST_MODE", Some("true")),
             ("OMG_TEST_DISTRO", Some("debian")),
+            ("OMG_DATA_DIR", Some(temp_path.as_str())),
             ("OMG_DAEMON_DATA_DIR", Some(temp_path.as_str())),
         ],
         || {

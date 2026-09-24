@@ -18,6 +18,7 @@ fn test_daemon_initialization_debian_mock() {
         [
             ("OMG_TEST_MODE", Some("true")),
             ("OMG_TEST_DISTRO", Some("debian")),
+            ("OMG_DATA_DIR", Some(temp_path.as_str())),
             ("OMG_DAEMON_DATA_DIR", Some(temp_path.as_str())),
         ],
         DaemonState::new,
@@ -46,6 +47,7 @@ async fn test_handle_debian_search() {
         [
             ("OMG_TEST_MODE", Some("true")),
             ("OMG_TEST_DISTRO", Some("debian")),
+            ("OMG_DATA_DIR", Some(temp_path.as_str())),
             ("OMG_DAEMON_DATA_DIR", Some(temp_path.as_str())),
         ],
         DaemonState::new,
