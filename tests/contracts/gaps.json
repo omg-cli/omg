@@ -3007,17 +3007,13 @@
         "refusal"
       ],
       "surfaces": [
-        "omg env export",
         "omg env export --all-commands",
         "omg env export --json",
         "omg env export --quiet",
-        "omg env export --source-target",
         "omg env export --verbose",
-        "omg env plan",
         "omg env plan --all-commands",
         "omg env plan --json",
         "omg env plan --quiet",
-        "omg env plan --target",
         "omg env plan --verbose"
       ]
     },

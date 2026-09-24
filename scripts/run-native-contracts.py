@@ -48,6 +48,8 @@ BEHAVIOR_TESTS = frozenset({
         'list_rejects_duplicate_json_flags_and_reports_backend_errors_once',
         'every_runtime_uninstall_preserves_active_siblings_and_external_state')) | frozenset(
     'omg::env_lockfile_integrity::' + name for name in (
+        'env_export_preserves_lock_and_maps_only_the_declared_source_target',
+        'env_plan_reports_exact_target_intent_without_writing_or_applying_it',
         'snapshot_index_access_failures_never_report_empty_or_delete_saved_state',
         'capture_records_every_registered_runtime_and_check_detects_its_drift',
         'snapshot_restores_installed_php_offline_without_replacing_its_payload',
@@ -56,6 +58,8 @@ BEHAVIOR_TESTS = frozenset({
 
 
 CLI_FAULT_TESTS = frozenset({
+    'omg::env_lockfile_integrity::env_export_preserves_lock_and_maps_only_the_declared_source_target',
+    'omg::env_lockfile_integrity::env_plan_reports_exact_target_intent_without_writing_or_applying_it',
     'omg::cli_comprehensive::system_tests::config_access_errors_never_report_missing_or_valid_defaults',
     'omg::cli_comprehensive::system_tests::config_reset_preserves_backup_and_refuses_backup_failure',
     'omg::cli_comprehensive::system_tests::config_values_round_trip_and_rejected_writes_preserve_state',

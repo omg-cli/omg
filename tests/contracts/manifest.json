@@ -1246,6 +1246,94 @@
       ]
     },
     {
+      "id": "omg.environment.export.portable.fixture",
+      "source": "src/cli/env.rs",
+      "binary": "omg",
+      "surface": "omg env export",
+      "platforms": ["portable", "debian-pure", "arch", "debian", "debian-trixie", "ubuntu", "fedora", "macos"],
+      "requires": ["success", "state", "refusal", "fault"],
+      "critical": true,
+      "assertions": {
+        "success": ["export-is-parseable-toml-with-exact-source-tools-runtimes-and-packages"],
+        "state": ["export-preserves-lockfile-and-creates-no-project-file"],
+        "refusal": ["unsupported-source-target-fails"],
+        "fault": ["symlinked-lockfile-refused-with-external-bytes-preserved"]
+      },
+      "scope": "Real debug CLI with a valid isolated lockfile; verifies declared-source mapping and read-only behavior. Does not assert package versions or remote Gist operations; not native package transactions.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::env_lockfile_integrity::env_export_preserves_lock_and_maps_only_the_declared_source_target",
+        "evidence": ["success", "state", "refusal", "fault"],
+        "assertions": ["export-is-parseable-toml-with-exact-source-tools-runtimes-and-packages", "export-preserves-lockfile-and-creates-no-project-file", "unsupported-source-target-fails", "symlinked-lockfile-refused-with-external-bytes-preserved", "fixture-cleanup"]
+      }]
+    },
+    {
+      "id": "omg.environment.export.source-target.fixture",
+      "source": "src/cli/env.rs",
+      "binary": "omg",
+      "surface": "omg env export --source-target",
+      "platforms": ["portable", "debian-pure", "arch", "debian", "debian-trixie", "ubuntu", "fedora", "macos"],
+      "requires": ["success", "state", "refusal", "fault"],
+      "critical": true,
+      "assertions": {
+        "success": ["explicit-source-target-maps-only-declared-platform"],
+        "state": ["export-preserves-lockfile-and-creates-no-project-file"],
+        "refusal": ["unsupported-source-target-fails"],
+        "fault": ["symlinked-lockfile-refused-with-external-bytes-preserved"]
+      },
+      "scope": "Real debug CLI exercises the explicit --source-target flag and rejects unsupported values; other global flags remain gaps. This is not native package transactions.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::env_lockfile_integrity::env_export_preserves_lock_and_maps_only_the_declared_source_target",
+        "evidence": ["success", "state", "refusal", "fault"],
+        "assertions": ["explicit-source-target-maps-only-declared-platform", "export-preserves-lockfile-and-creates-no-project-file", "unsupported-source-target-fails", "symlinked-lockfile-refused-with-external-bytes-preserved", "fixture-cleanup"]
+      }]
+    },
+    {
+      "id": "omg.environment.plan.portable.fixture",
+      "source": "src/cli/env.rs",
+      "binary": "omg",
+      "surface": "omg env plan",
+      "platforms": ["portable", "debian-pure", "arch", "debian", "debian-trixie", "ubuntu", "fedora", "macos"],
+      "requires": ["success", "state", "refusal", "fault"],
+      "critical": true,
+      "assertions": {
+        "success": ["plan-json-has-exact-target-packages-unmapped-tools-runtimes-and-dotfiles"],
+        "state": ["plan-preserves-manifest-lockfile-and-project-contents"],
+        "refusal": ["unsupported-target-and-traversal-refused"],
+        "fault": ["symlinked-manifest-refused-with-external-bytes-preserved"]
+      },
+      "scope": "Real debug CLI with an isolated portable manifest; validates a read-only intent preview, not installation or package availability and not native package transactions.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::env_lockfile_integrity::env_plan_reports_exact_target_intent_without_writing_or_applying_it",
+        "evidence": ["success", "state", "refusal", "fault"],
+        "assertions": ["plan-json-has-exact-target-packages-unmapped-tools-runtimes-and-dotfiles", "plan-preserves-manifest-lockfile-and-project-contents", "unsupported-target-and-traversal-refused", "symlinked-manifest-refused-with-external-bytes-preserved", "fixture-cleanup"]
+      }]
+    },
+    {
+      "id": "omg.environment.plan.target.fixture",
+      "source": "src/cli/env.rs",
+      "binary": "omg",
+      "surface": "omg env plan --target",
+      "platforms": ["portable", "debian-pure", "arch", "debian", "debian-trixie", "ubuntu", "fedora", "macos"],
+      "requires": ["success", "state", "refusal", "fault"],
+      "critical": true,
+      "assertions": {
+        "success": ["explicit-target-selects-only-its-package-map"],
+        "state": ["plan-preserves-manifest-lockfile-and-project-contents"],
+        "refusal": ["unsupported-target-and-traversal-refused"],
+        "fault": ["symlinked-manifest-refused-with-external-bytes-preserved"]
+      },
+      "scope": "Real debug CLI exercises the explicit --target flag and rejects unsupported targets; other global flags remain gaps. This is not native package transactions.",
+      "tests": [{
+        "lane": "native-cli-fixture",
+        "id": "omg::env_lockfile_integrity::env_plan_reports_exact_target_intent_without_writing_or_applying_it",
+        "evidence": ["success", "state", "refusal", "fault"],
+        "assertions": ["explicit-target-selects-only-its-package-map", "plan-preserves-manifest-lockfile-and-project-contents", "unsupported-target-and-traversal-refused", "symlinked-manifest-refused-with-external-bytes-preserved", "fixture-cleanup"]
+      }]
+    },
+    {
       "id": "omg.environment.capture-registry.fixture",
       "source": "src/core/env/fingerprint.rs",
       "binary": "omg",
