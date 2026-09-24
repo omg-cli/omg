@@ -64,10 +64,6 @@ mod dnf_integration {
 
     #[tokio::test]
     async fn explicit_cli_matches_native_backend_without_a_daemon() -> Result<()> {
-        if common::TestConfig::default().skip_if_no_system("dnf_explicit_cli") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
-        }
         let mut expected = DnfPackageManager::new().list_explicit().await?;
         expected.sort();
         expected.dedup();
@@ -97,10 +93,6 @@ mod dnf_integration {
 
     #[test]
     fn size_cli_matches_native_installed_packages() -> Result<()> {
-        if common::TestConfig::default().skip_if_no_system("dnf_size_cli") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
-        }
         let before = std::process::Command::new("rpm")
             .args([
                 "-qa",
@@ -137,6 +129,7 @@ mod dnf_integration {
             cursor += top[cursor..].find(name).expect("ranked native identity") + name.len();
         }
         assert!(top.contains(&format!("Number of Packages: {}", packages.len())));
+        let selector = format!("glibc.{}", std::env::consts::ARCH);
         let providers = std::process::Command::new("dnf")
             .args([
                 "--setopt=disable_excludes=*",
@@ -145,7 +138,7 @@ mod dnf_integration {
                 "--providers-of=requires",
                 "--qf",
                 "%{full_nevra}\n",
-                "glibc",
+                &selector,
             ])
             .output()?;
         assert!(providers.status.success());
@@ -153,7 +146,7 @@ mod dnf_integration {
         let root = std::process::Command::new("rpm")
             .args([
                 "-q",
-                "glibc",
+                &selector,
                 "--qf",
                 "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n",
             ])
@@ -165,7 +158,7 @@ mod dnf_integration {
         let tree = std::process::Command::new(binary)
             .env("NO_COLOR", "1")
             .env("LC_ALL", "C")
-            .args(["size", "--tree", "glibc", "--limit", "10000"])
+            .args(["size", "--tree", &selector, "--limit", "10000"])
             .output()?;
         assert!(
             tree.status.success(),
@@ -203,11 +196,6 @@ mod dnf_integration {
     #[test]
     fn installed_metadata_does_not_hide_excluded_packages() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
-
-        if common::TestConfig::default().skip_if_no_system("dnf_installed_metadata_exclusions") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
-        }
         let cache = dirs::cache_dir().expect("user cache directory");
         std::fs::create_dir_all(&cache)?;
         let fixture = tempfile::tempdir_in(cache)?;
@@ -267,10 +255,6 @@ mod dnf_integration {
 
     #[test]
     fn why_cli_matches_native_reasons_and_reverse_requirements() -> Result<()> {
-        if common::TestConfig::default().skip_if_no_system("dnf_why_cli") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
-        }
         let selector = format!("glibc.{}", std::env::consts::ARCH);
         #[expect(
             clippy::literal_string_with_formatting_args,
@@ -362,17 +346,13 @@ mod dnf_integration {
     #[test]
     fn blame_cli_uses_native_details_and_canonical_omg_history() -> Result<()> {
         use omg_lib::core::history::{HistoryManager, PackageChange, Transaction, TransactionType};
-
-        if common::TestConfig::default().skip_if_no_system("dnf_blame_cli") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
-        }
-        let cache = dirs::cache_dir().expect("user cache directory");
-        std::fs::create_dir_all(&cache)?;
-        let fixture = tempfile::tempdir_in(cache)?;
+        let fixture = tempfile::Builder::new()
+            .prefix("omg-fedora-blame-")
+            .tempdir_in("/tmp")?;
         let selector = format!("glibc.{}", std::env::consts::ARCH);
         let invoke = || {
             std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+                .env("OMG_TEST_MODE", "1")
                 .env("OMG_DATA_DIR", fixture.path())
                 .env("NO_COLOR", "1")
                 .args(["blame", &selector])
@@ -646,10 +626,6 @@ mod dnf_integration {
 
     #[tokio::test]
     async fn cleanup_preview_preserves_installed_packages() -> Result<()> {
-        if common::TestConfig::default().skip_if_no_system("dnf_cleanup_preview") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
-        }
         let snapshot = || -> Result<Vec<String>> {
             let output = std::process::Command::new("rpm")
                 .args(["-qa", "--qf", "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n"])

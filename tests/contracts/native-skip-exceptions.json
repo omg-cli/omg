@@ -331,34 +331,6 @@
       ]
     },
     {
-      "test_id": "omg::fedora_tests::dnf_integration::blame_cli_uses_native_details_and_canonical_omg_history",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_integration::cleanup_preview_preserves_installed_packages",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_integration::explicit_cli_matches_native_backend_without_a_daemon",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_integration::installed_metadata_does_not_hide_excluded_packages",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
       "test_id": "omg::fedora_tests::dnf_integration::native_history_honors_custom_and_disabled_service_history",
       "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
       "platforms": [
@@ -380,21 +352,7 @@
       ]
     },
     {
-      "test_id": "omg::fedora_tests::dnf_integration::size_cli_matches_native_installed_packages",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
       "test_id": "omg::fedora_tests::dnf_integration::test_list_updates",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements",
       "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
       "platforms": [
         "fedora"
