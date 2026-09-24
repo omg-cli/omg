@@ -69,14 +69,14 @@ workflow grants `omgci` access to this device when needed; it requires
 sudo apt-get update
 sudo apt-get install -y acl
 command -v setfacl
-sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+sudo setfacl -m u:omgci:rw /dev/kvm
 ```
 
 Before registration, verify these from PowerShell:
 
 ```powershell
-wsl.exe --distribution Ubuntu-24.04 --exec bash -lc 'id; docker info --format "{{.ServerVersion}}"; test ! -e /mnt/c/Users; sudo -n true'
-wsl.exe --distribution Ubuntu-24.04 --exec python3 -c 'import fcntl,os; f=os.open("/dev/kvm",os.O_RDWR); print(fcntl.ioctl(f,0xAE00,0)); os.close(f)'
+wsl.exe --distribution Ubuntu-24.04 --user omgci --exec bash -lc 'test "$(id -un)" = omgci; docker info --format "{{.ServerVersion}}"; test ! -e /mnt/c/Users; sudo -n true'
+wsl.exe --distribution Ubuntu-24.04 --user omgci --exec python3 -c 'import fcntl,os; f=os.open("/dev/kvm",os.O_RDWR); print(fcntl.ioctl(f,0xAE00,0)); os.close(f)'
 ```
 
 The KVM API check must print `12`. Download the current x64 Linux runner from

@@ -245,6 +245,10 @@ jobs:
         # The dedicated runner already has device access. Hosted runners may
         # still need an ACL; the next step verifies access in either case.
         run: |
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::/dev/kvm is missing on this runner; refusing TCG fallback"
+            exit 1
+          fi
           if [[ -r /dev/kvm && -w /dev/kvm ]]; then
             echo "/dev/kvm is already accessible"
           else
