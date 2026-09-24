@@ -23,6 +23,9 @@ SPEC.loader.exec_module(SELECTION)
 COVERAGE = SELECTION.COVERAGE
 require = COVERAGE.require
 
+NETWORK_SKIP_REASON = 'network tests disabled (set OMG_RUN_NETWORK_TESTS=1)'
+SYSTEM_SKIP_REASON = 'system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)'
+
 
 BEHAVIOR_TESTS = frozenset({
     'omg::cli_comprehensive::system_tests::config_access_errors_never_report_missing_or_valid_defaults',
@@ -264,10 +267,63 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n', encoding='utf-8')
 
 
+def native_skip_policy():
+    document = COVERAGE.read_json(Path(__file__).resolve().parents[1]
+                                  / 'tests/contracts/native-skip-exceptions.json')
+    require(isinstance(document, dict) and type(document.get('schema_version')) is int
+            and document['schema_version'] == 1
+            and isinstance(document.get('exceptions'), list), 'invalid native skip policy')
+    policy = {}
+    for row in document['exceptions']:
+        require(isinstance(row, dict) and set(row) == {'test_id', 'reason', 'platforms'}
+                and COVERAGE.text(row['test_id']) and COVERAGE.text(row['reason'])
+                and len(row['reason']) <= 200 and row['test_id'] not in policy,
+                'invalid or duplicate native skip exception')
+        platforms = COVERAGE.strings(row['platforms'])
+        policy[row['test_id']] = (row['reason'], platforms)
+    return policy
+
+
+def explained_runtime_skips(execution):
+    policy = native_skip_policy()
+    platform_id = os.environ.get('OMG_CONTRACT_PLATFORM')
+    approved = []
+    for identity, test in execution['tests'].items():
+        if not test['runtime_skip']:
+            continue
+        require(test['selection_state'] == 'selected',
+                'unselected native runtime skip marker: ' + identity)
+        reason = test.get('runtime_skip_reason')
+        expected = policy.get(identity)
+        require(expected is not None and reason == expected[0]
+                and platform_id in expected[1]
+                and [attempt['result'] for attempt in test['attempts']] == ['SKIPPED'],
+                'unexplained native runtime skip: ' + identity)
+        require(reason != NETWORK_SKIP_REASON or os.environ.get('OMG_RUN_NETWORK_TESTS') != '1',
+                'network test skipped despite network opt-in: ' + identity)
+        require(reason != SYSTEM_SKIP_REASON or os.environ.get('OMG_RUN_SYSTEM_TESTS') != '1',
+                'system test skipped despite system opt-in: ' + identity)
+        require(reason != 'elevated verifier ownership test requires root'
+                or not hasattr(os, 'geteuid') or os.geteuid() != 0,
+                'root-only test skipped on root runner: ' + identity)
+        approved.append({'test_id': identity, 'reason': reason})
+    selected_skipped = {identity for identity, test in execution['tests'].items()
+                        if test['selection_state'] == 'selected'
+                        and any(attempt['result'] == 'SKIPPED' for attempt in test['attempts'])}
+    require({row['test_id'] for row in approved} == selected_skipped,
+            'unexplained selected native test skip')
+    return sorted(approved, key=lambda row: row['test_id'])
+
+
 def admission_exit_code(process_status, execution, contracts_passed):
     # Nextest may accept a later attempt, but every selected test's first
-    # failure remains fatal, even before that test owns a reviewed contract.
-    return int(bool(process_status or execution['counts']['failed'] or not contracts_passed))
+    # failure remains fatal. Known host/network skips are recorded but never
+    # become passing tests or contract evidence.
+    counts = execution['counts']
+    skips = explained_runtime_skips(execution)
+    return int(bool(process_status or counts['failed'] or counts['retried']
+                    or counts['passed'] + len(skips) != counts['selected']
+                    or not contracts_passed))
 
 
 def command_output(argv):
@@ -285,7 +341,7 @@ def main():
     try:
         for name in ('recipe.json', 'list.json', 'provenance.json', 'junit.xml',
                      'selection.json', 'receipts.json', 'required.json', 'coverage.json',
-                     'admission-error.json'):
+                     'aggregate.json', 'admission-error.json'):
             (evidence / name).unlink(missing_ok=True)
         source = command_output(['git', 'rev-parse', 'HEAD'])
         require(source == os.environ['OMG_CONTRACT_SOURCE_SHA'], 'checkout source mismatch')
@@ -376,6 +432,7 @@ def main():
         write_json(evidence / 'coverage.json', report)
         summary = COVERAGE.render_markdown(report)
         passed = report['passed']
+        admissions = [(provenance, report, required)]
         if behavior_paths:
             require(all(sha256_file(path) == behavior_hashes[name]
                         for name, path in behavior_paths.items()), 'behavior executable changed during execution')
@@ -397,6 +454,7 @@ def main():
             write_json(behavior_directory / 'coverage.json', behavior_report)
             summary += '\n' + COVERAGE.render_markdown(behavior_report)
             passed = passed and behavior_report['passed']
+            admissions.append((behavior_provenance, behavior_report, behavior_required))
         service_provenance = daemon_provenance(provenance, recipe, daemon_path, daemon_hash)
         write_json(daemon_directory / 'provenance.json', service_provenance)
         daemon_rows, daemon_required = behavior_receipts(manifest, service_provenance, execution)
@@ -408,11 +466,30 @@ def main():
         write_json(daemon_directory / 'coverage.json', daemon_report)
         summary += '\n' + COVERAGE.render_markdown(daemon_report)
         passed = passed and daemon_report['passed']
+        admissions.append((service_provenance, daemon_report, daemon_required))
+        verdict = admission_exit_code(result.returncode, execution, passed)
+        if verdict == 0:
+            aggregate = COVERAGE.aggregate_admissions(manifest, admissions)
+            aggregate['selected_tests'] = {
+                'selected': execution['counts']['selected'],
+                'passed': execution['counts']['passed'],
+                'explained_skips': explained_runtime_skips(execution),
+            }
+            write_json(evidence / 'aggregate.json', aggregate)
+            progress = aggregate['behavioral_progress']
+            summary += (f"\nNative owner union: {aggregate['contracts']['passed']}/"
+                        f"{aggregate['contracts']['supported']} reviewed contracts passed; "
+                        f"fully evidenced behavioral surfaces {progress['covered']}/"
+                        f"{progress['supported']}. Inventory review: "
+                        f"{'complete' if progress['inventory_reviewed'] else 'incomplete'}.\n")
+            skips = aggregate['selected_tests']['explained_skips']
+            summary += f"Selected native tests: {execution['counts']['passed']} passed, {len(skips)} explained skips.\n"
+            summary += ''.join(f"- Not credited: `{row['test_id']}` ({row['reason']})\n" for row in skips)
         print(summary)
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as stream:
                 stream.write(summary)
-        return admission_exit_code(result.returncode, execution, passed)
+        return verdict
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
         write_json(evidence / 'admission-error.json', {'schema_version': 1, 'error': str(error)})
         print('Native contract admission failed: ' + str(error), file=sys.stderr)

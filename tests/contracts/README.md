@@ -42,6 +42,18 @@ The `cli-surfaces-*` artifacts contain, per owner:
 - `execution/receipts.json`, `required.json` and `coverage.json`: admitted parser
   assertions, first-failure history and explicit debt. Admission errors are
   preserved in `admission-error.json` and fail the owning job.
+- `execution/aggregate.json`: the union of the parser, CLI fixture and daemon
+  fixture owners from the same source, run, platform and feature selection.
+  Every applicable native test binding must have its named owner and every
+  selected owner must pass without a retry. Known selected runtime skips have
+  exact test IDs and reasons in `selected_tests.explained_skips`; they remain
+  uncredited and any new or unexplained skip blocks the aggregate. The finite
+  platform-specific exception list is in `native-skip-exceptions.json`; its
+  system-test entries are debt until an isolated owner executes those tests.
+  Different test subjects retain their separate executable hashes. The
+  aggregate still counts explicit gaps as uncovered and cannot certify the
+  95% target while inventory review is open.
+  QEMU and release evidence remain separate and are not credited by this file.
 
 For Debian, Trixie, Ubuntu and pure Debian, `execution/behavior/` separately
 records three reviewed CLI fixture contracts: status, JSON status and explicit
