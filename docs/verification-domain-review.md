@@ -328,3 +328,26 @@ package-count response being served as a false healthy result.
 The admitted contract covers this injected-backend failure and recovery, not
 native package databases, completed vulnerability scans, concurrent refresh,
 or arbitrary persistent-cache corruption. Those remain outside this claim.
+
+## Portable environment export and plan evidence (2026-09-24)
+
+Two real `omg` CLI fixtures exercise `env export --source-target` and
+`env plan --target` against isolated project files. Export must produce
+parseable TOML with the exact declared source packages and runtime while
+leaving the lockfile and project contents unchanged. Plan must produce the
+exact target package map, unmapped tools, runtime, dotfile intent, and
+read-only notice as JSON for two competing targets without modifying the
+manifest or lockfile. These
+checks compare parsed data, not TOML formatting; the
+[TOML specification](https://toml.io/en/v1.0.0) defines the data model.
+
+Each fixture also checks an unsupported target refusal and an unsafe-file
+refusal: a symlinked lockfile or manifest must not be followed, and the
+external file must retain its bytes. The plan fixture rejects a dotfile
+destination that escapes the project. The four contracts bind only the
+command and explicit target flag surfaces to these assertions. They do not
+prove remote Gist operations, native package transactions, other flags, or
+cross-distro package availability; those remain gaps. Local and hosted
+results must be recorded separately. The full `env_lockfile_integrity` suite
+passed locally on Fedora WSL as an unprivileged user (10 passed, 0 skipped);
+the global inventory review flag remains false.

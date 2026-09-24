@@ -87,13 +87,13 @@ class NativeReceipts(unittest.TestCase):
         actual = json.loads((Path(__file__).resolve().parents[1] / 'tests/contracts/manifest.json').read_text())
         contracts = [c for c in actual['contracts'] if any(
             b['lane'] == 'native-cli-fixture' and 'fault' in b['evidence'] for b in c['tests'])]
-        self.assertEqual(len(contracts), 8)
+        self.assertEqual(len(contracts), 12)
         manifest['contracts'] = contracts
         provenance.update(platform='arch', features=['arch', 'pgp', 'license'], lane='native-cli-fixture')
         execution = report['tests']['install-dry-run-state']
         report['tests'] = {b['id']: execution for c in contracts for b in c['tests']}
         rows, required = NATIVE.behavior_receipts(manifest, provenance, report)
-        self.assertEqual(len(required), 8)
+        self.assertEqual(len(required), 12)
         self.assertTrue(all('fault' in row['evidence'] for row in rows))
         unrelated = 'omg::e2e_runtime_management::test_detect_nvmrc'
         contracts[0]['tests'][0]['id'] = unrelated
@@ -416,7 +416,8 @@ class NativeReceipts(unittest.TestCase):
                     'uninstall-lifecycle', 'which-registry', 'list-installed', 'list-runtime', 'list-json',
                     'list-installed-backend-errors', 'list-runtime-backend-errors', 'list-json-backend-errors')} | {
                 'omg.environment.' + name + '.fixture' for name in (
-                    'capture-registry', 'php-restore', 'registry-restore', 'unsupported-capture')} | {
+                    'capture-registry', 'php-restore', 'registry-restore', 'unsupported-capture',
+                    'export.portable', 'export.source-target', 'plan.portable', 'plan.target')} | {
                 'omg.snapshot.list-index-failures.fixture',
                 'omg.snapshot.delete-index-failures.fixture'})
         for contract in mapped:

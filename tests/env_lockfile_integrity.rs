@@ -138,6 +138,189 @@ fn env_check_fails_on_tampered_lockfile_integrity() {
 }
 
 #[test]
+fn env_export_preserves_lock_and_maps_only_the_declared_source_target() {
+    let project = TestProject::new();
+    let mut state = sample_state();
+    state
+        .runtimes
+        .insert("node".to_string(), "22.1.0".to_string());
+    state.save(project.path().join("omg.lock")).unwrap();
+    let lock_before = std::fs::read(project.path().join("omg.lock")).unwrap();
+
+    let export = project.run(&["env", "export", "--source-target", "arch-x86_64"]);
+    export.assert_success();
+    export.assert_no_ansi();
+    assert!(
+        export.stderr.is_empty(),
+        "unexpected export diagnostic: {}",
+        export.stderr
+    );
+    let manifest: toml::Value = toml::from_str(&export.stdout).unwrap();
+    let environment = &manifest["environment"];
+    assert_eq!(environment["schema_version"].as_integer(), Some(1));
+    assert_eq!(
+        environment["tools"].as_array().unwrap(),
+        &[
+            toml::Value::String("curl".into()),
+            toml::Value::String("git".into())
+        ]
+    );
+    assert_eq!(environment["runtimes"]["node"].as_str(), Some("22.1.0"));
+    assert_eq!(
+        environment["packages"]["arch-x86_64"]["curl"].as_str(),
+        Some("curl")
+    );
+    assert_eq!(
+        environment["packages"]["arch-x86_64"]["git"].as_str(),
+        Some("git")
+    );
+    assert_eq!(environment["packages"].as_table().unwrap().len(), 1);
+    assert!(environment["dotfiles"].as_table().unwrap().is_empty());
+    assert!(export.stdout.contains("package versions are not captured"));
+
+    let invalid = project.run(&["env", "export", "--source-target", "unknown-x86_64"]);
+    invalid.assert_failure();
+    assert!(
+        invalid
+            .combined_output()
+            .contains("invalid value 'unknown-x86_64' for '--source-target <SOURCE_TARGET>'")
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("omg.lock")).unwrap(),
+        lock_before,
+        "successful export or invalid-target refusal changed the lockfile"
+    );
+    #[cfg(unix)]
+    {
+        let external = tempfile::TempDir::new().unwrap();
+        let sentinel = external.path().join("omg.lock");
+        std::fs::write(&sentinel, &lock_before).unwrap();
+        std::fs::remove_file(project.path().join("omg.lock")).unwrap();
+        std::os::unix::fs::symlink(&sentinel, project.path().join("omg.lock")).unwrap();
+        let linked = project.run(&["env", "export", "--source-target", "arch-x86_64"]);
+        linked.assert_failure();
+        assert!(linked.combined_output().contains("not a regular file"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), lock_before);
+        std::fs::remove_file(project.path().join("omg.lock")).unwrap();
+        std::fs::write(project.path().join("omg.lock"), &lock_before).unwrap();
+        external.close().unwrap();
+    }
+    assert_eq!(
+        std::fs::read(project.path().join("omg.lock")).unwrap(),
+        lock_before
+    );
+    assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 1);
+    project.close_checked();
+}
+
+#[test]
+fn env_plan_reports_exact_target_intent_without_writing_or_applying_it() {
+    let project = TestProject::new();
+    let manifest = r#"[environment]
+schema_version = 1
+tools = ["curl", "git"]
+
+[environment.runtimes]
+node = "22.1.0"
+
+[environment.packages.arch-x86_64]
+curl = "curl"
+
+[environment.packages.ubuntu-x86_64]
+git = "git"
+
+[environment.dotfiles]
+".config/example" = ".config/example"
+"#;
+    project.create_file(".omg.toml", manifest);
+    project.create_file("omg.lock", "existing-lock-sentinel");
+
+    let plan = project.run(&["env", "plan", "--target", "ubuntu-x86_64"]);
+    plan.assert_success();
+    plan.assert_no_ansi();
+    assert!(
+        plan.stderr.is_empty(),
+        "unexpected plan diagnostic: {}",
+        plan.stderr
+    );
+    let output: serde_json::Value = serde_json::from_str(&plan.stdout).unwrap();
+    assert_eq!(output["schema_version"], 1);
+    assert_eq!(output["target"], "ubuntu-x86_64");
+    assert_eq!(output["packages"], serde_json::json!({"git": "git"}));
+    assert_eq!(output["unmapped_tools"], serde_json::json!(["curl"]));
+    assert_eq!(output["runtimes"], serde_json::json!({"node": "22.1.0"}));
+    assert_eq!(
+        output["dotfiles"],
+        serde_json::json!({".config/example": ".config/example"})
+    );
+    assert!(output["notices"].as_array().unwrap().iter().any(|notice| {
+        notice
+            .as_str()
+            .unwrap()
+            .contains("no packages installed and no files copied")
+    }));
+    let other_target = project.run(&["env", "plan", "--target", "arch-x86_64"]);
+    other_target.assert_success();
+    let other_output: serde_json::Value = serde_json::from_str(&other_target.stdout).unwrap();
+    assert_eq!(other_output["target"], "arch-x86_64");
+    assert_eq!(
+        other_output["packages"],
+        serde_json::json!({"curl": "curl"})
+    );
+    assert_eq!(other_output["unmapped_tools"], serde_json::json!(["git"]));
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".omg.toml")).unwrap(),
+        manifest
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("omg.lock")).unwrap(),
+        "existing-lock-sentinel"
+    );
+    assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 2);
+
+    let invalid = project.run(&["env", "plan", "--target", "unknown-x86_64"]);
+    invalid.assert_failure();
+    assert!(
+        invalid
+            .combined_output()
+            .contains("invalid value 'unknown-x86_64' for '--target <TARGET>'")
+    );
+    let traversal = manifest.replace(
+        "\".config/example\" = \".config/example\"",
+        "\".config/example\" = \"../escape\"",
+    );
+    project.create_file(".omg.toml", &traversal);
+    let invalid = project.run(&["env", "plan", "--target", "ubuntu-x86_64"]);
+    invalid.assert_failure();
+    assert!(
+        invalid
+            .combined_output()
+            .contains("Dotfile destination must be relative")
+    );
+    #[cfg(unix)]
+    {
+        let external = tempfile::TempDir::new().unwrap();
+        let sentinel = external.path().join("manifest.toml");
+        std::fs::write(&sentinel, manifest).unwrap();
+        std::fs::remove_file(project.path().join(".omg.toml")).unwrap();
+        std::os::unix::fs::symlink(&sentinel, project.path().join(".omg.toml")).unwrap();
+        let linked = project.run(&["env", "plan", "--target", "ubuntu-x86_64"]);
+        linked.assert_failure();
+        assert!(linked.combined_output().contains("not a regular file"));
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), manifest);
+        std::fs::remove_file(project.path().join(".omg.toml")).unwrap();
+        std::fs::write(project.path().join(".omg.toml"), manifest).unwrap();
+        external.close().unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("omg.lock")).unwrap(),
+        "existing-lock-sentinel"
+    );
+    assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 2);
+    project.close_checked();
+}
+
+#[test]
 #[cfg(all(
     unix,
     any(feature = "arch", feature = "debian", feature = "debian-pure")
