@@ -3343,7 +3343,7 @@
     },
     {
       "id": "omgd.security-audit-osv-pages.server-fixture",
-      "source": "src/core/security/scan.rs",
+      "source": "src/daemon/protocol.rs",
       "binary": "omgd",
       "surface": "ipc:SecurityAudit",
       "platforms": [
