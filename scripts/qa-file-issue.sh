@@ -10,8 +10,8 @@
 #
 # Issues carry failure excerpts (scrubbed tails of the per-case logs) plus
 # an agent runbook so a fixer agent can work them without asking for
-# context. Cases present in the input as PASS/EXPECTED_REJECTION resolve
-# their open issue (comment + close). A fresh failure whose fingerprint
+# context. A passing retry does not prove a fix; link the fixing PR with a
+# GitHub closing keyword so the issue closes with that change. A fresh failure whose fingerprint
 # matches a *closed* issue links it as a follow-up instead of duplicating.
 #
 # Only allowlisted fields ever leave the machine; unknown result keys are
@@ -20,7 +20,7 @@
 set -euo pipefail
 
 results=""; run_url=""; source=""; label="qa-failure"; repo=""; dry_run=false
-evidence_dir=""; failures_only=false
+evidence_dir=""
 while (($#)); do
   case "$1" in
     --run-url|--source|--label|--repo|--evidence-dir)
@@ -31,8 +31,8 @@ while (($#)); do
       esac
       shift 2 ;;
     --dry-run) dry_run=true; shift ;;
-    --failures-only) failures_only=true; shift ;;
-    --help) printf 'Usage: qa-file-issue.sh RESULTS_JSON --run-url URL --source NAME [--evidence-dir DIR] [--label L] [--repo R] [--failures-only] [--dry-run]\nFiles or updates one issue per failing case, closes issues fixed in this run. Use --failures-only for local evidence to prevent issue closure. Needs jq and gh (GH_TOKEN).\n'; exit 0 ;;
+    --failures-only) shift ;;
+    --help) printf 'Usage: qa-file-issue.sh RESULTS_JSON --run-url URL --source NAME [--evidence-dir DIR] [--label L] [--repo R] [--failures-only] [--dry-run]\nFiles or updates one issue per failing case. Passing retries never close issues; link the fixing PR with a GitHub closing keyword. Needs jq and gh (GH_TOKEN).\n'; exit 0 ;;
     -*) printf 'error: unknown argument %s\n' "$1" >&2; exit 2 ;;
     *) [[ -z "$results" ]] || exit 2; results=$1; shift ;;
   esac
@@ -48,18 +48,11 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/qa-evidence-lib.sh"
 # Validate once, before any GitHub operations or filtering.
 rows="$(qa_result_rows "$results")"
 failures="$(jq -ce 'map(select(.result == "PRODUCT_FAIL" or .result == "HARNESS_ERROR" or .result == "FAIL"))' <<< "$rows")"
-# Healthy verdicts in THIS run resolve open issues for the same fingerprint.
-# Only cases present in this input are considered: a run covering one
-# distro must never close another distro's issues.
-passes="$(jq -ce '
-  map(select(.result == "PASS" or .result == "EXPECTED_REJECTION") |
-    {case_id, distro})
-' <<< "$rows")"
-# Local or otherwise non-authoritative runs may report failures but cannot
-# establish recovery of an issue tracked by the hosted pipeline.
-if [[ "$failures_only" == true ]]; then passes='[]'; fi
-if [[ "$(jq 'length' <<< "$failures")" == 0 && "$(jq 'length' <<< "$passes")" == 0 ]]; then
-  printf 'No failures to file and no fixes to resolve.\n'; exit 0
+# Retain --failures-only for existing local callers. All callers are now
+# failure-only: a green retry, including a published run, cannot name the
+# change that fixed an intermittent defect.
+if [[ "$(jq 'length' <<< "$failures")" == 0 ]]; then
+  printf 'No failures to file.\nfiled=0 updated=0 closed=0 errors=0\n'; exit 0
 fi
 
 runbook_for() {
@@ -121,12 +114,7 @@ EOF
     if [[ -n "$excerpt" ]]; then
       body+=$(printf '\n\n### Failure excerpt (`%s`, tail)\n````log\n%s\n````' "$excerpt_source" "$excerpt")
     fi
-    if [[ "$source" == qemu-matrix ]]; then
-      resolve_criteria='a later successful four-distro published QEMU run on current main verifies this case against the latest release'
-    else
-      resolve_criteria='this case reports PASS on a later scheduled run'
-    fi
-    body+=$(printf '\n\n### Agent runbook\n%s\nResolve criteria: %s; automation comments here and closes this issue. A recurrence while open lands as a new comment; after a close it files a follow-up like this one.' "$(runbook_for "$distro" "$([[ "$distro" == macos ]] && printf ' --executor native' || printf '')")" "$resolve_criteria")
+    body+=$(printf '\n\n### Agent runbook\n%s\nResolve criteria: verify the fix in a pull request and link this issue with a GitHub closing keyword. A passing retry alone does not close it. A recurrence while open lands as a new comment; after a close it files a follow-up like this one.' "$(runbook_for "$distro" "$([[ "$distro" == macos ]] && printf ' --executor native' || printf '')")")
     if [[ "$dry_run" == true ]]; then
       printf 'would create: %s\n' "$title"
     elif gh issue create --repo "$repo" --title "$title" --label "$label" --body "$body" >/dev/null; then
@@ -166,27 +154,6 @@ EOF
     fi
   fi
 done < <(jq -c '.[]' <<< "$failures")
-# Resolve: open issues whose case now passes in THIS run (presence-gated
-# above by construction: passes come from the same input file).
-while IFS= read -r row; do
-  case_id=$(jq -r '.case_id' <<< "$row")
-  distro=$(jq -r '.distro' <<< "$row")
-  fingerprint="$source:$distro:$case_id"
-  marker="<!-- omg-qa-fingerprint: $fingerprint -->"
-  existing=$(jq -r --arg m "$marker" '[.[] | select((.state // "open" | ascii_downcase) == "open" and .body != null and (.body | contains($m))) | .number] | first // empty' <<< "$open_issues")
-  [[ -n "$existing" ]] || continue
-  if [[ "$dry_run" == true ]]; then
-    printf 'would close #%s (fixed: %s on %s)\n' "$existing" "$case_id" "$distro"
-    closed=$((closed + 1)); continue
-  fi
-  if gh issue comment "$existing" --repo "$repo" --body "Verified fixed on [$run_url]($run_url): \`$case_id\` on \`$distro\` reports PASS. Closing." >/dev/null &&
-     gh issue close "$existing" --repo "$repo" >/dev/null; then
-    closed=$((closed + 1))
-  else
-    printf 'warning: failed to close #%s\n' "$existing" >&2
-    errors=$((errors + 1))
-  fi
-done < <(jq -c '.[]' <<< "$passes")
 if [[ "$(jq 'length' <<< "$failures")" == 0 ]]; then printf 'No failures to file.\n'; fi
 printf 'filed=%s updated=%s closed=%s errors=%s\n' "$filed" "$updated" "$closed" "$errors"
 [[ "$errors" -eq 0 ]]
