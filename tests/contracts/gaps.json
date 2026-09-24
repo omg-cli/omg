@@ -2923,7 +2923,6 @@
         "ipc:Explicit",
         "ipc:ExplicitCount",
         "ipc:SecurityAudit",
-        "ipc:CacheStats",
         "ipc:CacheClear",
         "ipc:RefreshIndex",
         "ipc:Metrics",

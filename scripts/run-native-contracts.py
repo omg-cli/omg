@@ -82,6 +82,7 @@ DAEMON_TESTS = frozenset('omg::coverage_18::' + name for name in (
     'suggestions_preserve_catalog_order_limits_refusal_and_state_over_real_ipc',
     'package_inventory_and_updates_survive_the_production_transport',
     'clearing_search_cache_forces_a_new_lookup_over_real_ipc',
+    'cache_stats_reports_live_entries_and_capacity_over_real_ipc',
     'package_info_cache_preserves_metadata_and_missing_package_identity',
     'isolated_refresh_refusal_preserves_server_liveness',
     'fragmented_then_coalesced_frames_preserve_response_order_and_ids',

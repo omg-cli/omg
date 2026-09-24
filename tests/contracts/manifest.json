@@ -2213,6 +2213,51 @@
       ]
     },
     {
+      "id": "omgd.cache-stats.server-fixture",
+      "source": "src/daemon/protocol.rs",
+      "binary": "omgd",
+      "surface": "ipc:CacheStats",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "exact-request-ids-and-configured-capacity"
+        ],
+        "state": [
+          "populated-cache-count-and-clear-to-zero"
+        ]
+      },
+      "scope": "Production server::run over a real Unix socket with an isolated package backend. Synchronized counts cover one empty-search cache entry and explicit clear; fixture drains SIGTERM and checks directory cleanup; not native package transactions, standalone omgd process lifecycle or every transport fault.",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::cache_stats_reports_live_entries_and_capacity_over_real_ipc",
+          "evidence": [
+            "success",
+            "state"
+          ],
+          "assertions": [
+            "exact-request-ids-and-configured-capacity",
+            "populated-cache-count-and-clear-to-zero",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
       "id": "omgd.cache-clear.server-fixture",
       "source": "src/daemon/protocol.rs",
       "binary": "omgd",

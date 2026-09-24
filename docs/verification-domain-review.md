@@ -43,6 +43,27 @@ as EOF at the peer while leaving the local read half available. The interrupted
 request assertion uses that behavior to verify the server's actual close, rather
 than dropping the client and inferring that the server released the connection.
 
+## CacheStats over the production socket
+
+`Request::CacheStats` has only a request ID; it reads the in-memory cache and
+returns `size` and `max_size` without changing package state. The reviewed
+behavior is an exact response ID and configured per-cache capacity, a live
+entry count after a known search, and zero after explicit clear. The
+`cache_stats_reports_live_entries_and_capacity_over_real_ipc` fixture checks
+those observations through `server::run` on a real Unix socket, then drains the
+server and verifies private-directory cleanup. This closes the specific
+`ipc:CacheStats` inventory gap on each platform where its native daemon fixture
+passes; it does not claim process startup, native package transactions, or
+transport fault coverage.
+
+The original test caught a zero count immediately after a successful search.
+[Moka documents](https://docs.rs/moka/latest/moka/sync/struct.Cache.html#method.entry_count)
+that `entry_count` can lag pending maintenance. `PackageCache::stats` now
+synchronizes those operations before reading; `CacheClear` already synchronizes
+invalidation. The query is an introspection request, so this work does not add
+maintenance to the hot search path. The broader daemon gap retains its other
+request and lifecycle surfaces, and the whole inventory remains provisional.
+
 ## Connection capacity lifecycle evidence
 
 `connection_capacity_refuses_overflow_and_recovers_released_permits` holds
