@@ -134,15 +134,15 @@ out=$(bash "$runner" "$results" --run-url https://run/7d --source qemu --evidenc
 grep -q 'synthetic-unclosed-private-material' "$CALL_LOG" && fail "excerpt leaked unterminated private key"
 grep -q 'failure before key remains visible' "$CALL_LOG" || fail "redaction lost earlier failure cause"
 
-# 8. A passing case resolves its open issue (comment + close).
+# 8. A passing retry cannot close an issue without a linked fixing PR.
 printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":2}]' > "$results"
 export FAKE_ISSUES_JSON='[{"number":7,"state":"open","body":"<!-- omg-qa-fingerprint: qemu:arch:search-tree -->"}]'
 : > "$CALL_LOG"
-out=$(bash "$runner" "$results" --run-url https://run/8 --source qemu); assert_rc 0 "$?" "resolve-close"
-grep -q "issue close 7" "$CALL_LOG" || fail "resolve-close issued no close call"
-grep -q "filed=0 updated=0 closed=1 errors=0" <<< "$out" || fail "resolve-close bad summary: $out"
+out=$(bash "$runner" "$results" --run-url https://run/8 --source qemu); assert_rc 0 "$?" "passing-retry"
+[[ ! -s "$CALL_LOG" ]] || fail "passing retry contacted GitHub"
+grep -q "filed=0 updated=0 closed=0 errors=0" <<< "$out" || fail "passing-retry bad summary: $out"
 
-# 9. Resolve is scoped to cases present in this run: other open issues stay open.
+# 9. An unrelated issue also stays open.
 export FAKE_ISSUES_JSON='[{"number":9,"state":"open","body":"<!-- omg-qa-fingerprint: qemu:debian:other-case -->"}]'
 : > "$CALL_LOG"
 out=$(bash "$runner" "$results" --run-url https://run/9 --source qemu); assert_rc 0 "$?" "resolve-scope"
@@ -158,13 +158,14 @@ grep -q "issue create" "$CALL_LOG" || fail "followup-link issued no create call"
 grep -q "Follow-up to #9" "$CALL_LOG" || fail "followup-link omitted the prior issue"
 grep -q "filed=1 updated=0 closed=0 errors=0" <<< "$out" || fail "followup-link bad summary: $out"
 
-# 11. Dry run plans closes without mutating.
+# 11. Dry run cannot plan a closure from a passing retry.
 printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":2}]' > "$results"
 export FAKE_ISSUES_JSON='[{"number":7,"state":"open","body":"<!-- omg-qa-fingerprint: qemu:arch:search-tree -->"}]'
 : > "$CALL_LOG"
 out=$(bash "$runner" "$results" --run-url https://run/11 --source qemu --dry-run); assert_rc 0 "$?" "dry-run-close"
 grep -q "issue close" "$CALL_LOG" && fail "dry-run-close mutated"
-grep -q "would close #7" <<< "$out" || fail "dry-run-close printed no plan: $out"
+grep -q "would close #7" <<< "$out" && fail "dry-run-close planned an unproven fix"
+[[ ! -s "$CALL_LOG" ]] || fail "dry-run-close contacted GitHub"
 
 # 12. The original issue body already records its first run. Replaying that
 # reporting attempt must not add a redundant "still failing" comment.
@@ -190,12 +191,11 @@ grep -q "issue comment 7" "$CALL_LOG" || fail "comment-run-prefix lost a recurre
 
 # 15. GitHub API failures must never be reported as successful delivery.
 export FAKE_COMMENTS_JSON='[]'
-for operation in create comment close view; do
+for operation in create comment view; do
   export FAKE_FAIL_OPERATION="issue $operation"
   export FAKE_ISSUES_JSON='[{"number":7,"state":"open","body":"<!-- omg-qa-fingerprint: qemu:arch:search-tree -->"}]'
   verdict=PRODUCT_FAIL; code=1
   if [[ "$operation" == create ]]; then export FAKE_ISSUES_JSON='[]'; fi
-  if [[ "$operation" == close ]]; then verdict=PASS; code=0; fi
   printf '[{"case_id":"search-tree","distro":"arch","result":"%s","exit_code":%s,"elapsed_seconds":2}]' "$verdict" "$code" > "$results"
   : > "$CALL_LOG"
   if out=$(bash "$runner" "$results" --run-url https://run/15 --source qemu 2>"$scratch/error"); then
@@ -216,11 +216,11 @@ fi
 [[ -s "$CALL_LOG" ]] && fail "contradictory results reached GitHub"
 
 # 17. A QEMU expected-refusal assertion can PASS with observed exit 1.
-# Its runner already checked the expected code; preserve that verdict.
+# That verdict is evidence, not proof of a linked fix.
 printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PASS","exit_code":1,"elapsed_seconds":2}]' > "$results"
 : > "$CALL_LOG"
 out=$(bash "$runner" "$results" --run-url https://run/17 --source qemu); assert_rc 0 "$?" "expected-refusal"
-grep -q "issue close 7" "$CALL_LOG" || fail "expected-refusal lost verified closure"
+[[ ! -s "$CALL_LOG" ]] || fail "expected-refusal closed an issue without a fix"
 
 # Local evidence may report a regression but must not close a hosted issue.
 printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":2},{"case_id":"audit","distro":"arch","result":"PRODUCT_FAIL","exit_code":1,"elapsed_seconds":2}]' > "$results"
