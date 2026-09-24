@@ -41,26 +41,6 @@
       ]
     },
     {
-      "test_id": "omg::debian_tests::apt_integration::test_explicit_packages",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::apt_integration::test_explicit_packages_count",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
       "test_id": "omg::debian_tests::apt_integration::test_info_installed_package",
       "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
       "platforms": [
@@ -91,57 +71,7 @@
       ]
     },
     {
-      "test_id": "omg::debian_tests::apt_integration::test_search_development_packages",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::apt_integration::test_search_essential_packages",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::apt_integration::test_search_main_repo",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::apt_integration::test_search_with_architecture",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
       "test_id": "omg::debian_tests::apt_integration::test_size_integration",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::apt_integration::test_update_check",
       "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
       "platforms": [
         "debian",
