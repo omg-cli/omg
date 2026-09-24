@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run as the unprivileged guest user against the binaries in the tested archive.
-set -euo pipefail
+set -Eeuo pipefail
 # BEGIN EXPLICIT QUERY ORACLE
 check_explicit_query_outputs() {
   local expected=$1 listing=$2 count=$3 shortcut=$4 jsoncount=$5 wanted output
@@ -157,11 +157,16 @@ check_fedora_reason_refusal() {
   [[ ! -e "$fixture" && ! -L "$fixture" ]]
 }
 # END BACKEND FAULT PROBE
-[[ $# == 2 && $(id -u) != 0 ]] || exit 2
+if [[ $# != 2 || $(id -u) == 0 ]]; then
+  printf 'daemon lifecycle probe requires an unprivileged user and binary/evidence paths\n' >&2
+  exit 2
+fi
 bin=$(realpath "$1")
 daemon="${bin%/*}/omgd"
 evidence=$(realpath "$2")
-[[ -x "$bin" && -x "$daemon" && -d "$evidence" ]] || exit 1
+if [[ ! -x "$bin" ]]; then printf 'daemon lifecycle OMG binary is not executable: %s\n' "$bin" >&2; exit 1; fi
+if [[ ! -x "$daemon" ]]; then printf 'daemon lifecycle omgd binary is not executable: %s\n' "$daemon" >&2; exit 1; fi
+if [[ ! -d "$evidence" ]]; then printf 'daemon lifecycle evidence directory is missing: %s\n' "$evidence" >&2; exit 1; fi
 export LC_ALL=C NO_COLOR=1
 unset OMG_DISABLE_DAEMON OMG_NO_DAEMON
 case "${OMG_QEMU_ACCEL:-kvm}" in
@@ -235,6 +240,7 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+trap 'status=$?; printf "daemon lifecycle probe failed at line %s (exit %s)\n" "$LINENO" "$status" >&2' ERR
 trap 'exit 143' TERM
 trap 'exit 130' INT
 # Independent native inventory, captured before starting either daemon mode.

@@ -60,11 +60,23 @@ Its `/etc/wsl.conf` enables systemd and disables automatic Windows-drive mounts
 and Windows process interop. This reduces accidental access to host files, but
 does not replace the organization runner-group restriction.
 
+Install the ACL utility before enabling QEMU jobs. WSL can expose `/dev/kvm`
+with a group other than `kvm`, even when `omgci` belongs to that group. The
+workflow grants `omgci` access to this device when needed; it requires
+`setfacl` and must not widen access to all local users:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y acl
+command -v setfacl
+sudo setfacl -m u:omgci:rw /dev/kvm
+```
+
 Before registration, verify these from PowerShell:
 
 ```powershell
-wsl.exe --distribution Ubuntu-24.04 --exec bash -lc 'id; docker info --format "{{.ServerVersion}}"; test ! -e /mnt/c/Users; sudo -n true'
-wsl.exe --distribution Ubuntu-24.04 --exec python3 -c 'import fcntl,os; f=os.open("/dev/kvm",os.O_RDWR); print(fcntl.ioctl(f,0xAE00,0)); os.close(f)'
+wsl.exe --distribution Ubuntu-24.04 --user omgci --exec bash -lc 'test "$(id -un)" = omgci; docker info --format "{{.ServerVersion}}"; test ! -e /mnt/c/Users; sudo -n true'
+wsl.exe --distribution Ubuntu-24.04 --user omgci --exec python3 -c 'import fcntl,os; f=os.open("/dev/kvm",os.O_RDWR); print(fcntl.ioctl(f,0xAE00,0)); os.close(f)'
 ```
 
 The KVM API check must print `12`. Download the current x64 Linux runner from
@@ -91,6 +103,15 @@ Check that task and the runner's GitHub status after a reboot before expecting
 jobs to leave the GitHub queue. To start the distro manually, run
 `wsl.exe --distribution Ubuntu-24.04 --exec /usr/bin/sleep infinity` in a
 separate terminal.
+
+The QEMU controller checks that its metadata-service probe increments its own
+firewall reject rule before it boots a guest. Its source-scoped chain is hooked
+at the start of `FORWARD` and `INPUT`; this keeps the rule reachable even if
+Docker places `DOCKER-USER` behind bridge `ACCEPT` rules. The controller removes
+both hooks after the container exits. If the probe still times out with a zero
+reject counter, inspect `sudo iptables -S FORWARD` and the job's egress receipt
+before rerunning. Do not disable the probe: a green guest without proven egress
+confinement is invalid evidence. See [Docker's iptables chain order](https://docs.docker.com/engine/network/firewall-iptables/).
 
 ## Enable and verify routing
 

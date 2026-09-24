@@ -225,10 +225,15 @@ def projection(rows, verified_published):
     # The matrix job emits an aggregate receipt whenever a lane fails. Once
     # detailed evidence identifies that failure, filing both adds no diagnosis.
     # Keep the aggregate when it is the only failure (and keep PASS closures).
-    if any(row["case_id"] != "qemu-matrix-workflow" and row["result"] in FAILURES
+    def aggregate(case_id):
+        return case_id == "qemu-matrix-workflow" or (
+            case_id.startswith("qemu-matrix-") and case_id.endswith("-workflow")
+        )
+
+    if any(not aggregate(row["case_id"]) and row["result"] in FAILURES
            for row in selected.values()):
         selected = {key: row for key, row in selected.items()
-                    if row["case_id"] != "qemu-matrix-workflow" or row["result"] not in FAILURES}
+                    if not aggregate(row["case_id"]) or row["result"] not in FAILURES}
     return list(selected.values())
 
 

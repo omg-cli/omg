@@ -217,11 +217,14 @@ class ReportingBoundaryTests(unittest.TestCase):
         ])
 
     def test_detailed_failures_replace_duplicate_aggregate_issue(self):
-        aggregate = dict(self.row(), case_id="qemu-matrix-workflow", distro="ubuntu")
-        for rows in ([aggregate, self.row()], [self.row(), aggregate]):
-            self.assertEqual(REPORT.projection(rows, False), [self.row()])
-        self.assertEqual(REPORT.projection([aggregate], False), [aggregate])
-        self.assertEqual(REPORT.projection([aggregate, self.row("PASS")], False), [aggregate])
+        for case_id in ("qemu-matrix-workflow", "qemu-matrix-x86-workflow",
+                        "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow"):
+            with self.subTest(case_id=case_id):
+                aggregate = dict(self.row(), case_id=case_id, distro="ubuntu")
+                for rows in ([aggregate, self.row()], [self.row(), aggregate]):
+                    self.assertEqual(REPORT.projection(rows, False), [self.row()])
+                self.assertEqual(REPORT.projection([aggregate], False), [aggregate])
+                self.assertEqual(REPORT.projection([aggregate, self.row("PASS")], False), [aggregate])
 
     def test_failure_overflow_preserves_every_identity_with_bounded_issues(self):
         failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(26)]
