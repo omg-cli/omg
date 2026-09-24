@@ -1666,7 +1666,9 @@ async fn security_audit_fetches_all_osv_pages_and_refuses_partial_results_over_r
                 )
             );
         }
-        other => anyhow::bail!("partial OSV pages produced a successful audit: {other:?}"),
+        other @ Response::Success { .. } => {
+            anyhow::bail!("partial OSV pages produced a successful audit: {other:?}")
+        }
     }
     assert_eq!(std::fs::read(&state_path)?, original);
 
