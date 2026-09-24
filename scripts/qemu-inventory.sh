@@ -63,14 +63,23 @@ check_native_counter() {
 }
 
 check_native_tree_state() {
-  local distro=$1 expected=$2 tree_binary=${3:-/usr/bin/tree} installed=false
+  local distro=$1 expected=$2 tree_binary=${3:-/usr/bin/tree} installed=false inventory
   case "$distro" in
-    arch) pacman -Q tree >/dev/null 2>&1 && installed=true ;;
+    arch)
+      inventory=$(pacman -Qq) || { printf 'assertion failed: native pacman database query failed\n' >&2; return 1; }
+      grep -Fxq tree <<< "$inventory" && installed=true ;;
     debian|ubuntu)
-      [[ $(dpkg-query -W '-f=${Status}' tree 2>/dev/null) == 'install ok installed' ]] && installed=true ;;
-    fedora) rpm -q tree >/dev/null 2>&1 && installed=true ;;
+      inventory=$(dpkg-query -W '-f=${Package}\t${Status}\n') || { printf 'assertion failed: native dpkg database query failed\n' >&2; return 1; }
+      grep -Fxq $'tree\tinstall ok installed' <<< "$inventory" && installed=true ;;
+    fedora)
+      inventory=$(rpm -qa --qf '%{NAME}\n') || { printf 'assertion failed: native rpm database query failed\n' >&2; return 1; }
+      grep -Fxq tree <<< "$inventory" && installed=true ;;
     *) printf 'assertion failed: unknown package backend %s\n' "$distro" >&2; return 1 ;;
   esac
+  if [[ -z "$inventory" ]]; then
+    printf 'assertion failed: native %s database query returned no packages\n' "$distro" >&2
+    return 1
+  fi
   if [[ "$expected" == installed ]]; then
     if [[ "$installed" != true || ! -x "$tree_binary" ]] || ! "$tree_binary" --version >/dev/null 2>&1; then
       printf 'assertion failed: native %s database or executable lacks installed tree\n' "$distro" >&2

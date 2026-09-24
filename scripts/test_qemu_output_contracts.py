@@ -438,24 +438,32 @@ esac
             commands.mkdir()
             for name in ('pacman', 'dpkg-query', 'rpm'):
                 manager = commands / name
-                manager.write_text('#!/bin/sh\n[ "$OMG_TEST_PRESENT" = 1 ] || exit 1\n'
-                                   'printf "install ok installed"\n', encoding='utf-8')
+                row = 'tree\\tinstall ok installed\\n' if name == 'dpkg-query' else 'tree\\n'
+                base = 'base\\tinstall ok installed\\n' if name == 'dpkg-query' else 'base\\n'
+                manager.write_text('#!/bin/sh\n[ "$OMG_TEST_QUERY_STATUS" = 3 ] && exit 0\n'
+                                   '[ "$OMG_TEST_QUERY_STATUS" = 0 ] || exit 2\n'
+                                   f'printf "{base}"\n[ "$OMG_TEST_PRESENT" = 1 ] && printf "{row}"\nexit 0\n',
+                                   encoding='utf-8')
                 manager.chmod(0o755)
             tree = root / 'tree'
             tree.write_text('#!/bin/sh\n[ "$1" = --version ] && echo "tree v2"\n', encoding='utf-8')
             tree.chmod(0o755)
             for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
-                for present, payload, expected, accepted in (
-                    ('0', False, 'absent', True), ('0', False, 'installed', False),
-                    ('1', True, 'installed', True), ('1', True, 'absent', False),
-                    ('1', False, 'installed', False), ('0', True, 'absent', False)):
-                    with self.subTest(distro=distro, present=present, payload=payload, expected=expected):
+                for present, payload, expected, query_status, accepted in (
+                    ('0', False, 'absent', '0', True), ('0', False, 'installed', '0', False),
+                    ('1', True, 'installed', '0', True), ('1', True, 'absent', '0', False),
+                    ('1', False, 'installed', '0', False), ('0', True, 'absent', '0', False),
+                    ('0', False, 'absent', '2', False), ('1', True, 'installed', '2', False),
+                    ('0', False, 'absent', '3', False)):
+                    with self.subTest(distro=distro, present=present, payload=payload,
+                                      expected=expected, query_status=query_status):
                         if not payload:
                             tree.unlink(missing_ok=True)
                         elif not tree.exists():
                             tree.write_text('#!/bin/sh\n[ "$1" = --version ] && echo "tree v2"\n', encoding='utf-8')
                             tree.chmod(0o755)
                         environment = dict(os.environ, OMG_TEST_PRESENT=present,
+                                           OMG_TEST_QUERY_STATUS=query_status,
                                            PATH=str(commands) + os.pathsep + os.environ['PATH'])
                         result = subprocess.run(
                             [shutil.which('bash'), '-c', function + '\ncheck_native_tree_state "$@"',
