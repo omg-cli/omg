@@ -1935,13 +1935,15 @@ pub fn ensure_complete_collection(marker: &Path) -> anyhow::Result<()> {
 }
 
 fn mark_audit_incomplete() {
-    let marker = AUDIT_INCOMPLETE_MARKER
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let marker = marker
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| paths::data_dir().join("audit/incomplete"));
+    let marker = {
+        let guard = AUDIT_INCOMPLETE_MARKER
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| paths::data_dir().join("audit/incomplete"))
+    };
     mark_audit_incomplete_at_or_log(&marker);
 }
 
