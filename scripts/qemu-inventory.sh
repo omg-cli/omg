@@ -232,7 +232,7 @@ check_python_install() {
   if [[ "$status" != 0 || "$output" != "Python $version" ]]; then
     printf 'assertion failed: Python executable version expected=%s exit=%s observed=%s\n' "$version" "$status" "$output" >&2; return 1
   fi
-  output=$(timeout --kill-after=2s 60 "$executable" -I - "$version" "$expected" "$base" 2>&1 <<'PY'
+  output=$(timeout --kill-after=2s 150 "$executable" -I - "$version" "$expected" "$base" 2>&1 <<'PY'
 import bz2, ctypes, gzip, hashlib, json, lzma, pathlib, sqlite3, ssl, subprocess, sys, tempfile, venv
 
 version, expected, base = sys.argv[1:]
@@ -253,24 +253,52 @@ assert libc.abs(-42) == 42, 'ctypes foreign call failed'
 context = ssl.create_default_context()
 assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname, 'TLS verification defaults disabled'
 # ensurepip uses bundled wheels offline; no package index or second download.
+def crash_context():
+    diagnostics = []
+    probes = (
+        ('kernel', ['sudo', '-n', 'journalctl', '-k', '--no-pager', '--since', '2 minutes ago']),
+        ('coredump', ['coredumpctl', '--no-pager', 'list', '--since', '2 minutes ago']),
+    )
+    for label, command in probes:
+        try:
+            result = subprocess.run(command, text=True, capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            diagnostics.append(f'{label} unavailable: {error}')
+            continue
+        lines = result.stdout.splitlines()
+        if label == 'kernel':
+            lines = [line for line in lines if 'segfault' in line.lower()]
+        else:
+            lines = [line for line in lines if 'python' in line.lower()]
+        diagnostics.append(f'{label} exit={result.returncode}: ' + (' | '.join(lines[-3:]) or 'no matching record'))
+    return '; '.join(diagnostics)
+
 def run_probe(arguments, timeout=10):
     result = subprocess.run(arguments, text=True, capture_output=True, timeout=timeout)
     if result.returncode != 0:
-        raise RuntimeError(f'Python child exited {result.returncode}: {result.stdout[:4096]} {result.stderr[:4096]}')
+        detail = f'Python child exited {result.returncode}: {result.stdout[:4096]} {result.stderr[:4096]}'
+        if result.returncode == -11 or 'SIGSEGV' in result.stderr:
+            detail += f'\nCrash diagnostics: {crash_context()}'
+        raise RuntimeError(detail)
     return result.stdout
 
-with tempfile.TemporaryDirectory(prefix='.qemu-python-', dir=base) as temporary:
-    environment = pathlib.Path(temporary) / 'venv'
-    venv.create(environment, with_pip=False)
-    child = environment / 'bin/python'
-    run_probe([str(child), '-I', '-m', 'ensurepip', '--upgrade', '--default-pip'], timeout=40)
-    observed = run_probe([str(child), '-I', '-c', 'import json,sys; print(json.dumps([sys.version.split()[0],sys.prefix,sys.base_prefix]))'])
-    child_version, prefix, base_prefix = json.loads(observed)
-    assert child_version == version and pathlib.Path(prefix) == environment, 'venv identity mismatch'
-    assert prefix != base_prefix, 'venv is not isolated from its base interpreter'
-    pip = run_probe([str(child), '-I', '-m', 'pip', '--isolated', '--disable-pip-version-check', '--version'])
-    assert pip.startswith('pip ') and str(environment) in pip, 'pip is outside its venv'
-assert not pathlib.Path(temporary).exists(), 'Python behavior fixture cleanup failed'
+# Each attempt must pass: a transient crash must fail the row, not become a green retry.
+for attempt in range(1, 6):
+    try:
+        with tempfile.TemporaryDirectory(prefix='.qemu-python-', dir=base) as temporary:
+            environment = pathlib.Path(temporary) / 'venv'
+            venv.create(environment, with_pip=False)
+            child = environment / 'bin/python'
+            run_probe([str(child), '-I', '-m', 'ensurepip', '--upgrade', '--default-pip'], timeout=40)
+            observed = run_probe([str(child), '-I', '-c', 'import json,sys; print(json.dumps([sys.version.split()[0],sys.prefix,sys.base_prefix]))'])
+            child_version, prefix, base_prefix = json.loads(observed)
+            assert child_version == version and pathlib.Path(prefix) == environment, 'venv identity mismatch'
+            assert prefix != base_prefix, 'venv is not isolated from its base interpreter'
+            pip = run_probe([str(child), '-I', '-m', 'pip', '--isolated', '--disable-pip-version-check', '--version'])
+            assert pip.startswith('pip ') and str(environment) in pip, 'pip is outside its venv'
+        assert not pathlib.Path(temporary).exists(), 'Python behavior fixture cleanup failed'
+    except Exception as error:
+        raise RuntimeError(f'Python installed runtime attempt {attempt}/5 failed: {error}') from error
 print(f'OMG_PYTHON_RUNTIME_OK:{version}')
 PY
   ) || status=$?
@@ -868,7 +896,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
-  if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then budget=$((budget + 74)); fi
+  if [[ "$case" == runtime-python-install ]]; then
+    # Five venv probes can outlast the former single-probe deadline on a slow
+    # guest. The SSH ceiling includes the Python oracle's 150s plus cleanup.
+    budget=$((budget + 164))
+  elif [[ "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then
+    budget=$((budget + 74))
+  fi
   if [[ "$case" == runtime-go-install ]]; then budget=$((budget + 210)); fi
   timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
   read -r uptime _ < /proc/uptime
