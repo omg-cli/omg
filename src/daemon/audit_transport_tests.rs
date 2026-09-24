@@ -67,7 +67,10 @@ async fn cancelled_active_and_waiting_scans_release_the_lock_without_caching() -
     }));
     let manager = Arc::new(MockPackageManager::new_in("arch", temp.path()));
     let mut state = DaemonState::new_isolated(temp.path(), PackageIndex::empty(), manager)?;
-    state.vulnerability_scanner = Arc::new(VulnerabilityScanner::with_osv_api_url(endpoint));
+    state.vulnerability_scanner = Arc::new(VulnerabilityScanner::with_osv_endpoint(
+        endpoint,
+        "Debian:12".into(),
+    ));
     let state = Arc::new(state);
     let active_state = Arc::clone(&state);
     let mut active = RunningTask(tokio::spawn(async move {
@@ -208,7 +211,10 @@ async fn real_server_fetches_scores_and_rejects_failed_scans_before_recovery() -
             DaemonState::new_isolated(temp.path(), PackageIndex::empty(), manager)
         },
     )?;
-    state.vulnerability_scanner = Arc::new(VulnerabilityScanner::with_osv_api_url(endpoint));
+    state.vulnerability_scanner = Arc::new(VulnerabilityScanner::with_osv_endpoint(
+        endpoint,
+        "Debian:12".into(),
+    ));
     state.background_security_scans = true;
     let path = temp.path().join("audit.sock");
     let listener = UnixListener::bind(&path)?;

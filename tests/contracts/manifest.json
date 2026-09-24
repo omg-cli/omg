@@ -3342,6 +3342,59 @@
       ]
     },
     {
+      "id": "omgd.security-audit-osv-pages.server-fixture",
+      "source": "src/core/security/scan.rs",
+      "binary": "omgd",
+      "surface": "ipc:SecurityAudit",
+      "platforms": [
+        "portable",
+        "debian-pure",
+        "arch",
+        "debian",
+        "debian-trixie",
+        "fedora",
+        "ubuntu",
+        "macos"
+      ],
+      "requires": [
+        "success",
+        "refusal",
+        "state"
+      ],
+      "critical": true,
+      "assertions": {
+        "success": [
+          "populated-osv-audit-exact-identities-scores-and-high-count"
+        ],
+        "refusal": [
+          "partial-osv-pages-return-internal-error-not-a-clean-or-partial-audit"
+        ],
+        "state": [
+          "retry-traverses-empty-continuation-page-and-reuses-complete-cache",
+          "installed-inventory-preserved-and-three-audits-counted"
+        ]
+      },
+      "scope": "Production server::run over real Unix IPC with an installed mock package and the product OSV scanner pointed at a bounded local HTTP fixture. Covers partial-page HTTP failure, retry through an empty continuation page, exact CVSS score/count/installed identity, complete-result cache reuse and checked SIGTERM cleanup; not native package transactions, live upstream availability, native distro advisories, every score vector or standalone omgd process lifecycle. Wider gaps remain.",
+      "tests": [
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::security_audit_fetches_all_osv_pages_and_refuses_partial_results_over_real_ipc",
+          "evidence": [
+            "success",
+            "refusal",
+            "state"
+          ],
+          "assertions": [
+            "populated-osv-audit-exact-identities-scores-and-high-count",
+            "partial-osv-pages-return-internal-error-not-a-clean-or-partial-audit",
+            "retry-traverses-empty-continuation-page-and-reuses-complete-cache",
+            "installed-inventory-preserved-and-three-audits-counted",
+            "fixture-cleanup"
+          ]
+        }
+      ]
+    },
+    {
       "id": "omg.audit.sbom.empty-recovery.fixture",
       "source": "src/cli/security.rs",
       "binary": "omg",

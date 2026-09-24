@@ -214,5 +214,10 @@ this lane admits no OMG CLI contracts. Harness ownership and pre/post execution
 hashes are checked. The same nextest run supplies the observations, so this
 reconciliation does not add another test run. Injected package state, real Unix
 transport, explicit SIGTERM drain and checked cleanup are the bounded scope.
-Native backend, executable lifecycle, security-audit and wider request/fault
-coverage remain separate gaps. Do not add percentages from separate lane reports.
+The security-audit IPC fixture also uses the product scanner against a local
+OSV server: a failed continuation page cannot produce a partial success, and
+a retry must traverse an empty continuation page, report exact scores and
+installed identities, then reuse only the complete result. Native backend
+advisories, live upstream availability, executable lifecycle and wider
+request/fault coverage remain separate gaps. Do not add percentages from
+separate lane reports.
