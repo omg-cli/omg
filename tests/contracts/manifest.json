@@ -2066,12 +2066,20 @@
         "macos"
       ],
       "requires": [
-        "success"
+        "success",
+        "fault",
+        "state"
       ],
       "critical": true,
       "assertions": {
         "success": [
           "seeded-explicit-exact-package-names"
+        ],
+        "fault": [
+          "corrupt-backend-explicit-error-with-request-id"
+        ],
+        "state": [
+          "corrupt-backend-preserved-and-explicit-recovers"
         ]
       },
       "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
@@ -2084,6 +2092,19 @@
           ],
           "assertions": [
             "seeded-explicit-exact-package-names",
+            "fixture-cleanup"
+          ]
+        },
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::inventory_requests_report_backend_corruption_and_recover_over_real_ipc",
+          "evidence": [
+            "fault",
+            "state"
+          ],
+          "assertions": [
+            "corrupt-backend-explicit-error-with-request-id",
+            "corrupt-backend-preserved-and-explicit-recovers",
             "fixture-cleanup"
           ]
         }
@@ -2105,12 +2126,20 @@
         "macos"
       ],
       "requires": [
-        "success"
+        "success",
+        "fault",
+        "state"
       ],
       "critical": true,
       "assertions": {
         "success": [
           "seeded-explicit-count-exact-two"
+        ],
+        "fault": [
+          "corrupt-backend-explicit-count-error-with-request-id"
+        ],
+        "state": [
+          "corrupt-backend-preserved-and-explicit-count-recovers"
         ]
       },
       "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
@@ -2123,6 +2152,19 @@
           ],
           "assertions": [
             "seeded-explicit-count-exact-two",
+            "fixture-cleanup"
+          ]
+        },
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::inventory_requests_report_backend_corruption_and_recover_over_real_ipc",
+          "evidence": [
+            "fault",
+            "state"
+          ],
+          "assertions": [
+            "corrupt-backend-explicit-count-error-with-request-id",
+            "corrupt-backend-preserved-and-explicit-count-recovers",
             "fixture-cleanup"
           ]
         }
@@ -2144,12 +2186,20 @@
         "macos"
       ],
       "requires": [
-        "success"
+        "success",
+        "fault",
+        "state"
       ],
       "critical": true,
       "assertions": {
         "success": [
           "only-outdated-package-with-exact-old-new-version-and-repository"
+        ],
+        "fault": [
+          "corrupt-backend-updates-error-with-request-id"
+        ],
+        "state": [
+          "corrupt-backend-preserved-and-updates-recover"
         ]
       },
       "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
@@ -2162,6 +2212,19 @@
           ],
           "assertions": [
             "only-outdated-package-with-exact-old-new-version-and-repository",
+            "fixture-cleanup"
+          ]
+        },
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::inventory_requests_report_backend_corruption_and_recover_over_real_ipc",
+          "evidence": [
+            "fault",
+            "state"
+          ],
+          "assertions": [
+            "corrupt-backend-updates-error-with-request-id",
+            "corrupt-backend-preserved-and-updates-recover",
             "fixture-cleanup"
           ]
         }
