@@ -699,32 +699,116 @@ mod dnf_integration {
 
     #[tokio::test]
     async fn test_list_updates() -> Result<()> {
-        // Gate inline (instead of require_system_tests!, whose `return;` is
-        // incompatible with this test's Result signature).
-        if common::TestConfig::default().skip_if_no_system("dnf_list_updates") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
-        }
-
-        let pm = DnfPackageManager::new();
-
-        // The call must succeed on a real system, and every reported update
-        // must be well-formed: named package with distinct old/new versions.
-        let updates = pm.list_updates().await?;
-        for update in &updates {
-            assert!(
-                !update.name.is_empty(),
-                "every update entry needs a package name"
+        let native_query = |selection: &str| -> Result<Vec<(String, String, String, String)>> {
+            let output = std::process::Command::new("dnf")
+                .args([
+                    "--cacheonly",
+                    "repoquery",
+                    selection,
+                    "--queryformat",
+                    "%{name}\t%{arch}\t%{evr}\t%{repoid}\\n",
+                    "--latest-limit=1",
+                ])
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "native DNF {selection} query failed: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
-            assert!(
-                update.old_version != update.new_version,
-                "update for {} must change version ({} -> {})",
-                update.name,
-                update.old_version,
-                update.new_version
+            String::from_utf8(output.stdout)?
+                .lines()
+                .map(|line| {
+                    let fields = line.split('\t').collect::<Vec<_>>();
+                    anyhow::ensure!(fields.len() == 4, "invalid native DNF row: {line}");
+                    Ok((
+                        fields[0].to_owned(),
+                        fields[1].to_owned(),
+                        fields[2].to_owned(),
+                        fields[3].to_owned(),
+                    ))
+                })
+                .collect()
+        };
+        let installed = native_query("--installed")?;
+        let upgrades = native_query("--upgrades")?;
+        let mut expected = Vec::new();
+        for (name, arch, new_version, repo) in upgrades {
+            let matching = installed
+                .iter()
+                .filter(|(installed_name, installed_arch, _, _)| {
+                    installed_name == &name && installed_arch == &arch
+                })
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                matching.len() == 1,
+                "native DNF upgrade {name}.{arch} has {} installed matches",
+                matching.len()
             );
+            let old_version = &matching[0].2;
+            anyhow::ensure!(
+                old_version != &new_version,
+                "unchanged DNF upgrade {name}.{arch}"
+            );
+            expected.push((name, old_version.clone(), new_version, repo));
         }
+        expected.sort();
 
+        let mut actual = DnfPackageManager::new()
+            .list_updates()
+            .await?
+            .into_iter()
+            .map(|update| {
+                (
+                    update.name,
+                    update.old_version,
+                    update.new_version,
+                    update.repo,
+                )
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "OMG update inventory differs from native DNF"
+        );
+
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["outdated", "--json"])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "omg outdated --json failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let rows = parsed
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("outdated --json must return an array"))?;
+        let mut cli = rows
+            .iter()
+            .map(|row| -> Result<(String, String, String, String)> {
+                Ok((
+                    row["name"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing name"))?
+                        .to_owned(),
+                    row["current_version"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing current version"))?
+                        .to_owned(),
+                    row["new_version"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing new version"))?
+                        .to_owned(),
+                    row["repo"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing repo"))?
+                        .to_owned(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        cli.sort();
+        assert_eq!(cli, expected, "CLI outdated JSON differs from native DNF");
         Ok(())
     }
 
