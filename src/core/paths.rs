@@ -5,6 +5,8 @@
 //! production path resolution cannot be redirected at runtime.
 
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::path::{Component, Path};
 #[cfg(any(test, debug_assertions))]
 use std::sync::OnceLock;
 #[cfg(any(test, debug_assertions))]
@@ -129,11 +131,76 @@ fn elevated_home_from_lookup(
 #[must_use]
 pub fn data_dir() -> PathBuf {
     if crate::core::is_root() {
+        // Debug-only CLI fixtures explicitly opt into an isolated data
+        // directory. Without this exception, root-run tests leave synthetic
+        // runtimes in /var/lib/omg and the next run fails.
+        if test_mode() {
+            let path = std::env::var_os("OMG_DATA_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .expect("root OMG_TEST_MODE requires an isolated OMG_DATA_DIR");
+            #[cfg(unix)]
+            assert!(
+                trusted_root_test_data_dir(&path),
+                "root OMG_TEST_MODE requires a root-owned protected temporary OMG_DATA_DIR"
+            );
+            #[cfg(not(unix))]
+            assert!(
+                path.is_absolute(),
+                "OMG_TEST_MODE requires an absolute OMG_DATA_DIR"
+            );
+            return path;
+        }
         return PathBuf::from("/var/lib/omg");
     }
     env_path("OMG_DATA_DIR").unwrap_or_else(|| {
         dirs::data_dir().map_or_else(|| fallback_home_dir().join(".omg"), |d| d.join("omg"))
     })
+}
+
+/// Root debug fixtures may write only below a protected directory they own in
+/// the system temporary tree. An env-controlled test switch alone must not
+/// redirect privileged state to an arbitrary path or a symlink.
+#[cfg(unix)]
+fn trusted_root_test_data_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Some((base, relative)) = [Path::new("/tmp"), Path::new("/var/tmp")]
+        .into_iter()
+        .find_map(|base| {
+            path.strip_prefix(base)
+                .ok()
+                .map(|relative| (base, relative))
+        })
+    else {
+        return false;
+    };
+    let Ok(base_metadata) = std::fs::symlink_metadata(base) else {
+        return false;
+    };
+    if !base_metadata.file_type().is_dir()
+        || base_metadata.uid() != 0
+        || base_metadata.mode() & 0o1000 == 0
+    {
+        return false;
+    }
+
+    let mut current = base.to_path_buf();
+    let mut saw_child = false;
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return false;
+        }
+        current.push(component);
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            return false;
+        };
+        if !metadata.file_type().is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return false;
+        }
+        saw_child = true;
+    }
+    saw_child
 }
 
 /// Create missing data directories privately without changing existing permissions.
@@ -777,6 +844,32 @@ mod tests {
                 "{name} must not be gated by the state-location guard"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_test_data_dir_requires_a_protected_owned_temporary_tree() {
+        let fixture = tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("temporary fixture");
+        assert_eq!(
+            trusted_root_test_data_dir(fixture.path()),
+            crate::core::is_root(),
+            "only a root-owned protected fixture may redirect root test state"
+        );
+        assert!(!trusted_root_test_data_dir(Path::new("/etc")));
+        assert!(!trusted_root_test_data_dir(Path::new("/tmp/../etc")));
+
+        let linked = fixture.path().join("linked");
+        std::os::unix::fs::symlink("/etc", &linked).expect("symlink fixture");
+        assert!(!trusted_root_test_data_dir(&linked));
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let writable = fixture.path().join("writable");
+        std::fs::create_dir(&writable).expect("writable fixture");
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o777))
+            .expect("set writable fixture mode");
+        assert!(!trusted_root_test_data_dir(&writable));
     }
 
     #[test]
