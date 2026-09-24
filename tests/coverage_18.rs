@@ -586,6 +586,20 @@ async fn cache_stats_reports_live_entries_and_capacity_over_real_ipc() -> Result
     }
 
     let fixture = RealServerFixture::new().await?;
+    // The accept loop starts before the background worker finishes its initial
+    // prewarm. Wait for its six search entries and two explicit-package entries so
+    // a late startup write cannot be mistaken for a failed CacheClear.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if stats(&fixture, 609).await?.0 >= 8 {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "daemon did not finish initial cache prewarm"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     match request_on_wire(&fixture, Request::CacheClear { id: 610 }).await? {
         Response::Success {
             id: 610,
