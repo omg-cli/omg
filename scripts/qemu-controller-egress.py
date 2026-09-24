@@ -29,7 +29,7 @@ def rules(address):
     ip = str(ipaddress.IPv4Address(address))
     yield ["!", "-s", ip, "-j", "RETURN"]
     # INPUT traffic to the runner itself is denied as well as routed private
-    # destinations. DOCKER-USER alone would not cover the bridge host address.
+    # destinations. INPUT also covers the bridge host address.
     yield ["-m", "addrtype", "--dst-type", "LOCAL", "-j", "REJECT"]
     for destination in PRIVATE:
         yield ["-d", destination, "-j", "REJECT"]
@@ -90,11 +90,14 @@ def install(controller):
                         ipv6=networks.get("bridge", {}).get("GlobalIPv6Address"))
         raise ValueError("controller network/capability configuration is not confined: " + json.dumps(observed))
     address = str(ipaddress.IPv4Address(networks["bridge"]["IPAddress"]))
-    execute(["iptables", "-w", "5", "-S", "DOCKER-USER"])
+    # Docker can leave DOCKER-USER behind bridge ACCEPT rules after a network
+    # is created. Hook our source-scoped chain directly into FORWARD so those
+    # rules cannot bypass it; the metadata counter below proves reachability.
+    execute(["iptables", "-w", "5", "-S", "FORWARD"])
     execute(["iptables", "-w", "5", "-N", chain])
     for rule in rules(address):
         execute(["iptables", "-w", "5", "-A", chain] + rule)
-    for parent in ("DOCKER-USER", "INPUT"):
+    for parent in ("FORWARD", "INPUT"):
         execute(["iptables", "-w", "5", "-I", parent, "1", "-j", chain])
     metadata_probe_attempts = verify_metadata_block(controller, chain)
     return dict(schema_version=1, chain=chain, metadata_block_verified=True,
@@ -110,7 +113,7 @@ def remove(controller):
     existing = execute(["iptables", "-w", "5", "-S"]).stdout
     if "-N " + chain not in existing.splitlines():
         return
-    for parent in ("DOCKER-USER", "INPUT"):
+    for parent in ("FORWARD", "INPUT"):
         if f"-A {parent} -j {chain}" in existing.splitlines():
             execute(["iptables", "-w", "5", "-D", parent, "-j", chain])
     execute(["iptables", "-w", "5", "-F", chain])

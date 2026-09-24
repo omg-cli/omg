@@ -37,6 +37,23 @@ class EgressTests(unittest.TestCase):
                 EGRESS.remove(NAME)
         self.assertEqual(run.call_count, 1)
 
+    def test_cleanup_removes_both_source_scoped_hooks(self):
+        chain = EGRESS.chain_name(NAME)
+
+        def fake(argv, check=True):
+            output = "" if argv[:2] == ["docker", "ps"] else (
+                f"-N {chain}\n-A FORWARD -j {chain}\n-A INPUT -j {chain}\n"
+                if argv[-1] == "-S" else ""
+            )
+            return subprocess.CompletedProcess(argv, 0, output, "")
+
+        with patch.object(EGRESS, "execute", side_effect=fake) as run:
+            EGRESS.remove(NAME)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["iptables", "-w", "5", "-D", "FORWARD", "-j", chain], commands)
+        self.assertIn(["iptables", "-w", "5", "-D", "INPUT", "-j", chain], commands)
+        self.assertIn(["iptables", "-w", "5", "-X", chain], commands)
+
     def test_invalid_controller_names_are_rejected(self):
         for name in ("other-container", "omg-qemu-run-../host", "--privileged"):
             with self.assertRaises(ValueError):
@@ -77,6 +94,10 @@ class EgressTests(unittest.TestCase):
                         EGRESS.install(NAME)
                 self.assertEqual(sleep.call_count, max(0, len(exits) - 1) if exits[0] != 0 else 0)
                 self.assertEqual(sum(call.args[0][:2] == ["docker", "exec"] for call in calls.call_args_list), len(exits))
+                self.assertIn(
+                    ["iptables", "-w", "5", "-I", "FORWARD", "1", "-j", EGRESS.chain_name(NAME)],
+                    [call.args[0] for call in calls.call_args_list],
+                )
 
 
 if __name__ == "__main__":

@@ -104,14 +104,14 @@ jobs to leave the GitHub queue. To start the distro manually, run
 `wsl.exe --distribution Ubuntu-24.04 --exec /usr/bin/sleep infinity` in a
 separate terminal.
 
-The QEMU controller also checks that its metadata-service probe increments its
-own firewall reject rule before it boots a guest. Docker's `DOCKER-USER` jump
-must run before bridge traffic is accepted in `FORWARD`. If the probe times out
-with a zero reject counter, inspect `sudo iptables -S FORWARD`. After a Docker
-upgrade or stale firewall restore, restart Docker while the runner is idle and
-verify the jump is ahead of bridge `ACCEPT` rules, then rerun the failed job.
-Do not disable the probe: a green guest without proven egress confinement is
-invalid evidence. See [Docker's iptables chain order](https://docs.docker.com/engine/network/firewall-iptables/).
+The QEMU controller checks that its metadata-service probe increments its own
+firewall reject rule before it boots a guest. Its source-scoped chain is hooked
+at the start of `FORWARD` and `INPUT`; this keeps the rule reachable even if
+Docker places `DOCKER-USER` behind bridge `ACCEPT` rules. The controller removes
+both hooks after the container exits. If the probe still times out with a zero
+reject counter, inspect `sudo iptables -S FORWARD` and the job's egress receipt
+before rerunning. Do not disable the probe: a green guest without proven egress
+confinement is invalid evidence. See [Docker's iptables chain order](https://docs.docker.com/engine/network/firewall-iptables/).
 
 ## Enable and verify routing
 
