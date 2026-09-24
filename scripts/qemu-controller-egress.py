@@ -6,6 +6,7 @@ import ipaddress
 import json
 import re
 import subprocess
+import time
 
 PRIVATE = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
            "169.254.0.0/16", "168.63.129.16/32", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
@@ -41,6 +42,37 @@ def rules(address):
     yield ["-j", "REJECT"]
 
 
+def metadata_reject_count(chain):
+    counters = execute(["iptables", "-w", "5", "-L", chain, "-n", "-v", "-x"]).stdout
+    matched = [line.split() for line in counters.splitlines()
+               if "169.254.0.0/16" in line and "REJECT" in line]
+    if len(matched) != 1 or not matched[0][0].isdigit():
+        raise ValueError("metadata reject rule is missing or ambiguous")
+    return int(matched[0][0])
+
+
+def verify_metadata_block(controller, chain):
+    # If the first probe is lost before FORWARD, allow a bounded setup retry.
+    # Only an observed increment in our own reject rule proves
+    # confinement; successful connections fail immediately and are never retried.
+    before = metadata_reject_count(chain)
+    attempts = []
+    for attempt in range(3):
+        probe = execute(["docker", "exec", controller, "bash", "-c",
+                         "timeout 3 bash -c 'exec 3<>/dev/tcp/169.254.169.254/80'"], check=False)
+        after = metadata_reject_count(chain)
+        attempts.append({"exit_code": probe.returncode, "reject_count_before": before,
+                         "reject_count_after": after, "stderr": probe.stderr[:512]})
+        if probe.returncode == 0:
+            raise ValueError("metadata connection succeeded despite firewall: " + json.dumps(attempts))
+        if after > before:
+            return attempts
+        before = after
+        if attempt < 2:
+            time.sleep(1)
+    raise ValueError("metadata rejection was not observed at the firewall: " + json.dumps(attempts))
+
+
 def install(controller):
     chain = chain_name(controller)
     container, = json.loads(execute(["docker", "inspect", controller]).stdout)
@@ -64,16 +96,9 @@ def install(controller):
         execute(["iptables", "-w", "5", "-A", chain] + rule)
     for parent in ("DOCKER-USER", "INPUT"):
         execute(["iptables", "-w", "5", "-I", parent, "1", "-j", chain])
-    # A failed connect alone could be missing routing. Require the installed
-    # metadata-deny rule's packet counter to increase as positive evidence.
-    probe = execute(["docker", "exec", controller, "bash", "-c",
-                     "timeout 3 bash -c 'exec 3<>/dev/tcp/169.254.169.254/80'"], check=False)
-    counters = execute(["iptables", "-w", "5", "-L", chain, "-n", "-v", "-x"]).stdout
-    matched = [line.split() for line in counters.splitlines()
-               if "169.254.0.0/16" in line and "REJECT" in line]
-    if probe.returncode == 0 or len(matched) != 1 or int(matched[0][0]) < 1:
-        raise ValueError("metadata rejection was not observed at the firewall")
+    metadata_probe_attempts = verify_metadata_block(controller, chain)
     return dict(schema_version=1, chain=chain, metadata_block_verified=True,
+                metadata_probe_attempts=metadata_probe_attempts,
                 scope="public-http-https-and-explicit-dns-ntp", ipv6="unconfigured")
 
 

@@ -46,20 +46,37 @@ class EgressTests(unittest.TestCase):
         container = dict(Name="/" + NAME, State=dict(Running=True),
                          HostConfig=dict(Privileged=False, CapDrop=["CAP_NET_RAW", "CAP_NET_ADMIN"], Dns=list(EGRESS.RESOLVERS)),
                          NetworkSettings=dict(Networks=dict(bridge=dict(IPAddress="172.17.0.2", GlobalIPv6Address=""))))
-        for packets in (0, 1):
+        for counts, exits, allowed in (
+            ([0, 1], [1], True),
+            ([0, 0, 1], [1, 1], True),
+            ([0, 0, 0, 0], [1, 1, 1], False),
+            ([0, 1], [0], False),
+        ):
+            counters = iter(counts)
+            probes = iter(exits)
+
             def fake(argv, check=True):
                 output = ""
                 if argv[:2] == ["docker", "inspect"]:
                     output = json.dumps([container])
                 elif "-L" in argv:
-                    output = f"{packets} 60 REJECT all -- * * 0.0.0.0/0 169.254.0.0/16\n"
-                return subprocess.CompletedProcess(argv, 1 if argv[:2] == ["docker", "exec"] else 0, output, "")
-            with patch.object(EGRESS, "execute", side_effect=fake):
-                if packets:
-                    self.assertTrue(EGRESS.install(NAME)["metadata_block_verified"])
+                    output = f"{next(counters)} 60 REJECT all -- * * 0.0.0.0/0 169.254.0.0/16\n"
+                return subprocess.CompletedProcess(argv, next(probes) if argv[:2] == ["docker", "exec"] else 0, output, "")
+
+            with self.subTest(counts=counts, exits=exits), \
+                    patch.object(EGRESS, "execute", side_effect=fake) as calls, \
+                    patch.object(EGRESS.time, "sleep") as sleep:
+                if allowed:
+                    receipt = EGRESS.install(NAME)
+                    self.assertTrue(receipt["metadata_block_verified"])
+                    self.assertEqual(len(receipt["metadata_probe_attempts"]), len(exits))
+                    self.assertGreater(receipt["metadata_probe_attempts"][-1]["reject_count_after"],
+                                       receipt["metadata_probe_attempts"][-1]["reject_count_before"])
                 else:
-                    with self.assertRaises(ValueError):
+                    with self.assertRaisesRegex(ValueError, "metadata (rejection was not observed|connection succeeded)"):
                         EGRESS.install(NAME)
+                self.assertEqual(sleep.call_count, max(0, len(exits) - 1) if exits[0] != 0 else 0)
+                self.assertEqual(sum(call.args[0][:2] == ["docker", "exec"] for call in calls.call_args_list), len(exits))
 
 
 if __name__ == "__main__":
