@@ -816,6 +816,10 @@ impl AuditIntegrityReport {
 /// Global audit logger instance
 static AUDIT_LOGGER: std::sync::LazyLock<std::sync::Mutex<Option<AuditLogger>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+// Queue overflow must find the active collection without waiting for the
+// writer's logger mutex, which can be held through file locking and fsync.
+static AUDIT_INCOMPLETE_MARKER: std::sync::LazyLock<std::sync::RwLock<Option<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
 
 const AUDIT_QUEUE_CAPACITY: usize = 1024;
 
@@ -874,9 +878,13 @@ pub(crate) fn init_audit_logger_in(log_path: impl AsRef<Path>) -> Result<(), Aud
         }
         Err(e) => return Err(e),
     };
+    let marker = logger.log_path.with_file_name("incomplete");
     *AUDIT_LOGGER
         .lock()
         .map_err(|_| AuditError::LoggerPoisoned)? = Some(logger);
+    *AUDIT_INCOMPLETE_MARKER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(marker);
     Ok(())
 }
 
@@ -898,7 +906,10 @@ fn record_global(
     };
     if guard.is_none() {
         match AuditLogger::new() {
-            Ok(logger) => *guard = Some(logger),
+            Ok(logger) => {
+                remember_audit_marker(&logger);
+                *guard = Some(logger);
+            }
             Err(AuditError::CorruptLine { .. } | AuditError::MissingHash { .. }) => {
                 let log_path = paths::data_dir().join("audit/audit.jsonl");
                 if let Ok(quarantined) = quarantine_corrupt_audit_log(&log_path) {
@@ -907,6 +918,7 @@ fn record_global(
                         quarantined.display()
                     );
                     if let Ok(logger) = AuditLogger::new() {
+                        remember_audit_marker(&logger);
                         *guard = Some(logger);
                     }
                 }
@@ -1923,15 +1935,21 @@ pub fn ensure_complete_collection(marker: &Path) -> anyhow::Result<()> {
 }
 
 fn mark_audit_incomplete() {
-    let guard = AUDIT_LOGGER
-        .lock()
+    let marker = AUDIT_INCOMPLETE_MARKER
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let marker = guard.as_ref().map_or_else(
-        || paths::data_dir().join("audit/incomplete"),
-        |logger| logger.log_path.with_file_name("incomplete"),
-    );
-    drop(guard);
+    let marker = marker
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| paths::data_dir().join("audit/incomplete"));
     mark_audit_incomplete_at_or_log(&marker);
+}
+
+fn remember_audit_marker(logger: &AuditLogger) {
+    *AUDIT_INCOMPLETE_MARKER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(logger.log_path.with_file_name("incomplete"));
 }
 
 fn mark_audit_incomplete_at_or_log(path: &Path) {
@@ -1976,6 +1994,29 @@ mod completeness_tests {
         let marker = log_path.with_file_name("incomplete");
         assert!(super::ensure_complete_collection(&marker).is_err());
         *super::AUDIT_LOGGER.lock().unwrap() = None;
+        *super::AUDIT_INCOMPLETE_MARKER.write().unwrap() = None;
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn incomplete_marker_does_not_wait_for_audit_writer_lock() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let log_path = directory.path().join("audit/audit.jsonl");
+        super::init_audit_logger_in(&log_path)?;
+        let logger_guard = super::AUDIT_LOGGER.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            super::mark_audit_incomplete();
+            let _ = sender.send(());
+        });
+        let completed = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        drop(logger_guard);
+        worker.join().expect("marker writer thread must finish");
+        completed.expect("incomplete marker must not wait for the audit writer lock");
+        assert!(super::ensure_complete_collection(&log_path.with_file_name("incomplete")).is_err());
+        *super::AUDIT_LOGGER.lock().unwrap() = None;
+        *super::AUDIT_INCOMPLETE_MARKER.write().unwrap() = None;
         Ok(())
     }
 
