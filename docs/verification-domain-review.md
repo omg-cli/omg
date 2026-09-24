@@ -329,6 +329,24 @@ The admitted contract covers this injected-backend failure and recovery, not
 native package databases, completed vulnerability scans, concurrent refresh,
 or arbitrary persistent-cache corruption. Those remain outside this claim.
 
+## Truncated GitHub Gist lockfile fetch (2026-09-24)
+
+[Issue #559](https://github.com/omg-cli/omg/issues/559) records a valid
+Gist sync failure: GitHub's [Gist API](https://docs.github.com/en/rest/gists/gists#truncation)
+may return a partial `content` field with `truncated: true`, while the complete
+file remains available at `raw_url`. A loopback HTTP fixture reproduced the
+pre-fix failure: sync parsed the partial inline field and rejected the lock
+without requesting the raw file. The production fetch path now selects the
+bounded raw response when inline content is truncated or absent.
+
+The same fixture requires an exact valid lockfile replacement and backup of
+the previous bytes. A separate fixture requires complete inline content to
+sync without any raw request. Both run against the normal deserializer,
+lockfile integrity check and atomic write path. This is local library-path
+evidence, not an end-to-end live GitHub or `omg env sync` binary claim; the
+CLI sync surfaces remain provisional gaps until their own reviewed receipts
+exist. No global coverage flag changes.
+
 ## Portable environment export and plan evidence (2026-09-24)
 
 Two real `omg` CLI fixtures exercise `env export --source-target` and
