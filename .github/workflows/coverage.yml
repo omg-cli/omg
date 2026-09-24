@@ -47,9 +47,26 @@ jobs:
 
     steps:
       - name: Install system dependencies
+        shell: bash
         run: |
-          pacman -Syu --noconfirm
-          pacman -S --noconfirm base-devel git curl pkgconf openssl libarchive clang cmake
+          set -euo pipefail
+          packages=(base-devel git curl pkgconf openssl libarchive clang cmake)
+          # One full upgrade/install transaction keeps the rolling container
+          # consistent and avoids resolving the package graph twice.
+          if pacman -Syu --noconfirm --needed "${packages[@]}" 2>&1 | tee /tmp/omg-pacman-setup.log; then
+            exit 0
+          fi
+
+          # The official image lists Fastly before the geo mirror. Only a
+          # Fastly transfer failure warrants a synchronized mirror fallback;
+          # resolution, signature verification, and hook failures remain fatal.
+          if ! grep -Eq 'error: failed retrieving file .* from fastly\.mirror\.pkgbuild\.com' /tmp/omg-pacman-setup.log; then
+            exit 1
+          fi
+          grep -q '^Server = https://geo\.mirror\.pkgbuild\.com/' /etc/pacman.d/mirrorlist
+          echo '::warning::Fastly package fetch failed; refreshing from the official geo mirror'
+          sed -i '/fastly\.mirror\.pkgbuild\.com/d' /etc/pacman.d/mirrorlist
+          pacman -Syyu --noconfirm --needed "${packages[@]}"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
