@@ -23,6 +23,17 @@ SPEC.loader.exec_module(SELECTION)
 COVERAGE = SELECTION.COVERAGE
 require = COVERAGE.require
 
+NETWORK_SKIP_REASON = 'network tests disabled (set OMG_RUN_NETWORK_TESTS=1)'
+EXPLAINED_SKIP_REASONS = {
+    **{'omg::e2e_runtime_management::' + name: NETWORK_SKIP_REASON for name in (
+        'test_list_available_versions', 'test_use_node_latest', 'test_use_node_lts',
+        'test_use_node_with_version', 'test_use_python_with_version')},
+    'omg::cli::self_update::tests::attestation_ignores_path_hijacked_gh':
+        'PATH impostor test requires a host without a trusted gh binary',
+    'omg::cli::self_update::tests::elevated_verifier_rejects_another_users_helper':
+        'elevated verifier ownership test requires root',
+}
+
 
 BEHAVIOR_TESTS = frozenset({
     'omg::cli_comprehensive::system_tests::config_access_errors_never_report_missing_or_valid_defaults',
@@ -264,12 +275,36 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n', encoding='utf-8')
 
 
+def explained_runtime_skips(execution):
+    approved = []
+    for identity, test in execution['tests'].items():
+        if not test['runtime_skip']:
+            continue
+        reason = test.get('runtime_skip_reason')
+        require(reason == EXPLAINED_SKIP_REASONS.get(identity)
+                and [attempt['result'] for attempt in test['attempts']] == ['SKIPPED'],
+                'unexplained native runtime skip: ' + identity)
+        require(reason != NETWORK_SKIP_REASON or os.environ.get('OMG_RUN_NETWORK_TESTS') != '1',
+                'network test skipped despite network opt-in: ' + identity)
+        require(reason != 'elevated verifier ownership test requires root'
+                or not hasattr(os, 'geteuid') or os.geteuid() != 0,
+                'root-only test skipped on root runner: ' + identity)
+        approved.append({'test_id': identity, 'reason': reason})
+    return sorted(approved, key=lambda row: row['test_id'])
+
+
 def admission_exit_code(process_status, execution, contracts_passed):
     # Nextest may accept a later attempt, but every selected test's first
-    # failure or runtime skip remains fatal, even without a reviewed contract.
+    # failure remains fatal. Known host/network skips are recorded but never
+    # become passing tests or contract evidence.
     counts = execution['counts']
-    return int(bool(process_status or counts['passed'] != counts['selected']
-                    or counts['retried'] or not contracts_passed))
+    try:
+        skips = explained_runtime_skips(execution)
+    except (ValueError, KeyError):
+        return 1
+    return int(bool(process_status or counts['failed'] or counts['retried']
+                    or counts['passed'] + len(skips) != counts['selected']
+                    or not contracts_passed))
 
 
 def command_output(argv):
@@ -416,6 +451,11 @@ def main():
         verdict = admission_exit_code(result.returncode, execution, passed)
         if verdict == 0:
             aggregate = COVERAGE.aggregate_admissions(manifest, admissions)
+            aggregate['selected_tests'] = {
+                'selected': execution['counts']['selected'],
+                'passed': execution['counts']['passed'],
+                'explained_skips': explained_runtime_skips(execution),
+            }
             write_json(evidence / 'aggregate.json', aggregate)
             progress = aggregate['behavioral_progress']
             summary += (f"\nNative owner union: {aggregate['contracts']['passed']}/"
@@ -423,6 +463,9 @@ def main():
                         f"fully evidenced behavioral surfaces {progress['covered']}/"
                         f"{progress['supported']}. Inventory review: "
                         f"{'complete' if progress['inventory_reviewed'] else 'incomplete'}.\n")
+            skips = aggregate['selected_tests']['explained_skips']
+            summary += f"Selected native tests: {execution['counts']['passed']} passed, {len(skips)} explained skips.\n"
+            summary += ''.join(f"- Not credited: `{row['test_id']}` ({row['reason']})\n" for row in skips)
         print(summary)
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as stream:

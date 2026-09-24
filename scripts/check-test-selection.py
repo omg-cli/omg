@@ -92,6 +92,10 @@ def read_junit(data):
             output = '\n'.join(''.join(child.itertext()) for child in case
                                if child.tag in ('system-out', 'system-err'))
             runtime_skip = '[omg-skip]' in output
+            markers = [line.removeprefix('[omg-skip] ').strip() for line in output.splitlines()
+                       if line.startswith('[omg-skip] ')]
+            require(len(markers) <= 1, 'ambiguous runtime skip reason')
+            skip_reason = markers[0] if markers else None
             attempts = []
             if skipped:
                 attempts.append({'result': 'SKIPPED', 'duration_ms': 0.0})
@@ -102,7 +106,8 @@ def read_junit(data):
                 attempts.extend({'result': 'FAIL', 'duration_ms': duration(child)} for child in flaky)
                 attempts.append({'result': 'SKIPPED' if runtime_skip else 'PASS', 'duration_ms': duration(case)})
             require(len(attempts) <= 100, 'too many execution attempts')
-            observed[identity] = {'attempts': attempts, 'runtime_skip': runtime_skip}
+            observed[identity] = {'attempts': attempts, 'runtime_skip': runtime_skip,
+                                  'runtime_skip_reason': skip_reason}
     return observed
 
 

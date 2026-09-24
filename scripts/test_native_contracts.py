@@ -49,6 +49,27 @@ class WholeSuiteAdmission(unittest.TestCase):
         self.assertEqual(execution['counts']['skipped'], 1)
         self.assertEqual(NATIVE.admission_exit_code(0, execution, True), 1)
 
+    def test_only_named_and_explained_host_skips_can_leave_native_contracts_green(self):
+        known = 'omg::cli::self_update::tests::elevated_verifier_rejects_another_users_helper'
+        reason = 'elevated verifier ownership test requires root'
+        execution = {'counts': {'selected': 2, 'passed': 1, 'failed': 0, 'retried': 0},
+                     'tests': {known: {'runtime_skip': True, 'runtime_skip_reason': reason,
+                                       'attempts': [{'result': 'SKIPPED'}]}}}
+        if os.name == 'posix' and os.geteuid() != 0:
+            self.assertEqual(NATIVE.admission_exit_code(0, execution, True), 0)
+            self.assertEqual(NATIVE.explained_runtime_skips(execution),
+                             [{'test_id': known, 'reason': reason}])
+        for mutation in ('unknown-id', 'wrong-reason', 'unexpected-pass'):
+            invalid = copy.deepcopy(execution)
+            if mutation == 'unknown-id':
+                invalid['tests']['omg::unknown'] = invalid['tests'].pop(known)
+            elif mutation == 'wrong-reason':
+                invalid['tests'][known]['runtime_skip_reason'] = 'unexpected environment failure'
+            else:
+                invalid['counts']['passed'] = 2
+            with self.subTest(mutation=mutation):
+                self.assertEqual(NATIVE.admission_exit_code(0, invalid, True), 1)
+
 
 @unittest.skipUnless(os.name == 'posix' and shutil.which('runuser'), 'requires Linux runuser')
 class NativeRunner(unittest.TestCase):
