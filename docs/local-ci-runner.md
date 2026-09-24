@@ -60,6 +60,18 @@ Its `/etc/wsl.conf` enables systemd and disables automatic Windows-drive mounts
 and Windows process interop. This reduces accidental access to host files, but
 does not replace the organization runner-group restriction.
 
+Install the ACL utility before enabling QEMU jobs. WSL can expose `/dev/kvm`
+with a group other than `kvm`, even when `omgci` belongs to that group. The
+workflow grants `omgci` access to this device when needed; it requires
+`setfacl` and must not widen access to all local users:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y acl
+command -v setfacl
+sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+```
+
 Before registration, verify these from PowerShell:
 
 ```powershell
@@ -91,6 +103,15 @@ Check that task and the runner's GitHub status after a reboot before expecting
 jobs to leave the GitHub queue. To start the distro manually, run
 `wsl.exe --distribution Ubuntu-24.04 --exec /usr/bin/sleep infinity` in a
 separate terminal.
+
+The QEMU controller also checks that its metadata-service probe increments its
+own firewall reject rule before it boots a guest. Docker's `DOCKER-USER` jump
+must run before bridge traffic is accepted in `FORWARD`. If the probe times out
+with a zero reject counter, inspect `sudo iptables -S FORWARD`. After a Docker
+upgrade or stale firewall restore, restart Docker while the runner is idle and
+verify the jump is ahead of bridge `ACCEPT` rules, then rerun the failed job.
+Do not disable the probe: a green guest without proven egress confinement is
+invalid evidence. See [Docker's iptables chain order](https://docs.docker.com/engine/network/firewall-iptables/).
 
 ## Enable and verify routing
 

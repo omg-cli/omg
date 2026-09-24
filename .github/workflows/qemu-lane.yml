@@ -248,7 +248,11 @@ jobs:
           if [[ -r /dev/kvm && -w /dev/kvm ]]; then
             echo "/dev/kvm is already accessible"
           else
-            sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+            if ! command -v setfacl >/dev/null 2>&1; then
+              echo "::error::setfacl is missing; install the acl package on this runner (docs/local-ci-runner.md)"
+              exit 1
+            fi
+            sudo -n setfacl -m "u:$(id -u):rw" /dev/kvm
           fi
 
       - name: Fail fast without KVM
