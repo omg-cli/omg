@@ -484,13 +484,20 @@ async fn run_with_status_path(
         Duration::from_secs(30),
     )
     .await;
+    let audit_result = crate::core::security::audit::drain_audit_queue().await;
     if intake_result.is_err()
         && let Err(error) = &shutdown_result
     {
         tracing::error!("Additional daemon shutdown failure: {error:#}");
     }
+    if (intake_result.is_err() || shutdown_result.is_err())
+        && let Err(error) = &audit_result
+    {
+        tracing::error!("Additional audit drain failure: {error:#}");
+    }
     intake_result?;
     shutdown_result?;
+    audit_result?;
     if internal_failure.is_none() {
         internal_failure = internal_failure_rx.try_recv().ok();
     }

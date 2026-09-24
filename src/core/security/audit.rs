@@ -830,23 +830,33 @@ struct QueuedAuditEvent {
     description: String,
 }
 
+enum AuditQueueMessage {
+    Event(QueuedAuditEvent),
+    Drain(std::sync::mpsc::SyncSender<()>),
+}
+
 /// Daemon callers enqueue owned events so filesystem locking, serialization,
 /// and durability syncs run on one dedicated blocking writer thread rather
 /// than a Tokio executor thread.
-static AUDIT_QUEUE: std::sync::LazyLock<std::sync::mpsc::SyncSender<QueuedAuditEvent>> =
+static AUDIT_QUEUE: std::sync::LazyLock<std::sync::mpsc::SyncSender<AuditQueueMessage>> =
     std::sync::LazyLock::new(|| {
         let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<QueuedAuditEvent>(AUDIT_QUEUE_CAPACITY);
+            std::sync::mpsc::sync_channel::<AuditQueueMessage>(AUDIT_QUEUE_CAPACITY);
         if let Err(error) = std::thread::Builder::new()
             .name("omg-audit-writer".to_string())
             .spawn(move || {
                 while let Ok(message) = receiver.recv() {
-                    record_global(
-                        message.event,
-                        message.severity,
-                        &message.resource,
-                        &message.description,
-                    );
+                    match message {
+                        AuditQueueMessage::Event(message) => record_global(
+                            message.event,
+                            message.severity,
+                            &message.resource,
+                            &message.description,
+                        ),
+                        AuditQueueMessage::Drain(done) => {
+                            let _ = done.send(());
+                        }
+                    }
                 }
             })
         {
@@ -959,9 +969,9 @@ pub fn audit_log_nonblocking(
         resource: bounded_audit_field(resource),
         description: bounded_audit_field(description),
     };
-    match AUDIT_QUEUE.try_send(message) {
+    match AUDIT_QUEUE.try_send(AuditQueueMessage::Event(message)) {
         Ok(()) => {}
-        Err(std::sync::mpsc::TrySendError::Full(message)) => {
+        Err(std::sync::mpsc::TrySendError::Full(AuditQueueMessage::Event(message))) => {
             mark_audit_incomplete();
             tracing::error!(
                 "Audit queue is full; dropping event {} for {}",
@@ -969,7 +979,7 @@ pub fn audit_log_nonblocking(
                 message.resource
             );
         }
-        Err(std::sync::mpsc::TrySendError::Disconnected(message)) => {
+        Err(std::sync::mpsc::TrySendError::Disconnected(AuditQueueMessage::Event(message))) => {
             mark_audit_incomplete();
             tracing::error!(
                 "Audit writer is unavailable; dropping event {} for {}",
@@ -977,7 +987,58 @@ pub fn audit_log_nonblocking(
                 message.resource
             );
         }
+        Err(_) => unreachable!("only audit events are submitted by this function"),
     }
+}
+
+/// Wait until all events submitted before this barrier have been written or
+/// marked incomplete. A stopped daemon must not leave its audit writer using
+/// a collection after the daemon's state has been torn down.
+pub(crate) async fn drain_audit_queue() -> anyhow::Result<()> {
+    let result = tokio::task::spawn_blocking(|| {
+        wait_for_audit_drain(&AUDIT_QUEUE, std::time::Duration::from_secs(10))
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            mark_audit_incomplete();
+            Err(error)
+        }
+        Err(error) => {
+            mark_audit_incomplete();
+            Err(error.into())
+        }
+    }
+}
+
+fn wait_for_audit_drain(
+    sender: &std::sync::mpsc::SyncSender<AuditQueueMessage>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    let (done, received) = std::sync::mpsc::sync_channel(0);
+    let mut message = AuditQueueMessage::Drain(done);
+    loop {
+        match sender.try_send(message) {
+            Ok(()) => break,
+            Err(std::sync::mpsc::TrySendError::Full(pending)) => {
+                message = pending;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                anyhow::ensure!(
+                    !remaining.is_zero(),
+                    "audit queue drain timed out before enqueue"
+                );
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                anyhow::bail!("audit writer is unavailable");
+            }
+        }
+    }
+    received
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .map_err(|error| anyhow::anyhow!("audit writer did not drain: {error}"))
 }
 
 #[cfg(test)]
@@ -1980,6 +2041,35 @@ fn mark_audit_incomplete_at(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod completeness_tests {
+    #[test]
+    fn drain_timeout_does_not_leave_a_blocked_sender() {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(0);
+        let start = std::time::Instant::now();
+        let result = super::wait_for_audit_drain(&sender, std::time::Duration::from_millis(20));
+        assert!(result.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn drain_waits_for_prior_queued_event_to_reach_disk() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let log_path = directory.path().join("audit/audit.jsonl");
+        super::init_audit_logger_in(&log_path)?;
+        super::audit_log_nonblocking(
+            super::AuditEventType::SecurityAudit,
+            super::AuditSeverity::Info,
+            "drain-contract",
+            "queued before shutdown",
+        );
+        super::drain_audit_queue().await?;
+        let written = std::fs::read_to_string(&log_path)?;
+        assert!(written.contains("drain-contract"));
+        *super::AUDIT_LOGGER.lock().unwrap() = None;
+        *super::AUDIT_INCOMPLETE_MARKER.write().unwrap() = None;
+        Ok(())
+    }
+
     #[test]
     #[serial_test::serial]
     fn failed_global_append_marks_its_explicit_collection_incomplete() -> anyhow::Result<()> {
