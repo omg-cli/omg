@@ -329,20 +329,6 @@
         "portable",
         "ubuntu"
       ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_integration::native_history_honors_custom_and_disabled_service_history",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_integration::native_transactions_record_install_remove_and_ignore_noops",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
     }
   ]
 }

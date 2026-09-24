@@ -1,12 +1,22 @@
 [store]
 dir = "target/nextest"
 
+[test-groups]
+fedora-rpm-state = { max-threads = 1 }
+
 [profile.default]
 test-threads = "num-cpus"
 fail-fast = true
 status-level = "pass"
 final-status-level = "fail"
 retries = 1
+
+# Nextest runs each test in a separate process. Fedora read assertions compare
+# snapshots of shared RPM state, so they cannot overlap a package mutation.
+[[profile.default.overrides]]
+filter = 'binary(=fedora_tests)'
+test-group = 'fedora-rpm-state'
+retries = 0
 
 # These regressions must fail on their first failure: a successful retry can
 # conceal a lost update or first-creation lock race. Default overrides apply
