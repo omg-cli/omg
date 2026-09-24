@@ -157,11 +157,16 @@ check_fedora_reason_refusal() {
   [[ ! -e "$fixture" && ! -L "$fixture" ]]
 }
 # END BACKEND FAULT PROBE
-[[ $# == 2 && $(id -u) != 0 ]] || exit 2
+if [[ $# != 2 || $(id -u) == 0 ]]; then
+  printf 'daemon lifecycle probe requires an unprivileged user and binary/evidence paths\n' >&2
+  exit 2
+fi
 bin=$(realpath "$1")
 daemon="${bin%/*}/omgd"
 evidence=$(realpath "$2")
-[[ -x "$bin" && -x "$daemon" && -d "$evidence" ]] || exit 1
+if [[ ! -x "$bin" ]]; then printf 'daemon lifecycle OMG binary is not executable: %s\n' "$bin" >&2; exit 1; fi
+if [[ ! -x "$daemon" ]]; then printf 'daemon lifecycle omgd binary is not executable: %s\n' "$daemon" >&2; exit 1; fi
+if [[ ! -d "$evidence" ]]; then printf 'daemon lifecycle evidence directory is missing: %s\n' "$evidence" >&2; exit 1; fi
 export LC_ALL=C NO_COLOR=1
 unset OMG_DISABLE_DAEMON OMG_NO_DAEMON
 case "${OMG_QEMU_ACCEL:-kvm}" in
