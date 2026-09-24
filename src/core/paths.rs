@@ -132,22 +132,22 @@ fn elevated_home_from_lookup(
 pub fn data_dir() -> PathBuf {
     if crate::core::is_root() {
         // Debug-only CLI fixtures explicitly opt into an isolated data
-        // directory. Without this exception, root-run tests leave synthetic
-        // runtimes in /var/lib/omg and the next run fails.
-        if test_mode() {
+        // directory. Native fixtures use the real package backend; the
+        // separate test-mode switch selects a synthetic backend.
+        if test_mode() || native_test_data_dir_enabled() {
             let path = std::env::var_os("OMG_DATA_DIR")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
-                .expect("root OMG_TEST_MODE requires an isolated OMG_DATA_DIR");
+                .expect("root debug fixture requires an isolated OMG_DATA_DIR");
             #[cfg(unix)]
             assert!(
                 trusted_root_test_data_dir(&path),
-                "root OMG_TEST_MODE requires a root-owned protected temporary OMG_DATA_DIR"
+                "root debug fixture requires a root-owned protected temporary OMG_DATA_DIR"
             );
             #[cfg(not(unix))]
             assert!(
                 path.is_absolute(),
-                "OMG_TEST_MODE requires an absolute OMG_DATA_DIR"
+                "debug fixture requires an absolute OMG_DATA_DIR"
             );
             return path;
         }
@@ -720,6 +720,13 @@ fn test_mode_value(value: Option<&str>, debug_assertions: bool) -> bool {
         && value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
+fn native_test_data_dir_enabled() -> bool {
+    test_mode_value(
+        std::env::var("OMG_NATIVE_TEST_DATA_DIR").ok().as_deref(),
+        cfg!(debug_assertions),
+    )
+}
+
 /// Returns true if a debug/test binary is running in hermetic test mode.
 ///
 /// Release binaries ignore `OMG_TEST_MODE`: an inherited environment variable
@@ -870,6 +877,20 @@ mod tests {
         std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o777))
             .expect("set writable fixture mode");
         assert!(!trusted_root_test_data_dir(&writable));
+    }
+
+    #[test]
+    fn native_test_data_dir_keeps_the_real_package_backend() {
+        temp_env::with_vars(
+            [
+                ("OMG_NATIVE_TEST_DATA_DIR", Some("1")),
+                ("OMG_TEST_MODE", None),
+            ],
+            || {
+                assert_eq!(native_test_data_dir_enabled(), cfg!(debug_assertions));
+                assert!(!test_mode());
+            },
+        );
     }
 
     #[test]
