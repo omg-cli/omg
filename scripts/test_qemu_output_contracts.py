@@ -428,6 +428,39 @@ esac
             self.assertEqual(self.run_oracle(assertion=assertion, tree_oracle_status=0).returncode, 0)
             self.assertNotEqual(self.run_oracle(assertion=assertion, tree_oracle_status=1).returncode, 0)
 
+    def test_release_search_requires_an_exact_ranked_official_result(self):
+        valid = '  | Search\n    tree\n  tree 2.1.3  Official\n  tree-sitter 1.0  Official\n'
+        self.assertEqual(self.run_oracle(assertion='search-official-tree-output', stdout=valid).returncode, 0)
+        invalid = [
+            '', 'No results found\n', '  tree 2.1.3  AUR\n',
+            '  tree  Official\n', '  tree-sitter 1.0  Official\n',
+            '  tree 2.1.3  AUR\n  tree 2.1.3  Official\n',
+            '  tree-sitter 1.0  Official\n  tree 2.1.3  Official\n',
+            '  tree 2.1.3  Official\n  tree 2.1.3  Official\n',
+        ]
+        for output in invalid:
+            with self.subTest(output=output):
+                self.assertNotEqual(
+                    self.run_oracle(assertion='search-official-tree-output', stdout=output).returncode,
+                    0,
+                )
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_release_search_runner_rejects_successful_empty_search(self):
+        row = ('release-package-search-tree\t["search","tree"]\tread\t0\tpass\t-'
+               '\tcontainer\tarch:pass\tsearch-official-tree-output\tnone')
+        for payload, accepted in (
+            ('No results found', False),
+            ('  tree 2.1.3  Official', True),
+        ):
+            with self.subTest(payload=payload):
+                product = f'printf %s {shlex.quote(payload)}\n'
+                result, evidence, logs = self.run_inventory(product, [row], tiers='container')
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'PASS' if accepted else 'FAIL')
+                if not accepted:
+                    self.assertIn('search lacks a ranked official tree', logs['release-package-search-tree.log'])
+
     @unittest.skipIf(os.name == 'nt', 'Native package oracle fixtures require POSIX executables')
     def test_native_tree_state_requires_database_and_payload_parity(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')

@@ -391,6 +391,17 @@ check_product_output() {
         local expected=installed
         [[ "$assertion" == native-tree-installed ]] || expected=absent
         check_native_tree_state "$distro" "$expected" || return 1 ;;
+      search-official-tree-output)
+        if ! awk '
+          /^  [^[:space:]]+ [^[:space:]]+  / {
+            results++
+            if (results == 1 && ($1 != "tree" || $3 != "Official" || NF != 3)) bad=1
+            if ($1 == "tree") trees++
+          }
+          END { exit !(results > 0 && trees == 1 && !bad) }
+        ' "$stdout"; then
+          printf 'assertion failed: search lacks a ranked official tree result\n' >&2; return 1
+        fi ;;
       search-official-limit-three)
         if ! awk '
           /^  \| Search$/ { headings++; next }
@@ -613,7 +624,8 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|native-tree-installed|native-tree-absent) ;; *) exit 2 ;; esac
+  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent) ;; *) exit 2 ;; esac
+  if [[ "$a" == search-official-tree-output ]]; then [[ "$id" == release-package-search-tree ]] || exit 2; fi
   if [[ "$a" == native-tree-installed ]]; then [[ "$id" == release-package-install-tree ]] || exit 2; fi
   if [[ "$a" == native-tree-absent ]]; then [[ "$id" == release-package-remove-tree ]] || exit 2; fi
   case "$cleanup" in tempdir-drop|none|container-prune|host-state-restore|vm-revert|daemon-stop) ;; *) exit 2 ;; esac
