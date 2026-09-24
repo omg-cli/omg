@@ -36,6 +36,19 @@ class WholeSuiteAdmission(unittest.TestCase):
                 self.assertEqual(NATIVE.admission_exit_code(17, execution, True), 1)
                 self.assertEqual(NATIVE.admission_exit_code(0, execution, False), 1)
 
+    def test_selected_unmapped_runtime_skip_blocks_native_summary(self):
+        binary = 'omg::unmapped'
+        listing = {'test-count': 1, 'rust-suites': {binary: {
+            'binary-id': binary, 'status': 'listed', 'testcases': {
+                'behavior': {'ignored': False, 'filter-match': {'status': 'matches'}}}}}}
+        xml = (f'<testsuites><testsuite name="{binary}"><testcase '
+               f'classname="{binary}" name="behavior" time="0.2">'
+               '<skipped/></testcase></testsuite></testsuites>').encode()
+        execution = NATIVE.SELECTION.reconcile(listing, xml, [binary])
+        self.assertEqual(execution['counts']['selected'], 1)
+        self.assertEqual(execution['counts']['skipped'], 1)
+        self.assertEqual(NATIVE.admission_exit_code(0, execution, True), 1)
+
 
 @unittest.skipUnless(os.name == 'posix' and shutil.which('runuser'), 'requires Linux runuser')
 class NativeRunner(unittest.TestCase):

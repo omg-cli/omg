@@ -266,8 +266,10 @@ def write_json(path, value):
 
 def admission_exit_code(process_status, execution, contracts_passed):
     # Nextest may accept a later attempt, but every selected test's first
-    # failure remains fatal, even before that test owns a reviewed contract.
-    return int(bool(process_status or execution['counts']['failed'] or not contracts_passed))
+    # failure or runtime skip remains fatal, even without a reviewed contract.
+    counts = execution['counts']
+    return int(bool(process_status or counts['passed'] != counts['selected']
+                    or counts['retried'] or not contracts_passed))
 
 
 def command_output(argv):
@@ -411,7 +413,8 @@ def main():
         summary += '\n' + COVERAGE.render_markdown(daemon_report)
         passed = passed and daemon_report['passed']
         admissions.append((service_provenance, daemon_report, daemon_required))
-        if passed:
+        verdict = admission_exit_code(result.returncode, execution, passed)
+        if verdict == 0:
             aggregate = COVERAGE.aggregate_admissions(manifest, admissions)
             write_json(evidence / 'aggregate.json', aggregate)
             progress = aggregate['behavioral_progress']
@@ -424,7 +427,7 @@ def main():
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as stream:
                 stream.write(summary)
-        return admission_exit_code(result.returncode, execution, passed)
+        return verdict
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
         write_json(evidence / 'admission-error.json', {'schema_version': 1, 'error': str(error)})
         print('Native contract admission failed: ' + str(error), file=sys.stderr)
