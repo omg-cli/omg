@@ -41,7 +41,7 @@ jobs:
     name: Run Benchmarks
     needs: workflow-helpers
     runs-on: ubuntu-24.04
-    container: archlinux:latest@sha256:b0deabeb3d283da2c7f7dbf0eea051b7b2cd0554e0b737cc457fd21683bdcdd1
+    container: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
     timeout-minutes: 30
     outputs:
       search_time: ${{ steps.bench.outputs.search_time }}
@@ -86,7 +86,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v2-benchmark-dependencies
-          shared-key: arch-b0deabeb3d283da2c
+          shared-key: arch-f3691b4dde62ba4c4
           cache-bin: false
           cache-workspace-crates: false
 
