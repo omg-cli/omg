@@ -350,13 +350,6 @@
       "platforms": [
         "fedora"
       ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_integration::test_list_updates",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
     }
   ]
 }
