@@ -313,3 +313,18 @@ database access, standalone `omgd` startup, all repository policies, or
 concurrent inventory requests. Those need separate evidence. The grouped
 daemon gaps for other requests remain open; the global inventory review flag
 is unchanged.
+
+## Daemon status backend failure evidence (2026-09-23)
+
+The production-server fixture now sends `Status` through a real Unix socket
+before, during, and after corruption of its private mock package-state file.
+The initial response has exact package/update counts and explicitly says
+vulnerabilities were not scanned. Without clearing the cache, the corrupt
+backend must return an internal error with the matching request ID and parse
+cause, leaving the file unchanged. Restoring the original bytes must restore
+the exact counts and unscanned marker. This detects an earlier successful
+package-count response being served as a false healthy result.
+
+The admitted contract covers this injected-backend failure and recovery, not
+native package databases, completed vulnerability scans, concurrent refresh,
+or arbitrary persistent-cache corruption. Those remain outside this claim.

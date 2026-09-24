@@ -330,6 +330,7 @@ async fn package_inventory_and_updates_survive_the_production_transport() -> Res
             assert_eq!(status.explicit_packages, 2);
             assert_eq!(status.orphan_packages, 0);
             assert_eq!(status.updates_available, 1);
+            assert_eq!(status.scanned_vulnerability_count(), None);
         }
         other => panic!("status returned {other:?}"),
     }
@@ -452,6 +453,71 @@ async fn inventory_requests_report_backend_corruption_and_recover_over_real_ipc(
             assert_eq!(updates[0].new_version, "2.1.0");
         }
         other => panic!("recovered updates returned {other:?}"),
+    }
+    assert_eq!(std::fs::read(&state_path)?, original);
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+#[serial]
+async fn status_reports_backend_corruption_without_cached_success_and_recovers_over_real_ipc()
+-> Result<()> {
+    let fixture = RealServerFixture::with_packages(
+        &[("git", "2.0.0"), ("firefox", "122.0.0")],
+        &[("git", "2.1.0"), ("firefox", "122.0.0")],
+    )
+    .await?;
+    let state_path = fixture
+        .temp_dir
+        .as_ref()
+        .context("missing fixture directory")?
+        .path()
+        .join("data/mock_state_pacman.json");
+    let original = std::fs::read(&state_path)?;
+
+    match request_on_wire(&fixture, Request::Status { id: 740 }).await? {
+        Response::Success {
+            id: 740,
+            result: ResponseResult::Status(status),
+        } => {
+            assert_eq!(status.total_packages, 2);
+            assert_eq!(status.updates_available, 1);
+            assert_eq!(status.scanned_vulnerability_count(), None);
+        }
+        other => panic!("initial status returned {other:?}"),
+    }
+
+    let broken = b"{invalid mock state";
+    std::fs::write(&state_path, broken)?;
+    match request_on_wire(&fixture, Request::Status { id: 741 }).await? {
+        Response::Error {
+            id: 741,
+            code: error_codes::INTERNAL_ERROR,
+            message,
+        } => {
+            assert!(
+                message.starts_with("Failed to get system status:"),
+                "{message}"
+            );
+            assert!(message.contains("failed to parse mock state"), "{message}");
+        }
+        other => panic!("corrupt backend status returned {other:?}"),
+    }
+    assert_eq!(std::fs::read(&state_path)?, broken);
+
+    std::fs::write(&state_path, &original)?;
+    match request_on_wire(&fixture, Request::Status { id: 742 }).await? {
+        Response::Success {
+            id: 742,
+            result: ResponseResult::Status(status),
+        } => {
+            assert_eq!(status.total_packages, 2);
+            assert_eq!(status.explicit_packages, 2);
+            assert_eq!(status.orphan_packages, 0);
+            assert_eq!(status.updates_available, 1);
+            assert_eq!(status.scanned_vulnerability_count(), None);
+        }
+        other => panic!("recovered status returned {other:?}"),
     }
     assert_eq!(std::fs::read(&state_path)?, original);
     fixture.shutdown().await

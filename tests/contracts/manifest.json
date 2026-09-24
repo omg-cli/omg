@@ -2027,12 +2027,21 @@
         "macos"
       ],
       "requires": [
-        "success"
+        "success",
+        "fault",
+        "state"
       ],
       "critical": true,
       "assertions": {
         "success": [
-          "seeded-status-exact-total-explicit-orphan-update-counts"
+          "seeded-status-exact-total-explicit-orphan-update-counts",
+          "unscanned-status-does-not-claim-zero-vulnerabilities"
+        ],
+        "fault": [
+          "corrupt-backend-status-error-with-request-id-after-success"
+        ],
+        "state": [
+          "corrupt-backend-preserved-and-status-recovers"
         ]
       },
       "scope": "Production server::run inside coverage_18 over real Unix sockets with injected package backend; exact SIGTERM drain and checked directory cleanup; not native package transactions, standalone omgd process lifecycle or exhaustive request/fault/concurrency coverage",
@@ -2045,6 +2054,20 @@
           ],
           "assertions": [
             "seeded-status-exact-total-explicit-orphan-update-counts",
+            "unscanned-status-does-not-claim-zero-vulnerabilities",
+            "fixture-cleanup"
+          ]
+        },
+        {
+          "lane": "native-daemon-fixture",
+          "id": "omg::coverage_18::status_reports_backend_corruption_without_cached_success_and_recovers_over_real_ipc",
+          "evidence": [
+            "fault",
+            "state"
+          ],
+          "assertions": [
+            "corrupt-backend-status-error-with-request-id-after-success",
+            "corrupt-backend-preserved-and-status-recovers",
             "fixture-cleanup"
           ]
         }
