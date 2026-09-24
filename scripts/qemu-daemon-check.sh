@@ -165,8 +165,8 @@ evidence=$(realpath "$2")
 export LC_ALL=C NO_COLOR=1
 unset OMG_DISABLE_DAEMON OMG_NO_DAEMON
 case "${OMG_QEMU_ACCEL:-kvm}" in
-  kvm) readiness_attempts=30; child_attempts=100; command_timeout=15; status_timeout=5 ;;
-  tcg) readiness_attempts=300; child_attempts=300; command_timeout=60; status_timeout=30 ;;
+  kvm) readiness_attempts=30; child_attempts=100; command_timeout=15; status_timeout=5; cold_status_timeout=40 ;;
+  tcg) readiness_attempts=300; child_attempts=300; command_timeout=60; status_timeout=30; cold_status_timeout=60 ;;
   *) printf 'Unsupported QEMU acceleration mode: %s\n' "$OMG_QEMU_ACCEL" >&2; exit 2 ;;
 esac
 state=$(mktemp -d "$HOME/omg-daemon-check.XXXXXX")
@@ -277,14 +277,27 @@ for mode in direct foreground direct-sigint foreground-sigint; do
       tail -n 25 "$evidence/daemon-$mode.log" >&2
       exit 1
     fi
-    if [[ -S "$OMG_SOCKET_PATH" ]] && timeout "$status_timeout" "$bin" daemon-status > "$evidence/daemon-$mode-status.txt" 2>&1 \
-      && grep -Fq 'Daemon is running' "$evidence/daemon-$mode-status.txt" \
-      && grep -Fq 'Requests total:' "$evidence/daemon-$mode-status.txt"; then ready=true; break; fi
+    # A cold daemon-status performs a backend Status request. On Fedora that
+    # can exceed the short readiness timeout, leaving a request whose client
+    # has already been killed; its eventual reply then fails with EPIPE.
+    # Probe the cheap Metrics request until the daemon can answer IPC, then
+    # run the full status check once with the daemon's request budget.
+    if [[ -S "$OMG_SOCKET_PATH" ]] && timeout "$status_timeout" "$bin" metrics > "$evidence/daemon-$mode-readiness.prom" 2>&1 \
+      && metric_counter "$evidence/daemon-$mode-readiness.prom" omg_requests_total >/dev/null; then ready=true; break; fi
     sleep 0.2
   done
   if [[ "$ready" != true ]]; then
     printf 'assertion failed: %s daemon did not become ready within the %s-mode budget\n' "$mode" "${OMG_QEMU_ACCEL:-kvm}" >&2
     tail -n 25 "$evidence/daemon-$mode.log" >&2
+    exit 1
+  fi
+  if ! timeout "$cold_status_timeout" "$bin" daemon-status > "$evidence/daemon-$mode-status.txt" 2>&1 \
+    || ! grep -Fq 'Daemon is running' "$evidence/daemon-$mode-status.txt" \
+    || ! grep -Fq 'Package Cache' "$evidence/daemon-$mode-status.txt" \
+    || ! grep -Fq 'Requests total:' "$evidence/daemon-$mode-status.txt" \
+    || [[ $(awk '/Requests failed:/ {print $NF}' "$evidence/daemon-$mode-status.txt") != 0 ]]; then
+    printf 'assertion failed: %s cold daemon status was incomplete or recorded a failed request\n' "$mode" >&2
+    tail -n 25 "$evidence/daemon-$mode-status.txt" >&2
     exit 1
   fi
   [[ $(readlink "/proc/$daemon_pid/exe") == "$daemon" ]]
@@ -322,10 +335,19 @@ for mode in direct foreground direct-sigint foreground-sigint; do
   if [[ "$mode" == direct ]]; then
     query_package_cli daemon-direct
   fi
-  timeout "$status_timeout" "$bin" daemon-status > "$evidence/daemon-$mode-after-queries.txt" 2>&1
+  if ! timeout "$cold_status_timeout" "$bin" daemon-status > "$evidence/daemon-$mode-after-queries.txt" 2>&1 \
+    || ! grep -Fq 'Package Cache' "$evidence/daemon-$mode-after-queries.txt"; then
+    printf 'assertion failed: %s post-query daemon status was incomplete\n' "$mode" >&2
+    tail -n 25 "$evidence/daemon-$mode-after-queries.txt" >&2
+    exit 1
+  fi
   requests_after=$(awk '/Requests total:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
   failed_after=$(awk '/Requests failed:/ {print $NF}' "$evidence/daemon-$mode-after-queries.txt")
-  [[ "$requests_after" =~ ^[0-9]+$ && "$failed_after" == 0 ]]
+  if [[ ! "$requests_after" =~ ^[0-9]+$ || "$failed_after" != 0 ]]; then
+    printf 'assertion failed: %s post-query daemon metrics reported %s total and %s failed requests\n' \
+      "$mode" "$requests_after" "$failed_after" >&2
+    exit 1
+  fi
   # daemon-status itself contributes three requests between snapshots: the
   # preceding Status plus the following Ping and Metrics. The three explicit
   # forms use IPC; ec can legitimately read the daemon's binary status cache.
