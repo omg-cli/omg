@@ -60,6 +60,17 @@ Its `/etc/wsl.conf` enables systemd and disables automatic Windows-drive mounts
 and Windows process interop. This reduces accidental access to host files, but
 does not replace the organization runner-group restriction.
 
+[WSL's `automount=false` setting](https://learn.microsoft.com/en-us/windows/wsl/wsl-config)
+does not prevent a later manual DrvFs mount. The QEMU
+job checks `/proc/self/mounts` and refuses to run if a Windows drive is visible.
+After a local diagnostic that mounts `/mnt/c`, unmount it before the next
+trusted CI run:
+
+```bash
+sudo umount /mnt/c
+test ! -e /mnt/c/Users
+```
+
 Install the ACL utility before enabling QEMU jobs. WSL can expose `/dev/kvm`
 with a group other than `kvm`, even when `omgci` belongs to that group. The
 workflow grants `omgci` access to this device when needed; it requires

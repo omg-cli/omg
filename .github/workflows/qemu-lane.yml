@@ -217,6 +217,9 @@ jobs:
             '{harness_revision:$revision,artifact_tag:$tag,staged:($staged == "true"),distro:$distro,arch:$arch}' \
             > "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.json"
 
+      - name: Reject Windows drive mounts on the QEMU runner
+        run: python3 scripts/check-qemu-runner-isolation.py
+
       - name: Prepare published release
         if: ${{ !inputs.staged }}
         env:
@@ -327,6 +330,7 @@ jobs:
           args+=(--image-cache "$RUNNER_TEMP/qemu-image-cache")
           args+=(--storage-faults)
           args+=(--restrict-egress)
+          python3 scripts/check-qemu-runner-isolation.py
           ./scripts/benchmark-qemu.sh "${args[@]}"
 
       - name: Save verified guest image cache
