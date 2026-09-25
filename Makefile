@@ -243,6 +243,11 @@ docker-ubuntu-shell:
 	docker build -f Dockerfile.ubuntu -t omg-ubuntu .
 	docker run --rm -it omg-ubuntu /bin/bash
 
+# Unused dependencies; install once with: cargo install cargo-machete
+.PHONY: deps-check
+deps-check:
+	cargo-machete
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Development Workflow
 # ═══════════════════════════════════════════════════════════════════════════════
