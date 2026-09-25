@@ -327,7 +327,7 @@ class OutputContracts(unittest.TestCase):
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
-    def run_inventory(self, product, rows, *, native_commands=None, distro='arch', tiers='hermetic', row_timeout=None):
+    def run_inventory(self, product, rows, *, native_commands=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -359,6 +359,8 @@ class OutputContracts(unittest.TestCase):
                        '--distro', distro, '--tiers', tiers, '--tag', 'fixture']
             if row_timeout is not None:
                 command += ['--row-timeout', str(row_timeout)]
+            if allow_mutations:
+                command.append('--allow-mutations')
             result = subprocess.run(
                 command,
                 env=env, capture_output=True, text=True, timeout=30)
@@ -375,7 +377,8 @@ class OutputContracts(unittest.TestCase):
             'arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable\t-\tcontainer-prune',
         ]
         product = '[[ "$1" == --help ]] || exit 99\nprintf "Usage: fixture\\n"\n'
-        result, evidence, _ = self.run_inventory(product, rows, tiers='hermetic,container')
+        result, evidence, _ = self.run_inventory(
+            product, rows, tiers='hermetic,container', allow_mutations=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([row['result'] for row in evidence], ['PASS', 'SKIPPED'])
         self.assertEqual(evidence[1]['exit_code'], -1)
