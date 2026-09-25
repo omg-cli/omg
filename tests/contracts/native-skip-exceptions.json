@@ -81,36 +81,6 @@
       ]
     },
     {
-      "test_id": "omg::debian_tests::new_features::test_blame_command",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::new_features::test_outdated_command",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::new_features::test_outdated_json_output",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
       "test_id": "omg::debian_tests::runtime_management::test_list_available_node",
       "reason": "network tests disabled (set OMG_RUN_NETWORK_TESTS=1)",
       "platforms": [

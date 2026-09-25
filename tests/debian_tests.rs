@@ -623,55 +623,43 @@ mod new_features {
 
     #[test]
     fn test_outdated_command() {
-        require_system_tests!();
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("apt", "1.0")
+            .expect("seed installed apt");
+        project
+            .mock_available("apt", "1.1")
+            .expect("seed newer apt candidate");
+        let state = project.data_dir.path().join("mock_state_apt.json");
+        let before = std::fs::read(&state).expect("read update fixture");
 
-        let result = run_omg(&["outdated"]);
-        let output = result.combined_output();
-        assert_ne!(result.exit_code, 101, "outdated panicked:\n{output}");
-        if result.success {
-            // A successful run always renders a report (either the up-to-date
-            // banner or the sorted updates table).
-            assert!(
-                !result.stdout.trim().is_empty(),
-                "outdated must render its report on success"
-            );
-        } else {
-            let lowered = output.to_lowercase();
-            assert!(
-                [
-                    "error",
-                    "failed",
-                    "unable",
-                    "permission",
-                    "not found",
-                    "no such"
-                ]
-                .iter()
-                .any(|cause| lowered.contains(cause)),
-                "failed outdated must name its cause, got: {output}"
-            );
-        }
+        let result = project.run(&["outdated"]);
+        result.assert_success();
+        result.assert_stdout_contains("Available Updates");
+        result.assert_stdout_contains("apt 1.0 → 1.1");
+        assert_eq!(std::fs::read(&state).expect("read update fixture"), before);
+        project.close_checked();
     }
 
     #[test]
     fn test_outdated_json_output() {
-        require_system_tests!();
-
-        // Contract (src/cli/outdated.rs): --json prints either `[]` when
-        // current or a JSON array of outdated packages — never prose.
-        let result = run_omg(&["outdated", "--json"]);
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("apt", "1.0")
+            .expect("seed installed apt");
+        project
+            .mock_available("apt", "1.1")
+            .expect("seed newer apt candidate");
+        let result = project.run(&["outdated", "--json"]);
         result.assert_success();
-        let parsed: serde_json::Value =
-            serde_json::from_str(result.stdout.trim()).unwrap_or_else(|error| {
-                panic!(
-                    "outdated --json must print a JSON document, got '{}': {error}",
-                    result.stdout.trim()
-                )
-            });
-        assert!(
-            parsed.is_array(),
-            "outdated --json prints an array, got: {parsed}"
-        );
+        let parsed: serde_json::Value = serde_json::from_str(result.stdout.trim())
+            .expect("outdated --json must print only a JSON document");
+        let rows = parsed.as_array().expect("outdated --json prints an array");
+        assert_eq!(rows.len(), 1, "unexpected update rows: {parsed}");
+        assert_eq!(rows[0]["name"], "apt");
+        assert_eq!(rows[0]["current_version"], "1.0");
+        assert_eq!(rows[0]["new_version"], "1.1");
+        project.close_checked();
     }
 
     #[test]
@@ -709,10 +697,34 @@ mod new_features {
 
     #[test]
     fn test_blame_command() {
-        require_system_tests!();
-
-        let result = run_omg(&["blame", "apt"]);
-        assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        let native = std::process::Command::new("dpkg-query")
+            .args(["-W", "-f=${Version}", "apt"])
+            .output()
+            .expect("query native apt version");
+        assert!(native.status.success(), "native apt is required");
+        let version = String::from_utf8(native.stdout).expect("apt version is UTF-8");
+        let auto = std::process::Command::new("apt-mark")
+            .arg("showauto")
+            .output()
+            .expect("query native APT install reason");
+        assert!(auto.status.success(), "apt-mark showauto failed");
+        let is_auto = String::from_utf8(auto.stdout)
+            .expect("APT install reasons are UTF-8")
+            .lines()
+            .any(|package| package == "apt");
+        let output = apt_integration::native_info(&["blame", "apt"]);
+        let stdout = String::from_utf8(output.stdout).expect("blame text is UTF-8");
+        assert!(stdout.contains("Package History"), "{stdout}");
+        assert!(stdout.contains(&format!("Version: {version}")), "{stdout}");
+        let reason = if is_auto {
+            "dependency (auto-installed)"
+        } else {
+            "explicit (user installed)"
+        };
+        assert!(
+            stdout.contains(&format!("Install Reason: {reason}")),
+            "{stdout}"
+        );
     }
 
     #[test]
