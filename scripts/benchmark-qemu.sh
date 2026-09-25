@@ -530,11 +530,25 @@ awk '
 printf 'QEMU isolation verified: uid=65534 gid=65534 capabilities=none no_new_privs=1 seccomp=2\n'
 opts=(-i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=2 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
 wait_ssh() {
+  local pid serial_bytes kernel_banner qemu_state
   for attempt in {1..120}; do
-    kill -0 "$(<qemu.pid)"
+    pid=$(<qemu.pid)
+    if ! kill -0 "$pid" 2>/dev/null; then
+      printf 'QEMU exited before SSH became ready (attempt %s)\n' "$attempt" >&2
+      cat qemu-startup.log >&2
+      return 1
+    fi
     if timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 true 2>/dev/null; then return 0; fi
     sleep 2
   done
+  serial_bytes=$(wc -c < "$vm_serial")
+  kernel_banner=no
+  if grep -aqm1 'Linux version ' "$vm_serial"; then kernel_banner=yes; fi
+  qemu_state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf 'unknown')
+  printf 'SSH readiness timed out after 120 attempts: qemu_state=%s serial_bytes=%s kernel_banner_seen=%s\n' \
+    "$qemu_state" "$serial_bytes" "$kernel_banner" >&2
+  printf 'Last guest serial lines:\n' >&2
+  tail -n 6 "$vm_serial" >&2
   return 1
 }
 wait_ssh

@@ -52,11 +52,15 @@ class QemuProcessIsolationTests(unittest.TestCase):
             ssh.write_text('#!/usr/bin/env bash\nsleep 5\n', encoding='utf-8')
             ssh.chmod(0o755)
             (root / 'qemu.pid').write_text(str(os.getpid()))
+            (root / 'serial.log').write_text('Booting Fedora Linux\n', encoding='utf-8')
             result = subprocess.run(
-                [BASH, '-c', 'opts=(); ' + function + '\nwait_ssh'],
+                [BASH, '-c', 'opts=(); vm_serial=serial.log; ' + function + '\nwait_ssh'],
                 cwd=root, env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH']),
                 capture_output=True, text=True, timeout=4)
             self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('SSH readiness timed out after 120 attempts', result.stderr)
+            self.assertIn('kernel_banner_seen=no', result.stderr)
+            self.assertIn('Booting Fedora Linux', result.stderr)
 
 
 if __name__ == '__main__':
