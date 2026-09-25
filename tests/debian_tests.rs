@@ -13,7 +13,6 @@
 pub mod common;
 pub mod platform_semantics;
 
-use common::assertions::*;
 use common::fixtures::*;
 use common::*;
 use platform_semantics::{assert_no_arch_terms, assert_no_fedora_terms, assert_no_macos_terms};
@@ -54,6 +53,61 @@ mod docker_integration {
 
 mod apt_integration {
     use super::*;
+
+    fn native_candidate(package: &str) -> String {
+        let installed = std::process::Command::new("dpkg-query")
+            .args(["-W", package])
+            .output()
+            .expect("query native dpkg state");
+        assert!(
+            installed.status.success(),
+            "{package} must be installed: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let policy = std::process::Command::new("apt-cache")
+            .args(["policy", package])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("query native APT policy");
+        assert!(
+            policy.status.success(),
+            "APT policy failed for {package}: {}",
+            String::from_utf8_lossy(&policy.stderr)
+        );
+        String::from_utf8(policy.stdout)
+            .expect("APT policy is UTF-8")
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Candidate: ").map(str::to_owned))
+            .filter(|version| version != "(none)")
+            .expect("installed package has an APT candidate")
+    }
+
+    fn native_info(args: &[&str]) -> std::process::Output {
+        let executable = assert_cmd::cargo::cargo_bin!("omg");
+        if let Some(expected) = std::env::var_os("OMG_CONTRACT_EXPECTED_CLI") {
+            assert_eq!(
+                std::fs::canonicalize(executable).expect("CLI executable exists"),
+                std::fs::canonicalize(expected).expect("receipt subject exists"),
+                "native info executable differs from admitted receipt subject"
+            );
+        }
+        let output = std::process::Command::new(executable)
+            .args(args)
+            .env_remove("OMG_TEST_MODE")
+            .env_remove("OMG_TEST_DISTRO")
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("run OMG against native APT state");
+        assert!(
+            output.status.success(),
+            "omg {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
 
     fn search_rows(project: &TestProject, query: &str) -> Vec<serde_json::Value> {
         let result = project.run(&["search", query, "--json"]);
@@ -117,23 +171,38 @@ mod apt_integration {
 
     #[test]
     fn test_info_installed_package() {
-        require_system_tests!();
-
-        let result = run_omg(&["info", "apt"]);
-        result.assert_success();
-        assert_package_info(&result, "apt");
-        assert_debian_platform_purity(&result, "Debian info installed package");
+        let candidate = native_candidate("apt");
+        let output = native_info(&["--json", "info", "apt"]);
+        let row: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("info --json returns a JSON object");
+        assert_eq!(row["name"], "apt");
+        assert_eq!(row["installed"], true);
+        assert_eq!(row["version"], candidate);
+        assert!(
+            row["description"]
+                .as_str()
+                .is_some_and(|description| !description.is_empty()),
+            "native APT description missing: {row}"
+        );
     }
 
     #[test]
     fn test_info_package_details() {
-        require_system_tests!();
-
-        let result = run_omg(&["info", "dpkg"]);
-        // Must show the package name plus a real dotted version token
-        // (e.g. 1.21.0); the old `contains('.')` matched almost any prose.
-        assert_package_info(&result, "dpkg");
-        assert_debian_platform_purity(&result, "Debian info package details");
+        let candidate = native_candidate("dpkg");
+        let output = native_info(&["info", "dpkg"]);
+        let stdout = String::from_utf8(output.stdout).expect("info text is UTF-8");
+        let rows = stdout
+            .lines()
+            .filter_map(|line| line.trim().split_once(": "))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(rows.get("Name"), Some(&"dpkg"), "{stdout}");
+        assert_eq!(rows.get("Version"), Some(&candidate.as_str()), "{stdout}");
+        assert_eq!(rows.get("Installed"), Some(&"yes"), "{stdout}");
+        assert!(
+            rows.get("Description")
+                .is_some_and(|description| !description.is_empty()),
+            "{stdout}"
+        );
     }
 
     #[test]
