@@ -219,12 +219,18 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertIn("inputs.distro == 'ubuntu' && needs.build-staged-ubuntu.result == 'success'", LANE)
         self.assertNotIn('concurrency:', LANE)
 
-    def test_image_caches_never_save_from_prs_and_do_not_cache_guest_state(self):
+    def test_guest_images_are_downloaded_and_verified_not_shared_via_actions_caches(self):
+        # Measured on main run 36170417749 (2026-09-25): four qemu-image-v1
+        # entries held 2.04 GiB of a 10 GiB repository cache quota, one lane's
+        # entry had already been evicted, and a pinned 533 MiB guest image
+        # downloaded in about two seconds on the hosted runner. Lanes now
+        # download the digest-pinned image each run; the provenance manifest
+        # stays the integrity gate, and guest bytes are never cached.
         for workflow in (PARENT, LANE):
-            self.assertIn("github.ref == 'refs/heads/main' && github.event_name != 'pull_request'", workflow)
-            self.assertIn('path: ${{ runner.temp }}/qemu-image-cache', workflow)
-            self.assertNotIn('restore-keys:', workflow)
-            self.assertIn('--image-cache "$RUNNER_TEMP/qemu-image-cache"', workflow)
+            self.assertNotIn('qemu-image-cache', workflow)
+            self.assertNotIn('qemu-image-v1-', workflow)
+            self.assertNotIn('--image-cache', workflow)
+            self.assertIn('--image-policy tests/qemu-image-provenance/manifest.json', workflow)
 
     def test_all_distros_keep_daemon_release_compilation_and_unit_tests(self):
         self.assertEqual(TEXT.count('cargo test --lib --bins '), 4)

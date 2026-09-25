@@ -231,13 +231,6 @@ jobs:
           jq -s '.[0] + .[1]' "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.json" published/inventory-provenance.json > "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.next.json"
           mv "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.next.json" "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.json"
 
-      - name: Restore pinned guest image cache
-        id: image-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/qemu-image-cache
-          key: qemu-image-v1-${{ runner.arch }}-${{ inputs.distro }}-${{ hashFiles('tests/qemu-image-provenance/manifest.json') }}
-
       - name: Configure Sentry reporting
         if: github.event_name != 'pull_request'
         env:
@@ -327,18 +320,10 @@ jobs:
           fi
           args+=(--inventory-isolate-hermetic)
           args+=(--benchmark-transactions 1)
-          args+=(--image-cache "$RUNNER_TEMP/qemu-image-cache")
           args+=(--storage-faults)
           args+=(--restrict-egress)
           python3 scripts/check-qemu-runner-isolation.py
           ./scripts/benchmark-qemu.sh "${args[@]}"
-
-      - name: Save verified guest image cache
-        if: success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && steps.image-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/qemu-image-cache
-          key: ${{ steps.image-cache.outputs.cache-primary-key }}
 
       - name: Preserve setup failure evidence
         if: always()
