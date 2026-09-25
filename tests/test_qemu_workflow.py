@@ -102,6 +102,12 @@ class QemuWorkflowTests(unittest.TestCase):
         self.assertIn('STAGED: ${{ inputs.staged }}', guest)
         script = literal(guest, 'run', 8)
         script = script.replace('${{ inputs.distro }}', 'arch').replace('${{ inputs.tag }}', 'v1.2.3')
+        # The runner-isolation probe deliberately rejects WSL/DrvFs hosts such
+        # as /mnt/c (a supported local QEMU environment), so stub only that
+        # probe and keep asserting the step still runs it. The probe's own
+        # behavior is covered by scripts/test_qemu_runner_isolation.py.
+        self.assertIn('python3 scripts/check-qemu-runner-isolation.py', script)
+        script = script.replace('python3 scripts/check-qemu-runner-isolation.py', 'true')
         # Execute the real argument-selection shell, substituting only the VM launch.
         script = script.replace('./scripts/benchmark-qemu.sh', 'printf "%s\\n"')
         for event, staged in [('push', True), ('pull_request', True),
