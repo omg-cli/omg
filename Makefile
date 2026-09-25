@@ -298,3 +298,9 @@ ci-local-full: ci-local-quick
 		--locked --profile ci
 	cargo nextest run --no-default-features --features arch,pgp,license \
 		--locked --profile ci --no-fail-fast
+
+# Doc audit: broken links, removed features, config keys, command references.
+.PHONY: audit-docs
+audit-docs:
+	python3 scripts/audit_docs.py
+
