@@ -93,7 +93,8 @@ fi
         self.assertIn("cloud-final.service failed", failed.stderr)
 
     def test_incomplete_or_degraded_stage_rejects_boot(self):
-        for change in ("unfinished", "error", "recoverable", "wrong-datasource"):
+        for change in ("unfinished", "error", "recoverable", "aggregate-recoverable",
+                       "wrong-datasource"):
             status = healthy_status()
             if change == "unfinished":
                 status["v1"]["modules-final"]["finished"] = None
@@ -101,6 +102,10 @@ fi
                 status["v1"]["modules-final"]["errors"] = ["failed user-data"]
             elif change == "recoverable":
                 status["v1"]["init"]["recoverable_errors"] = {"WARNING": ["bad config"]}
+            elif change == "aggregate-recoverable":
+                # A future stage could report recoverables without a stage name
+                # this gate enumerates; the aggregate must still reject them.
+                status["v1"]["recoverable_errors"] = {"WARNING": ["bad config"]}
             else:
                 status["v1"]["datasource"] = "DataSourceNone"
             with self.subTest(change=change):
