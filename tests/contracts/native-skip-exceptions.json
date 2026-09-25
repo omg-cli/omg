@@ -51,26 +51,6 @@
       ]
     },
     {
-      "test_id": "omg::debian_tests::apt_integration::test_size_integration",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::apt_integration::test_why_integration",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
       "test_id": "omg::debian_tests::debian_specific::test_debian_backports_awareness",
       "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
       "platforms": [
@@ -122,46 +102,6 @@
     },
     {
       "test_id": "omg::debian_tests::new_features::test_outdated_json_output",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::new_features::test_size_command",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::new_features::test_size_with_limit",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::new_features::test_why_command",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
-      "test_id": "omg::debian_tests::new_features::test_why_reverse_dependencies",
       "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
       "platforms": [
         "debian",
