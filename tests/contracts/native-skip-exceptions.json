@@ -102,22 +102,20 @@
     },
     {
       "test_id": "omg::debian_tests::ubuntu_specific::test_ubuntu_main_repo",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "reason": "native Ubuntu APT search requires Ubuntu with libapt",
       "platforms": [
         "debian",
         "debian-pure",
-        "debian-trixie",
-        "ubuntu"
+        "debian-trixie"
       ]
     },
     {
       "test_id": "omg::debian_tests::ubuntu_specific::test_ubuntu_universe_repo",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "reason": "native Ubuntu APT search requires Ubuntu with libapt",
       "platforms": [
         "debian",
         "debian-pure",
-        "debian-trixie",
-        "ubuntu"
+        "debian-trixie"
       ]
     },
     {
