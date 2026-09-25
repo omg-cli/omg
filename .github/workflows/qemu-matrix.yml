@@ -119,7 +119,7 @@ jobs:
             [
               {
                 "distro": "arch",
-                "image": "archlinux:latest@sha256:b0deabeb3d283da2c7f7dbf0eea051b7b2cd0554e0b737cc457fd21683bdcdd1",
+                "image": "archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6",
                 "features": "arch,pgp,license",
                 "setup": "pacman -Syu --noconfirm\npacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq\n"
               },
