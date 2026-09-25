@@ -362,26 +362,83 @@ mod apt_integration {
 
     #[test]
     fn test_clean_orphans() {
-        require_system_tests!();
-        require_destructive_tests!();
         require_debian_like!();
 
-        let result = run_omg(&["clean", "--orphans"]);
-        if result.success {
+        // Read-only oracle: the dry run must summarize native orphan
+        // candidates and must not mutate the package database. The actual
+        // removal is owned by the disposable QEMU inventory row
+        // `clean-orphans-native`; this test proves the report and the
+        // no-mutation contract on the native CI lanes.
+        let inventory = || -> String {
+            let output = std::process::Command::new("dpkg-query")
+                .args(["-W", "-f=${Package} ${Status}\n"])
+                .env("LC_ALL", "C")
+                .output()
+                .expect("query native dpkg inventory");
+            assert!(output.status.success(), "dpkg-query failed");
+            String::from_utf8(output.stdout).expect("dpkg inventory is UTF-8")
+        };
+        let before = inventory();
+
+        let output = native_info(&["clean", "--orphans", "--dry-run"]);
+        let stdout = String::from_utf8(output.stdout).expect("clean output is UTF-8");
+
+        #[cfg(feature = "debian")]
+        {
+            // The libapt backend counts autoremovable packages through the
+            // native cache; `apt-get -s autoremove` is the same oracle the
+            // QEMU inventory uses for its orphan counter, so require exact
+            // parity here.
+            let simulation = std::process::Command::new("apt-get")
+                .args(["-s", "autoremove"])
+                .env("LC_ALL", "C")
+                .output()
+                .expect("simulate native autoremove");
             assert!(
-                !result.stdout.trim().is_empty() || !result.stderr.trim().is_empty(),
-                "clean --orphans must report its outcome"
+                simulation.status.success(),
+                "apt-get -s autoremove failed: {}",
+                String::from_utf8_lossy(&simulation.stderr)
             );
-        } else {
-            let combined = result.combined_output().to_lowercase();
-            assert!(
-                ["orphan", "permission", "root", "privilege"]
-                    .iter()
-                    .any(|cause| combined.contains(cause)),
-                "failed clean --orphans must name its cause. Got: {}",
-                result.combined_output()
-            );
+            let expected = String::from_utf8_lossy(&simulation.stdout)
+                .lines()
+                .filter(|line| line.starts_with("Remv "))
+                .count();
+            if expected == 0 {
+                assert!(
+                    stdout.contains("No orphan packages found"),
+                    "dry run must report an empty native orphan set: {stdout}"
+                );
+            } else {
+                assert!(
+                    stdout.contains(&format!("Would remove {expected} orphan")),
+                    "dry run must report the native orphan count {expected}: {stdout}"
+                );
+            }
         }
+
+        #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+        {
+            // The pure backend derives candidates from extended_states and a
+            // local dependency map without libapt; require a coherent report
+            // without claiming exact resolver parity.
+            if stdout.contains("Would remove") {
+                assert!(
+                    stdout.contains("orphan"),
+                    "a nonempty pure dry run must name its orphan set: {stdout}"
+                );
+            } else {
+                assert!(
+                    stdout.contains("No orphan packages found"),
+                    "pure dry run must report its orphan state: {stdout}"
+                );
+            }
+        }
+
+        let after = inventory();
+        assert_eq!(
+            before, after,
+            "clean --orphans --dry-run must not mutate the package database"
+        );
     }
 
     #[test]
