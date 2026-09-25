@@ -439,13 +439,6 @@ jobs:
             '{harness_revision:$revision,artifact_tag:$tag,staged:($staged == "true"),distro:$distro,arch:$arch}' \
             > "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME/provenance.json"
 
-      - name: Restore pinned guest image cache
-        id: image-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/qemu-image-cache
-          key: qemu-image-v1-${{ runner.arch }}-${{ matrix.distro }}-${{ hashFiles('tests/qemu-image-provenance/manifest.json') }}
-
       - name: Configure Sentry reporting
         if: github.event_name != 'pull_request'
         env:
@@ -480,17 +473,9 @@ jobs:
             --image-policy tests/qemu-image-provenance/manifest.json \
             --inventory-isolate-hermetic \
             --benchmark-transactions 1 \
-            --image-cache "$RUNNER_TEMP/qemu-image-cache" \
             --storage-faults \
             --restrict-egress \
             --staged-dir staged --inventory-tiers hermetic,container --inventory-allow-mutations
-
-      - name: Save verified guest image cache
-        if: success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && steps.image-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/qemu-image-cache
-          key: ${{ steps.image-cache.outputs.cache-primary-key }}
 
       - name: Preserve setup failure evidence
         if: always()
