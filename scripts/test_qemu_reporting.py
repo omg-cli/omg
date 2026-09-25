@@ -140,6 +140,20 @@ class ReportingBoundaryTests(unittest.TestCase):
                          [row])
         self.assertIn("SSH connection refused", diagnostics[(row["case_id"], "arch")])
 
+    def test_kvm_preflight_failure_reaches_lifecycle_issue_excerpt(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/results.json", json.dumps([row]))
+            archive.writestr("run-a/kvm-probe.log", "kvm=inaccessible device=/dev/kvm\ngroup=render")
+            archive.writestr("run-b/kvm-probe.log", "unrelated runner")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        excerpt = diagnostics[(row["case_id"], "arch")]
+        self.assertIn("kvm=inaccessible device=/dev/kvm", excerpt)
+        self.assertIn("group=render", excerpt)
+        self.assertNotIn("unrelated runner", excerpt)
+
     def test_successful_rows_never_supply_failure_excerpts(self):
         row = self.row("PASS")
         diagnostics = {}

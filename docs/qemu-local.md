@@ -21,6 +21,11 @@ hosted reporter closes an issue only after a qualifying passing push to
 - Linux x86_64 with KVM (`/dev/kvm` readable+writable), Docker, `jq`,
   authenticated `gh`, and coreutils. Guests need ~3 GB RAM and several GB
   of image downloads. Container smoke also supports Podman; QEMU uses Docker.
+  On a self-hosted runner, add the service account to the group that owns
+  `/dev/kvm` (check `stat -c '%G' /dev/kvm`), then restart the runner service
+  so its existing process inherits the new group. Verify the service process's
+  groups and read/write access as that account. A temporary device ACL can
+  disappear if WSL recreates `/dev/kvm` between workflow steps.
 - ARM legs: an aarch64 host with working KVM; a runner label alone does not
   prove `/dev/kvm` is available. KVM
   cannot cross architectures, so x86_64 hosts fail ARM legs closed

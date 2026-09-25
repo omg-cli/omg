@@ -332,7 +332,11 @@ elif [[ ! -c "$kvm_device" ]]; then
   exit 3
 else
   printf 'error: KVM device %s is not accessible\n' "$kvm_device" >&2
-  printf 'kvm=inaccessible device=%s\n' "$kvm_device" > "$work/kvm-probe.log"
+  {
+    printf 'kvm=inaccessible device=%s\n' "$kvm_device"
+    id
+    stat -c 'device_mode=%a owner=%U group=%G' "$kvm_device"
+  } > "$work/kvm-probe.log"
   exit 3
 fi
 if [[ "$qemu_accel" == tcg ]]; then
