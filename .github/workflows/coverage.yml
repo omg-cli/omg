@@ -100,6 +100,8 @@ jobs:
         with:
           prefix-key: v2-coverage-dependencies
           shared-key: arch-f3691b4dde62ba4c4-arch-pgp-license
+          # Keep main's reusable cache; PR merge-ref writes cannot warm main.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: . -> target/llvm-cov-target
           cache-bin: false
           cache-workspace-crates: false

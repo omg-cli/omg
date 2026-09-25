@@ -116,6 +116,8 @@ jobs:
           prefix-key: "v2-portable"
           shared-key: "portable"
           cache-on-failure: true
+          # PRs restore main's cache; merge-ref writes only benefit that PR's reruns.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
         run: |
@@ -305,6 +307,7 @@ jobs:
         with:
           prefix-key: v2-platform-dependencies
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           # Never restore across distro ABI or feature contracts. The action
           # additionally keys rustc, Cargo config, lockfiles and compiler flags.
           shared-key: ${{ steps.cache-key.outputs.key }}
@@ -633,6 +636,7 @@ jobs:
         with:
           prefix-key: v2-intersection-dependencies
           shared-key: ${{ steps.cache-key.outputs.key }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: false
           cache-workspace-crates: false
 
@@ -677,6 +681,7 @@ jobs:
           # Keep dependency compatibility hashes; recover in a fresh namespace.
           prefix-key: "v2-macos-dependencies"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: false
           cache-workspace-crates: false
 
@@ -769,6 +774,7 @@ jobs:
         with:
           prefix-key: "v1-ubuntu-debian"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release
         run: python3 scripts/native-build-artifact.py build --distro ubuntu --image ubuntu-24.04 --features debian,pgp,license --destination "$RUNNER_TEMP/native-release"
