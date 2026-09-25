@@ -47,9 +47,26 @@ jobs:
 
     steps:
       - name: Install system dependencies
+        shell: bash
         run: |
-          pacman -Syu --noconfirm
-          pacman -S --noconfirm base-devel git curl pkgconf openssl libarchive clang cmake
+          set -euo pipefail
+          packages=(base-devel git curl pkgconf openssl libarchive clang cmake)
+          # One full upgrade/install transaction keeps the rolling container
+          # consistent and avoids resolving the package graph twice.
+          if pacman -Syu --noconfirm --needed "${packages[@]}" 2>&1 | tee /tmp/omg-pacman-setup.log; then
+            exit 0
+          fi
+
+          # The official image lists Fastly before the geo mirror. Only a
+          # Fastly transfer failure warrants a synchronized mirror fallback;
+          # resolution, signature verification, and hook failures remain fatal.
+          if ! grep -Eq 'error: failed retrieving file .* from fastly\.mirror\.pkgbuild\.com' /tmp/omg-pacman-setup.log; then
+            exit 1
+          fi
+          grep -q '^Server = https://geo\.mirror\.pkgbuild\.com/' /etc/pacman.d/mirrorlist
+          echo '::warning::Fastly package fetch failed; refreshing from the official geo mirror'
+          sed -i '/fastly\.mirror\.pkgbuild\.com/d' /etc/pacman.d/mirrorlist
+          pacman -Syyu --noconfirm --needed "${packages[@]}"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,6 +116,7 @@ jobs:
       # Run tests once with --no-report, then generate reports separately
       # This avoids running the full test suite 3 times
       - name: Run tests with coverage instrumentation
+        id: instrumented_tests
         run: |
           # Production root execution intentionally ignores fixture overrides.
           # Run the complete suite with the normal user configuration contract.
@@ -114,14 +132,14 @@ jobs:
             --no-report
 
       - name: Generate LCOV report
-        if: always()
+        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         run: |
           cargo llvm-cov report \
             --lcov \
             --output-path lcov.info
 
       - name: Upload coverage to Codecov
-        if: always()
+        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: lcov.info
@@ -132,12 +150,12 @@ jobs:
         continue-on-error: true
 
       - name: Generate HTML report
-        if: failure() || github.event_name == 'workflow_dispatch'
+        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') && (failure() || github.event_name == 'workflow_dispatch') }}
         run: |
           cargo llvm-cov report --html
 
       - name: Upload HTML coverage report
-        if: failure() || github.event_name == 'workflow_dispatch'
+        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') && (failure() || github.event_name == 'workflow_dispatch') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
@@ -145,7 +163,7 @@ jobs:
           retention-days: 30
 
       - name: Preserve LCOV evidence
-        if: always()
+        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-lcov
@@ -154,7 +172,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Coverage summary
-        if: always()
+        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         run: |
           set -o pipefail
 
