@@ -16,8 +16,41 @@ Utility scripts for development, testing, and CI of the OMG project.
 | `r2-rollback.sh` | Roll back R2 release artifacts | `./scripts/r2-rollback.sh` |
 | `record-benchmark-run.py` | Archive a hyperfine run into `benchmarks/records/` | `python3 scripts/record-benchmark-run.py` |
 | `release-smoke.sh` | Smoke-test published or staged archives in distro containers or a native macOS runner | `./scripts/release-smoke.sh --release latest --distro all` |
+| `debt-ratchet.py` | Fail when per-file debt counts exceed the shrink-only baseline | `python3 scripts/debt-ratchet.py` |
 
 ---
+## debt-ratchet.py
+
+**Purpose:** Freeze technical debt so it can only shrink
+
+Each ratchet counts one debt pattern per file and compares the result against a committed
+baseline in `scripts/debt-ratchets/`:
+
+- `todo-markers` — uppercase todo/fixme/hack/xxx marker tokens in any maintained text file.
+- `dead-code-allows` — `allow(...)`/`expect(...)` annotations for `dead_code` or `unused*`.
+
+A file with no baseline entry must have zero findings, so new code is born clean; a listed
+file may only shrink. The baseline was seeded from the tree as it stood when the gate
+landed, deliberately not from zero: inherited debt stays visible and frozen instead of
+blocking every change.
+
+**Usage:**
+
+```bash
+python3 scripts/debt-ratchet.py            # gate: exit 1 on any increase or new file
+python3 scripts/debt-ratchet.py --report   # list improvements since the baseline
+python3 scripts/debt-ratchet.py --refresh  # lower the floor after a cleanup
+```
+
+`--refresh` refuses to raise a count or to add a file: a baseline that can grow is not a
+gate. Exit codes follow the script conventions — 0 clean, 1 regression or refused
+refresh, 2 invalid usage, 4 malformed baseline. The gate runs unconditionally in the
+`ci.yml` quick job and through `make debt-check`; use `make debt-refresh` locally after
+removing debt.
+
+---
+
+
 
 ## check-perf-regression.py
 

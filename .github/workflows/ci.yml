@@ -72,6 +72,9 @@ jobs:
       - name: Validate change classification
         run: python3 -m unittest discover -s scripts -p test_ci_change_scope.py
 
+      - name: Debt ratchet (gating)
+        run: python3 scripts/debt-ratchet.py
+
       - name: Install Rust
         if: steps.changes.outputs.required == 'true'
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
