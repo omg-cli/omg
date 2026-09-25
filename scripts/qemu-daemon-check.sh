@@ -174,6 +174,12 @@ case "${OMG_QEMU_ACCEL:-kvm}" in
   tcg) readiness_attempts=300; child_attempts=300; command_timeout=60; status_timeout=30; cold_status_timeout=60 ;;
   *) printf 'Unsupported QEMU acceleration mode: %s\n' "$OMG_QEMU_ACCEL" >&2; exit 2 ;;
 esac
+# Fedora builds the daemon's repository index before it binds the socket.
+# Its DNF query has a 60-second timeout; a six-second socket probe reports a
+# live but still-initializing daemon as failed under KVM contention. Preserve
+# a bounded startup check without changing the product's repository behavior.
+readiness_budget=0
+if [[ "${OMG_QEMU_ACCEL:-kvm}" == kvm && -r /etc/fedora-release ]]; then readiness_budget=70; fi
 state=$(mktemp -d "$HOME/omg-daemon-check.XXXXXX")
 chmod 700 "$state"
 export OMG_SOCKET_PATH="$state/omg.sock"
@@ -277,7 +283,22 @@ for mode in direct foreground direct-sigint foreground-sigint; do
     [[ -n "$daemon_pid" ]]
   fi
   ready=false
-  for ((attempt=0; attempt<readiness_attempts; attempt++)); do
+  read -r started _ < /proc/uptime
+  started=${started%%.*}
+  deadline=$((started + readiness_budget))
+  if ((readiness_budget > 0)); then
+    budget_label="${readiness_budget}s"
+  else
+    budget_label="$readiness_attempts attempts"
+  fi
+  for ((attempt=0; ; attempt++)); do
+    read -r now _ < /proc/uptime
+    now=${now%%.*}
+    if ((readiness_budget > 0)); then
+      ((now < deadline)) || break
+    elif ((attempt >= readiness_attempts)); then
+      break
+    fi
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
       printf 'assertion failed: %s daemon exited before its socket was ready\n' "$mode" >&2
       tail -n 25 "$evidence/daemon-$mode.log" >&2
@@ -292,11 +313,15 @@ for mode in direct foreground direct-sigint foreground-sigint; do
       && metric_counter "$evidence/daemon-$mode-readiness.prom" omg_requests_total >/dev/null; then ready=true; break; fi
     sleep 0.2
   done
+  read -r now _ < /proc/uptime
+  now=${now%%.*}
   if [[ "$ready" != true ]]; then
-    printf 'assertion failed: %s daemon did not become ready within the %s-mode budget\n' "$mode" "${OMG_QEMU_ACCEL:-kvm}" >&2
+    printf 'assertion failed: %s daemon did not become ready after %ss (budget %s, %s mode)\n' \
+      "$mode" "$((now - started))" "$budget_label" "${OMG_QEMU_ACCEL:-kvm}" >&2
     tail -n 25 "$evidence/daemon-$mode.log" >&2
     exit 1
   fi
+  printf 'daemon readiness: mode=%s elapsed=%ss\n' "$mode" "$((now - started))"
   if ! timeout "$cold_status_timeout" "$bin" daemon-status > "$evidence/daemon-$mode-status.txt" 2>&1 \
     || ! grep -Fq 'Daemon is running' "$evidence/daemon-$mode-status.txt" \
     || ! grep -Fq 'Package Cache' "$evidence/daemon-$mode-status.txt" \
