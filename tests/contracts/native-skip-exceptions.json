@@ -72,11 +72,9 @@
     },
     {
       "test_id": "omg::debian_tests::debian_specific::test_debian_stable_packages",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
+      "reason": "requires Debian",
       "platforms": [
-        "debian",
         "debian-pure",
-        "debian-trixie",
         "ubuntu"
       ]
     },
