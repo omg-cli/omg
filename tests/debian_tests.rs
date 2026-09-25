@@ -520,7 +520,6 @@ mod ubuntu_specific {
                 candidate_entry = line
                     .trim()
                     .trim_start_matches("***")
-                    .trim()
                     .split_whitespace()
                     .next()
                     == Some(candidate);
