@@ -216,6 +216,26 @@ class OutputContracts(unittest.TestCase):
         self.assertEqual(evidence[0]['result'], 'PASS', logs)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_python_download_outlives_generic_budget_but_failure_stays_fatal(self):
+        rows = ['runtime-python-install\t["use","python","3.12.14"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        product = 'sleep 2\nprintf "download failed\\n" >&2\nexit 17\n'
+        result, evidence, logs = self.run_inventory(product, rows, row_timeout=1)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+        self.assertEqual(evidence[0]['exit_code'], 17, logs)
+        self.assertIn('download failed', logs['runtime-python-install.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_executor_timeout_names_deadline_not_product_refusal(self):
+        rows = ['slow\t["slow"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        result, evidence, logs = self.run_inventory('sleep 2\n', rows, row_timeout=1)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+        self.assertEqual(evidence[0]['exit_code'], 124, logs)
+        self.assertIn('command exceeded 1s QEMU row deadline', logs['slow.log'])
+        self.assertNotIn('product refusal', logs['slow.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_system_update_transactions_outlive_the_generic_row_budget(self):
         rows = [
             'update-check\t["update","--check"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\tnone',
