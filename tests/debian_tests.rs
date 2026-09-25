@@ -623,55 +623,43 @@ mod new_features {
 
     #[test]
     fn test_outdated_command() {
-        require_system_tests!();
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("apt", "1.0")
+            .expect("seed installed apt");
+        project
+            .mock_available("apt", "1.1")
+            .expect("seed newer apt candidate");
+        let state = project.data_dir.path().join("mock_state_apt.json");
+        let before = std::fs::read(&state).expect("read update fixture");
 
-        let result = run_omg(&["outdated"]);
-        let output = result.combined_output();
-        assert_ne!(result.exit_code, 101, "outdated panicked:\n{output}");
-        if result.success {
-            // A successful run always renders a report (either the up-to-date
-            // banner or the sorted updates table).
-            assert!(
-                !result.stdout.trim().is_empty(),
-                "outdated must render its report on success"
-            );
-        } else {
-            let lowered = output.to_lowercase();
-            assert!(
-                [
-                    "error",
-                    "failed",
-                    "unable",
-                    "permission",
-                    "not found",
-                    "no such"
-                ]
-                .iter()
-                .any(|cause| lowered.contains(cause)),
-                "failed outdated must name its cause, got: {output}"
-            );
-        }
+        let result = project.run(&["outdated"]);
+        result.assert_success();
+        result.assert_stdout_contains("Available Updates");
+        result.assert_stdout_contains("apt 1.0 → 1.1");
+        assert_eq!(std::fs::read(&state).expect("read update fixture"), before);
+        project.close_checked();
     }
 
     #[test]
     fn test_outdated_json_output() {
-        require_system_tests!();
-
-        // Contract (src/cli/outdated.rs): --json prints either `[]` when
-        // current or a JSON array of outdated packages — never prose.
-        let result = run_omg(&["outdated", "--json"]);
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("apt", "1.0")
+            .expect("seed installed apt");
+        project
+            .mock_available("apt", "1.1")
+            .expect("seed newer apt candidate");
+        let result = project.run(&["outdated", "--json"]);
         result.assert_success();
-        let parsed: serde_json::Value =
-            serde_json::from_str(result.stdout.trim()).unwrap_or_else(|error| {
-                panic!(
-                    "outdated --json must print a JSON document, got '{}': {error}",
-                    result.stdout.trim()
-                )
-            });
-        assert!(
-            parsed.is_array(),
-            "outdated --json prints an array, got: {parsed}"
-        );
+        let parsed: serde_json::Value = serde_json::from_str(result.stdout.trim())
+            .expect("outdated --json must print only a JSON document");
+        let rows = parsed.as_array().expect("outdated --json prints an array");
+        assert_eq!(rows.len(), 1, "unexpected update rows: {parsed}");
+        assert_eq!(rows[0]["name"], "apt");
+        assert_eq!(rows[0]["current_version"], "1.0");
+        assert_eq!(rows[0]["new_version"], "1.1");
+        project.close_checked();
     }
 
     #[test]
@@ -709,10 +697,34 @@ mod new_features {
 
     #[test]
     fn test_blame_command() {
-        require_system_tests!();
-
-        let result = run_omg(&["blame", "apt"]);
-        assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        let native = std::process::Command::new("dpkg-query")
+            .args(["-W", "-f=${Version}", "apt"])
+            .output()
+            .expect("query native apt version");
+        assert!(native.status.success(), "native apt is required");
+        let version = String::from_utf8(native.stdout).expect("apt version is UTF-8");
+        let auto = std::process::Command::new("apt-mark")
+            .arg("showauto")
+            .output()
+            .expect("query native APT install reason");
+        assert!(auto.status.success(), "apt-mark showauto failed");
+        let is_auto = String::from_utf8(auto.stdout)
+            .expect("APT install reasons are UTF-8")
+            .lines()
+            .any(|package| package == "apt");
+        let output = apt_integration::native_info(&["blame", "apt"]);
+        let stdout = String::from_utf8(output.stdout).expect("blame text is UTF-8");
+        assert!(stdout.contains("Package History"), "{stdout}");
+        assert!(stdout.contains(&format!("Version: {version}")), "{stdout}");
+        let reason = if is_auto {
+            "dependency (auto-installed)"
+        } else {
+            "explicit (user installed)"
+        };
+        assert!(
+            stdout.contains(&format!("Install Reason: {reason}")),
+            "{stdout}"
+        );
     }
 
     #[test]
@@ -762,23 +774,110 @@ mod security {
 
     #[test]
     fn test_audit_scan_is_not_paywalled() {
-        require_system_tests!();
-
-        let result = run_omg(&["audit", "scan"]);
+        let project = TestProject::for_distro("debian");
+        let state = project.data_dir.path().join("mock_state_apt.json");
+        std::fs::write(&state, r#"{"installed":{},"available":{}}"#)
+            .expect("seed empty Debian package inventory");
+        let result = project.run(&["audit", "scan"]);
+        result.assert_success();
+        assert!(
+            result.stdout_contains("No vulnerabilities found in scanned packages."),
+            "audit scan did not complete: {}",
+            result.combined_output()
+        );
         let output = result.combined_output();
         assert!(
             !output.contains("requires Pro tier") && !output.contains("/pricing"),
             "audit scan must not be paywalled, got:\n{output}"
         );
+        assert_eq!(
+            std::fs::read(&state).expect("read package inventory"),
+            br#"{"installed":{},"available":{}}"#
+        );
+        project.close_checked();
     }
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_audit_sbom_generation() {
-        require_system_tests!();
+        let native = std::process::Command::new("dpkg-query")
+            .args(["-W", "-f=${Version}", "apt"])
+            .output()
+            .expect("query native apt version");
+        assert!(native.status.success(), "native apt is required");
+        let version = String::from_utf8(native.stdout).expect("native version is UTF-8");
+        let fixture = tempfile::tempdir().expect("create SBOM output fixture");
+        let path = fixture.path().join("sbom.json");
+        let output = apt_integration::native_info(&[
+            "audit",
+            "sbom",
+            "--inventory-only",
+            "--output",
+            path.to_str().expect("fixture path is UTF-8"),
+        ]);
+        let stdout = String::from_utf8(output.stdout).expect("SBOM output is UTF-8");
+        assert!(stdout.contains("advisory matching was skipped"), "{stdout}");
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("inventory-only SBOM was written"))
+                .expect("SBOM is valid JSON");
+        assert_eq!(document["bomFormat"], "CycloneDX");
+        assert_eq!(document["specVersion"], "1.5");
+        assert!(
+            document["components"]
+                .as_array()
+                .is_some_and(|components| components.iter().any(|component| {
+                    component["name"] == "apt"
+                        && component["version"] == version
+                        && component["purl"]
+                            .as_str()
+                            .is_some_and(|purl| purl.starts_with("pkg:deb/"))
+                })),
+            "SBOM omitted native apt identity: {document}"
+        );
+        assert!(
+            document["metadata"]["component"]["properties"]
+                .as_array()
+                .is_some_and(|properties| properties.iter().any(|property| {
+                    property["name"] == "omg:advisory-scan" && property["value"] == "not-performed"
+                })),
+            "inventory-only SBOM did not disclose skipped advisory matching"
+        );
+        assert!(
+            document["vulnerabilities"].is_null()
+                || document["vulnerabilities"] == serde_json::json!([])
+        );
+        fixture.close().expect("remove SBOM fixture");
+    }
 
-        let project = TestProject::new();
-        let result = project.run(&["audit", "sbom", "--output", "sbom.json"]);
-        assert!(!result.stderr_contains("panicked at"), "Should not panic");
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_audit_sbom_generation() {
+        let fixture = tempfile::tempdir().expect("create SBOM output fixture");
+        let path = fixture.path().join("sbom.json");
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args([
+                "audit",
+                "sbom",
+                "--inventory-only",
+                "--output",
+                path.to_str().expect("fixture path is UTF-8"),
+            ])
+            .env_remove("OMG_TEST_MODE")
+            .env_remove("OMG_TEST_DISTRO")
+            .env("OMG_DISABLE_DAEMON", "1")
+            .output()
+            .expect("run pure Debian SBOM command");
+        assert!(
+            !output.status.success(),
+            "pure indexing build generated a live SBOM"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("pure-Rust Debian indexing engine"),
+            "wrong pure-backend refusal: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!path.exists(), "refused SBOM command wrote an output file");
+        fixture.close().expect("remove SBOM fixture");
     }
 
     #[test]
@@ -825,12 +924,22 @@ mod security {
 
     #[test]
     fn test_gpg_verification_awareness() {
-        require_system_tests!();
-
-        let result = run_omg(&["audit", "policy"]);
+        let project = TestProject::for_distro("debian");
+        project.with_security_policy(policies::STRICT_POLICY);
+        // Root deliberately ignores OMG_CONFIG_DIR. Its XDG fallback still
+        // points inside this fixture's isolated HOME.
+        let root_policy = project.home_dir.path().join(".config/omg/policy.toml");
+        std::fs::create_dir_all(root_policy.parent().expect("policy parent"))
+            .expect("create isolated policy directory");
+        std::fs::write(&root_policy, policies::STRICT_POLICY)
+            .expect("write root-safe policy fixture");
+        let result = project.run(&["audit", "policy"]);
         result.assert_success();
         result.assert_stdout_contains("OMG Security Policy Status");
-        result.assert_stdout_contains("PGP Required:");
+        result.assert_stdout_contains("PGP Required: Yes");
+        result.assert_stdout_contains("Minimum Grade: VERIFIED");
+        result.assert_stdout_contains("AUR Allowed: No");
+        project.close_checked();
     }
 }
 
