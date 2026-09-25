@@ -160,6 +160,43 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                 else:
                     candidates = []
                 excerpts = []
+                if case in ("lifecycle", "aarch64-lifecycle"):
+                    summary = members_by_name.get(str(parent / "transactions/summary.json"))
+                    if summary is not None and summary.file_size <= 1024 * 1024:
+                        try:
+                            receipt = json.loads(archive.read(summary), object_pairs_hook=unique_object)
+                        except (ValueError, UnicodeDecodeError):
+                            receipt = None
+                        trials = receipt.get("results", []) if isinstance(receipt, dict) else []
+                        if isinstance(trials, list):
+                            for trial in trials:
+                                if (not isinstance(trial, dict)
+                                        or not isinstance(trial.get("result"), str)
+                                        or trial["result"] not in FAILURES):
+                                    continue
+                                trial_id = trial.get("id")
+                                if not isinstance(trial_id, str) or not re.fullmatch(
+                                        r"(?:install|remove)-(?:native|omg)-[0-9]{3}", trial_id):
+                                    continue
+                                serial_name = f"transactions/trials/{trial_id}/serial.log"
+                                serial = members_by_name.get(str(parent / serial_name))
+                                if serial is not None and serial.file_size <= 8 * 1024 * 1024:
+                                    lines = archive.read(serial).decode("utf-8", errors="replace").splitlines()
+                                    signals = [line for line in lines if re.search(
+                                        r"fail|error|panic|timed out|lost carrier|gained carrier|DHCP|fe80::",
+                                        line, flags=re.IGNORECASE)]
+                                    if signals:
+                                        priority = [line for line in signals if re.search(
+                                            r"fail|error|panic|timed out|lost carrier|fe80::",
+                                            line, flags=re.IGNORECASE)]
+                                        excerpts.append((serial_name, diagnostic_excerpt(
+                                            "\n".join(signals[-4:] + priority[-4:]).encode("utf-8"))))
+                                break
+                if excerpts:
+                    # When a clone failed, earlier successful guest probes are
+                    # less useful than its serial transcript and final health.
+                    candidates = [parent / name for name in
+                                  ("health-validation.log", "transactions.log")]
                 for candidate in candidates:
                     member = members_by_name.get(str(candidate))
                     if member is None or member.file_size > 8 * 1024 * 1024:
@@ -170,6 +207,21 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                     excerpts.append((candidate.name, diagnostic_excerpt(raw)))
                     if parent.name == "inventory":
                         break
+                if not excerpts and case in ("lifecycle", "aarch64-lifecycle"):
+                    # A setup failure can occur before boot.log or any guest
+                    # case log exists. Report the latest available setup stage
+                    # rather than an empty lifecycle diagnostic.
+                    for name in ("image-setup.log", "controller-security.log",
+                                 "controller-setup.log", "controller-pull.log",
+                                 "engine-preflight.log"):
+                        candidate = parent / name
+                        member = members_by_name.get(str(candidate))
+                        if member is None or member.file_size > 8 * 1024 * 1024:
+                            continue
+                        raw = archive.read(member)
+                        if raw.strip():
+                            excerpts.append((name, diagnostic_excerpt(raw)))
+                            break
                 if excerpts:
                     # Keep every selected stage visible within the existing
                     # issue budget. Redaction happens before truncation.

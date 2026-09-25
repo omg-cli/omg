@@ -21,6 +21,7 @@ QEMU_COVERAGE_IRRELEVANT = {
     '.github/workflows/qemu-matrix.yml',
     'scripts/benchmark-qemu.sh',
     'scripts/check-qemu-runner-isolation.py',
+    'scripts/report-qemu-workflow.py',
     'scripts/test_qemu_runner_isolation.py',
 }
 

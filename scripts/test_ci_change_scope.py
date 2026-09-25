@@ -45,6 +45,7 @@ class ScopeTests(unittest.TestCase):
         self.assertTrue(scope.coverage_irrelevant([
             '.github/workflows/qemu-lane.yml',
             'scripts/qemu-daemon-check.sh',
+            'scripts/report-qemu-workflow.py',
             'scripts/test_qemu_runner_isolation.py',
             'docs/local-ci-runner.md',
         ]))
