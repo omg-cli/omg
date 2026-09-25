@@ -426,23 +426,40 @@ pub fn list_orphans() -> Result<Vec<String>> {
     Ok(orphans)
 }
 
-/// Remove all auto-removable orphan packages with the same elevation contract
-/// as other mutating APT operations.
-pub async fn remove_orphans() -> Result<()> {
+/// Remove all auto-removable orphan packages through the normal APT elevation path.
+///
+/// Returns the count only after a fresh native APT cache confirms that every
+/// selected package is absent.
+pub async fn remove_orphans() -> Result<usize> {
     let orphans = tokio::task::spawn_blocking(list_orphans)
         .await
         .context("APT orphan listing task failed")??;
     if orphans.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    if !is_root() {
+    if is_root() {
+        let selected = orphans.clone();
+        tokio::task::spawn_blocking(move || remove_blocking(&selected))
+            .await
+            .context("APT orphan removal task failed")??;
+    } else {
         crate::core::privilege::run_privileged_program("apt-get", &["autoremove", "-y"]).await?;
-        return Ok(());
     }
-    tokio::task::spawn_blocking(move || remove_blocking(&orphans))
-        .await
-        .context("APT orphan removal task failed")??;
-    Ok(())
+
+    tokio::task::spawn_blocking(move || {
+        let (_apt_guard, cache) = open_cache(&[])?;
+        for name in &orphans {
+            anyhow::ensure!(
+                !cache
+                    .get(name)
+                    .is_some_and(|package| package.is_installed()),
+                "APT reported success but orphan remained installed: {name}"
+            );
+        }
+        Ok(orphans.len())
+    })
+    .await
+    .context("APT orphan verification task failed")?
 }
 
 /// Upgradable packages as `(name, installed_version, candidate_version)`.

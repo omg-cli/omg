@@ -21117,7 +21117,7 @@
         }
       ]
     },
-    "5c95c169b51cc16be2965fcc2178a94f44aa9903fe3e853360e5118f04c72f2d": {
+    "b518d66c32331048207448022dc022de390838946df77840a414094579ab8bbf": {
       "releases": [],
       "cases": [
         {
@@ -22502,6 +22502,18 @@
           ],
           "allowed_skips": {},
           "network_scope": "network"
+        },
+        {
+          "id": "clean-orphans-native",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {
+            "arch": "APT-only-orphan-fixture",
+            "fedora": "APT-only-orphan-fixture"
+          },
+          "network_scope": "network",
+          "network_reason": "Replays native tree installation before the APT orphan cleanup; the guest may fetch that package from its configured mirror."
         },
         {
           "id": "update-fast",

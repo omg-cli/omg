@@ -487,7 +487,9 @@ impl App {
             }
             #[cfg(all(feature = "debian", not(feature = "debian-pure")))]
             {
-                return crate::package_managers::apt_remove_orphans().await;
+                return crate::package_managers::apt_remove_orphans()
+                    .await
+                    .map(|_| ());
             }
         }
 
@@ -497,7 +499,9 @@ impl App {
         }
         #[cfg(all(feature = "debian", not(feature = "arch")))]
         {
-            crate::package_managers::apt_remove_orphans().await
+            crate::package_managers::apt_remove_orphans()
+                .await
+                .map(|_| ())
         }
         #[cfg(all(
             feature = "debian-pure",

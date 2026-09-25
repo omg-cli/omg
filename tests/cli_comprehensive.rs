@@ -309,6 +309,7 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
         ("update-fast", Assertion::UpdateFastOutput),
         ("update-turbo", Assertion::UpdateTurboOutput),
         ("daemon-foreground", Assertion::DaemonForegroundLifecycle),
+        ("clean-orphans-native", Assertion::NativeAptOrphanRemoved),
     ] {
         let case = cases
             .iter()
@@ -521,6 +522,7 @@ enum Assertion {
     SearchOfficialTreeOutput,
     NativeTreeInstalled,
     NativeTreeAbsent,
+    NativeAptOrphanRemoved,
 }
 
 impl Assertion {
@@ -542,6 +544,7 @@ impl Assertion {
             "search-official-tree-output" => Self::SearchOfficialTreeOutput,
             "native-tree-installed" => Self::NativeTreeInstalled,
             "native-tree-absent" => Self::NativeTreeAbsent,
+            "native-apt-orphan-removed" => Self::NativeAptOrphanRemoved,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1391,7 +1394,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::SearchOfficialLimitThree
                 | Assertion::SearchOfficialTreeOutput
                 | Assertion::NativeTreeInstalled
-                | Assertion::NativeTreeAbsent => {
+                | Assertion::NativeTreeAbsent
+                | Assertion::NativeAptOrphanRemoved => {
                     unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
             }

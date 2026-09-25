@@ -174,6 +174,7 @@ rollback-yes	["rollback","--yes"]	controlled-error	1	pass	-	hermetic	hermetic:pa
 release-package-search-tree	["search","tree"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:known-defect	search-official-tree-output	none
 release-package-install-tree	["install","--yes","tree"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:known-defect	native-tree-installed	container-prune
 release-package-remove-tree	["remove","--yes","tree"]	package-mutation	0	pass	release-package-install-tree	container	arch:pass,debian:pass,ubuntu:pass,fedora:known-defect	native-tree-absent	container-prune
+clean-orphans-native	["clean","--orphans","--yes"]	package-mutation	0	pass	release-package-install-tree	container	arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable	native-apt-orphan-removed	container-prune
 daemon-foreground	["daemon","--foreground"]	service-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	daemon-foreground-lifecycle	daemon-stop
 update-turbo	["update","--turbo"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-turbo-output	none
 update-fast	["update","--fast"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-fast-output	none

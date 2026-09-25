@@ -114,11 +114,13 @@ pub async fn clean(
                 println!("  {} No changes made (dry run)", style::info("ℹ"));
                 return Ok(());
             }
-            // No top-level prompt here: failure/success reporting below is the
-            // tested contract (debian_tests test_clean_orphans), and stdin may
-            // be piped. `--yes` remains accepted for forward uniformity.
+            // APT cleanup runs noninteractively. The QEMU native orphan case
+            // verifies the resulting package state and removal report.
+            // `--yes` remains accepted for CLI parity.
             let _ = yes;
-            crate::package_managers::apt_remove_orphans().await?;
+            let removed = crate::package_managers::apt_remove_orphans().await?;
+            let noun = if removed == 1 { "package" } else { "packages" };
+            println!("  {} Removed {removed} orphan {noun}", style::positive("✓"));
             return Ok(());
         }
     }
