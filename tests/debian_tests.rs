@@ -82,7 +82,7 @@ mod apt_integration {
             .expect("installed package has an APT candidate")
     }
 
-    fn native_info(args: &[&str]) -> std::process::Output {
+    pub(super) fn native_info(args: &[&str]) -> std::process::Output {
         let executable = assert_cmd::cargo::cargo_bin!("omg");
         if let Some(expected) = std::env::var_os("OMG_CONTRACT_EXPECTED_CLI") {
             assert_eq!(
@@ -107,6 +107,31 @@ mod apt_integration {
             String::from_utf8_lossy(&output.stderr)
         );
         output
+    }
+
+    fn native_status(package: &str) -> String {
+        let output = std::process::Command::new("dpkg-query")
+            .args(["-s", package])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("query native dpkg status");
+        assert!(
+            output.status.success(),
+            "dpkg status failed for {package}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("dpkg status is UTF-8")
+    }
+
+    pub(super) fn native_depends_on(package: &str, dependency: &str) -> bool {
+        native_status(package)
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("Depends: ")
+                    .or_else(|| line.strip_prefix("Pre-Depends: "))
+            })
+            .flat_map(|field| field.split(','))
+            .any(|entry| entry.split_whitespace().next() == Some(dependency))
     }
 
     fn search_rows(project: &TestProject, query: &str) -> Vec<serde_json::Value> {
@@ -414,29 +439,40 @@ mod apt_integration {
 
     #[test]
     fn test_why_integration() {
-        require_system_tests!();
-        require_debian_like!();
-
-        let result = run_omg(&["why", "apt"]);
-        result.assert_success();
-        // The explanation is about apt specifically, so it must name it.
         assert!(
-            result.stdout_contains("apt"),
-            "why apt must mention the queried package. Got:\n{}",
-            result.stdout
+            native_depends_on("apt", "libc6"),
+            "native apt must depend on libc6"
+        );
+        let output = native_info(&["why", "apt"]);
+        let stdout = String::from_utf8(output.stdout).expect("why text is UTF-8");
+        assert!(stdout.contains("Package Analysis"), "{stdout}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.split_whitespace().any(|part| part == "libc6")),
+            "why apt omitted its native libc6 dependency: {stdout}"
         );
     }
 
     #[test]
     fn test_size_integration() {
-        require_system_tests!();
-        require_debian_like!();
-
-        let result = run_omg(&["size", "--tree", "apt"]);
-        result.assert_success();
+        let status = native_status("apt");
+        let kib: u64 = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Installed-Size: "))
+            .expect("native apt installed size")
+            .parse()
+            .expect("native apt size is numeric");
+        assert!(kib >= 1024, "native apt fixture must exceed one MiB");
+        let expected = format!("{:.1} MB", kib as f64 / 1024.0);
+        let output = native_info(&["size", "--tree", "apt"]);
+        let stdout = String::from_utf8(output.stdout).expect("size text is UTF-8");
+        assert!(stdout.contains("Package Size Tree"), "{stdout}");
         assert!(
-            result.stdout_contains("MB") || result.stdout_contains("KB"),
-            "Should show size of apt package"
+            stdout
+                .lines()
+                .any(|line| line.contains(&format!("apt: {expected}"))),
+            "size --tree apt differs from native Installed-Size ({kib} KiB): {stdout}"
         );
     }
 }
@@ -536,20 +572,53 @@ mod debian_specific {
 mod new_features {
     use super::*;
 
+    fn native_sized_package_count() -> usize {
+        let output = std::process::Command::new("dpkg-query")
+            .args(["-W", "-f=${Status}\t${Installed-Size}\n"])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("query native installed package sizes");
+        assert!(
+            output.status.success(),
+            "dpkg size inventory failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("dpkg size inventory is UTF-8")
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(status, size)| {
+                *status == "install ok installed" && size.parse::<u64>().is_ok_and(|kib| kib > 0)
+            })
+            .count()
+    }
+
     #[test]
     fn test_why_command() {
-        require_system_tests!();
-
-        let result = run_omg(&["why", "bash"]);
-        assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        assert!(apt_integration::native_depends_on("bash", "libc6"));
+        let output = apt_integration::native_info(&["why", "bash"]);
+        let stdout = String::from_utf8(output.stdout).expect("why text is UTF-8");
+        assert!(stdout.contains("Package Analysis"), "{stdout}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.split_whitespace().any(|part| part == "libc6")),
+            "why bash omitted its native libc6 dependency: {stdout}"
+        );
     }
 
     #[test]
     fn test_why_reverse_dependencies() {
-        require_system_tests!();
-
-        let result = run_omg(&["why", "libc6", "--reverse"]);
-        assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        assert!(apt_integration::native_depends_on("apt", "libc6"));
+        let output = apt_integration::native_info(&["why", "libc6", "--reverse"]);
+        let stdout = String::from_utf8(output.stdout).expect("reverse why text is UTF-8");
+        assert!(stdout.contains("Reverse Dependencies"), "{stdout}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.split_whitespace().any(|part| part == "apt:")),
+            "reverse dependencies of libc6 omitted native dependent apt: {stdout}"
+        );
     }
 
     #[test]
@@ -607,18 +676,35 @@ mod new_features {
 
     #[test]
     fn test_size_command() {
-        require_system_tests!();
-
-        let result = run_omg(&["size"]);
-        result.assert_success();
+        let count = native_sized_package_count();
+        assert!(
+            count > 10,
+            "native package inventory is too small for this fixture"
+        );
+        let output = apt_integration::native_info(&["size"]);
+        let stdout = String::from_utf8(output.stdout).expect("size text is UTF-8");
+        assert!(stdout.contains("Disk Usage Analysis"), "{stdout}");
+        assert!(
+            stdout.contains(&format!("Number of Packages: {count}")),
+            "size count differs from native dpkg inventory ({count}): {stdout}"
+        );
     }
 
     #[test]
     fn test_size_with_limit() {
-        require_system_tests!();
-
-        let result = run_omg(&["size", "--limit", "10"]);
-        result.assert_success();
+        assert!(native_sized_package_count() > 10);
+        let output = apt_integration::native_info(&["size", "--limit", "10"]);
+        let stdout = String::from_utf8(output.stdout).expect("size limit text is UTF-8");
+        assert!(stdout.contains("Top 10 Packages"), "{stdout}");
+        let ranks = stdout
+            .lines()
+            .filter_map(|line| {
+                let row = line.trim_start_matches([' ', '│']);
+                let (rank, _) = row.split_once(". ")?;
+                rank.trim().parse::<usize>().ok()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ranks, (1..=10).collect::<Vec<_>>(), "{stdout}");
     }
 
     #[test]
