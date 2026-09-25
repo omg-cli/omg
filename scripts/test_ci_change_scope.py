@@ -42,9 +42,25 @@ class ScopeTests(unittest.TestCase):
             with self.subTest(paths=paths):
                 self.assertFalse(scope.documentation_only(paths))
 
+        self.assertTrue(scope.coverage_irrelevant([
+            '.github/workflows/qemu-lane.yml',
+            'scripts/qemu-daemon-check.sh',
+            'scripts/test_qemu_runner_isolation.py',
+            'docs/local-ci-runner.md',
+        ]))
+        for paths in ([], ['src/cli/args.rs'], ['tests/fedora_tests.rs'],
+                      ['Cargo.lock'], ['.github/workflows/coverage.yml'],
+                      ['scripts/ci-change-scope.py'],
+                      ['scripts/qemu-inventory.rs'],
+                      ['scripts/qemu-fixture/../src/fake.sh'],
+                      ['scripts/qemu-daemon-check.sh', 'src/cli/args.rs']):
+            with self.subTest(paths=paths):
+                self.assertFalse(scope.coverage_irrelevant(paths))
+
     def test_non_pr_events_always_build(self):
         for event in ('push', 'merge_group', 'schedule', 'workflow_dispatch', 'unknown'):
             self.assertTrue(scope.requires_build(event, {}))
+            self.assertEqual(scope.classify_scope(event, {}), (True, True))
 
     def test_malformed_identity_fails(self):
         with self.assertRaises(ValueError):
@@ -68,10 +84,19 @@ class ScopeTests(unittest.TestCase):
             def event(head):
                 return {'pull_request': {'base': {'sha': base}, 'head': {'sha': head}}}
             self.assertFalse(scope.requires_build('pull_request', event(git('rev-parse', 'HEAD')), root))
+            self.assertEqual(scope.classify_scope('pull_request',
+                event(git('rev-parse', 'HEAD')), root), (False, False))
+            (root / 'scripts').mkdir()
+            (root / 'scripts/qemu-daemon-check.sh').write_text('test harness')
+            git('add', '.')
+            git('commit', '-qm', 'QEMU harness')
+            self.assertEqual(scope.classify_scope('pull_request',
+                event(git('rev-parse', 'HEAD')), root), (True, False))
             (root / 'docs').mkdir()
             git('mv', 'source.rs', 'docs/renamed.md')
             git('commit', '-qm', 'rename code')
-            self.assertTrue(scope.requires_build('pull_request', event(git('rev-parse', 'HEAD')), root))
+            self.assertEqual(scope.classify_scope('pull_request',
+                event(git('rev-parse', 'HEAD')), root), (True, True))
             with self.assertRaises(subprocess.CalledProcessError):
                 scope.requires_build('pull_request', event('f' * 40), root)
 

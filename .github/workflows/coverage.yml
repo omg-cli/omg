@@ -28,6 +28,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       required: ${{ steps.scope.outputs.required }}
+      coverage_required: ${{ steps.scope.outputs.coverage_required }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,7 +40,7 @@ jobs:
   coverage:
     name: Instrumented coverage tests
     needs: changes
-    if: needs.changes.outputs.required == 'true'
+    if: needs.changes.outputs.coverage_required == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     container:
@@ -192,7 +193,7 @@ jobs:
       - name: Require selected coverage
         env:
           CLASSIFICATION: ${{ needs.changes.result }}
-          REQUIRED: ${{ needs.changes.outputs.required }}
+          REQUIRED: ${{ needs.changes.outputs.coverage_required }}
           COVERAGE: ${{ needs.coverage.result }}
         run: |
           set -euo pipefail
@@ -201,7 +202,7 @@ jobs:
             test "$COVERAGE" = success
           elif [[ "$REQUIRED" == false ]]; then
             test "$COVERAGE" = skipped
-            echo 'Documentation-only PR: coverage compilation not required.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'PR changes cannot affect Rust coverage: instrumentation not required.' >> "$GITHUB_STEP_SUMMARY"
           else
             echo '::error::Missing or invalid coverage selection'
             exit 1
