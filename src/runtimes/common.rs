@@ -397,6 +397,144 @@ where
     unreachable!("final request attempt always returns")
 }
 
+/// Number of attempts for one runtime artifact download: the initial try plus
+/// two bounded retries cover transient mid-stream stalls without turning a
+/// persistent failure into an unbounded loop.
+const MAX_DOWNLOAD_ATTEMPTS: usize = 3;
+
+/// Mid-stream failures that are safe to retry: read stalls, incomplete bodies,
+/// decode faults, and retryable transport errors. HTTP status errors and
+/// checksum mismatches are never retried here.
+fn is_retryable_download_stream_error(error: &reqwest::Error) -> bool {
+    error.is_timeout()
+        || error.is_body()
+        || error.is_decode()
+        || crate::core::http::is_retryable_error(error)
+}
+
+/// Stream a runtime artifact body into a same-filesystem temporary file with
+/// bounded retry for transient mid-stream failures.
+///
+/// Each attempt performs its own request so a broken body is replaced instead
+/// of resumed, the digest is computed over the bytes that actually landed, and
+/// the caller verifies that digest before persisting `dest`.
+async fn stream_runtime_download_to_temp<D, F, Fut>(
+    host: &str,
+    mut request: F,
+    dest: &Path,
+) -> Result<(tempfile::TempPath, String)>
+where
+    D: Digest + Default,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response>>,
+{
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
+    let label = dest.file_name().map_or_else(
+        || "download".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+
+    for attempt in 0..MAX_DOWNLOAD_ATTEMPTS {
+        let response = request()
+            .await
+            .with_context(|| format!("Failed to connect to {host}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            if status.as_u16() == 404 {
+                anyhow::bail!(
+                    "Version not found (404). Check available versions with: omg list --available"
+                );
+            }
+            anyhow::bail!("Download failed: HTTP {status}");
+        }
+
+        let total_size = response.content_length().unwrap_or(0);
+        anyhow::ensure!(
+            total_size <= MAX_RUNTIME_DOWNLOAD_BYTES,
+            "Runtime download declares {total_size} bytes, exceeding the {MAX_RUNTIME_DOWNLOAD_BYTES}-byte limit"
+        );
+        let task = ProgressTask::start(&TaskSpec {
+            label: label.clone(),
+            kind: TaskKind::Bytes {
+                total: (total_size > 0).then_some(total_size),
+            },
+            accent: Accent::Network,
+        });
+
+        // Stream into a same-filesystem temporary file so a failed, aborted, or
+        // checksum-mismatched download never leaves a partial artifact at `dest`.
+        let temporary = tempfile::Builder::new()
+            .prefix(".download-")
+            .tempfile_in(parent)
+            .with_context(|| {
+                format!("Failed to create temporary download for {}", dest.display())
+            })?;
+        let (std_file, temporary_path) = temporary.into_parts();
+        let mut file = tokio::fs::File::from_std(std_file);
+        let mut stream = response.bytes_stream();
+        let mut downloaded: u64 = 0;
+        let mut hasher = D::default();
+        let mut failure: Option<reqwest::Error> = None;
+
+        while let Some(item) = stream.next().await {
+            let chunk = match item {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            file.write_all(&chunk)
+                .await
+                .context("Error writing to file")?;
+
+            hasher.update(&chunk);
+
+            downloaded = bounded_download_size(downloaded, chunk.len())?;
+            task.set_position(downloaded);
+        }
+
+        if let Some(error) = failure {
+            drop(file);
+            drop(temporary_path);
+            if attempt + 1 < MAX_DOWNLOAD_ATTEMPTS && is_retryable_download_stream_error(&error) {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    host,
+                    "Runtime download body failed; retrying bounded download"
+                );
+                tokio::time::sleep(crate::core::http::retry_backoff(
+                    std::time::Duration::from_millis(100),
+                    u32::try_from(attempt).unwrap_or(u32::MAX),
+                ))
+                .await;
+                continue;
+            }
+            return Err(error).context("Error downloading chunk");
+        }
+
+        file.flush()
+            .await
+            .with_context(|| format!("Failed to flush download to: {}", dest.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("Failed to sync download to: {}", dest.display()))?;
+        drop(file);
+
+        let digest = hex::encode(hasher.finalize());
+        task.finish(Outcome::Done);
+        return Ok((temporary_path, digest));
+    }
+    unreachable!("final download attempt always returns")
+}
+
 /// Download a file with progress bar and checksum verification.
 pub async fn download_with_progress(
     client: &reqwest::Client,
@@ -404,85 +542,19 @@ pub async fn download_with_progress(
     dest: &Path,
     expected_sha256: &str,
 ) -> Result<()> {
-    use futures::StreamExt;
-    use tokio::io::AsyncWriteExt;
-
     // Vendor metadata supplies this URL: pin it to TLS on routable hosts so
     // tampered metadata cannot aim downloads at plain HTTP or private
     // network services.
     crate::core::http::validate_download_url(url)?;
 
-    let response = request_runtime_download(client, url)
-        .await
-        .with_context(|| format!("Failed to connect to {}", extract_domain(url)))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        if status.as_u16() == 404 {
-            anyhow::bail!(
-                "Version not found (404). Check available versions with: omg list --available"
-            );
-        }
-        anyhow::bail!("Download failed: HTTP {status}");
-    }
-
-    let total_size = response.content_length().unwrap_or(0);
-    anyhow::ensure!(
-        total_size <= MAX_RUNTIME_DOWNLOAD_BYTES,
-        "Runtime download declares {total_size} bytes, exceeding the {MAX_RUNTIME_DOWNLOAD_BYTES}-byte limit"
-    );
-    let label = dest.file_name().map_or_else(
-        || "download".to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    let task = ProgressTask::start(&TaskSpec {
-        label,
-        kind: TaskKind::Bytes {
-            total: (total_size > 0).then_some(total_size),
-        },
-        accent: Accent::Network,
-    });
-
-    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
-    tokio::fs::create_dir_all(parent)
-        .await
-        .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
-
-    // Stream into a same-filesystem temporary file so a failed, aborted, or
-    // checksum-mismatched download never leaves a partial artifact at `dest`.
-    let temporary = tempfile::Builder::new()
-        .prefix(".download-")
-        .tempfile_in(parent)
-        .with_context(|| format!("Failed to create temporary download for {}", dest.display()))?;
-    let (std_file, temporary_path) = temporary.into_parts();
-    let mut file = tokio::fs::File::from_std(std_file);
-
-    let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let mut hasher = Sha256::new();
-
-    while let Some(item) = stream.next().await {
-        let chunk = item.context("Error downloading chunk")?;
-        file.write_all(&chunk)
-            .await
-            .context("Error writing to file")?;
-
-        hasher.update(&chunk);
-
-        downloaded = bounded_download_size(downloaded, chunk.len())?;
-        task.set_position(downloaded);
-    }
-
-    file.flush()
-        .await
-        .with_context(|| format!("Failed to flush download to: {}", dest.display()))?;
-    file.sync_all()
-        .await
-        .with_context(|| format!("Failed to sync download to: {}", dest.display()))?;
-    drop(file);
+    let (temporary_path, actual) = stream_runtime_download_to_temp::<Sha256, _, _>(
+        extract_domain(url),
+        || request_runtime_download(client, url),
+        dest,
+    )
+    .await?;
 
     // Verify checksum before publishing the download to its final path.
-    let actual = hex::encode(hasher.finalize());
     let expected = expected_sha256.trim();
     if !actual.eq_ignore_ascii_case(expected) {
         anyhow::bail!(
@@ -494,98 +566,30 @@ pub async fn download_with_progress(
         .persist(dest)
         .map_err(|error| error.error)
         .with_context(|| format!("Failed to finalize download: {}", dest.display()))?;
-    task.finish(Outcome::Done);
     Ok(())
 }
 
 /// Download a file with progress bar and SHA-512 verification.
 ///
 /// Structural mirror of [`download_with_progress`] for vendors that publish
-/// SHA-512 hashes (Microsoft's .NET release metadata). Kept as a separate
-/// function so the SHA-256 hot path used by every other manager is untouched.
+/// SHA-512 hashes (Microsoft's .NET release metadata).
 pub async fn download_with_progress_sha512(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
     expected_sha512: &str,
 ) -> Result<()> {
-    use futures::StreamExt;
-    use tokio::io::AsyncWriteExt;
-
     // Same metadata-supplied-URL pinning as the SHA-256 hot path.
     crate::core::http::validate_download_url(url)?;
 
-    let response = request_runtime_download(client, url)
-        .await
-        .with_context(|| format!("Failed to connect to {}", extract_domain(url)))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        if status.as_u16() == 404 {
-            anyhow::bail!(
-                "Version not found (404). Check available versions with: omg list --available"
-            );
-        }
-        anyhow::bail!("Download failed: HTTP {status}");
-    }
-
-    let total_size = response.content_length().unwrap_or(0);
-    anyhow::ensure!(
-        total_size <= MAX_RUNTIME_DOWNLOAD_BYTES,
-        "Runtime download declares {total_size} bytes, exceeding the {MAX_RUNTIME_DOWNLOAD_BYTES}-byte limit"
-    );
-    let label = dest.file_name().map_or_else(
-        || "download".to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    let task = ProgressTask::start(&TaskSpec {
-        label,
-        kind: TaskKind::Bytes {
-            total: (total_size > 0).then_some(total_size),
-        },
-        accent: Accent::Network,
-    });
-
-    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
-    tokio::fs::create_dir_all(parent)
-        .await
-        .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
-
-    // Stream into a same-filesystem temporary file so a failed, aborted, or
-    // checksum-mismatched download never leaves a partial artifact at `dest`.
-    let temporary = tempfile::Builder::new()
-        .prefix(".download-")
-        .tempfile_in(parent)
-        .with_context(|| format!("Failed to create temporary download for {}", dest.display()))?;
-    let (std_file, temporary_path) = temporary.into_parts();
-    let mut file = tokio::fs::File::from_std(std_file);
-
-    let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let mut hasher = Sha512::new();
-
-    while let Some(item) = stream.next().await {
-        let chunk = item.context("Error downloading chunk")?;
-        file.write_all(&chunk)
-            .await
-            .context("Error writing to file")?;
-
-        hasher.update(&chunk);
-
-        downloaded = bounded_download_size(downloaded, chunk.len())?;
-        task.set_position(downloaded);
-    }
-
-    file.flush()
-        .await
-        .with_context(|| format!("Failed to flush download to: {}", dest.display()))?;
-    file.sync_all()
-        .await
-        .with_context(|| format!("Failed to sync download to: {}", dest.display()))?;
-    drop(file);
+    let (temporary_path, actual) = stream_runtime_download_to_temp::<Sha512, _, _>(
+        extract_domain(url),
+        || request_runtime_download(client, url),
+        dest,
+    )
+    .await?;
 
     // Verify checksum before publishing the download to its final path.
-    let actual = hex::encode(hasher.finalize());
     let expected = expected_sha512.trim();
     if !actual.eq_ignore_ascii_case(expected) {
         anyhow::bail!(
@@ -597,7 +601,6 @@ pub async fn download_with_progress_sha512(
         .persist(dest)
         .map_err(|error| error.error)
         .with_context(|| format!("Failed to finalize download: {}", dest.display()))?;
-    task.finish(Outcome::Done);
     Ok(())
 }
 
@@ -1830,6 +1833,65 @@ mod tests {
             drop(server?);
             request?;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_download_retries_a_truncated_body_before_verifying() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/archive", listener.local_addr()?);
+        let body = b"runtime archive fixture bytes".to_vec();
+        let digest = hex::encode(Sha256::digest(&body));
+        let server = async {
+            let mut request = [0; 4096];
+            // Attempt 1: advertise more bytes than the body contains and close
+            // the connection, which surfaces as a mid-stream body error.
+            let (mut stream, _) = listener.accept().await?;
+            let _ = stream.read(&mut request).await?;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\ntruncated",
+                )
+                .await?;
+            drop(stream);
+            // Attempt 2: the complete body.
+            let (mut stream, _) = listener.accept().await?;
+            let _ = stream.read(&mut request).await?;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            stream.write_all(&body).await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let directory = tempfile::tempdir()?;
+        let dest = directory.path().join("archive.tar.gz");
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let download = stream_runtime_download_to_temp::<Sha256, _, _>(
+            "127.0.0.1",
+            || {
+                let client = client.clone();
+                let url = url.clone();
+                async move { Ok(client.get(url).send().await?) }
+            },
+            &dest,
+        );
+        let (server, download) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(server, download)
+        })
+        .await?;
+        server?;
+        let (temporary_path, actual) = download?;
+        assert_eq!(actual, digest);
+        temporary_path.persist(&dest).map_err(|error| error.error)?;
+        assert_eq!(std::fs::read(&dest)?, body);
         Ok(())
     }
 
