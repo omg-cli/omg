@@ -417,6 +417,18 @@ check_product_output() {
       printf 'assertion failed: offline SBOM did not refuse an unavailable advisory source without an artifact\n' >&2; return 1
     fi
   fi
+  if [[ "$assertion" == self-update-downgrade-refusal ]]; then
+    if [[ "$code" != 1 ]] \
+      || ! grep -Fq 'Refusing to downgrade' "$stderr"; then
+      printf 'assertion failed: self-update did not refuse an offline downgrade\n' >&2; return 1
+    fi
+  fi
+  if [[ "$assertion" == env-share-missing-lock ]]; then
+    if [[ "$code" != 1 ]] \
+      || ! grep -Fq 'No omg.lock file found' "$stderr"; then
+      printf 'assertion failed: env share did not refuse without an omg.lock\n' >&2; return 1
+    fi
+  fi
   if [[ "$code" == 0 ]]; then
     case "$assertion" in
       hooks-installed|hooks-absent)
@@ -689,7 +701,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed) ;; *) exit 2 ;; esac
+  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock) ;; *) exit 2 ;; esac
   if [[ "$a" == search-official-tree-output ]]; then [[ "$id" == release-package-search-tree ]] || exit 2; fi
   if [[ "$a" == native-tree-installed ]]; then [[ "$id" == release-package-install-tree ]] || exit 2; fi
   if [[ "$a" == native-tree-absent ]]; then [[ "$id" == release-package-remove-tree ]] || exit 2; fi
@@ -707,6 +719,12 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   if [[ "$id" == runtime-go-install ]]; then
     jq -e 'length == 3 and .[0] == "use" and .[1] == "go" and (.[2] | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$aj" >/dev/null || exit 2
+  fi
+  if [[ "$id" == self-update-version ]]; then
+    jq -e 'length == 3 and .[0] == "self-update" and .[1] == "--version" and (.[2] | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$aj" >/dev/null || exit 2
+  fi
+  if [[ "$id" == env-share-missing-lock ]]; then
+    jq -e 'length == 2 and .[0] == "env" and .[1] == "share"' <<< "$aj" >/dev/null || exit 2
   fi
 done < <(tail -n +2 "$tsv")
 

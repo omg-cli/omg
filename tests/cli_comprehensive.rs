@@ -322,6 +322,56 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
     }
 }
 
+#[test]
+fn behavior_inventory_keeps_offline_refusal_assertions() {
+    let cases = behavior_cases();
+    for (id, assertion) in [
+        ("self-update-version", Assertion::SelfUpdateDowngradeRefusal),
+        ("env-share-missing-lock", Assertion::EnvShareMissingLock),
+    ] {
+        let case = cases
+            .iter()
+            .find(|case| case.id == id)
+            .expect("required offline refusal case");
+        assert!(
+            case.runs_hermetically(),
+            "{id} must run hermetically instead of being declared"
+        );
+        assert!(
+            case.assertions.contains(&assertion),
+            "{id} lost its offline refusal assertion"
+        );
+    }
+}
+
+/// Rows that need their own empty project directory.
+///
+/// The shared fixture captures an `omg.lock` (env-capture) and other state
+/// early in the run, so a row whose contract is a missing-input refusal must
+/// not inherit it - `env share` would otherwise pass the lock check and fail
+/// the assertion instead of refusing.
+fn needs_isolated_fixture(case: &BehaviorCase) -> bool {
+    matches!(
+        case.id.as_str(),
+        "env-export-missing-lock" | "env-plan-missing-manifest" | "env-share-missing-lock"
+    )
+}
+
+#[test]
+fn missing_lock_rows_run_without_the_shared_fixture() {
+    let cases = behavior_cases();
+    for case in cases
+        .iter()
+        .filter(|case| case.assertions.contains(&Assertion::EnvShareMissingLock))
+    {
+        assert!(
+            needs_isolated_fixture(case),
+            "{} asserts a missing-lock refusal and must run in an isolated fixture",
+            case.id
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UxState {
     Pass,
@@ -523,6 +573,8 @@ enum Assertion {
     NativeTreeInstalled,
     NativeTreeAbsent,
     NativeAptOrphanRemoved,
+    SelfUpdateDowngradeRefusal,
+    EnvShareMissingLock,
 }
 
 impl Assertion {
@@ -545,6 +597,8 @@ impl Assertion {
             "native-tree-installed" => Self::NativeTreeInstalled,
             "native-tree-absent" => Self::NativeTreeAbsent,
             "native-apt-orphan-removed" => Self::NativeAptOrphanRemoved,
+            "self-update-downgrade-refusal" => Self::SelfUpdateDowngradeRefusal,
+            "env-share-missing-lock" => Self::EnvShareMissingLock,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1154,11 +1208,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
     for (number, case) in behavior_cases().into_iter().enumerate() {
         // Missing-input probes must not inherit files written by earlier rows
         // such as env-capture. Keep the shared fixture for dependent cases.
-        let empty_environment = matches!(
-            case.id.as_str(),
-            "env-export-missing-lock" | "env-plan-missing-manifest"
-        )
-        .then(|| TestProject::for_distro("arch"));
+        let empty_environment =
+            needs_isolated_fixture(&case).then(|| TestProject::for_distro("arch"));
         let project = empty_environment.as_ref().unwrap_or(&project);
         let root = project.path().to_string_lossy().into_owned();
         let expanded_args: Vec<String> = case
@@ -1386,6 +1437,16 @@ fn behavior_inventory_runs_in_hermetic_state() {
                             "artifact {relative} was not written as valid JSON at {}",
                             path.display()
                         ));
+                    }
+                }
+                Assertion::SelfUpdateDowngradeRefusal => {
+                    if !result.stderr.contains("Refusing to downgrade") {
+                        issues.push("self-update did not refuse the offline downgrade".to_string());
+                    }
+                }
+                Assertion::EnvShareMissingLock => {
+                    if !result.stderr.contains("No omg.lock file found") {
+                        issues.push("env share did not refuse without an omg.lock".to_string());
                     }
                 }
                 Assertion::UpdateFastOutput
