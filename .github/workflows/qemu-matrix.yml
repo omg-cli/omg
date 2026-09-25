@@ -97,6 +97,7 @@ jobs:
           python3 -m unittest discover -s scripts -p test_qemu_daemon_contract.py
           python3 -m unittest discover -s scripts -p test_qemu_image_cache.py
           python3 -m unittest discover -s scripts -p test_qemu_process_isolation.py
+          python3 -m unittest discover -s scripts -p test_qemu_runner_isolation.py
           python3 -m unittest discover -s scripts -p test_qemu_controller_floor.py
 
       - name: Verify harness and reporting fixtures before guest builds
