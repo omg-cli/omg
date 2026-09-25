@@ -215,7 +215,7 @@ class CiDeduplicationTests(unittest.TestCase):
                 root = Path(directory)
                 (root / "Makefile").write_bytes((CI_YML.parents[2] / "Makefile").read_bytes())
                 (root / "scripts").mkdir()
-                for name in ("install.sh", "benchmark.sh", "benchmark-hyperfine.sh", "scripts/probe.sh"):
+                for name in ("install.sh", "benchmark-hyperfine.sh", "scripts/probe.sh"):
                     (root / name).write_text("exit 99\n", encoding="utf-8")
                 runner = root / "record.py"
                 runner.write_text(
@@ -266,7 +266,6 @@ class ShellSyntaxGateTests(unittest.TestCase):
         makefile = CI_YML.parents[2] / "Makefile"
         scripts = [
             "install.sh",
-            "benchmark.sh",
             "benchmark-hyperfine.sh",
             "scripts/last.sh",
         ]
