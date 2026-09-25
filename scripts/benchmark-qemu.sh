@@ -406,7 +406,7 @@ fi
 # Fedora's pinned cloud image is 556 MiB: a valid mirror delivering about
 # 1 MiB/s needs more than five minutes. Keep a finite transfer deadline and
 # verify the complete image digest before any guest boot or cache write.
-timeout 960 docker exec "$controller" bash -c 'set -e; cd /work/guest; if [[ ! -f base.qcow2 ]]; then curl --fail --location --max-time 900 -o base.qcow2 "$1"; fi; printf "%s  base.qcow2\n" "$2" | "$3" -c -' _ "$image_url" "$image_hash" "$hash_tool" > "$work/image-setup.log" 2>&1
+timeout 960 docker exec "$controller" bash -c 'set -e; cd /work/guest; if [[ ! -f base.qcow2 ]]; then curl --fail --location --connect-timeout 20 --max-time 900 --retry 4 --retry-all-errors --retry-delay 5 --retry-max-time 900 -o base.qcow2 "$1"; fi; printf "%s  base.qcow2\n" "$2" | "$3" -c -' _ "$image_url" "$image_hash" "$hash_tool" > "$work/image-setup.log" 2>&1
 if [[ -n "$cache_file" && "$cache_hit" == false ]]; then
   timeout 90 python3 "$here/qemu-image-cache.py" "$work/guest/base.qcow2" "$cache_file" --algorithm "${hash_tool%sum}" --digest "$image_hash" >> "$work/image-cache.log" 2>&1
 fi
