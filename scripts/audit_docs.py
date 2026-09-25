@@ -175,8 +175,33 @@ def check_config_keys(repo):
     return findings
 
 
+def _validate_command(rel, lineno, cmd_line, enums, findings, location="inline"):
+    """Record unknown words and options for one `omg ...` invocation."""
+    if re.match(r'^omg\s+\d+\.\d+', cmd_line):
+        return
+    if cmd_line == "omg migrate from-nvm":
+        return
+    words, options = ALIGNMENT.tokens_for(cmd_line)
+    if not words or words[0] in ALIGNMENT.DOCUMENTED_REMOVALS:
+        return
+    owner, bad = ALIGNMENT.resolve(enums, words)
+    if bad:
+        findings.append(f"{rel}:{lineno}: {location} command unknown word {bad!r} in `{cmd_line}`")
+        return
+    if owner is None:
+        return
+    for option in options:
+        name = option.lstrip('-')
+        if name in ALIGNMENT.GLOBAL_OPTIONS or name in owner.options:
+            continue
+        known = any(name in variant.options
+                    for variants in enums.values() for variant in variants.values())
+        reason = 'not accepted by' if known else 'unknown'
+        findings.append(f"{rel}:{lineno}: {location} option --{name} {reason} in `{cmd_line}`")
+
+
 def check_all_command_references(repo):
-    """Find all `omg ...` snippets in backticks or code blocks."""
+    """Find all `omg ...` snippets in inline code or fenced code blocks."""
     args_rs = repo / 'src' / 'cli' / 'args.rs'
     enums = ALIGNMENT.parse_enums(args_rs.read_text(encoding='utf-8').splitlines())
     
@@ -188,31 +213,27 @@ def check_all_command_references(repo):
         except Exception:
             continue
         
+        in_fence = False
         for lineno, line in enumerate(content.splitlines(), 1):
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+                continue
+
             # Check inline code `omg ...`
             for match in re.finditer(r'`\s*(?:#\s*)?(?:\$\s*)?(omg\s+[^`]+)`', line):
                 cmd_line = match.group(1).strip()
-                if re.match(r'^omg\s+\d+\.\d+', cmd_line):
+                if cmd_line == "omg run --list" and "no `omg" in line:
                     continue
-                if cmd_line == "omg migrate from-nvm" or (cmd_line == "omg run --list" and "no `omg" in line):
-                    continue
-                words, options = ALIGNMENT.tokens_for(cmd_line)
-                if not words or words[0] in ALIGNMENT.DOCUMENTED_REMOVALS:
-                    continue
-                owner, bad = ALIGNMENT.resolve(enums, words)
-                if bad:
-                    findings.append(f"{rel}:{lineno}: inline command unknown word {bad!r} in `{cmd_line}`")
-                    continue
-                if owner is None:
-                    continue
-                for option in options:
-                    name = option.lstrip('-')
-                    if name in ALIGNMENT.GLOBAL_OPTIONS or name in owner.options:
-                        continue
-                    known = any(name in variant.options
-                                for variants in enums.values() for variant in variants.values())
-                    reason = 'not accepted by' if known else 'unknown'
-                    findings.append(f"{rel}:{lineno}: inline option --{name} {reason} in `{cmd_line}`")
+                _validate_command(rel, lineno, cmd_line, enums, findings)
+
+            # Check `omg ...` lines inside fenced code blocks
+            if in_fence:
+                block = re.match(r'\s*(?:\$\s*)?(?:sudo\s+)?(omg\s+\S.*)$', line)
+                if block:
+                    _validate_command(
+                        rel, lineno, block.group(1).strip(), enums, findings,
+                        location="code block",
+                    )
 
     return findings
 
@@ -243,10 +264,12 @@ def main():
         print(" ", c)
 
     print("\n" + "=" * 60)
-    print("AUDIT 4: Inline Command References")
+    print("AUDIT 4: Command References (inline and code blocks)")
     print("=" * 60)
     cmd_issues = check_all_command_references(REPO_ROOT)
-    print(f"Inline command issues: {len(cmd_issues)}")
+    print(f"Command reference issues: {len(cmd_issues)}")
+    for c in cmd_issues:
+        print(" ", c)
     total_issues = len(links) + len(forbidden) + len(config_issues) + len(cmd_issues)
     if total_issues > 0:
         print(f"\nAudit failed with {total_issues} issue(s).")

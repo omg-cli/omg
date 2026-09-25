@@ -26,6 +26,7 @@ if ! jq -e '
   ($root.v1 | type == "object") and
   ($root.v1.datasource | type == "string" and startswith("DataSourceNoCloud")) and
   ($root.v1.stage == null) and
+  (($root.v1 | has("recoverable_errors") | not) or $root.v1.recoverable_errors == {}) and
   all(["init-local", "init", "modules-config", "modules-final"][];
     . as $stage | $root.v1[$stage] as $entry |
     ($entry | type == "object") and

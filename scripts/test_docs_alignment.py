@@ -199,13 +199,15 @@ class ScanTest(unittest.TestCase):
         code, output = run(repo)
         self.assertEqual(code, 0, output)
 
-    def test_changelog_and_superpowers_are_skipped(self):
+    def test_changelog_is_skipped_and_working_plans_are_checked(self):
         repo = self.repo({
             'changelog.md': '```bash\nomg frobnicate\n```\n',
             'superpowers/plan.md': '```bash\nomg frobnicate\n```\n',
         })
         code, output = run(repo)
-        self.assertEqual(code, 0, output)
+        self.assertEqual(code, 1, output)
+        self.assertIn('docs/superpowers/plan.md', output)
+        self.assertNotIn('changelog.md:', output)
 
     def test_missing_args_rs_is_an_error(self):
         repo = Path(self._tmp.name)

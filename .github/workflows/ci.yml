@@ -86,6 +86,16 @@ jobs:
       - name: Verify installer destination safety
         run: bash tests/installer_security.sh
 
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-machete
+
+      - name: Unused dependencies (gating)
+        # Standalone binary: the machete scan needs no Rust toolchain, so it
+        # still runs on changes that skip compilation.
+        run: cargo-machete
+
   portable:
     name: "Portable Rust"
     needs: quick-gate
@@ -851,9 +861,26 @@ jobs:
     secrets:
       OMG_SMOKE_SENTRY_DSN: ${{ github.event_name != 'pull_request' && secrets.OMG_SMOKE_SENTRY_DSN || '' }}
 
+  docs-audit:
+    name: Docs audit
+    # Unconditional: doc-only changes must not be able to introduce broken
+    # links, phantom flags, or unknown commands in fenced code blocks.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Audit repository docs
+        run: make audit-docs
+
+
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu, qemu]
+    needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu, qemu, docs-audit]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -872,6 +899,7 @@ jobs:
           UBUNTU: ${{ needs.ubuntu.result }}
           QEMU: ${{ needs.qemu.result }}
           QEMU_REQUIRED: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true' }}
+          DOCS_AUDIT: ${{ needs.docs-audit.result }}
         run: |
           echo "## CI Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -885,6 +913,12 @@ jobs:
           echo "| macOS | $MACOS |" >> $GITHUB_STEP_SUMMARY
           echo "| Ubuntu | $UBUNTU |" >> $GITHUB_STEP_SUMMARY
           echo "| QEMU | $QEMU |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docs audit | $DOCS_AUDIT |" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$DOCS_AUDIT" != "success" ]]; then
+            echo "::error::Documentation audit did not succeed: $DOCS_AUDIT"
+            exit 1
+          fi
 
           if [[ "$QEMU_REQUIRED" == "true" && "$QEMU" != "success" ]]; then
             echo "::error::Required QEMU verification did not succeed: $QEMU"
