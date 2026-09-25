@@ -11,19 +11,7 @@ use platform_semantics::{assert_no_arch_terms, assert_no_debian_terms, assert_no
 mod dnf_integration {
     use super::*;
 
-    #[tokio::test]
-    async fn test_dnf_package_manager_creation() {
-        let pm = DnfPackageManager::new();
-        assert_eq!(pm.name(), "dnf");
-        let identity = pm.name().to_string();
-        assert_no_debian_terms(&identity, "Fedora package manager identity");
-        assert_no_arch_terms(&identity, "Fedora package manager identity");
-        assert_no_macos_terms(&identity, "Fedora package manager identity");
-    }
-
-    #[tokio::test]
-    async fn repository_lookup_finds_uninstalled_package() -> Result<()> {
-        let mut selected = None;
+    fn uninstalled_repository_package() -> Result<&'static str> {
         for candidate in ["tree", "htop", "nano", "rsync", "jq"] {
             let installed = std::process::Command::new("rpm")
                 .args(["-q", candidate])
@@ -55,13 +43,25 @@ mod dnf_integration {
                 .lines()
                 .any(|name| name == candidate)
             {
-                selected = Some(candidate);
-                break;
+                return Ok(candidate);
             }
         }
-        let package = selected.ok_or_else(|| {
-            anyhow::anyhow!("no known available, uninstalled Fedora package for lookup fixture")
-        })?;
+        anyhow::bail!("no known available, uninstalled Fedora package for native fixture")
+    }
+
+    #[tokio::test]
+    async fn test_dnf_package_manager_creation() {
+        let pm = DnfPackageManager::new();
+        assert_eq!(pm.name(), "dnf");
+        let identity = pm.name().to_string();
+        assert_no_debian_terms(&identity, "Fedora package manager identity");
+        assert_no_arch_terms(&identity, "Fedora package manager identity");
+        assert_no_macos_terms(&identity, "Fedora package manager identity");
+    }
+
+    #[tokio::test]
+    async fn repository_lookup_finds_uninstalled_package() -> Result<()> {
+        let package = uninstalled_repository_package()?;
         let pm = DnfPackageManager::new();
         assert!(
             !pm.list_installed()
@@ -480,17 +480,7 @@ mod dnf_integration {
     #[test]
     fn native_transactions_record_install_remove_and_ignore_noops() -> Result<()> {
         use omg_lib::core::history::{HistoryManager, TransactionType};
-        if common::TestConfig::default().skip_if_no_system("dnf_transaction_history") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
-        }
-        let absent = std::process::Command::new("rpm")
-            .args(["-q", "tree"])
-            .output()?;
-        anyhow::ensure!(
-            absent.status.code() == Some(1),
-            "tree must be absent before this lifecycle fixture"
-        );
+        let package = uninstalled_repository_package()?;
         let snapshot = || -> Result<Vec<String>> {
             let output = std::process::Command::new("rpm")
                 .args(["-qa", "--qf", "%{NAME}\t%{NEVRA}\n"])
@@ -509,12 +499,13 @@ mod dnf_integration {
             Ok(rows)
         };
         let before = snapshot()?;
-        let cache = dirs::cache_dir().expect("user cache directory");
-        std::fs::create_dir_all(&cache)?;
-        let fixture = tempfile::tempdir_in(cache)?;
+        let fixture = tempfile::Builder::new()
+            .prefix("omg-fedora-transaction-")
+            .tempdir_in("/tmp")?;
         let history = HistoryManager::new_in(fixture.path().join("history.json"))?;
         let run = |arguments: &[&str]| {
             std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+                .env("OMG_NATIVE_TEST_DATA_DIR", "1")
                 .env("OMG_DATA_DIR", fixture.path())
                 .env("NO_COLOR", "1")
                 .stdin(std::process::Stdio::null())
@@ -522,7 +513,7 @@ mod dnf_integration {
                 .output()
         };
         let verified = (|| -> Result<()> {
-            let install = run(&["install", "tree", "--yes"])?;
+            let install = run(&["install", package, "--yes"])?;
             anyhow::ensure!(
                 install.status.success(),
                 "Install failed: {}",
@@ -541,10 +532,10 @@ mod dnf_integration {
             let change = record
                 .changes
                 .iter()
-                .find(|change| change.name == "tree")
-                .ok_or_else(|| anyhow::anyhow!("Installation history omitted tree"))?;
+                .find(|change| change.name == package)
+                .ok_or_else(|| anyhow::anyhow!("Installation history omitted {package}"))?;
             let native = std::process::Command::new("rpm")
-                .args(["-q", "tree", "--qf", "%{EPOCHNUM}:%{VERSION}-%{RELEASE}"])
+                .args(["-q", package, "--qf", "%{EPOCHNUM}:%{VERSION}-%{RELEASE}"])
                 .output()?;
             anyhow::ensure!(native.status.success(), "Native installed version failed");
             anyhow::ensure!(
@@ -552,10 +543,10 @@ mod dnf_integration {
                     && change.new_version.as_deref() == Some(std::str::from_utf8(&native.stdout)?),
                 "Recorded version differs from RPM"
             );
-            let noop = run(&["install", "tree", "--yes"])?;
+            let noop = run(&["install", package, "--yes"])?;
             anyhow::ensure!(noop.status.success(), "No-op install failed");
             anyhow::ensure!(history.load()?.len() == 1, "No-op invented a transaction");
-            let blame = run(&["blame", "tree"])?;
+            let blame = run(&["blame", package])?;
             anyhow::ensure!(
                 blame.status.success()
                     && String::from_utf8(blame.stdout)?.contains("OMG Transaction History (1)"),
@@ -564,23 +555,33 @@ mod dnf_integration {
             Ok(())
         })();
         let present = std::process::Command::new("rpm")
-            .args(["-q", "tree"])
+            .args(["-q", package])
             .output()?;
         if present.status.success() {
-            let removed = run(&["remove", "tree", "--yes"])?;
-            anyhow::ensure!(snapshot()? == before, "RPM inventory was not restored");
-            anyhow::ensure!(
-                removed.status.success(),
-                "Fixture cleanup failed: {}",
-                String::from_utf8_lossy(&removed.stderr)
-            );
+            let removed = run(&["remove", package, "--yes"])?;
+            if !removed.status.success() {
+                let fallback = std::process::Command::new("dnf")
+                    .args(["remove", "-y", package])
+                    .output()?;
+                anyhow::ensure!(
+                    fallback.status.success(),
+                    "OMG removal failed: {}; native cleanup also failed: {}",
+                    String::from_utf8_lossy(&removed.stderr),
+                    String::from_utf8_lossy(&fallback.stderr)
+                );
+                anyhow::ensure!(snapshot()? == before, "RPM inventory was not restored");
+                anyhow::bail!(
+                    "OMG removal failed after native cleanup: {}",
+                    String::from_utf8_lossy(&removed.stderr)
+                );
+            }
         } else {
             anyhow::ensure!(
                 present.status.code() == Some(1),
                 "Cannot determine fixture package state"
             );
-            anyhow::ensure!(snapshot()? == before, "RPM inventory was not restored");
         }
+        anyhow::ensure!(snapshot()? == before, "RPM inventory was not restored");
         verified?;
         let records = history.load()?;
         anyhow::ensure!(records.len() == 2, "Expected install and remove history");
@@ -590,10 +591,10 @@ mod dnf_integration {
             "Incorrect removal outcome"
         );
         anyhow::ensure!(
-            removed.changes.iter().any(|change| change.name == "tree"
+            removed.changes.iter().any(|change| change.name == package
                 && change.old_version.is_some()
                 && change.new_version.is_none()),
-            "Removal history omitted tree"
+            "Removal history omitted {package}"
         );
         fixture.close()?;
         Ok(())
@@ -604,27 +605,43 @@ mod dnf_integration {
     async fn native_history_honors_custom_and_disabled_service_history() -> Result<()> {
         use omg_lib::core::history::HistoryManager;
         use omg_lib::core::packages::PackageService;
-        if common::TestConfig::default().skip_if_no_system("dnf_history_ownership") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
-        }
-        let absent = std::process::Command::new("rpm")
-            .args(["-q", "tree"])
-            .output()?;
-        anyhow::ensure!(absent.status.code() == Some(1), "tree must be absent");
-        let fixture = tempfile::tempdir_in(dirs::cache_dir().expect("user cache directory"))?;
+        let package = uninstalled_repository_package()?;
+        let inventory = || -> Result<Vec<String>> {
+            let output = std::process::Command::new("rpm")
+                .args(["-qa", "--qf", "%{NEVRA}\\n"])
+                .output()?;
+            anyhow::ensure!(output.status.success(), "RPM inventory failed");
+            let mut rows = String::from_utf8(output.stdout)?
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            rows.sort();
+            Ok(rows)
+        };
+        let before = inventory()?;
+        let fixture = tempfile::Builder::new()
+            .prefix("omg-fedora-history-owner-")
+            .tempdir_in("/tmp")?;
         let custom_path = fixture.path().join("custom.json");
         let default = HistoryManager::new()?;
         let default_before = serde_json::to_vec(&default.load()?)?;
         let manager = std::sync::Arc::new(DnfPackageManager::new());
-        let packages = vec!["tree".to_owned()];
+        let packages = vec![package.to_owned()];
         enum Owner {
             Service,
             Disabled,
             Parent,
         }
         for owner in [Owner::Service, Owner::Disabled, Owner::Parent] {
-            manager.install(&packages).await?;
+            if let Err(error) = manager.install(&packages).await {
+                let remaining = std::process::Command::new("rpm")
+                    .args(["-q", package])
+                    .output()?;
+                if remaining.status.success() {
+                    manager.remove(&packages).await?;
+                }
+                return Err(error);
+            }
             let builder = PackageService::builder(manager.clone());
             let service = match owner {
                 Owner::Service | Owner::Parent => builder
@@ -636,7 +653,7 @@ mod dnf_integration {
             let outcome = service.remove(&packages).await;
             omg_lib::core::privilege::set_parent_owns_history(false);
             let remaining = std::process::Command::new("rpm")
-                .args(["-q", "tree"])
+                .args(["-q", package])
                 .output()?;
             if remaining.status.success() {
                 manager.remove(&packages).await?;
@@ -644,8 +661,9 @@ mod dnf_integration {
             outcome?;
             anyhow::ensure!(
                 remaining.status.code() == Some(1),
-                "Service removal did not remove tree"
+                "Service removal did not remove {package}"
             );
+            anyhow::ensure!(inventory()? == before, "RPM inventory was not restored");
             anyhow::ensure!(
                 HistoryManager::new_in(&custom_path)?.load()?.len() == 1,
                 "Service history setting was not respected"
