@@ -368,6 +368,19 @@ class OutputContracts(unittest.TestCase):
                 path.name: path.read_text() for path in (root / 'inventory/rows').glob('*.log')}
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_actual_runner_records_not_applicable_target_without_running_product(self):
+        rows = [
+            'help\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop',
+            'apt-only\t["clean","--orphans"]\tpackage-mutation\t0\tpass\t-\tcontainer\t'
+            'arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable\t-\tcontainer-prune',
+        ]
+        product = '[[ "$1" == --help ]] || exit 99\nprintf "Usage: fixture\\n"\n'
+        result, evidence, _ = self.run_inventory(product, rows, tiers='hermetic,container')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row['result'] for row in evidence], ['PASS', 'SKIPPED'])
+        self.assertEqual(evidence[1]['exit_code'], -1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_actual_runner_rejects_false_green_help_and_exports(self):
         rows = [
             'help\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop',
@@ -523,6 +536,45 @@ esac
                              '_', distro, expected, str(tree)],
                             env=environment, capture_output=True, text=True, timeout=10)
                         self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Native APT oracle needs POSIX executables')
+    def test_apt_orphan_oracle_rejects_claims_without_native_removal(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        functions = source[source.index('check_native_tree_state() {'):source.index('check_go_install() (')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / 'commands'
+            commands.mkdir()
+            query = commands / 'dpkg-query'
+            query.write_text(
+                '#!/usr/bin/env bash\n'
+                'printf "apt\\tinstall ok installed\\n"\n'
+                'if [[ "$OMG_TEST_BASELINE_CHANGED" != 1 ]]; then '
+                'printf "bash\\tinstall ok installed\\n"; fi\n'
+                'if [[ "$OMG_TEST_TREE_PRESENT" == 1 && $# == 2 ]]; then '
+                'printf "tree\\tinstall ok installed\\n"; fi\n',
+                encoding='utf-8')
+            query.chmod(0o755)
+            (root / 'baseline-packages.tsv').write_text(
+                'apt\tinstall ok installed\nbash\tinstall ok installed\n')
+            for tree_present, baseline_changed, report, accepted in (
+                ('0', '0', 'Removed 1 orphan package\n', True),
+                ('1', '0', 'Removed 1 orphan package\n', False),
+                ('0', '1', 'Removed 1 orphan package\n', False),
+                ('0', '0', 'Cleanup complete\n', False),
+                ('0', '0', 'Removed 0 orphan packages\n', False),
+            ):
+                with self.subTest(tree_present=tree_present, baseline_changed=baseline_changed,
+                                  report=report):
+                    (root / 'output').write_text(report)
+                    env = dict(os.environ, OMG_TEST_TREE_PRESENT=tree_present,
+                               OMG_TEST_BASELINE_CHANGED=baseline_changed,
+                               PATH=str(commands) + os.pathsep + os.environ['PATH'])
+                    result = subprocess.run(
+                        [shutil.which('bash'), '-c', functions +
+                         '\ncheck_native_apt_orphan_removed debian output missing-tree'],
+                        cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
 
     def test_offline_sbom_requires_advisory_source_failure(self):
         prefix = 'Error: Failed to generate system SBOM: Failed to generate a complete security SBOM: '

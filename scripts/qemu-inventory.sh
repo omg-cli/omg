@@ -96,6 +96,41 @@ check_native_tree_state() {
   fi
 }
 
+prepare_native_apt_orphan() {
+  local distro=$1
+  check_native_tree_state "$distro" installed || return 1
+  if ! dpkg-query -W '-f=${Package}\t${Status}\n' apt bash > baseline-packages.tsv \
+    || [[ $(wc -l < baseline-packages.tsv) != 2 ]] \
+    || grep -qv $'\tinstall ok installed$' baseline-packages.tsv; then
+    printf 'assertion failed: APT baseline packages are not installed\n' >&2
+    return 1
+  fi
+  if ! apt-get -s autoremove > baseline-autoremove.log 2>&1 \
+    || grep -q '^Remv ' baseline-autoremove.log; then
+    printf 'assertion failed: APT guest has unrelated pre-existing orphans\n' >&2
+    return 1
+  fi
+  if ! sudo -n apt-mark auto tree > apt-mark.log 2>&1 \
+    || ! apt-mark showauto > auto-marked.log 2>&1 \
+    || ! grep -Fxq tree auto-marked.log \
+    || ! apt-get -s autoremove > orphan-preview.log 2>&1 \
+    || [[ $(awk '$1 == "Remv" {print $2}' orphan-preview.log) != tree ]]; then
+    printf 'assertion failed: native APT did not select exactly tree as an orphan\n' >&2
+    return 1
+  fi
+}
+
+check_native_apt_orphan_removed() {
+  local distro=$1 output=$2 tree_binary=${3:-/usr/bin/tree}
+  check_native_tree_state "$distro" absent "$tree_binary" || return 1
+  if ! dpkg-query -W '-f=${Package}\t${Status}\n' apt bash > after-packages.tsv \
+    || ! cmp -s baseline-packages.tsv after-packages.tsv \
+    || ! grep -Eq 'Removed 1 orphan package([^[:alpha:]]|$)' "$output"; then
+    printf 'assertion failed: APT cleanup did not preserve baseline packages and report one verified removal\n' >&2
+    return 1
+  fi
+}
+
 check_go_install() (
   local version=$1 base expected active executable fixture observed status
   base="$OMG_DATA_DIR/versions/go"
@@ -419,6 +454,8 @@ check_product_output() {
         local expected=installed
         [[ "$assertion" == native-tree-installed ]] || expected=absent
         check_native_tree_state "$distro" "$expected" || return 1 ;;
+      native-apt-orphan-removed)
+        check_native_apt_orphan_removed "$distro" "$stdout" || return 1 ;;
       search-official-tree-output)
         if ! awk '
           /^  [^[:space:]]+ [^[:space:]]+  / {
@@ -644,7 +681,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     IFS=',' read -ra input_targets <<< "$tg"
     seen_targets=,
     for input_target in "${input_targets[@]}"; do
-      [[ "$input_target" =~ ^(arch|debian|ubuntu|fedora):(pass|pending|known-defect)$ ]] || exit 2
+      [[ "$input_target" =~ ^(arch|debian|ubuntu|fedora):(pass|pending|known-defect|not-applicable)$ ]] || exit 2
       target_distro=${input_target%%:*}
       [[ "$seen_targets" != *",$target_distro,"* ]] || exit 2
       seen_targets+="$target_distro,"
@@ -652,10 +689,11 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent) ;; *) exit 2 ;; esac
+  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed) ;; *) exit 2 ;; esac
   if [[ "$a" == search-official-tree-output ]]; then [[ "$id" == release-package-search-tree ]] || exit 2; fi
   if [[ "$a" == native-tree-installed ]]; then [[ "$id" == release-package-install-tree ]] || exit 2; fi
   if [[ "$a" == native-tree-absent ]]; then [[ "$id" == release-package-remove-tree ]] || exit 2; fi
+  if [[ "$a" == native-apt-orphan-removed ]]; then [[ "$id" == clean-orphans-native ]] || exit 2; fi
   case "$cleanup" in tempdir-drop|none|container-prune|host-state-restore|vm-revert|daemon-stop) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
@@ -731,7 +769,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       if [[ "$t" == "$distro:"* ]]; then status="${t#*:}"; break; fi
     done
   fi
-  if [[ -z "$status" || "$status" == pending ]]; then
+  if [[ -z "$status" || "$status" == pending || "$status" == not-applicable ]]; then
     record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
   fi
   case "$status" in pass|known-defect) ;; *) record "qemu-$distro-$case" HARNESS_ERROR -1 0; fail=$((fail+1)); continue ;; esac
@@ -790,10 +828,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')
   remote+="; status_file=\$(mktemp \"\$HOME/inventory-status.XXXXXX\"); trap 'rm -f \"\$status_file\"' EXIT"
   remote+="; run_omg() { local deadline=\$1; shift; execution_phase=executor; rc=0; timeout --kill-after=5s \"\$deadline\" bash -c $supervisor _ \"\$@\" 3>\"\$status_file\" || rc=\$?; if [ \"\$rc\" = 0 ]; then if IFS= read -r rc < \"\$status_file\"; then execution_phase=product; else rc=125; fi; fi; }"
-  if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree ]]; then
+  if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree || "$case" == clean-orphans-native ]]; then
     remote+="; $(declare -f check_native_tree_state)"
   fi
-  if [[ "$case" == release-package-install-tree ]]; then
+  if [[ "$case" == clean-orphans-native ]]; then
+    remote+="; $(declare -f prepare_native_apt_orphan); $(declare -f check_native_apt_orphan_removed)"
+  fi
+  if [[ "$case" == release-package-install-tree || "$case" == clean-orphans-native ]]; then
     remote+="; if ! check_native_tree_state '$distro' absent; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
   fi
   for p in "${chain[@]}"; do
@@ -803,6 +844,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
     remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log' '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
   done
+  if [[ "$case" == clean-orphans-native ]]; then
+    remote+="; if ! prepare_native_apt_orphan '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi; export OMG_DISABLE_DAEMON=1"
+  fi
   if [[ "$case" == hooks-install-force ]]; then
     # An identical reinstall cannot prove --force is honored. Replace each
     # generated prerequisite hook with user content and non-executable mode;
