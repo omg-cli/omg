@@ -101,6 +101,45 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertNotIn("controller setup succeeded", excerpt)
         self.assertNotIn("unrelated run failure", excerpt)
 
+    def test_failed_clone_reports_its_network_serial_evidence(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/results.json", json.dumps([row]))
+            archive.writestr("run-a/transactions/summary.json", json.dumps({
+                "results": [
+                    {"id": "install-native-001", "result": "PASS"},
+                    {"id": "remove-native-001", "result": "HARNESS_ERROR"},
+                ],
+            }))
+            archive.writestr("run-a/transactions/trials/remove-native-001/serial.log",
+                             "eth0: Lost carrier\n" + "boot progress\n" * 20 +
+                             "Failed to start Wait for Network to be Online.\n" +
+                             "eth0 fe80::5054:ff:fe12:3456/64\n" + "login: \n" * 20)
+            archive.writestr("run-b/transactions/trials/remove-native-001/serial.log",
+                             "unrelated private output")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        excerpt = diagnostics[(row["case_id"], "arch")]
+        self.assertIn("remove-native-001/serial.log", excerpt)
+        self.assertIn("Lost carrier", excerpt)
+        self.assertIn("Wait for Network", excerpt)
+        self.assertIn("fe80::", excerpt)
+        self.assertNotIn("unrelated private output", excerpt)
+        self.assertLessEqual(len(excerpt.encode("utf-8")), 1400)
+
+    def test_malformed_clone_receipt_does_not_hide_lifecycle_failure(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/results.json", json.dumps([row]))
+            archive.writestr("run-a/transactions/summary.json", '{"results": [')
+            archive.writestr("run-a/health-validation.log", "SSH connection refused")
+        diagnostics = {}
+        self.assertEqual(REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics),
+                         [row])
+        self.assertIn("SSH connection refused", diagnostics[(row["case_id"], "arch")])
+
     def test_successful_rows_never_supply_failure_excerpts(self):
         row = self.row("PASS")
         diagnostics = {}
