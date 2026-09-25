@@ -343,13 +343,6 @@
       "platforms": [
         "fedora"
       ]
-    },
-    {
-      "test_id": "omg::fedora_tests::dnf_integration::repository_lookup_finds_tree_before_installation",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "fedora"
-      ]
     }
   ]
 }

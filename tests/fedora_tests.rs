@@ -22,33 +22,68 @@ mod dnf_integration {
     }
 
     #[tokio::test]
-    async fn repository_lookup_finds_tree_before_installation() -> Result<()> {
-        if common::TestConfig::default().skip_if_no_system("dnf_uninstalled_repository_lookup") {
-            common::report_skip("system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)");
-            return Ok(());
+    async fn repository_lookup_finds_uninstalled_package() -> Result<()> {
+        let mut selected = None;
+        for candidate in ["tree", "htop", "nano", "rsync", "jq"] {
+            let installed = std::process::Command::new("rpm")
+                .args(["-q", candidate])
+                .output()?;
+            anyhow::ensure!(
+                installed.status.success() || installed.status.code() == Some(1),
+                "RPM could not determine whether {candidate} is installed"
+            );
+            if installed.status.success() {
+                continue;
+            }
+            let available = std::process::Command::new("dnf")
+                .args([
+                    "--cacheonly",
+                    "repoquery",
+                    "--available",
+                    "--queryformat",
+                    "%{name}\\n",
+                    "--latest-limit=1",
+                    candidate,
+                ])
+                .output()?;
+            anyhow::ensure!(
+                available.status.success(),
+                "DNF could not query {candidate}: {}",
+                String::from_utf8_lossy(&available.stderr)
+            );
+            if String::from_utf8(available.stdout)?
+                .lines()
+                .any(|name| name == candidate)
+            {
+                selected = Some(candidate);
+                break;
+            }
         }
+        let package = selected.ok_or_else(|| {
+            anyhow::anyhow!("no known available, uninstalled Fedora package for lookup fixture")
+        })?;
         let pm = DnfPackageManager::new();
         assert!(
             !pm.list_installed()
                 .await?
                 .iter()
-                .any(|package| package.name == "tree"),
-            "run this regression in the fresh Fedora smoke image with tree absent"
+                .any(|installed| installed.name == package),
+            "native RPM reports {package} absent but OMG reports it installed"
         );
-        let search = pm.search("tree").await?;
+        let search = pm.search(package).await?;
         assert!(
             search
                 .iter()
-                .any(|package| package.name == "tree" && !package.installed)
+                .any(|result| result.name == package && !result.installed)
         );
         let info = pm
-            .info("tree")
+            .info(package)
             .await?
             .expect("available repository package");
-        assert_eq!(info.name, "tree");
+        assert_eq!(info.name, package);
         assert!(!info.installed);
 
-        for arguments in [vec!["info", "tree"], vec!["--json", "info", "tree"]] {
+        for arguments in [vec!["info", package], vec!["--json", "info", package]] {
             let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
                 .args(arguments)
                 .output()?;
@@ -57,7 +92,7 @@ mod dnf_integration {
                 "CLI info failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(String::from_utf8_lossy(&output.stdout).contains("tree"));
+            assert!(String::from_utf8_lossy(&output.stdout).contains(package));
         }
         Ok(())
     }
