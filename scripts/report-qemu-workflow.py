@@ -170,6 +170,21 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                     excerpts.append((candidate.name, diagnostic_excerpt(raw)))
                     if parent.name == "inventory":
                         break
+                if not excerpts and case in ("lifecycle", "aarch64-lifecycle"):
+                    # A setup failure can occur before boot.log or any guest
+                    # case log exists. Report the latest available setup stage
+                    # rather than an empty lifecycle diagnostic.
+                    for name in ("image-setup.log", "controller-security.log",
+                                 "controller-setup.log", "controller-pull.log",
+                                 "engine-preflight.log"):
+                        candidate = parent / name
+                        member = members_by_name.get(str(candidate))
+                        if member is None or member.file_size > 8 * 1024 * 1024:
+                            continue
+                        raw = archive.read(member)
+                        if raw.strip():
+                            excerpts.append((name, diagnostic_excerpt(raw)))
+                            break
                 if excerpts:
                     # Keep every selected stage visible within the existing
                     # issue budget. Redaction happens before truncation.

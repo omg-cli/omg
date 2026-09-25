@@ -81,6 +81,26 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertIn("daemon failed to restart", diagnostics[(row["case_id"], "arch")])
         self.assertNotIn("unrelated run", diagnostics[(row["case_id"], "arch")])
 
+    def test_preboot_image_failure_supplies_lifecycle_diagnostic(self):
+        row = dict(self.row(), case_id="qemu-fedora-lifecycle",
+                   distro="fedora", result="HARNESS_ERROR")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/results.json", json.dumps([row]))
+            archive.writestr("run-a/image-setup.log",
+                             "Bearer private-credential\n"
+                             "curl: (6) Could not resolve host: download.fedoraproject.org\n")
+            archive.writestr("run-a/controller-setup.log", "controller setup succeeded")
+            archive.writestr("run-b/image-setup.log", "unrelated run failure")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        excerpt = diagnostics[(row["case_id"], "fedora")]
+        self.assertIn("image-setup.log", excerpt)
+        self.assertIn("Could not resolve host", excerpt)
+        self.assertNotIn("private-credential", excerpt)
+        self.assertNotIn("controller setup succeeded", excerpt)
+        self.assertNotIn("unrelated run failure", excerpt)
+
     def test_successful_rows_never_supply_failure_excerpts(self):
         row = self.row("PASS")
         diagnostics = {}
