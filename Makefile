@@ -271,6 +271,11 @@ check-shell-syntax:
 		bash -n "$$script" || exit $$?; \
 	done
 
+# Unused dependencies; install once with: cargo install cargo-machete
+.PHONY: deps-check
+deps-check:
+	cargo-machete
+
 # Hosted prerequisite: no compilation before independent platform jobs.
 ci-workflow-quick: check-shell-syntax
 	cargo fmt --all -- --check

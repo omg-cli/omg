@@ -86,6 +86,16 @@ jobs:
       - name: Verify installer destination safety
         run: bash tests/installer_security.sh
 
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-machete
+
+      - name: Unused dependencies (gating)
+        # Standalone binary: the machete scan needs no Rust toolchain, so it
+        # still runs on changes that skip compilation.
+        run: cargo-machete
+
   portable:
     name: "Portable Rust"
     needs: quick-gate
