@@ -811,11 +811,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   arg_string=$(quote_args "$args_json")
   command_timeout=$row_timeout
-  # The pinned Go archive is substantially larger than the other runtime
-  # fixtures and is downloaded through a software-emulated guest. Keep a
-  # hard deadline, but do not classify a progressing official download as a
-  # product hang merely because it exceeds the generic row budget.
-  if [[ "$case" == runtime-go-install ]]; then
+  # Official runtime archives are downloaded inside a fresh guest. A 34 MB
+  # Python archive reached the generic 120s limit on Fedora before the CLI
+  # returned (run 36086453655); Go already needs the same bounded allowance.
+  # Keep the result fatal if either download exceeds this larger deadline.
+  if [[ "$case" == runtime-python-install || "$case" == runtime-go-install ]]; then
     command_timeout=$((row_timeout * 3))
   fi
   # dnf5 cacheonly=metadata reuses repository metadata and still downloads
@@ -852,7 +852,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
-  remote+="; if ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
+  remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
   if [[ "$distro" == fedora && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; if [[ \"\$rc\" == 120 ]] && grep -Fq 'OMG_QEMU_FIXTURE_SETUP_FAILED' command.stderr.log; then execution_phase=dependency; fi"
     remote+="; if [[ \"\$rc\" == 121 ]] && grep -Fq 'OMG_QEMU_FIXTURE_CLEANUP_FAILED' command.stderr.log; then execution_phase=dependency; fi"
