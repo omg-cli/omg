@@ -41,16 +41,6 @@
       ]
     },
     {
-      "test_id": "omg::debian_tests::apt_integration::test_install_remove_cycle",
-      "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
-      "platforms": [
-        "debian",
-        "debian-pure",
-        "debian-trixie",
-        "ubuntu"
-      ]
-    },
-    {
       "test_id": "omg::debian_tests::debian_specific::test_debian_backports_awareness",
       "reason": "system tests disabled (set OMG_RUN_SYSTEM_TESTS=1)",
       "platforms": [

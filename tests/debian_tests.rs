@@ -386,55 +386,45 @@ mod apt_integration {
 
     #[test]
     fn test_install_remove_cycle() {
-        require_system_tests!();
-        require_destructive_tests!();
-        require_debian_like!();
+        let project = TestProject::for_distro("debian");
+        let package = "omg-cycle-fixture";
+        let version = "1.2.3";
+        project
+            .mock_available(package, version)
+            .expect("seed isolated Debian package candidate");
 
-        // Ensure database is synced before installing.
-        let sync_result = run_omg(&["sync"]);
+        let search = project.run(&["search", package, "--json"]);
+        search.assert_success();
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(search.stdout.trim()).expect("search --json returns an array");
         assert!(
-            sync_result.success
-                || sync_result.contains("permission")
-                || sync_result.contains("root")
-                || sync_result.contains("repository")
-                || sync_result.contains("Unable"),
-            "Sync should succeed or explain why it cannot run: {}",
-            sync_result.combined_output()
+            rows.iter()
+                .any(|row| row["name"] == package && row["version"] == version),
+            "{package} {version} missing from available candidates: {rows:?}"
         );
 
-        // Use a tiny, harmless package
-        let pkg = "vim-tiny";
+        let installed = |expected: bool| {
+            let explicit = project.run(&["explicit", "--json"]);
+            explicit.assert_success();
+            let row: serde_json::Value = serde_json::from_str(explicit.stdout.trim())
+                .expect("explicit --json returns an object");
+            let packages = row["packages"]
+                .as_array()
+                .expect("explicit --json packages is an array");
+            assert_eq!(
+                packages.iter().any(|name| name == package),
+                expected,
+                "{package} installed={expected} differs from explicit inventory: {row}"
+            );
+            assert_eq!(row["count"], if expected { 1 } else { 0 });
+        };
 
-        // 1. Install
-        let result = run_omg(&["install", pkg, "-y"]);
-        if !result.success {
-            if result.stderr_contains("permission") || result.stderr_contains("root") {
-                report_skip("install/remove test requires root");
-                return;
-            }
-            result.assert_success();
-        }
-
-        // 2. Verify installed
-        let info = run_omg(&["info", pkg]);
-        info.assert_success();
-        assert!(
-            info.stdout_contains("Status") && !info.stdout_contains("not installed"),
-            "package info must report the installed state: {}",
-            info.stdout
-        );
-
-        // 3. Remove
-        let result = run_omg(&["remove", pkg, "-y"]);
-        result.assert_success();
-
-        // 4. Verify removed
-        let info = run_omg(&["info", pkg]);
-        assert!(
-            info.stdout_contains("Status") && info.stdout_contains("not installed"),
-            "package info must report the removed state: {}",
-            info.stdout
-        );
+        installed(false);
+        project.run(&["install", package, "-y"]).assert_success();
+        installed(true);
+        project.run(&["remove", package, "-y"]).assert_success();
+        installed(false);
+        project.close_checked();
     }
 
     #[test]
