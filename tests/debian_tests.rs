@@ -496,33 +496,93 @@ macro_rules! require_debian_like {
 mod ubuntu_specific {
     use super::*;
 
-    #[test]
-    fn test_ubuntu_main_repo() {
-        require_system_tests!();
-        require_ubuntu!();
-
-        let result = run_omg(&["search", "ubuntu-desktop"]);
-        result.assert_success();
+    #[cfg(feature = "debian")]
+    fn native_candidate_in_component(package: &str, component: &str) -> String {
+        let output = std::process::Command::new("apt-cache")
+            .args(["policy", package])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("query native Ubuntu APT policy");
+        assert!(output.status.success(), "apt-cache policy {package} failed");
+        let policy = String::from_utf8(output.stdout).expect("APT policy is UTF-8");
+        let candidate = policy
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Candidate: "))
+            .filter(|version| *version != "(none)")
+            .expect("Ubuntu package has an APT candidate");
+        let mut candidate_entry = false;
+        let mut candidate_component = false;
+        for line in policy
+            .lines()
+            .skip_while(|line| !line.contains("Version table:"))
+        {
+            if line.starts_with("     ") && !line.starts_with("        ") {
+                candidate_entry = line
+                    .trim()
+                    .trim_start_matches("***")
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    == Some(candidate);
+            } else if candidate_entry
+                && line
+                    .split_whitespace()
+                    .any(|field| field.ends_with(&format!("/{component}")))
+            {
+                candidate_component = true;
+            }
+        }
         assert!(
-            result.stdout_contains("ubuntu-desktop"),
-            "Ubuntu main repo search must list ubuntu-desktop. Got:\n{}",
-            result.stdout
+            candidate_component,
+            "{package} candidate {candidate} is not supplied by Ubuntu {component}: {policy}"
+        );
+        candidate.to_owned()
+    }
+
+    #[cfg(feature = "debian")]
+    fn assert_native_search(package: &str, component: &str) {
+        let candidate = native_candidate_in_component(package, component);
+        let output = apt_integration::native_info(&["search", package, "--json"]);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&output.stdout).expect("search --json returns an array");
+        assert!(
+            rows.iter().any(|row| {
+                row["name"] == package && row["version"] == candidate && row["source"] == "Official"
+            }),
+            "OMG omitted native Ubuntu {component} candidate {package} {candidate}: {rows:?}"
         );
     }
 
+    #[cfg(feature = "debian")]
+    #[test]
+    fn test_ubuntu_main_repo() {
+        if !TestConfig::default().is_ubuntu() {
+            report_skip("native Ubuntu APT search requires Ubuntu with libapt");
+            return;
+        }
+        assert_native_search("ubuntu-desktop", "main");
+    }
+
+    #[cfg(feature = "debian")]
     #[test]
     fn test_ubuntu_universe_repo() {
-        require_system_tests!();
-        require_ubuntu!();
+        if !TestConfig::default().is_ubuntu() {
+            report_skip("native Ubuntu APT search requires Ubuntu with libapt");
+            return;
+        }
+        assert_native_search("cowsay", "universe");
+    }
 
-        // Universe repo packages
-        let result = run_omg(&["search", "htop"]);
-        result.assert_success();
-        assert!(
-            result.stdout_contains("htop"),
-            "universe search must list htop. Got:\n{}",
-            result.stdout
-        );
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_ubuntu_main_repo() {
+        report_skip("native Ubuntu APT search requires Ubuntu with libapt");
+    }
+
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_ubuntu_universe_repo() {
+        report_skip("native Ubuntu APT search requires Ubuntu with libapt");
     }
 }
 
