@@ -243,6 +243,11 @@ docker-ubuntu-shell:
 	docker build -f Dockerfile.ubuntu -t omg-ubuntu .
 	docker run --rm -it omg-ubuntu /bin/bash
 
+# Unused dependencies; install once with: cargo install cargo-machete
+.PHONY: deps-check
+deps-check:
+	cargo-machete
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Development Workflow
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -270,11 +275,6 @@ check-shell-syntax:
 	@for script in install.sh benchmark.sh benchmark-hyperfine.sh scripts/*.sh; do \
 		bash -n "$$script" || exit $$?; \
 	done
-
-# Unused dependencies; install once with: cargo install cargo-machete
-.PHONY: deps-check
-deps-check:
-	cargo-machete
 
 # Hosted prerequisite: no compilation before independent platform jobs.
 ci-workflow-quick: check-shell-syntax
