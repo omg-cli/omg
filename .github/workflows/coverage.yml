@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     container:
-      image: archlinux:latest@sha256:b0deabeb3d283da2c7f7dbf0eea051b7b2cd0554e0b737cc457fd21683bdcdd1
+      image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
 
     steps:
       - name: Install system dependencies
@@ -81,7 +81,7 @@ jobs:
           ZSTD_CLEVEL: "6"
         with:
           prefix-key: v2-coverage-dependencies
-          shared-key: arch-b0deabeb3d283da2c-arch-pgp-license
+          shared-key: arch-f3691b4dde62ba4c4-arch-pgp-license
           workspaces: . -> target/llvm-cov-target
           cache-bin: false
           cache-workspace-crates: false
