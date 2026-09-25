@@ -19,6 +19,7 @@ class RequiredResultsTests(unittest.TestCase):
             env = dict(os.environ, QUICK_GATE="success", BUILD_REQUIRED=required,
                        PORTABLE="success", LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
                        FEATURE_INTERSECTIONS="success", MACOS="success", UBUNTU="success",
+                       DOCS_AUDIT="success",
                        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"))
             env.update(overrides or {})
             bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
@@ -38,6 +39,14 @@ class RequiredResultsTests(unittest.TestCase):
         for required in ("true", "false"):
             for state in ("failure", "cancelled", ""):
                 self.assertNotEqual(self.evaluate(required, {"PORTABLE": state}).returncode, 0)
+
+    def test_docs_audit_failure_always_fails_the_gate(self):
+        for required in ("true", "false"):
+            for state in ("failure", "cancelled", "skipped", ""):
+                with self.subTest(required=required, state=state):
+                    self.assertNotEqual(
+                        self.evaluate(required, {"DOCS_AUDIT": state}).returncode, 0
+                    )
 
     def test_binary_unit_targets_in_every_unit_lane(self):
         text = CI_YML.read_text(encoding="utf-8")
