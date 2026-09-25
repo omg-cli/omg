@@ -61,7 +61,7 @@ installer and the CI scripts own several of them.
 Findings print one per line as `<file>:<line>: <problem>`. Exit status is 1 when
 anything fails to resolve, 2 when the repository root or parser cannot be read, and 0
 when every reference resolves. Generated and internal files are skipped:
-`docs/changelog.md` and `docs/superpowers/**`.
+`docs/changelog.md`.
 
 **Tests:** `python3 scripts/test_docs_alignment.py`
 
