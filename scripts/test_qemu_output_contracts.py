@@ -111,6 +111,33 @@ class OutputContracts(unittest.TestCase):
                 self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_audit_eol_requires_private_runtime_classifications_and_issue_count(self):
+        row = ('audit-eol\t["audit","eol"]\tread\t0\tpass\t-\t'
+               'hermetic\thermetic:pass\taudit-eol-state\ttempdir-drop')
+        preflight = ('[[ $(id -u) != 0 && "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 '
+                     '&& -d "$OMG_DATA_DIR/versions/node/16.20.2" '
+                     '&& $(readlink "$OMG_DATA_DIR/versions/node/current") == 16.20.2 '
+                     '&& -d "$OMG_DATA_DIR/versions/python/3.12.14" '
+                     '&& $(readlink "$OMG_DATA_DIR/versions/python/current") == 3.12.14 ]] '
+                     '|| exit 70\n')
+        good = ('  ✗ node v16.20.2 - EOL (EOL: 2023-09-11)\n'
+                '  ✓ python v3.12.14 - Active (EOL: 2028-10-31)\n'
+                '⚠ 1 runtime(s) need attention. Consider upgrading to supported versions.\n')
+        for output, expected in (
+            (good, 'PASS'),
+            (good.replace('EOL (EOL: 2023-09-11)', 'Active (EOL: 2023-09-11)'), 'FAIL'),
+            (good.replace('  ✓ python v3.12.14 - Active (EOL: 2028-10-31)\n', ''), 'FAIL'),
+            (good.replace('1 runtime(s) need attention', '0 runtime(s) need attention'), 'FAIL'),
+            (good.replace('1 runtime(s) need attention', '11 runtime(s) need attention'), 'FAIL'),
+            (good + '  ✗ node v16.20.2 - EOL (EOL: 2023-09-11)\n', 'FAIL'),
+        ):
+            with self.subTest(expected=expected, output=output):
+                product = preflight + 'printf %s ' + shlex.quote(output) + '\n'
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_doctor_network_requires_backend_probes_and_counted_failures(self):
         row = ('doctor-network\t["doctor","--network"]\tcontrolled-error\t1\tpass\t-\t'
                'container\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tdoctor-network-state\ttempdir-drop')

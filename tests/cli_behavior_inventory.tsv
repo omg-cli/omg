@@ -77,7 +77,7 @@ audit-slsa-identity	["audit","slsa","--certificate-identity","dev@example.invali
 audit-licenses	["audit","licenses","--format","json"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	json-stdout	tempdir-drop
 audit-fix	["audit","fix","--dry-run"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
 audit-export	["audit","export","--output","${ROOT}/audit-evidence"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-audit-eol	["audit","eol"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit-eol	["audit","eol"]	read	0	pass	-	hermetic	hermetic:pass	audit-eol-state	tempdir-drop
 run	["run","smoke","--using","make"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 new	["new","rust","smoke-app"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 tool-install	["tool","install","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop

@@ -786,6 +786,17 @@ check_product_output() {
       printf 'assertion failed: critical secret scan did not fail closed and redact the fixture\n' >&2; return 1
     fi
   fi
+  if [[ "$assertion" == audit-eol-state ]]; then
+    if [[ "$code" != 0 ]] \
+      || ! grep -Fxq '  ✗ node v16.20.2 - EOL (EOL: 2023-09-11)' "$stdout" \
+      || ! grep -Fxq '  ✓ python v3.12.14 - Active (EOL: 2028-10-31)' "$stdout" \
+      || ! grep -Fxq '⚠ 1 runtime(s) need attention. Consider upgrading to supported versions.' "$stdout" \
+      || [[ $(grep -Fc 'node v16.20.2' "$stdout") != 1 ]] \
+      || [[ $(grep -Fc 'python v3.12.14' "$stdout") != 1 ]] \
+      || grep -Eq 'All runtimes are within support period|No managed runtimes were detected' "$stdout"; then
+      printf 'assertion failed: audit EOL did not classify both confined runtimes and count one issue\n' >&2; return 1
+    fi
+  fi
   if [[ "$assertion" == sbom-source-failure ]]; then
     if [[ "$code" != 1 || -e sbom.json || -L sbom.json ]] \
       || ! grep -Eq '^Error: Failed to generate system SBOM: Failed to generate a complete security SBOM: (Failed to scan package .+ for vulnerabilities: Failed to query the OSV vulnerability database|Failed to query native security advisories)' "$stderr" \
@@ -1109,7 +1120,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
   case "$id" in
     snapshot-create|migrate-export|migrate-import|env-capture|env-check|team-status|team-push|team-pull)
       [[ "$a" == "fingerprint:$id" ]] || exit 2 ;;
@@ -1171,6 +1182,12 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     [[ "$a" == doctor-eol-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == container ]] || exit 2
     jq -e '. == ["doctor", "--eol"]' <<< "$aj" >/dev/null || exit 2
   elif [[ "$a" == doctor-eol-state ]]; then
+    exit 2
+  fi
+  if [[ "$id" == audit-eol ]]; then
+    [[ "$a" == audit-eol-state && "$s" == read && "$resolved" == 0 && "$t" == hermetic ]] || exit 2
+    jq -e '. == ["audit", "eol"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == audit-eol-state ]]; then
     exit 2
   fi
   if [[ "$id" == doctor-network ]]; then
@@ -1342,10 +1359,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == fingerprint:* || "$case" == team-init || "$case" == snapshot-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/fingerprint-config\" OMG_DATA_DIR=\"\$rowdir/fingerprint-data\" OMG_CACHE_DIR=\"\$rowdir/fingerprint-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
   fi
-  if [[ "$assertions" == doctor-eol-state ]]; then
-    remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: doctor EOL fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/eol-config\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/eol-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
+  if [[ "$assertions" == doctor-eol-state || "$assertions" == audit-eol-state ]]; then
+    remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: EOL fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/eol-config\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/eol-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
     remote+="; mkdir -p \"\$OMG_DATA_DIR/versions/node/16.20.2\" \"\$OMG_DATA_DIR/versions/python/3.12.14\"; ln -s 16.20.2 \"\$OMG_DATA_DIR/versions/node/current\"; ln -s 3.12.14 \"\$OMG_DATA_DIR/versions/python/current\""
-    remote+="; $(declare -f check_doctor_issue_delta)"
+    if [[ "$assertions" == doctor-eol-state ]]; then remote+="; $(declare -f check_doctor_issue_delta)"; fi
   fi
   if [[ "$assertions" == doctor-network-state ]]; then
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: doctor network fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/network-config\" OMG_DATA_DIR=\"\$rowdir/network-data\" OMG_CACHE_DIR=\"\$rowdir/network-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
