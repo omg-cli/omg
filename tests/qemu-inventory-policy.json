@@ -26141,7 +26141,7 @@
         }
       ]
     },
-    "13beedb9c4781947b3dc5fe116199450c768f22cc860bd69439cd12497b09efd": {
+    "c17f1b924a69da3e78ef01d3f3d1e9716181d5901f6fc4454f521d3e0b210f2f": {
       "releases": [],
       "cases": [
         {
@@ -27823,7 +27823,7 @@
         {
           "id": "runtime-node-uninstall",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -27831,7 +27831,7 @@
         {
           "id": "runtime-python-uninstall",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -27839,7 +27839,7 @@
         {
           "id": "runtime-go-uninstall",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"

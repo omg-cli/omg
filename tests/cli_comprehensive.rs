@@ -592,6 +592,7 @@ enum Assertion {
     PrivacyStatusDisabled,
     PrivacyOptedIn,
     PrivacyStatusEnabled,
+    RuntimeVersionRemoved,
 }
 
 impl Assertion {
@@ -633,6 +634,7 @@ impl Assertion {
             "privacy-status-disabled" => Self::PrivacyStatusDisabled,
             "privacy-opted-in" => Self::PrivacyOptedIn,
             "privacy-status-enabled" => Self::PrivacyStatusEnabled,
+            "runtime-version-removed" => Self::RuntimeVersionRemoved,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1623,7 +1625,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::InfoNativePackage
                 // Test mode always opts out, so only the real guest can prove
                 // enabled privacy status after opt-in.
-                | Assertion::PrivacyStatusEnabled => {
+                | Assertion::PrivacyStatusEnabled
+                | Assertion::RuntimeVersionRemoved => {
                     unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
             }

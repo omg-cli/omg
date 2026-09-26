@@ -127,7 +127,7 @@ class PolicyTests(unittest.TestCase):
         for runtime in ("node", "python", "go"):
             with self.subTest(runtime=runtime):
                 self.assertEqual(by_id[f"runtime-{runtime}-uninstall"], {
-                    "id": f"runtime-{runtime}-uninstall", "tiers": ["hermetic"],
+                    "id": f"runtime-{runtime}-uninstall", "tiers": ["container"],
                     "allowed_skips": {}, "network_scope": "offline",
                 })
         workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()

@@ -164,7 +164,7 @@ class OutputContracts(unittest.TestCase):
         for row in rows:
             case = row.split('\t')[0]
             with self.subTest(case=case):
-                result, evidence, logs = self.run_inventory(product, [row])
+                result, evidence, logs = self.run_inventory(product, [row], tiers='container')
                 self.assertEqual(evidence[0]['result'], 'PASS', logs)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 mutations = {
@@ -176,7 +176,7 @@ class OutputContracts(unittest.TestCase):
                 }
                 for fault, broken in mutations.items():
                     with self.subTest(case=case, fault=fault):
-                        result, evidence, logs = self.run_inventory(broken, [row])
+                        result, evidence, logs = self.run_inventory(broken, [row], tiers='container')
                         self.assertEqual(evidence[0]['result'], 'FAIL', logs)
                         self.assertEqual(result.returncode, 1, result.stderr)
                         self.assertIn('assertion failed: runtime uninstall', logs[case + '.log'])
