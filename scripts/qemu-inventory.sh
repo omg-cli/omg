@@ -638,6 +638,23 @@ check_privacy_oracle() {
     *) return 2 ;;
   esac
 }
+check_runtime_uninstall() {
+  local runtime=$1 version=$2 base sibling external guard
+  [[ "${OMG_DATA_DIR:-}" == "$rowdir/runtime-data" ]] || {
+    printf 'assertion failed: runtime uninstall escaped its private data directory\n' >&2; return 1
+  }
+  base="$OMG_DATA_DIR/versions/$runtime"
+  sibling="$base/9.9.9"
+  external="$rowdir/external-runtime"
+  guard="$OMG_DATA_DIR/versions/other-guard/1.0.0"
+  if [[ -e "$base/$version" || -L "$base/$version" ]] \
+    || [[ ! -f "$sibling/sentinel" || $(cat "$sibling/sentinel") != keep-sibling ]] \
+    || [[ ! -L "$base/current" || $(readlink "$base/current") != "$sibling" ]] \
+    || [[ ! -f "$external/sentinel" || $(cat "$external/sentinel") != keep-external ]] \
+    || [[ ! -f "$guard/sentinel" || $(cat "$guard/sentinel") != keep-other ]]; then
+    printf 'assertion failed: runtime uninstall did not remove only the inactive version\n' >&2; return 1
+  fi
+}
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
   if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
@@ -973,7 +990,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed) ;; *) exit 2 ;; esac
   case "$id" in
     config-set)
       [[ "$a" == config-set-persisted ]] && jq -e '. == ["config","set","telemetry.enabled","true"]' <<< "$aj" >/dev/null || exit 2 ;;
@@ -988,6 +1005,13 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     config-reset)
       [[ "$a" == config-reset-defaults && "$r" == config-set ]] && jq -e '. == ["config","reset","--yes"]' <<< "$aj" >/dev/null || exit 2 ;;
     *) [[ "$a" != config-* ]] || exit 2 ;;
+  esac
+  case "$id" in
+    runtime-node-uninstall|runtime-python-uninstall|runtime-go-uninstall)
+      runtime=${id#runtime-}; runtime=${runtime%-uninstall}
+      [[ "$a" == runtime-version-removed ]] && jq -e --arg runtime "$runtime" \
+        '. == ["use", $runtime, (if $runtime == "node" then "24.21.0" elif $runtime == "python" then "3.12.14" else "1.27.1" end), "--uninstall"]' <<< "$aj" >/dev/null || exit 2 ;;
+    *) [[ "$a" != runtime-version-removed ]] || exit 2 ;;
   esac
   case "$id" in
     privacy-export)
@@ -1255,6 +1279,14 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     runtime_name=$(jq -r '.[1]' <<< "$args_json")
     remote+="; umask 0002; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install"); $(declare -f check_runtime_usage)"
   fi
+  if [[ "$assertions" == runtime-version-removed ]]; then
+    runtime_name=${case#runtime-}; runtime_name=${runtime_name%-uninstall}
+    runtime_version=$(jq -r '.[2]' <<< "$args_json")
+    remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: runtime uninstall fixture requires an unprivileged guest user\\n' >&2; exit 2; }; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0 OMG_DISABLE_DAEMON=1"
+    remote+="; versions=\"\$OMG_DATA_DIR/versions/$runtime_name\"; mkdir -p \"\$versions/$runtime_version\" \"\$versions/9.9.9\" \"\$OMG_DATA_DIR/versions/other-guard/1.0.0\" \"\$rowdir/external-runtime\""
+    remote+="; printf remove-me > \"\$versions/$runtime_version/sentinel\"; printf keep-sibling > \"\$versions/9.9.9/sentinel\"; printf keep-other > \"\$OMG_DATA_DIR/versions/other-guard/1.0.0/sentinel\"; printf keep-external > \"\$rowdir/external-runtime/sentinel\""
+    remote+="; ln -s \"\$rowdir/external-runtime\" \"\$versions/$runtime_version/external-link\"; ln -s \"\$versions/9.9.9\" \"\$versions/current\"; $(declare -f check_runtime_uninstall)"
+  fi
   if [[ "$distro" == fedora && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     # Keep the real OMG path, but bound native DNF to a local versioned RPM.
     # The root-owned helper restores system repo policy and checks the RPMDB
@@ -1295,6 +1327,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if [ \"\$rc\" = 0 ] && ! check_${runtime_name}_install '$runtime_version'; then assertion=1; fi"
     remote+="; if [ \"\$rc\" = 0 ] && ! check_runtime_usage '$runtime_name'; then assertion=1; fi"
     remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: runtime fixture cleanup failed\\n' >&2; assertion=1; fi"
+  fi
+  if [[ "$assertions" == runtime-version-removed ]]; then
+    remote+="; if [ \"\$rc\" = 0 ] && ! check_runtime_uninstall '$runtime_name' '$runtime_version'; then assertion=1; fi"
   fi
   # Every inventory row receives a private fixture directory. Product-specific
   # cleanup assertions run above; removal here proves the harness itself does

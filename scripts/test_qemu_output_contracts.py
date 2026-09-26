@@ -149,6 +149,39 @@ class OutputContracts(unittest.TestCase):
                     self.assertIn('assertion failed: runtime usage', logs['runtime-node-install.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_runtime_uninstall_removes_only_inactive_version(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if re.match(r'^runtime-(node|python|go)-uninstall\t', line)]
+        self.assertEqual(len(rows), 3)
+        checks = ('[[ "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 '
+                  '&& -f "$OMG_DATA_DIR/versions/$2/$3/sentinel" '
+                  '&& -L "$OMG_DATA_DIR/versions/$2/current" '
+                  '&& -f "$OMG_DATA_DIR/versions/$2/9.9.9/sentinel" '
+                  '&& -f "$OMG_DATA_DIR/versions/other-guard/1.0.0/sentinel" '
+                  '&& -L "$OMG_DATA_DIR/versions/$2/$3/external-link" ]] || exit 70\n')
+        product = checks + 'rm -rf -- "$OMG_DATA_DIR/versions/$2/$3"\n'
+        for row in rows:
+            case = row.split('\t')[0]
+            with self.subTest(case=case):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], 'PASS', logs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                mutations = {
+                    'no-removal': checks + ':\n',
+                    'sibling': product + 'rm -rf -- "$OMG_DATA_DIR/versions/$2/9.9.9"\n',
+                    'active-pointer': product + 'ln -sfn /missing "$OMG_DATA_DIR/versions/$2/current"\n',
+                    'external-target': checks + 'rm -rf -- "$(readlink "$OMG_DATA_DIR/versions/$2/$3/external-link")"\n' + product,
+                    'other-runtime': product + 'rm -rf -- "$OMG_DATA_DIR/versions/other-guard"\n',
+                }
+                for fault, broken in mutations.items():
+                    with self.subTest(case=case, fault=fault):
+                        result, evidence, logs = self.run_inventory(broken, [row])
+                        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn('assertion failed: runtime uninstall', logs[case + '.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_config_rows_require_private_persisted_state(self):
         rows = [
             'config-set\t["config","set","telemetry.enabled","true"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\tconfig-set-persisted\ttempdir-drop',

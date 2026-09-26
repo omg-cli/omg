@@ -123,6 +123,13 @@ class PolicyTests(unittest.TestCase):
         cases = rules["inventories"][hashlib.sha256(content).hexdigest()]["cases"]
         self.assertEqual(len(cases), len(content.splitlines()) - 1)
         self.assertEqual(len({case["id"] for case in cases}), len(cases))
+        by_id = {case["id"]: case for case in cases}
+        for runtime in ("node", "python", "go"):
+            with self.subTest(runtime=runtime):
+                self.assertEqual(by_id[f"runtime-{runtime}-uninstall"], {
+                    "id": f"runtime-{runtime}-uninstall", "tiers": ["hermetic"],
+                    "allowed_skips": {}, "network_scope": "offline",
+                })
         workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
         self.assertEqual(workflow.count("--inventory-policy tests/qemu-inventory-policy.json"), 2)
 
