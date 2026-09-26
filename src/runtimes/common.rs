@@ -357,14 +357,35 @@ pub(crate) fn validate_download_filename(filename: &str) -> Result<&str> {
     Ok(filename)
 }
 
-// Callers validate the vendor URL before entering this helper. Only the GET
-// before response headers is retried; no partial file or checksum is reused.
+#[derive(Clone)]
+struct ResumeRequest {
+    offset: u64,
+    total: u64,
+    validator: reqwest::header::HeaderValue,
+}
+
+// Callers validate the vendor URL before entering this helper. Every request,
+// including a range retry, retains the public-address redirect policy.
 async fn request_runtime_download(
     _client: &reqwest::Client,
     url: &str,
+    resume: Option<ResumeRequest>,
 ) -> Result<reqwest::Response> {
     retry_runtime_request(url, || {
-        crate::core::http::fetch_public_download(url, GITHUB_USER_AGENT)
+        let resume = resume.clone();
+        async move {
+            if let Some(resume) = resume {
+                crate::core::http::fetch_public_download_with_range(
+                    url,
+                    GITHUB_USER_AGENT,
+                    resume.offset,
+                    resume.validator,
+                )
+                .await
+            } else {
+                crate::core::http::fetch_public_download(url, GITHUB_USER_AGENT).await
+            }
+        }
     })
     .await
 }
@@ -454,9 +475,8 @@ fn is_retryable_connect_error(error: &anyhow::Error) -> bool {
 /// Stream a runtime artifact body into a same-filesystem temporary file with
 /// bounded retry for transient mid-stream failures.
 ///
-/// Each attempt performs its own request so a broken body is replaced instead
-/// of resumed, the digest is computed over the bytes that actually landed, and
-/// the caller verifies that digest before persisting `dest`.
+/// A broken body is resumed only under a strong HTTP validator and an exact
+/// range response. The caller verifies the digest before persisting `dest`.
 async fn stream_runtime_download_to_temp<D, F, Fut>(
     host: &str,
     mut request: F,
@@ -464,11 +484,11 @@ async fn stream_runtime_download_to_temp<D, F, Fut>(
 ) -> Result<(tempfile::TempPath, String)>
 where
     D: Digest + Default,
-    F: FnMut() -> Fut,
+    F: FnMut(Option<ResumeRequest>) -> Fut,
     Fut: std::future::Future<Output = Result<reqwest::Response>>,
 {
     use futures::StreamExt;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     tokio::fs::create_dir_all(parent)
@@ -479,8 +499,20 @@ where
         |name| name.to_string_lossy().into_owned(),
     );
 
+    let temporary = tempfile::Builder::new()
+        .prefix(".download-")
+        .tempfile_in(parent)
+        .with_context(|| format!("Failed to create temporary download for {}", dest.display()))?;
+    let (std_file, temporary_path) = temporary.into_parts();
+    let mut file = tokio::fs::File::from_std(std_file);
+    let mut downloaded: u64 = 0;
+    let mut hasher = D::default();
+    let mut representation: Option<(u64, reqwest::header::HeaderValue)> = None;
+    let mut resume: Option<ResumeRequest> = None;
+
     for attempt in 0..MAX_DOWNLOAD_ATTEMPTS {
-        let response = match request().await {
+        let requested = resume.clone();
+        let response = match request(requested.clone()).await {
             Ok(response) => response,
             Err(error) => {
                 if attempt + 1 < MAX_DOWNLOAD_ATTEMPTS && is_retryable_connect_error(&error) {
@@ -514,7 +546,75 @@ where
             anyhow::bail!("Download failed: HTTP {status}");
         }
 
-        let total_size = response.content_length().unwrap_or(0);
+        anyhow::ensure!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_ENCODING)
+                .is_none_or(|encoding| encoding == "identity"),
+            "Runtime download must use identity content encoding"
+        );
+
+        let partial_end = match (requested.as_ref(), response.status().as_u16()) {
+            (_, 200) => {
+                file.set_len(0).await.context("Failed to reset download")?;
+                file.seek(SeekFrom::Start(0))
+                    .await
+                    .context("Failed to rewind download")?;
+                downloaded = 0;
+                hasher = D::default();
+                let total = response.content_length();
+                let validator = response
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .filter(|value| {
+                        value.to_str().is_ok_and(|text| {
+                            text.len() >= 2 && text.starts_with('"') && text.ends_with('"')
+                        })
+                    })
+                    .cloned();
+                representation = total.zip(validator);
+                None
+            }
+            (Some(expected), 206) => {
+                let actual_validator = response.headers().get(reqwest::header::ETAG);
+                anyhow::ensure!(
+                    actual_validator == Some(&expected.validator),
+                    "Runtime download range validator changed"
+                );
+                let range = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .context("Runtime download range has no Content-Range")?
+                    .to_str()
+                    .context("Runtime download range has invalid Content-Range")?;
+                let (bounds, total) = range
+                    .strip_prefix("bytes ")
+                    .and_then(|value| value.split_once('/'))
+                    .context("Runtime download has malformed Content-Range")?;
+                let (start, end) = bounds
+                    .split_once('-')
+                    .context("Runtime download has malformed Content-Range")?;
+                let start = start.parse::<u64>()?;
+                let end = end.parse::<u64>()?;
+                let total = total.parse::<u64>()?;
+                anyhow::ensure!(
+                    start == expected.offset
+                        && end >= start
+                        && end.checked_add(1).is_some_and(|next| next <= total)
+                        && total == expected.total
+                        && response.content_length() == Some(end - start + 1),
+                    "Runtime download range does not match the retained prefix"
+                );
+                Some(end)
+            }
+            (None, 206) => anyhow::bail!("Unexpected partial runtime download response"),
+            _ => anyhow::bail!("Unexpected successful runtime download status"),
+        };
+
+        let total_size = representation.as_ref().map_or_else(
+            || response.content_length().unwrap_or(0),
+            |(total, _)| *total,
+        );
         anyhow::ensure!(
             total_size <= MAX_RUNTIME_DOWNLOAD_BYTES,
             "Runtime download declares {total_size} bytes, exceeding the {MAX_RUNTIME_DOWNLOAD_BYTES}-byte limit"
@@ -526,20 +626,9 @@ where
             },
             accent: Accent::Network,
         });
-
-        // Stream into a same-filesystem temporary file so a failed, aborted, or
-        // checksum-mismatched download never leaves a partial artifact at `dest`.
-        let temporary = tempfile::Builder::new()
-            .prefix(".download-")
-            .tempfile_in(parent)
-            .with_context(|| {
-                format!("Failed to create temporary download for {}", dest.display())
-            })?;
-        let (std_file, temporary_path) = temporary.into_parts();
-        let mut file = tokio::fs::File::from_std(std_file);
+        task.set_position(downloaded);
         let mut stream = response.bytes_stream();
-        let mut downloaded: u64 = 0;
-        let mut hasher = D::default();
+        let mut received_this_attempt: u64 = 0;
         let mut failure: Option<reqwest::Error> = None;
 
         while let Some(item) = stream.next().await {
@@ -550,23 +639,38 @@ where
                     break;
                 }
             };
+            let next_size = bounded_download_size(downloaded, chunk.len())?;
+            if let Some((total, _)) = &representation {
+                anyhow::ensure!(
+                    next_size <= *total,
+                    "Runtime download exceeds the declared length"
+                );
+            }
             file.write_all(&chunk)
                 .await
                 .context("Error writing to file")?;
 
             hasher.update(&chunk);
 
-            downloaded = bounded_download_size(downloaded, chunk.len())?;
+            downloaded = next_size;
+            received_this_attempt += u64::try_from(chunk.len())?;
             task.set_position(downloaded);
         }
 
         if let Some(error) = failure {
-            drop(file);
-            drop(temporary_path);
             if attempt + 1 < MAX_DOWNLOAD_ATTEMPTS && is_retryable_download_stream_error(&error) {
+                resume = representation.as_ref().and_then(|(total, validator)| {
+                    (downloaded > 0 && downloaded < *total).then(|| ResumeRequest {
+                        offset: downloaded,
+                        total: *total,
+                        validator: validator.clone(),
+                    })
+                });
                 tracing::warn!(
                     attempt = attempt + 1,
                     host,
+                    bytes_received = received_this_attempt,
+                    retained_bytes = resume.as_ref().map_or(0, |range| range.offset),
                     "Runtime download body failed; retrying bounded download"
                 );
                 tokio::time::sleep(crate::core::http::retry_backoff(
@@ -577,6 +681,29 @@ where
                 continue;
             }
             return Err(error).context("Error downloading chunk");
+        }
+
+        if let Some((total, _)) = &representation {
+            if let Some(end) = partial_end {
+                anyhow::ensure!(
+                    downloaded == end + 1,
+                    "Runtime download partial body does not match Content-Range"
+                );
+                if downloaded < *total && attempt + 1 < MAX_DOWNLOAD_ATTEMPTS {
+                    resume = representation
+                        .as_ref()
+                        .map(|(total, validator)| ResumeRequest {
+                            offset: downloaded,
+                            total: *total,
+                            validator: validator.clone(),
+                        });
+                    continue;
+                }
+            }
+            anyhow::ensure!(
+                downloaded == *total,
+                "Runtime download ended before the declared length"
+            );
         }
 
         file.flush()
@@ -608,7 +735,7 @@ pub async fn download_with_progress(
 
     let (temporary_path, actual) = stream_runtime_download_to_temp::<Sha256, _, _>(
         extract_domain(url),
-        || request_runtime_download(client, url),
+        |resume| request_runtime_download(client, url, resume),
         dest,
     )
     .await?;
@@ -643,7 +770,7 @@ pub async fn download_with_progress_sha512(
 
     let (temporary_path, actual) = stream_runtime_download_to_temp::<Sha512, _, _>(
         extract_domain(url),
-        || request_runtime_download(client, url),
+        |resume| request_runtime_download(client, url, resume),
         dest,
     )
     .await?;
@@ -1976,7 +2103,7 @@ mod tests {
         let client = reqwest::Client::builder().no_proxy().build()?;
         let download = stream_runtime_download_to_temp::<Sha256, _, _>(
             "127.0.0.1",
-            || {
+            |_| {
                 let client = client.clone();
                 let url = url.clone();
                 async move { Ok(client.get(url).send().await?) }
@@ -1992,6 +2119,342 @@ mod tests {
         assert_eq!(actual, digest);
         temporary_path.persist(&dest).map_err(|error| error.error)?;
         assert_eq!(std::fs::read(&dest)?, body);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_download_keeps_validated_prefix_across_partial_response() -> anyhow::Result<()>
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/archive", listener.local_addr()?);
+        let body = b"runtime archive fixture bytes".to_vec();
+        let split = 8;
+        let cap = body.len() - 5;
+        let digest = hex::encode(Sha256::digest(&body));
+        let server = async {
+            let mut request = [0; 4096];
+            let (mut stream, _) = listener.accept().await?;
+            let length = stream.read(&mut request).await?;
+            anyhow::ensure!(!request[..length].windows(6).any(|part| part == b"range:"));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            stream.write_all(&body[..split]).await?;
+            // Keep the first body open until the client's read timeout, as in
+            // the Fedora Go archive failure. The next request must resume it.
+            let _stalled_body = stream;
+
+            let (mut stream, _) = listener.accept().await?;
+            let length = stream.read(&mut request).await?;
+            let request_text = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
+            anyhow::ensure!(request_text.contains("range: bytes=8-\r\n"));
+            anyhow::ensure!(request_text.contains("if-range: \"stable\"\r\n"));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {split}-{}/{}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n",
+                        cap - split,
+                        cap - 1,
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            stream.write_all(&body[split..cap]).await?;
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().await?;
+            let length = stream.read(&mut request).await?;
+            let request_text = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
+            anyhow::ensure!(request_text.contains(&format!("range: bytes={cap}-\r\n")));
+            anyhow::ensure!(request_text.contains("if-range: \"stable\"\r\n"));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {cap}-{}/{}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n",
+                        body.len() - cap,
+                        body.len() - 1,
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            stream.write_all(&body[cap..]).await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let directory = tempfile::tempdir()?;
+        let dest = directory.path().join("archive.tar.gz");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .read_timeout(std::time::Duration::from_millis(100))
+            .build()?;
+        let download = stream_runtime_download_to_temp::<Sha256, _, _>(
+            "127.0.0.1",
+            |resume| {
+                let client = client.clone();
+                let url = url.clone();
+                async move {
+                    let mut request = client.get(url);
+                    if let Some(resume) = resume {
+                        assert!(resume.offset == 8 || resume.offset == cap as u64);
+                        request = request
+                            .header(reqwest::header::RANGE, format!("bytes={}-", resume.offset))
+                            .header(reqwest::header::IF_RANGE, resume.validator);
+                    }
+                    Ok(request.send().await?)
+                }
+            },
+            &dest,
+        );
+        let (server, download) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(server, download)
+        })
+        .await?;
+        server?;
+        let (temporary_path, actual) = download?;
+        assert_eq!(
+            actual, digest,
+            "the resumed archive must include its first body"
+        );
+        temporary_path.persist(&dest).map_err(|error| error.error)?;
+        assert_eq!(std::fs::read(&dest)?, body);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_download_production_range_survives_redirects() -> anyhow::Result<()> {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "runtimes::common::tests::runtime_download_production_range_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OMG_TEST_MODE", "1")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "production resume probe failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "invoked in an isolated OMG_TEST_MODE process by the production range test"]
+    async fn runtime_download_production_range_child() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        anyhow::ensure!(crate::core::paths::test_mode());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/start", listener.local_addr()?);
+        let body = b"runtime production redirect fixture";
+        let split = 8;
+        let server = async {
+            for step in 0..4 {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = [0; 4096];
+                let length = stream.read(&mut request).await?;
+                let request = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
+                anyhow::ensure!(request.contains("accept-encoding: identity\r\n"));
+                anyhow::ensure!(request.contains("range: bytes=8-\r\n") == (step >= 2));
+                anyhow::ensure!(request.contains("if-range: \"stable\"\r\n") == (step >= 2));
+                if step % 2 == 0 {
+                    anyhow::ensure!(request.starts_with("get /start http/1.1\r\n"));
+                    stream
+                        .write_all(b"HTTP/1.1 302 Found\r\nLocation: /archive\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await?;
+                } else if step == 1 {
+                    anyhow::ensure!(request.starts_with("get /archive http/1.1\r\n"));
+                    stream
+                        .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n", body.len()).as_bytes())
+                        .await?;
+                    stream.write_all(&body[..split]).await?;
+                } else {
+                    anyhow::ensure!(request.starts_with("get /archive http/1.1\r\n"));
+                    stream
+                        .write_all(format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {split}-{}/{}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n", body.len() - split, body.len() - 1, body.len()).as_bytes())
+                        .await?;
+                    stream.write_all(&body[split..]).await?;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let directory = tempfile::tempdir()?;
+        let dest = directory.path().join("archive.tar.gz");
+        let client = reqwest::Client::new();
+        let digest = hex::encode(Sha256::digest(body));
+        let download = download_with_progress(&client, &url, &dest, &digest);
+        let (server, download) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(server, download)
+        })
+        .await?;
+        server?;
+        download?;
+        anyhow::ensure!(std::fs::read(dest)? == body);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_download_restarts_when_range_is_ignored_or_unvalidated() -> anyhow::Result<()>
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for validator in [Some("\"stable\""), None] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/archive", listener.local_addr()?);
+            let body = b"runtime archive fixture bytes".to_vec();
+            let digest = hex::encode(Sha256::digest(&body));
+            let server = async {
+                let mut request = [0; 4096];
+                let (mut stream, _) = listener.accept().await?;
+                let _ = stream.read(&mut request).await?;
+                let etag = validator.map_or(String::new(), |value| format!("ETag: {value}\r\n"));
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{etag}Connection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                stream.write_all(&body[..8]).await?;
+                drop(stream);
+
+                let (mut stream, _) = listener.accept().await?;
+                let length = stream.read(&mut request).await?;
+                let request = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
+                assert_eq!(request.contains("range: bytes=8-\r\n"), validator.is_some());
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"replacement\"\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                stream.write_all(&body).await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            let directory = tempfile::tempdir()?;
+            let dest = directory.path().join("archive.tar.gz");
+            let client = reqwest::Client::builder().no_proxy().build()?;
+            let download = stream_runtime_download_to_temp::<Sha256, _, _>(
+                "127.0.0.1",
+                |resume| {
+                    let client = client.clone();
+                    let url = url.clone();
+                    async move {
+                        let mut request = client.get(url);
+                        if let Some(resume) = resume {
+                            request = request
+                                .header(reqwest::header::RANGE, format!("bytes={}-", resume.offset))
+                                .header(reqwest::header::IF_RANGE, resume.validator);
+                        }
+                        Ok(request.send().await?)
+                    }
+                },
+                &dest,
+            );
+            let (server, download) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(server, download)
+                })
+                .await?;
+            server?;
+            let (temporary_path, actual) = download?;
+            assert_eq!(actual, digest);
+            temporary_path.persist(&dest).map_err(|error| error.error)?;
+            assert_eq!(std::fs::read(&dest)?, body);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_download_rejects_changed_or_misaligned_ranges() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (validator, start, expected_error) in [
+            ("\"changed\"", 8, "range validator changed"),
+            ("\"stable\"", 9, "range does not match"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/archive", listener.local_addr()?);
+            let body = b"runtime archive fixture bytes".to_vec();
+            let server = async {
+                let mut request = [0; 4096];
+                let (mut stream, _) = listener.accept().await?;
+                let _ = stream.read(&mut request).await?;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                stream.write_all(&body[..8]).await?;
+                drop(stream);
+
+                let (mut stream, _) = listener.accept().await?;
+                let length = stream.read(&mut request).await?;
+                let request = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
+                anyhow::ensure!(request.contains("range: bytes=8-\r\n"));
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{}/{}\r\nETag: {validator}\r\nConnection: close\r\n\r\n",
+                            body.len() - 8,
+                            body.len() - 1,
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            let directory = tempfile::tempdir()?;
+            let dest = directory.path().join("archive.tar.gz");
+            let client = reqwest::Client::builder().no_proxy().build()?;
+            let download = stream_runtime_download_to_temp::<Sha256, _, _>(
+                "127.0.0.1",
+                |resume| {
+                    let client = client.clone();
+                    let url = url.clone();
+                    async move {
+                        let mut request = client.get(url);
+                        if let Some(resume) = resume {
+                            request = request
+                                .header(reqwest::header::RANGE, format!("bytes={}-", resume.offset))
+                                .header(reqwest::header::IF_RANGE, resume.validator);
+                        }
+                        Ok(request.send().await?)
+                    }
+                },
+                &dest,
+            );
+            let (server, download) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(server, download)
+                })
+                .await?;
+            server?;
+            let error = download.expect_err("unmatched ranges cannot be combined");
+            assert!(format!("{error:#}").contains(expected_error), "{error:#}");
+            assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+        }
         Ok(())
     }
 
@@ -2026,7 +2489,7 @@ mod tests {
         let attempts = AtomicUsize::new(0);
         let download = stream_runtime_download_to_temp::<Sha256, _, _>(
             "127.0.0.1",
-            || {
+            |_| {
                 let client = client.clone();
                 let url = url.clone();
                 let attempts = &attempts;
@@ -2094,10 +2557,20 @@ mod tests {
             .proxy(proxy)
             .timeout(std::time::Duration::from_secs(1))
             .build()?;
-        let error = super::request_runtime_download(&client, "https://127.0.0.1/archive")
-            .await
-            .expect_err("private target must be rejected before any connection");
-        assert!(format!("{error:#}").contains("private or local"));
+        for resume in [
+            None,
+            Some(ResumeRequest {
+                offset: 1,
+                total: 2,
+                validator: reqwest::header::HeaderValue::from_static("\"stable\""),
+            }),
+        ] {
+            let error =
+                super::request_runtime_download(&client, "https://127.0.0.1/archive", resume)
+                    .await
+                    .expect_err("private target must be rejected before any connection");
+            assert!(format!("{error:#}").contains("private or local"));
+        }
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
                 .await
