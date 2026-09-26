@@ -96,6 +96,8 @@ class QemuWorkflowTests(unittest.TestCase):
             self.assertEqual(values['tag'], 'v1.2.3')
 
     def test_guest_uses_resolved_artifact_mode_for_every_event(self):
+        selection = step('Resolve selection')
+        self.assertIn("github.event_name == 'schedule'", selection.split('STAGED:', 1)[1].split('\n', 1)[0])
         download = step('Download staged binaries')
         self.assertIn("if: inputs.staged", download)
         guest = step('Run disposable guest lifecycle + read benchmarks + inventory rows')
@@ -112,7 +114,7 @@ class QemuWorkflowTests(unittest.TestCase):
         script = script.replace('./scripts/benchmark-qemu.sh', 'printf "%s\\n"')
         for event, staged in [('push', True), ('pull_request', True),
                               ('workflow_dispatch', True), ('workflow_dispatch', False),
-                              ('schedule', False)]:
+                              ('schedule', True)]:
             with self.subTest(event=event, staged=staged), tempfile.TemporaryDirectory() as tmp:
                 result, _ = self.run_script(script, {'STAGED': str(staged).lower(),
                     'RUNNER_TEMP': tmp, 'GITHUB_EVENT_NAME': event,

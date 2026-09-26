@@ -2,7 +2,9 @@
 #
 # Boots disposable KVM guests per distro and runs the package-lifecycle
 # guest check via scripts/benchmark-qemu.sh.
-# - schedule/dispatch default: published release guests, x86_64 (no build).
+# - schedule: current default-branch build and inventory in x86_64 guests.
+#   Published artifacts have a separate nightly Release Smoke workflow.
+# - dispatch default: published release guests, x86_64 (no build).
 # - pull_request/main push: verified native CI release pairs are reused per distro
 #   and tested via --staged-dir. ARM is excluded because its configurable
 #   runner must never execute untrusted pull-request code.
@@ -155,7 +157,7 @@ jobs:
           REQUESTED_RELEASE_TAG: ${{ inputs.tag }}
           REQUESTED_DISTRO: ${{ inputs.distro || 'all' }}
           REQUESTED_ARCH: ${{ inputs.arch || 'all' }}
-          STAGED: ${{ github.event_name == 'pull_request' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.staged) }}
+          STAGED: ${{ github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.staged) }}
           EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.event_name != 'pull_request' && secrets.GITHUB_TOKEN || '' }}
         run: |
