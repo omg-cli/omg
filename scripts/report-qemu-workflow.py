@@ -37,6 +37,7 @@ def identity(event, live, repository):
             or live["head_sha"] != run["head_sha"]
             or live["workflow_id"] != run["workflow_id"]
             or not trusted_workflow
+            or live.get("head_branch") != "main"
             or live["status"] != "completed"
             or live["event"] not in ("push", "workflow_dispatch", "schedule")
             or not re.fullmatch(r"[0-9a-f]{40}", live["head_sha"])):

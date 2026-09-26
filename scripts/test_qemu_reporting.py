@@ -624,11 +624,12 @@ class ReportingBoundaryTests(unittest.TestCase):
     def test_identity_binds_repo_workflow_commit_and_attempt(self):
         live = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                     head_sha="a" * 40, workflow_id=20, path=".github/workflows/qemu-matrix.yml",
-                    status="completed", event="push")
+                    status="completed", event="push", head_branch="main")
         event = dict(repository={"full_name": "owner/repo"}, workflow_run=copy.deepcopy(live))
         self.assertEqual(REPORT.identity(event, live, "owner/repo"), live)
         for key, value in (("id", 11), ("run_attempt", 1), ("head_sha", "b" * 40),
-                           ("path", ".github/workflows/evil.yml"), ("event", "pull_request"),
+                           ("path", ".github/workflows/evil.yml"), ("head_branch", "feature"),
+                           ("event", "pull_request"),
                            ("event", "pull_request_target")):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 REPORT.identity(event, dict(live, **{key: value}), "owner/repo")
@@ -718,7 +719,9 @@ class ReportingBoundaryTests(unittest.TestCase):
 
     def test_privileged_report_job_excludes_pull_request_runs(self):
         text = (ROOT / ".github/workflows/qemu-report.yml").read_text()
-        self.assertIn("if: github.event.workflow_run.event != 'pull_request'", text)
+        self.assertIn("    branches: [main]", text)
+        self.assertIn("if: github.event.workflow_run.head_branch == 'main'", text)
+        self.assertIn("github.event.workflow_run.event != 'pull_request'", text)
 
     def test_reporter_checks_out_default_sha_and_never_executes_artifacts(self):
         text = (ROOT / ".github/workflows/qemu-report.yml").read_text()
