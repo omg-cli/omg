@@ -390,6 +390,22 @@ def write_failure_catalog(directory, run, repository, failures, evidence_error):
     directory.joinpath("failures.json").write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
 
 
+def retained_guest_artifact(artifact, run, jobs):
+    """Admit old evidence only for a successful guest job carried into a rerun."""
+    name = artifact["name"]
+    guest = re.fullmatch(r"qemu-(arm-)?evidence-(arch|debian|ubuntu|fedora)", name)
+    if guest is None:
+        return False
+    label = (f"QEMU guest arm64 ({guest.group(2)})" if guest.group(1)
+             else f"QEMU guest ({guest.group(2)})")
+    owners = [job for job in jobs if job.get("name", "").endswith(label)
+              and job.get("conclusion") == "success"
+              and job.get("started_at", "") < run["run_started_at"]
+              and job.get("started_at", "") <= artifact["created_at"]
+              <= job.get("completed_at", "")]
+    return len(owners) == 1
+
+
 def main():
     repository = os.environ["GITHUB_REPOSITORY"]
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
@@ -406,6 +422,8 @@ def main():
     if run["conclusion"] in ("cancelled", "skipped"):
         print("Cancelled/skipped run retained in Actions; no failure issue generated")
         return 0
+    jobs = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100"))
+    job_rows = jobs.get("jobs")
     published_candidate = (run["conclusion"] == "success"
                            and run["path"] == ".github/workflows/qemu-matrix.yml"
                            and run["event"] in ("schedule", "workflow_dispatch")
@@ -425,10 +443,14 @@ def main():
         for artifact in listing["artifacts"]:
             if not re.fullmatch(r"qemu-(?:arm-)?evidence-(?:arch|debian|ubuntu|fedora)|qemu-workflow-report", artifact["name"]):
                 continue
-            # Reruns keep their run ID. Reject older-attempt artifacts rather
-            # than using stale success to close a current failure.
-            if artifact["created_at"] < run["run_started_at"] or artifact["expired"]:
-                raise ValueError("stale or expired artifact")
+            # Re-run failed jobs retains successful jobs and their artifacts.
+            # Carry those guests forward only when the latest job receipt still
+            # owns the artifact; a replaced failed job cannot supply evidence.
+            if (artifact["created_at"] < run["run_started_at"]
+                    and not retained_guest_artifact(artifact, run, job_rows)):
+                continue
+            if artifact["expired"]:
+                raise ValueError("expired artifact")
             if type(artifact["id"]) is not int or artifact["size_in_bytes"] > MAX_DOWNLOAD:
                 raise ValueError("invalid artifact identity or size")
             content = api(f"repos/{repository}/actions/artifacts/{artifact['id']}/zip", MAX_DOWNLOAD)
@@ -465,8 +487,6 @@ def main():
     except (ValueError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError):
         selected = []
         evidence_error = True
-    jobs = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100"))
-    job_rows = jobs.get("jobs")
     receipt = workflow_receipt(job_rows, run["conclusion"])
     selected = [receipt if row["case_id"] == "qemu-matrix-workflow" else row for row in selected]
     if evidence_error:

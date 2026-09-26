@@ -400,7 +400,8 @@ class ReportingBoundaryTests(unittest.TestCase):
                            log_case="search", main_shas=None, changed_attempt=False,
                            workflow_path=".github/workflows/qemu-matrix.yml", all_distros=False,
                            latest_tag="v0.1.224", provenance_override=None, commit_shas=None,
-                           jobs=None):
+                           jobs=None, prior_attempt_artifact=False,
+                           retained_guest_artifacts=False):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -432,6 +433,28 @@ class ReportingBoundaryTests(unittest.TestCase):
                 payloads[identifier] = output.getvalue()
                 artifacts.append(dict(artifact, id=identifier, name=f"qemu-evidence-{distro}",
                                       size_in_bytes=len(payloads[identifier])))
+        if prior_attempt_artifact:
+            artifacts.insert(0, dict(artifact, id=29, name="qemu-workflow-report",
+                                     created_at="2026-09-19T23:00:00Z", expired=False))
+            payloads[29] = payload
+        if retained_guest_artifacts:
+            old_start = "2026-09-19T23:00:00Z"
+            old_end = "2026-09-19T23:20:00Z"
+            for item in artifacts:
+                if item["name"] in {f"qemu-evidence-{distro}" for distro in REPORT.DISTROS[:-1]}:
+                    item["created_at"] = "2026-09-19T23:10:00Z"
+            stale = dict(self.row(), case_id="qemu-fedora-search", distro="fedora")
+            old_zip = io.BytesIO()
+            with zipfile.ZipFile(old_zip, "w") as archive:
+                archive.writestr("run/inventory/results.json", json.dumps([stale]))
+            payloads[28] = old_zip.getvalue()
+            artifacts.insert(0, dict(artifact, id=28, name="qemu-evidence-fedora",
+                                     created_at="2026-09-19T23:10:00Z", expired=False,
+                                     size_in_bytes=len(payloads[28])))
+            jobs = [dict(name=f"QEMU guest ({distro})", conclusion="success",
+                         started_at=old_start if distro != "fedora" else run["run_started_at"],
+                         completed_at=old_end if distro != "fedora" else "2026-09-20T00:20:00Z")
+                    for distro in REPORT.DISTROS]
         calls = []
         main_refs = iter(main_shas or [run["head_sha"], run["head_sha"]])
         tag_commits = iter(commit_shas or ["c" * 40, "c" * 40])
@@ -638,6 +661,16 @@ class ReportingBoundaryTests(unittest.TestCase):
                 for distro in REPORT.DISTROS]
         calls, catalog = self.run_report_fixture(rows, conclusion="success",
             workflow_path=".github/workflows/ci.yml", all_distros=True)
+        self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
+
+    def test_successful_rerun_ignores_previous_attempt_failure_artifact(self):
+        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
+                for distro in REPORT.DISTROS]
+        calls, catalog = self.run_report_fixture(
+            rows, conclusion="success", workflow_path=".github/workflows/ci.yml",
+            all_distros=True, prior_attempt_artifact=True,
+            retained_guest_artifacts=True)
         self.assertEqual(calls, [])
         self.assertIsNone(catalog)
 
