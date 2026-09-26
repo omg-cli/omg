@@ -72,6 +72,12 @@ Performance depends on the operation, backend, query, and cache state. Read [ben
 - [Contributing](../CONTRIBUTING.md) and [changelog](./changelog.md).
 - [Documentation style](./documentation-style.md) if you write or edit a page.
 
-Historical changelogs, dated investigations, and audit reports describe their recorded state, not current feature guarantees.
+Historical changelogs, dated investigations, and audit reports describe their recorded state, not current feature guarantees. Dated research is kept for provenance and is linked here so it is not mistaken for current guidance:
+
+- [Extreme Technical Review, 2026-08-31](./TECH-DEBT-REVIEW-2026-08-31.md)
+- [Rust CI/CD best practices, 2025-2026](./ci-cd-best-practices-2025.md)
+- [CI/CD deep research, 2026-09-19](./ci-cd-deep-research-2026-09-19.md) with its raw job and source data ([jobs.csv](./ci-cd-research-2026-09-19-jobs.csv), [sources.json](./ci-cd-research-2026-09-19-sources.json))
+- [CI/CD review, 2026-09-19](./ci-cd-review-2026-09-19.md)
+- [Consolidated CI/CD audit and QEMU verification roadmap, 2026-09-20](./ci-cd-consolidated-audit-2026-09-20.md)
 
 [Report a bug](https://github.com/omg-cli/omg/issues) with your version, distribution, command, and redacted output. Report vulnerabilities privately using [SECURITY.md](../SECURITY.md).
