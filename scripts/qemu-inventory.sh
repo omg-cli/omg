@@ -590,6 +590,39 @@ check_config_oracle() {
     *) return 2 ;;
   esac
 }
+check_privacy_oracle() {
+  local assertion=$1 output=$2 config_file queue_file
+  [[ "${OMG_CONFIG_DIR:-}" == "$rowdir/privacy-config" \
+    && "${OMG_DATA_DIR:-}" == "$rowdir/privacy-data" ]] || {
+    printf 'assertion failed: privacy row escaped its private directories\n' >&2; return 1
+  }
+  config_file="$OMG_CONFIG_DIR/config.toml"
+  queue_file="$OMG_DATA_DIR/telemetry_queue.json"
+  case "$assertion" in
+    privacy-opted-out)
+      check_config_value "$config_file" false \
+        && [[ ! -e "$queue_file" && ! -L "$queue_file" ]] \
+        && grep -Fq 'Telemetry disabled locally' "$output" || {
+          printf 'assertion failed: privacy opt-out did not persist disabled and purge the queue\n' >&2; return 1
+        } ;;
+    privacy-status-disabled)
+      check_config_value "$config_file" false \
+        && grep -Eq '^[[:space:]]*Telemetry: Disabled$' "$output" || {
+          printf 'assertion failed: privacy status did not reflect disabled telemetry\n' >&2; return 1
+        } ;;
+    privacy-status-enabled)
+      check_config_value "$config_file" true \
+        && grep -Eq '^[[:space:]]*Telemetry: Enabled$' "$output" || {
+          printf 'assertion failed: privacy status did not reflect enabled telemetry\n' >&2; return 1
+        } ;;
+    privacy-opted-in)
+      check_config_value "$config_file" true \
+        && grep -Fq 'Telemetry enabled locally' "$output" || {
+          printf 'assertion failed: privacy opt-in did not persist enabled telemetry\n' >&2; return 1
+        } ;;
+    *) return 2 ;;
+  esac
+}
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
   if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
@@ -643,6 +676,8 @@ check_product_output() {
     case "$assertion" in
       config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults)
         check_config_oracle "$assertion" "$stdout" || return 1 ;;
+      privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled)
+        check_privacy_oracle "$assertion" "$stdout" || return 1 ;;
       hooks-installed|hooks-absent)
         local hook label hook_path
         for hook in pre-commit post-checkout post-merge; do
@@ -920,7 +955,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled) ;; *) exit 2 ;; esac
   case "$id" in
     config-set)
       [[ "$a" == config-set-persisted ]] && jq -e '. == ["config","set","telemetry.enabled","true"]' <<< "$aj" >/dev/null || exit 2 ;;
@@ -935,6 +970,17 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     config-reset)
       [[ "$a" == config-reset-defaults && "$r" == config-set ]] && jq -e '. == ["config","reset","--yes"]' <<< "$aj" >/dev/null || exit 2 ;;
     *) [[ "$a" != config-* ]] || exit 2 ;;
+  esac
+  case "$id" in
+    privacy-opt-out)
+      [[ "$a" == privacy-opted-out ]] && jq -e '. == ["privacy","opt-out"]' <<< "$aj" >/dev/null || exit 2 ;;
+    privacy-status)
+      [[ "$a" == privacy-status-disabled && "$r" == privacy-opt-out ]] && jq -e '. == ["privacy","status"]' <<< "$aj" >/dev/null || exit 2 ;;
+    privacy-opt-in)
+      [[ "$a" == privacy-opted-in && "$r" == privacy-opt-out ]] && jq -e '. == ["privacy","opt-in"]' <<< "$aj" >/dev/null || exit 2 ;;
+    privacy-status-enabled)
+      [[ "$a" == privacy-status-enabled && "$r" == privacy-opt-in ]] && jq -e '. == ["privacy","status"]' <<< "$aj" >/dev/null || exit 2 ;;
+    *) [[ "$a" != privacy-opted-out && "$a" != privacy-status-disabled && "$a" != privacy-opted-in && "$a" != privacy-status-enabled ]] || exit 2 ;;
   esac
   if [[ "$id" == doctor ]]; then
     [[ "$a" == doctor-native-backend ]] || exit 2
@@ -1096,6 +1142,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == config-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/config\""
   fi
+  if [[ "$case" == privacy-opt-out || "$case" == privacy-status || "$case" == privacy-opt-in || "$case" == privacy-status-enabled ]]; then
+    remote+="; export OMG_CONFIG_DIR=\"\$rowdir/privacy-config\" OMG_DATA_DIR=\"\$rowdir/privacy-data\""
+    remote+="; mkdir -p \"\$OMG_DATA_DIR\"; printf 'queued' > \"\$OMG_DATA_DIR/telemetry_queue.json\""
+  fi
   remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n' > Makefile"
   if [[ "$assertions" == audit-source-failure || "$assertions" == sbom-source-failure ]]; then
     # DNF5 can satisfy an offline advisory query from a previous row's cache.
@@ -1107,7 +1157,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote+="; printf '%s' $overlap_fixture > workspace-overlap.sh"
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
-  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_product_output)"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_privacy_oracle); $(declare -f check_product_output)"
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')

@@ -24460,7 +24460,7 @@
         }
       ]
     },
-    "2fc2e124ec62f98cad54173dc60dae5d515f66bf3f25782035255eaa68468fc0": {
+    "14071a6b47e96e8edd4c04b8868cdb06c989e4ae6eeab88e441f8953515d4942": {
       "releases": [],
       "cases": [
         {
@@ -24892,6 +24892,14 @@
           "id": "privacy-opt-in",
           "tiers": [
             "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "privacy-status-enabled",
+          "tiers": [
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
