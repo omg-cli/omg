@@ -301,10 +301,11 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
     for pkg in cache.packages(&PackageSort::default()) {
         let name = pkg.name();
         let matched = name.contains(&query_lower)
-            || pkg
-                .candidate()
-                .and_then(|c| c.summary())
-                .is_some_and(|s| s.to_lowercase().contains(&query_lower));
+            || pkg.candidate().is_some_and(|candidate| {
+                selected_summary(&candidate)
+                    .to_lowercase()
+                    .contains(&query_lower)
+            });
 
         if matched {
             let candidate = pkg.candidate();
@@ -320,7 +321,7 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
                 .as_ref()
                 .map_or(0, |v| i64::try_from(v.size()).unwrap_or(i64::MAX));
 
-            let description = candidate.and_then(|c| c.summary()).unwrap_or_default();
+            let description = candidate.as_ref().map(selected_summary).unwrap_or_default();
 
             results.push(SyncPackage {
                 name: name.to_string(),
@@ -338,6 +339,24 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
     }
 
     Ok(results)
+}
+
+/// APT's translated description can point at another version when several
+/// suites publish the same name. Read the selected version's own Packages
+/// record first; its first Description line is the short summary.
+fn selected_summary(version: &rust_apt::Version<'_>) -> String {
+    version
+        .get_record("Description")
+        .and_then(|description| {
+            description
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|summary| !summary.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| version.summary())
+        .unwrap_or_default()
 }
 
 /// Detailed metadata for one package from the APT cache, if present.
@@ -383,7 +402,7 @@ fn get_sync_pkg_info_selected(
     Ok(Some(PackageInfo {
         name: pkg.name().to_string(),
         version: parse_version_or_zero(version.version()),
-        description: version.summary().unwrap_or_default(),
+        description: selected_summary(&version),
         url: None,
         size: version.size(),
         install_size: Some(i64::try_from(version.installed_size()).unwrap_or(i64::MAX)),
@@ -405,7 +424,7 @@ fn candidate_packages_for_names(matches: Vec<Package>) -> Result<Vec<Package>> {
             Some(Package {
                 name: pkg.name().to_string(),
                 version: parse_version_or_zero(version.version()),
-                description: version.summary().unwrap_or_default(),
+                description: selected_summary(&version),
                 source: PackageSource::Official,
                 installed: pkg.is_installed(),
             })
@@ -425,7 +444,7 @@ pub(crate) fn candidate_index_packages() -> Result<Vec<PackageInfo>> {
             Some(PackageInfo {
                 name: pkg.name().to_string(),
                 version: parse_version_or_zero(version.version()),
-                description: version.summary().unwrap_or_default(),
+                description: selected_summary(&version),
                 url: None,
                 size: version.size(),
                 install_size: Some(i64::try_from(version.installed_size()).unwrap_or(i64::MAX)),

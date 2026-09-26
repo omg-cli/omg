@@ -275,6 +275,36 @@ mod apt_integration {
         );
     }
 
+    #[cfg(feature = "debian")]
+    #[test]
+    fn test_native_apt_candidate_pockets() {
+        let output = std::process::Command::new("python3")
+            .args([
+                "scripts/test-debian-apt-candidates.py",
+                "--omg-binary",
+                assert_cmd::cargo::cargo_bin!("omg")
+                    .to_str()
+                    .expect("OMG executable path is UTF-8"),
+            ])
+            .env_remove("OMG_TEST_MODE")
+            .env_remove("OMG_TEST_DISTRO")
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("run isolated native APT pocket fixture");
+        assert!(
+            output.status.success(),
+            "APT pocket fixture failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("PASS: native APT candidate"),
+            "APT pocket fixture emitted no success receipt: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     #[test]
     fn test_info_nonexistent_package() {
         // Contract (src/cli/packages/info.rs): an unknown package must fail
