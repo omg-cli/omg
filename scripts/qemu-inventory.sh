@@ -591,14 +591,29 @@ check_config_oracle() {
   esac
 }
 check_privacy_oracle() {
-  local assertion=$1 output=$2 config_file queue_file
+  local assertion=$1 output=$2 config_file queue_file export_file
   [[ "${OMG_CONFIG_DIR:-}" == "$rowdir/privacy-config" \
     && "${OMG_DATA_DIR:-}" == "$rowdir/privacy-data" ]] || {
     printf 'assertion failed: privacy row escaped its private directories\n' >&2; return 1
   }
   config_file="$OMG_CONFIG_DIR/config.toml"
   queue_file="$OMG_DATA_DIR/telemetry_queue.json"
+  export_file="$rowdir/privacy.json"
   case "$assertion" in
+    artifact:privacy.json)
+      if [[ ! -f "$export_file" || -L "$export_file" || $(stat -c %a "$export_file") != 600 ]] \
+        || ! jq -e -s 'length == 1 and (.[0] |
+          (keys == ["exported_at", "local", "scope"]) and
+          .scope == "local" and (.exported_at | type == "string" and length > 0) and
+          ((.local | keys) == ["config.toml", "license.json", "usage.json"]) and
+          .local["usage.json"] == {"fixture":"usage","total_commands":7} and
+          .local["config.toml"] == "telemetry_enabled = false\n" and
+          .local["license.json"] == {
+            "tier":"pro", "features":["sbom"], "customer":"fixture@example.invalid",
+            "expires_at":null, "validated_at":1700000000, "machine_id":"fixture-machine"
+          })' "$export_file" >/dev/null 2>&1; then
+        printf 'assertion failed: privacy export omitted local data, exposed secrets, or lacks owner-only permissions\n' >&2; return 1
+      fi ;;
     privacy-opted-out)
       check_config_value "$config_file" false \
         && [[ ! -e "$queue_file" && ! -L "$queue_file" ]] \
@@ -748,6 +763,9 @@ check_product_output() {
         local artifact=${assertion#artifact:}
         if [[ ! -f "$artifact" || -L "$artifact" ]] || ! jq -e -s 'length == 1' "$artifact" >/dev/null 2>&1; then
           printf 'assertion failed: artifact %s is not a regular JSON document\n' "$artifact" >&2; return 1
+        fi
+        if [[ "$artifact" == privacy.json ]]; then
+          check_privacy_oracle "$assertion" "$stdout" || return 1
         fi ;;
       sbom-inventory-only)
         if [[ ! -f sbom.json || -L sbom.json ]] || ! jq -e -s '
@@ -972,6 +990,8 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     *) [[ "$a" != config-* ]] || exit 2 ;;
   esac
   case "$id" in
+    privacy-export)
+      [[ "$a" == artifact:privacy.json ]] && jq -e '. == ["privacy","export","--output","${ROOT}/privacy.json"]' <<< "$aj" >/dev/null || exit 2 ;;
     privacy-opt-out)
       [[ "$a" == privacy-opted-out ]] && jq -e '. == ["privacy","opt-out"]' <<< "$aj" >/dev/null || exit 2 ;;
     privacy-status)
@@ -980,7 +1000,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
       [[ "$a" == privacy-opted-in && "$r" == privacy-opt-out ]] && jq -e '. == ["privacy","opt-in"]' <<< "$aj" >/dev/null || exit 2 ;;
     privacy-status-enabled)
       [[ "$a" == privacy-status-enabled && "$r" == privacy-opt-in ]] && jq -e '. == ["privacy","status"]' <<< "$aj" >/dev/null || exit 2 ;;
-    *) [[ "$a" != privacy-opted-out && "$a" != privacy-status-disabled && "$a" != privacy-opted-in && "$a" != privacy-status-enabled ]] || exit 2 ;;
+    *) [[ "$a" != artifact:privacy.json && "$a" != privacy-opted-out && "$a" != privacy-status-disabled && "$a" != privacy-opted-in && "$a" != privacy-status-enabled ]] || exit 2 ;;
   esac
   if [[ "$id" == doctor ]]; then
     [[ "$a" == doctor-native-backend ]] || exit 2
@@ -1142,9 +1162,16 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == config-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/config\""
   fi
-  if [[ "$case" == privacy-opt-out || "$case" == privacy-status || "$case" == privacy-opt-in || "$case" == privacy-status-enabled ]]; then
+  if [[ "$case" == privacy-export || "$case" == privacy-opt-out || "$case" == privacy-status || "$case" == privacy-opt-in || "$case" == privacy-status-enabled ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/privacy-config\" OMG_DATA_DIR=\"\$rowdir/privacy-data\""
-    remote+="; mkdir -p \"\$OMG_DATA_DIR\"; printf 'queued' > \"\$OMG_DATA_DIR/telemetry_queue.json\""
+    if [[ "$case" == privacy-export ]]; then
+      remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: privacy export fixture requires an unprivileged guest user\\n' >&2; exit 2; }; export OMG_DISABLE_DAEMON=1; mkdir -p \"\$OMG_DATA_DIR\" \"\$OMG_CONFIG_DIR\""
+      remote+="; printf '%s\\n' '{\"fixture\":\"usage\",\"total_commands\":7}' > \"\$OMG_DATA_DIR/usage.json\""
+      remote+="; printf '%s\\n' '{\"key\":\"qemu-secret-license-key\",\"tier\":\"pro\",\"features\":[\"sbom\"],\"customer\":\"fixture@example.invalid\",\"expires_at\":null,\"validated_at\":1700000000,\"token\":\"qemu-secret-license-token\",\"machine_id\":\"fixture-machine\"}' > \"\$OMG_DATA_DIR/license.json\""
+      remote+="; printf 'telemetry_enabled = false\\n' > \"\$OMG_CONFIG_DIR/config.toml\"; printf old > privacy.json; chmod 644 privacy.json"
+    else
+      remote+="; mkdir -p \"\$OMG_DATA_DIR\"; printf 'queued' > \"\$OMG_DATA_DIR/telemetry_queue.json\""
+    fi
   fi
   remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n' > Makefile"
   if [[ "$assertions" == audit-source-failure || "$assertions" == sbom-source-failure ]]; then

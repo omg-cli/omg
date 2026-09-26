@@ -228,6 +228,71 @@ esac
                 self.assertIn('assertion failed: privacy', logs[case + '.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_privacy_export_requires_private_complete_redacted_local_data(self):
+        row = ('privacy-export\t["privacy","export","--output","${ROOT}/privacy.json"]'
+               '\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass'
+               '\tartifact:privacy.json\ttempdir-drop')
+        payload = {
+            'exported_at': '2026-09-26T00:00:00Z', 'scope': 'local',
+            'local': {
+                'usage.json': {'fixture': 'usage', 'total_commands': 7},
+                'config.toml': 'telemetry_enabled = false\n',
+                'license.json': {
+                    'tier': 'pro', 'features': ['sbom'],
+                    'customer': 'fixture@example.invalid', 'expires_at': None,
+                    'validated_at': 1700000000, 'machine_id': 'fixture-machine',
+                },
+            },
+        }
+        preflight = ('[[ "$OMG_DISABLE_DAEMON" == 1 && '
+                     '-f "$OMG_DATA_DIR/usage.json" && '
+                     '-f "$OMG_DATA_DIR/license.json" && '
+                     '-f "$OMG_CONFIG_DIR/config.toml" && '
+                     '$(stat -c %a "$4") == 644 ]] || exit 70\n'
+                     'jq -e \'.fixture == "usage" and .total_commands == 7\' '
+                     '"$OMG_DATA_DIR/usage.json" >/dev/null || exit 70\n'
+                     'jq -e \'.key == "qemu-secret-license-key" and '
+                     '.token == "qemu-secret-license-token"\' '
+                     '"$OMG_DATA_DIR/license.json" >/dev/null || exit 70\n'
+                     'grep -Fxq "telemetry_enabled = false" '
+                     '"$OMG_CONFIG_DIR/config.toml" || exit 70\n')
+
+        def product(data, *, mode=600, write=True):
+            command = preflight
+            if write:
+                command += 'printf "%s\\n" ' + shlex.quote(json.dumps(data)) + ' > "$4"\n'
+                command += f'chmod {mode} "$4"\n'
+            command += 'printf "Data exported to: %s\\n" "$4"\n'
+            return command
+
+        result, evidence, logs = self.run_inventory(product(payload), [row])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'PASS', logs)
+
+        faults = {
+            'wrong-usage': {**payload, 'local': {**payload['local'],
+                'usage.json': {'fixture': 'usage', 'total_commands': 0}}},
+            'missing-config': {**payload, 'local': {key: value for key, value in
+                payload['local'].items() if key != 'config.toml'}},
+            'leaked-license-key': {**payload, 'local': {**payload['local'],
+                'license.json': {**payload['local']['license.json'], 'key': 'qemu-secret-license-key'}}},
+            'wrong-scope': {**payload, 'scope': 'remote'},
+            'extra-remote': {**payload, 'remote': {}},
+        }
+        for fault, data in faults.items():
+            with self.subTest(fault=fault):
+                result, evidence, logs = self.run_inventory(product(data), [row])
+                self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('assertion failed: privacy export', logs['privacy-export.log'])
+        for fault, command in [('permissive-mode', product(payload, mode=644)),
+                               ('unchanged-stale-file', product(payload, write=False))]:
+            with self.subTest(fault=fault):
+                result, evidence, logs = self.run_inventory(command, [row])
+                self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_counter_rows_require_native_counts_and_block_failed_references(self):
         cases = {'ec': 'explicit-shortcut', 'tc': 'total-shortcut',
                  'oc': 'orphan-shortcut', 'uc': 'updates-shortcut'}
