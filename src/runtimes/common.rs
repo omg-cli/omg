@@ -412,6 +412,38 @@ fn is_retryable_download_stream_error(error: &reqwest::Error) -> bool {
         || crate::core::http::is_retryable_error(error)
 }
 
+/// Connect-phase failures that are safe to retry.
+///
+/// The download URL is resolved with our own deadline (`tokio::time::timeout`,
+/// which returns `Elapsed` when the deadline elapses:
+/// "Requires a Future to complete before the specified duration has elapsed. If
+/// the future completes before the duration has elapsed, then the completed
+/// value is returned. Otherwise, an error is returned and the future is
+/// canceled", <https://docs.rs/tokio/latest/tokio/time/fn.timeout.html>). A
+/// resolution that runs past that deadline on a loaded host must not consume the
+/// whole row: the request is an idempotent GET for an immutable archive, so it
+/// shares the body retry budget.
+///
+/// Local validation failures (for example a resolved address that is not
+/// public) carry none of the retryable types and stay fatal, so a retry can
+/// never mask a refusal.
+fn is_retryable_connect_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if cause.is::<tokio::time::error::Elapsed>() {
+            return true;
+        }
+        if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+            return http.is_timeout()
+                || http.is_connect()
+                || http.is_body()
+                || crate::core::http::is_retryable_error(http);
+        }
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+    })
+}
+
 /// Stream a runtime artifact body into a same-filesystem temporary file with
 /// bounded retry for transient mid-stream failures.
 ///
@@ -441,9 +473,29 @@ where
     );
 
     for attempt in 0..MAX_DOWNLOAD_ATTEMPTS {
-        let response = request()
-            .await
-            .with_context(|| format!("Failed to connect to {host}"))?;
+        let response = match request().await {
+            Ok(response) => response,
+            Err(error) => {
+                if attempt + 1 < MAX_DOWNLOAD_ATTEMPTS && is_retryable_connect_error(&error) {
+                    // Local Debian sweep lane (run-mfY0GF) failed the Go row with
+                    // "Failed to connect to go.dev: deadline has elapsed" while the
+                    // host was loaded: our DNS deadline expired before any byte
+                    // moved. Retry inside the same bounded budget the body uses.
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        host,
+                        "Runtime download connection failed; retrying bounded download"
+                    );
+                    tokio::time::sleep(crate::core::http::retry_backoff(
+                        std::time::Duration::from_millis(100),
+                        u32::try_from(attempt).unwrap_or(u32::MAX),
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(error).with_context(|| format!("Failed to connect to {host}"));
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1935,6 +1987,96 @@ mod tests {
         temporary_path.persist(&dest).map_err(|error| error.error)?;
         assert_eq!(std::fs::read(&dest)?, body);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_download_retries_a_connect_deadline_before_giving_up() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/archive", listener.local_addr()?);
+        let body = b"runtime archive fixture bytes".to_vec();
+        let digest = hex::encode(Sha256::digest(&body));
+        let server = async {
+            let mut request = [0; 4096];
+            let (mut stream, _) = listener.accept().await?;
+            let _ = stream.read(&mut request).await?;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            stream.write_all(&body).await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let directory = tempfile::tempdir()?;
+        let dest = directory.path().join("archive.tar.gz");
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let attempts = AtomicUsize::new(0);
+        let download = stream_runtime_download_to_temp::<Sha256, _, _>(
+            "127.0.0.1",
+            || {
+                let client = client.clone();
+                let url = url.clone();
+                let attempts = &attempts;
+                async move {
+                    // First attempt: our DNS deadline elapses before any request
+                    // leaves the process, exactly like the Go row in the Debian
+                    // sweep lane. The retry must still finish the download.
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let elapsed = tokio::time::timeout(
+                            std::time::Duration::ZERO,
+                            std::future::pending::<()>(),
+                        )
+                        .await
+                        .expect_err("zero-duration deadline must elapse");
+                        return Err(anyhow::Error::from(elapsed));
+                    }
+                    Ok(client.get(url).send().await?)
+                }
+            },
+            &dest,
+        );
+        let (server, download) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(server, download)
+        })
+        .await?;
+        server?;
+        let (temporary_path, actual) = download?;
+        assert_eq!(actual, digest);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "exactly one deadline retry must be used"
+        );
+        temporary_path.persist(&dest).map_err(|error| error.error)?;
+        assert_eq!(std::fs::read(&dest)?, body);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_download_connect_retry_keeps_local_refusals_fatal() {
+        let elapsed = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .expect_err("zero-duration deadline must elapse");
+        assert!(is_retryable_connect_error(&anyhow::Error::from(elapsed)));
+        let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "connect deadline");
+        assert!(is_retryable_connect_error(&anyhow::Error::from(timed_out)));
+        for permanent in [
+            anyhow::anyhow!("Download resolves to a non-public address"),
+            anyhow::anyhow!("Download URL must not contain credentials"),
+            anyhow::anyhow!("Too many download redirects"),
+        ] {
+            assert!(
+                !is_retryable_connect_error(&permanent),
+                "{permanent} must stay fatal instead of being retried"
+            );
+        }
     }
 
     #[tokio::test]
