@@ -406,6 +406,50 @@ class OutputContracts(unittest.TestCase):
         self.assertEqual([row['result'] for row in evidence], ['PASS', 'FAIL'])
         self.assertIn('own stderr explanation', logs['refuse.log'])
 
+    def test_offline_refusals_require_the_product_explanation(self):
+        cases = (
+            ('self-update-downgrade-refusal',
+             'Error: Refusing to downgrade from 1.0.0 to 0.0.1 (use --force to override)\n'),
+            ('env-share-missing-lock', 'Error: No omg.lock file found\n'),
+        )
+        for assertion, refusal in cases:
+            with self.subTest(assertion=assertion):
+                self.assertEqual(
+                    self.run_oracle(safety='controlled-error', assertion=assertion,
+                                    code=1, stderr=refusal).returncode,
+                    0,
+                )
+                self.assertNotEqual(
+                    self.run_oracle(safety='controlled-error', assertion=assertion,
+                                    code=1, stderr='unrelated refusal\n').returncode,
+                    0,
+                )
+                self.assertNotEqual(
+                    self.run_oracle(safety='controlled-error', assertion=assertion,
+                                    code=0, stderr=refusal).returncode,
+                    0,
+                )
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_actual_runner_executes_offline_refusals(self):
+        rows = [
+            'self-update-version\t["self-update","--version","0.0.1"]\tcontrolled-error\t1\tpass\t-\thermetic\thermetic:pass\tself-update-downgrade-refusal\ttempdir-drop',
+            'env-share-missing-lock\t["env","share"]\tcontrolled-error\t1\tpass\t-\thermetic\thermetic:pass\tenv-share-missing-lock\ttempdir-drop',
+        ]
+        product = '''case "$1" in
+self-update) printf 'OMG Checking for updates... (current: v0.1.224)\\n'
+  printf 'Error: Refusing to downgrade from 0.1.224 to 0.0.1 (use --force to override)\\n' >&2; exit 1 ;;
+env) printf 'Error: No omg.lock file found\\n' >&2; exit 1 ;;
+esac
+'''
+        result, evidence, _ = self.run_inventory(product, rows)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row['result'] for row in evidence], ['PASS', 'PASS'])
+        result, evidence, logs = self.run_inventory(product.replace('Refusing to downgrade', 'Proceeding'), rows)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual([row['result'] for row in evidence], ['FAIL', 'PASS'])
+        self.assertIn('did not refuse an offline downgrade', logs['self-update-version.log'])
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_actual_runner_accepts_valid_output_and_blocks_bad_dependencies(self):
         rows = [

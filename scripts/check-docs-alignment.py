@@ -11,7 +11,7 @@ Environment variables mentioned in docs must exist somewhere in the repository
 and CI own several of them.
 
 Generated and internal files are skipped: ``docs/changelog.md`` (generated from
-commits), ``docs/superpowers/**`` (working plans), and ``.superpowers/**``.
+commits) and ``.superpowers/**``.
 
 Exit status is 0 only when every reference resolves. Findings print one per line so
 they can be read in a CI log.
@@ -29,7 +29,7 @@ GLOBAL_OPTIONS = frozenset({
 # short and explain each entry; it is not a place to hide a broken reference.
 DOCUMENTED_REMOVALS = frozenset({'license'})
 
-SKIP_PARTS = frozenset({'superpowers', '.superpowers'})
+SKIP_PARTS = frozenset({'.superpowers'})
 SKIP_FILES = frozenset({'changelog.md'})
 
 ENV_ROOTS = ('src', 'scripts', '.github', 'tests', 'benches', 'fuzz')
