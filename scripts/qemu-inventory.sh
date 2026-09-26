@@ -318,13 +318,17 @@ def run_probe(arguments, timeout=10):
     return result.stdout
 
 # Each attempt must pass: a transient crash must fail the row, not become a green retry.
+# ensurepip unpacks bundled wheels onto an emulated disk. Run 36204199869 (main
+# Fedora) saw a cold venv need >40s at attempt 2/5 on a loaded guest, which the
+# former 40s cap reported as a product FAIL. The allowance now covers slow
+# guest I/O; the SSH ceiling below still bounds the whole five-attempt probe.
 for attempt in range(1, 6):
     try:
         with tempfile.TemporaryDirectory(prefix='.qemu-python-', dir=base) as temporary:
             environment = pathlib.Path(temporary) / 'venv'
             venv.create(environment, with_pip=False)
             child = environment / 'bin/python'
-            run_probe([str(child), '-I', '-m', 'ensurepip', '--upgrade', '--default-pip'], timeout=40)
+            run_probe([str(child), '-I', '-m', 'ensurepip', '--upgrade', '--default-pip'], timeout=120)
             observed = run_probe([str(child), '-I', '-c', 'import json,sys; print(json.dumps([sys.version.split()[0],sys.prefix,sys.base_prefix]))'])
             child_version, prefix, base_prefix = json.loads(observed)
             assert child_version == version and pathlib.Path(prefix) == environment, 'venv identity mismatch'
@@ -961,8 +965,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
   if [[ "$case" == runtime-python-install ]]; then
     # Five venv probes can outlast the former single-probe deadline on a slow
-    # guest. The SSH ceiling includes the Python oracle's 150s plus cleanup.
-    budget=$((budget + 164))
+    # guest. The SSH ceiling includes the Python oracle's worst case: five
+    # attempts of (venv create + 120s ensurepip + probes) plus cleanup.
+    budget=$((budget + 660))
   elif [[ "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then
     budget=$((budget + 74))
   fi

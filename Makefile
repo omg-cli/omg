@@ -1,6 +1,6 @@
 # OMG Makefile - Development and Testing Targets
 
-.PHONY: help build release test test-lib check fmt fmt-check clippy clippy-strict clean bench bench-fast bench-hyperfine bench-hyperfine-fast bench-charts docker-debian docker-ubuntu docker-test docker-debian-shell docker-ubuntu-shell install audit dev dev-stop dev-check test-property test-fuzz test-fuzz-quick test-advanced test-security qa coverage tdd ci-workflow-quick ci-local-quick ci-local-full check-shell-syntax
+.PHONY: help build release test test-lib check fmt fmt-check clippy clippy-strict clean bench bench-fast bench-hyperfine bench-hyperfine-fast bench-charts docker-debian docker-ubuntu docker-test docker-debian-shell docker-ubuntu-shell install audit dev dev-stop dev-check test-property test-fuzz test-fuzz-quick test-advanced test-security qa coverage tdd ci-workflow-quick ci-local-quick ci-local-full check-shell-syntax debt-check debt-refresh
 
 # Default target - show help
 .DEFAULT_GOAL := help
@@ -275,6 +275,14 @@ check-shell-syntax:
 	@for script in install.sh benchmark-hyperfine.sh scripts/*.sh; do \
 		bash -n "$$script" || exit $$?; \
 	done
+
+# Debt ratchet: fails when per-file debt counts exceed the committed baseline.
+debt-check:
+	python3 scripts/debt-ratchet.py
+
+# Lower the ratchet floor after a cleanup; refuses to raise any count.
+debt-refresh:
+	python3 scripts/debt-ratchet.py --refresh
 
 # Hosted prerequisite: no compilation before independent platform jobs.
 ci-workflow-quick: check-shell-syntax
