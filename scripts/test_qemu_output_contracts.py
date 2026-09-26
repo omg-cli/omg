@@ -62,6 +62,7 @@ class OutputContracts(unittest.TestCase):
                          '  *) exit 2 ;;\n'
                          'esac\n'}
         preview = "printf '%s\\n' '  | Remove Preview' '    dry run' " \
+                  "'  → The following packages would be removed:' " \
                   "'    ✗ bash 5.3-1' '  ℹ No changes made (dry run)'\n"
         result, evidence, logs = self.run_inventory(preview, [row],
                                                      distro='fedora', native_commands=native)
@@ -69,6 +70,13 @@ class OutputContracts(unittest.TestCase):
                          f'{result.stdout}\n{result.stderr}\n{logs}')
         result, evidence, logs = self.run_inventory(
             preview.replace('bash 5.3-1', 'bash (feature-specific info unavailable)'),
+            [row], distro='fedora', native_commands=native)
+        self.assertEqual(evidence[0]['result'], 'FAIL',
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertIn('lacks the native installed bash version', logs['remove.log'])
+        result, evidence, logs = self.run_inventory(
+            preview.replace('✗ bash 5.3-1', '✗ bash 0.0-1')
+            + "printf '%s\\n' 'unrelated bash 5.3-1 diagnostic'\n",
             [row], distro='fedora', native_commands=native)
         self.assertEqual(evidence[0]['result'], 'FAIL',
                          f'{result.stdout}\n{result.stderr}\n{logs}')

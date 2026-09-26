@@ -279,6 +279,16 @@ native_installed_version() {
   esac
 }
 
+check_native_remove_preview() {
+  local output=$1 version=$2
+  awk -v version="$version" '
+    /The following .*packages would be removed:/ { in_list = 1; next }
+    /No changes made \(dry run\)/ { in_list = 0 }
+    in_list && $1 == "✗" && $2 == "bash" && $3 == version { found = 1 }
+    END { exit !found }
+  ' "$output"
+}
+
 prepare_native_apt_orphan() {
   local distro=$1
   check_native_tree_state "$distro" installed || return 1
@@ -1496,7 +1506,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
   remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_privacy_oracle); $(declare -f check_product_output)"
   if [[ "$assertions" == package-dry-run-* ]]; then
-    remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version)"
+    remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f check_native_remove_preview)"
   fi
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
@@ -1616,7 +1626,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
   if [[ "$assertions" == package-dry-run-* ]]; then
     if [[ "$assertions" != package-dry-run-install && "$assertions" != package-dry-run-recursive || "$assertions" == package-dry-run-recursive && "$distro" == arch ]]; then
-      remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! grep -Fq \"bash \$installed_version\" command.stdout.log; then printf 'assertion failed: remove preview lacks the native installed bash version\n' >&2; assertion=1; fi"
+      remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_native_remove_preview command.stdout.log \"\$installed_version\"; then printf 'assertion failed: remove preview lacks the native installed bash version\n' >&2; assertion=1; fi"
     fi
     remote+="; native_after=\$(native_package_snapshot '$distro') || { execution_phase=dependency; rc=2; assertion=1; printf 'assertion failed: native package after-state is unavailable\n' >&2; }"
     remote+="; if [[ \"\$execution_phase\" == product && \"\$native_before\" != \"\$native_after\" ]]; then printf 'assertion failed: dry run changed the native installed-package database\n' >&2; assertion=1; fi"
