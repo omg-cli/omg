@@ -88,6 +88,7 @@ BENCH_FILES = {
 # Admit these only at the transaction-trial root, never in cache/data/config.
 TRANSACTION_FILES = {
     "command.json", "expected-identity.tsv",
+    "transaction.stdout", "transaction.stderr",
     "omg-info-before.stdout", "omg-info-before.stderr",
     "native-info-before.stdout", "native-info-before.stderr",
     "omg-identity-before.tsv", "native-identity-before.tsv",

@@ -1,6 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
+# The one-shot transaction benchmark uses this mode for both OMG and the
+# native manager. Hyperfine's pipe output policy discards stderr, which hid
+# the command's actual failure in QEMU evidence. Keep both streams without
+# printing them into the measured terminal path, and preserve the exit code.
+if [[ "${1:-}" == --capture-transaction ]]; then
+    [[ $# -ge 4 ]] || exit 2
+    transaction_stdout=$2 transaction_stderr=$3
+    shift 3
+    exec "$@" >"$transaction_stdout" 2>"$transaction_stderr"
+fi
+
 # ============================================================================
 # OMG command measurements with Hyperfine
 # ============================================================================
@@ -434,7 +445,9 @@ if [[ "$GUEST_MODE" == true ]]; then
         # shellcheck disable=SC2024
         sudo -n cat /var/lib/omg/audit/audit.jsonl > "$EXPORT_DIR/audit-before.jsonl"
         cache_manifest before
-        printf -v transaction_command '%q ' "${transaction[@]}"
+        printf -v transaction_command '%q ' bash "$REPO_ROOT/benchmark-hyperfine.sh" \
+            --capture-transaction "$EXPORT_DIR/transaction.stdout" \
+            "$EXPORT_DIR/transaction.stderr" "${transaction[@]}"
         WARMUP=0 MIN_RUNS=1 MAX_RUNS=1
         measurement_rc=0
         # Retain the actual program exit even on failure; admission below remains strict.

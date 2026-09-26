@@ -128,6 +128,30 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertNotIn("unrelated private output", excerpt)
         self.assertLessEqual(len(excerpt.encode("utf-8")), 1400)
 
+    def test_failed_transaction_reports_measured_command_output(self):
+        row = dict(self.row(), case_id="qemu-fedora-lifecycle", distro="fedora",
+                   result="HARNESS_ERROR")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/results.json", json.dumps([row]))
+            archive.writestr("run-a/transactions/summary.json", json.dumps({
+                "results": [{"id": "install-native-001", "result": "FAIL"}],
+            }))
+            trial = "run-a/transactions/trials/install-native-001/"
+            archive.writestr(trial + "transaction-trial/transaction.stderr",
+                             "Error: failed to download tree from Fedora mirror\n")
+            archive.writestr(trial + "transaction-trial/transaction.stdout",
+                             "Updating and loading repositories\n")
+            archive.writestr(trial + "serial.log", "unrelated boot error\n")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        excerpt = diagnostics[(row["case_id"], "fedora")]
+        self.assertIn("install-native-001/transaction-trial/transaction.stderr", excerpt)
+        self.assertIn("failed to download tree", excerpt)
+        self.assertIn("Updating and loading repositories", excerpt)
+        self.assertNotIn("unrelated boot error", excerpt)
+        self.assertLessEqual(len(excerpt.encode("utf-8")), 1400)
+
     def test_malformed_clone_receipt_does_not_hide_lifecycle_failure(self):
         row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
         output = io.BytesIO()
