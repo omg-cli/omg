@@ -33105,7 +33105,7 @@
         }
       ]
     },
-    "9861796a840ec7c5ec66a060960e8342fc85b38cef7e58cc54fb325c2cb6bef0": {
+    "d500fe36743876a55a52778abfcd0d017c36f125a5b2e665fbed9675ffcedae1": {
       "releases": [],
       "cases": [
         {
@@ -34539,15 +34539,10 @@
         {
           "id": "doctor-network",
           "tiers": [
-            "network"
+            "container"
           ],
-          "allowed_skips": {
-            "arch": "declared-cli-shape-only",
-            "debian": "declared-cli-shape-only",
-            "ubuntu": "declared-cli-shape-only",
-            "fedora": "declared-cli-shape-only"
-          },
-          "network_scope": "network"
+          "allowed_skips": {},
+          "network_scope": "offline"
         },
         {
           "id": "doctor-eol",

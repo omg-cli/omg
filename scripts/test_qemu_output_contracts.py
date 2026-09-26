@@ -111,6 +111,41 @@ class OutputContracts(unittest.TestCase):
                 self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_doctor_network_requires_backend_probes_and_counted_failures(self):
+        row = ('doctor-network\t["doctor","--network"]\tcontrolled-error\t1\tpass\t-\t'
+               'container\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tdoctor-network-state\ttempdir-drop')
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            mirrors = ((('Arch Linux', 'https://archlinux.org'), ('Kernel.org', 'https://kernel.org'),
+                        ('GitHub', 'https://github.com'), ('AUR', 'https://aur.archlinux.org'))
+                       if distro == 'arch' else (('Kernel.org', 'https://kernel.org'),
+                                                ('GitHub', 'https://github.com')))
+            hosts = (('archlinux.org', 'aur.archlinux.org', 'github.com') if distro == 'arch'
+                     else ('kernel.org', 'github.com'))
+            mirror_lines = ''.join(f'  ✗ {name} (request failed for {url})\n' for name, url in mirrors)
+            dns_lines = f'    ✓ {hosts[0]} (2 addresses)\n'
+            dns_lines += ''.join(f'    ✗ {host} (resolver unavailable)\n' for host in hosts[1:])
+            correct = f'Network Diagnostics\n{mirror_lines}\n  DNS Resolution:\n{dns_lines}'
+            expected_count = 1 + len(mirrors) + len(hosts) - 1
+            variants = (
+                (correct, expected_count, 'PASS'),
+                (correct, expected_count - 1, 'FAIL'),
+                (correct.replace(f'  ✗ {mirrors[0][0]}', f'  ✓ {mirrors[0][0]}'), expected_count, 'FAIL'),
+                (correct.replace(mirrors[0][1], 'https://wrong.example'), expected_count, 'FAIL'),
+                (correct.replace(f'    ✗ {hosts[-1]}', '    ✗ wrong.example'), expected_count, 'FAIL'),
+            )
+            for output, count, expected in variants:
+                with self.subTest(distro=distro, expected=expected, count=count, output=output):
+                    product = (
+                        '[[ "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 ]] || exit 70\n'
+                        'if [[ "$2" != --network ]]; then echo "Error: doctor found 1 health issue(s)" >&2; exit 1; fi\n'
+                        + 'printf %s ' + shlex.quote(output) + '\n'
+                        + f'echo "Error: doctor found {count} health issue(s)" >&2\nexit 1\n'
+                    )
+                    result, evidence, logs = self.run_inventory(product, [row], tiers='container', distro=distro)
+                    self.assertEqual(evidence[0]['result'], expected, logs)
+                    self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_info_row_compares_version_and_source_to_native_catalog(self):
         row = ('info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass'
                '\tinfo-native-package\ttempdir-drop')

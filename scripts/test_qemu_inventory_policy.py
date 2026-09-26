@@ -100,6 +100,10 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(cases['update-turbo']['network_scope'], 'network')
         self.assertTrue(cases['update-turbo']['network_reason'])
         self.assertEqual(cases['daemon-foreground']['network_scope'], 'offline')
+        self.assertEqual(cases['doctor-network']['network_scope'], 'offline')
+        self.assertEqual(cases['doctor-network']['tiers'], ['container'])
+        self.assertEqual(cases['doctor-network']['allowed_skips'], {})
+        self.assertIn('container', rules['profiles']['hermetic,container'])
         for inventory in rules["inventories"].values():
             cases = {case["id"]: case for case in inventory["cases"]}
             for identity in ("doctor", "update", "runtime-python-install", "container-list"):

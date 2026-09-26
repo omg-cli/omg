@@ -655,19 +655,55 @@ check_runtime_uninstall() {
     printf 'assertion failed: runtime uninstall did not remove only the inactive version\n' >&2; return 1
   fi
 }
-check_doctor_eol_delta() {
-  local baseline_rc=$1 baseline_out=$2 baseline_err=$3 eol_rc=$4 eol_err=$5
-  local baseline_count eol_count
+check_doctor_issue_delta() {
+  local baseline_rc=$1 baseline_out=$2 baseline_err=$3 variant_rc=$4 variant_err=$5 expected_delta=$6
+  local baseline_count variant_count
   baseline_count=$(sed -nE 's/^Error: doctor found ([0-9]+) health issue\(s\)$/\1/p' "$baseline_err")
-  eol_count=$(sed -nE 's/^Error: doctor found ([0-9]+) health issue\(s\)$/\1/p' "$eol_err")
+  variant_count=$(sed -nE 's/^Error: doctor found ([0-9]+) health issue\(s\)$/\1/p' "$variant_err")
   if [[ "$baseline_rc" == 0 ]]; then
     [[ -z "$baseline_count" ]] && grep -Fq 'System is healthy' "$baseline_out" || return 1
     baseline_count=0
   elif [[ "$baseline_rc" != 1 || ! "$baseline_count" =~ ^[1-9][0-9]*$ ]]; then
     return 1
   fi
-  [[ "$eol_rc" == 1 && "$eol_count" =~ ^[1-9][0-9]*$ ]] || return 1
-  (( eol_count == baseline_count + 1 ))
+  [[ "$variant_rc" == 1 && "$variant_count" =~ ^[1-9][0-9]*$ ]] || return 1
+  (( variant_count == baseline_count + expected_delta ))
+}
+check_doctor_network_output() {
+  python3 - "$1" "$2" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+distro, output = sys.argv[1:]
+mirrors = [('Arch Linux', 'https://archlinux.org'), ('Kernel.org', 'https://kernel.org'),
+           ('GitHub', 'https://github.com'), ('AUR', 'https://aur.archlinux.org')]
+if distro != 'arch':
+    mirrors = mirrors[1:3]
+hosts = ['archlinux.org', 'aur.archlinux.org', 'github.com'] if distro == 'arch' else ['kernel.org', 'github.com']
+if distro not in ('arch', 'debian', 'ubuntu', 'fedora'):
+    raise SystemExit('assertion failed: unknown doctor network backend')
+text = Path(output).read_text()
+if text.count('Network Diagnostics\n') != 1 or text.count('DNS Resolution:\n') != 1:
+    raise SystemExit('assertion failed: missing or duplicated doctor network sections')
+section = text.split('Network Diagnostics\n', 1)[1].split('DNS Resolution:\n', 1)
+mirror_rows = [re.fullmatch(r'  ([✓✗⚠]) (.+?) \((.+)\)', line) for line in section[0].splitlines() if line.strip()]
+dns_rows = [re.fullmatch(r'    ([✓✗]) (\S+) \((.+)\)', line) for line in section[1].splitlines() if line.startswith('    ')]
+if any(row is None for row in mirror_rows + dns_rows):
+    raise SystemExit('assertion failed: malformed doctor network row')
+if [(row[1], row[2]) for row in mirror_rows] != [('✗', name) for name, _ in mirrors]:
+    raise SystemExit('assertion failed: wrong or successful backend mirror probe')
+for row, (_, url) in zip(mirror_rows, mirrors):
+    if row[3] != 'timeout' and url not in row[3]:
+        raise SystemExit('assertion failed: backend mirror failure lacks its requested URL')
+if [row[2] for row in dns_rows] != hosts:
+    raise SystemExit('assertion failed: wrong or missing backend DNS probe')
+for row in dns_rows:
+    if row[1] == '✓' and not re.fullmatch(r'[1-9][0-9]* addresses', row[3]):
+        raise SystemExit('assertion failed: DNS success lacks resolved addresses')
+dns_failures = sum(row[1] == '✗' for row in dns_rows)
+print(len(mirrors) + dns_failures)
+PY
 }
 check_runtime_state() {
   local runtime=$1 selected=$2 active=$3 assertion=$4 output=$5 base current
@@ -753,6 +789,11 @@ check_product_output() {
       || ! grep -Fxq '  ✓ python 3.12.14' "$stdout" \
       || grep -Eq 'No managed runtimes were detected|All detected runtimes are within support period' "$stdout"; then
       printf 'assertion failed: doctor EOL did not classify both confined runtimes\n' >&2; return 1
+    fi
+  fi
+  if [[ "$assertion" == doctor-network-state ]]; then
+    if [[ "$code" != 1 ]] || ! grep -Fxq 'Network Diagnostics' "$stdout"; then
+      printf 'assertion failed: doctor network did not report a failed diagnostic run\n' >&2; return 1
     fi
   fi
   if [[ "$code" == 0 ]]; then
@@ -1045,7 +1086,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
   case "$id" in
     snapshot-create|migrate-export|migrate-import|env-capture|env-check|team-status|team-push|team-pull)
       [[ "$a" == "fingerprint:$id" ]] || exit 2 ;;
@@ -1107,6 +1148,12 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     [[ "$a" == doctor-eol-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == container ]] || exit 2
     jq -e '. == ["doctor", "--eol"]' <<< "$aj" >/dev/null || exit 2
   elif [[ "$a" == doctor-eol-state ]]; then
+    exit 2
+  fi
+  if [[ "$id" == doctor-network ]]; then
+    [[ "$a" == doctor-network-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == container ]] || exit 2
+    jq -e '. == ["doctor", "--network"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == doctor-network-state ]]; then
     exit 2
   fi
   if [[ "$id" == info ]]; then
@@ -1266,7 +1313,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == doctor-eol-state ]]; then
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: doctor EOL fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/eol-config\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/eol-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
     remote+="; mkdir -p \"\$OMG_DATA_DIR/versions/node/16.20.2\" \"\$OMG_DATA_DIR/versions/python/3.12.14\"; ln -s 16.20.2 \"\$OMG_DATA_DIR/versions/node/current\"; ln -s 3.12.14 \"\$OMG_DATA_DIR/versions/python/current\""
-    remote+="; $(declare -f check_doctor_eol_delta)"
+    remote+="; $(declare -f check_doctor_issue_delta)"
+  fi
+  if [[ "$assertions" == doctor-network-state ]]; then
+    remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: doctor network fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/network-config\" OMG_DATA_DIR=\"\$rowdir/network-data\" OMG_CACHE_DIR=\"\$rowdir/network-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
+    remote+="; $(declare -f check_doctor_issue_delta); $(declare -f check_doctor_network_output)"
   fi
   if [[ "$case" == config-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/config\""
@@ -1327,7 +1378,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # the normal installed-hook oracle must observe real replacement.
     remote+="; for hook in pre-commit post-checkout post-merge; do printf '#!/bin/sh\\n# user-owned hook fixture\\nexit 23\\n' > \".git/hooks/\$hook\"; chmod 640 \".git/hooks/\$hook\"; done"
   fi
-  if [[ "$assertions" == doctor-eol-state ]]; then
+  if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state ]]; then
     remote+="; run_omg '$row_timeout' $quoted_binary doctor > doctor.baseline.stdout.log 2> doctor.baseline.stderr.log; baseline_rc=\$rc; baseline_phase=\$execution_phase"
     remote+="; cat doctor.baseline.stdout.log doctor.baseline.stderr.log >&2"
   fi
@@ -1404,7 +1455,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
   if [[ "$assertions" == doctor-eol-state ]]; then
-    remote+="; if [[ \"\$baseline_phase\" != product ]] || ! check_doctor_eol_delta \"\$baseline_rc\" doctor.baseline.stdout.log doctor.baseline.stderr.log \"\$rc\" command.stderr.log; then printf 'assertion failed: doctor EOL did not add exactly one health issue over its baseline\n' >&2; assertion=1; fi"
+    remote+="; if [[ \"\$baseline_phase\" != product ]] || ! check_doctor_issue_delta \"\$baseline_rc\" doctor.baseline.stdout.log doctor.baseline.stderr.log \"\$rc\" command.stderr.log 1; then printf 'assertion failed: doctor EOL did not add exactly one health issue over its baseline\n' >&2; assertion=1; fi"
+  fi
+  if [[ "$assertions" == doctor-network-state ]]; then
+    remote+="; expected_network_delta=\$(check_doctor_network_output '$distro' command.stdout.log) || assertion=1"
+    remote+="; if [[ \"\$baseline_phase\" != product || \"\$assertion\" != 0 ]] || ! check_doctor_issue_delta \"\$baseline_rc\" doctor.baseline.stdout.log doctor.baseline.stderr.log \"\$rc\" command.stderr.log \"\$expected_network_delta\"; then printf 'assertion failed: doctor network issue count did not match failed probes\n' >&2; assertion=1; fi"
   fi
   if [[ "$distro" == fedora && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; if [[ \"\$rc\" == 120 ]] && grep -Fq 'OMG_QEMU_FIXTURE_SETUP_FAILED' command.stderr.log; then execution_phase=dependency; fi"
@@ -1470,7 +1525,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   start_centis=${uptime/./}
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
-  if [[ "$assertions" == doctor-eol-state ]]; then budget=$((budget + row_timeout + 5)); fi
+  if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == outdated-native-count || "$assertions" == outdated-json-native-count ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == status-native-fast ]]; then budget=$((budget + 64)); fi
