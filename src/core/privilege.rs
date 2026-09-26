@@ -467,7 +467,7 @@ pub async fn run_privileged_program(program: &str, args: &[&str]) -> anyhow::Res
     if status.success() {
         Ok(())
     } else {
-        Err(describe_program_failure(program, &status))
+        Err(describe_program_failure(program, status))
     }
 }
 
@@ -480,7 +480,7 @@ pub async fn run_privileged_program(program: &str, args: &[&str]) -> anyhow::Res
 /// signal that actually ended it. Evidence: Fedora lane 36204199869 reported
 /// only `dnf failed with exit code 1` while the transaction row stayed in
 /// libdnf5's `STARTED` state, i.e. the run was interrupted rather than refused.
-fn describe_program_failure(program: &str, status: &std::process::ExitStatus) -> anyhow::Error {
+fn describe_program_failure(program: &str, status: std::process::ExitStatus) -> anyhow::Error {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -1153,12 +1153,12 @@ mod tests {
         // high byte (std::os::unix::process::ExitStatusExt::from_raw).
         let killed = std::process::ExitStatus::from_raw(9);
         assert_eq!(
-            super::describe_program_failure("dnf", &killed).to_string(),
+            super::describe_program_failure("dnf", killed).to_string(),
             "dnf was terminated by signal 9"
         );
         let failed = std::process::ExitStatus::from_raw(1 << 8);
         assert_eq!(
-            super::describe_program_failure("dnf", &failed).to_string(),
+            super::describe_program_failure("dnf", failed).to_string(),
             "dnf failed with exit code 1"
         );
     }
