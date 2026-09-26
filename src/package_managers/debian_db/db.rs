@@ -29,6 +29,7 @@ use std::sync::RwLock;
 
 use crate::core::paths;
 use crate::core::{Package, PackageSource};
+use crate::runtimes::common::{BudgetedWriter, decode_xz_to};
 
 /// TTL for cache eviction safety net (30 minutes)
 const CACHE_TTL_SECS: u64 = 30 * 60;
@@ -1052,9 +1053,9 @@ fn read_packages_file_content(path: &Path) -> Result<String> {
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("xz"))
     {
-        let mut decompressed = Vec::new();
-        lzma_rs::xz_decompress(&mut reader, &mut decompressed)?;
-        buf = String::from_utf8(decompressed)
+        let mut decompressed = BudgetedWriter::new(Vec::new(), MAX_INDEX_SNAPSHOT_BYTES);
+        decode_xz_to(&mut reader, &mut decompressed)?;
+        buf = String::from_utf8(decompressed.into_inner())
             .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in xz-compressed Packages file: {e}"))?;
     } else {
         reader.read_to_string(&mut buf)?;
@@ -3879,6 +3880,20 @@ mod tests {
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].name, "vim");
         assert_eq!(packages[1].name, "bash");
+    }
+
+    #[test]
+    fn parse_packages_file_sync_accepts_sha256_checked_xz() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("fixture_Packages.xz");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../tests/data/xz-subset/apt-packages-sha256.xz"),
+        )
+        .expect("write APT Packages index");
+        let packages = parse_packages_file_sync(&path).expect("decode SHA-256 checked index");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "fixture");
     }
 
     #[test]

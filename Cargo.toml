@@ -155,7 +155,7 @@ zip = { version = "8.1.0", default-features = false, features = [
   "deflate",
   "time",
 ] }
-lzma-rs = "0.3" # Pure Rust XZ/LZMA (replaces xz2)
+lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", "xz"] }
 regex = "1.12.2"
 ruzstd = "0.9.0" # Pure Rust zstd decoder (replaces zstd)
 
@@ -300,6 +300,7 @@ rusqlite = { version = "0.40", features = [
 cvss = "2.2.0"
 
 [dev-dependencies]
+lzma-rs = "0.3" # Test-only XZ encoder for synthetic archives.
 tokio = { version = "1.49", features = ["test-util"] }
 rcgen = "=0.13.2"
 criterion = { version = "0.8", features = ["html_reports"] }
