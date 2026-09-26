@@ -149,6 +149,49 @@ class OutputContracts(unittest.TestCase):
                     self.assertIn('assertion failed: runtime usage', logs['runtime-node-install.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_config_rows_require_private_persisted_state(self):
+        rows = [
+            'config-set\t["config","set","telemetry.enabled","true"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\tconfig-set-persisted\ttempdir-drop',
+            'config-get\t["config","get","telemetry.enabled"]\tread\t0\tpass\tconfig-set\thermetic\thermetic:pass\tconfig-get-persisted\ttempdir-drop',
+            'config-list\t["config","list"]\tread\t0\tpass\tconfig-set\thermetic\thermetic:pass\tconfig-list-persisted\ttempdir-drop',
+            'config-validate\t["config","validate"]\tread\t0\tpass\tconfig-set\thermetic\thermetic:pass\tconfig-validate-persisted\ttempdir-drop',
+            'config-path\t["config","path"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tconfig-path-isolated\ttempdir-drop',
+            'config-reset\t["config","reset","--yes"]\tisolated-write\t0\tpass\tconfig-set\thermetic\thermetic:pass\tconfig-reset-defaults\ttempdir-drop',
+        ]
+        product = r'''file="$OMG_CONFIG_DIR/config.toml"
+case "$1:$2" in
+  config:set) mkdir -p "$OMG_CONFIG_DIR"; printf 'telemetry_enabled = true\n' > "$file"; echo 'Set telemetry.enabled = true' ;;
+  config:get) echo true ;;
+  config:list) echo 'telemetry.enabled = true' ;;
+  config:validate) echo 'Configuration is valid!' ;;
+  config:path) printf '%s\n' "$file" ;;
+  config:reset) cp "$file" "$file.backup"; printf 'telemetry_enabled = false\n' > "$file"; echo 'Configuration reset to defaults' ;;
+  *) exit 77 ;;
+esac
+'''
+        result, evidence, logs = self.run_inventory(product, rows)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows), logs)
+
+        faults = (
+            ("printf 'telemetry_enabled = true\\n' > \"$file\"", ':', 'config-set'),
+            ("printf 'telemetry_enabled = true\\n' > \"$file\"", "printf 'telemetry_enabled = true\\ntelemetry_enabled=false\\n' > \"$file\"", 'config-set'),
+            ('config:get) echo true', 'config:get) echo false', 'config-get'),
+            ("config:list) echo 'telemetry.enabled = true'", "config:list) echo 'telemetry.enabled = false'", 'config-list'),
+            ("config:validate) echo 'Configuration is valid!'", "config:validate) echo 'Validation skipped'", 'config-validate'),
+            ("config:path) printf '%s\\n' \"$file\"", 'config:path) echo /tmp/wrong', 'config-path'),
+            ("printf 'telemetry_enabled = false\\n' > \"$file\"", "printf 'telemetry_enabled = true\\n' > \"$file\"", 'config-reset'),
+        )
+        for old, new, case in faults:
+            with self.subTest(case=case):
+                self.assertIn(old, product)
+                result, evidence, logs = self.run_inventory(product.replace(old, new, 1), rows)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                observed = {row['case_id'].removeprefix('qemu-arch-'): row['result'] for row in evidence}
+                self.assertEqual(observed[case], 'FAIL', logs)
+                self.assertIn('assertion failed: config', logs[case + '.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_counter_rows_require_native_counts_and_block_failed_references(self):
         cases = {'ec': 'explicit-shortcut', 'tc': 'total-shortcut',
                  'oc': 'orphan-shortcut', 'uc': 'updates-shortcut'}
