@@ -4,6 +4,7 @@ on:
   workflow_run:
     workflows: [QEMU Matrix, CI]
     types: [completed]
+    branches: [main]
 
 permissions: {}
 
@@ -13,9 +14,9 @@ concurrency:
 
 jobs:
   report:
-    # workflow_run has secrets and a write token. Never let pull-request
-    # artifacts drive this privileged reporter, even though they are parsed.
-    if: github.event.workflow_run.event != 'pull_request' && (github.event.workflow_run.name == 'QEMU Matrix' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'))
+    # workflow_run has secrets and a write token. Only default-branch runs
+    # may file issues; feature-branch dispatches retain their Actions evidence.
+    if: github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event != 'pull_request' && (github.event.workflow_run.name == 'QEMU Matrix' || github.event.workflow_run.event == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
