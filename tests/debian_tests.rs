@@ -230,6 +230,51 @@ mod apt_integration {
         );
     }
 
+    #[cfg(feature = "debian")]
+    #[test]
+    fn test_native_search_uses_apt_candidate() {
+        let candidate = native_candidate("apt");
+        let output = native_info(&["search", "apt", "--json", "--no-aur", "--limit", "3"]);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&output.stdout).expect("search returns a JSON array");
+        let row = rows
+            .iter()
+            .find(|row| row["name"] == "apt")
+            .expect("native search must include the exact apt package");
+        assert_eq!(row["version"], candidate, "{rows:?}");
+    }
+
+    #[cfg(feature = "debian")]
+    #[test]
+    fn test_native_install_preview_matches_apt_simulation() {
+        let native = std::process::Command::new("apt-get")
+            .args(["-s", "install", "--", "apt"])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("simulate native APT install");
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let expected = String::from_utf8(native.stdout).expect("APT simulation is UTF-8");
+        assert!(
+            !expected.trim().is_empty(),
+            "APT simulation produced no plan"
+        );
+
+        let output = native_info(&["install", "--dry-run", "apt"]);
+        let actual = String::from_utf8(output.stdout).expect("OMG preview is UTF-8");
+        assert!(
+            actual.contains(expected.trim()),
+            "OMG preview disagrees with native APT simulation\nexpected:\n{expected}\nactual:\n{actual}"
+        );
+        assert!(
+            actual.contains("No changes will be made (dry run)"),
+            "{actual}"
+        );
+    }
+
     #[test]
     fn test_info_nonexistent_package() {
         // Contract (src/cli/packages/info.rs): an unknown package must fail
