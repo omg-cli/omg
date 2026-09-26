@@ -92,6 +92,13 @@ async fn remove_packages(packages: &[String], recursive: bool) -> Result<()> {
     reason = "backend feature dispatch may select fallible implementations"
 )]
 #[cfg_attr(
+    any(feature = "arch", feature = "debian", feature = "debian-pure"),
+    allow(
+        clippy::unused_async,
+        reason = "the generic backend awaits native package lookup; selected native backends preview synchronously"
+    )
+)]
+#[cfg_attr(
     not(feature = "arch"),
     allow(
         unused_variables,
