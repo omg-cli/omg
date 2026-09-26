@@ -1478,7 +1478,6 @@
       "surface": "omg env capture",
       "platforms": [
         "portable",
-        "fedora",
         "macos"
       ],
       "requires": [
