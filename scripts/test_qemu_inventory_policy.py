@@ -138,6 +138,10 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(len(cases), len(content.splitlines()) - 1)
         self.assertEqual(len({case["id"] for case in cases}), len(cases))
         by_id = {case["id"]: case for case in cases}
+        self.assertEqual(by_id["doctor-eol"], {
+            "id": "doctor-eol", "tiers": ["container"],
+            "allowed_skips": {}, "network_scope": "offline",
+        })
         for runtime in ("node", "python", "go"):
             with self.subTest(runtime=runtime):
                 self.assertEqual(by_id[f"runtime-{runtime}-uninstall"], {
@@ -152,6 +156,7 @@ class PolicyTests(unittest.TestCase):
                     })
         workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
         self.assertEqual(workflow.count("--inventory-policy tests/qemu-inventory-policy.json"), 2)
+        self.assertIn('--inventory-tiers "hermetic,container"', workflow)
 
 
 if __name__ == "__main__":
