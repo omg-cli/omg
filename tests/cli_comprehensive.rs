@@ -582,6 +582,12 @@ enum Assertion {
     OutdatedJsonNativeCount,
     DoctorNativeBackend,
     InfoNativePackage,
+    ConfigSetPersisted,
+    ConfigGetPersisted,
+    ConfigListPersisted,
+    ConfigValidatePersisted,
+    ConfigPathIsolated,
+    ConfigResetDefaults,
 }
 
 impl Assertion {
@@ -613,6 +619,12 @@ impl Assertion {
             "outdated-json-native-count" => Self::OutdatedJsonNativeCount,
             "doctor-native-backend" => Self::DoctorNativeBackend,
             "info-native-package" => Self::InfoNativePackage,
+            "config-set-persisted" => Self::ConfigSetPersisted,
+            "config-get-persisted" => Self::ConfigGetPersisted,
+            "config-list-persisted" => Self::ConfigListPersisted,
+            "config-validate-persisted" => Self::ConfigValidatePersisted,
+            "config-path-isolated" => Self::ConfigPathIsolated,
+            "config-reset-defaults" => Self::ConfigResetDefaults,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(

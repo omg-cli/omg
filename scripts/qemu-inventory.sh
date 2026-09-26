@@ -543,6 +543,53 @@ check_hook_lifecycle() (
   [[ $(cat omg.lock) == changed ]] || exit 1
   expect_notice no 'Environment changed after merge' merge --ff-only changed || exit 1
 )
+check_config_value() {
+  local file=$1 expected=$2
+  [[ -f "$file" && ! -L "$file" ]] \
+    && [[ $(grep -Ec '^[[:space:]]*telemetry_enabled[[:space:]]*=' "$file") == 1 ]] \
+    && grep -Fxq "telemetry_enabled = $expected" "$file"
+}
+check_config_oracle() {
+  local assertion=$1 output=$2 config_file backup
+  [[ -n "${OMG_CONFIG_DIR:-}" && "${OMG_CONFIG_DIR:-}" == "$rowdir/config" ]] || {
+    printf 'assertion failed: config row escaped its private directory\n' >&2; return 1
+  }
+  config_file="$OMG_CONFIG_DIR/config.toml"
+  backup="$config_file.backup"
+  case "$assertion" in
+    config-set-persisted)
+      check_config_value "$config_file" true \
+        && grep -Fq 'Set telemetry.enabled = true' "$output" || {
+          printf 'assertion failed: config set did not persist true in private config\n' >&2; return 1
+        } ;;
+    config-get-persisted)
+      check_config_value "$config_file" true \
+        && [[ $(cat "$output") == true ]] || {
+          printf 'assertion failed: config get disagrees with persisted true\n' >&2; return 1
+        } ;;
+    config-list-persisted)
+      check_config_value "$config_file" true \
+        && grep -Eq '^[[:space:]]*telemetry.enabled = true$' "$output" || {
+          printf 'assertion failed: config list omits persisted telemetry value\n' >&2; return 1
+        } ;;
+    config-validate-persisted)
+      check_config_value "$config_file" true \
+        && grep -Fq 'Configuration is valid!' "$output" || {
+          printf 'assertion failed: config validate did not check persisted config\n' >&2; return 1
+        } ;;
+    config-path-isolated)
+      [[ $(cat "$output") == "$config_file" && ! -e "$config_file" && ! -L "$config_file" ]] || {
+        printf 'assertion failed: config path did not name the private config file\n' >&2; return 1
+      } ;;
+    config-reset-defaults)
+      check_config_value "$config_file" false \
+        && check_config_value "$backup" true \
+        && grep -Fq 'Configuration reset to defaults' "$output" || {
+          printf 'assertion failed: config reset did not restore defaults and retain backup\n' >&2; return 1
+        } ;;
+    *) return 2 ;;
+  esac
+}
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
   if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
@@ -594,6 +641,8 @@ check_product_output() {
   fi
   if [[ "$code" == 0 ]]; then
     case "$assertion" in
+      config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults)
+        check_config_oracle "$assertion" "$stdout" || return 1 ;;
       hooks-installed|hooks-absent)
         local hook label hook_path
         for hook in pre-commit post-checkout post-merge; do
@@ -871,7 +920,22 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults) ;; *) exit 2 ;; esac
+  case "$id" in
+    config-set)
+      [[ "$a" == config-set-persisted ]] && jq -e '. == ["config","set","telemetry.enabled","true"]' <<< "$aj" >/dev/null || exit 2 ;;
+    config-get)
+      [[ "$a" == config-get-persisted && "$r" == config-set ]] && jq -e '. == ["config","get","telemetry.enabled"]' <<< "$aj" >/dev/null || exit 2 ;;
+    config-list)
+      [[ "$a" == config-list-persisted && "$r" == config-set ]] && jq -e '. == ["config","list"]' <<< "$aj" >/dev/null || exit 2 ;;
+    config-validate)
+      [[ "$a" == config-validate-persisted && "$r" == config-set ]] && jq -e '. == ["config","validate"]' <<< "$aj" >/dev/null || exit 2 ;;
+    config-path)
+      [[ "$a" == config-path-isolated ]] && jq -e '. == ["config","path"]' <<< "$aj" >/dev/null || exit 2 ;;
+    config-reset)
+      [[ "$a" == config-reset-defaults && "$r" == config-set ]] && jq -e '. == ["config","reset","--yes"]' <<< "$aj" >/dev/null || exit 2 ;;
+    *) [[ "$a" != config-* ]] || exit 2 ;;
+  esac
   if [[ "$id" == doctor ]]; then
     [[ "$a" == doctor-native-backend ]] || exit 2
     jq -e '. == ["doctor"]' <<< "$aj" >/dev/null || exit 2
@@ -1029,6 +1093,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
   remote="set -eu; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
+  if [[ "$case" == config-* ]]; then
+    remote+="; export OMG_CONFIG_DIR=\"\$rowdir/config\""
+  fi
   remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n' > Makefile"
   if [[ "$assertions" == audit-source-failure || "$assertions" == sbom-source-failure ]]; then
     # DNF5 can satisfy an offline advisory query from a previous row's cache.
@@ -1040,7 +1107,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote+="; printf '%s' $overlap_fixture > workspace-overlap.sh"
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
-  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_product_output)"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_product_output)"
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')
