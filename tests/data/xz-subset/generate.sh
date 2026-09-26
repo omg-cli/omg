@@ -1,14 +1,8 @@
 #!/usr/bin/env bash
 # Regenerate the XZ variants used by
-# `src/runtimes/common.rs::supported_xz_stream_variants_decode`. The fixtures
-# exist to pin what the pure-Rust decoder (lzma-rs) can and cannot read:
-#
-#   * lzma-rs implements "a subset of the .xz file format"
-#     (https://github.com/gendx/lzma-rs) and its changelog records the limitation
-#     "Return an error instead of panicking on unsupported SHA-256 checksum for XZ
-#     decoding" (CHANGELOG 0.1.3, upstream PR #40). 0.3.0 (2023-01-04) is still the
-#     newest published version (crates.io max_version), so SHA-256 streams remain
-#     unreadable.
+# `src/runtimes/common.rs::xz_stream_variants_decode_through_the_extraction_path`.
+# The fixtures pin single/multi-block decoding and integrity checks with the
+# system XZ encoder; SHA-256 streams must now decode and verify successfully.
 #
 # Run from anywhere; it writes next to itself:
 #   bash tests/data/xz-subset/generate.sh
@@ -34,7 +28,7 @@ xz -0 -k -c payload.tar > "$dest/single-block-crc64.tar.xz"
 xz -0 --check=none -k -c payload.tar > "$dest/single-block-none.tar.xz"
 # Many small blocks with CRC64: exercises the block loop, not the check type.
 xz -0 --block-size=4KiB -k -c payload.tar > "$dest/multi-block-crc64.tar.xz"
-# SHA-256 checked streams: documented as unsupported by lzma-rs 0.3.0.
+# SHA-256 checked streams exercise the decoder's full integrity-check path.
 xz -0 --check=sha256 -k -c payload.tar > "$dest/single-block-sha256.tar.xz"
 xz -0 --block-size=4KiB --check=sha256 -k -c payload.tar > "$dest/multi-block-sha256.tar.xz"
 

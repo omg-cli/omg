@@ -5,7 +5,7 @@
 use crate::core::http::BoundedResponseExt;
 use std::cmp::Ordering;
 use std::fs::{self, File};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -191,10 +191,8 @@ impl<R: Read> Read for BudgetedReader<R> {
 
 /// In-memory sink that refuses to grow past a decompressed-size budget.
 ///
-/// Used with compressors that only expose a `Read -> Write` API (xz), where a
-/// budgeted reader is not available: the sink errors as soon as the budget is
-/// exhausted, so the backing buffer stops growing at the cap instead of after
-/// decompression has completed.
+/// The sink errors as soon as the budget is exhausted, so decompression stops
+/// before the backing file or buffer can grow past the cap.
 pub(crate) struct BudgetedWriter<W> {
     inner: W,
     written: u64,
@@ -234,6 +232,15 @@ impl<W: Write> Write for BudgetedWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+/// Decode the entire XZ stream before trusting its tar entries. Draining the
+/// reader verifies block checks and the footer even when the caller needs only
+/// a subset of archive members. Bound decoder memory independently of output.
+pub(crate) fn decode_xz_to<R: Read, W: Write>(input: R, output: &mut W) -> io::Result<u64> {
+    const DECODER_MEMORY_KIB: u32 = 256 * 1024;
+    let mut decoder = lzma_rust2::XzReader::new_mem_limit(input, true, DECODER_MEMORY_KIB);
+    io::copy(&mut decoder, output)
 }
 
 #[cfg_attr(
@@ -911,8 +918,7 @@ fn archive_identity(archive_path: &Path) -> (u64, String) {
 /// Synchronously extract selected entries from a .tar.xz component archive
 /// with a bounded decompression budget.
 ///
-/// lzma-rs exposes a `Read -> Write` API rather than a streaming decoder, so
-/// the bounded output is kept in a same-filesystem temporary file: a valid
+/// The bounded output is kept in a same-filesystem temporary file: a valid
 /// archive never needs its whole decompressed tar payload on the heap, and an
 /// over-budget archive aborts before any output is published. Also backs
 /// whole-runtime extraction: [`extract_tar_xz`] calls this with the default
@@ -937,7 +943,7 @@ pub(crate) fn extract_component_tar_xz(
         )
     })?;
     let mut output = BudgetedWriter::new(output, budget);
-    if let Err(error) = lzma_rs::xz_decompress(&mut BufReader::new(file), &mut output) {
+    if let Err(error) = decode_xz_to(BufReader::new(file), &mut output) {
         // A digest-verified archive that later fails to decode means either the
         // bytes changed after verification or the decoder hit input it cannot
         // represent. Sizes and digests make that decidable from the log alone;
@@ -2747,15 +2753,11 @@ mod tests {
         Ok(())
     }
 
-    /// lzma-rs readme: "It already supports LZMA, LZMA2 and a subset of the .xz
-    /// file format" (<https://github.com/gendx/lzma-rs>). These fixtures come from
-    /// the system `xz` encoder, so the supported variants stay pinned: a single
-    /// block, thirteen blocks, and both a CRC64 stream and one without an
-    /// integrity check. They run through the same extraction function the runtimes
-    /// call, which is what an install actually does.
+    /// System-encoded fixtures exercise single and multi-block streams with
+    /// no check, CRC64, and SHA-256 through the runtime extraction path.
     #[test]
-    fn supported_xz_stream_variants_decode_through_the_extraction_path() {
-        let fixtures: [(&str, &[u8]); 3] = [
+    fn xz_stream_variants_decode_through_the_extraction_path() {
+        let fixtures: [(&str, &[u8]); 5] = [
             (
                 "single-block/crc64",
                 include_bytes!("../../tests/data/xz-subset/single-block-crc64.tar.xz"),
@@ -2767,6 +2769,14 @@ mod tests {
             (
                 "multi-block/crc64",
                 include_bytes!("../../tests/data/xz-subset/multi-block-crc64.tar.xz"),
+            ),
+            (
+                "single-block/sha256",
+                include_bytes!("../../tests/data/xz-subset/single-block-sha256.tar.xz"),
+            ),
+            (
+                "multi-block/sha256",
+                include_bytes!("../../tests/data/xz-subset/multi-block-sha256.tar.xz"),
             ),
         ];
         for (label, bytes) in fixtures {
@@ -2796,50 +2806,29 @@ mod tests {
         }
     }
 
-    /// SHA-256 checked streams are documented as unsupported upstream ("Return an
-    /// error instead of panicking on unsupported SHA-256 checksum for XZ decoding",
-    /// lzma-rs CHANGELOG 0.1.3 / upstream PR #40; 0.3.0 is still the newest
-    /// published version on crates.io). The failure must therefore be a *precise*
-    /// one that names the cause and carries the archive identity, so an install
-    /// failure is diagnosable without a guest session. If upstream ever implements
-    /// SHA-256, this test fails on purpose and the support statement is revisited.
+    /// A corrupt SHA-256 check must fail before any tar entry is published.
     #[test]
-    fn sha256_checked_xz_streams_fail_with_the_identity_diagnostic() {
-        let fixtures: [(&str, &[u8]); 2] = [
-            (
-                "single-block/sha256",
-                include_bytes!("../../tests/data/xz-subset/single-block-sha256.tar.xz"),
-            ),
-            (
-                "multi-block/sha256",
-                include_bytes!("../../tests/data/xz-subset/multi-block-sha256.tar.xz"),
-            ),
-        ];
-        for (label, bytes) in fixtures {
-            let temp = TempDir::new().expect("fixture directory");
-            let archive_path = temp.path().join("variant.tar.xz");
-            fs::write(&archive_path, bytes).expect("write fixture");
-            let select = |path: &Path| -> Result<Option<PathBuf>> { Ok(Some(path.to_path_buf())) };
-            let error = extract_component_tar_xz(
-                &archive_path,
-                &temp.path().join("out"),
-                MAX_DECOMPRESSED_BYTES,
-                &select,
-            )
-            .expect_err("SHA-256 checked streams are not decodable by lzma-rs 0.3.0");
-            let message = format!("{error:#}");
-            assert!(
-                message.contains("Failed to decompress XZ archive"),
-                "{label}: {message}"
-            );
-            assert!(
-                message.contains("Unsupported SHA-256 checksum"),
-                "{label}: {message}"
-            );
-            assert!(message.contains("bytes="), "{label}: {message}");
-            assert!(message.contains("sha256="), "{label}: {message}");
-            assert!(message.contains("variant.tar.xz"), "{label}: {message}");
-        }
+    fn corrupt_xz_sha256_check_is_rejected_before_tar_extraction() {
+        let mut bytes =
+            include_bytes!("../../tests/data/xz-subset/single-block-sha256.tar.xz").to_vec();
+        let check_byte = bytes.len() - 32;
+        bytes[check_byte] ^= 1;
+        let temp = TempDir::new().expect("fixture directory");
+        let archive_path = temp.path().join("variant.tar.xz");
+        fs::write(&archive_path, bytes).expect("write corrupt fixture");
+        let dest = temp.path().join("out");
+        let select = |path: &Path| -> Result<Option<PathBuf>> { Ok(Some(path.to_path_buf())) };
+        let error = extract_component_tar_xz(&archive_path, &dest, MAX_DECOMPRESSED_BYTES, &select)
+            .expect_err("corrupt SHA-256 check must not be admitted");
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid block checksum"), "{message}");
+        assert!(message.contains("variant.tar.xz"), "{message}");
+        assert!(
+            fs::read_dir(dest)
+                .expect("output directory")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
