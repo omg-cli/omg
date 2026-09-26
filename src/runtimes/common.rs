@@ -2747,6 +2747,101 @@ mod tests {
         Ok(())
     }
 
+    /// lzma-rs readme: "It already supports LZMA, LZMA2 and a subset of the .xz
+    /// file format" (<https://github.com/gendx/lzma-rs>). These fixtures come from
+    /// the system `xz` encoder, so the supported variants stay pinned: a single
+    /// block, thirteen blocks, and both a CRC64 stream and one without an
+    /// integrity check. They run through the same extraction function the runtimes
+    /// call, which is what an install actually does.
+    #[test]
+    fn supported_xz_stream_variants_decode_through_the_extraction_path() {
+        let fixtures: [(&str, &[u8]); 3] = [
+            (
+                "single-block/crc64",
+                include_bytes!("../../tests/data/xz-subset/single-block-crc64.tar.xz"),
+            ),
+            (
+                "single-block/no-check",
+                include_bytes!("../../tests/data/xz-subset/single-block-none.tar.xz"),
+            ),
+            (
+                "multi-block/crc64",
+                include_bytes!("../../tests/data/xz-subset/multi-block-crc64.tar.xz"),
+            ),
+        ];
+        for (label, bytes) in fixtures {
+            let temp = TempDir::new().expect("fixture directory");
+            let archive_path = temp.path().join("variant.tar.xz");
+            fs::write(&archive_path, bytes).expect("write fixture");
+            let dest = temp.path().join("out");
+            let select = |path: &Path| -> Result<Option<PathBuf>> { Ok(Some(path.to_path_buf())) };
+            extract_component_tar_xz(&archive_path, &dest, MAX_DECOMPRESSED_BYTES, &select)
+                .unwrap_or_else(|error| panic!("{label} failed to decode: {error:#}"));
+            let mut names: Vec<String> = fs::read_dir(&dest)
+                .expect("output directory")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            assert_eq!(names.len(), 3, "{label} extracted {names:?}");
+            assert!(
+                names.iter().all(|name| name.starts_with("file-")),
+                "{label} extracted unexpected names: {names:?}"
+            );
+        }
+    }
+
+    /// SHA-256 checked streams are documented as unsupported upstream ("Return an
+    /// error instead of panicking on unsupported SHA-256 checksum for XZ decoding",
+    /// lzma-rs CHANGELOG 0.1.3 / upstream PR #40; 0.3.0 is still the newest
+    /// published version on crates.io). The failure must therefore be a *precise*
+    /// one that names the cause and carries the archive identity, so an install
+    /// failure is diagnosable without a guest session. If upstream ever implements
+    /// SHA-256, this test fails on purpose and the support statement is revisited.
+    #[test]
+    fn sha256_checked_xz_streams_fail_with_the_identity_diagnostic() {
+        let fixtures: [(&str, &[u8]); 2] = [
+            (
+                "single-block/sha256",
+                include_bytes!("../../tests/data/xz-subset/single-block-sha256.tar.xz"),
+            ),
+            (
+                "multi-block/sha256",
+                include_bytes!("../../tests/data/xz-subset/multi-block-sha256.tar.xz"),
+            ),
+        ];
+        for (label, bytes) in fixtures {
+            let temp = TempDir::new().expect("fixture directory");
+            let archive_path = temp.path().join("variant.tar.xz");
+            fs::write(&archive_path, bytes).expect("write fixture");
+            let select = |path: &Path| -> Result<Option<PathBuf>> { Ok(Some(path.to_path_buf())) };
+            let error = extract_component_tar_xz(
+                &archive_path,
+                &temp.path().join("out"),
+                MAX_DECOMPRESSED_BYTES,
+                &select,
+            )
+            .expect_err("SHA-256 checked streams are not decodable by lzma-rs 0.3.0");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("Failed to decompress XZ archive"),
+                "{label}: {message}"
+            );
+            assert!(
+                message.contains("Unsupported SHA-256 checksum"),
+                "{label}: {message}"
+            );
+            assert!(message.contains("bytes="), "{label}: {message}");
+            assert!(message.contains("sha256="), "{label}: {message}");
+            assert!(message.contains("variant.tar.xz"), "{label}: {message}");
+        }
+    }
+
     #[test]
     fn concurrent_downloads_with_identical_names_keep_independent_contents() -> anyhow::Result<()> {
         let versions = TempDir::new()?;
