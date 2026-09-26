@@ -22,6 +22,17 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual({case["id"] for case in cases}, expected)
         self.assertEqual(len(cases), len(expected))
 
+    def test_fedora_fingerprint_rows_require_real_success(self):
+        with (ROOT / "tests/cli_behavior_inventory.tsv").open(newline="") as source:
+            rows = {row["case"]: row for row in csv.DictReader(source, delimiter="\t")}
+        for case in (
+            "snapshot-create", "migrate-export", "migrate-import", "env-capture",
+            "env-check", "team-status", "team-push", "team-pull",
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(rows[case]["expected_exit"], "0")
+                self.assertEqual(rows[case]["targets"], "hermetic:pass")
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
