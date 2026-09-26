@@ -1,7 +1,7 @@
 case	args_json	safety	expected_exit	expected_ux	requires	tier	targets	assertions	cleanup
 search	["search","firefox"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-install	["install","--dry-run","pacman"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-remove	["remove","--dry-run","pacman"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+install	["install","--dry-run","pacman"]	read	0	pass	-	hermetic	hermetic:pass	package-dry-run-install	tempdir-drop
+remove	["remove","--dry-run","bash"]	read	0	pass	-	hermetic	hermetic:pass	package-dry-run-remove	tempdir-drop
 update	["update","--check"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 info	["info","pacman"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	info-native-package	tempdir-drop
 why	["why","pacman"]	read	arch:0,debian:0,ubuntu:0,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -139,8 +139,8 @@ workspace-readd-after-remove	["workspace","add",".","--name","fixture"]	isolated
 workspace-run-success	["workspace","run","smoke"]	read	0	pass	workspace-readd-after-remove	hermetic	hermetic:pass	workspace-filtered-output	tempdir-drop
 all-commands-help	["--all-commands","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 search-flags	["search","--detailed","--no-aur","--limit","3","git-"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	search-official-limit-three	tempdir-drop
-install-flags	["install","--yes","--dry-run","--allow-local-file","pacman"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-remove-flags	["remove","--recursive","--yes","--dry-run","pacman"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+install-flags	["install","--yes","--dry-run","--allow-local-file","pacman"]	read	0	pass	-	hermetic	hermetic:pass	package-dry-run-install	tempdir-drop
+remove-flags	["remove","--recursive","--yes","--dry-run","bash"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	package-dry-run-recursive	tempdir-drop
 update-dry-run-yes	["update","--dry-run","--yes"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 why-reverse	["why","--reverse","pacman"]	read	arch:0,debian:0,ubuntu:0,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 size-tree	["size","--tree","pacman"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop

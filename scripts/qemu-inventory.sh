@@ -255,6 +255,30 @@ check_native_tree_state() {
   fi
 }
 
+# Compare the installed package database around a dry run. Repository metadata
+# may refresh, but an install/remove preview must not change installed state.
+native_package_snapshot() {
+  local distro=$1 inventory
+  case "$distro" in
+    arch) inventory=$(pacman -Q) || return 1 ;;
+    debian|ubuntu) inventory=$(dpkg-query -W '-f=${Package}\t${Version}\t${Status}\n') || return 1 ;;
+    fedora) inventory=$(rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n') || return 1 ;;
+    *) return 1 ;;
+  esac
+  [[ -n "$inventory" ]] || return 1
+  printf '%s\n' "$inventory" | LC_ALL=C sort
+}
+
+native_installed_version() {
+  local distro=$1 package=$2
+  case "$distro" in
+    arch) pacman -Q "$package" | awk -v name="$package" '$1 == name { print $2 }' ;;
+    debian|ubuntu) dpkg-query -W '-f=${Status}\t${Version}\n' "$package" | awk -F '\t' '$1 == "install ok installed" { print $2 }' ;;
+    fedora) rpm -q --qf '%{VERSION}-%{RELEASE}\n' "$package" ;;
+    *) return 1 ;;
+  esac
+}
+
 prepare_native_apt_orphan() {
   local distro=$1
   check_native_tree_state "$distro" installed || return 1
@@ -744,6 +768,31 @@ check_product_output() {
   if [[ "$code" != 0 ]] && ! grep -q '[^[:space:]]' "$stderr"; then
     printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
   fi
+  if [[ "$assertion" == package-dry-run-install || "$assertion" == package-dry-run-remove || "$assertion" == package-dry-run-recursive ]]; then
+    if [[ "$assertion" == package-dry-run-recursive && "$distro" != arch ]]; then
+      local refusal='Recursive removal is not supported by the Debian backend'
+      [[ "$distro" != fedora ]] || refusal='Recursive removal is not supported by this package backend'
+      if [[ "$code" != 1 ]] || ! grep -Fxq "Error: $refusal" "$stderr" \
+        || grep -Fq 'Remove Preview' "$stdout"; then
+        printf 'assertion failed: unsupported recursive removal did not refuse before preview\n' >&2; return 1
+      fi
+    else
+      local preview='  | Install Preview' changes='  ℹ • No changes will be made (dry run)' target=pacman
+      if [[ "$assertion" != package-dry-run-install ]]; then
+        preview='  | Remove Preview'; changes='  ℹ No changes made (dry run)'; target=bash
+      fi
+      if [[ "$code" != 0 ]] || ! grep -Fxq "$preview" "$stdout" \
+        || ! grep -Fxq '    dry run' "$stdout" \
+        || ! grep -Eq "(^|[^[:alnum:]_-])${target}([^[:alnum:]_-]|$)" "$stdout" \
+        || ! grep -Fxq "$changes" "$stdout"; then
+        printf 'assertion failed: package dry run lacks target-specific no-change preview\n' >&2; return 1
+      fi
+      if [[ "$assertion" == package-dry-run-recursive ]] \
+        && ! grep -Fq 'Additional unneeded dependencies would also be removed' "$stdout"; then
+        printf 'assertion failed: recursive dry run omitted dependent-package preview\n' >&2; return 1
+      fi
+    fi
+  fi
   if [[ "$assertion" == audit-fix-refusal ]]; then
     case "$distro" in
       arch) assertion=audit-source-failure ;;
@@ -1142,7 +1191,23 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$id" in
+    install)
+      [[ "$a" == package-dry-run-install && "$s" == read && "$resolved" == 0 ]] || exit 2
+      jq -e '. == ["install", "--dry-run", "pacman"]' <<< "$aj" >/dev/null || exit 2 ;;
+    install-flags)
+      [[ "$a" == package-dry-run-install && "$s" == read && "$resolved" == 0 ]] || exit 2
+      jq -e '. == ["install", "--yes", "--dry-run", "--allow-local-file", "pacman"]' <<< "$aj" >/dev/null || exit 2 ;;
+    remove)
+      [[ "$a" == package-dry-run-remove && "$s" == read && "$resolved" == 0 ]] || exit 2
+      jq -e '. == ["remove", "--dry-run", "bash"]' <<< "$aj" >/dev/null || exit 2 ;;
+    remove-flags)
+      [[ "$a" == package-dry-run-recursive && "$s" == read ]] || exit 2
+      jq -e '. == ["remove", "--recursive", "--yes", "--dry-run", "bash"]' <<< "$aj" >/dev/null || exit 2 ;;
+    *)
+      [[ "$a" != package-dry-run-install && "$a" != package-dry-run-remove && "$a" != package-dry-run-recursive ]] || exit 2 ;;
+  esac
   if [[ "$id" == ci-init ]]; then
     [[ "$a" == ci-github-workflow && "$s" == isolated-write && "$resolved" == 0 ]] || exit 2
     jq -e '. == ["ci", "init", "github"]' <<< "$aj" >/dev/null || exit 2
@@ -1430,6 +1495,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
   remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_privacy_oracle); $(declare -f check_product_output)"
+  if [[ "$assertions" == package-dry-run-* ]]; then
+    remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version)"
+  fi
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')
@@ -1451,6 +1519,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
     remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log' '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
   done
+  if [[ "$assertions" == package-dry-run-* ]]; then
+    remote+="; native_before=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package baseline is unavailable\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+    if [[ "$assertions" != package-dry-run-install ]]; then
+      remote+="; installed_version=\$(native_installed_version '$distro' bash) || { printf 'assertion failed: native bash package query failed\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+      remote+="; [[ -n \"\$installed_version\" ]] || { printf 'assertion failed: bash is not installed in this guest\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+    fi
+  fi
   if [[ "$case" == team-status || "$case" == team-pull ]]; then
     remote+="; python3 \"\$HOME/qemu-fingerprint-oracle.py\" prepare-team-refresh '$distro' \"\$rowdir\" /dev/null"
   fi
@@ -1539,6 +1614,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
+  if [[ "$assertions" == package-dry-run-* ]]; then
+    if [[ "$assertions" != package-dry-run-install && "$assertions" != package-dry-run-recursive || "$assertions" == package-dry-run-recursive && "$distro" == arch ]]; then
+      remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! grep -Fq \"bash \$installed_version\" command.stdout.log; then printf 'assertion failed: remove preview lacks the native installed bash version\n' >&2; assertion=1; fi"
+    fi
+    remote+="; native_after=\$(native_package_snapshot '$distro') || { execution_phase=dependency; rc=2; assertion=1; printf 'assertion failed: native package after-state is unavailable\n' >&2; }"
+    remote+="; if [[ \"\$execution_phase\" == product && \"\$native_before\" != \"\$native_after\" ]]; then printf 'assertion failed: dry run changed the native installed-package database\n' >&2; assertion=1; fi"
+  fi
   if [[ "$assertions" == doctor-eol-state ]]; then
     remote+="; if [[ \"\$baseline_phase\" != product ]] || ! check_doctor_issue_delta \"\$baseline_rc\" doctor.baseline.stdout.log doctor.baseline.stderr.log \"\$rc\" command.stderr.log 1; then printf 'assertion failed: doctor EOL did not add exactly one health issue over its baseline\n' >&2; assertion=1; fi"
   fi
