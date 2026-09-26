@@ -182,6 +182,69 @@ class OutputContracts(unittest.TestCase):
                         self.assertIn('assertion failed: runtime uninstall', logs[case + '.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_runtime_list_and_switch_require_exact_private_state(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if re.match(r'^runtime-(node|python|go)-(list|switch)-installed\t', line)]
+        self.assertEqual(len(rows), 6)
+        versions = {'node': ('24.21.0', '22.21.0'),
+                    'python': ('3.12.14', '3.11.14'),
+                    'go': ('1.27.1', '1.26.0')}
+        for row in rows:
+            case = row.split('\t')[0]
+            runtime = case.split('-')[1]
+            operation = case.split('-')[2]
+            selected, active = versions[runtime]
+            base = f'"$OMG_DATA_DIR/versions/{runtime}"'
+            checks = (f'[[ "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 '
+                      f'&& -f "$OMG_DATA_DIR/versions/{runtime}/{selected}/sentinel" '
+                      f'&& -f "$OMG_DATA_DIR/versions/{runtime}/{active}/sentinel" '
+                      f'&& -f "$OMG_DATA_DIR/versions/{runtime}/8.8.8/.omg-installing" '
+                      f'&& -L "$OMG_DATA_DIR/versions/{runtime}/7.7.7" '
+                      f'&& -L "$OMG_DATA_DIR/versions/{runtime}/current" ]] || exit 70\n')
+            if operation == 'list':
+                payload = {'runtime': runtime, 'current': active,
+                           'installed': [selected, active]}
+                output = 'printf %s ' + shlex.quote(json.dumps(payload)) + '\n'
+                product = checks + output
+                mutants = {
+                    'silent': checks + ':\n',
+                    'wrong-current': checks + 'printf %s ' + shlex.quote(
+                        json.dumps({**payload, 'current': selected})) + '\n',
+                    'missing-version': checks + 'printf %s ' + shlex.quote(
+                        json.dumps({**payload, 'installed': [selected]})) + '\n',
+                    'leaked-pending': checks + 'printf %s ' + shlex.quote(
+                        json.dumps({**payload, 'installed': [selected, active, '8.8.8']})) + '\n',
+                    'leaked-symlink': checks + 'printf %s ' + shlex.quote(
+                        json.dumps({**payload, 'installed': [selected, active, '7.7.7']})) + '\n',
+                    'extra-document': product + output,
+                    'changed-pointer': checks + f'rm {base}/current; ln -s {base}/{selected} {base}/current\n' + output,
+                    'lost-pending': checks + f'rm {base}/8.8.8/.omg-installing\n' + output,
+                    'lost-external': checks + 'rm "$(dirname "$OMG_DATA_DIR")/external-runtime/sentinel"\n' + output,
+                }
+            else:
+                switch = f'rm {base}/current; ln -s {base}/{selected} {base}/current\n'
+                usage = self.runtime_usage_fixture(runtime)
+                product = checks + switch + usage
+                mutants = {
+                    'no-switch': checks + usage,
+                    'missing-usage': checks + switch,
+                    'lost-active': product + f'rm -rf {base}/{active}\n',
+                    'lost-pending': product + f'rm {base}/8.8.8/.omg-installing\n',
+                    'lost-external': product + 'rm "$(dirname "$OMG_DATA_DIR")/external-runtime/sentinel"\n',
+                }
+            with self.subTest(case=case):
+                result, evidence, logs = self.run_inventory(product, [row], tiers='container')
+                self.assertEqual(evidence[0]['result'], 'PASS', logs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for fault, broken in mutants.items():
+                    with self.subTest(case=case, fault=fault):
+                        result, evidence, logs = self.run_inventory(broken, [row], tiers='container')
+                        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn('assertion failed: runtime', logs[case + '.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_config_rows_require_private_persisted_state(self):
         rows = [
             'config-set\t["config","set","telemetry.enabled","true"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\tconfig-set-persisted\ttempdir-drop',

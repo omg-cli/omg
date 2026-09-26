@@ -655,6 +655,34 @@ check_runtime_uninstall() {
     printf 'assertion failed: runtime uninstall did not remove only the inactive version\n' >&2; return 1
   fi
 }
+check_runtime_state() {
+  local runtime=$1 selected=$2 active=$3 assertion=$4 output=$5 base current
+  [[ "${OMG_DATA_DIR:-}" == "$rowdir/runtime-data" ]] || {
+    printf 'assertion failed: runtime state escaped its private data directory\n' >&2; return 1
+  }
+  base="$OMG_DATA_DIR/versions/$runtime"
+  current="$base/$active"
+  [[ "$assertion" != runtime-switch-state ]] || current="$base/$selected"
+  if [[ ! -f "$base/$selected/sentinel" || $(cat "$base/$selected/sentinel") != keep-selected ]] \
+    || [[ ! -f "$base/$active/sentinel" || $(cat "$base/$active/sentinel") != keep-active ]] \
+    || [[ ! -f "$base/8.8.8/.omg-installing" || $(cat "$base/8.8.8/.omg-installing") != keep-pending ]] \
+    || [[ ! -L "$base/7.7.7" || $(readlink "$base/7.7.7") != "$rowdir/external-runtime" ]] \
+    || [[ ! -f "$rowdir/external-runtime/sentinel" || $(cat "$rowdir/external-runtime/sentinel") != keep-external ]] \
+    || [[ ! -L "$base/current" || $(readlink "$base/current") != "$current" ]]; then
+    printf 'assertion failed: runtime state changed outside the selected active pointer\n' >&2; return 1
+  fi
+  if [[ "$assertion" == runtime-list-state ]]; then
+    jq -e -s --arg runtime "$runtime" --arg selected "$selected" --arg active "$active" \
+      'length == 1 and .[0] == {runtime:$runtime,current:$active,installed:[$selected,$active]}' \
+      "$output" >/dev/null || {
+        printf 'assertion failed: runtime list did not report exact installed and active versions\n' >&2; return 1
+      }
+  elif [[ "$assertion" == runtime-switch-state ]]; then
+    check_runtime_usage "$runtime" || return 1
+  else
+    return 2
+  fi
+}
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
   if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
@@ -990,7 +1018,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
   case "$id" in
     config-set)
       [[ "$a" == config-set-persisted ]] && jq -e '. == ["config","set","telemetry.enabled","true"]' <<< "$aj" >/dev/null || exit 2 ;;
@@ -1012,6 +1040,17 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
       [[ "$a" == runtime-version-removed ]] && jq -e --arg runtime "$runtime" \
         '. == ["use", $runtime, (if $runtime == "node" then "24.21.0" elif $runtime == "python" then "3.12.14" else "1.27.1" end), "--uninstall"]' <<< "$aj" >/dev/null || exit 2 ;;
     *) [[ "$a" != runtime-version-removed ]] || exit 2 ;;
+  esac
+  case "$id" in
+    runtime-node-list-installed|runtime-python-list-installed|runtime-go-list-installed|runtime-node-switch-installed|runtime-python-switch-installed|runtime-go-switch-installed)
+      runtime=${id#runtime-}; runtime=${runtime%%-*}
+      if [[ "$id" == *-list-installed ]]; then
+        [[ "$a" == runtime-list-state ]] && jq -e --arg runtime "$runtime" '. == ["list",$runtime,"--json"]' <<< "$aj" >/dev/null || exit 2
+      else
+        [[ "$a" == runtime-switch-state ]] && jq -e --arg runtime "$runtime" \
+          '. == ["use",$runtime,(if $runtime == "node" then "v24.21.0" elif $runtime == "python" then "v3.12.14" else "v1.27.1" end)]' <<< "$aj" >/dev/null || exit 2
+      fi ;;
+    *) [[ "$a" != runtime-list-state && "$a" != runtime-switch-state ]] || exit 2 ;;
   esac
   case "$id" in
     privacy-export)
@@ -1287,6 +1326,18 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; printf remove-me > \"\$versions/$runtime_version/sentinel\"; printf keep-sibling > \"\$versions/9.9.9/sentinel\"; printf keep-other > \"\$OMG_DATA_DIR/versions/other-guard/1.0.0/sentinel\"; printf keep-external > \"\$rowdir/external-runtime/sentinel\""
     remote+="; ln -s \"\$rowdir/external-runtime\" \"\$versions/$runtime_version/external-link\"; ln -s \"\$versions/9.9.9\" \"\$versions/current\"; $(declare -f check_runtime_uninstall)"
   fi
+  if [[ "$assertions" == runtime-list-state || "$assertions" == runtime-switch-state ]]; then
+    runtime_name=${case#runtime-}; runtime_name=${runtime_name%%-*}
+    case "$runtime_name" in
+      node) runtime_version=24.21.0; runtime_active=22.21.0; runtime_launcher=node ;;
+      python) runtime_version=3.12.14; runtime_active=3.11.14; runtime_launcher=python3 ;;
+      go) runtime_version=1.27.1; runtime_active=1.26.0; runtime_launcher=go ;;
+    esac
+    remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: runtime state fixture requires an unprivileged guest user\\n' >&2; exit 2; }; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0 OMG_DISABLE_DAEMON=1"
+    remote+="; versions=\"\$OMG_DATA_DIR/versions/$runtime_name\"; mkdir -p \"\$versions/$runtime_version/bin\" \"\$versions/$runtime_active\" \"\$versions/8.8.8\" \"\$rowdir/external-runtime\"; chmod 700 \"\$OMG_DATA_DIR\""
+    remote+="; printf keep-selected > \"\$versions/$runtime_version/sentinel\"; printf keep-active > \"\$versions/$runtime_active/sentinel\"; printf keep-pending > \"\$versions/8.8.8/.omg-installing\"; printf keep-external > \"\$rowdir/external-runtime/sentinel\""
+    remote+="; printf '#!/bin/sh\\nprintf runtime-fixture\\n' > \"\$versions/$runtime_version/bin/$runtime_launcher\"; chmod 755 \"\$versions/$runtime_version/bin/$runtime_launcher\"; ln -s \"\$rowdir/external-runtime\" \"\$versions/7.7.7\"; ln -s \"\$versions/$runtime_active\" \"\$versions/current\"; $(declare -f check_runtime_state); $(declare -f check_runtime_usage)"
+  fi
   if [[ "$distro" == fedora && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     # Keep the real OMG path, but bound native DNF to a local versioned RPM.
     # The root-owned helper restores system repo policy and checks the RPMDB
@@ -1330,6 +1381,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$assertions" == runtime-version-removed ]]; then
     remote+="; if [ \"\$rc\" = 0 ] && ! check_runtime_uninstall '$runtime_name' '$runtime_version'; then assertion=1; fi"
+  fi
+  if [[ "$assertions" == runtime-list-state || "$assertions" == runtime-switch-state ]]; then
+    remote+="; if [ \"\$rc\" = 0 ] && ! check_runtime_state '$runtime_name' '$runtime_version' '$runtime_active' '$assertions' command.stdout.log; then assertion=1; fi"
   fi
   # Every inventory row receives a private fixture directory. Product-specific
   # cleanup assertions run above; removal here proves the harness itself does
