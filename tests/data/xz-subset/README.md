@@ -1,9 +1,12 @@
 # XZ decoder behavior fixtures
 
-OMG downloads runtime archives and inspects AUR packages that may use XZ. These
-fixtures are produced by `generate.sh` with the system `xz` encoder. The runtime
-tests pass them through `extract_component_tar_xz`, including its output budget
-and tar extraction, rather than checking only a parser or header.
+OMG downloads runtime archives, inspects AUR packages, and reads native Arch
+and Debian package metadata that may use XZ. These fixtures are produced by
+`generate.sh` with the system `xz` encoder. The runtime tests pass the tar
+fixtures through `extract_component_tar_xz`, including its output budget and
+tar extraction. Package tests use the native database and `.deb` member readers.
+The [XZ Utils manual](https://tukaani.org/xz/man/xz.1.html) specifies the
+SHA-256 block check and that decompression verifies it.
 
 | fixture | blocks | check | required behavior |
 |---|---:|---|---|
@@ -12,6 +15,8 @@ and tar extraction, rather than checking only a parser or header.
 | `multi-block-crc64.tar.xz` | 13 | CRC64 | extract three files |
 | `single-block-sha256.tar.xz` | 1 | SHA-256 | extract three files |
 | `multi-block-sha256.tar.xz` | 13 | SHA-256 | extract three files |
+| `pacman-sync-sha256.db.xz` | 1 | SHA-256 | parse the Arch sync database record |
+| `apt-packages-sha256.xz` | 1 | SHA-256 | parse the Debian Packages record |
 
 The SHA-256 fixture also has a negative test: changing a byte in its block
 check must fail before any tar entry is published. The decoder is drained into
@@ -36,6 +41,7 @@ That result establishes support for these inputs; it does not explain the
 intermittent CRC64 failure tracked in #621, which remains open for repeat QEMU
 evidence.
 
-Regenerate with `bash tests/data/xz-subset/generate.sh`. Review the generated
-binary changes alongside the test result; the fixtures are input artifacts,
-not pre-approved downloads.
+Regenerate with `bash tests/data/xz-subset/generate.sh`. The tar inputs use a
+fixed timestamp, owner, and entry order so rerunning the script reproduces the
+same bytes. Review generated binary changes alongside the test result; the
+fixtures are input artifacts, not pre-approved downloads.

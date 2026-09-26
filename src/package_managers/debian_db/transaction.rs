@@ -28,7 +28,7 @@ use tempfile::TempDir;
 use super::resolver::ResolutionResult;
 use super::validation::require_verified_deb;
 use crate::cli::progress::{Accent, Outcome, ProgressTask, TaskKind, TaskSpec};
-use crate::runtimes::common::{BudgetedReader, BudgetedSink, BudgetedWriter};
+use crate::runtimes::common::{BudgetedReader, BudgetedSink, BudgetedWriter, decode_xz_to};
 
 /// Transaction state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1409,9 +1409,8 @@ where
         return consume(&mut bounded);
     }
     if member_name.ends_with(".tar.xz") {
-        // lzma-rs exposes Read -> Write rather than a streaming Read decoder.
-        // Decompress into an anonymous file under the transaction directory,
-        // bounding writes before they reach disk, then rewind for tar parsing.
+        // Verify the full XZ stream into an anonymous file under the
+        // transaction directory, bounding writes before tar parsing.
         let output = tempfile::tempfile_in(temp_dir).with_context(|| {
             format!(
                 "Failed to create temporary XZ output in {}",
@@ -1419,7 +1418,7 @@ where
             )
         })?;
         let mut output = BudgetedWriter::new(output, budget);
-        lzma_rs::xz_decompress(&mut BufReader::new(reader), &mut output)
+        decode_xz_to(BufReader::new(reader), &mut output)
             .map_err(|error| anyhow::anyhow!("Failed to decompress XZ payload: {error}"))?;
         let mut output = output.into_inner();
         output.seek(SeekFrom::Start(0))?;
@@ -1723,11 +1722,9 @@ fn tar_payload_reader_with_budget(data: &[u8], budget: u64) -> Result<Box<dyn Re
     }
 
     if data.len() > 6 && data.starts_with(b"\xfd7zXZ\x00") {
-        // XZ: lzma-rs only exposes a Read->Write API, so bound the output
-        // sink instead; it stops accepting bytes at the budget, which stops
-        // buffer growth during decompression rather than after it.
+        // Bound output while the shared decoder verifies the full stream.
         let mut sink = BudgetedSink::with_budget(budget);
-        lzma_rs::xz_decompress(&mut std::io::Cursor::new(data), &mut sink)
+        decode_xz_to(std::io::Cursor::new(data), &mut sink)
             .map_err(|e| anyhow::anyhow!("Failed to decompress XZ payload: {e}"))?;
         return Ok(Box::new(std::io::Cursor::new(sink.into_inner())));
     }
@@ -3445,6 +3442,33 @@ mod tests {
 
         assert_eq!(byte, 0);
         assert_eq!(payload.position(), 1, "member must not be buffered eagerly");
+    }
+
+    #[test]
+    fn deb_tar_member_accepts_sha256_checked_xz() {
+        let fixture = include_bytes!("../../../tests/data/xz-subset/single-block-sha256.tar.xz");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let files = with_decompressed_tar(
+            std::io::Cursor::new(fixture),
+            "data.tar.xz",
+            temp.path(),
+            |reader| {
+                let mut archive = tar::Archive::new(reader);
+                let mut files = 0;
+                for entry in archive.entries()? {
+                    let mut entry = entry?;
+                    if entry.header().entry_type().is_file() {
+                        let mut content = String::new();
+                        entry.read_to_string(&mut content)?;
+                        anyhow::ensure!(content.starts_with("omg xz fixture file"));
+                        files += 1;
+                    }
+                }
+                Ok(files)
+            },
+        )
+        .expect("verified XZ data member");
+        assert_eq!(files, 3);
     }
 
     #[test]

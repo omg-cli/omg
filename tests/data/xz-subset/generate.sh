@@ -21,7 +21,8 @@ for index in 1 2 3; do
     awk -v n="$index" 'BEGIN { for (line = 0; line < 400; line++) print "repeated line for block splitting " n }'
   } > "tree/file-$index.txt"
 done
-tar -cf payload.tar -C tree .
+tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+  -cf payload.tar -C tree .
 
 # One block, CRC64 (xz's default) and no integrity check.
 xz -0 -k -c payload.tar > "$dest/single-block-crc64.tar.xz"
@@ -31,6 +32,16 @@ xz -0 --block-size=4KiB -k -c payload.tar > "$dest/multi-block-crc64.tar.xz"
 # SHA-256 checked streams exercise the decoder's full integrity-check path.
 xz -0 --check=sha256 -k -c payload.tar > "$dest/single-block-sha256.tar.xz"
 xz -0 --block-size=4KiB --check=sha256 -k -c payload.tar > "$dest/multi-block-sha256.tar.xz"
+
+# Native package databases also consume XZ; keep one parseable record for each
+# backend so tests exercise the production reader, not only the shared decoder.
+mkdir -p pacman-db/fixture-1-1
+printf '%%NAME%%\nfixture\n\n%%VERSION%%\n1-1\n\n%%DESC%%\nXZ fixture package\n\n' > pacman-db/fixture-1-1/desc
+tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+  -cf pacman-sync.tar -C pacman-db fixture-1-1
+xz -0 --check=sha256 -k -c pacman-sync.tar > "$dest/pacman-sync-sha256.db.xz"
+printf 'Package: fixture\nVersion: 1.0\n\n' > Packages
+xz -0 --check=sha256 -k -c Packages > "$dest/apt-packages-sha256.xz"
 
 for file in "$dest"/*.tar.xz; do
   printf '%s: %s bytes, %s\n' "$(basename "$file")" "$(stat -c%s "$file")" \
