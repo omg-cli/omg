@@ -47,6 +47,10 @@ for tool in jq gh; do command -v "$tool" >/dev/null || exit 3; done
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/qa-evidence-lib.sh"
 # Validate once, before any GitHub operations or filtering.
 rows="$(qa_result_rows "$results")"
+if [[ "$source" != qemu-matrix ]] && jq -e 'any(.[]; .distro == "matrix")' <<< "$rows" >/dev/null; then
+  printf 'error: matrix identity is only valid for QEMU workflow reports\n' >&2
+  exit 2
+fi
 failures="$(jq -ce 'map(select(.result == "PRODUCT_FAIL" or .result == "HARNESS_ERROR" or .result == "FAIL"))' <<< "$rows")"
 # Retain --failures-only for existing local callers. All callers are now
 # failure-only: a green retry, including a published run, cannot name the
@@ -96,6 +100,11 @@ while IFS= read -r row; do
   rm -f "$src_tmp"
   if [[ -z "$existing" ]]; then
     title="[qa] $case_id fails on $distro ($source)"
+    runbook_distro=$distro
+    if [[ "$distro" == matrix ]]; then
+      title="[qa] $case_id fails in QEMU workflow ($source)"
+      runbook_distro=all
+    fi
     followup=$(jq -r --arg m "$marker" '[.[] | select((.state // "" | ascii_downcase) == "closed" and .body != null and (.body | contains($m))) | .number] | max // empty' <<< "$open_issues")
     body=$(cat <<EOF
 $marker
@@ -114,7 +123,7 @@ EOF
     if [[ -n "$excerpt" ]]; then
       body+=$(printf '\n\n### Failure excerpt (`%s`, tail)\n````log\n%s\n````' "$excerpt_source" "$excerpt")
     fi
-    body+=$(printf '\n\n### Agent runbook\n%s\nResolve criteria: verify the fix in a pull request and link this issue with a GitHub closing keyword. A passing retry alone does not close it. A recurrence while open lands as a new comment; after a close it files a follow-up like this one.' "$(runbook_for "$distro" "$([[ "$distro" == macos ]] && printf ' --executor native' || printf '')")")
+    body+=$(printf '\n\n### Agent runbook\n%s\nResolve criteria: verify the fix in a pull request and link this issue with a GitHub closing keyword. A passing retry alone does not close it. A recurrence while open lands as a new comment; after a close it files a follow-up like this one.' "$(runbook_for "$runbook_distro" "$([[ "$distro" == macos ]] && printf ' --executor native' || printf '')")")
     if [[ "$dry_run" == true ]]; then
       printf 'would create: %s\n' "$title"
     elif gh issue create --repo "$repo" --title "$title" --label "$label" --body "$body" >/dev/null; then

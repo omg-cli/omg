@@ -307,6 +307,7 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(catalog, failures)
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0]["case_id"], "qemu-matrix-workflow")
+        self.assertEqual(issues[0]["distro"], "matrix")
         self.assertEqual(issues[0]["result"], "HARNESS_ERROR")
 
     def test_issue_limit_boundary_keeps_individual_diagnoses(self):
@@ -343,14 +344,39 @@ class ReportingBoundaryTests(unittest.TestCase):
             result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0,
         ))
         self.assertEqual(x86_success["case_id"], "qemu-matrix-x86-workflow")
+        self.assertEqual(x86_success["distro"], "matrix")
         self.assertEqual(x86_success["result"], "PASS")
         self.assertNotEqual(arm_failure["case_id"], x86_success["case_id"])
+
+    def test_workflow_failure_uses_the_only_failed_guest_distro(self):
+        jobs = [
+            {"name": "QEMU behavioral verification / Distro lane (fedora) / QEMU guest (fedora)",
+             "conclusion": "failure"},
+            {"name": "QEMU behavioral verification / Distro lane (ubuntu) / QEMU guest (ubuntu)",
+             "conclusion": "success"},
+            {"name": "QEMU behavioral verification / QEMU matrix result",
+             "conclusion": "failure"},
+        ]
+        receipt = REPORT.workflow_receipt(jobs, "failure")
+        self.assertEqual(receipt["case_id"], "qemu-matrix-x86-workflow")
+        self.assertEqual(receipt["distro"], "fedora")
+
+    def test_workflow_failure_without_one_guest_distro_uses_matrix_identity(self):
+        jobs = [
+            {"name": "QEMU behavioral verification / Distro lane (fedora) / QEMU guest (fedora)",
+             "conclusion": "failure"},
+            {"name": "QEMU behavioral verification / Distro lane (debian) / QEMU guest (debian)",
+             "conclusion": "failure"},
+        ]
+        receipt = REPORT.workflow_receipt(jobs, "failure")
+        self.assertEqual(receipt["distro"], "matrix")
 
     def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
                            corrupt=False, expired=False, helper_fails=False, case_log=None,
                            log_case="search", main_shas=None, changed_attempt=False,
                            workflow_path=".github/workflows/qemu-matrix.yml", all_distros=False,
-                           latest_tag="v0.1.224", provenance_override=None, commit_shas=None):
+                           latest_tag="v0.1.224", provenance_override=None, commit_shas=None,
+                           jobs=None):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -405,7 +431,7 @@ class ReportingBoundaryTests(unittest.TestCase):
             if path.endswith("/commits/v0.1.224"):
                 return json.dumps(dict(sha=next(tag_commits)))
             if "/jobs?" in path:
-                return json.dumps(dict(jobs=[]))
+                return json.dumps(dict(jobs=[] if jobs is None else jobs))
             self.fail(f"unexpected API request: {path}")
         def subprocess_run(argv, **kwargs):
             root = Path(argv[2]).parent
@@ -441,7 +467,7 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], "scripts/qa-file-issue.sh")
         self.assertEqual(calls[0][1], rows + [dict(
-            case_id="qemu-matrix-x86-workflow", distro="ubuntu", result="PASS",
+            case_id="qemu-matrix-x86-workflow", distro="matrix", result="PASS",
             exit_code=0, elapsed_seconds=0)])
         self.assertNotIn("--failures-only", calls[0][3])
         self.assertEqual(catalog["failures"], [])
@@ -526,6 +552,22 @@ class ReportingBoundaryTests(unittest.TestCase):
                 self.assertTrue(catalog["evidence_invalid_or_unavailable"])
                 self.assertEqual(calls[0][1][0]["result"], "HARNESS_ERROR")
                 self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-x86-workflow")
+
+    def test_failed_fedora_setup_without_guest_evidence_is_not_labeled_ubuntu(self):
+        jobs = [
+            {"name": "QEMU behavioral verification / Distro lane (fedora) / QEMU guest (fedora)",
+             "conclusion": "failure", "id": 11, "steps": [
+                 {"name": "Reuse verified native CI binaries", "conclusion": "failure", "number": 4}]},
+            {"name": "QEMU behavioral verification / Distro lane (ubuntu) / QEMU guest (ubuntu)",
+             "conclusion": "success", "id": 12, "steps": []},
+            {"name": "QEMU behavioral verification / QEMU matrix result",
+             "conclusion": "failure", "id": 13, "steps": []},
+        ]
+        calls, catalog = self.run_report_fixture([self.row()], corrupt=True, jobs=jobs)
+        self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+        self.assertEqual(len(calls[0][1]), 1)
+        self.assertEqual(calls[0][1][0]["distro"], "fedora")
+        self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-x86-workflow")
 
     def test_cancelled_run_makes_no_issue_updates(self):
         calls, catalog = self.run_report_fixture([self.row()], conclusion="cancelled")

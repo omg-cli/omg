@@ -69,6 +69,26 @@ if bash "$runner" "$results" --run-url https://run/4 --source qemu 2>/dev/null; 
 fi
 [[ -s "$CALL_LOG" ]] && fail "schema violation must not call gh"
 
+# Workflow-wide failures have no guest distro. Keep that identity explicit,
+# while refusing to use the matrix identity for ordinary cases.
+printf '%s' '[{"case_id":"qemu-matrix-x86-workflow","distro":"matrix","result":"HARNESS_ERROR","exit_code":1,"elapsed_seconds":0}]' > "$results"
+: > "$CALL_LOG"; export FAKE_ISSUES_JSON='[]'
+out=$(bash "$runner" "$results" --run-url https://run/matrix --source qemu-matrix)
+assert_rc 0 "$?" "matrix-workflow"
+grep -Fq 'fails in QEMU workflow' "$CALL_LOG" || fail "matrix failure claimed a guest distro"
+grep -Fq -- '--distro all' "$CALL_LOG" || fail "matrix runbook did not select all distros"
+: > "$CALL_LOG"
+if bash "$runner" "$results" --run-url https://run/wrong-source --source release-smoke 2>/dev/null; then
+  fail "release smoke accepted a QEMU matrix identity"
+fi
+[[ -s "$CALL_LOG" ]] && fail "wrong-source matrix case contacted GitHub"
+printf '%s' '[{"case_id":"search-tree","distro":"matrix","result":"FAIL","exit_code":1,"elapsed_seconds":0}]' > "$results"
+: > "$CALL_LOG"
+if bash "$runner" "$results" --run-url https://run/invalid-matrix --source qemu-matrix 2>/dev/null; then
+  fail "ordinary case accepted a matrix distro"
+fi
+[[ -s "$CALL_LOG" ]] && fail "invalid matrix case contacted GitHub"
+
 # 6. Clean run files nothing (and closes nothing when no issue is open).
 printf '%s' '[{"case_id":"x","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":1}]' > "$results"
 : > "$CALL_LOG"

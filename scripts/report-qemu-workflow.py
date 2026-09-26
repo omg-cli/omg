@@ -324,11 +324,20 @@ def workflow_receipt(jobs, conclusion):
     arm_health = None
     x86_selected = False
     arm_selected = False
+    failed_lane_distros = set()
     for job in jobs:
         if not isinstance(job, dict) or not isinstance(job.get("name"), str):
             raise ValueError("invalid workflow job")
         name = job["name"]
         job_conclusion = job.get("conclusion")
+        if job_conclusion in ("failure", "timed_out", "cancelled", "action_required"):
+            lane = re.search(r"(?:^|/)\s*Distro lane \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
+            if lane:
+                failed_lane_distros.add(lane.group(1))
+            else:
+                arm_guest = re.search(r"QEMU guest arm64 \((arch|debian|ubuntu|fedora)\)", name)
+                if arm_guest:
+                    failed_lane_distros.add(arm_guest.group(1))
         if name == "ARM guest runner KVM health":
             arm_health = job_conclusion
             arm_selected = job_conclusion != "skipped"
@@ -341,7 +350,8 @@ def workflow_receipt(jobs, conclusion):
                     result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
     scope = "all" if arm_selected and x86_selected else "arm" if arm_selected else "x86"
     passed = conclusion == "success"
-    return dict(case_id=f"qemu-matrix-{scope}-workflow", distro="ubuntu",
+    distro = next(iter(failed_lane_distros)) if len(failed_lane_distros) == 1 else "matrix"
+    return dict(case_id=f"qemu-matrix-{scope}-workflow", distro=distro,
                 result="PASS" if passed else "HARNESS_ERROR",
                 exit_code=0 if passed else 1, elapsed_seconds=0)
 
@@ -351,7 +361,7 @@ def bound_issue_updates(selected):
     failures = [row for row in selected if row["result"] in FAILURES]
     if len(failures) <= 25:
         return selected, failures
-    aggregate = dict(case_id="qemu-matrix-workflow", distro="ubuntu",
+    aggregate = dict(case_id="qemu-matrix-workflow", distro="matrix",
                      result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
     passes = [row for row in selected
               if row["result"] == "PASS" and row["case_id"] != "qemu-matrix-workflow"]
