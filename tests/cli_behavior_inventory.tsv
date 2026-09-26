@@ -183,8 +183,9 @@ doctor-eol	["doctor","--eol"]	read	-	declared	-	network	arch:pending,debian:pend
 doctor-turbo	["doctor","--turbo"]	read	-	declared	-	qemu	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
 run-watch	["run","--watch","smoke"]	interactive	-	declared	-	pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
 env-share-flags	["env","share","--public","--description","Probe Gist"]	service-mutation	-	declared	-	network,credentialed	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
+env-share-missing-lock	["env","share"]	controlled-error	1	pass	-	hermetic	hermetic:pass	env-share-missing-lock	tempdir-drop
 self-update-force	["self-update","--force"]	service-mutation	-	declared	-	network	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	host-state-restore
-self-update-version	["self-update","--version","0.0.1"]	service-mutation	-	declared	-	network	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	host-state-restore
+self-update-version	["self-update","--version","0.0.1"]	controlled-error	1	pass	-	hermetic	hermetic:pass	self-update-downgrade-refusal	tempdir-drop
 container-run-detached	["container","run","--name","smoke","--detach","--env","SMOKE=1","--volume","/tmp:/tmp","--workdir","/tmp","debian:bookworm"]	service-mutation	-	declared	-	nested-container	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
 container-run-interactive	["container","run","--interactive","--name","smoke-tty","debian:bookworm"]	interactive	-	declared	-	nested-container,pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
 container-shell-flags	["container","shell","--image","debian:bookworm","--workdir","/tmp","--env","SMOKE=1","--volume","/tmp:/tmp"]	interactive	-	declared	-	nested-container,pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
