@@ -58,6 +58,10 @@ pub use types::{parse_version, parse_version_or_zero, zero_version};
 pub fn search_sync(query: &str) -> anyhow::Result<Vec<SyncPackage>> {
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {
+        #[cfg(feature = "debian")]
+        if !crate::core::paths::test_mode() {
+            return apt::search_sync(query);
+        }
         return Ok(debian_db::search_fast(query)?
             .into_iter()
             .map(|pkg| SyncPackage {
@@ -250,6 +254,10 @@ pub fn get_package_info(name: &str) -> anyhow::Result<Option<types::PackageInfo>
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {
+        #[cfg(feature = "debian")]
+        if !crate::core::paths::test_mode() {
+            return apt::get_sync_pkg_info(name);
+        }
         return package_info_from_debian_db(name);
     }
 
@@ -260,7 +268,12 @@ pub fn get_package_info(name: &str) -> anyhow::Result<Option<types::PackageInfo>
         not(feature = "arch"),
         any(feature = "debian", feature = "debian-pure")
     ))]
-    return package_info_from_debian_db(name);
+    {
+        #[cfg(feature = "debian")]
+        return apt::get_sync_pkg_info(name);
+        #[cfg(not(feature = "debian"))]
+        return package_info_from_debian_db(name);
+    }
 
     #[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
     anyhow::bail!("No package manager backend enabled to query {name}")

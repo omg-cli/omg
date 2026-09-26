@@ -24,6 +24,38 @@ fn assert_debian_platform_purity(result: &CommandResult, context: &str) {
     assert_no_macos_terms(&output, context);
 }
 
+#[cfg(feature = "debian")]
+fn run_native_apt_pocket_fixture(scenario: &str) {
+    let output = std::process::Command::new("python3")
+        .args([
+            "scripts/test-debian-apt-candidates.py",
+            "--omg-binary",
+            assert_cmd::cargo::cargo_bin!("omg")
+                .to_str()
+                .expect("OMG executable path is UTF-8"),
+            "--scenario",
+            scenario,
+        ])
+        .env_remove("OMG_TEST_MODE")
+        .env_remove("OMG_TEST_DISTRO")
+        .env("OMG_DISABLE_TELEMETRY", "1")
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run isolated native APT pocket fixture");
+    assert!(
+        output.status.success(),
+        "APT {scenario} pocket fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("PASS: native APT {scenario} candidate")),
+        "APT pocket fixture emitted no success receipt: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // DOCKER INTEGRATION
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -227,6 +259,51 @@ mod apt_integration {
             rows.get("Description")
                 .is_some_and(|description| !description.is_empty()),
             "{stdout}"
+        );
+    }
+
+    #[cfg(feature = "debian")]
+    #[test]
+    fn test_native_search_uses_apt_candidate() {
+        let candidate = native_candidate("apt");
+        let output = native_info(&["search", "apt", "--json", "--no-aur", "--limit", "3"]);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&output.stdout).expect("search returns a JSON array");
+        let row = rows
+            .iter()
+            .find(|row| row["name"] == "apt")
+            .expect("native search must include the exact apt package");
+        assert_eq!(row["version"], candidate, "{rows:?}");
+    }
+
+    #[cfg(feature = "debian")]
+    #[test]
+    fn test_native_install_preview_matches_apt_simulation() {
+        let native = std::process::Command::new("apt-get")
+            .args(["-s", "install", "--", "apt"])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("simulate native APT install");
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let expected = String::from_utf8(native.stdout).expect("APT simulation is UTF-8");
+        assert!(
+            !expected.trim().is_empty(),
+            "APT simulation produced no plan"
+        );
+
+        let output = native_info(&["install", "--dry-run", "apt"]);
+        let actual = String::from_utf8(output.stdout).expect("OMG preview is UTF-8");
+        assert!(
+            actual.contains(expected.trim()),
+            "OMG preview disagrees with native APT simulation\nexpected:\n{expected}\nactual:\n{actual}"
+        );
+        assert!(
+            actual.contains("No changes will be made (dry run)"),
+            "{actual}"
         );
     }
 
@@ -637,8 +714,10 @@ mod ubuntu_specific {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod debian_specific {
+    #[cfg(feature = "debian")]
     use super::*;
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_debian_stable_packages() {
         require_debian!();
@@ -670,24 +749,16 @@ mod debian_specific {
         }
     }
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_debian_security_repo() {
-        require_system_tests!();
-        require_debian!();
-
-        // Security updates should be searchable
-        let result = run_omg(&["search", "openssl"]);
-        result.assert_success();
+        run_native_apt_pocket_fixture("security");
     }
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_debian_backports_awareness() {
-        require_system_tests!();
-        require_debian!();
-
-        // Should handle backports if configured
-        let result = run_omg(&["status"]);
-        result.assert_success();
+        run_native_apt_pocket_fixture("backports");
     }
 }
 
