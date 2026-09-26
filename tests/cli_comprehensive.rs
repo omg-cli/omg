@@ -588,6 +588,9 @@ enum Assertion {
     ConfigValidatePersisted,
     ConfigPathIsolated,
     ConfigResetDefaults,
+    PrivacyOptedOut,
+    PrivacyStatusDisabled,
+    PrivacyOptedIn,
 }
 
 impl Assertion {
@@ -625,6 +628,9 @@ impl Assertion {
             "config-validate-persisted" => Self::ConfigValidatePersisted,
             "config-path-isolated" => Self::ConfigPathIsolated,
             "config-reset-defaults" => Self::ConfigResetDefaults,
+            "privacy-opted-out" => Self::PrivacyOptedOut,
+            "privacy-status-disabled" => Self::PrivacyStatusDisabled,
+            "privacy-opted-in" => Self::PrivacyOptedIn,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1306,11 +1312,18 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .exit_for(Distro::Arch)
         };
         let args: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
-        let config_dir = project.path().join(if case.id == "config-path" {
+        let privacy_case = matches!(
+            case.id.as_str(),
+            "privacy-opt-out" | "privacy-status" | "privacy-opt-in"
+        );
+        let config_dir = project.path().join(if privacy_case {
+            "privacy-state"
+        } else if case.id == "config-path" {
             "config-path-only"
         } else {
             "config-state"
         });
+        let privacy_data_dir = project.path().join("privacy-data");
         let mut command_env = vec![
             ("HOME", home.as_str()),
             ("PATH", path.as_str()),
@@ -1321,11 +1334,22 @@ fn behavior_inventory_runs_in_hermetic_state() {
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
         ];
-        if case.id.starts_with("config-") {
+        if case.id.starts_with("config-") || privacy_case {
             command_env.push((
                 "OMG_CONFIG_DIR",
                 config_dir.to_str().expect("UTF-8 config path"),
             ));
+        }
+        if privacy_case {
+            command_env.push((
+                "OMG_DATA_DIR",
+                privacy_data_dir.to_str().expect("UTF-8 privacy data path"),
+            ));
+        }
+        if case.id == "privacy-opt-out" {
+            std::fs::create_dir_all(&privacy_data_dir).expect("create privacy data directory");
+            std::fs::write(privacy_data_dir.join("telemetry_queue.json"), b"queued")
+                .expect("seed queued telemetry");
         }
         let started = Instant::now();
         let result = project.run_with_env(&args, &command_env);
@@ -1381,6 +1405,37 @@ fn behavior_inventory_runs_in_hermetic_state() {
         };
         for assertion in &case.assertions {
             match assertion {
+                Assertion::PrivacyOptedOut => {
+                    if !config_value_is(&config_file, "false")
+                        || !privacy_data_dir
+                            .join("telemetry_queue.json")
+                            .symlink_metadata()
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        || !result.stdout.contains("Telemetry disabled locally")
+                    {
+                        issues.push(
+                            "privacy opt-out did not persist disabled and purge queue".to_string(),
+                        );
+                    }
+                }
+                Assertion::PrivacyStatusDisabled => {
+                    if !config_value_is(&config_file, "false")
+                        || !result
+                            .stdout
+                            .lines()
+                            .any(|line| line.trim() == "Telemetry: Disabled")
+                    {
+                        issues
+                            .push("privacy status did not reflect disabled telemetry".to_string());
+                    }
+                }
+                Assertion::PrivacyOptedIn => {
+                    if !config_value_is(&config_file, "true")
+                        || !result.stdout.contains("Telemetry enabled locally")
+                    {
+                        issues.push("privacy opt-in did not persist enabled telemetry".to_string());
+                    }
+                }
                 Assertion::ConfigSetPersisted => {
                     if !config_value_is(&config_file, "true")
                         || !result.stdout.contains("Set telemetry.enabled = true")

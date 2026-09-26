@@ -192,6 +192,40 @@ esac
                 self.assertIn('assertion failed: config', logs[case + '.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_privacy_rows_require_persisted_state_and_queue_purge(self):
+        rows = [
+            'privacy-opt-out\t["privacy","opt-out"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\tprivacy-opted-out\ttempdir-drop',
+            'privacy-status\t["privacy","status"]\tread\t0\tpass\tprivacy-opt-out\thermetic\thermetic:pass\tprivacy-status-disabled\ttempdir-drop',
+            'privacy-opt-in\t["privacy","opt-in"]\tisolated-write\t0\tpass\tprivacy-opt-out\thermetic\thermetic:pass\tprivacy-opted-in\ttempdir-drop',
+        ]
+        product = r'''file="$OMG_CONFIG_DIR/config.toml"
+case "$1:$2" in
+  privacy:opt-out) mkdir -p "$OMG_CONFIG_DIR"; rm "$OMG_DATA_DIR/telemetry_queue.json"; printf 'telemetry_enabled = false\n' > "$file"; echo 'Telemetry disabled locally' ;;
+  privacy:status) echo '  Telemetry: Disabled' ;;
+  privacy:opt-in) printf 'telemetry_enabled = true\n' > "$file"; echo 'Telemetry enabled locally' ;;
+  *) exit 77 ;;
+esac
+'''
+        result, evidence, logs = self.run_inventory(product, rows)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows), logs)
+
+        faults = (
+            ("printf 'telemetry_enabled = false\\n' > \"$file\"", ':', 'privacy-opt-out'),
+            ('rm "$OMG_DATA_DIR/telemetry_queue.json"', ':', 'privacy-opt-out'),
+            ("privacy:status) echo '  Telemetry: Disabled'", "privacy:status) echo '  Telemetry: Enabled'", 'privacy-status'),
+            ("printf 'telemetry_enabled = true\\n' > \"$file\"", ':', 'privacy-opt-in'),
+        )
+        for old, new, case in faults:
+            with self.subTest(case=case, mutation=old):
+                self.assertIn(old, product)
+                result, evidence, logs = self.run_inventory(product.replace(old, new, 1), rows)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                observed = {row['case_id'].removeprefix('qemu-arch-'): row['result'] for row in evidence}
+                self.assertEqual(observed[case], 'FAIL', logs)
+                self.assertIn('assertion failed: privacy', logs[case + '.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_counter_rows_require_native_counts_and_block_failed_references(self):
         cases = {'ec': 'explicit-shortcut', 'tc': 'total-shortcut',
                  'oc': 'orphan-shortcut', 'uc': 'updates-shortcut'}

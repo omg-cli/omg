@@ -50,10 +50,10 @@ config-validate	["config","validate"]	read	0	pass	config-set	hermetic	hermetic:p
 config-path	["config","path"]	read	0	pass	-	hermetic	hermetic:pass	config-path-isolated	tempdir-drop
 config-reset	["config","reset","--yes"]	isolated-write	0	pass	config-set	hermetic	hermetic:pass	config-reset-defaults	tempdir-drop
 privacy	["privacy"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-privacy-status	["privacy","status"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+privacy-opt-out	["privacy","opt-out"]	isolated-write	0	pass	-	hermetic	hermetic:pass	privacy-opted-out	tempdir-drop
+privacy-status	["privacy","status"]	read	0	pass	privacy-opt-out	hermetic	hermetic:pass	privacy-status-disabled	tempdir-drop
 privacy-export	["privacy","export","--output","${ROOT}/privacy.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	artifact:privacy.json	tempdir-drop
-privacy-opt-out	["privacy","opt-out"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-privacy-opt-in	["privacy","opt-in"]	isolated-write	0	pass	privacy-opt-out	hermetic	hermetic:pass	-	tempdir-drop
+privacy-opt-in	["privacy","opt-in"]	isolated-write	0	pass	privacy-opt-out	hermetic	hermetic:pass	privacy-opted-in	tempdir-drop
 generate-man	["generate-man","--output","${ROOT}/man"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 daemon-status	["daemon-status"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 completions	["completions","bash","--stdout"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
