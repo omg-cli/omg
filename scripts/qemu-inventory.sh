@@ -62,6 +62,165 @@ check_native_counter() {
   [[ "$actual" =~ ^[0-9]+$ && "$actual" == "$expected" ]]
 }
 
+check_status_native_counts() {
+  local distro=$1 mode=$2 output=$3 line total explicit updates orphans field value oracle_rc
+  local -a fields=(tc ec)
+  if [[ $(grep -Ec '^[[:space:]]*[0-9]+ packages installed · [0-9]+ explicit$' "$output") != 1 ]]; then
+    printf 'assertion failed: status lacks exactly one package-count summary\n' >&2
+    return 1
+  fi
+  line=$(grep -E '^[[:space:]]*[0-9]+ packages installed · [0-9]+ explicit$' "$output")
+  read -r total _ _ _ explicit _ <<< "$line"
+  if [[ "$mode" == fast ]]; then
+    if ! grep -Fq 'Updates and orphans not checked. Run omg status for a full check.' "$output" \
+      || grep -Eq '^[[:space:]]*(Updates|Orphans)[[:space:]]+[0-9]+$' "$output"; then
+      printf 'assertion failed: fast status did not distinguish unqueried updates and orphans\n' >&2
+      return 1
+    fi
+  elif [[ "$mode" == full ]]; then
+    if grep -Fq 'Updates and orphans not checked.' "$output" \
+      || [[ $(grep -Ec '^[[:space:]]*Updates[[:space:]]+[0-9]+$' "$output") != 1 ]] \
+      || [[ $(grep -Ec '^[[:space:]]*Orphans[[:space:]]+[0-9]+$' "$output") != 1 ]]; then
+      printf 'assertion failed: full status lacks queried updates or orphan counts\n' >&2
+      return 1
+    fi
+    updates=$(awk '$1 == "Updates" && $2 ~ /^[0-9]+$/ {print $2}' "$output")
+    orphans=$(awk '$1 == "Orphans" && $2 ~ /^[0-9]+$/ {print $2}' "$output")
+    fields+=(uc oc)
+  else
+    return 2
+  fi
+  for field in "${fields[@]}"; do
+    case "$field" in tc) value=$total ;; ec) value=$explicit ;; uc) value=$updates ;; oc) value=$orphans ;; esac
+    printf '%s\n' "$value" > native-count-observed
+    oracle_rc=0
+    check_native_counter "$distro" "$field" native-count-observed || oracle_rc=$?
+    if [[ "$oracle_rc" != 0 ]]; then
+      if [[ "$oracle_rc" == 1 ]]; then
+        printf 'assertion failed: status %s disagrees with the native %s package database\n' "$field" "$distro" >&2
+      fi
+      return "$oracle_rc"
+    fi
+  done
+}
+
+check_outdated_native_count() {
+  local distro=$1 format=$2 output=$3 actual oracle_rc=0
+  if [[ "$format" == json ]]; then
+    if ! jq -e -s 'length == 1 and (.[0] | type == "array" and
+      all(.[]; (.name | type == "string" and length > 0) and
+               (.current_version | type == "string" and length > 0) and
+               (.new_version | type == "string" and length > 0)))' "$output" >/dev/null; then
+      printf 'assertion failed: outdated JSON is not one nonempty-version update array\n' >&2
+      return 1
+    fi
+    actual=$(jq -r 'length' "$output")
+  elif [[ "$format" == text ]]; then
+    if grep -Fq 'Everything is up to date!' "$output"; then
+      if grep -Fq '[Available Updates]' "$output"; then
+        printf 'assertion failed: outdated reports both updates and no updates\n' >&2
+        return 1
+      fi
+      actual=0
+    elif [[ $(grep -Ec '^\[Available Updates\] [0-9]+ packages total$' "$output") == 1 ]]; then
+      actual=$(awk '$1 == "[Available" && $2 == "Updates]" {print $3}' "$output")
+      if [[ "$actual" == 0 ]]; then
+        printf 'assertion failed: outdated rendered zero as available updates\n' >&2
+        return 1
+      fi
+    else
+      printf 'assertion failed: outdated lacks a definitive update count\n' >&2
+      return 1
+    fi
+  else
+    return 2
+  fi
+  printf '%s\n' "$actual" > native-count-observed
+  check_native_counter "$distro" uc native-count-observed || oracle_rc=$?
+  if [[ "$oracle_rc" == 1 ]]; then
+    printf 'assertion failed: outdated count disagrees with the native %s package manager\n' "$distro" >&2
+  fi
+  return "$oracle_rc"
+}
+
+# BEGIN DOCTOR BACKEND ORACLE
+check_doctor_native_backend() {
+  local distro=$1 output=$2 os_release=${3:-/etc/os-release} guest_id expected
+  if [[ ! -f "$os_release" ]]; then
+    printf 'native doctor reference lacks an os-release file\n' >&2
+    return 2
+  fi
+  guest_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")
+  if [[ "$guest_id" != "$distro" ]]; then
+    printf 'native doctor reference expected %s guest, found %s\n' "$distro" "$guest_id" >&2
+    return 2
+  fi
+  case "$distro" in
+    arch) expected='Arch Linux detected' ;;
+    debian|ubuntu) expected='Debian/Ubuntu detected (apt backend)' ;;
+    fedora) expected='Fedora/RHEL detected (dnf backend)' ;;
+    *) return 2 ;;
+  esac
+  if [[ $(grep -Fxc "  $expected" "$output") != 1 ]] \
+    || [[ $(grep -Ec '^  (Arch Linux detected|Debian/Ubuntu detected \(apt backend\)|Fedora/RHEL detected \(dnf backend\))$' "$output") != 1 ]]; then
+    printf 'assertion failed: doctor did not identify the native %s backend exactly once\n' "$distro" >&2
+    return 1
+  fi
+  case "$distro" in
+    arch)
+      grep -Fq 'ALPM local package database (/var/lib/pacman/local)' "$output" || {
+        printf 'assertion failed: doctor omitted the Arch package database health check\n' >&2
+        return 1
+      } ;;
+    debian|ubuntu)
+      if ! grep -Fq 'dpkg package database (/var/lib/dpkg/status)' "$output" \
+        || ! grep -Fq 'APT package indexes (/var/lib/apt/lists)' "$output"; then
+        printf 'assertion failed: doctor omitted an APT or dpkg health check\n' >&2
+        return 1
+      fi ;;
+  esac
+}
+# END DOCTOR BACKEND ORACLE
+
+# BEGIN INFO NATIVE PACKAGE ORACLE
+check_info_native_package() {
+  local distro=$1 output=$2 status=0 version source actual_version actual_source
+  case "$distro" in
+    arch)
+      timeout --kill-after=2s 30 pacman -Si pacman > native-info.raw 2> native-info.stderr || status=$?
+      version=$(awk '$1 == "Version" && $2 == ":" {print $3}' native-info.raw)
+      source=$(awk '$1 == "Repository" && $2 == ":" {print "Official repository (" $3 ")"}' native-info.raw) ;;
+    debian|ubuntu)
+      timeout --kill-after=2s 30 apt-cache policy pacman > native-info.raw 2> native-info.stderr || status=$?
+      version=$(awk '$1 == "Candidate:" {print $2}' native-info.raw)
+      source='Official repository (apt)' ;;
+    fedora)
+      timeout --kill-after=2s 30 dnf --cacheonly repoquery pacman --latest-limit=1 --queryformat '%{evr}' > native-info.raw 2> native-info.stderr || status=$?
+      version=$(cat native-info.raw)
+      source='Official repository (dnf)' ;;
+    *) return 2 ;;
+  esac
+  if [[ "$status" != 0 || -z "$version" || "$version" == '(none)' || "$version" == *$'\n'* || -z "$source" || "$source" == *$'\n'* ]]; then
+    printf 'native info reference failed for %s: exit=%s version=%q source=%q\n' "$distro" "$status" "$version" "$source" >&2
+    head -c 4096 native-info.stderr >&2
+    return 2
+  fi
+  if [[ $(grep -Ec '^[[:space:]]*Name: pacman$' "$output") != 1 \
+    || $(grep -Ec '^[[:space:]]*Version: ' "$output") != 1 \
+    || $(grep -Ec '^[[:space:]]*Source: ' "$output") != 1 ]]; then
+    printf 'assertion failed: info omitted a unique pacman name, version, or source\n' >&2
+    return 1
+  fi
+  actual_version=$(awk '$1 == "Version:" {print $2}' "$output")
+  actual_source=$(sed -n 's/^[[:space:]]*Source: //p' "$output")
+  printf 'native info %s expected=%s source=%s actual=%s source=%s\n' "$distro" "$version" "$source" "$actual_version" "$actual_source" >&2
+  if [[ "$actual_version" != "$version" || "$actual_source" != "$source" ]]; then
+    printf 'assertion failed: info disagrees with the native %s package catalog\n' "$distro" >&2
+    return 1
+  fi
+}
+# END INFO NATIVE PACKAGE ORACLE
+
 check_native_tree_state() {
   local distro=$1 expected=$2 tree_binary=${3:-/usr/bin/tree} installed=false inventory
   case "$distro" in
@@ -672,7 +831,7 @@ awk -F '\t' 'NR > 1 { if (NF != 10) exit 1; for (i = 1; i <= NF; i++) if ($i == 
 declare -A row_args=() row_requires=() row_tier=() row_safety=() row_ux=() row_exit=() row_targets=() row_assertions=() row_cleanup=()
 counter_for_case() {
   case "$1" in
-    explicit-shortcut) printf ec ;; total-shortcut) printf tc ;;
+    explicit-shortcut|explicit) printf ec ;; total-shortcut) printf tc ;;
     orphan-shortcut) printf oc ;; updates-shortcut) printf uc ;;
   esac
 }
@@ -683,7 +842,14 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and (explode | index(0) == null))' <<< "$aj" >/dev/null || exit 2
   counter=$(counter_for_case "$id")
   if [[ -n "$counter" ]]; then
-    jq -e --arg counter "$counter" 'length == 1 and .[0] == $counter' <<< "$aj" >/dev/null || exit 2
+    [[ "$a" == native-count ]] || exit 2
+    if [[ "$id" == explicit ]]; then
+      jq -e '. == ["explicit", "--count"]' <<< "$aj" >/dev/null || exit 2
+    else
+      jq -e --arg counter "$counter" 'length == 1 and .[0] == $counter' <<< "$aj" >/dev/null || exit 2
+    fi
+  elif [[ "$a" == native-count ]]; then
+    exit 2
   fi
   case "$s" in read|isolated-write|controlled-error|help-boundary|interactive|package-mutation|service-mutation) ;; *) exit 2 ;; esac
   case "$u" in pass|declared) ;; *) exit 2 ;; esac
@@ -705,7 +871,37 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package) ;; *) exit 2 ;; esac
+  if [[ "$id" == doctor ]]; then
+    [[ "$a" == doctor-native-backend ]] || exit 2
+    jq -e '. == ["doctor"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == doctor-native-backend ]]; then
+    exit 2
+  fi
+  if [[ "$id" == info ]]; then
+    [[ "$a" == info-native-package ]] || exit 2
+    jq -e '. == ["info", "pacman"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == info-native-package ]]; then
+    exit 2
+  fi
+  if [[ "$id" == status ]]; then
+    [[ "$a" == status-native-fast ]] || exit 2
+    jq -e '. == ["status", "--fast"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$id" == status-verbose ]]; then
+    [[ "$a" == status-native-full ]] || exit 2
+    jq -e '. == ["--verbose", "status"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == status-native-fast || "$a" == status-native-full ]]; then
+    exit 2
+  fi
+  if [[ "$id" == outdated ]]; then
+    [[ "$a" == outdated-native-count ]] || exit 2
+    jq -e '. == ["outdated"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$id" == outdated-json ]]; then
+    [[ "$a" == outdated-json-native-count ]] || exit 2
+    jq -e '. == ["--json", "outdated"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == outdated-native-count || "$a" == outdated-json-native-count ]]; then
+    exit 2
+  fi
   if [[ "$a" == search-official-tree-output ]]; then [[ "$id" == release-package-search-tree ]] || exit 2; fi
   if [[ "$a" == native-tree-installed ]]; then [[ "$id" == release-package-install-tree ]] || exit 2; fi
   if [[ "$a" == native-tree-absent ]]; then [[ "$id" == release-package-remove-tree ]] || exit 2; fi
@@ -901,6 +1097,14 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   counter=$(counter_for_case "$case")
   if [[ -n "$counter" ]]; then
     remote+="; $(declare -f check_native_counter)"
+  elif [[ "$assertions" == doctor-native-backend ]]; then
+    remote+="; $(declare -f check_doctor_native_backend)"
+  elif [[ "$assertions" == info-native-package ]]; then
+    remote+="; $(declare -f check_info_native_package)"
+  elif [[ "$assertions" == status-native-fast || "$assertions" == status-native-full ]]; then
+    remote+="; $(declare -f check_native_counter); $(declare -f check_status_native_counts)"
+  elif [[ "$assertions" == outdated-native-count || "$assertions" == outdated-json-native-count ]]; then
+    remote+="; $(declare -f check_native_counter); $(declare -f check_outdated_native_count)"
   fi
   if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then
     runtime_version=$(jq -r '.[2]' <<< "$args_json")
@@ -927,6 +1131,21 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ -n "$counter" ]]; then
     remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_native_counter '$distro' '$counter' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: counter fixture cleanup failed\\n' >&2; assertion=1; fi"
+  fi
+  if [[ "$assertions" == doctor-native-backend ]]; then
+    remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+  fi
+  if [[ "$assertions" == info-native-package ]]; then
+    remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_info_native_package '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+  fi
+  if [[ "$assertions" == status-native-fast || "$assertions" == status-native-full ]]; then
+    mode=${assertions#status-native-}
+    remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_status_native_counts '$distro' '$mode' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+  fi
+  if [[ "$assertions" == outdated-native-count || "$assertions" == outdated-json-native-count ]]; then
+    format=text
+    [[ "$assertions" != outdated-json-native-count ]] || format=json
+    remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_outdated_native_count '$distro' '$format' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
   fi
   if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then
     remote+="; if [ \"\$rc\" = 0 ] && ! check_${runtime_name}_install '$runtime_version'; then assertion=1; fi"
@@ -963,6 +1182,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
+  if [[ "$assertions" == outdated-native-count || "$assertions" == outdated-json-native-count ]]; then budget=$((budget + 32)); fi
+  if [[ "$assertions" == status-native-fast ]]; then budget=$((budget + 64)); fi
+  if [[ "$assertions" == status-native-full ]]; then budget=$((budget + 128)); fi
   if [[ "$case" == runtime-python-install ]]; then
     # Five venv probes can outlast the former single-probe deadline on a slow
     # guest. The SSH ceiling includes the Python oracle's worst case: five
