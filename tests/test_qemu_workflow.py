@@ -127,6 +127,16 @@ class QemuWorkflowTests(unittest.TestCase):
 
     def test_nightly_builds_restore_native_caches_without_extra_saves(self):
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
+        container_build = LANE.split('\n  build-staged:\n', 1)[1].split('\n  build-staged-ubuntu:\n', 1)[0]
+        ubuntu_build = LANE.split('\n  build-staged-ubuntu:\n', 1)[1].split('\n  guest:\n', 1)[0]
+        for build in (container_build, ubuntu_build):
+            for variable in ('CARGO_NET_RETRY: 10', 'RUSTUP_MAX_RETRIES: 10',
+                             'RUST_BACKTRACE: short', 'CARGO_PROFILE_DEV_LTO: "off"',
+                             'CARGO_PROFILE_TEST_LTO: "off"'):
+                self.assertIn(variable, ci)
+                self.assertIn(variable, build)
+        self.assertIn('20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c', container_build)
+        self.assertNotIn('dtolnay/rust-toolchain@', container_build)
         native_identity = ci.split('      - name: Compute native cache identity\n', 1)[1].split('      - name: Cache Rust dependencies\n', 1)[0]
         staged_identity = LANE.split('      - name: Compute native cache identity\n', 1)[1].split('      - name: Restore native compiled dependencies\n', 1)[0]
         self.assertEqual(staged_identity, native_identity.replace('matrix.platform', 'inputs.distro').replace('matrix.image', 'inputs.image').replace('matrix.features', 'inputs.features'))
