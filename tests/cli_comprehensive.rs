@@ -1306,20 +1306,29 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .exit_for(Distro::Arch)
         };
         let args: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
+        let config_dir = project.path().join(if case.id == "config-path" {
+            "config-path-only"
+        } else {
+            "config-state"
+        });
+        let mut command_env = vec![
+            ("HOME", home.as_str()),
+            ("PATH", path.as_str()),
+            ("SHELL", "/bin/bash"),
+            ("NO_COLOR", "1"),
+            ("TERM", "dumb"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
+        ];
+        if case.id.starts_with("config-") {
+            command_env.push((
+                "OMG_CONFIG_DIR",
+                config_dir.to_str().expect("UTF-8 config path"),
+            ));
+        }
         let started = Instant::now();
-        let result = project.run_with_env(
-            &args,
-            &[
-                ("HOME", &home),
-                ("PATH", &path),
-                ("SHELL", "/bin/bash"),
-                ("NO_COLOR", "1"),
-                ("TERM", "dumb"),
-                ("GIT_CONFIG_GLOBAL", "/dev/null"),
-                ("GIT_CONFIG_NOSYSTEM", "1"),
-                ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
-            ],
-        );
+        let result = project.run_with_env(&args, &command_env);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut issues = Vec::new();
         if result.exit_code != expected_exit {
@@ -1353,8 +1362,73 @@ fn behavior_inventory_runs_in_hermetic_state() {
         {
             issues.push("empty-inventory audit did not report its completed scan".to_string());
         }
+        let config_file = config_dir.join("config.toml");
+        let config_value_is = |file: &std::path::Path, expected: &str| {
+            file.symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                && std::fs::read_to_string(file).is_ok_and(|contents| {
+                    let assignments: Vec<_> = contents
+                        .lines()
+                        .filter(|line| {
+                            line.trim_start()
+                                .strip_prefix("telemetry_enabled")
+                                .is_some_and(|rest| rest.trim_start().starts_with('='))
+                        })
+                        .collect();
+                    assignments.len() == 1
+                        && assignments[0] == format!("telemetry_enabled = {expected}")
+                })
+        };
         for assertion in &case.assertions {
             match assertion {
+                Assertion::ConfigSetPersisted => {
+                    if !config_value_is(&config_file, "true")
+                        || !result.stdout.contains("Set telemetry.enabled = true")
+                    {
+                        issues.push("config set did not persist true".to_string());
+                    }
+                }
+                Assertion::ConfigGetPersisted => {
+                    if !config_value_is(&config_file, "true")
+                        || result.stdout.trim_end_matches('\n') != "true"
+                    {
+                        issues.push("config get disagrees with persisted true".to_string());
+                    }
+                }
+                Assertion::ConfigListPersisted => {
+                    if !config_value_is(&config_file, "true")
+                        || !result
+                            .stdout
+                            .lines()
+                            .any(|line| line.trim() == "telemetry.enabled = true")
+                    {
+                        issues.push("config list omits persisted telemetry value".to_string());
+                    }
+                }
+                Assertion::ConfigValidatePersisted => {
+                    if !config_value_is(&config_file, "true")
+                        || !result.stdout.contains("Configuration is valid!")
+                    {
+                        issues.push("config validate did not check persisted config".to_string());
+                    }
+                }
+                Assertion::ConfigPathIsolated => {
+                    if result.stdout.trim_end_matches('\n') != config_file.to_string_lossy()
+                        || !config_file
+                            .symlink_metadata()
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        issues.push("config path did not name isolated config file".to_string());
+                    }
+                }
+                Assertion::ConfigResetDefaults => {
+                    if !config_value_is(&config_file, "false")
+                        || !config_value_is(&config_file.with_extension("toml.backup"), "true")
+                        || !result.stdout.contains("Configuration reset to defaults")
+                    {
+                        issues.push("config reset did not restore defaults and backup".to_string());
+                    }
+                }
                 Assertion::SbomSourceFailure => {
                     let report = std::fs::read_to_string(project.path().join("sbom.json"))
                         .ok()
@@ -1489,13 +1563,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::OutdatedNativeCount
                 | Assertion::OutdatedJsonNativeCount
                 | Assertion::DoctorNativeBackend
-                | Assertion::InfoNativePackage
-                | Assertion::ConfigSetPersisted
-                | Assertion::ConfigGetPersisted
-                | Assertion::ConfigListPersisted
-                | Assertion::ConfigValidatePersisted
-                | Assertion::ConfigPathIsolated
-                | Assertion::ConfigResetDefaults => {
+                | Assertion::InfoNativePackage => {
                     unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
             }
