@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 # Exercise the real installer functions with isolated transport/tool fixtures.
 set -euo pipefail
+# Every assertion below aborts the run on failure. Report which command failed
+# (and, inside the scenario loop, which scenario) so a hosted flake is
+# diagnosable from the job log alone.
+set -E
+trap 'printf "installer_security: command failed (exit %s): %s\n" "$?" "$BASH_COMMAND" >&2' ERR
+# A killed probe needs a moment to actually die on a loaded runner. The
+# invariant is unchanged: nothing may survive the probe.
+wait_until_dead() {
+  local pid=$1 attempt
+  for attempt in $(seq 1 25); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  return 1
+}
 cd "$(dirname "$0")/.."
 task_dir=$(mktemp -d)
 trap 'rm -rf "$task_dir"' EXIT
@@ -11,6 +26,7 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
     source "$task_dir/functions.sh"
     trap - EXIT
     set -e
+    trap 'printf "installer_security: scenario %s: command failed (exit %s): %s\n" "$scenario" "$?" "$BASH_COMMAND" >&2' ERR
     scenario_dir="$task_dir/$scenario"
     mkdir -p "$scenario_dir"
     INSTALL_DIR="$scenario_dir/bin"
@@ -103,7 +119,7 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
         hung_probe)
           grep -F 'omg version probe timed out' "$scenario_dir/output"
           [[ -s "$scenario_dir/probe.pid" ]]
-          if kill -0 "$(cat "$scenario_dir/probe.pid")" 2>/dev/null; then
+          if ! wait_until_dead "$(cat "$scenario_dir/probe.pid")"; then
             printf 'Hung version probe was left running\n' >&2
             exit 1
           fi
@@ -111,12 +127,16 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
         forked_probe)
           grep -F 'omg version probe left descendant processes running' "$scenario_dir/output"
           [[ -s "$scenario_dir/descendant.pid" ]]
+          if ! wait_until_dead "$(cat "$scenario_dir/descendant.pid")"; then
+            kill -KILL "$(cat "$scenario_dir/descendant.pid")" 2>/dev/null || true
+            printf 'Forked version probe descendant was left running\n' >&2
+            exit 1
+          fi
           heartbeat_before=$(wc -c < "$scenario_dir/descendant.heartbeat")
           sleep 0.1
           heartbeat_after=$(wc -c < "$scenario_dir/descendant.heartbeat")
           if [[ "$heartbeat_after" != "$heartbeat_before" ]]; then
-            kill -KILL "$(cat "$scenario_dir/descendant.pid")" 2>/dev/null || true
-            printf 'Forked version probe descendant was left running\n' >&2
+            printf 'Forked version probe descendant kept writing after the probe\n' >&2
             exit 1
           fi
           ;;
