@@ -145,6 +145,7 @@ class QemuWorkflowTests(unittest.TestCase):
         self.assertIn('prefix-key: v2-platform-dependencies', native_cache)
         self.assertIn('shared-key: ${{ steps.cache-key.outputs.key }}', native_cache)
         self.assertIn('prefix-key: v1-ubuntu-debian', ubuntu_cache)
+        self.assertIn('shared-key: ubuntu', ubuntu_cache)
         for cache in (native_cache, ubuntu_cache):
             self.assertIn('save-if: false', cache)
             self.assertNotIn('qemu-staged-v1', cache)

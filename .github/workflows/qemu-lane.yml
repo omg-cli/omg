@@ -179,6 +179,7 @@ jobs:
           ZSTD_CLEVEL: "6"
         with:
           prefix-key: v1-ubuntu-debian
+          shared-key: ubuntu
           save-if: false
 
       - name: Run library and binary unit tests (including omgd)
