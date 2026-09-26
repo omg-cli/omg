@@ -557,6 +557,8 @@ impl TargetExpectations {
 enum Assertion {
     AuditSourceFailure,
     AuditFixRefusal,
+    AuditSecretScoped,
+    AuditSecretCritical,
     SbomSourceFailure,
     SbomInventoryOnly,
     JsonStdout,
@@ -622,6 +624,8 @@ impl Assertion {
         match raw {
             "audit-source-failure" => Self::AuditSourceFailure,
             "audit-fix-refusal" => Self::AuditFixRefusal,
+            "audit-secret-scoped" => Self::AuditSecretScoped,
+            "audit-secret-critical" => Self::AuditSecretCritical,
             "sbom-source-failure" => Self::SbomSourceFailure,
             "sbom-inventory-only" => Self::SbomInventoryOnly,
             "json-stdout" => Self::JsonStdout,
@@ -1390,6 +1394,21 @@ fn behavior_inventory_runs_in_hermetic_state() {
             std::fs::write(privacy_data_dir.join("telemetry_queue.json"), b"queued")
                 .expect("seed queued telemetry");
         }
+        if case.id == "audit-secrets" {
+            project.create_file(
+                "project/config.txt",
+                &format!("password={}{}\n", "qemuSecret", "7429"),
+            );
+            project.create_file(
+                "outside.txt",
+                &format!("password={}{}\n", "outsideSecret", "9031"),
+            );
+        } else if case.id == "audit-secrets-critical" {
+            project.create_file(
+                "project/critical/key.pem",
+                &format!("{}{}\n", "-----BEGIN ", "PRIVATE KEY-----"),
+            );
+        }
         let started = Instant::now();
         let result = project.run_with_env(&args, &command_env);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1571,6 +1590,35 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         "audit assertion requires an explicit empty-inventory oracle"
                     );
                 }
+                Assertion::AuditSecretScoped => {
+                    if !result.stdout.contains("⚠ Found 1 potential secrets:")
+                        || !result.stdout.contains("  ● 1 MEDIUM")
+                        || !result.stdout.contains("  [MEDIUM] Password in project/config.txt:1")
+                        || !result.stdout.contains("      pass**********...7429")
+                        || result.stdout.contains("No secrets detected")
+                        || result.stdout.contains("outside.txt")
+                        || result.stdout.contains("outsideSecret9031")
+                        || result.stdout.contains("qemuSecret7429")
+                        || result.stderr.contains("qemuSecret7429")
+                        || result.stdout.matches("  [MEDIUM] Password in ").count() != 1
+                    {
+                        issues.push("scoped secret scan did not report one redacted medium finding".to_string());
+                    }
+                }
+                Assertion::AuditSecretCritical => {
+                    let raw_marker = format!("{}{}", "-----BEGIN ", "PRIVATE KEY-----");
+                    if !result.stdout.contains("⚠ Found 1 potential secrets:")
+                        || !result.stdout.contains("  ● 1 CRITICAL")
+                        || !result.stdout.contains("  [CRITICAL] Private Key in project/critical/key.pem:1")
+                        || !result.stdout.contains("      ----**********...----")
+                        || result.stdout.contains(&raw_marker)
+                        || result.stderr.contains(&raw_marker)
+                        || result.stdout.matches("  [CRITICAL] Private Key in ").count() != 1
+                        || !result.stderr.contains("Secret scan failed: 1 critical secret finding(s) require remediation")
+                    {
+                        issues.push("critical secret scan did not fail and redact the key fixture".to_string());
+                    }
+                }
                 Assertion::HooksInstalled | Assertion::HooksAbsent => {
                     use std::os::unix::fs::PermissionsExt as _;
                     for (name, label) in [
@@ -1679,6 +1727,16 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::PrivacyStatusEnabled => {
                     unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
+            }
+        }
+
+        for path in match case.id.as_str() {
+            "audit-secrets" => &["project/config.txt", "outside.txt"][..],
+            "audit-secrets-critical" => &["project/critical/key.pem"][..],
+            _ => &[][..],
+        } {
+            if let Err(error) = std::fs::remove_file(project.path().join(path)) {
+                issues.push(format!("failed to remove secret fixture {path}: {error}"));
             }
         }
 

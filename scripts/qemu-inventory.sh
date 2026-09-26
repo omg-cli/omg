@@ -763,6 +763,29 @@ check_product_output() {
       printf 'assertion failed: offline audit did not explicitly refuse an unavailable advisory source\n' >&2; return 1
     fi
   fi
+  if [[ "$assertion" == audit-secret-scoped ]]; then
+    if [[ "$code" != 0 ]] \
+      || ! grep -Fxq '⚠ Found 1 potential secrets:' "$stdout" \
+      || ! grep -Fxq '  ● 1 MEDIUM' "$stdout" \
+      || ! grep -Fxq '  [MEDIUM] Password in project/config.txt:1' "$stdout" \
+      || ! grep -Fxq '      pass**********...7429' "$stdout" \
+      || [[ $(grep -Ec '^  \[(LOW|MEDIUM|HIGH|CRITICAL)\]' "$stdout") != 1 ]] \
+      || grep -Eq 'No secrets detected|outside\.txt|qemuSecret7429|outsideSecret9031' "$stdout" "$stderr"; then
+      printf 'assertion failed: scoped secret scan missed, misclassified, or exposed the fixture\n' >&2; return 1
+    fi
+  fi
+  if [[ "$assertion" == audit-secret-critical ]]; then
+    if [[ "$code" != 1 ]] \
+      || ! grep -Fxq '⚠ Found 1 potential secrets:' "$stdout" \
+      || ! grep -Fxq '  ● 1 CRITICAL' "$stdout" \
+      || ! grep -Fxq '  [CRITICAL] Private Key in project/critical/key.pem:1' "$stdout" \
+      || ! grep -Fxq '      ----**********...----' "$stdout" \
+      || ! grep -Fxq 'Error: Secret scan failed: 1 critical secret finding(s) require remediation' "$stderr" \
+      || [[ $(grep -Ec '^  \[(LOW|MEDIUM|HIGH|CRITICAL)\]' "$stdout") != 1 ]] \
+      || grep -Fq -- "$(printf '%s%s' '-----BEGIN ' 'PRIVATE KEY-----')" "$stdout" "$stderr"; then
+      printf 'assertion failed: critical secret scan did not fail closed and redact the fixture\n' >&2; return 1
+    fi
+  fi
   if [[ "$assertion" == sbom-source-failure ]]; then
     if [[ "$code" != 1 || -e sbom.json || -L sbom.json ]] \
       || ! grep -Eq '^Error: Failed to generate system SBOM: Failed to generate a complete security SBOM: (Failed to scan package .+ for vulnerabilities: Failed to query the OSV vulnerability database|Failed to query native security advisories)' "$stderr" \
@@ -1086,7 +1109,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
   case "$id" in
     snapshot-create|migrate-export|migrate-import|env-capture|env-check|team-status|team-push|team-pull)
       [[ "$a" == "fingerprint:$id" ]] || exit 2 ;;
@@ -1154,6 +1177,15 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     [[ "$a" == doctor-network-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == container ]] || exit 2
     jq -e '. == ["doctor", "--network"]' <<< "$aj" >/dev/null || exit 2
   elif [[ "$a" == doctor-network-state ]]; then
+    exit 2
+  fi
+  if [[ "$id" == audit-secrets ]]; then
+    [[ "$a" == audit-secret-scoped && "$s" == read && "$resolved" == 0 ]] || exit 2
+    jq -e '. == ["audit", "secrets", "--path", "project"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$id" == audit-secrets-critical ]]; then
+    [[ "$a" == audit-secret-critical && "$s" == controlled-error && "$resolved" == 1 ]] || exit 2
+    jq -e '. == ["audit", "secrets", "--path", "project/critical"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == audit-secret-scoped || "$a" == audit-secret-critical ]]; then
     exit 2
   fi
   if [[ "$id" == info ]]; then
@@ -1343,6 +1375,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   remote+="; printf '%s' $overlap_fixture > workspace-overlap.sh"
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
+  if [[ "$assertions" == audit-secret-scoped ]]; then
+    remote+="; printf 'password=%s%s\n' 'qemuSecret' '7429' > project/config.txt; printf 'password=%s%s\n' 'outsideSecret' '9031' > outside.txt"
+  elif [[ "$assertions" == audit-secret-critical ]]; then
+    remote+="; mkdir -p project/critical; printf '%s%s\n' '-----BEGIN ' 'PRIVATE KEY-----' > project/critical/key.pem"
+  fi
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
   remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_privacy_oracle); $(declare -f check_product_output)"
   # The supervisor exits zero after recording a completed CLI's status.

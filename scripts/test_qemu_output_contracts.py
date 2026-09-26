@@ -146,6 +146,53 @@ class OutputContracts(unittest.TestCase):
                     self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_audit_secrets_requires_scoped_redacted_finding(self):
+        row = ('audit-secrets\t["audit","secrets","--path","project"]\tread\t0\tpass\t-\t'
+               'hermetic\thermetic:pass\taudit-secret-scoped\ttempdir-drop')
+        good = ('⚠ Found 1 potential secrets:\n  ● 1 MEDIUM\n'
+                '  [MEDIUM] Password in project/config.txt:1\n      pass**********...7429\n')
+        for output, expected in (
+            (good, 'PASS'),
+            ('✓ No secrets detected.\n', 'FAIL'),
+            (good.replace('project/config.txt', 'outside.txt'), 'FAIL'),
+            (good + '  [MEDIUM] Password in project/config.txt:1\n', 'FAIL'),
+            (good + 'password=qemuSecret7429\n', 'FAIL'),
+        ):
+            with self.subTest(expected=expected, output=output):
+                product = ('[[ -f project/config.txt && -f outside.txt ]] || exit 70\n'
+                           + 'printf %s ' + shlex.quote(output) + '\n')
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_audit_secrets_critical_requires_failure_and_redaction(self):
+        row = ('audit-secrets-critical\t["audit","secrets","--path","project/critical"]\t'
+               'controlled-error\t1\tpass\t-\thermetic\thermetic:pass\t'
+               'audit-secret-critical\ttempdir-drop')
+        good = ('⚠ Found 1 potential secrets:\n  ● 1 CRITICAL\n'
+                '  [CRITICAL] Private Key in project/critical/key.pem:1\n'
+                '      ----**********...----\n')
+        error = 'Error: Secret scan failed: 1 critical secret finding(s) require remediation'
+        raw_marker = '-----BEGIN ' + 'PRIVATE KEY-----'
+        for output, stderr, code, expected in (
+            (good, error, 1, 'PASS'),
+            (good, '', 1, 'FAIL'),
+            (good, error, 0, 'FAIL'),
+            (good + '  [CRITICAL] Private Key in project/critical/key.pem:1\n', error, 1, 'FAIL'),
+            (good + raw_marker + '\n', error, 1, 'FAIL'),
+            (good, error + '\n' + raw_marker, 1, 'FAIL'),
+        ):
+            with self.subTest(expected=expected, code=code, output=output):
+                product = ('[[ -f project/critical/key.pem ]] || exit 70\n'
+                           + 'printf %s ' + shlex.quote(output) + '\n'
+                           + 'printf %s ' + shlex.quote(stderr + '\n') + ' >&2\n'
+                           + f'exit {code}\n')
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_info_row_compares_version_and_source_to_native_catalog(self):
         row = ('info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass'
                '\tinfo-native-package\ttempdir-drop')
