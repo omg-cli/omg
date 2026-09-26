@@ -76,5 +76,4 @@ docs/* linguist-documentation
 .gitignore export-ignore
 .gitattributes export-ignore
 benchmark-hyperfine.sh export-ignore
-benchmark.sh export-ignore
 Makefile export-ignore

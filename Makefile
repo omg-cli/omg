@@ -188,13 +188,13 @@ coverage:
 # Benchmarking
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Run full benchmark suite (10 iterations, 2 warmup)
+# Run the full benchmark suite (hyperfine; see ./benchmark-hyperfine.sh --help)
 bench:
-	./benchmark.sh
+	./benchmark-hyperfine.sh
 
-# Run fast benchmark (5 iterations, 1 warmup)
+# Run the fast benchmark (hyperfine)
 bench-fast:
-	./benchmark.sh --fast
+	./benchmark-hyperfine.sh --fast
 
 # Run hyperfine benchmark (requires hyperfine: pacman -S hyperfine)
 bench-hyperfine:
@@ -243,6 +243,11 @@ docker-ubuntu-shell:
 	docker build -f Dockerfile.ubuntu -t omg-ubuntu .
 	docker run --rm -it omg-ubuntu /bin/bash
 
+# Unused dependencies; install once with: cargo install cargo-machete
+.PHONY: deps-check
+deps-check:
+	cargo-machete
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Development Workflow
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -267,7 +272,7 @@ CI_LOCAL_TARGET_DIR ?= $(HOME)/.cache/build-targets/omg-ci-local
 ci-local-quick ci-local-full: export CARGO_TARGET_DIR := $(CI_LOCAL_TARGET_DIR)
 
 check-shell-syntax:
-	@for script in install.sh benchmark.sh benchmark-hyperfine.sh scripts/*.sh; do \
+	@for script in install.sh benchmark-hyperfine.sh scripts/*.sh; do \
 		bash -n "$$script" || exit $$?; \
 	done
 
@@ -293,3 +298,9 @@ ci-local-full: ci-local-quick
 		--locked --profile ci
 	cargo nextest run --no-default-features --features arch,pgp,license \
 		--locked --profile ci --no-fail-fast
+
+# Doc audit: broken links, removed features, config keys, command references.
+.PHONY: audit-docs
+audit-docs:
+	python3 scripts/audit_docs.py
+
