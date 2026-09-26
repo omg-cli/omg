@@ -13,7 +13,7 @@ snapshot-create	["snapshot","create","--message","smoke"]	isolated-write	0	pass	
 snapshot-list	["snapshot","list"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 snapshot-restore	["snapshot","restore","missing","--dry-run"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 snapshot-delete	["snapshot","delete","missing"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-ci-init	["ci","init","github"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+ci-init	["ci","init","github"]	isolated-write	0	pass	-	hermetic	hermetic:pass	ci-github-workflow	tempdir-drop
 ci-validate	["ci","validate"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 ci-cache	["ci","cache"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 migrate-export	["migrate","export","--output","${ROOT}/manifest.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	fingerprint:migrate-export	tempdir-drop
@@ -146,7 +146,7 @@ why-reverse	["why","--reverse","pacman"]	read	arch:0,debian:0,ubuntu:0,fedora:1	
 size-tree	["size","--tree","pacman"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 diff-from	["diff","--from","missing.lock","missing-b.lock"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 snapshot-restore-yes	["snapshot","restore","missing","--yes","--dry-run"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-ci-init-advanced	["ci","init","github","--advanced"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+ci-init-advanced	["ci","init","github","--advanced"]	isolated-write	0	pass	-	hermetic	hermetic:pass	ci-github-workflow-advanced	tempdir-drop
 clean-flags	["clean","--orphans","--cache","--aur","--dry-run"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 use-uninstall	["use","--uninstall","invalid-runtime"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 list-available	["list","--available"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop

@@ -347,13 +347,17 @@ fn behavior_inventory_keeps_offline_refusal_assertions() {
 /// Rows that need their own empty project directory.
 ///
 /// The shared fixture captures an `omg.lock` (env-capture) and other state
-/// early in the run, so a row whose contract is a missing-input refusal must
-/// not inherit it - `env share` would otherwise pass the lock check and fail
-/// the assertion instead of refusing.
+/// early in the run, so missing-input refusals must not inherit it. CI init
+/// variants also need separate destinations because the command deliberately
+/// preserves an existing workflow instead of replacing it.
 fn needs_isolated_fixture(case: &BehaviorCase) -> bool {
     matches!(
         case.id.as_str(),
-        "env-export-missing-lock" | "env-plan-missing-manifest" | "env-share-missing-lock"
+        "env-export-missing-lock"
+            | "env-plan-missing-manifest"
+            | "env-share-missing-lock"
+            | "ci-init"
+            | "ci-init-advanced"
     )
 }
 
@@ -567,6 +571,8 @@ enum Assertion {
     Fingerprint(String),
     WorkspaceFilteredOutput,
     WorkspaceAllOutput,
+    CiGithubWorkflow,
+    CiGithubWorkflowAdvanced,
     HooksInstalled,
     HooksAbsent,
     UpdateFastOutput,
@@ -633,6 +639,8 @@ impl Assertion {
             "json-stdout" => Self::JsonStdout,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
+            "ci-github-workflow" => Self::CiGithubWorkflow,
+            "ci-github-workflow-advanced" => Self::CiGithubWorkflowAdvanced,
             "hooks-installed" => Self::HooksInstalled,
             "hooks-absent" => Self::HooksAbsent,
             "update-fast-output" => Self::UpdateFastOutput,
@@ -1691,6 +1699,39 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         usize::from(matches!(assertion, Assertion::WorkspaceAllOutput));
                     if primary != 1 || nested != expected_nested {
                         issues.push(format!("workspace task counts primary={primary} nested={nested}; expected primary=1 nested={expected_nested}"));
+                    }
+                }
+                Assertion::CiGithubWorkflow | Assertion::CiGithubWorkflowAdvanced => {
+                    let path = project.path().join(".github/workflows/ci.yml");
+                    let regular = path.symlink_metadata().is_ok_and(|metadata| {
+                        metadata.is_file() && !metadata.file_type().is_symlink()
+                    });
+                    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+                    let lines: Vec<_> = contents.lines().collect();
+                    let has_line = |expected: &str| lines.contains(&expected);
+                    let advanced = matches!(assertion, Assertion::CiGithubWorkflowAdvanced);
+                    let common = [
+                        "name: CI",
+                        "on: [push, pull_request]",
+                        "  contents: read",
+                        "  build-and-test:",
+                        "        run: omg run build",
+                        "        run: omg run test",
+                    ];
+                    let advanced_lines = ["          cargo audit", "          name: rust-dependencies-sbom"];
+                    if !regular
+                        || !common.iter().all(|line| has_line(line))
+                        || !lines
+                            .iter()
+                            .any(|line| line.starts_with("          OMG_VERSION=v"))
+                        || has_line("  security:") != advanced
+                        || (advanced
+                            && (!advanced_lines.iter().all(|line| has_line(line))
+                                || !lines
+                                    .iter()
+                                    .any(|line| line.starts_with("          cargo cyclonedx "))))
+                    {
+                        issues.push("ci init did not generate the expected GitHub workflow".to_string());
                     }
                 }
                 Assertion::JsonStdout => {
