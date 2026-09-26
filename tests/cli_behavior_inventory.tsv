@@ -200,3 +200,6 @@ env-export-missing-lock	["env","export","--source-target","arch-x86_64"]	control
 env-plan-missing-manifest	["env","plan","--target","ubuntu-x86_64"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 runtime-node-install	["use","node","24.21.0"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	-	tempdir-drop
 runtime-go-install	["use","go","1.27.1"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	-	tempdir-drop
+runtime-node-uninstall	["use","node","24.21.0","--uninstall"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-version-removed	tempdir-drop
+runtime-python-uninstall	["use","python","3.12.14","--uninstall"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-version-removed	tempdir-drop
+runtime-go-uninstall	["use","go","1.27.1","--uninstall"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-version-removed	tempdir-drop
