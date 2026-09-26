@@ -467,11 +467,31 @@ pub async fn run_privileged_program(program: &str, args: &[&str]) -> anyhow::Res
     if status.success() {
         Ok(())
     } else {
-        anyhow::bail!(
-            "{program} failed with exit code {}",
-            status.code().unwrap_or(1)
-        )
+        Err(describe_program_failure(program, status))
     }
+}
+
+/// Report a failed privileged program without losing how it terminated.
+///
+/// `std::process::ExitStatus::code` returns `None` when a child was terminated
+/// by a signal (std 1.98, "On Unix, this will return None if the process was
+/// terminated by a signal"), so a killed `dnf`/`apt`/`pacman` must not be
+/// reported as a generic exit-code failure: `ExitStatusExt::signal` carries the
+/// signal that actually ended it. Evidence: Fedora lane 36204199869 reported
+/// only `dnf failed with exit code 1` while the transaction row stayed in
+/// libdnf5's `STARTED` state, i.e. the run was interrupted rather than refused.
+fn describe_program_failure(program: &str, status: std::process::ExitStatus) -> anyhow::Error {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return anyhow::anyhow!("{program} was terminated by signal {signal}");
+        }
+    }
+    anyhow::anyhow!(
+        "{program} failed with exit code {}",
+        status.code().unwrap_or(1)
+    )
 }
 
 /// Check if the yes flag is set
@@ -1123,6 +1143,24 @@ mod tests {
                 "{name} must be scrubbed from sudo children"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_program_reports_signal_termination_instead_of_a_generic_exit_code() {
+        use std::os::unix::process::ExitStatusExt;
+        // Wait-status encoding: signal number in the low byte, exit code in the
+        // high byte (std::os::unix::process::ExitStatusExt::from_raw).
+        let killed = std::process::ExitStatus::from_raw(9);
+        assert_eq!(
+            super::describe_program_failure("dnf", killed).to_string(),
+            "dnf was terminated by signal 9"
+        );
+        let failed = std::process::ExitStatus::from_raw(1 << 8);
+        assert_eq!(
+            super::describe_program_failure("dnf", failed).to_string(),
+            "dnf failed with exit code 1"
+        );
     }
 
     #[test]
