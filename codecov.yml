@@ -1,0 +1,19 @@
+# Coverage is a ratchet, not a target: the project status compares against the
+# base commit, so coverage can only go up. Uploads stay non-fatal in
+# .github/workflows/coverage.yml, so a Codecov outage can never block a merge.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 0%
+    patch:
+      default:
+        target: auto
+        # New code may land slightly below the project level without noise;
+        # the project ratchet is the gate that matters.
+        threshold: 5%
+
+comment:
+  layout: "condensed_header, diff, files"
+  require_changes: false
