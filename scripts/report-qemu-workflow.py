@@ -178,25 +178,39 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                                 if not isinstance(trial_id, str) or not re.fullmatch(
                                         r"(?:install|remove)-(?:native|omg)-[0-9]{3}", trial_id):
                                     continue
-                                serial_name = f"transactions/trials/{trial_id}/serial.log"
-                                serial = members_by_name.get(str(parent / serial_name))
-                                if serial is not None and serial.file_size <= 8 * 1024 * 1024:
-                                    lines = archive.read(serial).decode("utf-8", errors="replace").splitlines()
-                                    signals = [line for line in lines if re.search(
-                                        r"fail|error|panic|timed out|lost carrier|gained carrier|DHCP|fe80::",
-                                        line, flags=re.IGNORECASE)]
-                                    if signals:
-                                        priority = [line for line in signals if re.search(
-                                            r"fail|error|panic|timed out|lost carrier|fe80::",
+                                if trial["result"] == "FAIL":
+                                    for stream in ("stderr", "stdout"):
+                                        name = (f"transactions/trials/{trial_id}/transaction-trial/"
+                                                f"transaction.{stream}")
+                                        member = members_by_name.get(str(parent / name))
+                                        if member is not None and member.file_size <= 8 * 1024 * 1024:
+                                            raw = archive.read(member)
+                                            if raw.strip():
+                                                excerpts.append((name, diagnostic_excerpt(raw)))
+                                if not excerpts:
+                                    serial_name = f"transactions/trials/{trial_id}/serial.log"
+                                    serial = members_by_name.get(str(parent / serial_name))
+                                    if serial is not None and serial.file_size <= 8 * 1024 * 1024:
+                                        lines = archive.read(serial).decode("utf-8", errors="replace").splitlines()
+                                        signals = [line for line in lines if re.search(
+                                            r"fail|error|panic|timed out|lost carrier|gained carrier|DHCP|fe80::",
                                             line, flags=re.IGNORECASE)]
-                                        excerpts.append((serial_name, diagnostic_excerpt(
-                                            "\n".join(signals[-4:] + priority[-4:]).encode("utf-8"))))
+                                        if signals:
+                                            priority = [line for line in signals if re.search(
+                                                r"fail|error|panic|timed out|lost carrier|fe80::",
+                                                line, flags=re.IGNORECASE)]
+                                            excerpts.append((serial_name, diagnostic_excerpt(
+                                                "\n".join(signals[-4:] + priority[-4:]).encode("utf-8"))))
                                 break
                 if excerpts:
-                    # When a clone failed, earlier successful guest probes are
-                    # less useful than its serial transcript and final health.
-                    candidates = [parent / name for name in
-                                  ("health-validation.log", "transactions.log")]
+                    # A measured command failure has a more precise cause than
+                    # earlier guest probes. Preserve the full excerpt budget.
+                    if any(name.endswith(("/transaction.stderr", "/transaction.stdout"))
+                           for name, _ in excerpts):
+                        candidates = []
+                    else:
+                        candidates = [parent / name for name in
+                                      ("health-validation.log", "transactions.log")]
                 for candidate in candidates:
                     member = members_by_name.get(str(candidate))
                     if member is None or member.file_size > 8 * 1024 * 1024:

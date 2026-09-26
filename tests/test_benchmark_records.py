@@ -570,6 +570,24 @@ class HeadlineResolutionTests(unittest.TestCase):
         self.assertIn("Daemon mean **200.0 ms**", rendered)
         self.assertIn("pacman **400.0 ms**", rendered)
 
+    def test_transaction_capture_preserves_exit_and_both_streams(self) -> None:
+        if os.name != "posix":
+            self.skipTest("QEMU guest transaction capture requires POSIX")
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        script = Path(__file__).resolve().parents[1] / "benchmark-hyperfine.sh"
+        stdout = self.source / "transaction.stdout"
+        stderr = self.source / "transaction.stderr"
+        result = subprocess.run(
+            [bash, str(script), "--capture-transaction", str(stdout), str(stderr),
+             bash, "-c", 'printf "install started\\n"; printf "native failure\\n" >&2; exit 17'],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertEqual(stdout.read_text(), "install started\n")
+        self.assertEqual(stderr.read_text(), "native failure\n")
+        self.assertEqual((result.stdout, result.stderr), ("", ""))
+
 
 if __name__ == "__main__":
     unittest.main()
