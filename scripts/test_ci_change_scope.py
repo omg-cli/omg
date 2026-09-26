@@ -44,12 +44,15 @@ class ScopeTests(unittest.TestCase):
 
         self.assertTrue(scope.coverage_irrelevant([
             '.github/workflows/qemu-lane.yml',
+            '.github/workflows/qemu-report.yml',
             'scripts/qemu-daemon-check.sh',
             'scripts/report-qemu-workflow.py',
             'scripts/test_qemu_runner_isolation.py',
+            'tests/qemu-inventory-policy.json',
             'docs/local-ci-runner.md',
         ]))
         for paths in ([], ['src/cli/args.rs'], ['tests/fedora_tests.rs'],
+                      ['tests/cli_behavior_inventory.tsv'],
                       ['Cargo.lock'], ['.github/workflows/coverage.yml'],
                       ['scripts/ci-change-scope.py'],
                       ['scripts/qemu-inventory.rs'],
@@ -93,6 +96,19 @@ class ScopeTests(unittest.TestCase):
             git('commit', '-qm', 'QEMU harness')
             self.assertEqual(scope.classify_scope('pull_request',
                 event(git('rev-parse', 'HEAD')), root), (True, False))
+            (root / '.github/workflows').mkdir(parents=True)
+            (root / 'tests').mkdir()
+            (root / '.github/workflows/qemu-report.yml').write_text('reporter')
+            (root / 'tests/qemu-inventory-policy.json').write_text('{}')
+            git('add', '.')
+            git('commit', '-qm', 'QEMU reporter and policy')
+            self.assertEqual(scope.classify_scope('pull_request',
+                event(git('rev-parse', 'HEAD')), root), (True, False))
+            (root / 'tests/cli_behavior_inventory.tsv').write_text('behavior')
+            git('add', '.')
+            git('commit', '-qm', 'Rust-consumed inventory')
+            self.assertEqual(scope.classify_scope('pull_request',
+                event(git('rev-parse', 'HEAD')), root), (True, True))
             (root / 'docs').mkdir()
             git('mv', 'source.rs', 'docs/renamed.md')
             git('commit', '-qm', 'rename code')
