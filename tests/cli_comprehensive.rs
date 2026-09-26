@@ -1489,7 +1489,13 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::OutdatedNativeCount
                 | Assertion::OutdatedJsonNativeCount
                 | Assertion::DoctorNativeBackend
-                | Assertion::InfoNativePackage => {
+                | Assertion::InfoNativePackage
+                | Assertion::ConfigSetPersisted
+                | Assertion::ConfigGetPersisted
+                | Assertion::ConfigListPersisted
+                | Assertion::ConfigValidatePersisted
+                | Assertion::ConfigPathIsolated
+                | Assertion::ConfigResetDefaults => {
                     unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
             }
