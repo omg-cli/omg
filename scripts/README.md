@@ -200,7 +200,8 @@ soft passes hide product failures.
 `report-smoke-sentry.sh` runs after the coordinator has collected results and each
 case has completed cleanup. It reads `~/.config/omg-smoke/sentry.json`, the path
 in `OMG_SMOKE_SENTRY_CONFIG`, or `OMG_SMOKE_SENTRY_DSN` when no file is configured.
-The DSN is not written to the log. Missing configuration disables reporting.
+A configuration file takes precedence over the environment value. The DSN is
+not written to the log. Missing configuration disables reporting.
 Reporting requires `jq` and `curl`; failures do not change the original test exit status.
 
 Keep the configuration outside the repository with permissions `600`. Its JSON

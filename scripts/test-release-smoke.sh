@@ -7,6 +7,7 @@ scratch_root="$HOME/.cache/build-targets"
 mkdir -p "$scratch_root"
 scratch="$(mktemp -d "$scratch_root/omg-release-smoke-tests.XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
+unset OMG_SMOKE_SENTRY_DSN
 mkdir -p "$scratch/bin" "$scratch/tmp"
 
 fail() {
@@ -375,6 +376,24 @@ jq -se '.[2].extra.failures | length == 2 and .[0].result == "PRODUCT_FAIL" and 
 rm "$FAKE_SENTRY_ENVELOPE"
 assert_rc 0 "$reporter" "$result"
 [[ ! -f "$FAKE_SENTRY_ENVELOPE" ]] || fail "passing run sent an error report"
+export OMG_SMOKE_SENTRY_DSN='https://envonlykey@o123.ingest.us.sentry.io/456'
+assert_rc 0 "$reporter" "$scratch/sentry-run/results.json"
+jq -se '.[0].dsn == "https://fixturekey@o123.ingest.us.sentry.io/123"' "$FAKE_SENTRY_ENVELOPE" >/dev/null || fail "configured file did not win over environment DSN"
+if grep -Fq 'envonlykey' "$scratch/command.out"; then fail "Sentry log printed environment DSN"; fi
+export OMG_SMOKE_SENTRY_CONFIG="$scratch/sentry-run/missing-sentry.json"
+rm "$FAKE_SENTRY_ENVELOPE"
+assert_rc 0 "$reporter" "$scratch/sentry-run/results.json"
+jq -se '.[0].dsn == "https://envonlykey@o123.ingest.us.sentry.io/456"' "$FAKE_SENTRY_ENVELOPE" >/dev/null || fail "workflow DSN did not reach Sentry"
+if grep -Fq 'envonlykey' "$scratch/command.out"; then fail "Sentry log printed workflow DSN"; fi
+export OMG_SMOKE_SENTRY_DSN='https://not-a-dsn'
+rm "$FAKE_SENTRY_ENVELOPE"
+assert_rc 2 "$reporter" "$scratch/sentry-run/results.json"
+[[ ! -f "$FAKE_SENTRY_ENVELOPE" ]] || fail "malformed DSN reached Sentry"
+if grep -Fq 'not-a-dsn' "$scratch/command.out"; then fail "malformed DSN was printed"; fi
+unset OMG_SMOKE_SENTRY_DSN
+assert_rc 0 "$reporter" "$scratch/sentry-run/results.json"
+grep -q 'Sentry reporting disabled: no configuration' "$scratch/command.out" || fail "missing DSN did not disable reporting"
+export OMG_SMOKE_SENTRY_CONFIG="$scratch/sentry-config.json"
 export OMG_SMOKE_ENVIRONMENT=fixture-private-token
 assert_rc 2 "$reporter" "$scratch/sentry-run/results.json"
 [[ ! -f "$FAKE_SENTRY_ENVELOPE" ]] || fail 'unsupported environment reached Sentry'
