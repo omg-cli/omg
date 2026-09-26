@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 SOURCE = Path(__file__).with_name("qemu-fingerprint-oracle.py")
@@ -16,6 +17,14 @@ SPEC.loader.exec_module(ORACLE)
 
 
 class FingerprintOracleTests(unittest.TestCase):
+    def test_fedora_native_query_keeps_literal_dnf_format_escape(self):
+        with patch.object(ORACLE.subprocess, "run",
+                          return_value=SimpleNamespace(stdout="curl\ngit\n")) as run:
+            self.assertEqual(ORACLE.native_packages("fedora"), {"curl", "git"})
+        self.assertEqual(run.call_args.args[0][-1], "%{name}\\n")
+        self.assertIn("--cacheonly", run.call_args.args[0])
+        self.assertIn("--disable-repo=*", run.call_args.args[0])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -88,15 +97,28 @@ class FingerprintOracleTests(unittest.TestCase):
     def test_team_push_requires_persisted_lock_and_matching_status(self):
         self.lock()
         self.output.write_text("Team lock updated!")
-        self.write(".omg/team.toml", 'team_id = "smoke/team"\n')
+        self.write(".omg/team.toml", 'team_id = "smoke/team"\nmember_id = "tester"\n')
         status = {"config": {"team_id": "smoke/team"}, "lock_hash": "",
-                  "members": [{"env_hash": self.state["hash"], "in_sync": True}]}
+                  "members": [{"id": "tester", "env_hash": self.state["hash"],
+                               "in_sync": True, "drift_summary": None}]}
         self.write(".omg/team-status.json", json.dumps(status))
         with self.assertRaises(AssertionError):
             self.run_case("team-push")
         status["lock_hash"] = self.state["hash"]
         self.write(".omg/team-status.json", json.dumps(status))
         self.run_case("team-push")
+        ORACLE.poison_team_status(self.root)
+        self.output.write_text("Environment is in sync with team!")
+        with self.assertRaises(AssertionError):
+            self.run_case("team-pull")
+        with self.assertRaises(AssertionError):
+            self.run_case("team-status")
+        status["members"][0].update(env_hash=self.state["hash"], in_sync=True,
+                                    drift_summary=None)
+        self.write(".omg/team-status.json", json.dumps(status))
+        self.run_case("team-pull")
+        self.output.write_text("[Team Status] 1/1 members in sync")
+        self.run_case("team-status")
 
 
 if __name__ == "__main__":

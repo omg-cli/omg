@@ -1281,6 +1281,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
     remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log' '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
   done
+  if [[ "$case" == team-status || "$case" == team-pull ]]; then
+    remote+="; python3 \"\$HOME/qemu-fingerprint-oracle.py\" prepare-team-refresh '$distro' \"\$rowdir\" /dev/null"
+  fi
   if [[ "$case" == clean-orphans-native ]]; then
     remote+="; if ! prepare_native_apt_orphan '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi; export OMG_DISABLE_DAEMON=1"
   fi

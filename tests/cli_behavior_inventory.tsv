@@ -91,8 +91,8 @@ env-share	["env","share","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass
 env-sync	["env","sync","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 team-init	["team","init","smoke/team","--name","Smoke Team"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 team-join-help	["team","join","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-team-status	["team","status"]	isolated-write	0	pass	team-push	hermetic	hermetic:pass	fingerprint:team-status	tempdir-drop
 team-push	["team","push"]	isolated-write	0	pass	team-init	hermetic	hermetic:pass	fingerprint:team-push	tempdir-drop
+team-status	["team","status"]	isolated-write	0	pass	team-push	hermetic	hermetic:pass	fingerprint:team-status	tempdir-drop
 team-pull	["team","pull"]	isolated-write	0	pass	team-push	hermetic	hermetic:pass	fingerprint:team-pull	tempdir-drop
 team-members	["team","members"]	read	1	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 team-dashboard	["team","dashboard","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop

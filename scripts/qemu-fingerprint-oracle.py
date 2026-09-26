@@ -28,7 +28,7 @@ def native_packages(distro):
     elif distro == "fedora":
         command = ["dnf", "--cacheonly", "--disable-repo=*",
                    "--setopt=disable_excludes=*", "repoquery", "--userinstalled",
-                   "--qf", "%{name}\n"]
+                   "--qf", "%{name}\\n"]
     else:
         raise AssertionError(f"unknown distro: {distro}")
     result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
@@ -65,9 +65,25 @@ def output_contains(output, *markers):
         require(marker in output, f"command output lacks {marker!r}")
 
 
+def poison_team_status(root):
+    config = tomllib.loads(regular(root / ".omg/team.toml").read_text())
+    path = regular(root / ".omg/team-status.json")
+    status = json.loads(path.read_text())
+    member = next((item for item in status["members"]
+                   if item["id"] == config["member_id"]), None)
+    require(member is not None, "team fixture lacks the local member")
+    member["env_hash"] = "0" * 64
+    member["in_sync"] = False
+    member["drift_summary"] = "oracle stale state"
+    path.write_text(json.dumps(status))
+
+
 def main():
     case, distro, root_arg, output_arg = sys.argv[1:]
     root = Path(root_arg)
+    if case == "prepare-team-refresh":
+        poison_team_status(root)
+        return
     output = regular(Path(output_arg)).read_text()
     expected = native_packages(distro)
     if case == "snapshot-create":
@@ -115,7 +131,9 @@ def main():
                 "team state belongs to the wrong workspace")
         members = status.get("members")
         require(status["lock_hash"] == digest and isinstance(members, list) and
-                any(member.get("env_hash") == digest and member.get("in_sync") for member in members),
+                any(member.get("id") == config["member_id"] and
+                    member.get("env_hash") == digest and member.get("in_sync") and
+                    member.get("drift_summary") is None for member in members),
                 "team state does not match native-backed lock")
         marker = {"team-status": "members in sync", "team-push": "Team lock updated!",
                   "team-pull": "Environment is in sync"}[case]
