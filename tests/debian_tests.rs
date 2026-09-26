@@ -24,6 +24,38 @@ fn assert_debian_platform_purity(result: &CommandResult, context: &str) {
     assert_no_macos_terms(&output, context);
 }
 
+#[cfg(feature = "debian")]
+fn run_native_apt_pocket_fixture(scenario: &str) {
+    let output = std::process::Command::new("python3")
+        .args([
+            "scripts/test-debian-apt-candidates.py",
+            "--omg-binary",
+            assert_cmd::cargo::cargo_bin!("omg")
+                .to_str()
+                .expect("OMG executable path is UTF-8"),
+            "--scenario",
+            scenario,
+        ])
+        .env_remove("OMG_TEST_MODE")
+        .env_remove("OMG_TEST_DISTRO")
+        .env("OMG_DISABLE_TELEMETRY", "1")
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run isolated native APT pocket fixture");
+    assert!(
+        output.status.success(),
+        "APT {scenario} pocket fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("PASS: native APT {scenario} candidate")),
+        "APT pocket fixture emitted no success receipt: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // DOCKER INTEGRATION
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -272,36 +304,6 @@ mod apt_integration {
         assert!(
             actual.contains("No changes will be made (dry run)"),
             "{actual}"
-        );
-    }
-
-    #[cfg(feature = "debian")]
-    #[test]
-    fn test_native_apt_candidate_pockets() {
-        let output = std::process::Command::new("python3")
-            .args([
-                "scripts/test-debian-apt-candidates.py",
-                "--omg-binary",
-                assert_cmd::cargo::cargo_bin!("omg")
-                    .to_str()
-                    .expect("OMG executable path is UTF-8"),
-            ])
-            .env_remove("OMG_TEST_MODE")
-            .env_remove("OMG_TEST_DISTRO")
-            .env("OMG_DISABLE_TELEMETRY", "1")
-            .env("LC_ALL", "C")
-            .output()
-            .expect("run isolated native APT pocket fixture");
-        assert!(
-            output.status.success(),
-            "APT pocket fixture failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("PASS: native APT candidate"),
-            "APT pocket fixture emitted no success receipt: {}",
-            String::from_utf8_lossy(&output.stdout)
         );
     }
 
@@ -712,8 +714,10 @@ mod ubuntu_specific {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod debian_specific {
+    #[cfg(feature = "debian")]
     use super::*;
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_debian_stable_packages() {
         require_debian!();
@@ -745,24 +749,16 @@ mod debian_specific {
         }
     }
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_debian_security_repo() {
-        require_system_tests!();
-        require_debian!();
-
-        // Security updates should be searchable
-        let result = run_omg(&["search", "openssl"]);
-        result.assert_success();
+        run_native_apt_pocket_fixture("security");
     }
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_debian_backports_awareness() {
-        require_system_tests!();
-        require_debian!();
-
-        // Should handle backports if configured
-        let result = run_omg(&["status"]);
-        result.assert_success();
+        run_native_apt_pocket_fixture("backports");
     }
 }
 

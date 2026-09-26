@@ -12,6 +12,7 @@ import tempfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--omg-binary", type=pathlib.Path, required=True)
+parser.add_argument("--scenario", choices=("security", "backports", "both"), default="both")
 args = parser.parse_args()
 binary = str(args.omg_binary.resolve(strict=True))
 
@@ -116,5 +117,6 @@ with tempfile.TemporaryDirectory(prefix="omg-apt-pin-") as temporary:
     (root / "preferences").write_text(
         "Package: omg-pin-probe\nPin: version 2.0-1~bpo\nPin-Priority: 1001\n"
     )
-    verify_candidate(environment, "2.0-1~bpo", "isolated backports candidate")
-    print("PASS: native APT candidate, pocket metadata, and preview parity")
+    if args.scenario in ("backports", "both"):
+        verify_candidate(environment, "2.0-1~bpo", "isolated backports candidate")
+    print(f"PASS: native APT {args.scenario} candidate, pocket metadata, and preview parity")
