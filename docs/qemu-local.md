@@ -312,6 +312,74 @@ of that pushed commit closes it. A local pass does not.
 Bring that output back: it is the input to the code/command audit —
 no pending-row flips, no expectation edits, just errors.
 
+## Why the timing limits, runners and defect rules are set this way
+
+Every limit in this pipeline comes from a documented property of the software it
+runs. This section lists the sources. Change a number only with a new source or
+a new evidence run.
+
+### The pipeline needs KVM, not an emulator
+
+KVM is a virtualization system for Linux on Intel VT or AMD-V hardware
+([KVM project](https://www.linux-kvm.org/page/Main_Page)). QEMU only uses it when
+it is told to: `-machine accel=` selects an accelerator, and QEMU states that
+"By default, `tcg` is used", which is a software emulator
+([QEMU invocation manual](https://www.qemu.org/docs/master/system/invocation.html)).
+A guest without the accelerator is far slower, so each lane records `accel=kvm`
+in `metadata.txt` and a fallback is visible instead of silently slow.
+
+Nested virtualization is not supported on GitHub-hosted runners. GitHub
+documents that Linux runners are Azure virtual machines and that nested VMs are
+"not officially supported ... no guarantees regarding stability, performance, or
+compatibility"
+([GitHub-hosted runners reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)).
+QEMU lanes therefore run on self-hosted runners that own `/dev/kvm`, and a
+health job checks the device before any guest starts.
+
+### Guest timeouts are sized for slow disks, not for network waits
+
+The Python case installs pip with `ensurepip`. CPython documents that this module
+"does not access the internet" and that "all of the components needed to
+bootstrap pip are included as internal parts of the package"
+([ensurepip](https://docs.python.org/3/library/ensurepip.html)). Its runtime is
+local CPU and disk work only, which on a cold, busy, emulated disk can take much
+longer than on a laptop. The step's allowance and the run that set it are
+recorded next to the probe in `scripts/qemu-inventory.sh`. The oracle still fails
+the row when any attempt fails, so a crash cannot become a green retry.
+
+The user-visible command timeout for the runtime install rows is three times the
+row timeout, because those rows download official archives inside a fresh guest.
+
+### A declared defect is never rewritten
+
+A row whose per-distro target is `known-defect` is still executed. A failure is
+recorded as `FAIL` and fails the lane; a pass is recorded as `PASS`. The inventory
+runner and its tests pin that rule, because an expectation must never rewrite an
+observation.
+
+The Fedora `remove` failures have a documented cause. libdnf5 inserts a
+transaction as `STARTED` when it begins, and only replaces that state from
+`finish(OK|ERROR)`
+([transaction.hpp](https://github.com/rpm-software-management/dnf5/blob/main/include/libdnf5/transaction/transaction.hpp):
+`TransactionState { STARTED = 1, OK = 2, ERROR = 3 }`). dnf5 also notes that
+`history redo` "is useful to finish interrupted transactions"
+([dnf5 history](https://dnf5.readthedocs.io/en/stable/commands/history.8.html)).
+A row that is still `STARTED` therefore means the run was interrupted, not
+refused. OMG reports the recorded transaction id, status, action count and
+command line so that state is readable from the lane log, and the remaining
+Fedora defect is tracked in
+[issue #626](https://github.com/omg-cli/omg/issues/626).
+
+### Failures report how a process ended
+
+Rust documents that `ExitStatus::code` "will return `None` if the process was
+terminated by a signal", and that `ExitStatusExt::signal` reports that signal
+([ExitStatus](https://doc.rust-lang.org/std/process/struct.ExitStatus.html)).
+`Stdio::inherit` means a child's output is not captured by OMG
+([Stdio](https://doc.rust-lang.org/std/process/struct.Stdio.html)). A killed
+`dnf`, `apt` or `pacman` is therefore reported as signal termination instead of a
+made-up exit code, and dnf failures carry the recorded history row as well.
+
 ## Where to go next
 
 - [QA issue loop](./qa-loop.md) explains when an issue opens or closes.
