@@ -82,6 +82,64 @@ class OutputContracts(unittest.TestCase):
         self.assertIn('doctor did not identify', logs['doctor.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_ci_init_requires_a_generated_workflow_and_advanced_security_job(self):
+        rows = [
+            'ci-init\t["ci","init","github"]\tisolated-write\t0\tpass\t-\t'
+            'hermetic\thermetic:pass\tci-github-workflow\ttempdir-drop',
+            'ci-init-advanced\t["ci","init","github","--advanced"]\tisolated-write\t0\tpass\t-\t'
+            'hermetic\thermetic:pass\tci-github-workflow-advanced\ttempdir-drop',
+        ]
+        basic = '''mkdir -p .github/workflows
+cat > .github/workflows/ci.yml <<'WORKFLOW'
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install release
+        run: |
+          OMG_VERSION=v0.1.224 bash omg-install.sh
+      - name: Build
+        run: omg run build
+      - name: Test
+        run: omg run test
+WORKFLOW
+'''
+        advanced = '''if [[ "${4:-}" == --advanced ]]; then
+cat >> .github/workflows/ci.yml <<'WORKFLOW'
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Audit
+        run: |
+          cargo audit
+          cargo cyclonedx --format json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-dependencies-sbom
+WORKFLOW
+fi
+'''
+        for product, expected in (
+            (basic + advanced, ['PASS', 'PASS']),
+            (basic, ['PASS', 'FAIL']),
+            (basic.replace('        run: omg run test\n', '# omg run test\n') + advanced,
+             ['FAIL', 'FAIL']),
+            (basic + advanced.replace('          cargo audit\n', '# cargo audit\n'),
+             ['PASS', 'FAIL']),
+            ('echo generated\n', ['FAIL', 'FAIL']),
+        ):
+            with self.subTest(expected=expected):
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, int('FAIL' in expected), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_doctor_eol_requires_confined_runtime_and_both_classifications(self):
         row = ('doctor-eol\t["doctor","--eol"]\tcontrolled-error\t1\tpass\t-\t'
                'container\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tdoctor-eol-state\ttempdir-drop')

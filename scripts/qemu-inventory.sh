@@ -863,6 +863,28 @@ check_product_output() {
         if [[ "$primary" != 1 || "$nested" != "$expected_nested" ]]; then
           printf 'assertion failed: workspace task counts primary=%s nested=%s; expected primary=1 nested=%s\n' "$primary" "$nested" "$expected_nested" >&2; return 1
         fi ;;
+      ci-github-workflow|ci-github-workflow-advanced)
+        local workflow=.github/workflows/ci.yml
+        if [[ ! -f "$workflow" || -L "$workflow" ]] \
+          || ! grep -Fxq 'name: CI' "$workflow" \
+          || ! grep -Fxq 'on: [push, pull_request]' "$workflow" \
+          || ! grep -Fxq '  contents: read' "$workflow" \
+          || ! grep -Fxq '  build-and-test:' "$workflow" \
+          || ! grep -Eq '^          OMG_VERSION=v[0-9]+\.[0-9]+\.[0-9]+ ' "$workflow" \
+          || ! grep -Fxq '        run: omg run build' "$workflow" \
+          || ! grep -Fxq '        run: omg run test' "$workflow"; then
+          printf 'assertion failed: ci init did not create the expected GitHub build/test workflow\n' >&2; return 1
+        fi
+        if [[ "$assertion" == ci-github-workflow-advanced ]]; then
+          if ! grep -Fxq '  security:' "$workflow" \
+            || ! grep -Fxq '          cargo audit' "$workflow" \
+            || ! grep -Eq '^          cargo cyclonedx ' "$workflow" \
+            || ! grep -Fxq '          name: rust-dependencies-sbom' "$workflow"; then
+            printf 'assertion failed: advanced ci init lacks its security audit and SBOM job\n' >&2; return 1
+          fi
+        elif grep -Fxq '  security:' "$workflow"; then
+          printf 'assertion failed: basic ci init unexpectedly generated the advanced security job\n' >&2; return 1
+        fi ;;
       json-stdout)
         if ! jq -e -s 'length == 1' "$stdout" >/dev/null 2>&1; then
           printf 'assertion failed: stdout is not exactly one JSON document\n' >&2; return 1
@@ -1120,7 +1142,16 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  if [[ "$id" == ci-init ]]; then
+    [[ "$a" == ci-github-workflow && "$s" == isolated-write && "$resolved" == 0 ]] || exit 2
+    jq -e '. == ["ci", "init", "github"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$id" == ci-init-advanced ]]; then
+    [[ "$a" == ci-github-workflow-advanced && "$s" == isolated-write && "$resolved" == 0 ]] || exit 2
+    jq -e '. == ["ci", "init", "github", "--advanced"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == ci-github-workflow || "$a" == ci-github-workflow-advanced ]]; then
+    exit 2
+  fi
   case "$id" in
     snapshot-create|migrate-export|migrate-import|env-capture|env-check|team-status|team-push|team-pull)
       [[ "$a" == "fingerprint:$id" ]] || exit 2 ;;
