@@ -258,15 +258,23 @@ check_native_tree_state() {
 # Compare the installed package database around a dry run. Repository metadata
 # may refresh, but an install/remove preview must not change installed state.
 native_package_snapshot() {
-  local distro=$1 inventory
+  local distro=$1 inventory reasons
   case "$distro" in
-    arch) inventory=$(pacman -Q) || return 1 ;;
-    debian|ubuntu) inventory=$(dpkg-query -W '-f=${Package}\t${Version}\t${Status}\n') || return 1 ;;
-    fedora) inventory=$(rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n') || return 1 ;;
+    arch)
+      inventory=$(pacman -Q) || return 1
+      reasons=$(pacman -Qqe) || return 1 ;;
+    debian|ubuntu)
+      inventory=$(dpkg-query -W '-f=${Package}\t${Version}\t${Status}\n') || return 1
+      reasons=$(apt-mark showmanual) || return 1 ;;
+    fedora)
+      inventory=$(rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n') || return 1
+      reasons=$(dnf --cacheonly --disable-repo='*' repoquery --installed --queryformat '%{name}\t%{reason}\n') || return 1 ;;
     *) return 1 ;;
   esac
   [[ -n "$inventory" ]] || return 1
-  printf '%s\n' "$inventory" | LC_ALL=C sort
+  printf 'installed packages\n%s\ninstall reasons\n%s\n' \
+    "$(printf '%s\n' "$inventory" | LC_ALL=C sort)" \
+    "$(printf '%s\n' "$reasons" | LC_ALL=C sort)"
 }
 
 native_installed_version() {
@@ -1629,7 +1637,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_native_remove_preview command.stdout.log \"\$installed_version\"; then printf 'assertion failed: remove preview lacks the native installed bash version\n' >&2; assertion=1; fi"
     fi
     remote+="; native_after=\$(native_package_snapshot '$distro') || { execution_phase=dependency; rc=2; assertion=1; printf 'assertion failed: native package after-state is unavailable\n' >&2; }"
-    remote+="; if [[ \"\$execution_phase\" == product && \"\$native_before\" != \"\$native_after\" ]]; then printf 'assertion failed: dry run changed the native installed-package database\n' >&2; assertion=1; fi"
+    remote+="; if [[ \"\$execution_phase\" == product && \"\$native_before\" != \"\$native_after\" ]]; then printf 'assertion failed: dry run changed native installed-package state or reasons\n' >&2; assertion=1; fi"
   fi
   if [[ "$assertions" == doctor-eol-state ]]; then
     remote+="; if [[ \"\$baseline_phase\" != product ]] || ! check_doctor_issue_delta \"\$baseline_rc\" doctor.baseline.stdout.log doctor.baseline.stderr.log \"\$rc\" command.stderr.log 1; then printf 'assertion failed: doctor EOL did not add exactly one health issue over its baseline\n' >&2; assertion=1; fi"

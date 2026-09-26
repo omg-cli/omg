@@ -35,9 +35,13 @@ class OutputContracts(unittest.TestCase):
         row = next(line for line in
                    (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
                    if line.startswith('install\t'))
-        native = {'pacman': '[[ "$1" == -Q ]] || exit 2\n'
-                            'if [[ -f native-state-changed ]]; then echo "pacman 8"; '
-                            'else echo "pacman 7"; fi\n'}
+        native = {'pacman': 'case "$1" in\n'
+                            '  -Q) if [[ -f native-state-changed ]]; then echo "pacman 8"; '
+                            'else echo "pacman 7"; fi ;;\n'
+                            '  -Qqe) if [[ -f native-reason-changed ]]; then echo changed; '
+                            'else echo pacman; fi ;;\n'
+                            '  *) exit 2 ;;\n'
+                            'esac\n'}
         preview = "printf '%s\\n' '  | Install Preview' '    dry run' " \
                   "'│ pacman  ┆ 7.1 ┆ 1 MB ┆ Official │' " \
                   "'  ℹ • No changes will be made (dry run)'\n"
@@ -49,7 +53,12 @@ class OutputContracts(unittest.TestCase):
                                                      [row], distro='arch', native_commands=native)
         self.assertEqual([item['result'] for item in evidence], ['FAIL'],
                          f'{result.stdout}\n{result.stderr}\n{logs}')
-        self.assertIn('dry run changed the native installed-package database', logs['install.log'])
+        self.assertIn('dry run changed native installed-package state or reasons', logs['install.log'])
+        result, evidence, logs = self.run_inventory('touch native-reason-changed\n' + preview,
+                                                     [row], distro='arch', native_commands=native)
+        self.assertEqual(evidence[0]['result'], 'FAIL',
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertIn('dry run changed native installed-package state or reasons', logs['install.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_fedora_remove_requires_the_installed_rpm_version(self):
@@ -60,7 +69,8 @@ class OutputContracts(unittest.TestCase):
                          '  -qa) printf "bash\\t5.3-1\\n" ;;\n'
                          '  -q) printf "5.3-1\\n" ;;\n'
                          '  *) exit 2 ;;\n'
-                         'esac\n'}
+                         'esac\n',
+                  'dnf': 'printf "bash\\tUser\\n"\n'}
         preview = "printf '%s\\n' '  | Remove Preview' '    dry run' " \
                   "'  → The following packages would be removed:' " \
                   "'    ✗ bash 5.3-1' '  ℹ No changes made (dry run)'\n"
