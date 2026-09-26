@@ -197,29 +197,31 @@ esac
             'privacy-opt-out\t["privacy","opt-out"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\tprivacy-opted-out\ttempdir-drop',
             'privacy-status\t["privacy","status"]\tread\t0\tpass\tprivacy-opt-out\thermetic\thermetic:pass\tprivacy-status-disabled\ttempdir-drop',
             'privacy-opt-in\t["privacy","opt-in"]\tisolated-write\t0\tpass\tprivacy-opt-out\thermetic\thermetic:pass\tprivacy-opted-in\ttempdir-drop',
+            'privacy-status-enabled\t["privacy","status"]\tread\t0\tpass\tprivacy-opt-in\tcontainer\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tprivacy-status-enabled\ttempdir-drop',
         ]
         product = r'''file="$OMG_CONFIG_DIR/config.toml"
 case "$1:$2" in
   privacy:opt-out) mkdir -p "$OMG_CONFIG_DIR"; rm "$OMG_DATA_DIR/telemetry_queue.json"; printf 'telemetry_enabled = false\n' > "$file"; echo 'Telemetry disabled locally' ;;
-  privacy:status) echo '  Telemetry: Disabled' ;;
+  privacy:status) if grep -Fxq 'telemetry_enabled = true' "$file"; then echo '  Telemetry: Enabled'; else echo '  Telemetry: Disabled'; fi ;;
   privacy:opt-in) printf 'telemetry_enabled = true\n' > "$file"; echo 'Telemetry enabled locally' ;;
   *) exit 77 ;;
 esac
 '''
-        result, evidence, logs = self.run_inventory(product, rows)
+        result, evidence, logs = self.run_inventory(product, rows, tiers='hermetic,container')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows), logs)
 
         faults = (
             ("printf 'telemetry_enabled = false\\n' > \"$file\"", ':', 'privacy-opt-out'),
             ('rm "$OMG_DATA_DIR/telemetry_queue.json"', ':', 'privacy-opt-out'),
-            ("privacy:status) echo '  Telemetry: Disabled'", "privacy:status) echo '  Telemetry: Enabled'", 'privacy-status'),
+            ("else echo '  Telemetry: Disabled'", "else echo '  Telemetry: Enabled'", 'privacy-status'),
             ("printf 'telemetry_enabled = true\\n' > \"$file\"", ':', 'privacy-opt-in'),
+            ("then echo '  Telemetry: Enabled'", "then echo '  Telemetry: Disabled'", 'privacy-status-enabled'),
         )
         for old, new, case in faults:
             with self.subTest(case=case, mutation=old):
                 self.assertIn(old, product)
-                result, evidence, logs = self.run_inventory(product.replace(old, new, 1), rows)
+                result, evidence, logs = self.run_inventory(product.replace(old, new, 1), rows, tiers='hermetic,container')
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 observed = {row['case_id'].removeprefix('qemu-arch-'): row['result'] for row in evidence}
                 self.assertEqual(observed[case], 'FAIL', logs)

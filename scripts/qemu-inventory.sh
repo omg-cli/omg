@@ -610,6 +610,11 @@ check_privacy_oracle() {
         && grep -Eq '^[[:space:]]*Telemetry: Disabled$' "$output" || {
           printf 'assertion failed: privacy status did not reflect disabled telemetry\n' >&2; return 1
         } ;;
+    privacy-status-enabled)
+      check_config_value "$config_file" true \
+        && grep -Eq '^[[:space:]]*Telemetry: Enabled$' "$output" || {
+          printf 'assertion failed: privacy status did not reflect enabled telemetry\n' >&2; return 1
+        } ;;
     privacy-opted-in)
       check_config_value "$config_file" true \
         && grep -Fq 'Telemetry enabled locally' "$output" || {
@@ -671,7 +676,7 @@ check_product_output() {
     case "$assertion" in
       config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults)
         check_config_oracle "$assertion" "$stdout" || return 1 ;;
-      privacy-opted-out|privacy-status-disabled|privacy-opted-in)
+      privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled)
         check_privacy_oracle "$assertion" "$stdout" || return 1 ;;
       hooks-installed|hooks-absent)
         local hook label hook_path
@@ -950,7 +955,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled) ;; *) exit 2 ;; esac
   case "$id" in
     config-set)
       [[ "$a" == config-set-persisted ]] && jq -e '. == ["config","set","telemetry.enabled","true"]' <<< "$aj" >/dev/null || exit 2 ;;
@@ -973,7 +978,9 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
       [[ "$a" == privacy-status-disabled && "$r" == privacy-opt-out ]] && jq -e '. == ["privacy","status"]' <<< "$aj" >/dev/null || exit 2 ;;
     privacy-opt-in)
       [[ "$a" == privacy-opted-in && "$r" == privacy-opt-out ]] && jq -e '. == ["privacy","opt-in"]' <<< "$aj" >/dev/null || exit 2 ;;
-    *) [[ "$a" != privacy-opted-out && "$a" != privacy-status-disabled && "$a" != privacy-opted-in ]] || exit 2 ;;
+    privacy-status-enabled)
+      [[ "$a" == privacy-status-enabled && "$r" == privacy-opt-in ]] && jq -e '. == ["privacy","status"]' <<< "$aj" >/dev/null || exit 2 ;;
+    *) [[ "$a" != privacy-opted-out && "$a" != privacy-status-disabled && "$a" != privacy-opted-in && "$a" != privacy-status-enabled ]] || exit 2 ;;
   esac
   if [[ "$id" == doctor ]]; then
     [[ "$a" == doctor-native-backend ]] || exit 2
@@ -1135,7 +1142,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == config-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/config\""
   fi
-  if [[ "$case" == privacy-opt-out || "$case" == privacy-status || "$case" == privacy-opt-in ]]; then
+  if [[ "$case" == privacy-opt-out || "$case" == privacy-status || "$case" == privacy-opt-in || "$case" == privacy-status-enabled ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/privacy-config\" OMG_DATA_DIR=\"\$rowdir/privacy-data\""
     remote+="; mkdir -p \"\$OMG_DATA_DIR\"; printf 'queued' > \"\$OMG_DATA_DIR/telemetry_queue.json\""
   fi
