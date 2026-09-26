@@ -480,8 +480,13 @@ impl DnfPackageManager {
     const USER_INSTALLED_QUERY_FORMAT: &str = "%{name}\\n";
 
     pub(crate) fn read_user_installed_names() -> Result<HashSet<String>> {
+        // Installation reasons are local DNF state. Keep this read offline and
+        // include packages hidden by repository exclude rules.
         let output = crate::core::privilege::system_command("dnf")?
             .args([
+                "--cacheonly",
+                "--disable-repo=*",
+                "--setopt=disable_excludes=*",
                 "repoquery",
                 "--userinstalled",
                 "--qf",
