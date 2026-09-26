@@ -1343,7 +1343,8 @@
         "debian",
         "debian-trixie",
         "ubuntu",
-        "debian-pure"
+        "debian-pure",
+        "fedora"
       ],
       "requires": [
         "success",
