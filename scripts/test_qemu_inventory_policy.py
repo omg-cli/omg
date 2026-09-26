@@ -107,6 +107,9 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(cases['audit-secrets']['network_scope'], 'offline')
         self.assertEqual(cases['audit-secrets-critical']['tiers'], ['hermetic'])
         self.assertEqual(cases['audit-secrets-critical']['allowed_skips'], {})
+        self.assertEqual(cases['audit-eol']['tiers'], ['hermetic'])
+        self.assertEqual(cases['audit-eol']['network_scope'], 'offline')
+        self.assertEqual(cases['audit-eol']['allowed_skips'], {})
         for inventory in rules["inventories"].values():
             cases = {case["id"]: case for case in inventory["cases"]}
             for identity in ("doctor", "update", "runtime-python-install", "container-list"):

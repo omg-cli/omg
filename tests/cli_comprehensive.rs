@@ -559,6 +559,7 @@ enum Assertion {
     AuditFixRefusal,
     AuditSecretScoped,
     AuditSecretCritical,
+    AuditEolState,
     SbomSourceFailure,
     SbomInventoryOnly,
     JsonStdout,
@@ -626,6 +627,7 @@ impl Assertion {
             "audit-fix-refusal" => Self::AuditFixRefusal,
             "audit-secret-scoped" => Self::AuditSecretScoped,
             "audit-secret-critical" => Self::AuditSecretCritical,
+            "audit-eol-state" => Self::AuditEolState,
             "sbom-source-failure" => Self::SbomSourceFailure,
             "sbom-inventory-only" => Self::SbomInventoryOnly,
             "json-stdout" => Self::JsonStdout,
@@ -1359,6 +1361,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
         });
         let privacy_data_dir = project.path().join("privacy-data");
         let fingerprint_data_dir = project.path().join("fingerprint-data");
+        let eol_data_dir = project.path().join("eol-data");
         let mut command_env = vec![
             ("HOME", home.as_str()),
             ("PATH", path.as_str()),
@@ -1388,6 +1391,21 @@ fn behavior_inventory_runs_in_hermetic_state() {
                     .to_str()
                     .expect("UTF-8 fingerprint data path"),
             ));
+        }
+        if case.id == "audit-eol" {
+            command_env.push((
+                "OMG_DATA_DIR",
+                eol_data_dir.to_str().expect("UTF-8 EOL data path"),
+            ));
+            command_env.push(("OMG_DISABLE_DAEMON", "1"));
+            command_env.push(("OMG_TEST_MODE", "0"));
+            for (runtime, version) in [("node", "16.20.2"), ("python", "3.12.14")] {
+                let runtime_dir = eol_data_dir.join("versions").join(runtime);
+                std::fs::create_dir_all(runtime_dir.join(version))
+                    .expect("create private EOL runtime version");
+                std::os::unix::fs::symlink(version, runtime_dir.join("current"))
+                    .expect("point private EOL runtime at version");
+            }
         }
         if case.id == "privacy-opt-out" {
             std::fs::create_dir_all(&privacy_data_dir).expect("create privacy data directory");
@@ -1617,6 +1635,17 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         || !result.stderr.contains("Secret scan failed: 1 critical secret finding(s) require remediation")
                     {
                         issues.push("critical secret scan did not fail and redact the key fixture".to_string());
+                    }
+                }
+                Assertion::AuditEolState => {
+                    if !result.stdout.contains("  ✗ node v16.20.2 - EOL (EOL: 2023-09-11)")
+                        || !result.stdout.contains("  ✓ python v3.12.14 - Active (EOL: 2028-10-31)")
+                        || !result.stdout.lines().any(|line| line == "⚠ 1 runtime(s) need attention. Consider upgrading to supported versions.")
+                        || result.stdout.contains("All runtimes are within support period")
+                        || result.stdout.matches("node v16.20.2").count() != 1
+                        || result.stdout.matches("python v3.12.14").count() != 1
+                    {
+                        issues.push("audit EOL did not classify both private runtimes and count one issue".to_string());
                     }
                 }
                 Assertion::HooksInstalled | Assertion::HooksAbsent => {
