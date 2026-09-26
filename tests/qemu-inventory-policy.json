@@ -33105,7 +33105,7 @@
         }
       ]
     },
-    "81f340d654d78cb805fce61054d850794d685efd4a99c60c94056a0cc7c364db": {
+    "b1a1e57321687a38e240dbe3af9454e2be9be8a535f8c772e42166ca523e6c42": {
       "releases": [],
       "cases": [
         {
@@ -34552,7 +34552,7 @@
         {
           "id": "doctor-eol",
           "tiers": [
-            "hermetic"
+            "qemu"
           ],
           "allowed_skips": {},
           "network_scope": "offline"

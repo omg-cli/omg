@@ -139,7 +139,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(len({case["id"] for case in cases}), len(cases))
         by_id = {case["id"]: case for case in cases}
         self.assertEqual(by_id["doctor-eol"], {
-            "id": "doctor-eol", "tiers": ["hermetic"],
+            "id": "doctor-eol", "tiers": ["qemu"],
             "allowed_skips": {}, "network_scope": "offline",
         })
         for runtime in ("node", "python", "go"):

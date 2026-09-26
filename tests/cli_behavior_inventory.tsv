@@ -180,7 +180,7 @@ daemon-foreground	["daemon","--foreground"]	service-mutation	0	pass	-	container	
 update-turbo	["update","--turbo"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-turbo-output	none
 update-fast	["update","--fast"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-fast-output	none
 doctor-network	["doctor","--network"]	read	-	declared	-	network	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
-doctor-eol	["doctor","--eol"]	controlled-error	1	pass	-	hermetic	hermetic:pass	doctor-eol-state	tempdir-drop
+doctor-eol	["doctor","--eol"]	controlled-error	1	pass	-	qemu	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-eol-state	tempdir-drop
 doctor-turbo	["doctor","--turbo"]	read	-	declared	-	qemu	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
 run-watch	["run","--watch","smoke"]	interactive	-	declared	-	pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
 env-share-flags	["env","share","--public","--description","Probe Gist"]	service-mutation	-	declared	-	network,credentialed	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none

@@ -84,7 +84,7 @@ class OutputContracts(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_doctor_eol_requires_confined_runtime_and_both_classifications(self):
         row = ('doctor-eol\t["doctor","--eol"]\tcontrolled-error\t1\tpass\t-\t'
-               'hermetic\thermetic:pass\tdoctor-eol-state\ttempdir-drop')
+               'qemu\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tdoctor-eol-state\ttempdir-drop')
         preflight = ('[[ $(id -u) != 0 && "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 '
                      '&& -d "$OMG_DATA_DIR/versions/node/16.20.2" '
                      '&& $(readlink "$OMG_DATA_DIR/versions/node/current") == 16.20.2 '
@@ -106,7 +106,7 @@ class OutputContracts(unittest.TestCase):
                            + 'if [[ "$2" != --eol ]]; then echo "Error: doctor found 1 health issue(s)" >&2; exit 1; fi\n'
                            + output
                            + f'echo "Error: doctor found {eol_count} health issue(s)" >&2\nexit 1\n')
-                result, evidence, logs = self.run_inventory(product, [row])
+                result, evidence, logs = self.run_inventory(product, [row], tiers='qemu')
                 self.assertEqual(evidence[0]['result'], expected, logs)
                 self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
 

@@ -1104,7 +1104,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     exit 2
   fi
   if [[ "$id" == doctor-eol ]]; then
-    [[ "$a" == doctor-eol-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == hermetic ]] || exit 2
+    [[ "$a" == doctor-eol-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == qemu ]] || exit 2
     jq -e '. == ["doctor", "--eol"]' <<< "$aj" >/dev/null || exit 2
   elif [[ "$a" == doctor-eol-state ]]; then
     exit 2

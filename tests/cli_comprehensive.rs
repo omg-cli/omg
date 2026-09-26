@@ -582,6 +582,7 @@ enum Assertion {
     OutdatedNativeCount,
     OutdatedJsonNativeCount,
     DoctorNativeBackend,
+    DoctorEolState,
     InfoNativePackage,
     ConfigSetPersisted,
     ConfigGetPersisted,
@@ -643,6 +644,7 @@ impl Assertion {
             "outdated-native-count" => Self::OutdatedNativeCount,
             "outdated-json-native-count" => Self::OutdatedJsonNativeCount,
             "doctor-native-backend" => Self::DoctorNativeBackend,
+            "doctor-eol-state" => Self::DoctorEolState,
             "info-native-package" => Self::InfoNativePackage,
             "config-set-persisted" => Self::ConfigSetPersisted,
             "config-get-persisted" => Self::ConfigGetPersisted,
@@ -1664,6 +1666,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::OutdatedNativeCount
                 | Assertion::OutdatedJsonNativeCount
                 | Assertion::DoctorNativeBackend
+                | Assertion::DoctorEolState
                 | Assertion::InfoNativePackage
                 | Assertion::RuntimeVersionRemoved
                 | Assertion::RuntimeListState
