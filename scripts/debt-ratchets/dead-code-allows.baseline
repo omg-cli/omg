@@ -1,0 +1,11 @@
+17 = src/cli/chrome.rs
+3 = src/cli/progress.rs
+2 = src/cli/commands.rs
+1 = src/bin/omg.rs
+1 = src/cli/mod.rs
+1 = src/cli/modern_ui.rs
+1 = src/daemon/handlers.rs
+1 = src/package_managers/types.rs
+1 = src/runtimes/common.rs
+1 = tests/alpm_harness.rs
+1 = tests/mise-compat/src/lib.rs
