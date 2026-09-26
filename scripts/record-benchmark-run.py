@@ -93,8 +93,8 @@ def find_result(results: list[dict], name: str) -> dict | None:
     return None
 
 
-# benchmark-hyperfine.sh labels the timed OMG driver "OMG"; benchmark.sh and
-# older records used "OMG (Daemon)". Accept both instead of hardcoding one.
+# benchmark-hyperfine.sh labels the timed OMG driver "OMG"; older records used
+# "OMG (Daemon)". Accept both instead of hardcoding one.
 DAEMON_LABELS = ("OMG", "OMG (Daemon)")
 
 

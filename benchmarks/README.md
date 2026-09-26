@@ -189,9 +189,9 @@ publish the new guest measurements without further work.
 
 ### Cleanup proposals — not deletion authorization
 
-- Retire `benchmark.sh` after migrating `Makefile`'s `bench`/`bench-fast` targets
-  and its CI path trigger. It uses a separate millisecond-rounded Bash timer and
-  compares explicit counts with package listings. Preserve historical records.
+- `benchmark.sh` was retired once `Makefile`'s `bench`/`bench-fast` targets moved to
+  `benchmark-hyperfine.sh`. The separate millisecond-rounded Bash timer is gone;
+  historical records, raw logs, and archives remain retained.
 - Replace the hardcoded arrays and speedup annotations in
   `scripts/generate-benchmark-chart.py` with validated record inputs; rebuild its
   derived images only after the evidence-backed reporting path is verified.
