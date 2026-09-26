@@ -134,8 +134,8 @@ execute a release binary on the host. Follow the commands in
 Full QEMU guests (needs KVM + Docker):
 
 ```bash
-./scripts/benchmark-qemu.sh --distro all --release vX.Y.Z --staged-dir <dir> --inventory-tiers hermetic,container --inventory-allow-mutations
-./scripts/benchmark-qemu.sh --arch aarch64 --distro debian --release vX.Y.Z --staged-dir <arm-dir> --inventory-tiers hermetic,container --inventory-allow-mutations  # ARM host only
+./scripts/benchmark-qemu.sh --distro all --release vX.Y.Z --staged-dir <dir> --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,container --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress --benchmark --benchmark-transactions 1 --storage-faults
+./scripts/benchmark-qemu.sh --arch aarch64 --distro debian --release vX.Y.Z --staged-dir <arm-dir> --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,container --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress --benchmark --benchmark-transactions 1 --storage-faults  # ARM host only
 ```
 
 Nightly-equivalent (published release + all safe tiers, x86_64 KVM host):
@@ -143,9 +143,18 @@ Nightly-equivalent (published release + all safe tiers, x86_64 KVM host):
 ```bash
 for distro in arch debian ubuntu fedora; do
   python3 scripts/prepare-qemu-release.py --tag vX.Y.Z --distro "$distro" --destination "published-$distro"
-  ./scripts/benchmark-qemu.sh --distro "$distro" --release vX.Y.Z --release-dir "published-$distro" --inventory-file "published-$distro/cases.tsv" --inventory-tiers hermetic,qemu,container,network,pty --inventory-allow-mutations
+  ./scripts/benchmark-qemu.sh --distro "$distro" --release vX.Y.Z --release-dir "published-$distro" --inventory-file "published-$distro/cases.tsv" --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,qemu,container,network,pty --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress
 done
 ```
+
+Use the isolation options when judging parity with hosted CI. Without
+`--inventory-isolate-hermetic`, an Arch `audit` row can fetch live advisories
+and fail its intentionally offline-source oracle even though the product is
+working; the hosted matrix runs that row in a separate network namespace.
+Hosted CI also runs `scripts/check-qemu-runner-isolation.py` before booting a
+guest. A WSL session with the Windows drive visible at `/mnt/c` fails that
+host-isolation check, so local guest results from such a session do not certify
+the hosted runner's filesystem containment.
 
 Published runs use the inventory from the release tag's resolved commit, with its
 revision and SHA-256 recorded in provenance. Staged builds use the current source
@@ -159,8 +168,8 @@ under guest evidence. See [Linux audit storage and migration](security.md#audit-
 
 ## What inventory results prove
 
-The current inventory has 196 rows: 176 hermetic-tier contracts, nine
-container-tier contracts, and 11 rows in other or combined tiers. The `hermetic`
+The current inventory has 200 rows: 179 hermetic-tier contracts, 11
+container-tier contracts, and 10 rows in other or combined tiers. The `hermetic`
 tier names the fixture-based Rust test contracts. Running these rows in a
 real guest is not hermetic: runtime downloads and other network operations
 still need network access. Guest images are pinned, but package index refreshes
@@ -168,6 +177,23 @@ use live repositories. Saved repository hashes and package versions identify the
 observed run, not a promise of identical future repository contents.
 Do not report all commands tested when declared,
 credentialed, or otherwise gated rows were skipped.
+
+The inventory is a scenario list, not a behavioral-coverage percentage. A
+successful exit, a help response, or syntactically valid JSON does not establish
+the result of a package transaction. For package and status rows, compare OMG
+with the guest's [pacman](https://man.archlinux.org/man/pacman.8.en),
+[dpkg-query](https://manpages.debian.org/bookworm/dpkg/dpkg-query.1.en.html),
+[APT candidate selection](https://manpages.debian.org/bookworm/apt/apt-cache.8.en.html),
+or [DNF5 repoquery](https://dnf5.readthedocs.io/en/latest/commands/repoquery.8.html),
+and inspect the resulting native database after mutations. The `info pacman`
+row compares version and source with each guest's native catalog. The `doctor` row
+also binds its backend identity to the guest's `/etc/os-release`;
+[the os-release specification](https://www.freedesktop.org/software/systemd/man/latest/os-release.html)
+allows that file to be a relative symlink. Current QEMU guests exercise Arch,
+Debian 12, Ubuntu 24.04 and Fedora 44. The documented Debian 13 and Ubuntu
+26.04 APT 7 targets, many runtime managers beyond Node/Python/Go, positive
+advisory fetch/scoring, and declared network/interactive rows still require
+guest evidence. They receive no credit from a passing four-distro matrix.
 
 The runner validates the inventory before executing commands. It replays
 per-row prerequisite chains in fresh working directories, expands `${ROOT}`

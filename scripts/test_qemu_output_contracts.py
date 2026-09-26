@@ -13,6 +13,106 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Doctor guest oracle requires a POSIX shell')
+    def test_doctor_backend_oracle_rejects_wrong_guest_and_false_health(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        begin = source.index('# BEGIN DOCTOR BACKEND ORACLE')
+        end = source.index('# END DOCTOR BACKEND ORACLE', begin)
+        oracle = source[begin:end]
+        expected = {
+            'arch': ('Arch Linux detected', 'ALPM local package database (/var/lib/pacman/local)'),
+            'debian': ('Debian/Ubuntu detected (apt backend)',
+                       'dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)'),
+            'ubuntu': ('Debian/Ubuntu detected (apt backend)',
+                       'dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)'),
+            'fedora': ('Fedora/RHEL detected (dnf backend)', ''),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / 'os-release'
+            output = root / 'doctor.out'
+            for distro, (identity, health) in expected.items():
+                with self.subTest(distro=distro):
+                    release.write_text(f'ID={distro}\n', encoding='utf-8')
+                    healthy = f'  {identity}\n'
+                    if health:
+                        healthy += f'  {health}\n'
+                    output.write_text(healthy, encoding='utf-8')
+                    command = oracle + '\ncheck_doctor_native_backend "$1" "$2" "$3"\n'
+                    def probe():
+                        return subprocess.run(
+                            [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                             command, '_', distro, str(output), str(release)],
+                            cwd=root, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(probe().returncode, 0)
+                    output.write_text('  Arch Linux detected\n' if distro != 'arch'
+                                      else '  Fedora/RHEL detected (dnf backend)\n', encoding='utf-8')
+                    self.assertEqual(probe().returncode, 1)
+                    output.write_text(healthy.replace(health, 'backend check absent')
+                                      if health else healthy + '  Arch Linux detected\n', encoding='utf-8')
+                    self.assertEqual(probe().returncode, 1)
+                    output.write_text(healthy, encoding='utf-8')
+                    release.write_text('ID=other\n', encoding='utf-8')
+                    self.assertEqual(probe().returncode, 2)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_actual_runner_requires_doctor_backend_evidence(self):
+        release = Path('/etc/os-release').read_text(encoding='utf-8')
+        distro = next((line.split('=', 1)[1].strip('"') for line in release.splitlines()
+                       if line.startswith('ID=')), '')
+        if distro not in ('arch', 'debian', 'ubuntu', 'fedora'):
+            self.skipTest('not a supported Linux guest')
+        rows = ['doctor\t["doctor"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tdoctor-native-backend\ttempdir-drop']
+        identity = {'arch': 'Arch Linux detected',
+                    'debian': 'Debian/Ubuntu detected (apt backend)',
+                    'ubuntu': 'Debian/Ubuntu detected (apt backend)',
+                    'fedora': 'Fedora/RHEL detected (dnf backend)'}[distro]
+        health = {'arch': '  ALPM local package database (/var/lib/pacman/local)\n',
+                  'debian': '  dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)\n',
+                  'ubuntu': '  dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)\n',
+                  'fedora': ''}[distro]
+        healthy = f'  {identity}\n{health}'
+        product = 'printf %s ' + shlex.quote(healthy) + '\n'
+        result, evidence, _ = self.run_inventory(product, rows, distro=distro)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'PASS')
+        result, evidence, logs = self.run_inventory('printf "Doctor is healthy\\n"\n', rows, distro=distro)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'FAIL')
+        self.assertIn('doctor did not identify', logs['doctor.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_info_row_compares_version_and_source_to_native_catalog(self):
+        row = ('info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass'
+               '\tinfo-native-package\ttempdir-drop')
+        references = {
+            'arch': ('pacman', 'Repository : core\nVersion : 1.2-3\n', 'Official repository (core)'),
+            'debian': ('apt-cache', 'pacman:\n  Candidate: 1.2-3\n', 'Official repository (apt)'),
+            'ubuntu': ('apt-cache', 'pacman:\n  Candidate: 1.2-3\n', 'Official repository (apt)'),
+            'fedora': ('dnf', '1.2-3\n', 'Official repository (dnf)'),
+        }
+        for distro, (tool, native_output, source) in references.items():
+            with self.subTest(distro=distro):
+                native = {tool: 'printf %s ' + shlex.quote(native_output) + '\n'}
+                def product(version):
+                    return 'printf %s ' + shlex.quote(
+                        f'  | Info\n    pacman\n          Name: pacman\n'
+                        f'       Version: {version}\n        Source: {source}\n') + '\n'
+                result, evidence, _ = self.run_inventory(
+                    product('1.2-3'), [row], distro=distro, native_commands=native)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'PASS')
+                result, evidence, logs = self.run_inventory(
+                    product('9.9-9'), [row], distro=distro, native_commands=native)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'FAIL')
+                self.assertIn('info disagrees with the native', logs['info.log'])
+                result, evidence, _ = self.run_inventory(
+                    product('1.2-3'), [row], distro=distro,
+                    native_commands={tool: 'exit 7\n'})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(evidence[0]['result'], 'BLOCKED')
+
     @staticmethod
     def runtime_usage_fixture(runtime):
         usage = json.dumps({'runtime_usage_counts': {runtime: 1},
@@ -63,7 +163,7 @@ class OutputContracts(unittest.TestCase):
         }
         for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
             for command, case in cases.items():
-                rows = [f'{case}\t["{command}"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+                rows = [f'{case}\t["{command}"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tnative-count\ttempdir-drop']
                 for value, verdict in [('2', 'PASS'), ('0', 'FAIL')]:
                     with self.subTest(distro=distro, command=command, value=value):
                         result, evidence, logs = self.run_inventory(
@@ -71,13 +171,20 @@ class OutputContracts(unittest.TestCase):
                         self.assertEqual(evidence[0]['result'], verdict, logs)
                         self.assertEqual(result.returncode, int(verdict == 'FAIL'), result.stderr)
                         self.assertIn(f'native counter {command} expected=2 actual={value}', logs[case + '.log'])
+            explicit = ['explicit\t["explicit","--count"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tnative-count\ttempdir-drop']
+            for value, verdict in [('2', 'PASS'), ('0', 'FAIL')]:
+                with self.subTest(distro=distro, case='explicit', value=value):
+                    result, evidence, _ = self.run_inventory(
+                        f'printf "{value}\\n"\n', explicit, native_commands=native, distro=distro)
+                    self.assertEqual(evidence[0]['result'], verdict)
+                    self.assertEqual(result.returncode, int(verdict == 'FAIL'))
             broken = {name: 'echo native-reference-failed >&2\nexit 17\n' for name in native}
             result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
                                                        native_commands=broken, distro=distro)
             self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('native counter reference failed', logs[case + '.log'])
-        rows = ['explicit-shortcut\t["ec"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        rows = ['explicit-shortcut\t["ec"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tnative-count\ttempdir-drop']
         result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
             native_commands=dict(native, sort='exit 17\n'))
         self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
@@ -93,6 +200,100 @@ class OutputContracts(unittest.TestCase):
                 native_commands={'pacman': diagnostic + 'exit 1\n'})
             self.assertEqual(evidence[0]['result'], verdict)
             self.assertEqual(result.returncode, int(verdict != 'PASS'))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_status_rows_require_distro_native_counts_instead_of_only_exit_zero(self):
+        native = {
+            'pacman': 'case "$1" in -Qq) printf "a\\nb\\nc\\n" ;; -Qqe) printf "a\\nb\\n" ;; -Qdtq|-Quq) printf "c\\n" ;; *) exit 17 ;; esac\n',
+            'dpkg-query': 'printf "installed\\nconfig-files\\ninstalled\\ninstalled\\n"\n',
+            'apt-mark': 'printf "a\\nb\\n"\n',
+            'apt-get': 'printf "Remv c [1.0]\\n"\n',
+            'apt': 'printf "c/stable 2 amd64 [upgradable from: 1]\\n"\n',
+            'rpm': 'printf "a.x86_64\\nb.x86_64\\nc.x86_64\\n"\n',
+            'dnf': 'case " $* " in *--userinstalled*) printf "a\\nb\\n" ;; *--unneeded*|*--upgrades*) printf "c\\n" ;; *) exit 17 ;; esac\n',
+        }
+        rows = (
+            'status\t["status","--fast"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tstatus-native-fast\ttempdir-drop',
+            'status-verbose\t["--verbose","status"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tstatus-native-full\ttempdir-drop',
+        )
+        product = (
+            'printf "Status\\n\\n  3 packages installed · 2 explicit\\n"\n'
+            'if [[ "$1" == status ]]; then\n'
+            '  printf "  Updates and orphans not checked. Run omg status for a full check.\\n"\n'
+            'else\n'
+            '  printf "  Updates    1\\n  Orphans    1\\n"\n'
+            'fi\n'
+        )
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            with self.subTest(distro=distro, case='correct'):
+                result, evidence, logs = self.run_inventory(product, rows, native_commands=native, distro=distro)
+                self.assertEqual(result.returncode, 0, logs)
+                self.assertEqual([item['result'] for item in evidence], ['PASS', 'PASS'])
+                self.assertIn('native counter tc expected=3 actual=3', logs['status.log'])
+                self.assertIn('native counter oc expected=1 actual=1', logs['status-verbose.log'])
+            with self.subTest(distro=distro, case='false-green-total'):
+                wrong = product.replace('3 packages installed', '4 packages installed')
+                result, evidence, logs = self.run_inventory(wrong, rows, native_commands=native, distro=distro)
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'])
+                self.assertIn('assertion failed: status tc', logs['status.log'])
+        for case, mutation in (
+            ('explicit', ('2 explicit', '9 explicit')),
+            ('updates', ('Updates    1', 'Updates    9')),
+            ('orphans', ('Orphans    1', 'Orphans    9')),
+            ('fast-marker', ('Updates and orphans not checked.', 'All checks complete.')),
+        ):
+            with self.subTest(case=case):
+                result, evidence, _ = self.run_inventory(
+                    product.replace(*mutation), rows, native_commands=native)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('FAIL', [item['result'] for item in evidence])
+        broken = dict(native, pacman='echo native-reference-failed >&2\nexit 17\n')
+        result, evidence, _ = self.run_inventory(product, rows, native_commands=broken)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([item['result'] for item in evidence], ['BLOCKED', 'BLOCKED'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_outdated_rows_compare_reported_updates_to_native_queries(self):
+        native = {
+            'pacman': '[[ "$1" == -Quq ]] || exit 17\nprintf "c\\n"\n',
+            'apt': 'printf "c/stable 2 amd64 [upgradable from: 1]\\n"\n',
+            'dnf': '[[ " $* " == *--upgrades* ]] || exit 17\nprintf "c.x86_64\\n"\n',
+        }
+        rows = (
+            'outdated\t["outdated"]\tread\t0\tpass\t-\thermetic\thermetic:pass\toutdated-native-count\ttempdir-drop',
+            'outdated-json\t["--json","outdated"]\tread\t0\tpass\t-\thermetic\thermetic:pass\toutdated-json-native-count\ttempdir-drop',
+        )
+        item = '{"name":"c","current_version":"1","new_version":"2"}'
+        product = (
+            'if [[ "$1" == --json ]]; then\n'
+            f'  printf "%s\\n" \'[{item}]\'\n'
+            'else\n'
+            '  printf "[Available Updates] 1 packages total\\n"\n'
+            'fi\n'
+        )
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            with self.subTest(distro=distro, case='correct'):
+                result, evidence, logs = self.run_inventory(product, rows, native_commands=native, distro=distro)
+                self.assertEqual(result.returncode, 0, logs)
+                self.assertEqual([item['result'] for item in evidence], ['PASS', 'PASS'])
+                self.assertIn('native counter uc expected=1 actual=1', logs['outdated.log'])
+            with self.subTest(distro=distro, case='false-zero'):
+                wrong = product.replace('1 packages total', '2 packages total').replace(f'[{item}]', '[]')
+                result, evidence, logs = self.run_inventory(wrong, rows, native_commands=native, distro=distro)
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'])
+        for case, mutation in (
+            ('missing-version', (item, '{"name":"c","current_version":"1","new_version":""}')),
+            ('no-summary', ('[Available Updates] 1 packages total', 'Updates may be available')),
+            ('conflicting-zero', ('[Available Updates] 1 packages total',
+                                  '[Available Updates] 1 packages total\\nEverything is up to date!')),
+        ):
+            with self.subTest(case=case):
+                result, evidence, _ = self.run_inventory(product.replace(*mutation), rows,
+                                                          native_commands=native)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('FAIL', [item['result'] for item in evidence])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_python_install_requires_active_executable_and_exact_version(self):
