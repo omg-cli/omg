@@ -575,6 +575,13 @@ enum Assertion {
     NativeAptOrphanRemoved,
     SelfUpdateDowngradeRefusal,
     EnvShareMissingLock,
+    NativeCount,
+    StatusNativeFast,
+    StatusNativeFull,
+    OutdatedNativeCount,
+    OutdatedJsonNativeCount,
+    DoctorNativeBackend,
+    InfoNativePackage,
 }
 
 impl Assertion {
@@ -599,6 +606,13 @@ impl Assertion {
             "native-apt-orphan-removed" => Self::NativeAptOrphanRemoved,
             "self-update-downgrade-refusal" => Self::SelfUpdateDowngradeRefusal,
             "env-share-missing-lock" => Self::EnvShareMissingLock,
+            "native-count" => Self::NativeCount,
+            "status-native-fast" => Self::StatusNativeFast,
+            "status-native-full" => Self::StatusNativeFull,
+            "outdated-native-count" => Self::OutdatedNativeCount,
+            "outdated-json-native-count" => Self::OutdatedJsonNativeCount,
+            "doctor-native-backend" => Self::DoctorNativeBackend,
+            "info-native-package" => Self::InfoNativePackage,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1456,7 +1470,14 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::SearchOfficialTreeOutput
                 | Assertion::NativeTreeInstalled
                 | Assertion::NativeTreeAbsent
-                | Assertion::NativeAptOrphanRemoved => {
+                | Assertion::NativeAptOrphanRemoved
+                | Assertion::NativeCount
+                | Assertion::StatusNativeFast
+                | Assertion::StatusNativeFull
+                | Assertion::OutdatedNativeCount
+                | Assertion::OutdatedJsonNativeCount
+                | Assertion::DoctorNativeBackend
+                | Assertion::InfoNativePackage => {
                     unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
             }

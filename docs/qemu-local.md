@@ -168,7 +168,7 @@ under guest evidence. See [Linux audit storage and migration](security.md#audit-
 
 ## What inventory results prove
 
-The current inventory has 200 rows: 179 hermetic-tier contracts, 11
+The current inventory has 200 rows: 168 hermetic-tier contracts, 22
 container-tier contracts, and 10 rows in other or combined tiers. The `hermetic`
 tier names the fixture-based Rust test contracts. Running these rows in a
 real guest is not hermetic: runtime downloads and other network operations

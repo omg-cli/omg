@@ -24460,7 +24460,7 @@
         }
       ]
     },
-    "214df1dc0ad7799d16bb14ea0a5c7df754f3fb311779633cdac94440720dac29": {
+    "9fceb59c1a267e5ebe0cff5e02c1a9a04d99b7a12c8379a8f354f3aea680c354": {
       "releases": [],
       "cases": [
         {
@@ -24515,7 +24515,7 @@
         {
           "id": "info",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -24531,7 +24531,7 @@
         {
           "id": "outdated",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -24643,7 +24643,7 @@
         {
           "id": "explicit",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -24651,7 +24651,7 @@
         {
           "id": "explicit-shortcut",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -24939,7 +24939,7 @@
         {
           "id": "status",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -24947,7 +24947,7 @@
         {
           "id": "doctor",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "network",
@@ -25488,7 +25488,7 @@
         {
           "id": "outdated-json",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -25504,7 +25504,7 @@
         {
           "id": "status-verbose",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -26092,7 +26092,7 @@
         {
           "id": "total-shortcut",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -26100,7 +26100,7 @@
         {
           "id": "orphan-shortcut",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
@@ -26108,7 +26108,7 @@
         {
           "id": "updates-shortcut",
           "tiers": [
-            "hermetic"
+            "container"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
