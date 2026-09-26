@@ -63,13 +63,28 @@ jobs:
         with:
           toolchain: "1.95.0"
 
-      - name: Cache compiled dependencies
+      - name: Compute native cache identity
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_PLATFORM: ${{ inputs.distro }}
+          CACHE_IMAGE: ${{ inputs.image }}
+          CACHE_FEATURES: ${{ inputs.features }}
+        run: |
+          set -euo pipefail
+          # GitHub cache keys reject commas. Hash the complete compatibility
+          # tuple instead of dropping features or making a lossy replacement.
+          key=$(printf '%s\0' "$CACHE_PLATFORM" "$CACHE_IMAGE" "$CACHE_FEATURES" | sha256sum)
+          printf 'key=%s\n' "${key%% *}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore native compiled dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          prefix-key: qemu-staged-v1
-          key: x64-${{ inputs.distro }}-${{ hashFiles('.github/workflows/qemu-matrix.yml', '.github/workflows/qemu-lane.yml') }}
+          prefix-key: v2-platform-dependencies
+          shared-key: ${{ steps.cache-key.outputs.key }}
+          save-if: false
           cache-bin: false
-          cache-on-failure: false
+          cache-workspace-crates: false
 
       - name: Run library and binary unit tests (including omgd)
         run: cargo test --lib --bins --no-default-features --features ${{ inputs.features }} --locked --no-fail-fast -- --test-threads=1
@@ -138,13 +153,12 @@ jobs:
         with:
           toolchain: "1.95.0"
 
-      - name: Cache compiled dependencies
+      - name: Restore native compiled dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          prefix-key: qemu-staged-v1
-          key: x64-ubuntu-${{ hashFiles('.github/workflows/qemu-matrix.yml', '.github/workflows/qemu-lane.yml') }}
+          prefix-key: v1-ubuntu-debian
+          save-if: false
           cache-bin: false
-          cache-on-failure: false
 
       - name: Run library and binary unit tests (including omgd)
         run: cargo test --lib --bins --no-default-features --features debian,pgp,license --locked --no-fail-fast -- --test-threads=1

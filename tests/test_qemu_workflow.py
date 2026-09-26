@@ -125,6 +125,20 @@ class QemuWorkflowTests(unittest.TestCase):
                 self.assertEqual('--release-dir' in args, not staged)
                 self.assertEqual('--inventory-file' in args, not staged)
 
+    def test_nightly_builds_restore_native_caches_without_extra_saves(self):
+        ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
+        native_identity = ci.split('      - name: Compute native cache identity\n', 1)[1].split('      - name: Cache Rust dependencies\n', 1)[0]
+        staged_identity = LANE.split('      - name: Compute native cache identity\n', 1)[1].split('      - name: Restore native compiled dependencies\n', 1)[0]
+        self.assertEqual(staged_identity, native_identity.replace('matrix.platform', 'inputs.distro').replace('matrix.image', 'inputs.image').replace('matrix.features', 'inputs.features'))
+        native_cache = LANE.split('      - name: Restore native compiled dependencies\n', 1)[1].split('      - name: Run library and binary unit tests', 1)[0]
+        ubuntu_cache = LANE.split('      - name: Restore native compiled dependencies\n', 2)[2].split('      - name: Run library and binary unit tests', 1)[0]
+        self.assertIn('prefix-key: v2-platform-dependencies', native_cache)
+        self.assertIn('shared-key: ${{ steps.cache-key.outputs.key }}', native_cache)
+        self.assertIn('prefix-key: v1-ubuntu-debian', ubuntu_cache)
+        for cache in (native_cache, ubuntu_cache):
+            self.assertIn('save-if: false', cache)
+            self.assertNotIn('qemu-staged-v1', cache)
+
     def test_pull_request_never_selects_configurable_arm_runner(self):
         with tempfile.TemporaryDirectory() as tmp:
             result, values = self.selection(Path(tmp), True, 'all', 'all', event_name='pull_request')
