@@ -33105,7 +33105,7 @@
         }
       ]
     },
-    "d500fe36743876a55a52778abfcd0d017c36f125a5b2e665fbed9675ffcedae1": {
+    "b173def15e7b47632af1285f53620706609d7ac5a5cbb531321c59a78da48d9a": {
       "releases": [],
       "cases": [
         {
@@ -33632,6 +33632,14 @@
         },
         {
           "id": "audit-secrets",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-secrets-critical",
           "tiers": [
             "hermetic"
           ],
