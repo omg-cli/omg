@@ -13,6 +13,103 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_package_dry_runs_reject_success_without_a_preview(self):
+        release = Path('/etc/os-release').read_text(encoding='utf-8')
+        match = re.search(r'^ID=(\S+)$', release, re.MULTILINE)
+        distro = {'arch': 'arch', 'archlinux': 'arch', 'debian': 'debian',
+                  'ubuntu': 'ubuntu', 'fedora': 'fedora'}.get(match.group(1).strip('"') if match else '')
+        if distro is None:
+            self.skipTest('requires one supported native package database')
+        ids = {'install', 'remove', 'install-flags', 'remove-flags'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        result, evidence, logs = self.run_inventory('exit 0\n', rows, distro=distro)
+        self.assertEqual([row['result'] for row in evidence], ['FAIL'] * len(rows),
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_package_dry_run_rejects_native_state_mutation(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('install\t'))
+        native = {'pacman': 'case "$1" in\n'
+                            '  -Q) if [[ -f native-state-changed ]]; then echo "pacman 8"; '
+                            'else echo "pacman 7"; fi ;;\n'
+                            '  -Qqe) if [[ -f native-reason-changed ]]; then echo changed; '
+                            'else echo pacman; fi ;;\n'
+                            '  *) exit 2 ;;\n'
+                            'esac\n'}
+        preview = "printf '%s\\n' '  | Install Preview' '    dry run' " \
+                  "'│ pacman  ┆ 7.1 ┆ 1 MB ┆ Official │' " \
+                  "'  ℹ • No changes will be made (dry run)'\n"
+        result, evidence, logs = self.run_inventory(preview, [row],
+                                                     distro='arch', native_commands=native)
+        self.assertEqual([item['result'] for item in evidence], ['PASS'],
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        result, evidence, logs = self.run_inventory('touch native-state-changed\n' + preview,
+                                                     [row], distro='arch', native_commands=native)
+        self.assertEqual([item['result'] for item in evidence], ['FAIL'],
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertIn('dry run changed native installed-package state or reasons', logs['install.log'])
+        result, evidence, logs = self.run_inventory('touch native-reason-changed\n' + preview,
+                                                     [row], distro='arch', native_commands=native)
+        self.assertEqual(evidence[0]['result'], 'FAIL',
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertIn('dry run changed native installed-package state or reasons', logs['install.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_fedora_remove_requires_the_installed_rpm_version(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('remove\t'))
+        native = {'rpm': 'case "$1" in\n'
+                         '  -qa) printf "bash\\t5.3-1\\n" ;;\n'
+                         '  -q) printf "5.3-1\\n" ;;\n'
+                         '  *) exit 2 ;;\n'
+                         'esac\n',
+                  'dnf': 'printf "bash\\tUser\\n"\n'}
+        preview = "printf '%s\\n' '  | Remove Preview' '    dry run' " \
+                  "'  → The following packages would be removed:' " \
+                  "'    ✗ bash 5.3-1' '  ℹ No changes made (dry run)'\n"
+        result, evidence, logs = self.run_inventory(preview, [row],
+                                                     distro='fedora', native_commands=native)
+        self.assertEqual(evidence[0]['result'], 'PASS',
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        result, evidence, logs = self.run_inventory(
+            preview.replace('bash 5.3-1', 'bash (feature-specific info unavailable)'),
+            [row], distro='fedora', native_commands=native)
+        self.assertEqual(evidence[0]['result'], 'FAIL',
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertIn('lacks the native installed bash version', logs['remove.log'])
+        result, evidence, logs = self.run_inventory(
+            preview.replace('✗ bash 5.3-1', '✗ bash 0.0-1')
+            + "printf '%s\\n' 'unrelated bash 5.3-1 diagnostic'\n",
+            [row], distro='fedora', native_commands=native)
+        self.assertEqual(evidence[0]['result'], 'FAIL',
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertIn('lacks the native installed bash version', logs['remove.log'])
+
+    def test_recursive_remove_requires_the_backend_specific_refusal(self):
+        for distro, explanation in (
+            ('debian', 'Recursive removal is not supported by the Debian backend'),
+            ('ubuntu', 'Recursive removal is not supported by the Debian backend'),
+            ('fedora', 'Recursive removal is not supported by this package backend'),
+        ):
+            with self.subTest(distro=distro):
+                refusal = f'Error: {explanation}\n'
+                self.assertEqual(self.run_oracle(assertion='package-dry-run-recursive',
+                                                code=1, stderr=refusal, distro=distro).returncode, 0)
+                self.assertNotEqual(self.run_oracle(assertion='package-dry-run-recursive',
+                                                   code=1, stderr='Error: arbitrary failure\n',
+                                                   distro=distro).returncode, 0)
+                self.assertNotEqual(self.run_oracle(assertion='package-dry-run-recursive',
+                                                   code=1, stderr=refusal,
+                                                   stdout='  | Remove Preview\n',
+                                                   distro=distro).returncode, 0)
+
     @unittest.skipIf(os.name == 'nt', 'Doctor guest oracle requires a POSIX shell')
     def test_doctor_backend_oracle_rejects_wrong_guest_and_false_health(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')

@@ -573,6 +573,9 @@ enum Assertion {
     WorkspaceAllOutput,
     CiGithubWorkflow,
     CiGithubWorkflowAdvanced,
+    PackageDryRunInstall,
+    PackageDryRunRemove,
+    PackageDryRunRecursive,
     HooksInstalled,
     HooksAbsent,
     UpdateFastOutput,
@@ -641,6 +644,9 @@ impl Assertion {
             "workspace-all-output" => Self::WorkspaceAllOutput,
             "ci-github-workflow" => Self::CiGithubWorkflow,
             "ci-github-workflow-advanced" => Self::CiGithubWorkflowAdvanced,
+            "package-dry-run-install" => Self::PackageDryRunInstall,
+            "package-dry-run-remove" => Self::PackageDryRunRemove,
+            "package-dry-run-recursive" => Self::PackageDryRunRecursive,
             "hooks-installed" => Self::HooksInstalled,
             "hooks-absent" => Self::HooksAbsent,
             "update-fast-output" => Self::UpdateFastOutput,
@@ -1435,6 +1441,14 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 &format!("{}{}\n", "-----BEGIN ", "PRIVATE KEY-----"),
             );
         }
+        let remove_data_dir = matches!(case.id.as_str(), "remove" | "remove-flags")
+            .then(|| project.path().join("remove-state"));
+        if let Some(path) = &remove_data_dir {
+            let mock = omg_lib::package_managers::mock::MockPackageManager::new_in("arch", path);
+            mock.set_installed_version("bash", "5.3.20-1")
+                .expect("seed isolated bash package");
+            command_env.push(("OMG_DATA_DIR", path.to_str().expect("UTF-8 mock path")));
+        }
         let started = Instant::now();
         let result = project.run_with_env(&args, &command_env);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1699,6 +1713,37 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         usize::from(matches!(assertion, Assertion::WorkspaceAllOutput));
                     if primary != 1 || nested != expected_nested {
                         issues.push(format!("workspace task counts primary={primary} nested={nested}; expected primary=1 nested={expected_nested}"));
+                    }
+                }
+                Assertion::PackageDryRunInstall
+                | Assertion::PackageDryRunRemove
+                | Assertion::PackageDryRunRecursive => {
+                    let install = matches!(assertion, Assertion::PackageDryRunInstall);
+                    let preview = if install {
+                        "  | Install Preview"
+                    } else {
+                        "  | Remove Preview"
+                    };
+                    let no_changes = if install {
+                        "  ℹ • No changes will be made (dry run)"
+                    } else {
+                        "  ℹ No changes made (dry run)"
+                    };
+                    let package_line = if install {
+                        "│ pacman  ┆"
+                    } else {
+                        "    ✗ bash "
+                    };
+                    if !result.stdout.lines().any(|line| line == preview)
+                        || !result.stdout.lines().any(|line| line == "    dry run")
+                        || !result.stdout.contains(package_line)
+                        || !result.stdout.lines().any(|line| line == no_changes)
+                        || (matches!(assertion, Assertion::PackageDryRunRecursive)
+                            && !result
+                                .stdout
+                                .contains("Additional unneeded dependencies would also be removed"))
+                    {
+                        issues.push(format!("{} did not prove a target-specific dry-run preview", case.id));
                     }
                 }
                 Assertion::CiGithubWorkflow | Assertion::CiGithubWorkflowAdvanced => {
