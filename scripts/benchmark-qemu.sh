@@ -587,6 +587,7 @@ if [[ -n "$inventory_tiers" ]]; then
   # The inventory executor runs inside the controller (same netns as the
   # guest); /work is bind-mounted there.
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
+  cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-fedora-update-fixture.sh" "$work/qemu-fedora-update-fixture.sh"
   cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"
   cp "$tsv" "$work/cases.tsv"
@@ -754,6 +755,7 @@ if [[ "$distro" == arch ]]; then
 fi
 if [[ -n "$inventory_tiers" ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fedora-update-fixture.sh bench@127.0.0.1:qemu-fedora-update-fixture.sh
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fingerprint-oracle.py bench@127.0.0.1:qemu-fingerprint-oracle.py
 fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/daemon-advisory-shutdown.sh bench@127.0.0.1:daemon-advisory-shutdown.sh
 if [[ "$benchmark" == true ]]; then

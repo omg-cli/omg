@@ -32,6 +32,9 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(case=case):
                 self.assertEqual(rows[case]["expected_exit"], "0")
                 self.assertEqual(rows[case]["targets"], "hermetic:pass")
+                self.assertEqual(rows[case]["assertions"], f"fingerprint:{case}")
+        self.assertEqual(rows["team-status"]["requires"], "team-push")
+        self.assertEqual(rows["team-pull"]["requires"], "team-push")
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

@@ -561,6 +561,7 @@ enum Assertion {
     SbomInventoryOnly,
     JsonStdout,
     Artifact(String),
+    Fingerprint(String),
     WorkspaceFilteredOutput,
     WorkspaceAllOutput,
     HooksInstalled,
@@ -599,6 +600,23 @@ enum Assertion {
 
 impl Assertion {
     fn parse(raw: &str, line_number: usize) -> Self {
+        if let Some(case) = raw.strip_prefix("fingerprint:") {
+            assert!(
+                matches!(
+                    case,
+                    "snapshot-create"
+                        | "migrate-export"
+                        | "migrate-import"
+                        | "env-capture"
+                        | "env-check"
+                        | "team-status"
+                        | "team-push"
+                        | "team-pull"
+                ),
+                "unknown fingerprint assertion on inventory line {line_number}: {raw}"
+            );
+            return Self::Fingerprint(case.to_string());
+        }
         match raw {
             "audit-source-failure" => Self::AuditSourceFailure,
             "audit-fix-refusal" => Self::AuditFixRefusal,
@@ -1332,6 +1350,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
             "config-state"
         });
         let privacy_data_dir = project.path().join("privacy-data");
+        let fingerprint_data_dir = project.path().join("fingerprint-data");
         let mut command_env = vec![
             ("HOME", home.as_str()),
             ("PATH", path.as_str()),
@@ -1352,6 +1371,14 @@ fn behavior_inventory_runs_in_hermetic_state() {
             command_env.push((
                 "OMG_DATA_DIR",
                 privacy_data_dir.to_str().expect("UTF-8 privacy data path"),
+            ));
+        }
+        if case.id == "snapshot-create" {
+            command_env.push((
+                "OMG_DATA_DIR",
+                fingerprint_data_dir
+                    .to_str()
+                    .expect("UTF-8 fingerprint data path"),
             ));
         }
         if case.id == "privacy-opt-out" {
@@ -1600,6 +1627,17 @@ fn behavior_inventory_runs_in_hermetic_state() {
                             "artifact {relative} was not written as valid JSON at {}",
                             path.display()
                         ));
+                    }
+                }
+                Assertion::Fingerprint(fingerprint_case) => {
+                    let artifact = match fingerprint_case.as_str() {
+                        "snapshot-create" => fingerprint_data_dir.join("snapshots/index.json"),
+                        "migrate-export" | "migrate-import" => project.path().join("manifest.json"),
+                        "team-status" => project.path().join(".omg/team-status.json"),
+                        _ => project.path().join("omg.lock"),
+                    };
+                    if !artifact.is_file() {
+                        issues.push(format!("fingerprint artifact missing: {}", artifact.display()));
                     }
                 }
                 Assertion::SelfUpdateDowngradeRefusal => {

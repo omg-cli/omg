@@ -769,6 +769,10 @@ check_product_output() {
         if ! jq -e -s 'length == 1' "$stdout" >/dev/null 2>&1; then
           printf 'assertion failed: stdout is not exactly one JSON document\n' >&2; return 1
         fi ;;
+      fingerprint:*)
+        if ! python3 "$HOME/qemu-fingerprint-oracle.py" "${assertion#fingerprint:}" "$distro" "$PWD" "$stdout"; then
+          printf 'assertion failed: native-backed fingerprint artifact oracle\n' >&2; return 1
+        fi ;;
       native-tree-installed|native-tree-absent)
         local expected=installed
         [[ "$assertion" == native-tree-installed ]] || expected=absent
@@ -1018,7 +1022,12 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$id" in
+    snapshot-create|migrate-export|migrate-import|env-capture|env-check|team-status|team-push|team-pull)
+      [[ "$a" == "fingerprint:$id" ]] || exit 2 ;;
+    *) [[ "$a" != fingerprint:* ]] || exit 2 ;;
+  esac
   case "$id" in
     config-set)
       [[ "$a" == config-set-persisted ]] && jq -e '. == ["config","set","telemetry.enabled","true"]' <<< "$aj" >/dev/null || exit 2 ;;
@@ -1222,6 +1231,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
   remote="set -eu; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
+  if [[ "$assertions" == fingerprint:* || "$case" == team-init || "$case" == snapshot-* ]]; then
+    remote+="; export OMG_CONFIG_DIR=\"\$rowdir/fingerprint-config\" OMG_DATA_DIR=\"\$rowdir/fingerprint-data\" OMG_CACHE_DIR=\"\$rowdir/fingerprint-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
+  fi
   if [[ "$case" == config-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/config\""
   fi
