@@ -824,6 +824,38 @@ pub(crate) async fn extract_tar_gz(
     .await?
 }
 
+/// Report an archive's byte size and SHA-256 for failure diagnostics.
+///
+/// Used only on the decompression failure path, where the archive was already
+/// checksum-verified at download time; the identity makes "bytes changed after
+/// verification" distinguishable from "the decoder rejects this input". The
+/// digest streams through a fixed buffer because a runtime archive may be up
+/// to [`MAX_RUNTIME_DOWNLOAD_BYTES`], which must not be buffered in a guest.
+fn archive_identity(archive_path: &Path) -> (u64, String) {
+    use std::io::Read as _;
+
+    let mut file = match File::open(archive_path) {
+        Ok(file) => file,
+        Err(error) => return (0, format!("unreadable: {error}")),
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            }
+            Err(error) => {
+                return (total, format!("unreadable after {total} bytes: {error}"));
+            }
+        }
+    }
+    (total, hex::encode(hasher.finalize()))
+}
+
 /// Synchronously extract selected entries from a .tar.xz component archive
 /// with a bounded decompression budget.
 ///
@@ -853,8 +885,18 @@ pub(crate) fn extract_component_tar_xz(
         )
     })?;
     let mut output = BudgetedWriter::new(output, budget);
-    lzma_rs::xz_decompress(&mut BufReader::new(file), &mut output)
-        .context("Failed to decompress XZ archive")?;
+    if let Err(error) = lzma_rs::xz_decompress(&mut BufReader::new(file), &mut output) {
+        // A digest-verified archive that later fails to decode means either the
+        // bytes changed after verification or the decoder hit input it cannot
+        // represent. Sizes and digests make that decidable from the log alone;
+        // see the intermittent Fedora runtime-node-install failure where the
+        // download verified but the decode reported a bogus LZ distance.
+        let (bytes, digest) = archive_identity(archive_path);
+        return Err(anyhow::Error::new(error).context(format!(
+            "Failed to decompress XZ archive (archive={} bytes={bytes} sha256={digest})",
+            archive_path.display()
+        )));
+    }
     let mut output = output.into_inner();
     output.seek(SeekFrom::Start(0))?;
 
@@ -2524,6 +2566,42 @@ mod tests {
 
         extract_tar_xz(&archive_path, temp.path().join("out").as_path(), 1).await?;
         assert_eq!(fs::read(temp.path().join("out/bin/tool"))?, b"tool");
+        Ok(())
+    }
+
+    #[test]
+    fn archive_identity_reports_size_and_digest() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("artifact.bin");
+        fs::write(&path, b"abc")?;
+        let (bytes, digest) = archive_identity(&path);
+        assert_eq!(bytes, 3);
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decompression_failure_reports_the_archive_identity() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let archive_path = temp.path().join("runtime.tar.xz");
+        fs::write(
+            &archive_path,
+            b"not an xz stream, but long enough to attempt decoding",
+        )?;
+        let error = extract_tar_xz(&archive_path, temp.path().join("out").as_path(), 1)
+            .await
+            .expect_err("garbage archive must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Failed to decompress XZ archive"),
+            "{message}"
+        );
+        assert!(message.contains("bytes="), "{message}");
+        assert!(message.contains("sha256="), "{message}");
+        assert!(message.contains("runtime.tar.xz"), "{message}");
         Ok(())
     }
 
