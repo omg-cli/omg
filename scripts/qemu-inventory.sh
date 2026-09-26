@@ -655,6 +655,20 @@ check_runtime_uninstall() {
     printf 'assertion failed: runtime uninstall did not remove only the inactive version\n' >&2; return 1
   fi
 }
+check_doctor_eol_delta() {
+  local baseline_rc=$1 baseline_out=$2 baseline_err=$3 eol_rc=$4 eol_err=$5
+  local baseline_count eol_count
+  baseline_count=$(sed -nE 's/^Error: doctor found ([0-9]+) health issue\(s\)$/\1/p' "$baseline_err")
+  eol_count=$(sed -nE 's/^Error: doctor found ([0-9]+) health issue\(s\)$/\1/p' "$eol_err")
+  if [[ "$baseline_rc" == 0 ]]; then
+    [[ -z "$baseline_count" ]] && grep -Fq 'System is healthy' "$baseline_out" || return 1
+    baseline_count=0
+  elif [[ "$baseline_rc" != 1 || ! "$baseline_count" =~ ^[1-9][0-9]*$ ]]; then
+    return 1
+  fi
+  [[ "$eol_rc" == 1 && "$eol_count" =~ ^[1-9][0-9]*$ ]] || return 1
+  (( eol_count == baseline_count + 1 ))
+}
 check_runtime_state() {
   local runtime=$1 selected=$2 active=$3 assertion=$4 output=$5 base current
   [[ "${OMG_DATA_DIR:-}" == "$rowdir/runtime-data" ]] || {
@@ -730,6 +744,15 @@ check_product_output() {
     if [[ "$code" != 1 ]] \
       || ! grep -Fq 'No omg.lock file found' "$stderr"; then
       printf 'assertion failed: env share did not refuse without an omg.lock\n' >&2; return 1
+    fi
+  fi
+  if [[ "$assertion" == doctor-eol-state ]]; then
+    if [[ "$code" != 1 ]] \
+      || ! grep -Fq 'Runtime EOL Status' "$stdout" \
+      || ! grep -Fxq '  ⚠ node 16.20.2 - EOL since 2023-09-11' "$stdout" \
+      || ! grep -Fxq '  ✓ python 3.12.14' "$stdout" \
+      || grep -Eq 'No managed runtimes were detected|All detected runtimes are within support period' "$stdout"; then
+      printf 'assertion failed: doctor EOL did not classify both confined runtimes\n' >&2; return 1
     fi
   fi
   if [[ "$code" == 0 ]]; then
@@ -1022,7 +1045,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
   case "$id" in
     snapshot-create|migrate-export|migrate-import|env-capture|env-check|team-status|team-push|team-pull)
       [[ "$a" == "fingerprint:$id" ]] || exit 2 ;;
@@ -1078,6 +1101,12 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     [[ "$a" == doctor-native-backend ]] || exit 2
     jq -e '. == ["doctor"]' <<< "$aj" >/dev/null || exit 2
   elif [[ "$a" == doctor-native-backend ]]; then
+    exit 2
+  fi
+  if [[ "$id" == doctor-eol ]]; then
+    [[ "$a" == doctor-eol-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == hermetic ]] || exit 2
+    jq -e '. == ["doctor", "--eol"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == doctor-eol-state ]]; then
     exit 2
   fi
   if [[ "$id" == info ]]; then
@@ -1234,6 +1263,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == fingerprint:* || "$case" == team-init || "$case" == snapshot-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/fingerprint-config\" OMG_DATA_DIR=\"\$rowdir/fingerprint-data\" OMG_CACHE_DIR=\"\$rowdir/fingerprint-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
   fi
+  if [[ "$assertions" == doctor-eol-state ]]; then
+    remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: doctor EOL fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/eol-config\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/eol-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
+    remote+="; mkdir -p \"\$OMG_DATA_DIR/versions/node/16.20.2\" \"\$OMG_DATA_DIR/versions/python/3.12.14\"; ln -s 16.20.2 \"\$OMG_DATA_DIR/versions/node/current\"; ln -s 3.12.14 \"\$OMG_DATA_DIR/versions/python/current\""
+    remote+="; $(declare -f check_doctor_eol_delta)"
+  fi
   if [[ "$case" == config-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/config\""
   fi
@@ -1292,6 +1326,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # generated prerequisite hook with user content and non-executable mode;
     # the normal installed-hook oracle must observe real replacement.
     remote+="; for hook in pre-commit post-checkout post-merge; do printf '#!/bin/sh\\n# user-owned hook fixture\\nexit 23\\n' > \".git/hooks/\$hook\"; chmod 640 \".git/hooks/\$hook\"; done"
+  fi
+  if [[ "$assertions" == doctor-eol-state ]]; then
+    remote+="; run_omg '$row_timeout' $quoted_binary doctor > doctor.baseline.stdout.log 2> doctor.baseline.stderr.log; baseline_rc=\$rc; baseline_phase=\$execution_phase"
+    remote+="; cat doctor.baseline.stdout.log doctor.baseline.stderr.log >&2"
   fi
   arg_string=$(quote_args "$args_json")
   command_timeout=$row_timeout
@@ -1365,6 +1403,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
+  if [[ "$assertions" == doctor-eol-state ]]; then
+    remote+="; if [[ \"\$baseline_phase\" != product ]] || ! check_doctor_eol_delta \"\$baseline_rc\" doctor.baseline.stdout.log doctor.baseline.stderr.log \"\$rc\" command.stderr.log; then printf 'assertion failed: doctor EOL did not add exactly one health issue over its baseline\n' >&2; assertion=1; fi"
+  fi
   if [[ "$distro" == fedora && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; if [[ \"\$rc\" == 120 ]] && grep -Fq 'OMG_QEMU_FIXTURE_SETUP_FAILED' command.stderr.log; then execution_phase=dependency; fi"
     remote+="; if [[ \"\$rc\" == 121 ]] && grep -Fq 'OMG_QEMU_FIXTURE_CLEANUP_FAILED' command.stderr.log; then execution_phase=dependency; fi"
@@ -1429,6 +1470,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   start_centis=${uptime/./}
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
+  if [[ "$assertions" == doctor-eol-state ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == outdated-native-count || "$assertions" == outdated-json-native-count ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == status-native-fast ]]; then budget=$((budget + 64)); fi

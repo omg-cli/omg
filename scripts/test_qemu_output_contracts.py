@@ -82,6 +82,35 @@ class OutputContracts(unittest.TestCase):
         self.assertIn('doctor did not identify', logs['doctor.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_doctor_eol_requires_confined_runtime_and_both_classifications(self):
+        row = ('doctor-eol\t["doctor","--eol"]\tcontrolled-error\t1\tpass\t-\t'
+               'hermetic\thermetic:pass\tdoctor-eol-state\ttempdir-drop')
+        preflight = ('[[ $(id -u) != 0 && "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 '
+                     '&& -d "$OMG_DATA_DIR/versions/node/16.20.2" '
+                     '&& $(readlink "$OMG_DATA_DIR/versions/node/current") == 16.20.2 '
+                     '&& -d "$OMG_DATA_DIR/versions/python/3.12.14" '
+                     '&& $(readlink "$OMG_DATA_DIR/versions/python/current") == 3.12.14 ]] '
+                     '|| exit 70\n')
+        good = ('printf "Runtime EOL Status\\n  ⚠ node 16.20.2 - EOL since 2023-09-11\\n'
+                '  ✓ python 3.12.14\\n"\n')
+        for output, eol_count, expected in (
+            (good, 2, 'PASS'),
+            (good, 1, 'FAIL'),
+            (good.replace('EOL since 2023-09-11', 'healthy'), 2, 'FAIL'),
+            (good.replace('  ✓ python 3.12.14\\n', ''), 2, 'FAIL'),
+            ('printf "Runtime EOL Status\\n  ⚠ node 16.20.2 - EOL since 2023-09-11\\n'
+             '  ⚠ python 3.12.14 - EOL since 2023-09-11\\n"\n', 2, 'FAIL'),
+        ):
+            with self.subTest(expected=expected, output=output, eol_count=eol_count):
+                product = (preflight
+                           + 'if [[ "$2" != --eol ]]; then echo "Error: doctor found 1 health issue(s)" >&2; exit 1; fi\n'
+                           + output
+                           + f'echo "Error: doctor found {eol_count} health issue(s)" >&2\nexit 1\n')
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_info_row_compares_version_and_source_to_native_catalog(self):
         row = ('info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass'
                '\tinfo-native-package\ttempdir-drop')
