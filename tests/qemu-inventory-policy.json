@@ -27845,6 +27845,1759 @@
           "network_scope": "offline"
         }
       ]
+    },
+    "72fc718c1cc94cd657a42db2eb7452fd2fa8e3cbf2db6e189ce4312d454283a9": {
+      "releases": [],
+      "cases": [
+        {
+          "id": "audit-scan-fail-on-findings-offline",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-sbom-inventory-only",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "search",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "install",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "remove",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "update",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "Synchronizes package indexes through sudo even for --check"
+        },
+        {
+          "id": "info",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "why",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "outdated",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "size",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "blame",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "diff",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "snapshot-create",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "snapshot-list",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "snapshot-restore",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "snapshot-delete",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "ci-init",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "ci-validate",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "ci-cache",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "migrate-export",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "migrate-import",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "clean",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "explicit",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "explicit-shortcut",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "sync",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "use",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "list",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "hook",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "hooks-install",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "hooks-status",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "hooks-run",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "hooks-uninstall",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-init",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-add",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-list",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-run",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-diff",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-check",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-status",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-remove",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "hook-env",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "daemon",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "config",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "config-get",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "config-set",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "config-list",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "config-validate",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "config-path",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "config-reset",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "privacy",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "privacy-status",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "privacy-export",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "privacy-opt-out",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "privacy-opt-in",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "privacy-status-enabled",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "generate-man",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "daemon-status",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "completions",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "complete",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "which",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "status",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "doctor",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "Checks internet connectivity"
+        },
+        {
+          "id": "audit",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-scan",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-sbom-offline",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-secrets",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-log",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-verify",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-policy",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-slsa",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-slsa-identity",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-licenses",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-fix",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-export",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-eol",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "run",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "new",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "tool-install",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "tool-list",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "tool-remove",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "tool-update",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "tool-search",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "tool-registry",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "env-capture",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "env-check",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "env-share",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "env-sync",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-init",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-join-help",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-status",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-push",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-pull",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-members",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-dashboard",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-roles-list",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-golden-create",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-golden-list",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-golden-delete",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-compliance",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-activity",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "container-status",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "Fedora rootless Podman invokes newuidmap"
+        },
+        {
+          "id": "container-run",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "container-shell",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "container-build",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "container-list",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "Fedora rootless Podman invokes newuidmap"
+        },
+        {
+          "id": "container-images",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "Fedora rootless Podman invokes newuidmap"
+        },
+        {
+          "id": "container-pull",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "container-stop",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "container-exec",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "container-init",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "account-link",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "account-link-stdin",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "account-status",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "account-unlink",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "fleet-status",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "enterprise-reports",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "enterprise-policy-show",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "enterprise-audit-export",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "enterprise-license-scan",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "history",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "rollback",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "dash",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "stats",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "metrics",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "self-update",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "init",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "completions-install",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "runtime-python-install",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "Published v0.1.220 inventory retrieves Python releases from GitHub"
+        },
+        {
+          "id": "outdated-json",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "search-quiet",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "status-verbose",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "info-verbose",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-readd-after-remove",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-run-success",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "all-commands-help",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "search-flags",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "install-flags",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "remove-flags",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "update-dry-run-yes",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "Synchronizes indexes and uses privilege checks"
+        },
+        {
+          "id": "why-reverse",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "size-tree",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "diff-from",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "snapshot-restore-yes",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "ci-init-advanced",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "clean-flags",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "use-uninstall",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "list-available",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "hook-uninstall",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "hooks-install-force",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-add-second",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-run-flags",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-run-parallel-all",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "workspace-run-sequential-all",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "complete-full",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-log-flags",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-licenses-filter-policy",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-licenses-export",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-fix-flags",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "audit-export-flags",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "run-parallel",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "run-all",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-golden-create-flags",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-compliance-export",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "team-compliance-enforce",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "enterprise-reports-type",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "enterprise-policy-scope",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "enterprise-audit-export-flags",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "enterprise-license-scan-export",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "history-flags",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "rollback-yes",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "release-package-search-tree",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network"
+        },
+        {
+          "id": "release-package-install-tree",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network"
+        },
+        {
+          "id": "release-package-remove-tree",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network"
+        },
+        {
+          "id": "clean-orphans-native",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {
+            "arch": "APT-only-orphan-fixture",
+            "fedora": "APT-only-orphan-fixture"
+          },
+          "network_scope": "network",
+          "network_reason": "Replays native tree installation before the APT orphan cleanup; the guest may fetch that package from its configured mirror."
+        },
+        {
+          "id": "update-fast",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network"
+        },
+        {
+          "id": "update-turbo",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "cached metadata mode may download package payloads while skipping repository synchronization"
+        },
+        {
+          "id": "daemon-foreground",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "doctor-network",
+          "tiers": [
+            "network"
+          ],
+          "allowed_skips": {
+            "arch": "declared-cli-shape-only",
+            "debian": "declared-cli-shape-only",
+            "ubuntu": "declared-cli-shape-only",
+            "fedora": "declared-cli-shape-only"
+          },
+          "network_scope": "network"
+        },
+        {
+          "id": "doctor-eol",
+          "tiers": [
+            "network"
+          ],
+          "allowed_skips": {
+            "arch": "declared-cli-shape-only",
+            "debian": "declared-cli-shape-only",
+            "ubuntu": "declared-cli-shape-only",
+            "fedora": "declared-cli-shape-only"
+          },
+          "network_scope": "network"
+        },
+        {
+          "id": "doctor-turbo",
+          "tiers": [
+            "qemu"
+          ],
+          "allowed_skips": {
+            "arch": "declared-cli-shape-only",
+            "debian": "declared-cli-shape-only",
+            "ubuntu": "declared-cli-shape-only",
+            "fedora": "declared-cli-shape-only"
+          },
+          "network_scope": "network"
+        },
+        {
+          "id": "run-watch",
+          "tiers": [
+            "pty"
+          ],
+          "allowed_skips": {
+            "arch": "declared-cli-shape-only",
+            "debian": "declared-cli-shape-only",
+            "ubuntu": "declared-cli-shape-only",
+            "fedora": "declared-cli-shape-only"
+          },
+          "network_scope": "network"
+        },
+        {
+          "id": "env-share-flags",
+          "tiers": [
+            "network",
+            "credentialed"
+          ],
+          "allowed_skips": {
+            "arch": "declared-cli-shape-only",
+            "debian": "declared-cli-shape-only",
+            "ubuntu": "declared-cli-shape-only",
+            "fedora": "declared-cli-shape-only"
+          },
+          "network_scope": "network"
+        },
+        {
+          "id": "env-share-missing-lock",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "self-update-force",
+          "tiers": [
+            "network"
+          ],
+          "allowed_skips": {
+            "arch": "declared-cli-shape-only",
+            "debian": "declared-cli-shape-only",
+            "ubuntu": "declared-cli-shape-only",
+            "fedora": "declared-cli-shape-only"
+          },
+          "network_scope": "network"
+        },
+        {
+          "id": "self-update-version",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "container-run-detached",
+          "tiers": [
+            "nested-container"
+          ],
+          "allowed_skips": {
+            "arch": "declared-cli-shape-only",
+            "debian": "declared-cli-shape-only",
+            "ubuntu": "declared-cli-shape-only",
+            "fedora": "declared-cli-shape-only"
+          },
+          "network_scope": "network"
+        },
+        {
+          "id": "container-run-interactive",
+          "tiers": [
+            "nested-container",
+            "pty"
+          ],
+          "allowed_skips": {
+            "arch": "declared-cli-shape-only",
+            "debian": "declared-cli-shape-only",
+            "ubuntu": "declared-cli-shape-only",
+            "fedora": "declared-cli-shape-only"
+          },
+          "network_scope": "network"
+        },
+        {
+          "id": "container-shell-flags",
+          "tiers": [
+            "nested-container",
+            "pty"
+          ],
+          "allowed_skips": {
+            "arch": "declared-cli-shape-only",
+            "debian": "declared-cli-shape-only",
+            "ubuntu": "declared-cli-shape-only",
+            "fedora": "declared-cli-shape-only"
+          },
+          "network_scope": "network"
+        },
+        {
+          "id": "container-build-flags",
+          "tiers": [
+            "nested-container"
+          ],
+          "allowed_skips": {
+            "arch": "declared-cli-shape-only",
+            "debian": "declared-cli-shape-only",
+            "ubuntu": "declared-cli-shape-only",
+            "fedora": "declared-cli-shape-only"
+          },
+          "network_scope": "network"
+        },
+        {
+          "id": "clean-yes",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "install-review",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "update-review",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "Synchronizes indexes through sudo"
+        },
+        {
+          "id": "update-no-sync",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "update-aur-only",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "env-export-missing-lock",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "env-plan-missing-manifest",
+          "tiers": [
+            "hermetic"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "total-shortcut",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "orphan-shortcut",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "updates-shortcut",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "runtime-node-install",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "Downloads the pinned official Node.js runtime and checksum; bundled npm behavior uses offline local fixtures."
+        },
+        {
+          "id": "runtime-go-install",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "network",
+          "network_reason": "Downloads the pinned official Go archive and checksum; local-only toolchain builds and tests a standard-library fixture offline."
+        },
+        {
+          "id": "runtime-node-uninstall",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "runtime-python-uninstall",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "runtime-go-uninstall",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "runtime-node-list-installed",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "runtime-python-list-installed",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "runtime-go-list-installed",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "runtime-node-switch-installed",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "runtime-python-switch-installed",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "runtime-go-switch-installed",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        }
+      ]
     }
   }
 }

@@ -203,3 +203,9 @@ runtime-go-install	["use","go","1.27.1"]	isolated-write	0	pass	-	container	arch:
 runtime-node-uninstall	["use","node","24.21.0","--uninstall"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-version-removed	tempdir-drop
 runtime-python-uninstall	["use","python","3.12.14","--uninstall"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-version-removed	tempdir-drop
 runtime-go-uninstall	["use","go","1.27.1","--uninstall"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-version-removed	tempdir-drop
+runtime-node-list-installed	["list","node","--json"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-list-state	tempdir-drop
+runtime-python-list-installed	["list","python","--json"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-list-state	tempdir-drop
+runtime-go-list-installed	["list","go","--json"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-list-state	tempdir-drop
+runtime-node-switch-installed	["use","node","v24.21.0"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop
+runtime-python-switch-installed	["use","python","v3.12.14"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop
+runtime-go-switch-installed	["use","go","v1.27.1"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop

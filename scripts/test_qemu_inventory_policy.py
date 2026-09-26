@@ -130,6 +130,12 @@ class PolicyTests(unittest.TestCase):
                     "id": f"runtime-{runtime}-uninstall", "tiers": ["container"],
                     "allowed_skips": {}, "network_scope": "offline",
                 })
+                for operation in ("list", "switch"):
+                    case_id = f"runtime-{runtime}-{operation}-installed"
+                    self.assertEqual(by_id[case_id], {
+                        "id": case_id, "tiers": ["container"],
+                        "allowed_skips": {}, "network_scope": "offline",
+                    })
         workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
         self.assertEqual(workflow.count("--inventory-policy tests/qemu-inventory-policy.json"), 2)
 

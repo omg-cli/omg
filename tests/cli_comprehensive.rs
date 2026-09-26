@@ -593,6 +593,8 @@ enum Assertion {
     PrivacyOptedIn,
     PrivacyStatusEnabled,
     RuntimeVersionRemoved,
+    RuntimeListState,
+    RuntimeSwitchState,
 }
 
 impl Assertion {
@@ -635,6 +637,8 @@ impl Assertion {
             "privacy-opted-in" => Self::PrivacyOptedIn,
             "privacy-status-enabled" => Self::PrivacyStatusEnabled,
             "runtime-version-removed" => Self::RuntimeVersionRemoved,
+            "runtime-list-state" => Self::RuntimeListState,
+            "runtime-switch-state" => Self::RuntimeSwitchState,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1623,10 +1627,12 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::OutdatedJsonNativeCount
                 | Assertion::DoctorNativeBackend
                 | Assertion::InfoNativePackage
+                | Assertion::RuntimeVersionRemoved
+                | Assertion::RuntimeListState
+                | Assertion::RuntimeSwitchState
                 // Test mode always opts out, so only the real guest can prove
                 // enabled privacy status after opt-in.
-                | Assertion::PrivacyStatusEnabled
-                | Assertion::RuntimeVersionRemoved => {
+                | Assertion::PrivacyStatusEnabled => {
                     unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
             }
