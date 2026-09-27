@@ -23,7 +23,7 @@ fixture=$(mktemp -d /tmp/omg-qemu-doctor.XXXXXXXX)
 trap 'rm -rf -- "$fixture"' EXIT
 mkdir "$fixture/lists"
 printf 'Package: corrupt\nStatus: install reinstreq half-configured\nVersion: 1\nArchitecture: amd64\n' > "$fixture/status"
-printf 'Package: broken\nArchitecture: amd64\n' > "$fixture/lists/omg_dists_test_main_binary-amd64_Packages"
+printf 'Package: broken\nVersion: 1\nArchitecture: amd64\nSize: 123\n' > "$fixture/lists/omg_dists_test_main_binary-amd64_Packages"
 chmod 644 "$fixture/status" "$fixture/lists/omg_dists_test_main_binary-amd64_Packages"
 
 doctor_as_guest() {
@@ -91,6 +91,11 @@ if [[ $(grep -Fc "$failed" "$fixture/variant.stdout") != 1 ]] \
   || [[ $(grep -Fc "$still_healthy" "$fixture/variant.stdout") != 1 ]] \
   || grep -Fq "$other_failed" "$fixture/variant.stdout"; then
   printf 'assertion failed: doctor did not identify only the corrupt %s database\n' "$mode" >&2
+  exit 121
+fi
+
+if [[ "$mode" == index ]] && ! grep -Fq 'lacks Filename' "$fixture/variant.stdout"; then
+  printf 'assertion failed: doctor did not identify the missing APT Filename\n' >&2
   exit 121
 fi
 

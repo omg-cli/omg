@@ -1080,7 +1080,18 @@ fn parse_packages_paragraph(
     if paragraph.trim().is_empty() {
         Ok(None)
     } else {
-        parse_paragraph_str(paragraph, component, suite, source_key).map(Some)
+        let package = parse_paragraph_str(paragraph, component, suite, source_key)?;
+        anyhow::ensure!(
+            !package.filename.is_empty(),
+            "APT Packages entry '{}' lacks Filename",
+            bounded_deb822_excerpt(&package.name)
+        );
+        anyhow::ensure!(
+            package.size > 0,
+            "APT Packages entry '{}' lacks positive Size",
+            bounded_deb822_excerpt(&package.name)
+        );
+        Ok(Some(package))
     }
 }
 
@@ -1434,6 +1445,13 @@ fn parse_paragraph_str(
         } else if key.eq_ignore_ascii_case("Filename") {
             filename = value.to_string();
         } else if key.eq_ignore_ascii_case("Size") {
+            anyhow::ensure!(
+                value.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                    && !value.starts_with('0')
+                    && value.bytes().all(|byte| byte.is_ascii_digit()),
+                "Invalid Size value: {}",
+                bounded_deb822_excerpt(value)
+            );
             size = value.parse().with_context(|| {
                 format!("Invalid Size value: {}", bounded_deb822_excerpt(value))
             })?;
@@ -1499,9 +1517,17 @@ fn valid_debian_package_name(name: &str) -> bool {
 }
 
 fn is_unfoldable_debian_field(field: &str) -> bool {
-    ["Package", "Version", "Architecture", "Source", "Status"]
-        .iter()
-        .any(|identity| field.eq_ignore_ascii_case(identity))
+    [
+        "Package",
+        "Version",
+        "Architecture",
+        "Source",
+        "Status",
+        "Filename",
+        "Size",
+    ]
+    .iter()
+    .any(|identity| field.eq_ignore_ascii_case(identity))
 }
 
 fn validate_debian_version_and_architecture(version: &str, architecture: &str) -> Result<()> {
@@ -3428,10 +3454,10 @@ mod tests {
         let removed = directory
             .path()
             .join("removed_dists_stable_main_binary-amd64_Packages");
-        fs::write(&kept, b"Package: kept\nVersion: 1\nArchitecture: amd64\n\n")?;
+        fs::write(&kept, b"Package: kept\nVersion: 1\nArchitecture: amd64\nFilename: pool/main/k/kept.deb\nSize: 123\n\n")?;
         fs::write(
             &removed,
-            b"Package: removed\nVersion: 2\nArchitecture: amd64\n\n",
+            b"Package: removed\nVersion: 2\nArchitecture: amd64\nFilename: pool/main/r/removed.deb\nSize: 123\n\n",
         )?;
         let before = rebuild_package_index(&[kept.clone(), removed.clone()])?;
         assert!(before.get("kept").is_some());
@@ -3482,7 +3508,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let good = directory.path().join("good_Packages");
         let bad = directory.path().join("bad_Packages");
-        fs::write(&good, b"Package: kept\nVersion: 1\nArchitecture: amd64\n\n")?;
+        fs::write(&good, b"Package: kept\nVersion: 1\nArchitecture: amd64\nFilename: pool/main/k/kept.deb\nSize: 123\n\n")?;
         fs::write(&bad, b"Version: 2\n\n")?;
         assert!(rebuild_package_index(&[good.clone(), bad.clone()]).is_err());
         fs::remove_file(&bad)?;
@@ -3663,7 +3689,7 @@ mod tests {
         ] {
             std::fs::write(
                 &index,
-                format!("Package: {name}\nVersion: 1\nArchitecture: amd64\n\n"),
+                format!("Package: {name}\nVersion: 1\nArchitecture: amd64\nFilename: pool/main/f/fixture.deb\nSize: 123\n\n"),
             )
             .expect("write Packages entry");
             let packages = parse_packages_file_sync(&index).expect("live Packages reader");
@@ -3735,7 +3761,7 @@ mod tests {
         let write_identity = |version: &str, architecture: &str| {
             std::fs::write(
                 &index,
-                format!("Package: fixture\nVersion: {version}\nArchitecture: {architecture}\n\n"),
+                format!("Package: fixture\nVersion: {version}\nArchitecture: {architecture}\nFilename: pool/main/f/fixture.deb\nSize: 123\n\n"),
             )
             .expect("write Packages entry");
             std::fs::write(
@@ -4485,7 +4511,7 @@ mod tests {
         let path = dir.path().join("test_Packages");
         std::fs::write(
             &path,
-            "Package: vim\nVersion: 1.0\nArchitecture: amd64\n\nVersion: 2.0\nArchitecture: amd64\n\nPackage: bash\nVersion: 1.0\nArchitecture: amd64\n",
+            "Package: vim\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/main/v/vim.deb\nSize: 123\n\nVersion: 2.0\nArchitecture: amd64\n\nPackage: bash\nVersion: 1.0\nArchitecture: amd64\n",
         )
         .expect("packages file");
         let error = parse_packages_file_sync(&path)
@@ -4504,7 +4530,7 @@ mod tests {
         let path = dir.path().join("test_Packages");
         std::fs::write(
             &path,
-            "Package: vim\nVersion: 1.0\nArchitecture: amd64\n\nPackage: bash\nVersion: 1.0\nArchitecture: amd64\n",
+            "Package: vim\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/main/v/vim.deb\nSize: 123\n\nPackage: bash\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/main/b/bash.deb\nSize: 123\n",
         )
         .expect("packages file");
         let packages = parse_packages_file_sync(&path).expect("valid Packages file");
@@ -4514,12 +4540,79 @@ mod tests {
     }
 
     #[test]
+    fn apt_indexes_require_usable_retrieval_fields_without_requiring_sha256() {
+        let dir = tempfile::tempdir().expect("isolated APT lists");
+        let index = dir.path().join("mirror_main_binary-amd64_Packages");
+        let status = dir.path().join("status");
+        let identity = "Package: fixture\nVersion: 1\nArchitecture: amd64\n";
+        let filename = "Filename: pool/main/f/fixture_1_amd64.deb\n";
+        let size = "Size: 123\n";
+
+        // A local trusted repository can provide retrievable packages without
+        // a SHA256 field. Installed status records have no retrieval fields.
+        std::fs::write(&index, format!("{identity}{filename}{size}\n"))
+            .expect("valid APT index without SHA256");
+        let packages = parse_packages_file_sync(&index).expect("live APT reader");
+        assert_eq!(packages[0].filename, "pool/main/f/fixture_1_amd64.deb");
+        assert_eq!(packages[0].size, 123);
+        assert_eq!(validate_apt_package_indexes_at(dir.path()).unwrap(), 1);
+        std::fs::write(
+            &status,
+            "Package: fixture\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n",
+        )
+        .expect("dpkg status without APT retrieval fields");
+        assert_eq!(validate_dpkg_status_at(&status).unwrap(), 1);
+
+        for (name, paragraph, expected) in [
+            (
+                "missing Filename",
+                format!("{identity}{size}\n"),
+                "lacks Filename",
+            ),
+            (
+                "missing Size",
+                format!("{identity}{filename}\n"),
+                "lacks positive Size",
+            ),
+            (
+                "zero Size",
+                format!("{identity}{filename}Size: 0\n\n"),
+                "Invalid Size value",
+            ),
+            (
+                "folded Filename",
+                format!("{identity}{filename} continuation\n{size}\n"),
+                "simple field",
+            ),
+            (
+                "leading-zero Size",
+                format!("{identity}{filename}Size: 0123\n\n"),
+                "Invalid Size value",
+            ),
+        ] {
+            std::fs::write(&index, paragraph).expect("malformed APT index");
+            let error = parse_packages_file_sync(&index).expect_err("live APT must reject");
+            assert!(
+                error.root_cause().to_string().contains(expected),
+                "{name}: {error:#}"
+            );
+            let error = validate_apt_package_indexes_at(dir.path())
+                .expect_err("Doctor must reject the same APT entry");
+            assert!(
+                error.root_cause().to_string().contains(expected),
+                "{name}: {error:#}"
+            );
+            assert_eq!(validate_dpkg_status_at(&status).unwrap(), 1, "{name}");
+        }
+    }
+
+    #[test]
     fn packages_fields_are_case_insensitive_and_duplicates_are_rejected() {
         let dir = tempfile::tempdir().expect("index fixture");
         let path = dir.path().join("fixture_Packages");
         std::fs::write(
             &path,
-            "package: fixture\nversion: 1 \narchitecture: all\ndescription: valid\n",
+            "package: fixture\nversion: 1 \narchitecture: all\nfilename: pool/main/f/fixture.deb\nsize: 123\ndescription: valid\n",
         )
         .expect("case-insensitive index");
         let packages = parse_packages_file_sync(&path).expect("valid deb822 fields");
@@ -4541,7 +4634,7 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "package: fixture\nversion: 1\narchitecture: all\ndescription: valid\n{duplicate}"
+                    "package: fixture\nversion: 1\narchitecture: all\nfilename: pool/main/f/fixture.deb\nsize: 123\ndescription: valid\n{duplicate}"
                 ),
             )
             .expect("duplicate index");
@@ -4598,8 +4691,8 @@ mod tests {
 
     #[test]
     fn compressed_packages_indexes_consume_all_concatenated_members() {
-        const FIRST: &str = "Package: first\nVersion: 1\nArchitecture: amd64\n\n";
-        const SECOND: &str = "Package: second\nVersion: 2\nArchitecture: amd64\n\n";
+        const FIRST: &str = "Package: first\nVersion: 1\nArchitecture: amd64\nFilename: pool/main/f/first.deb\nSize: 123\n\n";
+        const SECOND: &str = "Package: second\nVersion: 2\nArchitecture: amd64\nFilename: pool/main/s/second.deb\nSize: 123\n\n";
         for format in ["gz", "lz4", "xz"] {
             let directory = tempfile::tempdir().expect("isolated Packages index");
             let path = directory.path().join(format!("mirror_Packages.{format}"));
@@ -4622,7 +4715,7 @@ mod tests {
 
     #[test]
     fn compressed_packages_indexes_reject_corrupt_later_member() {
-        const FIRST: &str = "Package: first\nVersion: 1\nArchitecture: amd64\n\n";
+        const FIRST: &str = "Package: first\nVersion: 1\nArchitecture: amd64\nFilename: pool/main/f/first.deb\nSize: 123\n\n";
         const SECOND: &str = "Package: broken\nArchitecture: amd64\n\n";
         for format in ["gz", "lz4", "xz"] {
             let directory = tempfile::tempdir().expect("isolated Packages index");
@@ -4665,7 +4758,7 @@ mod tests {
 
     #[test]
     fn compressed_packages_indexes_reject_truncated_later_stream() {
-        const FIRST: &str = "Package: first\nVersion: 1\nArchitecture: amd64\n\n";
+        const FIRST: &str = "Package: first\nVersion: 1\nArchitecture: amd64\nFilename: pool/main/f/first.deb\nSize: 123\n\n";
         for (format, incomplete_header) in [
             ("gz", &[0x1f, 0x8b, 0x08][..]),
             ("lz4", &[0x04, 0x22, 0x4d, 0x18][..]),
@@ -4772,7 +4865,7 @@ mod tests {
         assert!(validate_apt_package_indexes_at(dir.path()).is_err());
 
         let first = dir.path().join("mirror_main_binary-amd64_Packages");
-        std::fs::write(&first, "Package: apt\nVersion: 1\nArchitecture: amd64\n\n")
+        std::fs::write(&first, "Package: apt\nVersion: 1\nArchitecture: amd64\nFilename: pool/main/a/apt.deb\nSize: 123\n\n")
             .expect("valid index");
         assert_eq!(
             validate_apt_package_indexes_at(dir.path()).expect("valid index"),
@@ -4822,7 +4915,7 @@ mod tests {
         for number in 0..101 {
             write!(
                 records,
-                "Package: valid-{number}\nVersion: 1\nArchitecture: amd64\n\n"
+                "Package: valid-{number}\nVersion: 1\nArchitecture: amd64\nFilename: pool/main/v/valid-{number}.deb\nSize: 123\n\n"
             )
             .expect("append valid package");
         }
