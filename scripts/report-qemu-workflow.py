@@ -94,7 +94,7 @@ def diagnostic_excerpt(raw):
     return text.encode("utf-8")[-1300:].decode("utf-8", errors="ignore")
 
 
-def archive_rows(content, allowed_cases, diagnostics=None):
+def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revision=None):
     if len(content) > MAX_DOWNLOAD:
         raise ValueError("artifact download exceeds limit")
     rows = []
@@ -135,8 +135,36 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                         or type(row.get("elapsed_seconds")) not in (int, float)
                         or not 0 <= row["elapsed_seconds"] <= 86400):
                     raise ValueError("invalid result row")
-                rows.append({key: row[key] for key in ("case_id", "distro", "result", "exit_code", "elapsed_seconds")})
+                if guest is not None and row["distro"] != guest[0]:
+                    raise ValueError("guest result distro differs from artifact identity")
+                if guest is not None and "arch" in row and row["arch"] != guest[1]:
+                    raise ValueError("guest result architecture differs from artifact identity")
+                admitted = {key: row[key] for key in (
+                    "case_id", "distro", "result", "exit_code", "elapsed_seconds")}
+                if guest is not None:
+                    admitted["arch"] = guest[1]
+                rows.append(admitted)
                 row_sources.append((row, path.parent))
+        if guest is not None:
+            provenance_members = [member for member in members if member.filename == "provenance.json"]
+            if provenance_members:
+                if len(provenance_members) != 1 or provenance_members[0].file_size > 4096:
+                    raise ValueError("invalid guest provenance")
+                provenance = json.loads(archive.read(provenance_members[0]),
+                                        object_pairs_hook=unique_object)
+                if (not isinstance(provenance, dict)
+                        or provenance.get("distro") != guest[0]
+                        or provenance.get("arch") != guest[1]
+                        or provenance.get("harness_revision") != revision):
+                    raise ValueError("guest artifact provenance mismatch")
+            else:
+                lifecycle = (f"qemu-{guest[0]}-lifecycle" if guest[1] == "x86_64"
+                             else f"qemu-{guest[0]}-aarch64-lifecycle")
+                if not row_sources or any(
+                        row["case_id"] != lifecycle or row["result"] not in FAILURES
+                        or not parent.name.startswith("run-setup-")
+                        for row, parent in row_sources):
+                    raise ValueError("guest artifact lacks provenance outside setup failure")
         # Admission above validates every archive member before any diagnostic
         # is consumed. Read only logs named by a validated failing case; never
         # extract files or execute artifact content. The issue helper applies
@@ -146,7 +174,8 @@ def archive_rows(content, allowed_cases, diagnostics=None):
             for row, parent in row_sources:
                 if row["result"] not in FAILURES or row["case_id"] == "qemu-matrix-workflow":
                     continue
-                key = row["case_id"], row["distro"]
+                key = (row["case_id"], row["distro"], guest[1]) if guest else (
+                    row["case_id"], row["distro"])
                 diagnostics.pop(key, None)
                 case = row["case_id"].removeprefix(f"qemu-{row['distro']}-")
                 if parent.name == "inventory":
@@ -248,7 +277,7 @@ def archive_rows(content, allowed_cases, diagnostics=None):
 
 
 def unexecuted_inventory_distros(rows):
-    """Distros whose inventory rows were never started.
+    """Guest identities whose inventory rows were never started.
 
     A guest that dies before inventory writes one BLOCKED placeholder per
     requested case. Those placeholders are not separate failures. Promoting
@@ -258,17 +287,18 @@ def unexecuted_inventory_distros(rows):
     failed_lifecycle = set()
     for row in rows:
         distro = row["distro"]
+        guest = distro, row.get("arch", "x86_64")
         case_id = row["case_id"]
         if case_id in (f"qemu-{distro}-lifecycle", f"qemu-{distro}-aarch64-lifecycle"):
             if row["result"] in FAILURES:
-                failed_lifecycle.add(distro)
+                failed_lifecycle.add(guest)
             continue
         if case_id == "qemu-matrix-workflow" or case_id.startswith("qemu-matrix-"):
             continue
-        grouped.setdefault(distro, []).append(row)
+        grouped.setdefault(guest, []).append(row)
     return {
-        distro for distro, group in grouped.items()
-        if distro in failed_lifecycle and all(
+        guest for guest, group in grouped.items()
+        if guest in failed_lifecycle and all(
             item["result"] == "BLOCKED" and item["exit_code"] == -1 and item["elapsed_seconds"] == 0
             for item in group
         )
@@ -279,10 +309,11 @@ def projection(rows, verified_published):
     placeholders = unexecuted_inventory_distros(rows)
     selected = {}
     for row in rows:
-        if (row["distro"] in placeholders and row["result"] == "BLOCKED"
+        if ((row["distro"], row.get("arch", "x86_64")) in placeholders
+                and row["result"] == "BLOCKED"
                 and row["exit_code"] == -1 and row["elapsed_seconds"] == 0):
             continue
-        key = row["case_id"], row["distro"]
+        key = row["case_id"], row["distro"], row.get("arch", "x86_64")
         if row["result"] in FAILURES:
             # The existing issue helper treats BLOCKED as context rather than
             # an issue. A failed prerequisite still needs a tracked diagnosis.
@@ -407,6 +438,13 @@ def retained_guest_artifact(artifact, run, jobs):
     return len(owners) == 1
 
 
+def artifact_guest_identity(name):
+    match = re.fullmatch(r"qemu-(arm-)?evidence-(arch|debian|ubuntu|fedora)", name)
+    if match is None:
+        return None
+    return match.group(2), "aarch64" if match.group(1) else "x86_64"
+
+
 def main():
     repository = os.environ["GITHUB_REPOSITORY"]
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
@@ -454,8 +492,19 @@ def main():
                 raise ValueError("expired artifact")
             if type(artifact["id"]) is not int or artifact["size_in_bytes"] > MAX_DOWNLOAD:
                 raise ValueError("invalid artifact identity or size")
+            guest = artifact_guest_identity(artifact["name"])
+            if guest is not None and artifact["name"] in guest_artifacts:
+                raise ValueError("duplicate guest artifact identity")
             content = api(f"repos/{repository}/actions/artifacts/{artifact['id']}/zip", MAX_DOWNLOAD)
-            rows.extend(archive_rows(content, allowed_cases, diagnostics))
+            artifact_rows = archive_rows(content, allowed_cases, diagnostics,
+                                         guest=guest, revision=run["head_sha"])
+            if guest is not None and any(row["case_id"] == "qemu-matrix-workflow"
+                                         for row in artifact_rows):
+                raise ValueError("guest artifact contains workflow result")
+            if guest is None and any(row["case_id"] != "qemu-matrix-workflow"
+                                     for row in artifact_rows):
+                raise ValueError("workflow report contains guest results")
+            rows.extend(artifact_rows)
             guest_artifacts.add(artifact["name"])
             if published_candidate and artifact["name"].startswith("qemu-evidence-"):
                 if artifact["name"] in published_artifacts:
@@ -541,16 +590,21 @@ def main():
         results.write_text(json.dumps(selected) + "\n")
         for row in selected:
             if row["result"] in FAILURES:
-                evidence = Path(directory) / f"{row['distro']}-{row['case_id']}"
+                arch = row.get("arch", "x86_64")
+                evidence_name = (f"{row['distro']}-{row['case_id']}" if arch == "x86_64"
+                                 else f"{row['distro']}-{arch}-{row['case_id']}")
+                evidence = Path(directory) / evidence_name
                 evidence.mkdir()
                 evidence.joinpath("transcript.txt").write_text(
                     f"Commit: {run['head_sha']}\nEvent: {run['event']}\nAttempt: {run['run_attempt']}\n"
+                    f"Guest architecture: {arch}\n"
                     f"Observed: {row['result']}, exit {row['exit_code']}, elapsed {row['elapsed_seconds']}s\n"
                     f"Evidence invalid/unavailable: {evidence_error}\n"
                     "Exit status alone does not establish the root cause. Inspect the linked run's logs and artifacts.\n"
                     + "\n".join(details[:6]) + "\n"
                     + "Case diagnostic (untrusted log excerpt, redacted by issue helper):\n"
-                    + diagnostics.get((row["case_id"], row["distro"]), "No case log available; inspect linked artifacts.")
+                    + diagnostics.get((row["case_id"], row["distro"], arch),
+                                      "No case log available; inspect linked artifacts.")
                     + "\n" + catalog_note)
         run_url = f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}"
         helper = ["bash", "scripts/qa-file-issue.sh", str(results), "--repo", repository,

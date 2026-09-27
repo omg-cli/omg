@@ -13,16 +13,19 @@ qa_result_rows() {
   def matrix_case: IN("qemu-matrix-workflow", "qemu-matrix-x86-workflow", "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow");
   if type != "array" then error("results must be an array") else . end |
   if length > 10000 then error("too many results") else . end |
-  if (map([.distro, .case_id]) | unique | length) != length
+  if (map([.distro, .case_id, (.arch // "x86_64")]) | unique | length) != length
   then error("duplicate case identity") else . end |
   if all(.[];
     (.case_id | identifier) and
     ((.distro | distro) or (.distro == "matrix" and (.case_id | matrix_case))) and
+    ((has("arch") | not) or (.arch | IN("x86_64", "aarch64"))) and
+    (if .distro == "matrix" then (has("arch") | not) else true end) and
     (.result | IN("PASS", "SKIPPED", "EXPECTED_REJECTION", "PRODUCT_FAIL", "HARNESS_ERROR", "FAIL", "BLOCKED")) and
     (.exit_code | type == "number" and floor == . and . >= -1 and . <= 255) and
     (.elapsed_seconds | type == "number" and . >= 0 and . <= 86400))
   then . else error("invalid result fields") end |
-  map({case_id, distro, result, exit_code, elapsed_seconds})
+  map({case_id, distro, result, exit_code, elapsed_seconds} +
+      (if has("arch") then {arch} else {} end))
 ' "$1"
 }
 
@@ -109,13 +112,15 @@ scrub() {
 # the evidence-relative source path to FD 3 and the scrubbed tail to
 # stdout. (FD 3 because command substitution would lose a global.)
 excerpt_for() {
-  local case_id=$1 distro=$2 candidate row
+  local case_id=$1 distro=$2 arch=${3:-x86_64} candidate row
   candidate=""
-  if [[ -f "$evidence_dir/$distro-$case_id/transcript.txt" ]]; then
+  if [[ "$arch" == aarch64 && -f "$evidence_dir/$distro-aarch64-$case_id/transcript.txt" ]]; then
+    candidate="$evidence_dir/$distro-aarch64-$case_id/transcript.txt"
+  elif [[ "$arch" == x86_64 && -f "$evidence_dir/$distro-$case_id/transcript.txt" ]]; then
     candidate="$evidence_dir/$distro-$case_id/transcript.txt"
-  elif [[ "$case_id" == qemu-*-lifecycle && -f "$evidence_dir/guest-check.log" ]]; then
+  elif [[ "$arch" == x86_64 && "$case_id" == qemu-*-lifecycle && -f "$evidence_dir/guest-check.log" ]]; then
     candidate="$evidence_dir/guest-check.log"
-  else
+  elif [[ "$arch" == x86_64 ]]; then
     row="$case_id"
     row="${row#qemu-"$distro"-}"
     if [[ -f "$evidence_dir/rows/$row.log" ]]; then
