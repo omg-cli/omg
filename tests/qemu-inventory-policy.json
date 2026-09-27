@@ -36607,7 +36607,7 @@
         }
       ]
     },
-    "c7141e5741c524f8c1c9898bf19332162b4110848cf37ade5d27730d66fabbde": {
+    "62e52cc6f1043fd18ec299a94aa033ddcaa5d965e64b893b0062213a0e2ff1b8": {
       "releases": [],
       "cases": [
         {
@@ -38008,6 +38008,18 @@
           ],
           "allowed_skips": {},
           "network_scope": "network"
+        },
+        {
+          "id": "release-package-rollback-tree",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {
+            "arch": "APT-only-rollback-fixture",
+            "fedora": "APT-only-rollback-fixture"
+          },
+          "network_scope": "network",
+          "network_reason": "Replays native tree install and remove, then restores the recorded version through APT."
         },
         {
           "id": "clean-orphans-native",

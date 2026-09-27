@@ -378,6 +378,34 @@ apt_installed_snapshot() {
   LC_ALL=C sort <<< "$installed"
 }
 
+apt_tree_removal_id() {
+  local history=$1 version=$2
+  jq -er --arg version "$version" '
+    [.[] | select(.transaction_type == "Remove" and .success == true and
+      (.changes | length) == 1 and .changes[0].name == "tree" and
+      .changes[0].old_version == $version and .changes[0].new_version == null and
+      .changes[0].source == "apt")] |
+    if length == 1 then .[0].id else empty end
+  ' "$history"
+}
+
+check_apt_tree_restoration() {
+  local history=$1 version=$2
+  jq -e --arg version "$version" '
+    [.[] | select(.transaction_type == "Install" and .success == true and
+      (.changes | length) == 1 and .changes[0].name == "tree" and
+      .changes[0].new_version == $version and .changes[0].source == "rollback")] |
+    length == 1
+  ' "$history" >/dev/null
+}
+
+check_apt_tree_only_delta() {
+  local before=$1 after=$2 before_other after_other
+  before_other=$(awk -F '\t' '$1 != "tree" { print }' <<< "$before") || return 1
+  after_other=$(awk -F '\t' '$1 != "tree" { print }' <<< "$after") || return 1
+  [[ "$before_other" == "$after_other" ]]
+}
+
 check_apt_update_delta() {
   local before=$1 after=$2 before_other after_other
   before_other=$(awk -F '\t' '$1 != "tree" { print }' <<< "$before") || return 1
@@ -1203,9 +1231,9 @@ PY
         if ! python3 "$HOME/qemu-fingerprint-oracle.py" "${assertion#fingerprint:}" "$distro" "$PWD" "$stdout"; then
           printf 'assertion failed: native-backed fingerprint artifact oracle\n' >&2; return 1
         fi ;;
-      native-tree-installed|native-tree-absent)
+      native-tree-installed|native-tree-absent|native-apt-tree-rollback)
         local expected=installed
-        [[ "$assertion" == native-tree-installed ]] || expected=absent
+        [[ "$assertion" != native-tree-absent ]] || expected=absent
         check_native_tree_state "$distro" "$expected" || return 1 ;;
       native-apt-orphan-removed)
         check_native_apt_orphan_removed "$distro" "$stdout" || return 1 ;;
@@ -1454,7 +1482,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
     jq -e '. == ["run", "smoke", "--using", "make"]' <<< "$aj" >/dev/null || exit 2
@@ -1609,6 +1637,10 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   if [[ "$a" == search-official-tree-output ]]; then [[ "$id" == release-package-search-tree ]] || exit 2; fi
   if [[ "$a" == native-tree-installed ]]; then [[ "$id" == release-package-install-tree ]] || exit 2; fi
   if [[ "$a" == native-tree-absent ]]; then [[ "$id" == release-package-remove-tree ]] || exit 2; fi
+  if [[ "$a" == native-apt-tree-rollback ]]; then
+    [[ "$id" == release-package-rollback-tree && "$r" == release-package-remove-tree && "$s" == package-mutation && "$resolved" == 0 && "$t" == container && "$tg" == arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable ]] || exit 2
+    jq -e '. == ["rollback", "--yes"]' <<< "$aj" >/dev/null || exit 2
+  fi
   if [[ "$a" == native-apt-orphan-removed ]]; then [[ "$id" == clean-orphans-native ]] || exit 2; fi
   case "$cleanup" in tempdir-drop|none|container-prune|host-state-restore|vm-revert|daemon-stop) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
@@ -1799,7 +1831,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')
   remote+="; status_file=\$(mktemp \"\$HOME/inventory-status.XXXXXX\"); trap 'rm -f \"\$status_file\"' EXIT"
   remote+="; run_omg() { local deadline=\$1; shift; execution_phase=executor; rc=0; timeout --kill-after=5s \"\$deadline\" bash -c $supervisor _ \"\$@\" 3>\"\$status_file\" || rc=\$?; if [ \"\$rc\" = 0 ]; then if IFS= read -r rc < \"\$status_file\"; then execution_phase=product; else rc=125; fi; fi; }"
-  if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree || "$case" == clean-orphans-native ]]; then
+  if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree || "$case" == release-package-rollback-tree || "$case" == clean-orphans-native ]]; then
     remote+="; $(declare -f check_native_tree_state)"
   fi
   if [[ "$case" == clean-orphans-native ]]; then
@@ -1808,13 +1840,27 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == release-package-install-tree || "$case" == clean-orphans-native ]]; then
     remote+="; if ! check_native_tree_state '$distro' absent; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
   fi
+  if [[ "$case" == release-package-rollback-tree ]]; then
+    remote+="; $(declare -f check_apt_tree_absent); $(declare -f native_package_snapshot); $(declare -f apt_tree_removal_id); $(declare -f check_apt_tree_restoration); $(declare -f check_apt_tree_only_delta); export OMG_DATA_DIR=\"\$rowdir/rollback-data\" OMG_DISABLE_DAEMON=1"
+    remote+="; if ! check_apt_tree_absent '$distro' || [[ -e \"\$OMG_DATA_DIR/history.json\" ]]; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+    remote+="; rollback_before=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native APT baseline is unavailable\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+    remote+="; rollback_owned=1; rollback_cleanup() { if [[ \"\$rollback_owned\" == 1 ]]; then sudo -n dpkg --purge tree >/dev/null 2>&1 || return 1; check_apt_tree_absent '$distro' || return 1; fi; rm -f \"\$status_file\"; }"
+    remote+="; rollback_exit_cleanup() { local original=\$?; if ! rollback_cleanup; then printf 'assertion failed: native APT rollback cleanup failed on exit\n' >&2; exit 71; fi; exit \"\$original\"; }; trap rollback_exit_cleanup EXIT"
+  fi
   for p in "${chain[@]}"; do
     pargs=$(quote_args "${row_args[$p]}")
     remote+="; run_omg '$row_timeout' $quoted_binary $pargs > '$p.prereq.log' 2> '$p.prereq.stderr.log'"
     remote+="; printf 'prereq $p exit=%s\n' \"\$rc\" >&2; cat '$p.prereq.log' '$p.prereq.stderr.log' >&2"
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
     remote+="; if ! check_product_output '${row_safety[$p]}' '${row_assertions[$p]}' \"\$rc\" '$p.prereq.log' '$p.prereq.stderr.log' '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:1\n' \"\$rc\"; exit 0; fi"
+    if [[ "$case" == release-package-rollback-tree && "$p" == release-package-install-tree ]]; then
+      remote+="; rollback_version=\$(dpkg-query -W '-f=\${Version}' tree) || { printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }; [[ -n \"\$rollback_version\" ]] || { printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+    fi
   done
+  if [[ "$case" == release-package-rollback-tree ]]; then
+    remote+="; rollback_id=\$(apt_tree_removal_id \"\$OMG_DATA_DIR/history.json\" \"\$rollback_version\") || { printf 'assertion failed: no unique native tree removal transaction with the installed version\n' >&2; printf '\nOMG_QEMU_RECEIPT:product:0:1\n'; exit 0; }"
+    remote+="; [[ \"\$rollback_id\" =~ ^[0-9a-f-]{36}\$ ]] || { printf 'assertion failed: native tree removal transaction has an invalid ID\n' >&2; printf '\nOMG_QEMU_RECEIPT:product:0:1\n'; exit 0; }"
+  fi
   if [[ "$assertions" == package-dry-run-* ]]; then
     remote+="; native_before=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package baseline is unavailable\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
     if [[ "$assertions" != package-dry-run-install ]]; then
@@ -1908,6 +1954,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; apt_fixture_exit_cleanup() { if [[ \"\$apt_fixture_installed\" == 1 || \"\$apt_fixture_pin_created\" == 1 ]]; then cleanup_apt_update_fixture '$distro' >/dev/null 2>&1 || true; fi; rm -f \"\$status_file\"; }; trap apt_fixture_exit_cleanup EXIT"
     remote+="; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\" || ! apt_before=\$(apt_installed_snapshot); then if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT setup cleanup failed\\n' >&2; fi; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+  elif [[ "$case" == release-package-rollback-tree ]]; then
+    remote+="; run_omg '$command_timeout' $quoted_binary rollback \"\$rollback_id\" --yes > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == daemon-foreground ]]; then
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$distro" == fedora && "$case" == doctor ]]; then
@@ -1918,6 +1966,16 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
+  if [[ "$case" == release-package-rollback-tree ]]; then
+    remote+="; restored=\$(dpkg-query -W '-f=\${Status}\t\${Version}' tree 2>/dev/null) || restored=missing"
+    remote+="; if [[ \"\$restored\" != \"\$(printf 'install ok installed\t%s' \"\$rollback_version\")\" ]]; then printf 'assertion failed: rollback did not restore native tree version %s (found %s)\n' \"\$rollback_version\" \"\$restored\" >&2; assertion=1; fi"
+    remote+="; if ! check_apt_tree_restoration \"\$OMG_DATA_DIR/history.json\" \"\$rollback_version\"; then printf 'assertion failed: rollback did not record the native tree restoration\n' >&2; assertion=1; fi"
+    remote+="; rollback_after=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native APT after-state is unavailable\n' >&2; execution_phase=dependency; rc=2; assertion=1; rollback_after=missing; }"
+    remote+="; if ! check_apt_tree_only_delta \"\$rollback_before\" \"\$rollback_after\"; then printf 'assertion failed: rollback changed installed packages other than tree\n' >&2; assertion=1; fi"
+    remote+="; if ! rollback_cleanup; then printf 'assertion failed: native APT rollback fixture cleanup failed\n' >&2; execution_phase=dependency; rc=2; assertion=1; else rollback_owned=0; fi"
+    remote+="; rollback_final=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native APT cleanup after-state is unavailable\n' >&2; execution_phase=dependency; rc=2; assertion=1; rollback_final=missing; }"
+    remote+="; if [[ \"\$rollback_before\" != \"\$rollback_final\" ]]; then printf 'assertion failed: rollback fixture changed the native installed-package baseline\n' >&2; assertion=1; fi"
+  fi
   if [[ "$assertions" == package-dry-run-* ]]; then
     if [[ "$assertions" != package-dry-run-install && "$assertions" != package-dry-run-recursive || "$assertions" == package-dry-run-recursive && "$distro" == arch ]]; then
       remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_native_remove_preview command.stdout.log \"\$installed_version\"; then printf 'assertion failed: remove preview lacks the native installed bash version\n' >&2; assertion=1; fi"
