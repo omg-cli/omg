@@ -326,12 +326,15 @@ check_apt_tree_absent() {
 
 # The lifecycle already downloaded the native tree archive and removed tree.
 # Repack that exact payload with an older version so both APT update modes must
-# complete a real upgrade. The guest is disposable; never use a host package.
+# complete a real upgrade. A temporary native APT preference limits the planned
+# transaction to tree, even when the cloud image has unrelated pending updates.
 prepare_apt_update_fixture() {
-  local distro=$1 rowdir=$2 archive candidate installed simulation
+  local distro=$1 rowdir=$2 archive candidate installed simulation pin
   local archives=("$HOME"/tree_*.deb)
   [[ ${#archives[@]} == 1 && -f "${archives[0]}" && ! -L "${archives[0]}" ]] || return 1
   check_apt_tree_absent "$distro" || return 1
+  pin=/etc/apt/preferences.d/omg-qemu-tree.pref
+  sudo -n test ! -e "$pin" && sudo -n test ! -L "$pin" || return 1
   archive=${archives[0]}
   mkdir -p "$rowdir/tree-old-package" || return 1
   dpkg-deb --raw-extract "$archive" "$rowdir/tree-old-package" >/dev/null || return 1
@@ -343,11 +346,16 @@ prepare_apt_update_fixture() {
   sudo -n dpkg --install "$rowdir/tree-old.deb" >/dev/null || return 1
   installed=$(dpkg-query -W '-f=${Status}\t${Version}\n' tree 2>/dev/null) || return 1
   [[ "$installed" == $'install ok installed\t0.0.1' ]] || return 1
+  printf 'Package: tree:any\nPin: version *\nPin-Priority: 500\n\nPackage: *:any\nPin: release *\nPin-Priority: -1\n' > "$rowdir/apt-tree.preferences" || return 1
+  apt_fixture_pin_created=1
+  sudo -n install -o root -g root -m 0644 "$rowdir/apt-tree.preferences" "$pin" || return 1
+  [[ $(sudo -n stat -c '%u:%g:%a' "$pin") == 0:0:644 ]] || return 1
   candidate=$(apt-cache policy tree | awk '$1 == "Candidate:" { print $2; exit }') || return 1
   [[ -n "$candidate" && "$candidate" != '(none)' ]] || return 1
   dpkg --compare-versions "$candidate" gt 0.0.1 || return 1
   simulation=$(apt-get -s upgrade) || return 1
-  grep -Eq '^[[:space:]]*Inst tree \[0\.0\.1\]' <<< "$simulation" || return 1
+  [[ $(grep -Ec '^Inst ' <<< "$simulation" || true) == 1 ]] || return 1
+  grep -Eq '^Inst tree \[0\.0\.1\]' <<< "$simulation" || return 1
 }
 
 check_apt_update_fixture() {
@@ -362,8 +370,20 @@ check_apt_update_fixture() {
 }
 
 cleanup_apt_update_fixture() {
-  sudo -n dpkg --purge tree >/dev/null || return 1
-  check_apt_tree_absent "$1"
+  local pin=/etc/apt/preferences.d/omg-qemu-tree.pref failed=0
+  if [[ "${apt_fixture_installed:-0}" == 1 ]]; then
+    sudo -n dpkg --purge tree >/dev/null || failed=1
+    if check_apt_tree_absent "$1"; then apt_fixture_installed=0; else failed=1; fi
+  fi
+  if [[ "${apt_fixture_pin_created:-0}" == 1 ]]; then
+    sudo -n rm -f -- "$pin" || failed=1
+    if sudo -n test ! -e "$pin" && sudo -n test ! -L "$pin"; then
+      apt_fixture_pin_created=0
+    else
+      failed=1
+    fi
+  fi
+  ((failed == 0))
 }
 
 # Compare the installed package database around a dry run. Repository metadata
@@ -1865,7 +1885,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # plus native DNF history before it can report success.
     remote+="; run_omg '$command_timeout' sudo -n bash \"\$HOME/qemu-fedora-update-fixture.sh\" '${case#update-}' $quoted_binary '$ssh_user' > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
-    remote+="; export OMG_DISABLE_DAEMON=1; apt_fixture_installed=0; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\"; then if [[ \"\$apt_fixture_installed\" == 1 ]]; then cleanup_apt_update_fixture '$distro' >/dev/null 2>&1 || true; fi; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+    remote+="; export OMG_DISABLE_DAEMON=1; apt_fixture_installed=0; apt_fixture_pin_created=0"
+    remote+="; apt_fixture_exit_cleanup() { if [[ \"\$apt_fixture_installed\" == 1 || \"\$apt_fixture_pin_created\" == 1 ]]; then cleanup_apt_update_fixture '$distro' >/dev/null 2>&1 || true; fi; rm -f \"\$status_file\"; }; trap apt_fixture_exit_cleanup EXIT"
+    remote+="; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\"; then if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT setup cleanup failed\\n' >&2; fi; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == daemon-foreground ]]; then
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
@@ -2002,6 +2024,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     budget=$((budget + 74))
   fi
   if [[ "$case" == runtime-go-install ]]; then budget=$((budget + 210)); fi
+  if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then budget=$((budget + 60)); fi
   timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
   read -r uptime _ < /proc/uptime
   elapsed=$(( (10#${uptime/./} - 10#$start_centis) / 100 ))

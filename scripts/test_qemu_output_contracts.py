@@ -66,8 +66,36 @@ class OutputContracts(unittest.TestCase):
         rows = [line for line in inventory.splitlines()
                 if line.startswith(('update-fast\t', 'update-turbo\t'))]
         self.assertEqual(len(rows), 2)
+        fast_row = next(row for row in rows if row.startswith('update-fast\t'))
+        pin_dir = Path(tempfile.mkdtemp(prefix='omg-qemu-apt-pin-test-'))
+        self.addCleanup(shutil.rmtree, pin_dir)
+        pin = pin_dir / 'omg-qemu-tree.pref'
+        quoted_pin = shlex.quote(str(pin))
         native = {
-            'sudo': '[[ "$1" != -n ]] || shift\nexec "$@"\n',
+            'sudo': f'''[[ "$1" != -n ]] || shift
+pin={quoted_pin}
+target=/etc/apt/preferences.d/omg-qemu-tree.pref
+case "$1" in
+  dpkg) exec "$@" ;;
+  test)
+    [[ "${{@: -1}}" == "$target" ]] || exit 70
+    case "$2:$3" in
+      '!:-e') [[ ! -e "$pin" ]] ;;
+      '!:-L') [[ ! -L "$pin" ]] ;;
+      *) exit 70 ;;
+    esac ;;
+  install)
+    [[ "$2:$3:$4:$5:$6:$7" == '-o:root:-g:root:-m:0644' && "${{@: -1}}" == "$target" ]] || exit 70
+    /usr/bin/install -m 0644 "${{@: -2:1}}" "$pin" ;;
+  stat)
+    [[ "${{@: -1}}" == "$target" && -f "$pin" ]] || exit 70
+    printf '0:0:644\\n' ;;
+  rm)
+    [[ "$2:$3:$4" == "-f:--:$target" ]] || exit 70
+    /usr/bin/rm -f -- "$pin" ;;
+  *) exit 70 ;;
+esac
+''',
             'dpkg-deb': '''case "$1" in
   --raw-extract) mkdir -p "$3/DEBIAN"; printf 'Package: tree\\nVersion: 2.0\\n' > "$3/DEBIAN/control" ;;
   --build) : > "$3" ;;
@@ -91,7 +119,15 @@ else
 fi
 ''',
             'apt-cache': 'printf "tree:\\n  Candidate: 2.0\\n"\n',
-            'apt-get': '[[ "$1" == -s && "$2" == upgrade ]] || exit 70\nprintf "Inst tree [0.0.1] (2.0 local)\\n"\n',
+            'apt-get': f'''[[ "$1" == -s && "$2" == upgrade ]] || exit 70
+pin={quoted_pin}
+[[ -f "$pin" ]] || exit 71
+grep -Fxq 'Package: tree:any' "$pin" || exit 72
+grep -Fxq 'Package: *:any' "$pin" || exit 72
+grep -Fxq 'Pin: release *' "$pin" || exit 72
+grep -Fxq 'Pin-Priority: -1' "$pin" || exit 72
+printf 'Inst tree [0.0.1] (2.0 local)\\n'
+''',
         }
         for row in rows:
             case = row.split('\t')[0]
@@ -99,7 +135,8 @@ fi
             title = 'Fast System Update\nSynced\n' if mode == 'fast' else 'TURBO System Update\nTurbo upgrade\n'
             for version, expected in (('0.0.1', 'FAIL'), ('9.9', 'FAIL'), ('2.0', 'PASS')):
                 with self.subTest(case=case, version=version):
-                    product = (f'printf %s {shlex.quote(title + "Upgraded 1 packages\n")}\n'
+                    product = (f'[[ -f {quoted_pin} ]] || exit 73\n'
+                               f'printf %s {shlex.quote(title + "Upgraded 1 packages\n")}\n'
                                f'printf %s {shlex.quote(version)} > "$HOME/tree-state"\n')
                     result, evidence, logs = self.run_inventory(
                         product, [row], native_commands=native,
@@ -107,6 +144,7 @@ fi
                         distro='debian', tiers='container', allow_mutations=True)
                     self.assertEqual(evidence[0]['result'], expected, logs)
                     self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+                    self.assertFalse(pin.exists(), 'APT pin survived a completed row')
         # A pre-existing native tree is a setup conflict, never this fixture's
         # package to purge. The host may independently have /usr/bin/tree.
         with tempfile.TemporaryDirectory() as directory:
@@ -121,6 +159,7 @@ fi
                 distro='debian', tiers='container', allow_mutations=True)
             self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
             self.assertFalse(marker.exists(), 'setup failure purged the pre-existing package')
+            self.assertFalse(pin.exists(), 'setup conflict installed an APT pin')
         failing_simulation = dict(native)
         failing_simulation['apt-get'] = native['apt-get'] + 'exit 43\n'
         result, evidence, logs = self.run_inventory(
@@ -128,6 +167,58 @@ fi
             home_files={'tree_fixture.deb': b'fixture'},
             distro='debian', tiers='container', allow_mutations=True)
         self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+        self.assertFalse(pin.exists(), 'APT simulation failure leaked the pin')
+        extra_upgrade = dict(native)
+        extra_upgrade['apt-get'] = native['apt-get'] + "printf 'Inst openssl [1.0] (2.0 local)\\n'\n"
+        result, evidence, logs = self.run_inventory(
+            'exit 74\n', [rows[0]], native_commands=extra_upgrade,
+            home_files={'tree_fixture.deb': b'fixture'},
+            distro='debian', tiers='container', allow_mutations=True)
+        self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+        self.assertFalse(pin.exists(), 'unrelated-upgrade refusal leaked the pin')
+        partial_install = dict(native)
+        partial_install['sudo'] = native['sudo'].replace(
+            '/usr/bin/install -m 0644 "${@: -2:1}" "$pin" ;;',
+            '/usr/bin/install -m 0644 "${@: -2:1}" "$pin"; exit 75 ;;')
+        result, evidence, logs = self.run_inventory(
+            'exit 74\n', [rows[0]], native_commands=partial_install,
+            home_files={'tree_fixture.deb': b'fixture'},
+            distro='debian', tiers='container', allow_mutations=True)
+        self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+        self.assertFalse(pin.exists(), 'partial pin installation leaked the pin')
+        failed_setup_cleanup = dict(partial_install)
+        failed_setup_cleanup['sudo'] = partial_install['sudo'].replace(
+            '/usr/bin/rm -f -- "$pin" ;;', 'exit 76 ;;')
+        result, evidence, logs = self.run_inventory(
+            'exit 74\n', [fast_row], native_commands=failed_setup_cleanup,
+            home_files={'tree_fixture.deb': b'fixture'},
+            distro='debian', tiers='container', allow_mutations=True)
+        self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+        self.assertIn('APT setup cleanup failed', logs['update-fast.log'])
+        self.assertTrue(pin.exists(), 'setup cleanup failure was not exercised')
+        pin.unlink()
+        pin.write_text('pre-existing policy\n', encoding='utf-8')
+        result, evidence, logs = self.run_inventory(
+            'exit 74\n', [rows[0]], native_commands=native,
+            home_files={'tree_fixture.deb': b'fixture'},
+            distro='debian', tiers='container', allow_mutations=True)
+        self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+        self.assertEqual(pin.read_text(encoding='utf-8'), 'pre-existing policy\n')
+        pin.unlink()
+        failed_cleanup = dict(native)
+        failed_cleanup['sudo'] = native['sudo'].replace(
+            '/usr/bin/rm -f -- "$pin" ;;', 'exit 76 ;;')
+        result, evidence, logs = self.run_inventory(
+            f'[[ -f {quoted_pin} ]] || exit 73\n'
+            'printf "Fast System Update\\nSynced\\nUpgraded 1 package\\n"\n'
+            'printf 2.0 > "$HOME/tree-state"\n',
+            [fast_row], native_commands=failed_cleanup,
+            home_files={'tree_fixture.deb': b'fixture'},
+            distro='debian', tiers='container', allow_mutations=True)
+        self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+        self.assertIn('APT update fixture cleanup failed', logs['update-fast.log'])
+        self.assertTrue(pin.exists(), 'cleanup failure was not exercised')
+        pin.unlink()
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_run_requires_the_make_task_to_execute(self):
