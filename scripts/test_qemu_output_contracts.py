@@ -14,6 +14,101 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class OutputContracts(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_diff_rows_require_the_requested_missing_lockfile_diagnostic(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if line.startswith(('diff\t', 'diff-from\t'))]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            case = row.split('\t')[0]
+            with self.subTest(case=case):
+                self.assertEqual(row.split('\t')[8], 'diff-missing-lock')
+                for diagnostic, expected in (
+                    ('unrelated failure', 'FAIL'),
+                    ('Failed to inspect lockfile other.lock', 'FAIL'),
+                    ('Failed to inspect lockfile missing.lock', 'PASS'),
+                ):
+                    with self.subTest(diagnostic=diagnostic):
+                        product = f'printf "%s\\n" {shlex.quote(diagnostic)} >&2\nexit 1\n'
+                        result, evidence, logs = self.run_inventory(product, [row])
+                        self.assertEqual(evidence[0]['result'], expected, logs)
+                        self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_workspace_init_and_add_require_persisted_workspace_state(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if line.startswith(('workspace-init\t', 'workspace-add\t'))]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row.split('\t')[8] for row in rows],
+                         ['workspace-initialized', 'workspace-project-added'])
+        initialize = ('if [[ "$2" == init ]]; then\n'
+                      '  printf \'name = "smoke"\\ncreated_at = "2026-09-27T00:00:00Z"\\n\' > omg-workspace.toml\n'
+                      'fi\n')
+        add = ('if [[ "$2" == add ]]; then\n'
+               '  printf \'[projects.fixture]\\npath = "."\\n\' >> omg-workspace.toml\n'
+               'fi\n')
+        for product, expected in (
+            (':\n', ['FAIL', 'BLOCKED']),
+            ('echo "Created omg-workspace.toml"\n', ['FAIL', 'BLOCKED']),
+            (initialize.replace('name = "smoke"', 'name = "wrong"') + add, ['FAIL', 'BLOCKED']),
+            (initialize, ['PASS', 'FAIL']),
+            (initialize + add, ['PASS', 'PASS']),
+        ):
+            with self.subTest(expected=expected):
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], expected, logs)
+                self.assertEqual(result.returncode, int(expected != ['PASS', 'PASS']), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_apt_fast_and_turbo_require_a_native_version_upgrade(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if line.startswith(('update-fast\t', 'update-turbo\t'))]
+        self.assertEqual(len(rows), 2)
+        native = {
+            'sudo': '[[ "$1" != -n ]] || shift\nexec "$@"\n',
+            'dpkg-deb': '''case "$1" in
+  --raw-extract) mkdir -p "$3/DEBIAN"; printf 'Package: tree\\nVersion: 2.0\\n' > "$3/DEBIAN/control" ;;
+  --build) : > "$3" ;;
+  *) exit 70 ;;
+esac
+''',
+            'dpkg': '''case "$1" in
+  --install) printf 0.0.1 > "$HOME/tree-state" ;;
+  --purge) rm -f "$HOME/tree-state" ;;
+  --compare-versions) [[ "$2" == 2.0 && "$3" == gt && "$4" == 0.0.1 ]] ;;
+  *) exit 70 ;;
+esac
+''',
+            'dpkg-query': '''if [[ "$*" == *'${Package}'* ]]; then
+  printf 'base\\tinstall ok installed\\n'
+  if [[ -f "$HOME/tree-state" ]]; then printf 'tree\\tinstall ok installed\\n'; fi
+elif [[ -f "$HOME/tree-state" ]]; then
+  printf 'install ok installed\\t%s\\n' "$(cat "$HOME/tree-state")"
+else
+  exit 1
+fi
+''',
+            'apt-cache': 'printf "tree:\\n  Candidate: 2.0\\n"\n',
+            'apt-get': '[[ "$1" == -s && "$2" == upgrade ]] || exit 70\nprintf "Inst tree [0.0.1] (2.0 local)\\n"\n',
+        }
+        for row in rows:
+            case = row.split('\t')[0]
+            mode = case.removeprefix('update-')
+            title = 'Fast System Update\nSynced\n' if mode == 'fast' else 'TURBO System Update\nTurbo upgrade\n'
+            for version, expected in (('0.0.1', 'FAIL'), ('9.9', 'FAIL'), ('2.0', 'PASS')):
+                with self.subTest(case=case, version=version):
+                    product = (f'printf %s {shlex.quote(title + "Upgraded 1 packages\n")}\n'
+                               f'printf %s {shlex.quote(version)} > "$HOME/tree-state"\n')
+                    result, evidence, logs = self.run_inventory(
+                        product, [row], native_commands=native,
+                        home_files={'tree_fixture.deb': b'fixture'},
+                        distro='debian', tiers='container', allow_mutations=True)
+                    self.assertEqual(evidence[0]['result'], expected, logs)
+                    self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_run_requires_the_make_task_to_execute(self):
         row = next(line for line in
                    (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
@@ -1206,7 +1301,7 @@ esac
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
-    def run_inventory(self, product, rows, *, native_commands=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False):
+    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -1215,6 +1310,8 @@ esac
             root = Path(directory)
             for name in ('home', 'bin', 'guest'):
                 (root / name).mkdir()
+            for name, content in (home_files or {}).items():
+                (root / 'home' / name).write_bytes(content)
             for name, content in (native_commands or {}).items():
                 tool = root / 'bin' / name
                 tool.write_text('#!/usr/bin/env bash\n' + content, encoding='utf-8', newline='\n')
