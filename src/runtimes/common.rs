@@ -2024,7 +2024,9 @@ mod tests {
             let url = format!("http://{}/archive", listener.local_addr()?);
             let client = reqwest::Client::builder()
                 .no_proxy()
-                .timeout(std::time::Duration::from_millis(100))
+                // Keep the deliberate first stall, while giving the later
+                // loopback response room for scheduling on loaded CI runners.
+                .timeout(std::time::Duration::from_millis(500))
                 .build()?;
             let server = async {
                 let mut held = Vec::new();
