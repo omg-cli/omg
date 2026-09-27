@@ -135,7 +135,7 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     if check_path() {
         println!("  {}", style::success("PATH configured correctly"));
     } else {
-        println!("  {}", style::error("OMG bin directory not in PATH"));
+        println!("  {}", style::error("omg executable not found on PATH"));
         issues += 1;
     }
 
@@ -1005,21 +1005,18 @@ fn check_path() -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };
-    let paths: Vec<std::path::PathBuf> = std::env::split_paths(&path_var).collect();
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
-    let data_bin = crate::core::paths::data_dir().join("bin");
-    let home_bin = dirs::home_dir().map(|h| h.join(".local/bin"));
+    path_resolves_omg(&path_var)
+}
 
-    // Compare PATH entries as whole components via split_paths; a substring
-    // check falsely matched lookalike directories (e.g. /usr/local/bin-backup)
-    // and vacuously passed when the exe dir was non-UTF-8.
-    // Accept if either the running executable directory, OMG's managed data
-    // bin directory (~/.local/share/omg/bin), or user bin (~/.local/bin) is in PATH.
-    paths.iter().any(|dir| {
-        exe_dir.as_ref() == Some(dir) || dir == &data_bin || home_bin.as_ref() == Some(dir)
-    })
+fn path_resolves_omg(path_var: &std::ffi::OsStr) -> bool {
+    // An absolute PATH directory works from any working directory. Check for
+    // a real executable, not merely a directory where OMG might be installed.
+    std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
+        .any(|dir| {
+            which::which_in_global("omg", Some(dir.as_os_str()))
+                .is_ok_and(|mut matches| matches.next().is_some())
+        })
 }
 
 fn check_shell_hook() -> bool {
@@ -1488,6 +1485,62 @@ mod tests {
         assert!(finish_doctor(0, 2).is_ok());
         let err = finish_doctor(3, 0).expect_err("issues must produce Err");
         assert!(err.to_string().contains('3'), "err: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_requires_an_executable_omg_not_just_a_listed_bin_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::TempDir::new().expect("isolated PATH fixture");
+        let bin = fixture.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("user bin fixture");
+        let path = std::env::join_paths([&bin]).expect("fixture PATH");
+
+        assert!(
+            !path_resolves_omg(&path),
+            "empty bin directory is not proof"
+        );
+        let other = bin.join("omgd");
+        std::fs::write(&other, b"#!/bin/sh\nexit 0\n").expect("other executable");
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+        assert!(!path_resolves_omg(&path), "omgd does not satisfy omg");
+
+        let omg = bin.join("omg");
+        std::fs::write(&omg, b"#!/bin/sh\nexit 0\n").expect("omg fixture");
+        std::fs::set_permissions(&omg, std::fs::Permissions::from_mode(0o600))
+            .expect("non-executable permissions");
+        assert!(
+            !path_resolves_omg(&path),
+            "non-executable omg is not runnable"
+        );
+        std::fs::set_permissions(&omg, std::fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+        assert!(path_resolves_omg(&path), "runnable omg must be found");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_follows_a_runnable_symlink_and_rejects_a_broken_one() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let fixture = tempfile::TempDir::new().expect("isolated PATH fixture");
+        let bin = fixture.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin fixture");
+        let target = fixture.path().join("real-omg");
+        symlink(&target, bin.join("omg")).expect("omg symlink");
+        let path = std::env::join_paths([&bin]).expect("fixture PATH");
+        assert!(!path_resolves_omg(&path), "broken symlink is not runnable");
+
+        std::fs::write(&target, b"#!/bin/sh\nexit 0\n").expect("symlink target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+        assert!(path_resolves_omg(&path), "runnable symlink must be found");
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("non-executable permissions");
+        assert!(!path_resolves_omg(&path), "symlink target must be runnable");
     }
 
     #[cfg(target_os = "linux")]
