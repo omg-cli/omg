@@ -164,6 +164,20 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertNotIn("unrelated prior trial output", excerpt)
         self.assertLessEqual(len(excerpt.encode("utf-8")), 1400)
 
+    def test_failed_trial_before_qemu_launch_uses_boot_log(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run/results.json", json.dumps([row]))
+            archive.writestr("run/transactions/summary.json", json.dumps({
+                "results": [{"id": "remove-native-001", "result": "HARNESS_ERROR"}],
+            }))
+            archive.writestr("run/transactions/trials/remove-native-001/boot.log",
+                             "seed creation failed before QEMU launch")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        self.assertIn("seed creation failed", diagnostics[(row["case_id"], "arch")])
+
     def test_preparation_and_restore_clone_startup_logs_follow_phase(self):
         row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
         for phase, selected, rejected in (
@@ -186,6 +200,27 @@ class ReportingBoundaryTests(unittest.TestCase):
                 self.assertIn(selected, excerpt)
                 self.assertIn("selected clone failure", excerpt)
                 self.assertNotIn("unrelated clone", excerpt)
+
+    def test_preparation_and_restore_use_boot_log_before_qemu_launch(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
+        for phase, step, selected in (
+            ("preparation", "prepare-install-boot", "prepare-install-boot.log"),
+            ("restore", None, "resume-boot.log"),
+        ):
+            with self.subTest(phase=phase):
+                output = io.BytesIO()
+                with zipfile.ZipFile(output, "w") as archive:
+                    archive.writestr("run/results.json", json.dumps([row]))
+                    summary = {"phase": phase, "results": []}
+                    if step is not None:
+                        summary["preparation_step"] = step
+                    archive.writestr("run/transactions/summary.json", json.dumps(summary))
+                    archive.writestr(f"run/transactions/{selected}",
+                                     "seed creation failed before QEMU launch")
+                diagnostics = {}
+                REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+                self.assertIn(selected, diagnostics[(row["case_id"], "arch")])
+                self.assertIn("seed creation failed", diagnostics[(row["case_id"], "arch")])
 
     def test_preparation_failure_selects_its_own_command_log(self):
         row = dict(self.row(), case_id="qemu-fedora-lifecycle", distro="fedora",
@@ -216,6 +251,38 @@ class ReportingBoundaryTests(unittest.TestCase):
                 self.assertIn(selected, excerpt)
                 self.assertIn(f"decisive {step} failure", excerpt)
                 self.assertNotIn("unrelated earlier clone", excerpt)
+
+    def test_unrecognized_preparation_step_does_not_select_stale_clone_log(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
+        for step in ("unknown", ["prepare-install-boot"]):
+            with self.subTest(step=step):
+                output = io.BytesIO()
+                with zipfile.ZipFile(output, "w") as archive:
+                    archive.writestr("run/results.json", json.dumps([row]))
+                    archive.writestr("run/transactions/summary.json", json.dumps({
+                        "phase": "preparation", "preparation_step": step, "results": [],
+                    }))
+                    archive.writestr("run/transactions/prepare-install-boot.qemu-startup.log",
+                                     "unrelated earlier clone")
+                    archive.writestr("run/transactions.log", "current preparation failed")
+                diagnostics = {}
+                REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+                excerpt = diagnostics[(row["case_id"], "arch")]
+                self.assertIn("current preparation failed", excerpt)
+                self.assertNotIn("unrelated earlier clone", excerpt)
+
+    def test_malformed_phase_keeps_generic_lifecycle_diagnostic(self):
+        row = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run/results.json", json.dumps([row]))
+            archive.writestr("run/transactions/summary.json", json.dumps({
+                "phase": ["preparation"], "results": [],
+            }))
+            archive.writestr("run/transactions.log", "preparation step failed")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        self.assertIn("preparation step failed", diagnostics[(row["case_id"], "arch")])
 
     def test_failed_transaction_reports_measured_command_output(self):
         row = dict(self.row(), case_id="qemu-fedora-lifecycle", distro="fedora",

@@ -220,12 +220,14 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                                             if raw.strip():
                                                 excerpts.append((name, diagnostic_excerpt(raw)))
                                 if trial["result"] == "HARNESS_ERROR":
-                                    name = f"transactions/trials/{trial_id}/boot.qemu-startup.log"
-                                    member = members_by_name.get(str(parent / name))
-                                    if member is not None and member.file_size <= 8 * 1024 * 1024:
-                                        raw = archive.read(member)
-                                        if raw.strip():
-                                            excerpts.append((name, diagnostic_excerpt(raw)))
+                                    for boot_name in ("boot.qemu-startup.log", "boot.log"):
+                                        name = f"transactions/trials/{trial_id}/{boot_name}"
+                                        member = members_by_name.get(str(parent / name))
+                                        if member is not None and member.file_size <= 8 * 1024 * 1024:
+                                            raw = archive.read(member)
+                                            if raw.strip():
+                                                excerpts.append((name, diagnostic_excerpt(raw)))
+                                                break
                                 if not excerpts or trial["result"] == "HARNESS_ERROR":
                                     serial_name = f"transactions/trials/{trial_id}/serial.log"
                                     serial = members_by_name.get(str(parent / serial_name))
@@ -253,18 +255,26 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                             "stop-prepared-install": "stop-prepared-install.log",
                         }
                         phase = receipt.get("phase")
+                        if not isinstance(phase, str):
+                            phase = None
                         if phase == "preparation" and "preparation_step" in receipt:
-                            selected = preparation_logs.get(receipt["preparation_step"])
+                            step = receipt["preparation_step"]
+                            selected = preparation_logs.get(step) if isinstance(step, str) else None
                         else:
                             selected = {"preparation": "prepare-install-boot.qemu-startup.log",
                                         "restore": "resume-boot.qemu-startup.log"}.get(phase)
                         if selected:
-                            name = f"transactions/{selected}"
-                            member = members_by_name.get(str(parent / name))
-                            if member is not None and member.file_size <= 8 * 1024 * 1024:
-                                raw = archive.read(member)
-                                if raw.strip():
-                                    excerpts.append((name, diagnostic_excerpt(raw)))
+                            names = [selected]
+                            if selected.endswith("boot.qemu-startup.log"):
+                                names.append(selected.removesuffix(".qemu-startup.log") + ".log")
+                            for boot_name in names:
+                                name = f"transactions/{boot_name}"
+                                member = members_by_name.get(str(parent / name))
+                                if member is not None and member.file_size <= 8 * 1024 * 1024:
+                                    raw = archive.read(member)
+                                    if raw.strip():
+                                        excerpts.append((name, diagnostic_excerpt(raw)))
+                                        break
                 if excerpts:
                     # A measured command failure has a more precise cause than
                     # earlier guest probes. Preserve the full excerpt budget.
