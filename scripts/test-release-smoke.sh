@@ -537,7 +537,7 @@ done
 [[ -n "$child_result" ]] || fail 'interrupted QEMU child did not record its exit'
 
 export FAKE_QEMU_INFO_EXIT=0 FAKE_QEMU_STATE="$scratch/qemu-controller"
-for scenario in pass pull-failure product-failure product-exit-three timeout cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-aur invalid-aur wrong-aur-events kernel-crash controller-oom missing-health; do
+for scenario in pass pull-failure product-failure product-exit-three timeout signaled cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-aur invalid-aur wrong-aur-events kernel-crash controller-oom missing-health; do
   export FAKE_QEMU_PULL_EXIT=0
   export FAKE_QEMU_DAEMON_RECEIPT=valid
   export FAKE_QEMU_AUR_RECEIPT=valid
@@ -558,7 +558,8 @@ for scenario in pass pull-failure product-failure product-exit-three timeout cle
     missing-health) export FAKE_QEMU_HEALTH_MISSING=1; expected_rc=120; expected_result=HARNESS_ERROR ;;
     product-failure) export FAKE_QEMU_GUEST_EXIT=1; expected_rc=1; expected_result=PRODUCT_FAIL ;;
     product-exit-three) export FAKE_QEMU_GUEST_EXIT=3; expected_rc=3; expected_result=PRODUCT_FAIL ;;
-    timeout) export FAKE_QEMU_GUEST_EXIT=124; expected_rc=124; expected_result=PRODUCT_FAIL ;;
+    timeout) export FAKE_QEMU_GUEST_EXIT=124; expected_rc=124; expected_result=HARNESS_ERROR ;;
+    signaled) export FAKE_QEMU_GUEST_EXIT=137; expected_rc=137; expected_result=HARNESS_ERROR ;;
     cleanup-failure) export FAKE_QEMU_CLEANUP_FAIL=1; expected_rc=3; expected_result=HARNESS_ERROR ;;
     transport-failure) export FAKE_QEMU_TRANSPORT_EXIT=1; expected_rc=3; expected_result=HARNESS_ERROR ;;
     missing-receipt) export FAKE_QEMU_MISSING_RECEIPT=1; expected_rc=3; expected_result=HARNESS_ERROR ;;

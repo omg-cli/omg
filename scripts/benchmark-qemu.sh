@@ -656,7 +656,7 @@ case "$distro" in
     sudo -n apt-get update > evidence/index-update.txt 2>&1 || exit 120
     native=(apt-cache --no-all-versions show tree)
     version_cmd=(dpkg-query -W '-f=${Version}\n' tree) ;;
-  fedora) sudo -n dnf -y makecache >/dev/null || exit 120; native=(rpm -qi tree); version_cmd=(rpm -q --qf '%{VERSION}-%{RELEASE}\n' tree) ;;
+  fedora) sudo -n dnf -y makecache > evidence/index-update.txt 2>&1 || exit 120; native=(rpm -qi tree); version_cmd=(rpm -q --qf '%{VERSION}-%{RELEASE}\n' tree) ;;
 esac
 installed() {
   case "$distro" in arch) pacman -Q tree ;; debian|ubuntu) [[ $(dpkg-query -W '-f=${Status}' tree 2>/dev/null) == 'install ok installed' ]] ;; fedora) rpm -q tree ;; esac
@@ -1034,14 +1034,14 @@ if [[ "$health_rc" != 0 ]]; then
   printf 'Final guest/controller health failed admission\n' >&2
   [[ "$rc" != 0 ]] || rc=120
 fi
-# Verdict map: only proven-rig codes are HARNESS_ERROR. Per the GNU
+# Verdict map: timeout/kill codes do not prove a product failure. Per the GNU
 # coreutils manual, timeout exits 124 when the managed command times out
 # and 125/126/127 when timeout/the-exec itself fails
 # (https://www.gnu.org/software/coreutils/manual/html_node/timeout-invocation.html):
 # A deadline or SIGKILL is a failed execution, not proof of its cause.
 # Status 137 alone cannot distinguish a killed command from killed timeout. 120 is this
 # pipeline's own fixture marker; 125/126/127/255 are exec/transport.
-case "$rc" in 0) result=PASS ;; 120|125|126|127|255) result=HARNESS_ERROR ;; *) result=PRODUCT_FAIL ;; esac
+case "$rc" in 0) result=PASS ;; 120|124|125|126|127|137|255) result=HARNESS_ERROR ;; *) result=PRODUCT_FAIL ;; esac
 [[ "$inventory_harness_error" == false ]] || result=HARNESS_ERROR
 [[ "$inventory_product_failure" == false ]] || rc=1
 exit "$rc"

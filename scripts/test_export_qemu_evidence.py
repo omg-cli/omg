@@ -69,6 +69,15 @@ class AllowlistTests(unittest.TestCase):
 
     def test_transaction_diagnostics_are_allowed_only_at_trial_root(self):
         prefix = ("run-test", "transactions", "trials", "install-omg-001", "transaction-trial")
+        startup = ("run-test", "transactions", "trials", "install-omg-001",
+                   "boot.qemu-startup.log")
+        self.assertTrue(exporter.allowed_file(startup))
+        self.assertFalse(exporter.allowed_file((*prefix, "boot.qemu-startup.log")))
+        self.assertFalse(exporter.allowed_file(("run-test", "boot.qemu-startup.log")))
+        self.assertTrue(exporter.allowed_file(("run-test", "transactions",
+                                               "prepare-install-boot.qemu-startup.log")))
+        self.assertTrue(exporter.allowed_file(("run-test", "transactions",
+                                               "resume-boot.qemu-startup.log")))
         for name in TRANSACTION_DIAGNOSTICS:
             with self.subTest(name=name):
                 self.assertTrue(exporter.allowed_file((*prefix, name)))
@@ -152,6 +161,16 @@ class DescriptorTests(unittest.TestCase):
                              ("diagnostic:" + name).encode())
         for name in TRANSACTION_PRIVATE:
             self.assertFalse((self.destination / (prefix + name)).exists())
+
+    def test_failed_clone_startup_log_survives_export_at_trial_root(self):
+        name = "run-test/transactions/trials/remove-native-001/boot.qemu-startup.log"
+        self.fixture(name, b"QEMU network backend failed")
+        self.fixture("run-test/transactions/trials/remove-native-001/transaction-trial/"
+                     "boot.qemu-startup.log", b"unrelated nested file")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(report["copied"], [name])
+        self.assertEqual((self.destination / name).read_bytes(), b"QEMU network backend failed")
 
     def test_daemon_ipc_snapshots_survive_export(self):
         prefix = "run-test/guest/evidence/"

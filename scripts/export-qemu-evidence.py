@@ -140,13 +140,16 @@ def allowed_file(parts):
     if parent == ("transactions",):
         return name in {"results.json", "summary.json", "bases.json", "boot-ids.txt",
                         "expected-version.txt", "automatic-updates.log", "resume-disk.log",
-                        "resume-serial.log", "resume-boot.log"} or re.fullmatch(
+                        "resume-serial.log", "resume-boot.log",
+                        "resume-boot.qemu-startup.log",
+                        "prepare-install-boot.qemu-startup.log"} or re.fullmatch(
             r"(?:install|remove)-(?:base-check\.log|base-unchanged\.log|firmware\.sha256|"
             r"repository-state\.(?:log|sha256)|before\.tsv|manual-before\.names)"
             r"|(?:prepare|stop-prepared)-(?:install|remove)(?:-serial|-boot)?\.log", name
         ) is not None
     if len(parent) == 3 and parent[:2] == ("transactions", "trials"):
-        return name in {"disk-create.log", "serial.log", "boot.log", "guest.log", "copy.log",
+        return name in {"disk-create.log", "serial.log", "boot.log", "boot.qemu-startup.log",
+                        "guest.log", "copy.log",
                         "validation.log", "stop.log", "health.json", "health.log"}
     return benchmark_file(name) or (
         len(parent) == 4 and parent[:2] == ("transactions", "trials")
