@@ -1574,6 +1574,15 @@ fn behavior_inventory_runs_in_hermetic_state() {
         if case.id == "container-build-argv" {
             project.create_file("Dockerfile", "FROM scratch\n");
         }
+        if case.id == "container-init" {
+            for name in [
+                ".dockerignore",
+                "Dockerfile.omg.dockerignore",
+                ".containerignore",
+            ] {
+                project.create_file(name, "!.env\n!secrets.key\n");
+            }
+        }
         if let Some(capture) = &container_capture {
             command_env.push((
                 "OMG_QEMU_ENGINE_CAPTURE",
@@ -2323,12 +2332,22 @@ fn behavior_inventory_runs_in_hermetic_state() {
                             .all(|required| lines.iter().filter(|line| *line == required).count() == 1)
                             && !text.contains("# WARNING: no pinned digest")
                     });
-                    let ignored = read_regular(".dockerignore").is_some_and(|text| {
-                        text.lines().collect::<Vec<_>>().ends_with(&[
-                            "# added by omg container init",
-                            ".git", ".env", ".env.*", "!.env.example", "*.pem", "*.key",
-                            "id_rsa*", ".omg/",
-                        ])
+                    let ignored = [
+                        ".dockerignore",
+                        "Dockerfile.omg.dockerignore",
+                        ".containerignore",
+                    ]
+                    .iter()
+                    .all(|name| {
+                        read_regular(name).is_some_and(|text| {
+                            let lines: Vec<_> = text.lines().collect();
+                            lines.starts_with(&["!.env", "!secrets.key"])
+                                && lines.ends_with(&[
+                                    "# added by omg container init",
+                                    ".git", ".env", ".env.*", "!.env.example", "*.pem", "*.key",
+                                    "id_rsa*", ".omg/",
+                                ])
+                        })
                     });
                     if !scaffold || !ignored {
                         issues.push("container init omitted its Debian scaffold or final credential exclusions".to_string());

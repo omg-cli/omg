@@ -476,7 +476,8 @@ WORKDIR /app
 COPY . .
 CMD ["/bin/bash"]
 DOCKERFILE
-cat > .dockerignore <<'IGNORE'
+for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do
+cat >> "$ignore" <<'IGNORE'
 # added by omg container init
 .git
 .env
@@ -487,6 +488,7 @@ cat > .dockerignore <<'IGNORE'
 id_rsa*
 .omg/
 IGNORE
+done
 printf '  ✓ Created Dockerfile.omg\\n│ Base image: debian:bookworm │\\n'
 '''
         for label, altered, expected in (
@@ -495,8 +497,18 @@ printf '  ✓ Created Dockerfile.omg\\n│ Base image: debian:bookworm │\\n'
             ('wrong base', product.replace('FROM debian:bookworm', 'FROM ubuntu:24.04'), 'FAIL'),
             ('missing build dependencies', product.replace('curl wget git build-essential ca-certificates',
                                                            'curl wget git'), 'FAIL'),
-            ('missing ignore', product.replace('cat > .dockerignore', 'cat > other-ignore'), 'FAIL'),
+            ('missing root protection', product.replace(
+                'for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do',
+                'for ignore in Dockerfile.omg.dockerignore .containerignore; do'), 'FAIL'),
+            ('missing BuildKit protection', product.replace(
+                'for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do',
+                'for ignore in .dockerignore .containerignore; do'), 'FAIL'),
+            ('missing Podman protection', product.replace(
+                'for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do',
+                'for ignore in .dockerignore Dockerfile.omg.dockerignore; do'), 'FAIL'),
             ('late exception', product + "printf '!*.key\\n' >> .dockerignore\n", 'FAIL'),
+            ('late override exception', product + "printf '!*.key\\n' >> Dockerfile.omg.dockerignore\n", 'FAIL'),
+            ('lost user negations', product + "sed -i '1,2d' .containerignore\n", 'FAIL'),
             ('extra build command', product.replace('WORKDIR /app', 'RUN echo unexpected\nWORKDIR /app'), 'FAIL'),
             ('silent output', product.replace("printf '  ✓ Created Dockerfile.omg\\n│ Base image: debian:bookworm │\\n'",
                                                ':'), 'FAIL'),

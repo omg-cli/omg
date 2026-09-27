@@ -1300,7 +1300,12 @@ assert not any(line.startswith(('# WARNING: no pinned digest', 'ENV NODE_VERSION
                                 'ENV GO_VERSION=', 'ENV PYTHON_VERSION=')) for line in lines)
 protection = ['# added by omg container init', '.git', '.env', '.env.*',
               '!.env.example', '*.pem', '*.key', 'id_rsa*', '.omg/']
-assert Path('.dockerignore').read_text().splitlines()[-len(protection):] == protection
+for name in ('.dockerignore', 'Dockerfile.omg.dockerignore', '.containerignore'):
+    path = Path(name)
+    assert path.is_file() and not path.is_symlink(), name
+    rules = path.read_text().splitlines()
+    assert rules[:2] == ['!.env', '!secrets.key'], name
+    assert rules[-len(protection):] == protection, name
 PY
         then
           printf 'assertion failed: container init omitted its Debian scaffold or final credential exclusions\n' >&2; return 1
@@ -2072,6 +2077,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@printf omg-qemu-smoke-task > smoke-task.marker\n\t@echo smoke-task-ok\nparallel-one:\n\t@touch parallel-one.started\n\t@timeout 15 sh -c \"until test -e parallel-two.started; do sleep 0.05; done\"\n\t@printf parallel-one > parallel-one.done\n\t@echo parallel-one-ok\nparallel-two:\n\t@touch parallel-two.started\n\t@timeout 15 sh -c \"until test -e parallel-one.started; do sleep 0.05; done\"\n\t@printf parallel-two > parallel-two.done\n\t@echo parallel-two-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n' > Makefile"
   if [[ "$case" == run-watch ]]; then
     remote+="; mkdir src; printf 'initial\\n' > src/watch-trigger.txt; printf 'smoke:\\n\\t@printf \\\"omg-qemu-watch-run\\\\n\\\" >> watch-runs.marker\\n\\t@echo smoke-task-ok\\n' > Makefile; export OMG_DISABLE_DAEMON=1"
+  fi
+  if [[ "$assertions" == container-init-scaffold ]]; then
+    remote+="; for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do printf '!.env\\n!secrets.key\\n' > \"\$ignore\"; done"
   fi
   if [[ "$case" == run-all ]]; then
     remote+="; mkdir -p \"\$rowdir/run-all-bin\"; printf '#!/bin/sh\ncase \$1:\$2 in\n  --version:) echo 9.0.0 ;;\n  run:smoke) printf npm-smoke-task > npm-task.marker; echo npm-task-ok ;;\n  *) exit 96 ;;\nesac\n' > \"\$rowdir/run-all-bin/npm\"; printf '#!/bin/sh\necho v24.0.0\n' > \"\$rowdir/run-all-bin/node\"; chmod 755 \"\$rowdir/run-all-bin/npm\" \"\$rowdir/run-all-bin/node\"; export PATH=\"\$rowdir/run-all-bin:\$PATH\"; printf '%s\n' '{\"scripts\":{\"smoke\":\"echo npm-task-ok\"}}' > package.json"
