@@ -627,6 +627,7 @@ enum Assertion {
     RuntimeListState,
     RuntimeSwitchState,
     TaskExecuted,
+    WatchTaskRerun,
     ParallelTasksExecuted,
     AllTasksExecuted,
 }
@@ -711,6 +712,7 @@ impl Assertion {
             "runtime-list-state" => Self::RuntimeListState,
             "runtime-switch-state" => Self::RuntimeSwitchState,
             "task-executed" => Self::TaskExecuted,
+            "watch-task-rerun" => Self::WatchTaskRerun,
             "parallel-tasks-executed" => Self::ParallelTasksExecuted,
             "all-tasks-executed" => Self::AllTasksExecuted,
             _ => match Self::parse_artifact_path(raw) {
@@ -2083,6 +2085,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                     }
                 }
                 Assertion::UpdateFastOutput
+                | Assertion::WatchTaskRerun
                 | Assertion::UpdateTurboOutput
                 | Assertion::DaemonForegroundLifecycle
                 | Assertion::SearchOfficialLimitThree
