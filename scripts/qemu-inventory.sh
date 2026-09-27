@@ -786,6 +786,38 @@ check_product_output() {
   if [[ "$code" != 0 ]] && ! grep -q '[^[:space:]]' "$stderr"; then
     printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
   fi
+  if [[ "$assertion" == license-* ]]; then
+    local mode=${assertion#license-} report=$stdout
+    if [[ "$distro" != arch ]]; then
+      local refusal='Error: License scanning of installed packages is not available without the Arch backend'
+      [[ "$mode" != enterprise-* ]] || refusal='Error: Enterprise license scan requires the Arch package backend'
+      local allowed_output='^[[:space:]]*$'
+      [[ "$mode" != audit-csv ]] || allowed_output+='|^OMG Scanning installed packages for license information\.\.\.$'
+      if [[ "$code" != 1 || $(cat "$stderr") != "$refusal" ]] \
+        || grep -Ev "$allowed_output" "$stdout" >/dev/null \
+        || [[ -e licenses-export.csv || -L licenses-export.csv ]] \
+        || compgen -G 'license-scan-*' >/dev/null; then
+        printf 'assertion failed: unsupported license backend must refuse without a report or export\n' >&2; return 1
+      fi
+    else
+      local expected_code=0
+      [[ "$mode" != audit-mit-json ]] || expected_code=1
+      [[ "$code" == "$expected_code" ]] || { printf 'assertion failed: Arch license scan returned the wrong status\n' >&2; return 1; }
+      if [[ "$mode" == audit-csv ]]; then
+        report=licenses-export.csv
+      elif [[ "$mode" == enterprise-json ]]; then
+        local -a exports=()
+        mapfile -t exports < <(compgen -G 'license-scan-*.json' || true)
+        [[ ${#exports[@]} == 1 ]] || { printf 'assertion failed: license scan must create exactly one JSON export\n' >&2; return 1; }
+        report=${exports[0]}
+      fi
+      if [[ "$mode" == audit-mit-json ]]; then
+        python3 qemu-license-oracle.py "$mode" "$report" "$stderr" || return 1
+      else
+        python3 qemu-license-oracle.py "$mode" "$report" || return 1
+      fi
+    fi
+  fi
   if [[ "$assertion" == package-dry-run-install || "$assertion" == package-dry-run-remove || "$assertion" == package-dry-run-recursive ]]; then
     if [[ "$assertion" == package-dry-run-recursive && "$distro" != arch ]]; then
       local refusal='Recursive removal is not supported by the Debian backend'
@@ -1114,6 +1146,8 @@ done
 case "$distro" in arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
 for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3; done
 overlap_fixture=$(jq -rn --rawfile fixture "$(dirname "$0")/workspace-overlap-fixture.sh" '$fixture | @sh')
+license_oracle_path="$(dirname "$0")/qemu-license-oracle.py"
+license_oracle=$(jq -rn --rawfile fixture "$license_oracle_path" '$fixture | @sh')
 [[ "$binary" == /* && "$binary" != *$'\n'* ]] || exit 2
 [[ "$ssh_user" =~ ^[a-z_][a-z0-9_-]*$ && "$ssh_port" =~ ^[0-9]+$ ]] || exit 2
 [[ "$tiers" =~ ^[a-z,-]+$ && "$tiers" != ,* && "$tiers" != *, && "$tiers" != *,,* ]] || exit 2
@@ -1138,7 +1172,7 @@ out="$root/inventory"
 # Refuse to overwrite evidence from a previous invocation.
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" > "$out/input-sha256.txt"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" > "$out/input-sha256.txt"
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
   '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
@@ -1233,7 +1267,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
     jq -e '. == ["run", "smoke", "--using", "make"]' <<< "$aj" >/dev/null || exit 2
@@ -1550,6 +1584,15 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; export OMG_CACHE_DIR=\"\$rowdir/audit-cache\" OMG_DISABLE_DAEMON=1"
   fi
   remote+="; printf '%s' $overlap_fixture > workspace-overlap.sh"
+  if [[ "$assertions" == license-* ]]; then
+    remote+="; printf '%s' $license_oracle > qemu-license-oracle.py"
+    if [[ "$assertions" == license-audit-mit-json ]]; then
+      if [[ "$distro" == arch ]]; then
+        remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: license policy fixture requires an unprivileged guest user\n' >&2; exit 2; }"
+      fi
+      remote+="; export OMG_CONFIG_DIR=\"\$rowdir/license-policy\"; mkdir -p \"\$OMG_CONFIG_DIR\"; printf '%s\n' 'allowed_licenses = [\"LicenseRef-QemuNoInstalledLicense\"]' > \"\$OMG_CONFIG_DIR/policy.toml\""
+    fi
+  fi
   remote+="; mkdir -p project; printf '# Nested audit fixture\n' > project/README.md"
   if [[ "$assertions" == audit-secret-scoped ]]; then
     remote+="; printf 'password=%s%s\n' 'qemuSecret' '7429' > project/config.txt; printf 'password=%s%s\n' 'outsideSecret' '9031' > outside.txt"

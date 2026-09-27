@@ -1220,6 +1220,39 @@ esac
                     0,
                 )
 
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_license_rows_require_the_backend_refusal_without_an_export(self):
+        ids = {'audit-licenses', 'audit-licenses-filter-policy', 'audit-licenses-export',
+               'enterprise-license-scan', 'enterprise-license-scan-export'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        refusal = ('if [[ "$1" == audit ]]; then\n'
+                   '  echo "Error: License scanning of installed packages is not available without the Arch backend" >&2\n'
+                   'else\n'
+                   '  echo "Error: Enterprise license scan requires the Arch package backend" >&2\n'
+                   'fi\nexit 1\n')
+        leaked_export = ('if [[ "$*" == *--export* ]]; then\n'
+                         '  if [[ "$1" == audit ]]; then printf partial > licenses-export.csv;\n'
+                         '  else printf partial > license-scan-fixture.json; fi\n'
+                         'fi\n' + refusal)
+        for distro in ('debian', 'ubuntu', 'fedora'):
+            for label, product, rejected in (
+                ('wrong cause', 'echo unrelated permission error >&2\nexit 1\n', ids),
+                ('explicit refusal', refusal, set()),
+                ('report despite refusal', 'echo "[]"\n' + refusal, ids),
+                ('partial export', leaked_export,
+                 {'audit-licenses-export', 'enterprise-license-scan-export'}),
+            ):
+                with self.subTest(distro=distro, label=label):
+                    result, evidence, logs = self.run_inventory(product, rows, distro=distro)
+                    for row in evidence:
+                        case = row['case_id'].removeprefix(f'qemu-{distro}-')
+                        self.assertEqual(row['result'], 'FAIL' if case in rejected else 'PASS',
+                                         f'{result.stdout}\n{result.stderr}\n{logs}')
+                    self.assertEqual(result.returncode, 1 if rejected else 0)
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_actual_runner_executes_offline_refusals(self):
         rows = [
