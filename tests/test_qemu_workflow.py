@@ -288,10 +288,37 @@ class SecurityBoundaryTests(unittest.TestCase):
                 self.assertIn("github.event_name != 'pull_request'", block)
 
     def test_kvm_access_is_user_scoped_and_mandatory(self):
-        block = step('Open KVM device permissions')
+        block = step('Select and verify KVM device')
         self.assertNotIn('chmod 666', block)
         self.assertNotIn('|| true', block)
+        self.assertIn('RUNNER_ENVIRONMENT: ${{ runner.environment }}', block)
+        self.assertIn('python3 scripts/omg-kvm-device.py check', block)
+        self.assertIn('python3 scripts/omg-kvm-device.py probe-hosted', block)
         self.assertIn('setfacl -m "u:$(id -u):rw" /dev/kvm', block)
+        self.assertIn('OMG_QEMU_KVM_DEVICE=/var/lib/omg-runner/kvm', block)
+        self.assertIn('OMG_QEMU_KVM_DEVICE=/dev/kvm', block)
+        self.assertIn('docker_device_args=(--device "$kvm_device:/dev/kvm")',
+                      (WORKFLOW.parents[2] / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8'))
+
+        # The self-hosted branch must not export a device if the private
+        # node fails its real verifier. Unknown runner types also fail closed.
+        bash = os.environ.get('OMG_TEST_BASH') or shutil.which('bash')
+        if not bash:
+            self.skipTest('requires Bash')
+        run = literal(block, 'run', 8)
+        fake_python = 'python3() { [[ "$*" == "scripts/omg-kvm-device.py check" && "$VERIFY" == pass ]]; };\n'
+        for environment, verify, passed in (('self-hosted', 'pass', True),
+                                            ('self-hosted', 'fail', False),
+                                            ('unknown', 'pass', False)):
+            with self.subTest(environment=environment, verify=verify), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'github-env'
+                result = subprocess.run(
+                    [bash, '--noprofile', '--norc', '-euo', 'pipefail', '-c', fake_python + run],
+                    env=dict(os.environ, RUNNER_ENVIRONMENT=environment, VERIFY=verify,
+                             GITHUB_ENV=str(output)), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+                self.assertEqual(output.read_text(encoding='utf-8').strip() if output.exists() else '',
+                                 'OMG_QEMU_KVM_DEVICE=/var/lib/omg-runner/kvm' if passed else '')
 
     def test_pull_requests_cannot_select_configurable_arm_runners(self):
         bash = os.environ.get('OMG_TEST_BASH') or shutil.which('bash')

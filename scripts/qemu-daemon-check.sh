@@ -174,12 +174,17 @@ case "${OMG_QEMU_ACCEL:-kvm}" in
   tcg) readiness_attempts=300; child_attempts=300; command_timeout=60; status_timeout=30; cold_status_timeout=60 ;;
   *) printf 'Unsupported QEMU acceleration mode: %s\n' "$OMG_QEMU_ACCEL" >&2; exit 2 ;;
 esac
-# Fedora builds the daemon's repository index before it binds the socket.
-# Its DNF query has a 60-second timeout; a six-second socket probe reports a
-# live but still-initializing daemon as failed under KVM contention. Preserve
-# a bounded startup check without changing the product's repository behavior.
+# Fedora's repository index and Debian/Ubuntu's APT cache are prepared before
+# the socket binds. On a cold guest under KVM contention, 30 short probes can
+# expire while a live daemon is still pre-warming. The timed budget still
+# requires the process to remain alive and Metrics IPC to answer successfully.
+os_id=
+if [[ -r /etc/os-release ]]; then os_id=$(. /etc/os-release; printf '%s' "${ID:-}"); fi
 readiness_budget=0
-if [[ "${OMG_QEMU_ACCEL:-kvm}" == kvm && -r /etc/fedora-release ]]; then readiness_budget=70; fi
+case "${OMG_QEMU_ACCEL:-kvm}:$os_id" in
+  kvm:fedora) readiness_budget=70 ;;
+  kvm:debian|kvm:ubuntu) readiness_budget=30 ;;
+esac
 state=$(mktemp -d "$HOME/omg-daemon-check.XXXXXX")
 chmod 700 "$state"
 export OMG_SOCKET_PATH="$state/omg.sock"

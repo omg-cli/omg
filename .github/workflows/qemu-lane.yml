@@ -273,10 +273,21 @@ jobs:
           OMG_SMOKE_SENTRY_DSN: ${{ secrets.OMG_SMOKE_SENTRY_DSN }}
         run: python3 scripts/ci-smoke-report.py configure
 
-      - name: Open KVM device permissions
-        # The dedicated runner already has device access. Hosted runners may
-        # still need an ACL; the next step verifies access in either case.
+      - name: Select and verify KVM device
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
+          if [[ "$RUNNER_ENVIRONMENT" == self-hosted ]]; then
+            # Ubuntu WSL's /dev is shared with other distros. A per-distro ext4
+            # alias is provisioned before the runner service starts.
+            python3 scripts/omg-kvm-device.py check
+            echo 'OMG_QEMU_KVM_DEVICE=/var/lib/omg-runner/kvm' >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [[ "$RUNNER_ENVIRONMENT" != github-hosted ]]; then
+            echo "::error::Unknown runner environment; refusing to select a KVM device"
+            exit 1
+          fi
           if [[ ! -c /dev/kvm ]]; then
             echo "::error::/dev/kvm is missing on this runner; refusing TCG fallback"
             exit 1
@@ -290,18 +301,8 @@ jobs:
             fi
             sudo -n setfacl -m "u:$(id -u):rw" /dev/kvm
           fi
-
-      - name: Fail fast without KVM
-        run: |
-          if [[ ! -c /dev/kvm ]]; then
-            echo "::error::/dev/kvm is missing on this runner; refusing TCG fallback"
-            exit 1
-          fi
-          if [[ ! -w /dev/kvm || ! -r /dev/kvm ]]; then
-            echo "::error::/dev/kvm is not accessible on this runner"
-            exit 1
-          fi
-          ls -l /dev/kvm
+          python3 scripts/omg-kvm-device.py probe-hosted
+          echo 'OMG_QEMU_KVM_DEVICE=/dev/kvm' >> "$GITHUB_ENV"
 
       - name: Download staged binaries
         if: inputs.staged && !inputs.reuse-ci

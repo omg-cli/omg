@@ -309,7 +309,7 @@ host_arch=x86_64
 case "$(uname -m)" in aarch64|arm64) host_arch=aarch64 ;; esac
 qemu_accel=kvm
 qemu_cpu=host
-docker_device_args=(--device "$kvm_device")
+docker_device_args=(--device "$kvm_device:/dev/kvm")
 if [[ "$host_arch" != "$arch" ]]; then
   if [[ "$allow_tcg" == false ]]; then
     printf 'error: guest arch %s needs a %s host with KVM; pass --allow-tcg for a local correctness audit\n' "$arch" "$arch" >&2
