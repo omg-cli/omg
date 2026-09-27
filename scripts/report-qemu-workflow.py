@@ -242,10 +242,24 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                                                 "\n".join(signals[-4:] + priority[-4:]).encode("utf-8"))))
                                 break
                     if not excerpts and isinstance(receipt, dict):
-                        startup = {"preparation": "prepare-install-boot.qemu-startup.log",
-                                   "restore": "resume-boot.qemu-startup.log"}.get(receipt.get("phase"))
-                        if startup:
-                            name = f"transactions/{startup}"
+                        preparation_logs = {
+                            "automatic-updates": "automatic-updates.log",
+                            "prepare-remove": "prepare-remove.log",
+                            "remove-repository-state": "remove-repository-state.log",
+                            "stop-prepared-remove": "stop-prepared-remove.log",
+                            "prepare-install-boot": "prepare-install-boot.qemu-startup.log",
+                            "prepare-install": "prepare-install.log",
+                            "install-repository-state": "install-repository-state.log",
+                            "stop-prepared-install": "stop-prepared-install.log",
+                        }
+                        phase = receipt.get("phase")
+                        if phase == "preparation" and "preparation_step" in receipt:
+                            selected = preparation_logs.get(receipt["preparation_step"])
+                        else:
+                            selected = {"preparation": "prepare-install-boot.qemu-startup.log",
+                                        "restore": "resume-boot.qemu-startup.log"}.get(phase)
+                        if selected:
+                            name = f"transactions/{selected}"
                             member = members_by_name.get(str(parent / name))
                             if member is not None and member.file_size <= 8 * 1024 * 1024:
                                 raw = archive.read(member)

@@ -27,6 +27,7 @@ current_id=
 failure_result=HARNESS_ERROR
 failure_exit=
 phase=preparation
+preparation_step=automatic-updates
 jq -n --argjson count "$samples" '
   [range(1;$count+1) as $round | ["install","remove"][] as $operation |
    ["omg","native"][] as $tool |
@@ -36,11 +37,11 @@ jq -n --argjson count "$samples" '
 ' > "$output/results.json"
 jq -n '{install:null,remove:null}' > "$output/bases.json"
 write_summary() {
-  jq -n --arg distro "$distro" --arg phase "$phase" --argjson count "$samples" \
+  jq -n --arg distro "$distro" --arg phase "$phase" --arg preparation_step "$preparation_step" --argjson count "$samples" \
     --argjson complete "$1" --slurpfile rows "$output/results.json" \
     --slurpfile bases "$output/bases.json" '
     {schema_version:2,kind:"transaction-suite",distro:$distro,complete:$complete,
-     phase:$phase,samples_per_tool:$count,expected_trials:($count*4),
+     phase:$phase,preparation_step:$preparation_step,samples_per_tool:$count,expected_trials:($count*4),
      bases:$bases[0],results:$rows[0]}
   ' > "$output/summary.next.json"
   mv "$output/summary.next.json" "$output/summary.json"
@@ -174,7 +175,9 @@ case "$distro" in
   arch)
     mask_units paccache.timer paccache.service > "$output/automatic-updates.log" 2>&1 ;;
 esac
+preparation_step=prepare-remove
 native_change install > "$output/prepare-remove.log" 2>&1
+preparation_step=query-tree-version
 case "$distro" in
   arch) version=$(remote_argv pacman -Q tree); version=${version#tree } ;;
   debian|ubuntu) version=$(remote_argv dpkg-query -W '-f=${Version}\n' tree) ;;
@@ -182,15 +185,24 @@ case "$distro" in
 esac
 [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9.:+~_-]*$ ]] || exit 1
 printf '%s\n' "$version" > "$output/expected-version.txt"
+preparation_step=remove-repository-state
 capture_repository_state remove
+preparation_step=stop-prepared-remove
 stop_guest > "$output/stop-prepared-remove.log" 2>&1
+preparation_step=freeze-remove-base
 freeze_base overlay.qcow2 remove vars.fd
+preparation_step=create-prepare-install-disk
 qemu-img create -f qcow2 -F qcow2 -b "$disks/remove-base.qcow2" "$disks/prepare-install.qcow2"
 if [[ "${boot_args[0]}" == uefi ]]; then cp "$disks/remove-vars.fd" "$disks/prepare-vars.fd"; fi
+preparation_step=prepare-install-boot
 start_clone "$disks/prepare-install.qcow2" "$disks/prepare-vars.fd" "$output/prepare-install-serial.log" "$output/prepare-install-boot.log"
+preparation_step=prepare-install
 native_change remove > "$output/prepare-install.log" 2>&1
+preparation_step=install-repository-state
 capture_repository_state install
+preparation_step=stop-prepared-install
 stop_guest > "$output/stop-prepared-install.log" 2>&1
+preparation_step=freeze-install-base
 freeze_base "$disks/prepare-install.qcow2" install "$disks/prepare-vars.fd"
 rm -f "$disks/prepare-install.qcow2" "$disks/prepare-vars.fd"
 : > "$output/boot-ids.txt"

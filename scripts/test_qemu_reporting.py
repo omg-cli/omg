@@ -187,6 +187,36 @@ class ReportingBoundaryTests(unittest.TestCase):
                 self.assertIn("selected clone failure", excerpt)
                 self.assertNotIn("unrelated clone", excerpt)
 
+    def test_preparation_failure_selects_its_own_command_log(self):
+        row = dict(self.row(), case_id="qemu-fedora-lifecycle", distro="fedora",
+                   result="HARNESS_ERROR")
+        for step, selected in (
+            ("automatic-updates", "automatic-updates.log"),
+            ("prepare-remove", "prepare-remove.log"),
+            ("remove-repository-state", "remove-repository-state.log"),
+            ("stop-prepared-remove", "stop-prepared-remove.log"),
+            ("prepare-install", "prepare-install.log"),
+            ("install-repository-state", "install-repository-state.log"),
+            ("stop-prepared-install", "stop-prepared-install.log"),
+        ):
+            with self.subTest(step=step):
+                output = io.BytesIO()
+                with zipfile.ZipFile(output, "w") as archive:
+                    archive.writestr("run/results.json", json.dumps([row]))
+                    archive.writestr("run/transactions/summary.json", json.dumps({
+                        "phase": "preparation", "preparation_step": step, "results": [],
+                    }))
+                    archive.writestr(f"run/transactions/{selected}",
+                                     f"decisive {step} failure")
+                    archive.writestr("run/transactions/prepare-install-boot.qemu-startup.log",
+                                     "unrelated earlier clone")
+                diagnostics = {}
+                REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+                excerpt = diagnostics[(row["case_id"], "fedora")]
+                self.assertIn(selected, excerpt)
+                self.assertIn(f"decisive {step} failure", excerpt)
+                self.assertNotIn("unrelated earlier clone", excerpt)
+
     def test_failed_transaction_reports_measured_command_output(self):
         row = dict(self.row(), case_id="qemu-fedora-lifecycle", distro="fedora",
                    result="HARNESS_ERROR")
