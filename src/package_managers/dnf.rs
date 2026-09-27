@@ -1395,6 +1395,7 @@ impl PackageManager for DnfPackageManager {
                 .map(|package| super::types::SecurityPackage {
                     name: package.name,
                     version: package.version,
+                    advisory_source: None,
                     architecture: Some(package.architecture),
                     description: String::new(),
                     licenses: Vec::new(),
@@ -1733,6 +1734,7 @@ mod tests {
         let package = |version: &str, architecture: &str| super::super::types::SecurityPackage {
             name: "fixture".into(),
             version: version.into(),
+            advisory_source: None,
             architecture: Some(architecture.into()),
             description: String::new(),
             licenses: Vec::new(),

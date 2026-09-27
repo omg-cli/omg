@@ -1819,9 +1819,46 @@ fn parse_security_inventory(
             identities.insert((name.clone(), architecture.clone())),
             "Duplicate installed dpkg identity: {name}:{architecture}"
         );
+        let mut source_fields = paragraph.lines().filter_map(|line| {
+            line.split_once(':')
+                .filter(|(key, _)| key.eq_ignore_ascii_case("Source"))
+                .map(|(_, value)| value.trim())
+        });
+        let advisory_source = if let Some(source) = source_fields.next() {
+            anyhow::ensure!(
+                source_fields.next().is_none(),
+                "Installed dpkg entry '{name}' has duplicate Source fields"
+            );
+            let (source_name, source_version) =
+                if let Some((source_name, suffix)) = source.split_once(" (") {
+                    let source_version = suffix
+                        .strip_suffix(')')
+                        .context("Invalid dpkg Source version")?;
+                    (source_name, source_version)
+                } else {
+                    (source, version.as_str())
+                };
+            anyhow::ensure!(
+                source_name.len() >= 2
+                    && source_name.as_bytes()[0].is_ascii_alphanumeric()
+                    && source_name.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'+' | b'-' | b'.'))
+                    && !source_version.is_empty()
+                    && !source_version
+                        .bytes()
+                        .any(|byte| byte.is_ascii_whitespace() || byte == b')'),
+                "Invalid dpkg Source identity for '{name}'"
+            );
+            (source_name != name || source_version != version)
+                .then(|| (source_name.to_owned(), source_version.to_owned()))
+        } else {
+            None
+        };
         packages.push(crate::package_managers::types::SecurityPackage {
             name,
             version,
+            advisory_source,
             description,
             architecture: Some(architecture),
             licenses: Vec::new(),
@@ -1835,12 +1872,16 @@ mod security_inventory_tests {
     use super::parse_security_inventory;
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "dpkg-query field syntax uses literal ${source:Package} and ${source:Version}"
+    )]
     fn security_inventory_matches_native_dpkg_identities() {
         let output = crate::core::privilege::system_command("dpkg-query")
             .unwrap()
             .args([
                 "--show",
-                "--showformat=${Package}\t${Architecture}\t${Version}\t${db:Status-Status}\n",
+                "--showformat=${Package}\t${Architecture}\t${Version}\t${source:Package}\t${source:Version}\t${db:Status-Status}\n",
             ])
             .output()
             .unwrap();
@@ -1861,11 +1902,14 @@ mod security_inventory_tests {
             .unwrap()
             .into_iter()
             .map(|package| {
+                let (advisory_name, advisory_version) = package.advisory_identity();
                 format!(
-                    "{}\t{}\t{}",
-                    package.name,
-                    package.architecture.unwrap(),
-                    package.version
+                    "{}\t{}\t{}\t{}\t{}",
+                    &package.name,
+                    package.architecture.as_deref().unwrap(),
+                    &package.version,
+                    advisory_name,
+                    advisory_version
                 )
             })
             .collect();
@@ -1963,6 +2007,39 @@ mod security_inventory_tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn security_inventory_uses_source_identity_only_for_advisory_lookups() {
+        let status = "Status: install ok installed\nArchitecture: amd64\nDescription: fixture\n";
+        let fixture = format!(
+            "Package: libacl1\nVersion: 2.3.2-2+b1\nSource: acl (2.3.2-2)\n{status}\n\
+             Package: libssl3t64\nVersion: 3.5.5-1ubuntu3.5\nSource: openssl\n{status}\n\
+             Package: native\nVersion: 1:2.0-3\n{status}\n\
+             Package: native-bnmu\nVersion: 2.0+b1\nSource: native-bnmu (2.0)\n{status}"
+        );
+        let packages = parse_security_inventory(&fixture).unwrap();
+        assert_eq!(packages[0].name, "libacl1");
+        assert_eq!(packages[0].version, "2.3.2-2+b1");
+        assert_eq!(packages[0].advisory_identity(), ("acl", "2.3.2-2"));
+        assert_eq!(
+            packages[1].advisory_identity(),
+            ("openssl", "3.5.5-1ubuntu3.5")
+        );
+        assert_eq!(packages[2].advisory_identity(), ("native", "1:2.0-3"));
+        assert_eq!(packages[3].advisory_identity(), ("native-bnmu", "2.0"));
+        for source in [
+            "Source: acl (2.3.2-2\n",
+            "Source: acl ()\n",
+            "Source: acl (2.3.2-2)\nSource: spoofed\n",
+            "Source: BadName\n",
+        ] {
+            let entry = format!("Package: libacl1\nVersion: 2.3.2-2+b1\n{source}{status}");
+            assert!(
+                parse_security_inventory(&entry).is_err(),
+                "accepted {source:?}"
+            );
+        }
     }
 }
 
