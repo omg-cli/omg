@@ -305,6 +305,8 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
     for (id, assertion) in [
         ("hooks-install", Assertion::HooksInstalled),
         ("hooks-install-force", Assertion::HooksInstalled),
+        ("workspace-init", Assertion::WorkspaceInitialized),
+        ("workspace-add", Assertion::WorkspaceProjectAdded),
         ("workspace-run-parallel-all", Assertion::WorkspaceAllOutput),
         ("update-fast", Assertion::UpdateFastOutput),
         ("update-turbo", Assertion::UpdateTurboOutput),
@@ -326,6 +328,8 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
 fn behavior_inventory_keeps_offline_refusal_assertions() {
     let cases = behavior_cases();
     for (id, assertion) in [
+        ("diff", Assertion::DiffMissingLock),
+        ("diff-from", Assertion::DiffMissingLock),
         ("self-update-version", Assertion::SelfUpdateDowngradeRefusal),
         ("env-share-missing-lock", Assertion::EnvShareMissingLock),
     ] {
@@ -353,7 +357,9 @@ fn behavior_inventory_keeps_offline_refusal_assertions() {
 fn needs_isolated_fixture(case: &BehaviorCase) -> bool {
     matches!(
         case.id.as_str(),
-        "env-export-missing-lock"
+        "diff"
+            | "diff-from"
+            | "env-export-missing-lock"
             | "env-plan-missing-manifest"
             | "env-share-missing-lock"
             | "ci-init"
@@ -364,10 +370,10 @@ fn needs_isolated_fixture(case: &BehaviorCase) -> bool {
 #[test]
 fn missing_lock_rows_run_without_the_shared_fixture() {
     let cases = behavior_cases();
-    for case in cases
-        .iter()
-        .filter(|case| case.assertions.contains(&Assertion::EnvShareMissingLock))
-    {
+    for case in cases.iter().filter(|case| {
+        case.assertions.contains(&Assertion::EnvShareMissingLock)
+            || case.assertions.contains(&Assertion::DiffMissingLock)
+    }) {
         assert!(
             needs_isolated_fixture(case),
             "{} asserts a missing-lock refusal and must run in an isolated fixture",
@@ -576,6 +582,8 @@ enum Assertion {
     Fingerprint(String),
     WorkspaceFilteredOutput,
     WorkspaceAllOutput,
+    WorkspaceInitialized,
+    WorkspaceProjectAdded,
     CiGithubWorkflow,
     CiGithubWorkflowAdvanced,
     PackageDryRunInstall,
@@ -593,6 +601,7 @@ enum Assertion {
     NativeAptOrphanRemoved,
     SelfUpdateDowngradeRefusal,
     EnvShareMissingLock,
+    DiffMissingLock,
     NativeCount,
     StatusNativeFast,
     StatusNativeFull,
@@ -655,6 +664,8 @@ impl Assertion {
             "json-stdout" => Self::JsonStdout,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
+            "workspace-initialized" => Self::WorkspaceInitialized,
+            "workspace-project-added" => Self::WorkspaceProjectAdded,
             "ci-github-workflow" => Self::CiGithubWorkflow,
             "ci-github-workflow-advanced" => Self::CiGithubWorkflowAdvanced,
             "package-dry-run-install" => Self::PackageDryRunInstall,
@@ -672,6 +683,7 @@ impl Assertion {
             "native-apt-orphan-removed" => Self::NativeAptOrphanRemoved,
             "self-update-downgrade-refusal" => Self::SelfUpdateDowngradeRefusal,
             "env-share-missing-lock" => Self::EnvShareMissingLock,
+            "diff-missing-lock" => Self::DiffMissingLock,
             "native-count" => Self::NativeCount,
             "status-native-fast" => Self::StatusNativeFast,
             "status-native-full" => Self::StatusNativeFull,
@@ -1970,6 +1982,50 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 Assertion::EnvShareMissingLock => {
                     if !result.stderr.contains("No omg.lock file found") {
                         issues.push("env share did not refuse without an omg.lock".to_string());
+                    }
+                }
+                Assertion::DiffMissingLock => {
+                    let missing = project.path().join("missing.lock");
+                    if missing.symlink_metadata().is_ok()
+                        || !result
+                            .stderr
+                            .contains("Failed to inspect lockfile missing.lock")
+                    {
+                        issues.push("diff did not refuse the requested missing lockfile".to_string());
+                    }
+                }
+                Assertion::WorkspaceInitialized | Assertion::WorkspaceProjectAdded => {
+                    let workspace_file = project.path().join("omg-workspace.toml");
+                    let workspace = workspace_file
+                        .symlink_metadata()
+                        .ok()
+                        .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                        .and_then(|_| std::fs::read_to_string(&workspace_file).ok())
+                        .and_then(|contents| toml::from_str::<toml::Value>(&contents).ok());
+                    let valid = workspace.is_some_and(|workspace| {
+                        let projects = workspace.get("projects").and_then(toml::Value::as_table);
+                        workspace.get("name").and_then(toml::Value::as_str) == Some("smoke")
+                            && workspace
+                                .get("created_at")
+                                .and_then(toml::Value::as_str)
+                                .is_some_and(|timestamp| !timestamp.is_empty())
+                            && if matches!(assertion, Assertion::WorkspaceInitialized) {
+                                projects.is_none_or(toml::map::Map::is_empty)
+                            } else {
+                                projects.is_some_and(|projects| {
+                                    projects.len() == 1
+                                        && projects.get("fixture").is_some_and(|fixture| {
+                                            fixture.get("path").and_then(toml::Value::as_str)
+                                                == Some(".")
+                                                && fixture.get("depends_on").is_none_or(|deps| {
+                                                    deps.as_array().is_some_and(Vec::is_empty)
+                                                })
+                                        })
+                                })
+                            }
+                    });
+                    if !valid {
+                        issues.push("workspace command did not persist the expected private workspace state".to_string());
                     }
                 }
                 Assertion::UpdateFastOutput
