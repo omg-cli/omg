@@ -25,10 +25,8 @@ fn doctor_test_mode_healthy_path_pins_full_output() {
     for line in [
         "Arch Linux detected",
         "Internet connectivity",
-        "Found dependency: git",
-        "Found dependency: curl",
-        "Found dependency: tar",
-        "Found dependency: sudo",
+        "Optional tool available: git",
+        "Optional tool available: makepkg",
         "Daemon is running",
         "PATH configured correctly",
         "Shell hook active",
@@ -37,7 +35,13 @@ fn doctor_test_mode_healthy_path_pins_full_output() {
         result.assert_stdout_contains(line);
     }
     // No failure markers may leak into the healthy run.
-    for forbidden in ["Missing dependency", "No internet connection", "issue(s)"] {
+    for forbidden in [
+        "Missing dependency",
+        "dependency: curl",
+        "dependency: tar",
+        "No internet connection",
+        "issue(s)",
+    ] {
         assert!(
             !result.stdout.contains(forbidden),
             "healthy doctor output must not contain '{forbidden}'\nstdout: {}",

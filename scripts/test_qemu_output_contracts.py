@@ -190,6 +190,10 @@ class OutputContracts(unittest.TestCase):
                 with self.subTest(distro=distro):
                     release.write_text(f'ID={distro}\n', encoding='utf-8')
                     healthy = f'  {identity}\n'
+                    if os.geteuid() != 0:
+                        healthy += '  Found dependency: sudo\n'
+                    if distro in ('debian', 'ubuntu'):
+                        healthy += '  Found dependency: apt-get\n'
                     if health:
                         healthy += f'  {health}\n'
                     output.write_text(healthy, encoding='utf-8')
@@ -206,6 +210,15 @@ class OutputContracts(unittest.TestCase):
                             cwd=root, capture_output=True, text=True, timeout=10)
                     passed = probe()
                     self.assertEqual(passed.returncode, 0, passed.stderr)
+                    output.write_text(healthy + '  Found dependency: curl\n', encoding='utf-8')
+                    self.assertEqual(probe().returncode, 1,
+                                     'an invented curl dependency must fail the Doctor oracle')
+                    output.write_text(healthy, encoding='utf-8')
+                    if distro in ('debian', 'ubuntu'):
+                        output.write_text(healthy.replace('  Found dependency: apt-get\n', ''), encoding='utf-8')
+                        self.assertEqual(probe().returncode, 1,
+                                         'APT Doctor must verify the native command')
+                        output.write_text(healthy, encoding='utf-8')
                     if distro == 'fedora':
                         self.assertIn('Fedora doctor RPM execution receipt: 122 execve(', passed.stderr)
                         self.assertIn('Fedora doctor DNF execution receipt: 123 execve(', passed.stderr)
@@ -254,7 +267,16 @@ class OutputContracts(unittest.TestCase):
                   'fedora': '  RPM installed package database nonempty\n'
                             '  DNF local package database healthy\n'}[distro]
         healthy = f'  {identity}\n{health}'
-        product = 'printf %s ' + shlex.quote(healthy) + '\n'
+        if os.geteuid() != 0:
+            healthy += '  Found dependency: sudo\n'
+        if distro in ('debian', 'ubuntu'):
+            healthy += '  Found dependency: apt-get\n'
+        product = ('printf %s ' + shlex.quote(healthy) + '\n'
+                   'if command -v git >/dev/null; then echo "  Optional tool available: git"; '
+                   'else echo "  Optional tool unavailable: git (project and Git integration)"; fi\n'
+                   'if [[ "$1" == doctor ]] && [[ "' + distro + '" == arch ]]; then '
+                   'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
+                   'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
         result, evidence, logs = self.run_inventory(product, rows, distro=distro)
         if distro == 'fedora':
             self.assertEqual(result.returncode, 1, result.stderr)
@@ -263,6 +285,11 @@ class OutputContracts(unittest.TestCase):
         else:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(evidence[0]['result'], 'PASS')
+            spoofed = 'printf %s ' + shlex.quote(healthy + '  Optional tool available: git\n') + '\n'
+            result, evidence, logs = self.run_inventory(spoofed, rows, distro=distro)
+            self.assertEqual(evidence[0]['result'], 'FAIL',
+                             'a fixed Git verdict must fail under the restricted PATH')
+            self.assertIn('did not report absent Git/AUR tools', logs['doctor.log'])
         result, evidence, logs = self.run_inventory('printf "Doctor is healthy\\n"\n', rows, distro=distro)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(evidence[0]['result'], 'FAIL')
@@ -1165,7 +1192,10 @@ esac
                 tool.write_text('#!/usr/bin/env bash\n' + content, encoding='utf-8', newline='\n')
                 tool.chmod(0o755)
             binary = root / 'product'
-            binary.write_text('#!/usr/bin/env bash\n' + product, encoding='utf-8', newline='\n')
+            # The real submitted product is an ELF executable and remains
+            # launchable when its PATH is restricted. Use an absolute shell
+            # interpreter for the fixture so it has that same property.
+            binary.write_text('#!/bin/bash\n' + product, encoding='utf-8', newline='\n')
             binary.chmod(0o755)
             ssh = root / 'bin/ssh'
             ssh.write_text('#!/usr/bin/env bash\nexec bash -c "${@: -1}"\n', encoding='utf-8', newline='\n')

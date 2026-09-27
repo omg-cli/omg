@@ -123,7 +123,7 @@ pub fn install_dry_run(packages: &[String]) -> Result<()> {
 
     // Preview the same APT transaction that the live backend requests. The
     // index resolver cannot reproduce preferences, backports, or custom pins.
-    let output = std::process::Command::new("apt-get")
+    let output = crate::core::privilege::system_command("apt-get")?
         .args(["-s", "install", "--"])
         .args(packages)
         .output()
