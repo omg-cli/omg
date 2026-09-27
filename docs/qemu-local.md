@@ -217,11 +217,23 @@ cannot satisfy its version-2 oracle.
 Gated or failed prerequisites block their dependents. Missing receipts,
 transport failures, and empty execution selections fail the harness.
 
+The five license rows use distro-specific checks. On Arch, the oracle reads
+the documented [ALPM local database fields](https://man.archlinux.org/man/alpm-db-desc.5.en)
+and cross-checks installed names and versions with `pacman -Q`. It compares
+audit JSON/CSV package identities and licenses, known license categories,
+enterprise assignment counts, and export permissions. The MIT-filtered row
+uses an allowlist that admits no installed license: it must still report policy
+violations for the entire installed inventory, including packages hidden by
+the filter. Complex license expressions do not yet have complete independent
+category checks. On Debian, Ubuntu, and Fedora, these commands must give the
+specific unsupported-backend error and leave no license report or export.
+Those passes prove refusal behavior, not license-scanning support.
+
 A guest-side supervisor records completed CLI exits separately from executor
 exits. A CLI returning 125 is not a timeout-tool failure. Guest-side deadlines
 terminate commands independently of SSH. Each row
 retains stdout, stderr, prerequisite output, and a completion receipt under
-`inventory/rows/`. `inventory/input-sha256.txt` identifies the runner and TSV.
+`inventory/rows/`. `inventory/input-sha256.txt` identifies the runner, TSV, and license oracle.
 `inventory/metadata.json` records the binary path, tiers, deadlines, and opt-ins. Existing inventory evidence cannot be overwritten.
 Working directories and installed runtime state disappear with the guest;
 only cwd-local fixtures are isolated per row, not the guest's home directory

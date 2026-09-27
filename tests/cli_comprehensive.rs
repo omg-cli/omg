@@ -564,6 +564,11 @@ enum Assertion {
     AuditSecretScoped,
     AuditSecretCritical,
     AuditEolState,
+    LicenseAuditJson,
+    LicenseAuditMitJson,
+    LicenseAuditCsv,
+    LicenseEnterpriseText,
+    LicenseEnterpriseJson,
     SbomSourceFailure,
     SbomInventoryOnly,
     JsonStdout,
@@ -640,6 +645,11 @@ impl Assertion {
             "audit-secret-scoped" => Self::AuditSecretScoped,
             "audit-secret-critical" => Self::AuditSecretCritical,
             "audit-eol-state" => Self::AuditEolState,
+            "license-audit-json" => Self::LicenseAuditJson,
+            "license-audit-mit-json" => Self::LicenseAuditMitJson,
+            "license-audit-csv" => Self::LicenseAuditCsv,
+            "license-enterprise-text" => Self::LicenseEnterpriseText,
+            "license-enterprise-json" => Self::LicenseEnterpriseJson,
             "sbom-source-failure" => Self::SbomSourceFailure,
             "sbom-inventory-only" => Self::SbomInventoryOnly,
             "json-stdout" => Self::JsonStdout,
@@ -1421,6 +1431,22 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 config_dir.to_str().expect("UTF-8 config path"),
             ));
         }
+        let license_policy_dir = project.path().join("license-policy-state");
+        if case.assertions.contains(&Assertion::LicenseAuditMitJson) {
+            std::fs::create_dir_all(&license_policy_dir)
+                .expect("create isolated license policy directory");
+            std::fs::write(
+                license_policy_dir.join("policy.toml"),
+                "allowed_licenses = [\"LicenseRef-QemuNoInstalledLicense\"]\n",
+            )
+            .expect("seed license policy that rejects the installed pacman fixture");
+            command_env.push((
+                "OMG_CONFIG_DIR",
+                license_policy_dir
+                    .to_str()
+                    .expect("UTF-8 license policy path"),
+            ));
+        }
         if privacy_case {
             command_env.push((
                 "OMG_DATA_DIR",
@@ -1842,6 +1868,75 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 Assertion::JsonStdout => {
                     if serde_json::from_str::<serde_json::Value>(&result.stdout).is_err() {
                         issues.push("JSON output did not parse".to_string());
+                    }
+                }
+                Assertion::LicenseAuditJson => {
+                    let expected = serde_json::json!([{
+                        "name": "pacman",
+                        "version": "7.0.0-1",
+                        "license": "GPL-2.0-or-later",
+                        "category": "Copyleft"
+                    }]);
+                    if serde_json::from_str::<serde_json::Value>(&result.stdout).ok()
+                        != Some(expected)
+                    {
+                        issues.push("license JSON did not match the isolated installed pacman package".to_string());
+                    }
+                }
+                Assertion::LicenseAuditMitJson => {
+                    if serde_json::from_str::<serde_json::Value>(&result.stdout).ok()
+                        != Some(serde_json::json!([]))
+                        || !result.stderr.contains("License policy check found 1 violation(s)")
+                    {
+                        issues.push("MIT display filter concealed a full-inventory license violation or returned an unexpected package".to_string());
+                    }
+                }
+                Assertion::LicenseAuditCsv => {
+                    let path = project.path().join("licenses-export.csv");
+                    let expected = "Package,Version,License,Category\npacman,7.0.0-1,GPL-2.0-or-later,Copyleft\n";
+                    let actual = std::fs::read_to_string(path)
+                        .ok()
+                        .map(|content| content.replace("\r\n", "\n"));
+                    if actual.as_deref() != Some(expected) {
+                        issues.push("license CSV export did not match the isolated installed pacman package".to_string());
+                    }
+                }
+                Assertion::LicenseEnterpriseText => {
+                    for expected in [
+                        "License Compliance Scan",
+                        "1 total packages",
+                        "GPL-2.0-or-later: 1 assignments (100%)",
+                        "pacman - Copyleft license (GPL) requires legal review",
+                    ] {
+                        if !result.stdout.contains(expected) {
+                            issues.push(format!("enterprise license scan omitted {expected:?}"));
+                        }
+                    }
+                }
+                Assertion::LicenseEnterpriseJson => {
+                    let exports: Vec<_> = std::fs::read_dir(project.path())
+                        .expect("list isolated enterprise exports")
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry.file_name().to_string_lossy().starts_with("license-scan-")
+                                && entry.path().extension().is_some_and(|ext| ext == "json")
+                        })
+                        .collect();
+                    let expected = serde_json::json!({
+                        "total": 1,
+                        "by_license": {"GPL-2.0-or-later": 1},
+                        "violations": [{
+                            "package": "pacman",
+                            "license": "GPL-2.0-or-later",
+                            "reason": "Copyleft license (GPL) requires legal review"
+                        }],
+                        "unknown": []
+                    });
+                    let actual = exports.first().and_then(|entry| {
+                        std::fs::read_to_string(entry.path()).ok()
+                    }).and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+                    if exports.len() != 1 || actual != Some(expected) {
+                        issues.push("enterprise license export did not match the isolated installed pacman package".to_string());
                     }
                 }
                 Assertion::Artifact(relative) => {
