@@ -807,9 +807,9 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
             healthy += '  Found dependency: sudo\n'
         if distro in ('debian', 'ubuntu'):
             healthy += '  Found dependency: apt-get\n'
-        healthy_prefix = ('printf %s ' + shlex.quote(healthy) + '\n'
-                          'if command -v git >/dev/null; then echo "  Optional tool available: git"; '
-                          'else echo "  Optional tool unavailable: git (project and Git integration)"; fi\n'
+        git_probe = ('if command -v git >/dev/null; then echo "  Optional tool available: git"; '
+                     'else echo "  Optional tool unavailable: git (project and Git integration)"; fi\n')
+        healthy_prefix = ('printf %s ' + shlex.quote(healthy) + '\n' + git_probe +
                           'if [[ "$1" == doctor ]] && [[ "' + distro + '" == arch ]]; then '
                           'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
                           'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
@@ -855,7 +855,7 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
                                                         native_commands=native, distro=distro)
             self.assertEqual(evidence[0]['result'], 'FAIL', logs)
             self.assertIn('doctor accepted a corrupt Arch local package entry', logs['doctor.log'])
-            spoofed = fault_guard + 'printf %s ' + shlex.quote(healthy + '  Optional tool available: git\n') + '\n'
+            spoofed = product.replace(git_probe, 'echo "  Optional tool available: git"\n')
             result, evidence, logs = self.run_inventory(spoofed, rows, native_commands=native, distro=distro)
             self.assertEqual(evidence[0]['result'], 'FAIL',
                              'a fixed Git verdict must fail under the restricted PATH')
