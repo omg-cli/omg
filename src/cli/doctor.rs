@@ -61,21 +61,22 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     }
 
     // 2. Internet Connectivity (basic check)
-    let (endpoint, connectivity) = check_internet(distro).await;
-    if connectivity == EndpointProbe::Healthy {
-        println!(
+    match check_internet(distro).await {
+        Ok(endpoint) => println!(
             "  {}",
             style::success(&format!("Internet connectivity ({endpoint} reachable)"))
-        );
-    } else {
-        println!(
-            "  {}",
-            style::error(&format!(
-                "Connectivity probe to {endpoint} failed ({})",
-                connectivity.diagnostic()
-            ))
-        );
-        issues += 1;
+        ),
+        Err([(first, first_result), (second, second_result)]) => {
+            println!(
+                "  {}",
+                style::error(&format!(
+                    "Connectivity probes failed ({first}: {}; {second}: {})",
+                    first_result.diagnostic(),
+                    second_result.diagnostic()
+                ))
+            );
+            issues += 1;
+        }
     }
 
     // 3. Dependencies (backend-appropriate: the live Debian backend shells
@@ -820,23 +821,67 @@ async fn probe_endpoint(client: &reqwest::Client, url: &str, deadline: Duration)
     }
 }
 
-async fn check_internet(distro: Distro) -> (&'static str, EndpointProbe) {
-    // Backend-appropriate probe target: only the Arch backend has a fixed
-    // upstream host (archlinux.org) in this codebase; other backends get
-    // their repos from system configuration, so probe GitHub — already a
-    // doctor mirror endpoint — as the neutral connectivity target.
-    let (endpoint, url) = if matches!(distro, Distro::Arch) {
-        ("archlinux.org", "https://archlinux.org")
+async fn check_internet(
+    distro: Distro,
+) -> std::result::Result<&'static str, [(&'static str, EndpointProbe); 2]> {
+    // This is a basic Internet check, not a claim that any configured package
+    // repository is healthy. Repositories can use arbitrary user-configured
+    // mirrors, and one public site's outage does not mean Internet is down.
+    let endpoints = if matches!(distro, Distro::Arch) {
+        [
+            ("archlinux.org", "https://archlinux.org"),
+            ("kernel.org", "https://kernel.org"),
+        ]
     } else {
-        ("github.com", "https://github.com")
+        [
+            ("github.com", "https://github.com"),
+            ("kernel.org", "https://kernel.org"),
+        ]
     };
     if crate::core::paths::test_mode() {
-        return (endpoint, EndpointProbe::Healthy);
+        return Ok(endpoints[0].0);
     }
-    (
-        endpoint,
-        probe_endpoint(shared_client(), url, Duration::from_secs(2)).await,
-    )
+    // The detailed mirror probe already uses five seconds. Start both sites
+    // together so the basic check has the same ceiling, even when one stalls.
+    probe_connectivity(shared_client(), endpoints, Duration::from_secs(5)).await
+}
+
+async fn probe_connectivity(
+    client: &reqwest::Client,
+    [(first_name, first_url), (second_name, second_url)]: [(&'static str, &str); 2],
+    deadline: Duration,
+) -> std::result::Result<&'static str, [(&'static str, EndpointProbe); 2]> {
+    let first_probe = probe_endpoint(client, first_url, deadline);
+    let second_probe = probe_endpoint(client, second_url, deadline);
+    tokio::pin!(first_probe, second_probe);
+    let (first_finished, result) = tokio::select! {
+        result = &mut first_probe => (true, result),
+        result = &mut second_probe => (false, result),
+    };
+    if result == EndpointProbe::Healthy {
+        return Ok(if first_finished {
+            first_name
+        } else {
+            second_name
+        });
+    }
+    let remaining = if first_finished {
+        second_probe.await
+    } else {
+        first_probe.await
+    };
+    if remaining == EndpointProbe::Healthy {
+        return Ok(if first_finished {
+            second_name
+        } else {
+            first_name
+        });
+    }
+    Err(if first_finished {
+        [(first_name, result), (second_name, remaining)]
+    } else {
+        [(first_name, remaining), (second_name, result)]
+    })
 }
 
 fn check_command(cmd: &str) -> bool {
@@ -1184,6 +1229,76 @@ mod tests {
         assert!(matches!(malformed, EndpointProbe::RequestFailure(_)));
         assert!(malformed.diagnostic().starts_with("request error: "));
         finish_probe_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn basic_connectivity_uses_an_independent_site_but_fails_when_both_fail() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local probe client");
+        const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        const ERROR: &[u8] =
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+        let (bad_url, bad_server) = serve_probe_response(ERROR, Duration::ZERO).await;
+        // Let the failing site answer first: the alternate must still be
+        // awaited and allowed to establish connectivity.
+        let (good_url, good_server) = serve_probe_response(OK, Duration::from_millis(50)).await;
+        assert_eq!(
+            probe_connectivity(
+                &client,
+                [("primary", &bad_url), ("alternate", &good_url)],
+                Duration::from_secs(1)
+            )
+            .await,
+            Ok("alternate")
+        );
+        finish_probe_server(bad_server).await;
+        finish_probe_server(good_server).await;
+
+        let (first_url, first_server) = serve_probe_response(ERROR, Duration::ZERO).await;
+        let (second_url, second_server) = serve_probe_response(ERROR, Duration::ZERO).await;
+        assert_eq!(
+            probe_connectivity(
+                &client,
+                [("primary", &first_url), ("alternate", &second_url)],
+                Duration::from_secs(1)
+            )
+            .await,
+            Err([
+                ("primary", EndpointProbe::HttpStatus(500)),
+                ("alternate", EndpointProbe::HttpStatus(500))
+            ])
+        );
+        finish_probe_server(first_server).await;
+        finish_probe_server(second_server).await;
+    }
+
+    #[tokio::test]
+    async fn basic_connectivity_returns_before_an_unneeded_slow_site() {
+        const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local probe client");
+        let (fast_url, fast_server) = serve_probe_response(OK, Duration::ZERO).await;
+        let (slow_url, slow_server) = serve_probe_response(OK, Duration::from_secs(3)).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            probe_connectivity(
+                &client,
+                [("primary", &fast_url), ("alternate", &slow_url)],
+                Duration::from_secs(4),
+            ),
+        )
+        .await
+        .expect("a healthy primary must not wait for the slow alternate");
+        assert_eq!(result, Ok("primary"));
+        finish_probe_server(fast_server).await;
+        slow_server.abort();
+        let result = slow_server.await;
+        assert!(result.is_ok() || result.is_err_and(|error| error.is_cancelled()));
     }
 
     #[test]

@@ -415,11 +415,17 @@ fi
             mirror_lines = ''.join(f'  ✗ {name} (request failed for {url})\n' for name, url in mirrors)
             dns_lines = f'    ✓ {hosts[0]} (2 addresses)\n'
             dns_lines += ''.join(f'    ✗ {host} (resolver unavailable)\n' for host in hosts[1:])
-            correct = f'Network Diagnostics\n{mirror_lines}\n  DNS Resolution:\n{dns_lines}'
+            basic_hosts = ('archlinux.org', 'kernel.org') if distro == 'arch' else ('github.com', 'kernel.org')
+            basic = (f'  Connectivity probes failed ({basic_hosts[0]}: connection error: refused; '
+                     f'{basic_hosts[1]}: connection error: refused)\n\n')
+            correct = basic + f'Network Diagnostics\n{mirror_lines}\n  DNS Resolution:\n{dns_lines}'
             expected_count = 1 + len(mirrors) + len(hosts) - 1
             variants = (
                 (correct, expected_count, 'PASS'),
                 (correct, expected_count - 1, 'FAIL'),
+                (correct.replace(basic, ''), expected_count, 'FAIL'),
+                (correct.replace(basic_hosts[1] + ': connection error: refused',
+                                 'unknown.example: connection error: refused', 1), expected_count, 'FAIL'),
                 (correct.replace(f'  ✗ {mirrors[0][0]}', f'  ✓ {mirrors[0][0]}'), expected_count, 'FAIL'),
                 (correct.replace(mirrors[0][1], 'https://wrong.example'), expected_count, 'FAIL'),
                 (correct.replace(f'    ✗ {hosts[-1]}', '    ✗ wrong.example'), expected_count, 'FAIL'),

@@ -763,6 +763,14 @@ if distro not in ('arch', 'debian', 'ubuntu', 'fedora'):
 text = Path(output).read_text()
 if text.count('Network Diagnostics\n') != 1 or text.count('DNS Resolution:\n') != 1:
     raise SystemExit('assertion failed: missing or duplicated doctor network sections')
+basic = text.split('Network Diagnostics\n', 1)[0]
+basic_failures = re.findall(r'^  Connectivity probes failed \((.+)\)$', basic, re.MULTILINE)
+basic_hosts = ['archlinux.org', 'kernel.org'] if distro == 'arch' else ['github.com', 'kernel.org']
+if (len(basic_failures) != 1 or
+        not basic_failures[0].startswith(basic_hosts[0] + ': ') or
+        '; ' + basic_hosts[1] + ': ' not in basic_failures[0] or
+        basic_failures[0].endswith(basic_hosts[1] + ': ')):
+    raise SystemExit('assertion failed: offline doctor basic connectivity did not fail both independent endpoints')
 section = text.split('Network Diagnostics\n', 1)[1].split('DNS Resolution:\n', 1)
 mirror_rows = [re.fullmatch(r'  ([✓✗⚠]) (.+?) \((.+)\)', line) for line in section[0].splitlines() if line.strip()]
 dns_rows = [re.fullmatch(r'    ([✓✗]) (\S+) \((.+)\)', line) for line in section[1].splitlines() if line.startswith('    ')]
