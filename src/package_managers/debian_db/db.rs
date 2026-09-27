@@ -701,11 +701,7 @@ pub fn ensure_index_loaded() -> Result<()> {
         let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !filename.contains("_Packages")
-            || path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("diff"))
-        {
+        if !apt_package_index_filename(filename) {
             continue;
         }
         let mtime = required_mtime(&path)?;
@@ -886,11 +882,7 @@ fn disk_cache_is_fresh(cache_path: &Path, lists_dir: &Path) -> bool {
         let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !filename.contains("_Packages")
-            || path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("diff"))
-        {
+        if !apt_package_index_filename(filename) {
             continue;
         }
         let Ok(package_mtime) = fs::metadata(&path).and_then(|metadata| metadata.modified()) else {
@@ -982,22 +974,7 @@ fn parse_packages_file_sync(path: &Path) -> Result<Vec<DebianPackage>> {
     let source_key = extract_source_key_from_path(path);
     let content = read_packages_file_content(path)?;
 
-    // Collect paragraph byte ranges first
-    let double_newline_iter = memmem::find_iter(content.as_bytes(), b"\n\n");
-    let mut paragraph_ranges = Vec::new();
-    let mut start = 0;
-
-    for end in double_newline_iter {
-        if end > start {
-            paragraph_ranges.push((start, end));
-        }
-        start = end + 2;
-    }
-
-    // Handle last paragraph
-    if start < content.len() {
-        paragraph_ranges.push((start, content.len()));
-    }
+    let paragraph_ranges = package_paragraph_ranges(&content);
 
     // Parse paragraphs in parallel for large files (>100 packages)
     let packages = if paragraph_ranges.len() > 100 {
@@ -1019,6 +996,80 @@ fn parse_packages_file_sync(path: &Path) -> Result<Vec<DebianPackage>> {
     Ok(packages.into_iter().flatten().collect())
 }
 
+fn validate_packages_file_sync(path: &Path) -> Result<()> {
+    let component = extract_component_from_path(path);
+    let suite = extract_suite_from_path(path);
+    let source_key = extract_source_key_from_path(path);
+    let content = read_packages_file_content(path)?;
+
+    let paragraph_ranges = package_paragraph_ranges(&content);
+    if paragraph_ranges.len() > 100 {
+        paragraph_ranges.par_iter().try_for_each(|(start, end)| {
+            // Use the live backend parser but release each record immediately;
+            // Doctor does not need a second in-memory package inventory.
+            parse_packages_paragraph(&content[*start..*end], &component, &suite, &source_key)
+                .map(|_| ())
+        })?;
+    } else {
+        for (start, end) in paragraph_ranges {
+            parse_packages_paragraph(&content[start..end], &component, &suite, &source_key)?;
+        }
+    }
+    Ok(())
+}
+
+fn package_paragraph_ranges(content: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for end in memmem::find_iter(content.as_bytes(), b"\n\n") {
+        if end > start {
+            ranges.push((start, end));
+        }
+        start = end + 2;
+    }
+    if start < content.len() {
+        ranges.push((start, content.len()));
+    }
+    ranges
+}
+
+/// Validate the same on-disk index formats used by the live Debian backend.
+///
+/// Files are parsed one at a time and discarded; this does not populate or
+/// trust a previously built mmap snapshot, and never refreshes repositories.
+pub fn validate_apt_package_indexes_at(lists_dir: &Path) -> Result<usize> {
+    let entries = apt_lists_from_read_dir(fs::read_dir(lists_dir))?;
+    let mut count = 0;
+    for entry in entries {
+        let path = apt_lists_entry(entry)?.path();
+        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !apt_package_index_filename(filename) {
+            continue;
+        }
+        validate_packages_file_sync(&path)
+            .with_context(|| format!("Failed to parse APT package index {}", path.display()))?;
+        count += 1;
+    }
+    anyhow::ensure!(
+        count > 0,
+        "No APT package indexes found in {}",
+        lists_dir.display()
+    );
+    Ok(count)
+}
+
+fn apt_package_index_filename(filename: &str) -> bool {
+    filename.ends_with("_Packages")
+        || filename.rsplit_once('.').is_some_and(|(stem, suffix)| {
+            stem.ends_with("_Packages")
+                && ["lz4", "gz", "xz"]
+                    .iter()
+                    .any(|supported| suffix.eq_ignore_ascii_case(supported))
+        })
+}
+
 fn parse_packages_paragraph(
     paragraph: &str,
     component: &str,
@@ -1036,32 +1087,44 @@ fn read_packages_file_content(path: &Path) -> Result<String> {
     let file = fs::File::open(path)?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
 
-    let mut buf = String::new();
     if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("lz4"))
     {
-        let mut decoder = lz4_flex::frame::FrameDecoder::new(reader);
-        decoder.read_to_string(&mut buf)?;
+        read_index_text_bounded(
+            lz4_flex::frame::FrameDecoder::new(reader),
+            MAX_INDEX_SNAPSHOT_BYTES,
+        )
     } else if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
     {
-        let mut decoder = flate2::read::GzDecoder::new(reader);
-        decoder.read_to_string(&mut buf)?;
+        read_index_text_bounded(
+            flate2::read::GzDecoder::new(reader),
+            MAX_INDEX_SNAPSHOT_BYTES,
+        )
     } else if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("xz"))
     {
         let mut decompressed = BudgetedWriter::new(Vec::new(), MAX_INDEX_SNAPSHOT_BYTES);
         decode_xz_to(&mut reader, &mut decompressed)?;
-        buf = String::from_utf8(decompressed.into_inner())
-            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in xz-compressed Packages file: {e}"))?;
+        String::from_utf8(decompressed.into_inner())
+            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in xz-compressed Packages file: {e}"))
     } else {
-        reader.read_to_string(&mut buf)?;
+        read_index_text_bounded(reader, MAX_INDEX_SNAPSHOT_BYTES)
     }
+}
 
-    Ok(buf)
+fn read_index_text_bounded(reader: impl Read, limit: u64) -> Result<String> {
+    let mut reader = reader.take(limit.saturating_add(1));
+    let mut text = String::new();
+    reader.read_to_string(&mut text)?;
+    anyhow::ensure!(
+        text.len() as u64 <= limit,
+        "APT package index exceeds {limit}-byte decompression budget"
+    );
+    Ok(text)
 }
 
 fn parse_minimal_package_info(paragraph: &str, expected_name: &str) -> Option<(String, String)> {
@@ -1185,11 +1248,7 @@ fn find_info_from_apt_lists_fast(name: &str) -> Result<Option<Package>> {
             continue;
         };
 
-        if !filename.contains("_Packages")
-            || path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("diff"))
-        {
+        if !apt_package_index_filename(filename) {
             continue;
         }
 
@@ -1268,6 +1327,7 @@ fn parse_paragraph_str(
     let mut sha256 = String::new();
     let mut homepage = String::new();
     let mut current_field = None;
+    let mut required_fields = [0u8; 3];
 
     for line in paragraph.lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
@@ -1295,8 +1355,14 @@ fn parse_paragraph_str(
         current_field = Some(key);
 
         match key.as_bytes() {
-            b"Package" => name = value.to_string(),
-            b"Version" => version = value.to_string(),
+            b"Package" => {
+                required_fields[0] = required_fields[0].saturating_add(1);
+                name = value.to_string();
+            }
+            b"Version" => {
+                required_fields[1] = required_fields[1].saturating_add(1);
+                version = value.to_string();
+            }
             b"Description" => description = value.to_string(),
             b"Section" => section = value.to_string(),
             b"Priority" => priority = value.to_string(),
@@ -1306,7 +1372,10 @@ fn parse_paragraph_str(
                     .with_context(|| format!("Invalid Installed-Size value: {value}"))?;
             }
             b"Maintainer" => maintainer = value.to_string(),
-            b"Architecture" => architecture = value.to_string(),
+            b"Architecture" => {
+                required_fields[2] = required_fields[2].saturating_add(1);
+                architecture = value.to_string();
+            }
             b"Depends" | b"Pre-Depends" => append_dependencies(value, &mut depends),
             b"Filename" => filename = value.to_string(),
             b"Size" => {
@@ -1320,8 +1389,15 @@ fn parse_paragraph_str(
         }
     }
 
-    if name.is_empty() {
-        anyhow::bail!("Invalid package entry: missing 'Package' field in Packages file");
+    for (field, count, value) in [
+        ("Package", required_fields[0], &name),
+        ("Version", required_fields[1], &version),
+        ("Architecture", required_fields[2], &architecture),
+    ] {
+        anyhow::ensure!(
+            count == 1 && !value.is_empty(),
+            "Invalid package entry: missing or duplicate '{field}' field in Packages file"
+        );
     }
     Ok(DebianPackage {
         name,
@@ -1762,6 +1838,19 @@ fn parse_status_paragraph(paragraph: &str) -> Option<(String, String, String, St
 /// silently dropping incomplete identities.
 pub fn security_inventory() -> Result<Vec<crate::package_managers::types::SecurityPackage>> {
     parse_security_inventory(&fs::read_to_string("/var/lib/dpkg/status")?)
+}
+
+/// Read and strictly parse dpkg's live status file without package mutation.
+/// An empty database is not a usable installed-package inventory.
+pub fn validate_dpkg_status_at(path: &Path) -> Result<usize> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read dpkg status {}", path.display()))?;
+    let packages = parse_security_inventory(&contents)?;
+    anyhow::ensure!(
+        !packages.is_empty(),
+        "dpkg status contains no installed packages"
+    );
+    Ok(packages.len())
 }
 
 fn parse_security_inventory(
@@ -3199,7 +3288,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let good = directory.path().join("good_Packages");
         let bad = directory.path().join("bad_Packages");
-        fs::write(&good, b"Package: kept\nVersion: 1\n\n")?;
+        fs::write(&good, b"Package: kept\nVersion: 1\nArchitecture: amd64\n\n")?;
         fs::write(&bad, b"Version: 2\n\n")?;
         assert!(rebuild_package_index(&[good.clone(), bad.clone()]).is_err());
         fs::remove_file(&bad)?;
@@ -3285,7 +3374,7 @@ mod tests {
 
     #[test]
     fn parse_paragraph_reads_required_and_numeric_fields() -> Result<()> {
-        let paragraph = "Package: vim\nVersion: 2:9.1.0-1\nDescription: Vi IMproved - enhanced vi editor\nSection: editors\nPriority: optional\nInstalled-Size: 3500\n";
+        let paragraph = "Package: vim\nVersion: 2:9.1.0-1\nArchitecture: amd64\nDescription: Vi IMproved - enhanced vi editor\nSection: editors\nPriority: optional\nInstalled-Size: 3500\n";
 
         let package = parse_paragraph_str(paragraph, "main", "bookworm", "deb.example_debian")?;
 
@@ -3299,7 +3388,7 @@ mod tests {
 
     #[test]
     fn parse_paragraph_preserves_description_continuations() -> Result<()> {
-        let paragraph = "Package: curl\nVersion: 8.5.0-1\nDescription: command line tool for transferring data\n curl is a tool to transfer data from or to a server\n .\n using one of the supported protocols.\nSection: net\n";
+        let paragraph = "Package: curl\nVersion: 8.5.0-1\nArchitecture: amd64\nDescription: command line tool for transferring data\n curl is a tool to transfer data from or to a server\n .\n using one of the supported protocols.\nSection: net\n";
 
         let package = parse_paragraph_str(paragraph, "main", "bookworm", "deb.example_debian")?;
 
@@ -3329,6 +3418,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_paragraph_rejects_missing_or_duplicate_required_fields() {
+        for paragraph in [
+            "Package: demo\nArchitecture: amd64\n",
+            "Package: demo\nVersion: 1\n",
+            "Package: demo\nPackage: other\nVersion: 1\nArchitecture: amd64\n",
+            "Package: demo\nVersion: 1\nVersion: 2\nArchitecture: amd64\n",
+            "Package: demo\nVersion: 1\nArchitecture: amd64\nArchitecture: all\n",
+        ] {
+            assert!(
+                parse_paragraph_str(paragraph, "main", "bookworm", "deb.example_debian").is_err(),
+                "accepted malformed Packages stanza: {paragraph}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_index_text_read_is_bounded() {
+        assert_eq!(
+            read_index_text_bounded(std::io::Cursor::new("abc"), 3).expect("at budget"),
+            "abc"
+        );
+        assert!(read_index_text_bounded(std::io::Cursor::new("abcd"), 3).is_err());
+    }
+
+    #[test]
     fn parse_paragraph_rejects_invalid_numeric_fields() {
         let error = parse_paragraph_str(
             "Package: curl\nSize: many\n",
@@ -3343,7 +3457,7 @@ mod tests {
 
     #[test]
     fn parse_paragraph_reads_multiline_dependencies() -> Result<()> {
-        let paragraph = "Package: bash\nDepends: libc6 (>= 2.38),\n libreadline8 (>= 8.1), libtinfo6 | ncurses-term\n";
+        let paragraph = "Package: bash\nVersion: 1\nArchitecture: amd64\nDepends: libc6 (>= 2.38),\n libreadline8 (>= 8.1), libtinfo6 | ncurses-term\n";
 
         let package = parse_paragraph_str(paragraph, "main", "bookworm", "deb.example_debian")?;
 
@@ -3356,7 +3470,7 @@ mod tests {
             ]
         );
         let pre_depends = parse_paragraph_str(
-            "Package: init-system\nPre-Depends: libc6 (>= 2.36)\n",
+            "Package: init-system\nVersion: 1\nArchitecture: amd64\nPre-Depends: libc6 (>= 2.36)\n",
             "main",
             "bookworm",
             "deb.example_debian",
@@ -3933,13 +4047,15 @@ mod tests {
         let path = dir.path().join("test_Packages");
         std::fs::write(
             &path,
-            "Package: vim\nVersion: 1.0\n\nVersion: 2.0\n\nPackage: bash\nVersion: 1.0\n",
+            "Package: vim\nVersion: 1.0\nArchitecture: amd64\n\nVersion: 2.0\nArchitecture: amd64\n\nPackage: bash\nVersion: 1.0\nArchitecture: amd64\n",
         )
         .expect("packages file");
         let error = parse_packages_file_sync(&path)
             .expect_err("corrupt Packages paragraph must not be skipped");
         assert!(
-            error.to_string().contains("missing 'Package' field"),
+            error
+                .to_string()
+                .contains("missing or duplicate 'Package' field"),
             "got: {error}"
         );
     }
@@ -3950,7 +4066,7 @@ mod tests {
         let path = dir.path().join("test_Packages");
         std::fs::write(
             &path,
-            "Package: vim\nVersion: 1.0\n\nPackage: bash\nVersion: 1.0\n",
+            "Package: vim\nVersion: 1.0\nArchitecture: amd64\n\nPackage: bash\nVersion: 1.0\nArchitecture: amd64\n",
         )
         .expect("packages file");
         let packages = parse_packages_file_sync(&path).expect("valid Packages file");
@@ -3971,6 +4087,132 @@ mod tests {
         let packages = parse_packages_file_sync(&path).expect("decode SHA-256 checked index");
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "fixture");
+    }
+
+    #[test]
+    fn doctor_status_requires_installed_entries_and_rejects_bad_state() {
+        let dir = tempfile::tempdir().expect("status fixture");
+        let path = dir.path().join("status");
+        std::fs::write(&path, "").expect("empty status");
+        assert!(validate_dpkg_status_at(&path).is_err());
+
+        std::fs::write(
+            &path,
+            "Package: apt\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n",
+        )
+        .expect("valid status");
+        assert_eq!(
+            validate_dpkg_status_at(&path).expect("one installed package"),
+            1
+        );
+
+        std::fs::write(&path, "Package: apt\nStatus: install reinstreq half-configured\nVersion: 1\nArchitecture: amd64\n")
+            .expect("broken status");
+        assert!(validate_dpkg_status_at(&path).is_err());
+    }
+
+    #[test]
+    fn doctor_indexes_parse_every_supported_file_without_rejecting_empty_index() {
+        let dir = tempfile::tempdir().expect("APT lists fixture");
+        assert!(validate_apt_package_indexes_at(dir.path()).is_err());
+        std::fs::write(dir.path().join("mirror_InRelease"), "metadata")
+            .expect("unrelated metadata");
+        assert!(validate_apt_package_indexes_at(dir.path()).is_err());
+
+        let first = dir.path().join("mirror_main_binary-amd64_Packages");
+        std::fs::write(&first, "Package: apt\nVersion: 1\nArchitecture: amd64\n\n")
+            .expect("valid index");
+        assert_eq!(
+            validate_apt_package_indexes_at(dir.path()).expect("valid index"),
+            1
+        );
+
+        let second = dir.path().join("mirror_updates_binary-amd64_Packages");
+        std::fs::write(&second, "").expect("empty index");
+        assert_eq!(
+            validate_apt_package_indexes_at(dir.path()).expect("empty index allowed"),
+            2
+        );
+
+        std::fs::write(&second, "Package: other\nArchitecture: amd64\n")
+            .expect("corrupt second index: missing Version");
+        assert!(validate_apt_package_indexes_at(dir.path()).is_err());
+    }
+
+    #[test]
+    fn doctor_accepts_a_repository_with_only_an_empty_packages_index() {
+        let dir = tempfile::tempdir().expect("empty APT repository fixture");
+        std::fs::write(dir.path().join("empty_binary-amd64_Packages"), "")
+            .expect("valid empty index");
+        assert_eq!(
+            validate_apt_package_indexes_at(dir.path()).expect("empty repository is valid"),
+            1
+        );
+    }
+
+    #[test]
+    fn doctor_indexes_reject_corrupt_compressed_stream() {
+        let dir = tempfile::tempdir().expect("APT lists fixture");
+        std::fs::write(
+            dir.path().join("mirror_main_binary-amd64_Packages.gz"),
+            "not gzip",
+        )
+        .expect("corrupt index");
+        assert!(validate_apt_package_indexes_at(dir.path()).is_err());
+    }
+
+    #[test]
+    fn doctor_indexes_reject_late_malformed_record_in_parallel_parse() {
+        use std::fmt::Write as _;
+
+        let dir = tempfile::tempdir().expect("APT lists fixture");
+        let mut records = String::new();
+        for number in 0..101 {
+            write!(
+                records,
+                "Package: valid-{number}\nVersion: 1\nArchitecture: amd64\n\n"
+            )
+            .expect("append valid package");
+        }
+        records.push_str("Package: invalid\nArchitecture: amd64\n");
+        std::fs::write(
+            dir.path().join("mirror_main_binary-amd64_Packages"),
+            records,
+        )
+        .expect("Packages index");
+        assert!(validate_apt_package_indexes_at(dir.path()).is_err());
+    }
+
+    #[test]
+    fn doctor_accepts_valid_compressed_index_and_filters_non_indexes() {
+        for suffix in ["", ".lz4", ".gz", ".xz", ".LZ4", ".GZ", ".XZ"] {
+            assert!(apt_package_index_filename(&format!(
+                "deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages{suffix}"
+            )));
+        }
+        for filename in [
+            "mirror_InRelease",
+            "lock",
+            "mirror_main_binary-amd64_Packages.diff_Index",
+            "mirror_main_binary-amd64_Packages.bz2",
+            "mirror_main_binary-amd64_Packages.gz.bak",
+        ] {
+            assert!(!apt_package_index_filename(filename), "{filename}");
+        }
+
+        let dir = tempfile::tempdir().expect("APT lists fixture");
+        let index = dir
+            .path()
+            .join("deb.debian.org_main_binary-amd64_Packages.xz");
+        std::fs::write(
+            &index,
+            include_bytes!("../../../tests/data/xz-subset/apt-packages-sha256.xz"),
+        )
+        .expect("valid compressed index");
+        assert_eq!(
+            validate_apt_package_indexes_at(dir.path()).expect("xz index"),
+            1
+        );
     }
 
     #[test]

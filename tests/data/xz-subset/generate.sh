@@ -40,7 +40,7 @@ printf '%%NAME%%\nfixture\n\n%%VERSION%%\n1-1\n\n%%DESC%%\nXZ fixture package\n\
 tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
   -cf pacman-sync.tar -C pacman-db fixture-1-1
 xz -0 --check=sha256 -k -c pacman-sync.tar > "$dest/pacman-sync-sha256.db.xz"
-printf 'Package: fixture\nVersion: 1.0\n\n' > Packages
+printf 'Package: fixture\nVersion: 1.0\nArchitecture: amd64\n\n' > Packages
 xz -0 --check=sha256 -k -c Packages > "$dest/apt-packages-sha256.xz"
 
 for file in "$dest"/*.tar.xz; do

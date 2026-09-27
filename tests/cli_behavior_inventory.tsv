@@ -62,6 +62,8 @@ complete	["complete","--shell","bash","--current","se","--last","omg"]	read	0	pa
 which	["which","node"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 status	["status","--fast"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	status-native-fast	tempdir-drop
 doctor	["doctor"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-native-backend	tempdir-drop
+doctor-debian-status-fault	["doctor"]	controlled-error	1	pass	-	container	arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable	doctor-debian-status-fault	tempdir-drop
+doctor-debian-index-fault	["doctor"]	controlled-error	1	pass	-	container	arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable	doctor-debian-index-fault	tempdir-drop
 audit	["audit"]	read	1	pass	-	hermetic	hermetic:pass	audit-source-failure	tempdir-drop
 audit-scan	["audit","scan"]	read	1	pass	-	hermetic	hermetic:pass	audit-source-failure	tempdir-drop
 audit-scan-fail-on-findings-offline	["audit","scan","--fail-on-findings"]	read	1	pass	-	hermetic	hermetic:pass	audit-source-failure	tempdir-drop

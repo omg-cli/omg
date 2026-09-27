@@ -258,6 +258,107 @@ class OutputContracts(unittest.TestCase):
                     release.write_text('ID=other\n', encoding='utf-8')
                     self.assertEqual(probe().returncode, 2)
 
+    @unittest.skipIf(os.name == 'nt', 'Doctor fault oracle requires a POSIX shell')
+    def test_debian_doctor_fault_oracle_requires_counted_native_failures(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        begin = source.index('# BEGIN DEBIAN DOCTOR FAULT ORACLE')
+        end = source.index('# END DEBIAN DOCTOR FAULT ORACLE', begin)
+        oracle = source[begin:end]
+        rows = {line.split('\t', 1)[0]: line.split('\t') for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()[1:]}
+        targets = 'arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable'
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'doctor.out'
+            for mode in ('status', 'index'):
+                with self.subTest(mode=mode):
+                    row = rows[f'doctor-debian-{mode}-fault']
+                    self.assertEqual((row[3], row[6], row[7], row[8]),
+                                     ('1', 'container', targets, f'doctor-debian-{mode}-fault'))
+                    healthy_status = '  dpkg package database (/var/lib/dpkg/status)\n'
+                    healthy_index = '  APT package indexes (/var/lib/apt/lists)\n'
+                    failed_status = '  ✗ dpkg package database unhealthy (/var/lib/dpkg/status): broken state\n'
+                    failed_index = '  ✗ APT package indexes unhealthy (/var/lib/apt/lists): malformed stanza\n'
+                    good = ('OMG_QEMU_DOCTOR_BASELINE:exit=0\n' + healthy_status + healthy_index
+                            + 'OMG_QEMU_DOCTOR_VARIANT:exit=1\n'
+                            + (failed_status + healthy_index if mode == 'status'
+                               else healthy_status + failed_index)
+                            + f'OMG_QEMU_DOCTOR_FAULT:{mode}:baseline=0:variant=1\n')
+                    command = oracle + '\ncheck_doctor_debian_fault_output "$1" "$2"\n'
+                    for content, expected in (
+                        (good, 0),
+                        (good.replace('BASELINE:exit=0', 'BASELINE:exit=1')
+                             .replace('baseline=0:variant=1', 'baseline=1:variant=2'), 0),
+                        ('OMG_QEMU_DOCTOR_VARIANT:exit=1\n', 1),
+                        (good.replace('variant=1', 'variant=0'), 1),
+                        (good.replace(failed_status if mode == 'status' else failed_index,
+                                      healthy_status if mode == 'status' else healthy_index), 1),
+                        (good.replace('OMG_QEMU_DOCTOR_FAULT:',
+                                      (failed_index if mode == 'status' else failed_status)
+                                      + 'OMG_QEMU_DOCTOR_FAULT:'), 1),
+                        (good.replace('OMG_QEMU_DOCTOR_VARIANT:exit=1',
+                                      'OMG_QEMU_DOCTOR_VARIANT:exit=0'), 1),
+                    ):
+                        output.write_text(content, encoding='utf-8')
+                        result = subprocess.run(
+                            [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                             command, '_', mode, str(output)], capture_output=True, text=True,
+                            timeout=10)
+                        self.assertEqual(result.returncode, expected,
+                                         f'{mode}: {content}\n{result.stderr}')
+
+    @unittest.skipIf(os.name == 'nt', 'Doctor fault fixture requires POSIX shell scripts')
+    def test_debian_doctor_namespace_or_mount_failure_is_fixture_setup_not_product(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            commands = fixture / 'commands'
+            commands.mkdir()
+            scripts = {
+                'id': '#!/bin/sh\nprintf "0\\n"\n',
+                'getent': ("#!/bin/sh\nprintf 'bench:x:1000:1000::%s:/bin/sh\\n' "
+                           + shlex.quote(str(fixture)) + '\n'),
+                'runuser': '#!/bin/sh\nshift 3\nexec "$@"\n',
+                'mount': '#!/bin/sh\nprintf "mount: Operation not permitted\\n" >&2\nexit 1\n',
+            }
+            for name, content in scripts.items():
+                path = commands / name
+                path.write_text(content, encoding='utf-8')
+                path.chmod(0o755)
+            binary = fixture / 'omg'
+            binary.write_text(
+                '#!/bin/sh\nprintf "  dpkg package database (/var/lib/dpkg/status)\\n'
+                '  APT package indexes (/var/lib/apt/lists)\\n"\n', encoding='utf-8')
+            binary.chmod(0o755)
+            for stage, unshare in (
+                ('unshare', '#!/bin/sh\nprintf "unshare: Operation not permitted\\n" >&2\nexit 1\n'),
+                ('mount', '#!/bin/sh\nshift 3\nexec "$@"\n'),
+            ):
+                with self.subTest(stage=stage):
+                    unshare_path = commands / 'unshare'
+                    unshare_path.write_text(unshare, encoding='utf-8')
+                    unshare_path.chmod(0o755)
+                    result = subprocess.run(
+                        [shutil.which('bash'), str(ROOT / 'scripts/qemu-debian-doctor-check.sh'),
+                         'index', str(binary), 'bench'],
+                        capture_output=True, text=True, timeout=10,
+                        env={**os.environ, 'PATH': str(commands) + os.pathsep + os.environ['PATH']})
+                    self.assertEqual(result.returncode, 120, result.stdout + result.stderr)
+                    self.assertIn('OMG_QEMU_DOCTOR_FIXTURE_SETUP_FAILED', result.stderr)
+                    self.assertNotIn('OMG_QEMU_DOCTOR_FAULT:', result.stdout)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_debian_doctor_fixture_setup_failure_is_harness_error(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('doctor-debian-index-fault\t'))
+        result, evidence, logs = self.run_inventory(
+            'exit 99\n', [row], distro='debian', tiers='container',
+            native_commands={'sudo':
+                             'printf "OMG_QEMU_DOCTOR_FIXTURE_SETUP_FAILED: mount denied\\n" >&2\n'
+                             'exit 120\n'})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(evidence[0]['result'], 'HARNESS_ERROR', logs)
+        self.assertEqual(evidence[0]['exit_code'], 120)
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_actual_runner_requires_doctor_backend_evidence(self):
         release = Path('/etc/os-release').read_text(encoding='utf-8')

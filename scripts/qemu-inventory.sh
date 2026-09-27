@@ -238,6 +238,34 @@ check_doctor_native_backend() {
 }
 # END DOCTOR BACKEND ORACLE
 
+# BEGIN DEBIAN DOCTOR FAULT ORACLE
+check_doctor_debian_fault_output() {
+  local mode=$1 output=$2 baseline variant receipt
+  local -a receipts=()
+  [[ "$mode" == status || "$mode" == index ]] || return 2
+  [[ $(grep -Ec '^OMG_QEMU_DOCTOR_BASELINE:exit=(0|1)$' "$output") == 1 \
+     && $(grep -Fxc 'OMG_QEMU_DOCTOR_VARIANT:exit=1' "$output") == 1 ]] || return 1
+  mapfile -t receipts < <(grep -E "^OMG_QEMU_DOCTOR_FAULT:${mode}:baseline=[0-9]+:variant=[0-9]+$" "$output")
+  [[ ${#receipts[@]} == 1 ]] || return 1
+  receipt=${receipts[0]}
+  baseline=${receipt#*:baseline=}; baseline=${baseline%%:*}
+  variant=${receipt##*:variant=}
+  (( variant == baseline + 1 )) || return 1
+  case "$mode" in
+    status)
+      [[ $(grep -Fc 'dpkg package database (/var/lib/dpkg/status)' "$output") == 1 \
+         && $(grep -Fc 'dpkg package database unhealthy (/var/lib/dpkg/status)' "$output") == 1 \
+         && $(grep -Fc 'APT package indexes (/var/lib/apt/lists)' "$output") == 2 \
+         && $(grep -Fc 'APT package indexes unhealthy (/var/lib/apt/lists)' "$output") == 0 ]] ;;
+    index)
+      [[ $(grep -Fc 'APT package indexes (/var/lib/apt/lists)' "$output") == 1 \
+         && $(grep -Fc 'APT package indexes unhealthy (/var/lib/apt/lists)' "$output") == 1 \
+         && $(grep -Fc 'dpkg package database (/var/lib/dpkg/status)' "$output") == 2 \
+         && $(grep -Fc 'dpkg package database unhealthy (/var/lib/dpkg/status)' "$output") == 0 ]] ;;
+  esac
+}
+# END DEBIAN DOCTOR FAULT ORACLE
+
 # BEGIN INFO NATIVE PACKAGE ORACLE
 check_info_native_package() {
   local distro=$1 output=$2 status=0 version source actual_version actual_source
@@ -1213,6 +1241,7 @@ for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3
 overlap_fixture=$(jq -rn --rawfile fixture "$(dirname "$0")/workspace-overlap-fixture.sh" '$fixture | @sh')
 license_oracle_path="$(dirname "$0")/qemu-license-oracle.py"
 license_oracle=$(jq -rn --rawfile fixture "$license_oracle_path" '$fixture | @sh')
+doctor_fault_path="$(dirname "$0")/qemu-debian-doctor-check.sh"
 [[ "$binary" == /* && "$binary" != *$'\n'* ]] || exit 2
 [[ "$ssh_user" =~ ^[a-z_][a-z0-9_-]*$ && "$ssh_port" =~ ^[0-9]+$ ]] || exit 2
 [[ "$tiers" =~ ^[a-z,-]+$ && "$tiers" != ,* && "$tiers" != *, && "$tiers" != *,,* ]] || exit 2
@@ -1237,7 +1266,7 @@ out="$root/inventory"
 # Refuse to overwrite evidence from a previous invocation.
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" > "$out/input-sha256.txt"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$doctor_fault_path" > "$out/input-sha256.txt"
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
   '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
@@ -1332,7 +1361,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-debian-status-fault|doctor-debian-index-fault|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
     jq -e '. == ["run", "smoke", "--using", "make"]' <<< "$aj" >/dev/null || exit 2
@@ -1431,6 +1460,13 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     [[ "$a" == doctor-native-backend ]] || exit 2
     jq -e '. == ["doctor"]' <<< "$aj" >/dev/null || exit 2
   elif [[ "$a" == doctor-native-backend ]]; then
+    exit 2
+  fi
+  if [[ "$id" == doctor-debian-status-fault || "$id" == doctor-debian-index-fault ]]; then
+    [[ "$a" == "$id" && "$s" == controlled-error && "$resolved" == 1 && "$t" == container \
+       && "$tg" == 'arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable' ]] || exit 2
+    jq -e '. == ["doctor"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == doctor-debian-status-fault || "$a" == doctor-debian-index-fault ]]; then
     exit 2
   fi
   if [[ "$id" == doctor-eol ]]; then
@@ -1741,6 +1777,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; $(declare -f check_native_counter)"
   elif [[ "$assertions" == doctor-native-backend ]]; then
     remote+="; $(declare -f check_doctor_native_backend)"
+  elif [[ "$assertions" == doctor-debian-status-fault || "$assertions" == doctor-debian-index-fault ]]; then
+    remote+="; $(declare -f check_doctor_debian_fault_output)"
   elif [[ "$assertions" == info-native-package ]]; then
     remote+="; $(declare -f check_info_native_package)"
   elif [[ "$assertions" == status-native-fast || "$assertions" == status-native-full ]]; then
@@ -1778,6 +1816,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # The root-owned helper restores system repo policy and checks the RPMDB
     # plus native DNF history before it can report success.
     remote+="; run_omg '$command_timeout' sudo -n bash \"\$HOME/qemu-fedora-update-fixture.sh\" '${case#update-}' $quoted_binary '$ssh_user' > command.stdout.log 2> command.stderr.log; assertion=0"
+  elif [[ "$case" == doctor-debian-status-fault || "$case" == doctor-debian-index-fault ]]; then
+    doctor_fault_mode=${case#doctor-debian-}; doctor_fault_mode=${doctor_fault_mode%-fault}
+    remote+="; run_omg '$command_timeout' sudo -n bash \"\$HOME/qemu-debian-doctor-check.sh\" '$doctor_fault_mode' $quoted_binary '$ssh_user' > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == daemon-foreground ]]; then
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$distro" == fedora && "$case" == doctor ]]; then
@@ -1797,6 +1838,14 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$assertions" == doctor-eol-state ]]; then
     remote+="; if [[ \"\$baseline_phase\" != product ]] || ! check_doctor_issue_delta \"\$baseline_rc\" doctor.baseline.stdout.log doctor.baseline.stderr.log \"\$rc\" command.stderr.log 1; then printf 'assertion failed: doctor EOL did not add exactly one health issue over its baseline\n' >&2; assertion=1; fi"
+  fi
+  if [[ "$assertions" == doctor-debian-status-fault || "$assertions" == doctor-debian-index-fault ]]; then
+    doctor_fault_mode=${case#doctor-debian-}; doctor_fault_mode=${doctor_fault_mode%-fault}
+    remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 1 ]] && ! check_doctor_debian_fault_output '$doctor_fault_mode' command.stdout.log; then printf 'assertion failed: doctor %s fault lacks baseline, variant, and counted failure evidence\n' '$doctor_fault_mode' >&2; assertion=1; fi"
+    # Namespace and bind-mount setup failures mean this row never exercised
+    # Doctor. Keep them distinct from both a product failure and a missing
+    # guest dependency so the runner reports HARNESS_ERROR.
+    remote+="; if [[ \"\$rc\" == 120 ]] && grep -Fq 'OMG_QEMU_DOCTOR_FIXTURE_SETUP_FAILED' command.stderr.log; then execution_phase=executor; fi"
   fi
   if [[ "$assertions" == doctor-network-state ]]; then
     remote+="; expected_network_delta=\$(check_doctor_network_output '$distro' command.stdout.log) || assertion=1"
