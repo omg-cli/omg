@@ -19,7 +19,8 @@ MAX_TOTAL_BYTES = 256 * 1024 * 1024
 NAME = r"[a-zA-Z0-9][a-zA-Z0-9_.-]*"
 RUN = r"run-[a-zA-Z0-9-]+"
 HOST_FILES = {
-    "results.json", "sentry-results.json", "metadata.txt", "host-metadata.txt",
+    "results.json", "sentry-results.json", "backend-mismatch-results.json",
+    "backend-mismatch.json", "backend-mismatch.log", "metadata.txt", "host-metadata.txt",
     "cleanup.log", "reporting.log", "reporting-status.json", "kvm-probe.log", "engine-preflight.log",
     "controller-setup.log", "controller-security.log", "controller-pull.log", "image-setup.log", "boot.log", "guest-check.log",
     "evidence-copy.log", "benchmark-validation.log", "transactions.log",

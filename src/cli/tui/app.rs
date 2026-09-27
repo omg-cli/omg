@@ -478,9 +478,16 @@ impl App {
         reason = "feature-gated implementations await while fallback builds do not"
     )]
     pub async fn remove_orphans() -> Result<()> {
+        let backend = crate::package_managers::resolve_backend()?;
+        if backend == crate::package_managers::Backend::Fedora {
+            return crate::cli::packages::clean(true, false, false, false, false, true).await;
+        }
+        if backend == crate::package_managers::Backend::MacOS {
+            anyhow::bail!("Homebrew does not expose an orphan package listing");
+        }
         #[cfg(any(feature = "debian", feature = "debian-pure"))]
         if crate::core::env::distro::is_debian_like() {
-            #[cfg(feature = "debian-pure")]
+            #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
             {
                 let orphan_list = crate::package_managers::debian_db::list_orphans_fast()
                     .context("Failed to list orphan packages")?;
@@ -490,7 +497,7 @@ impl App {
                 let pm = crate::package_managers::get_package_manager()?;
                 return pm.remove(&orphan_list).await;
             }
-            #[cfg(all(feature = "debian", not(feature = "debian-pure")))]
+            #[cfg(feature = "debian")]
             {
                 return crate::package_managers::apt_remove_orphans()
                     .await

@@ -45,6 +45,10 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // A custom build for another distro must fail before creating a socket
+    // directory, opening the daemon cache, or constructing backend workers.
+    omg_lib::package_managers::resolve_backend()?;
+
     // Initialize Sentry (opt-in via OMG_SENTRY_DSN; no-op when unset)
     let _guard = sentry::init((
         std::env::var("OMG_SENTRY_DSN").ok(),

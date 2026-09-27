@@ -439,6 +439,13 @@ fn perform_license_scan() -> Result<LicenseScan> {
 
     #[cfg(feature = "arch")]
     {
+        anyhow::ensure!(
+            matches!(
+                crate::package_managers::resolve_backend()?,
+                crate::package_managers::Backend::Arch | crate::package_managers::Backend::Mock
+            ),
+            "Enterprise license scanning through ALPM requires an Arch host"
+        );
         let packages = crate::package_managers::pacman_db::list_local_cached()
             .context("Failed to list installed packages for license scan")?;
         let mut by_license: HashMap<String, usize> = HashMap::new();

@@ -38,6 +38,11 @@ pub async fn clean(
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
+    let backend = crate::package_managers::resolve_backend()?;
+    anyhow::ensure!(
+        backend != crate::package_managers::Backend::MacOS,
+        "Package cleanup is not implemented for the Homebrew backend"
+    );
     if dry_run {
         crate::cli::modern_ui::print_phase_header("🧹", "Clean Preview", "dry run");
     } else {
@@ -51,7 +56,7 @@ pub async fn clean(
     }
 
     #[cfg(feature = "fedora")]
-    if crate::package_managers::get_package_manager()?.name() == "dnf" {
+    if backend == crate::package_managers::Backend::Fedora {
         if aur {
             anyhow::bail!("AUR cleanup is not available on Fedora");
         }
@@ -69,12 +74,12 @@ pub async fn clean(
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if is_debian_like() {
-        #[cfg(feature = "debian-pure")]
+        #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
         {
             return handle_debian_pure_clean(orphans, cache, all, dry_run, yes).await;
         }
 
-        #[cfg(all(feature = "debian", not(feature = "debian-pure")))]
+        #[cfg(feature = "debian")]
         {
             if apt_cleanup_requests_unsupported_work(cache, aur, all) {
                 anyhow::bail!("Cache and AUR cleanup are not supported on the APT backend");
@@ -129,7 +134,11 @@ pub async fn clean(
     // not Debian-like: there is no Debian package database here to clean.
     // (With the Arch backend also compiled in, execution continues into the
     // Arch-capable block below instead.)
-    #[cfg(all(feature = "debian-pure", not(feature = "arch")))]
+    #[cfg(all(
+        feature = "debian-pure",
+        not(feature = "arch"),
+        not(feature = "debian")
+    ))]
     {
         anyhow::bail!(
             "Clean requires a Debian-like system (or an Arch-enabled build); \
@@ -137,7 +146,7 @@ pub async fn clean(
         );
     }
 
-    #[cfg(any(feature = "arch", not(feature = "debian-pure")))]
+    #[cfg(any(feature = "arch", feature = "debian", not(feature = "debian-pure")))]
     {
         let do_orphans = orphans || all;
         let do_cache = cache || all;

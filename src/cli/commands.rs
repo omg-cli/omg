@@ -153,18 +153,32 @@ async fn complete_package_names(
 }
 
 pub(crate) async fn available_package_names() -> Result<Vec<String>> {
+    let backend = crate::package_managers::resolve_backend()?;
     // Official lookup failures fail closed; AUR names remain optional enrichment.
     #[allow(
         unused_mut,
         reason = "mutated only when the Arch completion branch is compiled"
     )]
-    let mut names = tokio::task::spawn_blocking(official_package_names).await??;
+    let mut names = if matches!(
+        backend,
+        crate::package_managers::Backend::Fedora
+            | crate::package_managers::Backend::MacOS
+            | crate::package_managers::Backend::Mock
+    ) {
+        crate::package_managers::get_package_manager()?
+            .search("")
+            .await?
+            .into_iter()
+            .map(|package| package.name)
+            .collect()
+    } else {
+        tokio::task::spawn_blocking(official_package_names).await??
+    };
 
-    // Include AUR packages on Arch. Skip on Debian even if Arch is compiled in.
+    // Include AUR packages only when ALPM is selected, even in additive builds.
     #[cfg(feature = "arch")]
     {
-        #[cfg(any(feature = "debian", feature = "debian-pure"))]
-        if crate::core::env::distro::is_debian_like() {
+        if backend != crate::package_managers::Backend::Arch {
             return Ok(names);
         }
 
@@ -175,6 +189,9 @@ pub(crate) async fn available_package_names() -> Result<Vec<String>> {
             names.dedup();
         }
     }
+
+    #[cfg(not(feature = "arch"))]
+    let _ = backend;
 
     Ok(names)
 }
@@ -206,6 +223,17 @@ fn complete_installed_tools(
     reason = "additive backend feature branches return before compiled fallbacks"
 )]
 fn get_installed_package_names() -> Result<Vec<String>> {
+    let backend = crate::package_managers::resolve_backend()?;
+    if matches!(
+        backend,
+        crate::package_managers::Backend::Fedora
+            | crate::package_managers::Backend::MacOS
+            | crate::package_managers::Backend::Mock
+    ) {
+        return crate::package_managers::list_installed_fast()
+            .map(|installed| installed.into_iter().map(|pkg| pkg.name).collect())
+            .context("Failed to list installed packages for completion");
+    }
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {
         return crate::package_managers::debian_db::list_installed_fast()
@@ -244,6 +272,14 @@ fn get_installed_package_names() -> Result<Vec<String>> {
     reason = "additive backend feature branches return before compiled fallbacks"
 )]
 fn official_package_names() -> Result<Vec<String>> {
+    let backend = crate::package_managers::resolve_backend()?;
+    anyhow::ensure!(
+        matches!(
+            backend,
+            crate::package_managers::Backend::Arch | crate::package_managers::Backend::Debian
+        ),
+        "This backend has no ALPM or APT package-name reader"
+    );
     #[cfg(feature = "debian")]
     if use_debian_backend() {
         return apt_list_all_package_names()
@@ -400,6 +436,7 @@ type StatusSnapshot = (
 /// A missing daemon or binary cache falls back to a direct query, but a failed
 /// direct query is an error rather than a fake "healthy" zero report.
 fn read_status_snapshot() -> Result<StatusSnapshot> {
+    crate::package_managers::resolve_backend()?;
     // Use the same isolated fixture as JSON and async status. Native fast
     // readers may provide their own fixed test records and must not override
     // the explicit adapter (or read a real daemon cache in root-run tests).
@@ -1257,6 +1294,14 @@ fn history_entry_by_prefix<'a>(
     reason = "feature-gated implementations await while fallback builds do not"
 )]
 pub async fn rollback(id: Option<String>, yes: bool) -> Result<()> {
+    let backend = crate::package_managers::resolve_backend()?;
+    anyhow::ensure!(
+        !matches!(
+            backend,
+            crate::package_managers::Backend::Fedora | crate::package_managers::Backend::MacOS
+        ),
+        "Package rollback is not implemented for the selected {backend:?} backend"
+    );
     let id = match id {
         Some(id) => Some(normalize_transaction_id(&id)?),
         None => None,

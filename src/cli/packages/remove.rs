@@ -8,10 +8,6 @@ use super::dispatch_backend;
 mod arch;
 #[cfg(any(feature = "debian", feature = "debian-pure"))]
 mod debian;
-#[cfg(all(
-    not(feature = "arch"),
-    not(any(feature = "debian", feature = "debian-pure"))
-))]
 mod generic;
 
 /// Remove packages.

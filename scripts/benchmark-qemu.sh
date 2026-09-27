@@ -1026,6 +1026,51 @@ if [[ -n "$inventory_policy" ]]; then
     inventory_harness_error=true
   fi
 fi
+# Reuse the admitted distro artifact in a private guest mount namespace with
+# another supported distro's os-release. This is a separate reported QEMU row:
+# mount/trace setup errors cannot be counted as product refusals.
+if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
+  read -r mismatch_start _ < /proc/uptime
+  mismatch_binary="/home/bench/omg-${tag}-${arch}-linux-${distro}/omg"
+  quoted_mismatch_binary=$(jq -rn --arg binary "$mismatch_binary" '$binary | @sh')
+  mismatch_rc=0
+  timeout --kill-after=5s 180s docker exec -i -w /work/guest "$controller" \
+    ssh -i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5 \
+      -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+      -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts \
+      bench@127.0.0.1 "sudo -n unshare --mount --propagation private python3 - --binary $quoted_mismatch_binary --distro $distro" \
+      < "$here/qemu-backend-mismatch.py" > "$work/backend-mismatch.json" 2> "$work/backend-mismatch.log" || mismatch_rc=$?
+  mismatch_result=HARNESS_ERROR
+  if [[ -f "$work/backend-mismatch.json" && $(wc -c < "$work/backend-mismatch.json") -le 65536 ]]; then
+    if [[ "$mismatch_rc" == 0 ]] && python3 "$here/qemu-backend-mismatch.py" \
+      --distro "$distro" --receipt "$work/backend-mismatch.json" >> "$work/backend-mismatch.log" 2>&1; then
+      mismatch_result=PASS
+    elif [[ "$mismatch_rc" == 1 ]] && jq -e --arg distro "$distro" \
+      '.schema_version == 1 and .distro == $distro and .complete == false and .failure_kind == "product"' \
+      "$work/backend-mismatch.json" >/dev/null; then
+      mismatch_result=FAIL
+      inventory_product_failure=true
+    fi
+  fi
+  if [[ "$mismatch_result" == HARNESS_ERROR ]]; then
+    inventory_harness_error=true
+    rc=120
+  fi
+  read -r mismatch_end _ < /proc/uptime
+  mismatch_elapsed=$(awk -v start="$mismatch_start" -v end="$mismatch_end" \
+    'BEGIN { delta=end-start; if (delta < 0) delta=0; printf "%.2f", delta }')
+  jq -cn --arg distro "$distro" --arg result "$mismatch_result" \
+    --argjson exit_code "$mismatch_rc" --argjson elapsed "$mismatch_elapsed" \
+    '[{case_id:("qemu-" + $distro + "-backend-mismatch"), distro:$distro,
+      result:$result, artifact_source:"backend-mismatch", exit_code:$exit_code,
+      elapsed_seconds:$elapsed}]' > "$work/backend-mismatch-results.json"
+  report_inventory=$(jq -cn --argjson rows "$report_inventory" --arg distro "$distro" \
+    --arg result "$mismatch_result" --argjson exit_code "$mismatch_rc" \
+    --argjson elapsed "$mismatch_elapsed" \
+    '$rows + [{case_id:("qemu-" + $distro + "-backend-mismatch"), distro:$distro,
+      result:$result, exit_code:$exit_code, elapsed_seconds:$elapsed}]')
+fi
+
 if [[ "$storage_faults" == true && "$rc" == 0 ]]; then
   quoted_fault_binary=$(jq -rn --arg b "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" '$b | @sh')
   fault_setup='set -eu; token=$(cat /proc/sys/kernel/random/uuid); printf "%s\n" "$token" > /run/omg-qemu-storage-faults; chmod 444 /run/omg-qemu-storage-faults; exec unshare --mount --propagation private python3 - --binary "$1" --token "$token"'

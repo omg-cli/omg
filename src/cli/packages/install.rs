@@ -52,10 +52,6 @@ pub(crate) async fn enforce_install_policy(
 mod arch;
 #[cfg(any(feature = "debian", feature = "debian-pure"))]
 mod debian;
-#[cfg(all(
-    not(feature = "arch"),
-    not(any(feature = "debian", feature = "debian-pure"))
-))]
 mod generic;
 
 /// Install packages from repositories or AUR
@@ -175,26 +171,12 @@ fn validate_install_targets(packages: &[String]) -> Result<()> {
     }
 }
 
-#[cfg(feature = "arch")]
 async fn install_dry_run(packages: &[String]) -> Result<()> {
     dispatch_backend! {
         debian: { debian::install_dry_run(packages) },
         arch: { arch::install_dry_run(packages).await },
         generic: { generic::install_dry_run(packages) },
     }
-}
-
-#[cfg(all(
-    not(feature = "arch"),
-    any(feature = "debian", feature = "debian-pure")
-))]
-fn install_dry_run(packages: &[String]) -> impl std::future::Future<Output = Result<()>> + use<'_> {
-    std::future::ready(debian::install_dry_run(packages))
-}
-
-#[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
-fn install_dry_run(packages: &[String]) -> impl std::future::Future<Output = Result<()>> + use<'_> {
-    std::future::ready(generic::install_dry_run(packages))
 }
 
 #[cfg(test)]

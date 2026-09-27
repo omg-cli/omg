@@ -61,17 +61,30 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     let distro = detected_distro();
     let arch_backend = matches!(distro, Distro::Arch);
 
-    // 1. OS Check — every supported backend distro is healthy; only an
-    //    unsupported system is an issue (W3-A-02: a supported Debian system
-    //    must not be reported as permanently unhealthy).
-    if let Some(label) = supported_distro_label(distro) {
-        println!("  {}", style::success(label));
-    } else {
-        println!(
-            "  {}",
-            style::warning("Unsupported system detected (no package-manager backend)")
-        );
-        issues += 1;
+    // 1. OS and compiled backend must agree. A copied binary with the wrong
+    //    feature set must not advertise a healthy package manager.
+    match crate::package_managers::resolve_backend() {
+        Ok(_) => {
+            if let Some(label) = supported_distro_label(distro) {
+                println!("  {}", style::success(label));
+            } else {
+                println!(
+                    "  {}",
+                    style::warning("Unsupported system detected (no package-manager backend)")
+                );
+                issues += 1;
+            }
+        }
+        Err(error) => {
+            println!(
+                "  {} Package backend unavailable: {error}",
+                style::error("✗")
+            );
+            issues += 1;
+            // Native infrastructure checks are meaningful only when this
+            // binary can actually operate the detected host backend.
+            return finish_doctor(issues, warnings);
+        }
     }
 
     // 2. Internet Connectivity (basic check)

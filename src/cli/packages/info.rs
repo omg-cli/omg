@@ -23,6 +23,7 @@ const AUR_INFO_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Show package information (Synchronous fast-path)
 pub fn info_sync(package: &str) -> Result<bool> {
+    crate::package_managers::resolve_backend()?;
     // SECURITY: Validate package name
     if let Err(e) = crate::core::security::validate_package_name(package) {
         anyhow::bail!("Invalid package name: {e}");

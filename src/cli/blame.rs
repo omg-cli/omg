@@ -17,6 +17,10 @@ const REVERSE_DEPENDENCY_DISPLAY_LIMIT: usize = 20;
     )
 )]
 pub async fn run(package: &str) -> Result<()> {
+    anyhow::ensure!(
+        crate::package_managers::resolve_backend()? != crate::package_managers::Backend::MacOS,
+        "Package installation history is not implemented for Homebrew"
+    );
     crate::core::security::validate_package_name(package)?;
 
     #[cfg(feature = "fedora")]

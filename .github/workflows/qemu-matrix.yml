@@ -109,6 +109,7 @@ jobs:
           ./scripts/test-qa-audit.sh
           ./scripts/test-qa-open-pr.sh
           python3 -m unittest discover -s scripts -p test_qemu_reporting.py
+          python3 -m unittest discover -s scripts -p test_qemu_backend_mismatch.py
           python3 -m unittest discover -s scripts -p test_ci_smoke_report.py
           sudo -n python3 -m unittest discover -s scripts -p test_qemu_health.py
           python3 -m unittest discover -s scripts -p test_qemu_network_scope.py

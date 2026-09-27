@@ -35,6 +35,7 @@ fn print_count(count: usize, json: bool) -> Result<()> {
     reason = "additive backend feature branches return before compiled fallbacks"
 )]
 pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
+    let backend = crate::package_managers::resolve_backend()?;
     if crate::core::paths::test_mode() {
         // Test mode must observe the isolated mock state before consulting a
         // real daemon, fast-status file, or host package database.
@@ -92,6 +93,16 @@ pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
         tracing::debug!("Daemon unavailable for explicit listing; using direct backend");
     }
 
+    if backend == crate::package_managers::Backend::MacOS {
+        let packages = crate::package_managers::list_explicit_fast()
+            .context("Failed to list explicitly installed Homebrew packages")?;
+        return if count {
+            print_count(packages.len(), json)
+        } else {
+            display_explicit_list(packages, json)
+        };
+    }
+
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {
         let packages = crate::package_managers::debian_db::list_explicit_fast()
@@ -105,7 +116,7 @@ pub fn explicit_sync_with_json(count: bool, json: bool) -> Result<()> {
     }
 
     #[cfg(feature = "fedora")]
-    if crate::package_managers::get_package_manager()?.name() == "dnf" {
+    if backend == crate::package_managers::Backend::Fedora {
         let packages: Vec<String> =
             crate::package_managers::dnf::DnfPackageManager::read_user_installed_names()
                 .context("Failed to list explicitly installed Fedora packages")?

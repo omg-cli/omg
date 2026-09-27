@@ -23,6 +23,10 @@ use crate::cli::tea::Cmd;
     )
 )]
 pub async fn run(tree: Option<&str>, limit: usize) -> Result<()> {
+    anyhow::ensure!(
+        crate::package_managers::resolve_backend()? != crate::package_managers::Backend::MacOS,
+        "Package size analysis is not implemented for Homebrew"
+    );
     if let Some(package) = tree {
         crate::core::security::validate_package_name(package)?;
     }
