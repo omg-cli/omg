@@ -530,12 +530,20 @@ def main():
     if type(run_id) is not int or run_id <= 0:
         raise ValueError("invalid run ID")
     run = identity(event, json.loads(api(f"repos/{repository}/actions/runs/{run_id}")), repository)
-    _, snapshots = all_snapshots(Path("tests/qemu-inventory-policy.json"))
-    allowed_cases = canonical_case_ids({"inventories": snapshots})
     # Superseding an interactive run is not itself a product failure.
     if run["conclusion"] in ("cancelled", "skipped"):
         print("Cancelled/skipped run retained in Actions; no failure issue generated")
         return 0
+    # A corrupt historical snapshot invalidates the whole reviewed catalog.
+    # Keep the workflow failure reportable, but do not admit guest identities
+    # using an incomplete allowlist or whatever happened to remain readable.
+    evidence_error = False
+    try:
+        _, snapshots = all_snapshots(Path("tests/qemu-inventory-policy.json"))
+        allowed_cases = canonical_case_ids({"inventories": snapshots})
+    except (OSError, ValueError, KeyError, TypeError):
+        allowed_cases = None
+        evidence_error = True
     jobs = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100"))
     job_rows = jobs.get("jobs")
     published_candidate = (run["conclusion"] == "success"
@@ -547,8 +555,9 @@ def main():
     published_revision = None
     rows = []
     diagnostics = {}
-    evidence_error = False
     try:
+        if allowed_cases is None:
+            raise ValueError("unvalidated inventory policy catalog")
         listing = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100"))
         if listing["total_count"] > 100:
             raise ValueError("too many artifacts")
