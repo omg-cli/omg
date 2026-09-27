@@ -36607,7 +36607,7 @@
         }
       ]
     },
-    "bff39bc333c01c48f07d1081f4f3156e439aa2f362784447823c6ad400a743b3": {
+    "00ec561a4267154ace8d22dcc3dc6659cc0d873fb3ae47a51a959c8f12c1f1dd": {
       "releases": [],
       "cases": [
         {
@@ -38090,15 +38090,11 @@
         {
           "id": "run-watch",
           "tiers": [
+            "container",
             "pty"
           ],
-          "allowed_skips": {
-            "arch": "declared-cli-shape-only",
-            "debian": "declared-cli-shape-only",
-            "ubuntu": "declared-cli-shape-only",
-            "fedora": "declared-cli-shape-only"
-          },
-          "network_scope": "network"
+          "allowed_skips": {},
+          "network_scope": "offline"
         },
         {
           "id": "env-share-flags",

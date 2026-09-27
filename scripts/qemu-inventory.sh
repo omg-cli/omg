@@ -1167,6 +1167,20 @@ PY
           || [[ $(grep -Fxc 'smoke-task-ok' "$stdout" || true) != 1 ]]; then
           printf 'assertion failed: omg run lacks Makefile smoke task execution evidence\n' >&2; return 1
         fi ;;
+      watch-task-rerun)
+        if [[ ! -f watch-runs.marker || -L watch-runs.marker \
+              || ! -f watch-evidence.json || -L watch-evidence.json ]] \
+          || [[ $(grep -Fxc 'omg-qemu-watch-run' watch-runs.marker || true) != 2 \
+                || $(wc -l < watch-runs.marker) != 2 ]] \
+          || ! jq -e -s 'length == 1 and (.[0] == {
+            "schema_version": 1, "initial_runs": 1, "runs_after_edit": 2,
+            "readiness_seen": true, "rerun_seen": true, "ctrl_c_stopped": true
+          })' watch-evidence.json >/dev/null \
+          || [[ $(grep -Fc 'smoke-task-ok' "$stdout" || true) != 2 ]] \
+          || ! grep -Fq 'Watching for changes...' "$stdout" \
+          || ! grep -Fq 'File changed, re-running' "$stdout"; then
+          printf 'assertion failed: run --watch lacks a bounded source-edit rerun and Ctrl+C receipt\n' >&2; return 1
+        fi ;;
       parallel-tasks-executed)
         if [[ ! -f parallel-one.done || -L parallel-one.done \
               || ! -f parallel-two.done || -L parallel-two.done ]] \
@@ -1428,7 +1442,7 @@ out="$root/inventory"
 # Refuse to overwrite evidence from a previous invocation.
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" > "$out/input-sha256.txt"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" > "$out/input-sha256.txt"
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
   '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
@@ -1523,11 +1537,17 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv) ;; *) exit 2 ;; esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
     jq -e '. == ["run", "smoke", "--using", "make"]' <<< "$aj" >/dev/null || exit 2
   elif [[ "$a" == task-executed ]]; then
+    exit 2
+  fi
+  if [[ "$id" == run-watch ]]; then
+    [[ "$a" == watch-task-rerun && "$s" == isolated-write && "$resolved" == 0 && "$t" == container,pty && "$cleanup" == tempdir-drop ]] || exit 2
+    jq -e '. == ["run", "--watch", "smoke"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == watch-task-rerun ]]; then
     exit 2
   fi
   if [[ "$id" == run-parallel ]]; then
@@ -1844,6 +1864,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     fi
   fi
   remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@printf omg-qemu-smoke-task > smoke-task.marker\n\t@echo smoke-task-ok\nparallel-one:\n\t@touch parallel-one.started\n\t@timeout 15 sh -c \"until test -e parallel-two.started; do sleep 0.05; done\"\n\t@printf parallel-one > parallel-one.done\n\t@echo parallel-one-ok\nparallel-two:\n\t@touch parallel-two.started\n\t@timeout 15 sh -c \"until test -e parallel-one.started; do sleep 0.05; done\"\n\t@printf parallel-two > parallel-two.done\n\t@echo parallel-two-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n' > Makefile"
+  if [[ "$case" == run-watch ]]; then
+    remote+="; mkdir src; printf 'initial\\n' > src/watch-trigger.txt; printf 'smoke:\\n\\t@printf \\\"omg-qemu-watch-run\\\\n\\\" >> watch-runs.marker\\n\\t@echo smoke-task-ok\\n' > Makefile; export OMG_DISABLE_DAEMON=1"
+  fi
   if [[ "$case" == run-all ]]; then
     remote+="; mkdir -p \"\$rowdir/run-all-bin\"; printf '#!/bin/sh\ncase \$1:\$2 in\n  --version:) echo 9.0.0 ;;\n  run:smoke) printf npm-smoke-task > npm-task.marker; echo npm-task-ok ;;\n  *) exit 96 ;;\nesac\n' > \"\$rowdir/run-all-bin/npm\"; printf '#!/bin/sh\necho v24.0.0\n' > \"\$rowdir/run-all-bin/node\"; chmod 755 \"\$rowdir/run-all-bin/npm\" \"\$rowdir/run-all-bin/node\"; export PATH=\"\$rowdir/run-all-bin:\$PATH\"; printf '%s\n' '{\"scripts\":{\"smoke\":\"echo npm-task-ok\"}}' > package.json"
   fi
@@ -2019,6 +2042,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg '$command_timeout' $quoted_binary rollback \"\$rollback_id\" --yes > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == daemon-foreground ]]; then
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
+  elif [[ "$case" == run-watch ]]; then
+    remote+="; run_omg '$command_timeout' python3 \"\$HOME/qemu-run-watch-check.py\" $quoted_binary \"\$rowdir\" > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$distro" == fedora && "$case" == doctor ]]; then
     remote+="; if ! command -v strace >/dev/null || ! strace --seccomp-bpf -f -qq -e trace=execve -o doctor.preflight.log true; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve -o doctor.exec.log $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"

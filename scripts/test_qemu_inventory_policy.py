@@ -216,6 +216,10 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(len(cases), len(content.splitlines()) - 1)
         self.assertEqual(len({case["id"] for case in cases}), len(cases))
         by_id = {case["id"]: case for case in cases}
+        self.assertEqual(by_id["run-watch"], {
+            "id": "run-watch", "tiers": ["container", "pty"],
+            "allowed_skips": {}, "network_scope": "offline",
+        })
         self.assertEqual(by_id["doctor-eol"], {
             "id": "doctor-eol", "tiers": ["container"],
             "allowed_skips": {}, "network_scope": "offline",

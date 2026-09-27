@@ -591,6 +591,7 @@ if [[ -n "$inventory_tiers" ]]; then
   cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
   cp "$here/qemu-arch-update-fixture.sh" "$work/qemu-arch-update-fixture.sh"
+  cp "$here/qemu-run-watch-check.py" "$work/qemu-run-watch-check.py"
   cp "$here/qemu-fedora-update-fixture.sh" "$work/qemu-fedora-update-fixture.sh"
   cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"
   cp "$tsv" "$work/cases.tsv"
@@ -771,6 +772,7 @@ if [[ -n "$inventory_tiers" ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-arch-update-fixture.sh bench@127.0.0.1:qemu-arch-update-fixture.sh
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fedora-update-fixture.sh bench@127.0.0.1:qemu-fedora-update-fixture.sh
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fingerprint-oracle.py bench@127.0.0.1:qemu-fingerprint-oracle.py
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-run-watch-check.py bench@127.0.0.1:qemu-run-watch-check.py
 fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/daemon-advisory-shutdown.sh bench@127.0.0.1:daemon-advisory-shutdown.sh
 if [[ "$benchmark" == true ]]; then

@@ -184,7 +184,7 @@ update-fast	["update","--fast","--yes"]	package-mutation	0	pass	-	container	arch
 doctor-network	["doctor","--network"]	controlled-error	1	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-network-state	tempdir-drop
 doctor-eol	["doctor","--eol"]	controlled-error	1	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-eol-state	tempdir-drop
 doctor-turbo	["doctor","--turbo"]	read	-	declared	-	qemu	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
-run-watch	["run","--watch","smoke"]	interactive	-	declared	-	pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
+run-watch	["run","--watch","smoke"]	isolated-write	0	pass	-	container,pty	arch:pass,debian:pass,ubuntu:pass,fedora:pass	watch-task-rerun	tempdir-drop
 env-share-flags	["env","share","--public","--description","Probe Gist"]	service-mutation	-	declared	-	network,credentialed	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
 env-share-missing-lock	["env","share"]	controlled-error	1	pass	-	hermetic	hermetic:pass	env-share-missing-lock	tempdir-drop
 self-update-force	["self-update","--force"]	service-mutation	-	declared	-	network	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	host-state-restore

@@ -13,6 +13,27 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'PTY inventory fixture requires POSIX')
+    def test_run_watch_row_uses_bounded_source_edit_and_receipt(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        row = next(line for line in inventory.splitlines() if line.startswith('run-watch\t'))
+        self.assertEqual(row.split('\t')[8], 'watch-task-rerun')
+        product = '''[[ "$1:$2:$3" == run:--watch:smoke && -f src/watch-trigger.txt ]] || exit 70
+make -s smoke || exit 71
+printf 'Watching for changes...\\n'
+while [[ $(cat src/watch-trigger.txt) != 'changed once' ]]; do sleep .02; done
+printf 'File changed, re-running\\n'
+make -s smoke || exit 71
+trap 'exit 130' INT
+while :; do sleep .05; done
+'''
+        result, evidence, logs = self.run_inventory(
+            product, [row], tiers='container', row_timeout=12,
+            home_files={'qemu-run-watch-check.py':
+                        (ROOT / 'scripts/qemu-run-watch-check.py').read_bytes()})
+        self.assertEqual(result.returncode, 0, logs)
+        self.assertEqual(evidence[0]['result'], 'PASS', logs)
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_tree_install_remove_rows_reject_collateral_package_and_reason_changes(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
