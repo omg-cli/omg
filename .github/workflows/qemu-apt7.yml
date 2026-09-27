@@ -1,0 +1,138 @@
+# Manual pilot for APT ABI 7. One Debian Trixie archive is tested in two
+# distinct disposable guests; the four required QEMU Matrix lanes stay intact.
+name: QEMU APT 7 pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      guest:
+        description: "APT 7 guest to test"
+        type: choice
+        options: [all, debian13, ubuntu2604]
+        default: all
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      guests: ${{ steps.select.outputs.guests }}
+      tag: ${{ steps.select.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify pilot selection, pins and evidence contracts
+        run: python3 -m unittest scripts.test_qemu_apt7_pilot -q
+      - id: select
+        env:
+          GUEST: ${{ inputs.guest }}
+        run: |
+          case "$GUEST" in
+            all) guests='["debian13","ubuntu2604"]' ;;
+            debian13|ubuntu2604) guests=$(jq -cn --arg guest "$GUEST" '[$guest]') ;;
+            *) exit 2 ;;
+          esac
+          version=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
+          printf 'guests=%s\ntag=v%s\n' "$guests" "$version" >> "$GITHUB_OUTPUT"
+          printf 'APT 7 pilot: %s from one Debian Trixie archive at %s\n' "$guests" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  build-apt7:
+    name: Build one Debian Trixie archive
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container: debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CARGO_HOME: /usr/local/cargo
+      RUSTUP_HOME: /usr/local/rustup
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config libssl-dev \
+            libapt-pkg-dev clang cmake
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Trust checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install pinned Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
+            -o /tmp/rustup-init
+          echo '20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init' | sha256sum --check
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --profile minimal --default-toolchain 1.95.0
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - name: Build and require APT ABI 7
+        run: |
+          export PATH="$CARGO_HOME/bin:$PATH"
+          cargo build --release --no-default-features --features debian,pgp,license --locked
+          ldd target/release/omg > apt-abi-ldd.txt
+          grep -Eq 'libapt-pkg\.so\.7([ .]|$)' apt-abi-ldd.txt
+          ! grep -Eq 'libapt-pkg\.so\.6([ .]|$)' apt-abi-ldd.txt
+          cat apt-abi-ldd.txt
+      - name: Package the exact archive for both guests
+        run: |
+          version=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          package="omg-v${version}-x86_64-linux-debian-trixie"
+          mkdir -p "$package"
+          cp target/release/omg target/release/omgd README.md LICENSE "$package/"
+          tar -czf "$package.tar.gz" "$package"
+          sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staged-debian-trixie
+          path: omg-v*.tar.gz*
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+  guest:
+    name: "APT 7 guest (${{ matrix.guest }})"
+    needs: [prepare, build-apt7]
+    strategy:
+      fail-fast: false
+      matrix:
+        guest: ${{ fromJSON(needs.prepare.outputs.guests) }}
+    uses: ./.github/workflows/qemu-lane.yml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      distro: ${{ matrix.guest }}
+      staged: true
+      tag: ${{ needs.prepare.outputs.tag }}
+      reuse-ci: false
+      shared-staged: true
+      archive-distro: debian-trixie
+      image-policy: tests/qemu-image-provenance/apt7-manifest.json
+      image: unused
+      features: debian,pgp,license
+      setup: "echo APT 7 archive supplied by build-apt7"
+
+  result:
+    name: APT 7 pilot result
+    needs: [prepare, build-apt7, guest]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require selected guest evidence jobs
+        env:
+          PREPARE: ${{ needs.prepare.result }}
+          BUILD: ${{ needs.build-apt7.result }}
+          GUEST: ${{ needs.guest.result }}
+        run: |
+          printf 'prepare=%s build=%s guest=%s\n' "$PREPARE" "$BUILD" "$GUEST" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$PREPARE" == success && "$BUILD" == success && "$GUEST" == success ]]

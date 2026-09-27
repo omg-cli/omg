@@ -1368,7 +1368,7 @@ write_row_log() {
 # END ROW LOG
 trap 'rc=$?; if [[ "$rc" == 2 ]]; then printf "error: invalid inventory configuration or row %s\n" "${id:-<preflight>}" >&2; fi' EXIT
 
-work=""; distro=""; tiers=""; tag=""; binary=""; tsv=""
+work=""; distro=""; identity=""; tiers=""; tag=""; binary=""; tsv=""
 allow_mutations=false
 allow_credentialed=false
 isolate_hermetic=false
@@ -1379,10 +1379,10 @@ ssh_port=2222
 ssh_user=bench
 while (($#)); do
   case "$1" in
-    --work|--distro|--tiers|--tag|--binary|--tsv|--row-timeout|--ssh-port|--ssh-user|--network-policy)
+    --work|--distro|--identity|--tiers|--tag|--binary|--tsv|--row-timeout|--ssh-port|--ssh-user|--network-policy)
       [[ $# -ge 2 && -n "$2" ]] || exit 2
       case "$1" in
-        --work) work=$2 ;; --distro) distro=$2 ;; --tiers) tiers=$2 ;;
+        --work) work=$2 ;; --distro) distro=$2 ;; --identity) identity=$2 ;; --tiers) tiers=$2 ;;
         --tag) tag=$2 ;; --binary) binary=$2 ;; --tsv) tsv=$2 ;;
         --network-policy) network_policy=$2 ;;
         --row-timeout) row_timeout=$2 ;; --ssh-port) ssh_port=$2 ;; --ssh-user) ssh_user=$2 ;;
@@ -1398,6 +1398,11 @@ done
 [[ -n "$work" && -n "$distro" && -n "$tiers" && -n "$tag" && -n "$binary" && -n "$tsv" ]] || exit 2
 [[ "$row_timeout" =~ ^[0-9]+$ && "$row_timeout" -gt 0 ]] || exit 2
 case "$distro" in arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
+[[ -n "$identity" ]] || identity=$distro
+case "$identity:$distro" in
+  arch:arch|debian:debian|ubuntu:ubuntu|fedora:fedora|debian13:debian|ubuntu2604:ubuntu) ;;
+  *) exit 2 ;;
+esac
 for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3; done
 overlap_fixture=$(jq -rn --rawfile fixture "$(dirname "$0")/workspace-overlap-fixture.sh" '$fixture | @sh')
 license_oracle_path="$(dirname "$0")/qemu-license-oracle.py"
@@ -1429,9 +1434,9 @@ out="$root/inventory"
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
 sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" > "$out/input-sha256.txt"
-jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" \
+jq -n --arg release "$tag" --arg distro "$identity" --arg guest_distro "$distro" --arg tiers "$tiers" --arg binary "$binary" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
-  '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
+  '{release:$release,distro:$distro,guest_distro:$guest_distro,tiers:$tiers,binary:$binary,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
 # -n keeps ssh from forwarding (and draining) this loop's stdin, which is the
 # TSV stream: without it only the first tier-matching row ever executes.
 opts=(-n -i "$guest/client-key" -p "$ssh_port" -o BatchMode=yes -o ConnectTimeout=5
@@ -1449,7 +1454,7 @@ printf '{"complete":false}\n' > "$out/summary.json"
 pass=0; fail=0; skipped=0
 record() { # case_id result exit_code elapsed
   local entry
-  entry=$(jq -n --arg c "$1" --arg d "$distro" --arg r "$2" --argjson e "$3" --argjson s "$4" --arg scope "$network_scope" \
+  entry=$(jq -n --arg c "$1" --arg d "$identity" --arg r "$2" --argjson e "$3" --argjson s "$4" --arg scope "$network_scope" \
     '{case_id:$c, distro:$d, result:$r, artifact_source:"inventory", exit_code:$e, elapsed_seconds:$s, network_scope:$scope}')
   jq --slurpfile e <(printf '%s' "$entry") '. + [$e[0]]' "$summary_tmp" > "$summary_tmp.next"
   mv "$summary_tmp.next" "$summary_tmp"
@@ -1744,7 +1749,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # Sanitized id: one bad TSV row must fail loudly without poisoning
     # the whole results file for the downstream schema gate.
     safe="invalid-$(printf '%s' "$case" | tr -c 'a-z0-9-' '-' | cut -c1-80)"
-    record "qemu-$distro-$safe" FAIL -1 0; fail=$((fail+1)); continue
+    record "qemu-$identity-$safe" FAIL -1 0; fail=$((fail+1)); continue
   fi
   # Tier filter (tiers are comma-separated in the TSV too).
   hit=false
@@ -1759,7 +1764,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   # Declaration-only rows are parse-level, covered by cli_comprehensive.
   if [[ "$expected_ux" == declared ]]; then
-    record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
+    record "qemu-$identity-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
   fi
   # Per-distro target status.
   status=""
@@ -1771,21 +1776,21 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     done
   fi
   if [[ -z "$status" || "$status" == pending || "$status" == not-applicable ]]; then
-    record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
+    record "qemu-$identity-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
   fi
-  case "$status" in pass|known-defect) ;; *) record "qemu-$distro-$case" HARNESS_ERROR -1 0; fail=$((fail+1)); continue ;; esac
+  case "$status" in pass|known-defect) ;; *) record "qemu-$identity-$case" HARNESS_ERROR -1 0; fail=$((fail+1)); continue ;; esac
   # Credentialed rows need a real token in the guest: never run them
   # without an explicit opt-in (tiers match by substring, so "network"
   # would otherwise select "network,credentialed" rows).
   if [[ ",$tier," == *",credentialed,"* && "$allow_credentialed" == false ]]; then
-    record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
+    record "qemu-$identity-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
   fi
   # Safety gate.
   case "$safety" in
-    interactive) record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue ;;
+    interactive) record "qemu-$identity-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue ;;
     package-mutation|service-mutation)
       if [[ "$allow_mutations" == false ]]; then
-        record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
+        record "qemu-$identity-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
       fi ;;
   esac
   chain=()
@@ -1801,7 +1806,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   done
   if [[ "$blocked" == true ]]; then
     printf 'dependency %s is gated\n' "$next" > "$out/rows/$case.log"
-    record "qemu-$distro-$case" BLOCKED -1 0; fail=$((fail+1)); continue
+    record "qemu-$identity-$case" BLOCKED -1 0; fail=$((fail+1)); continue
   fi
 
   # Quote each literal segment, substituting only the documented ROOT token.
@@ -2192,12 +2197,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     fi
   fi
   write_row_log "$out/rows/$case.log" "$out/rows/$case.stdout.log" "$out/rows/$case.stderr.log" "$case" "$verdict"
-  record "qemu-$distro-$case" "$verdict" "$rc" "$elapsed"
+  record "qemu-$identity-$case" "$verdict" "$rc" "$elapsed"
   if [[ "$verdict" == PASS ]]; then pass=$((pass+1)); else fail=$((fail+1)); fi
   printf 'case=%s exit=%s verdict=%s\n' "$case" "$rc" "$verdict"
 done < <(tail -n +2 "$tsv")
 if ((pass + fail == 0)); then
-  record "qemu-$distro-inventory-selection" HARNESS_ERROR -1 0
+  record "qemu-$identity-inventory-selection" HARNESS_ERROR -1 0
   fail=$((fail+1))
 fi
 printf '{"complete":true,"pass":%s,"fail":%s,"skipped":%s}\n' "$pass" "$fail" "$skipped" > "$out/summary.json.next"
