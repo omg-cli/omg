@@ -290,7 +290,7 @@ class OutputContracts(unittest.TestCase):
         config_guard = (
             'if [[ "${OMG_PACMAN_CONF:-}" == */dependency-pacman.conf ]]; then\n'
             '  config_db="${OMG_PACMAN_CONF%/dependency-pacman.conf}/dependency-db"\n'
-            '  if grep -Fq "%DEPENDS%" "$config_db/local/omg-doctor-fixture-1.0-1/desc"; then\n'
+            '  if ! pacman -Dk --config "$OMG_PACMAN_CONF" --dbpath "$config_db" >/dev/null 2>&1; then\n'
             '    printf "  ALPM local package database inconsistent (%s/local): native pacman -Dk failed: '
             'missing omg-doctor-unavailable-687\\n" "$config_db"\n'
             '    printf "Error: doctor found 1 health issue(s)\\n" >&2; exit 1\n'
@@ -325,6 +325,16 @@ class OutputContracts(unittest.TestCase):
             self.assertEqual(result.returncode, 0, f'{result.stderr}\n{logs}')
             self.assertEqual(evidence[0]['result'], 'PASS')
         if distro == 'arch':
+            missing_config = (
+                config_guard.replace('pacman -Dk --config "$OMG_PACMAN_CONF" --dbpath "$config_db"',
+                                     'pacman -Dk --dbpath "$config_db"')
+                + fault_guard + healthy_product
+            )
+            result, evidence, logs = self.run_inventory(missing_config, rows,
+                                                        native_commands=native, distro=distro)
+            self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+            self.assertIn('did not invoke native pacman with the selected configuration',
+                          logs['doctor.log'])
             silent_fault = healthy_product
             result, evidence, logs = self.run_inventory(silent_fault, rows,
                                                         native_commands=native, distro=distro)
@@ -340,6 +350,7 @@ class OutputContracts(unittest.TestCase):
             ignored_dependency = (
                 'if [[ "${OMG_PACMAN_CONF:-}" == */dependency-pacman.conf ]]; then\n'
                 '  config_db="${OMG_PACMAN_CONF%/dependency-pacman.conf}/dependency-db"\n'
+                '  pacman -Dk --config "$OMG_PACMAN_CONF" --dbpath "$config_db" >/dev/null 2>&1 || :\n'
                 '  printf "  ALPM local package database (%s/local, 1 packages verified)\\n" "$config_db"\n'
                 '  printf "System is healthy with 1 warning(s).\\n"; exit 0\n'
                 'fi\n'

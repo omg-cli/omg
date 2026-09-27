@@ -566,7 +566,8 @@ async fn check_arch_local_db() -> usize {
 
 /// The shared parser checks that entries are readable, but only ALPM checks
 /// cross-package dependencies, conflicts, and file ownership. `pacman -Dk`
-/// is read-only and offline; use the same local database that Doctor parsed.
+/// is read-only and offline; use the same configuration and local database
+/// that Doctor and the ALPM backend parsed.
 #[cfg(feature = "arch")]
 async fn check_arch_native_db(local_dir: &std::path::Path) -> Result<()> {
     anyhow::ensure!(
@@ -576,10 +577,13 @@ async fn check_arch_native_db(local_dir: &std::path::Path) -> Result<()> {
     let db_path = local_dir
         .parent()
         .context("ALPM local package database has no parent directory")?;
+    let conf_path = crate::core::paths::pacman_conf_path();
     let mut command =
         tokio::process::Command::from(crate::core::privilege::system_command("pacman")?);
     command
-        .args(["-Dk", "--dbpath"])
+        .args(["-Dk", "--config"])
+        .arg(conf_path)
+        .arg("--dbpath")
         .arg(db_path)
         .kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(30), command.output())

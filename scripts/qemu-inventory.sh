@@ -241,6 +241,14 @@ check_arch_doctor_missing_dependency() {
   local binary=$1 rowdir=$2 baseline_rc=$3 baseline_out=$4 baseline_err=$5 deadline=$6
   local fixture="$rowdir/dependency-db" config="$rowdir/dependency-pacman.conf"
   local native_rc=0 doctor_rc=0 healthy_rc=0
+  command -v strace >/dev/null || {
+    printf 'native Arch doctor execution oracle requires strace\n' >&2
+    return 2
+  }
+  strace -f -qq -e trace=execve -o doctor-strace.preflight.log /usr/bin/true || {
+    printf 'native Arch doctor execution oracle cannot trace a child process\n' >&2
+    return 2
+  }
   mkdir -p "$fixture/local/omg-doctor-fixture-1.0-1" || return 2
   cp /var/lib/pacman/local/ALPM_DB_VERSION "$fixture/local/ALPM_DB_VERSION" || return 2
   printf '%%NAME%%\nomg-doctor-fixture\n\n%%VERSION%%\n1.0-1\n\n' \
@@ -248,7 +256,7 @@ check_arch_doctor_missing_dependency() {
   printf '%%FILES%%\nusr/bin/omg-doctor-fixture\n' \
     > "$fixture/local/omg-doctor-fixture-1.0-1/files" || return 2
   printf '[options]\nDBPath = %s\n' "$fixture" > "$config" || return 2
-  timeout --kill-after=2s 30s pacman -Dk --config "$config" \
+  timeout --kill-after=2s 30s pacman -Dk --config "$config" --dbpath "$fixture" \
     > native-config-healthy.stdout.log 2> native-config-healthy.stderr.log || native_rc=$?
   if [[ "$native_rc" != 0 ]]; then
     printf 'native Arch reference rejected a valid configured package database\n' >&2
@@ -256,8 +264,16 @@ check_arch_doctor_missing_dependency() {
   fi
   env -u OMG_PACMAN_DB_DIR -u OMG_PACMAN_LOCAL_DIR \
     OMG_PACMAN_CONF="$config" OMG_DISABLE_DAEMON=1 \
-    timeout --kill-after=5s "$deadline" "$binary" doctor \
+    timeout --kill-after=5s "$deadline" strace -f -qq -s 512 -e trace=execve \
+      -o doctor-config.exec.log "$binary" doctor \
     > doctor-config-healthy.stdout.log 2> doctor-config-healthy.stderr.log || healthy_rc=$?
+  local selected_exec
+  selected_exec=$(grep -Fm1 -- "\"-Dk\", \"--config\", \"$config\", \"--dbpath\", \"$fixture\"" doctor-config.exec.log) || {
+    tail -n 20 doctor-config.exec.log >&2
+    printf 'assertion failed: doctor did not invoke native pacman with the selected configuration and database\n' >&2
+    return 1
+  }
+  printf 'Arch doctor pacman execution receipt: %s\n' "$selected_exec" >&2
   if [[ "$healthy_rc" != "$baseline_rc" ]] \
     || [[ $(grep -Fc 'ALPM local package database' doctor-config-healthy.stdout.log) != 1 ]] \
     || ! grep -Fq "ALPM local package database ($fixture/local, 1 packages verified)" doctor-config-healthy.stdout.log; then
@@ -267,7 +283,7 @@ check_arch_doctor_missing_dependency() {
   fi
   printf '%%DEPENDS%%\nomg-doctor-unavailable-687>=1\n\n' \
     >> "$fixture/local/omg-doctor-fixture-1.0-1/desc" || return 2
-  timeout --kill-after=2s 30s pacman -Dk --config "$config" \
+  timeout --kill-after=2s 30s pacman -Dk --config "$config" --dbpath "$fixture" \
     > native-dependency.stdout.log 2> native-dependency.stderr.log || native_rc=$?
   if [[ "$native_rc" != 1 ]] \
     || ! grep -Fq "missing 'omg-doctor-unavailable-687>=1' dependency for 'omg-doctor-fixture'" native-dependency.stderr.log; then
