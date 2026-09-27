@@ -13,6 +13,63 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'APT rollback oracle requires POSIX jq')
+    def test_apt_rollback_requires_unique_native_history_and_tree_only_delta(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        functions = source[source.index('apt_tree_removal_id() {'):
+                           source.index('check_apt_update_delta() {')]
+        removal = {'id': '12345678-1234-1234-1234-123456789abc',
+                   'transaction_type': 'Remove', 'success': True,
+                   'changes': [{'name': 'tree', 'old_version': '2.0',
+                                'new_version': None, 'source': 'apt'}]}
+        restore = {'id': '87654321-1234-1234-1234-123456789abc',
+                   'transaction_type': 'Install', 'success': True,
+                   'changes': [{'name': 'tree', 'old_version': None,
+                                'new_version': '2.0', 'source': 'rollback'}]}
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / 'history.json'
+
+            def check(entries, command):
+                history.write_text(json.dumps(entries), encoding='utf-8')
+                return subprocess.run(
+                    [shutil.which('bash'), '-c', functions + '\n' + command,
+                     '_', str(history)], capture_output=True, text=True)
+
+            selected = check([removal], 'apt_tree_removal_id "$1" 2.0')
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            self.assertEqual(selected.stdout.strip(), removal['id'])
+            for entries in ([], [removal, removal],
+                            [dict(removal, success=False)],
+                            [dict(removal, changes=[dict(removal['changes'][0],
+                                                         old_version='1.0')])],
+                            [dict(removal, changes=[dict(removal['changes'][0],
+                                                         source='local')])]):
+                with self.subTest(entries=entries):
+                    self.assertNotEqual(
+                        check(entries, 'apt_tree_removal_id "$1" 2.0').returncode, 0)
+            self.assertEqual(
+                check([removal, restore], 'check_apt_tree_restoration "$1" 2.0').returncode, 0)
+            for entries in ([removal], [dict(restore, changes=[dict(restore['changes'][0],
+                                                                   new_version='9.0')])],
+                            [restore, restore]):
+                with self.subTest(restore_entries=entries):
+                    self.assertNotEqual(
+                        check(entries, 'check_apt_tree_restoration "$1" 2.0').returncode, 0)
+
+            baseline = 'installed packages\nbase\t1.0\tinstall ok installed\ninstall reasons\nbase'
+            tree = ('installed packages\nbase\t1.0\tinstall ok installed\n'
+                    'tree\t2.0\tinstall ok installed\ninstall reasons\nbase\ntree')
+            unrelated = tree.replace('base\t1.0', 'base\t2.0')
+            reason_changed = tree.replace('install reasons\nbase\ntree',
+                                          'install reasons\ntree')
+            for after, expected in ((tree, 0), (unrelated, 1), (reason_changed, 1)):
+                with self.subTest(after=after):
+                    result = subprocess.run(
+                        [shutil.which('bash'), '-c',
+                         functions + '\ncheck_apt_tree_only_delta "$1" "$2"',
+                         '_', baseline, after], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_diff_rows_require_the_requested_missing_lockfile_diagnostic(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
