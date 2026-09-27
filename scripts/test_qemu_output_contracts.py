@@ -286,6 +286,7 @@ class OutputContracts(unittest.TestCase):
                    'if [[ "$1" == doctor ]] && [[ "' + distro + '" == arch ]]; then '
                    'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
                    'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
+        healthy_product += 'echo "System is healthy with 1 warning(s)."\n'
         config_guard = (
             'if [[ "${OMG_PACMAN_CONF:-}" == */dependency-pacman.conf ]]; then\n'
             '  config_db="${OMG_PACMAN_CONF%/dependency-pacman.conf}/dependency-db"\n'
@@ -321,7 +322,7 @@ class OutputContracts(unittest.TestCase):
             self.assertEqual(evidence[0]['result'], 'FAIL')
             self.assertIn('did not execute the trusted offline DNF5', logs['doctor.log'])
         else:
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 0, f'{result.stderr}\n{logs}')
             self.assertEqual(evidence[0]['result'], 'PASS')
         if distro == 'arch':
             silent_fault = healthy_product
@@ -329,7 +330,9 @@ class OutputContracts(unittest.TestCase):
                                                         native_commands=native, distro=distro)
             self.assertEqual(evidence[0]['result'], 'FAIL', logs)
             self.assertIn('doctor accepted a corrupt Arch local package entry', logs['doctor.log'])
-            spoofed = fault_guard + 'printf %s ' + shlex.quote(healthy + '  Optional tool available: git\n') + '\n'
+            spoofed = (config_guard + fault_guard + 'printf %s '
+                       + shlex.quote(healthy + '  Optional tool available: git\n'
+                                     'System is healthy with 1 warning(s).\n') + '\n')
             result, evidence, logs = self.run_inventory(spoofed, rows, native_commands=native, distro=distro)
             self.assertEqual(evidence[0]['result'], 'FAIL',
                              'a fixed Git verdict must fail under the restricted PATH')

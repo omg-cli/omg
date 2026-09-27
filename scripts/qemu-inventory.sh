@@ -261,6 +261,7 @@ check_arch_doctor_missing_dependency() {
   if [[ "$healthy_rc" != "$baseline_rc" ]] \
     || [[ $(grep -Fc 'ALPM local package database' doctor-config-healthy.stdout.log) != 1 ]] \
     || ! grep -Fq "ALPM local package database ($fixture/local, 1 packages verified)" doctor-config-healthy.stdout.log; then
+    tail -n 40 doctor-config-healthy.stdout.log doctor-config-healthy.stderr.log >&2
     printf 'assertion failed: doctor did not verify the healthy configured Arch database\n' >&2
     return 1
   fi
@@ -282,6 +283,7 @@ check_arch_doctor_missing_dependency() {
     || ! grep -Fq "omg-doctor-unavailable-687" doctor-dependency.stdout.log \
     || ! check_doctor_issue_delta "$baseline_rc" "$baseline_out" "$baseline_err" \
       "$doctor_rc" doctor-dependency.stderr.log 1; then
+    tail -n 40 doctor-dependency.stdout.log doctor-dependency.stderr.log >&2
     printf 'assertion failed: doctor accepted an ALPM database with a missing dependency\n' >&2
     return 1
   fi
