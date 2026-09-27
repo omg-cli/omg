@@ -236,6 +236,35 @@ check_doctor_native_backend() {
       fi ;;
   esac
 }
+
+check_arch_doctor_missing_dependency() {
+  local binary=$1 rowdir=$2 baseline_rc=$3 baseline_out=$4 baseline_err=$5 deadline=$6
+  local fixture="$rowdir/dependency-db" native_rc=0 doctor_rc=0
+  mkdir -p "$fixture/local/omg-doctor-fixture-1.0-1" || return 2
+  cp /var/lib/pacman/local/ALPM_DB_VERSION "$fixture/local/ALPM_DB_VERSION" || return 2
+  printf '%%NAME%%\nomg-doctor-fixture\n\n%%VERSION%%\n1.0-1\n\n%%DEPENDS%%\nomg-doctor-unavailable-687>=1\n\n' \
+    > "$fixture/local/omg-doctor-fixture-1.0-1/desc" || return 2
+  printf '%%FILES%%\nusr/bin/omg-doctor-fixture\n' \
+    > "$fixture/local/omg-doctor-fixture-1.0-1/files" || return 2
+  timeout --kill-after=2s 30s pacman -Dk --dbpath "$fixture" \
+    > native-dependency.stdout.log 2> native-dependency.stderr.log || native_rc=$?
+  if [[ "$native_rc" != 1 ]] \
+    || ! grep -Fq "missing 'omg-doctor-unavailable-687>=1' dependency for 'omg-doctor-fixture'" native-dependency.stderr.log; then
+    printf 'native Arch reference did not identify the controlled missing dependency\n' >&2
+    return 2
+  fi
+  OMG_PACMAN_DB_DIR="$fixture" OMG_DISABLE_DAEMON=1 \
+    timeout --kill-after=5s "$deadline" "$binary" doctor \
+    > doctor-dependency.stdout.log 2> doctor-dependency.stderr.log || doctor_rc=$?
+  if [[ $(grep -Fc 'ALPM local package database' doctor-dependency.stdout.log) != 1 ]] \
+    || ! grep -Fq "ALPM local package database inconsistent ($fixture/local): native pacman -Dk failed" doctor-dependency.stdout.log \
+    || ! grep -Fq "omg-doctor-unavailable-687" doctor-dependency.stdout.log \
+    || ! check_doctor_issue_delta "$baseline_rc" "$baseline_out" "$baseline_err" \
+      "$doctor_rc" doctor-dependency.stderr.log 1; then
+    printf 'assertion failed: doctor accepted an ALPM database with a missing dependency\n' >&2
+    return 1
+  fi
+}
 # END DOCTOR BACKEND ORACLE
 
 # BEGIN INFO NATIVE PACKAGE ORACLE
@@ -1740,7 +1769,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ -n "$counter" ]]; then
     remote+="; $(declare -f check_native_counter)"
   elif [[ "$assertions" == doctor-native-backend ]]; then
-    remote+="; $(declare -f check_doctor_native_backend)"
+    remote+="; $(declare -f check_doctor_native_backend); $(declare -f check_doctor_issue_delta)"
+    if [[ "$distro" == arch ]]; then remote+="; $(declare -f check_arch_doctor_missing_dependency)"; fi
   elif [[ "$assertions" == info-native-package ]]; then
     remote+="; $(declare -f check_info_native_package)"
   elif [[ "$assertions" == status-native-fast || "$assertions" == status-native-full ]]; then
@@ -1821,6 +1851,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote+="; mkdir -p fault-db/local/broken-1.0-1; printf '%%NAME%%\\nbroken\\n\\n%%VERSION%%\\n1.0-1\\n' > fault-db/local/broken-1.0-1/desc"
       remote+="; fault_rc=0; OMG_PACMAN_DB_DIR=\"\$rowdir/fault-db\" OMG_DISABLE_DAEMON=1 timeout --kill-after=5s '$row_timeout' $quoted_binary doctor > doctor-fault.stdout.log 2> doctor-fault.stderr.log || fault_rc=\$?"
       remote+="; if [ \"\$fault_rc\" != 1 ] || ! grep -Fq 'ALPM local package database inconsistent (' doctor-fault.stdout.log; then printf 'assertion failed: doctor accepted a corrupt Arch local package entry\\n' >&2; assertion=1; fi"
+      remote+="; oracle_rc=0; check_arch_doctor_missing_dependency $quoted_binary \"\$rowdir\" \"\$rc\" command.stdout.log command.stderr.log '$row_timeout' || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; assertion=1; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi"
     fi
   fi
   if [[ "$assertions" == doctor-native-backend && "$case" == doctor ]]; then

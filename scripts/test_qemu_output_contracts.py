@@ -286,10 +286,28 @@ class OutputContracts(unittest.TestCase):
                    'if [[ "$1" == doctor ]] && [[ "' + distro + '" == arch ]]; then '
                    'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
                    'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
-        fault_guard = ('if [[ -n "${OMG_PACMAN_DB_DIR:-}" ]]; then '
-                       'printf "  ALPM local package database inconsistent (fixture): missing files\\n"; exit 1; fi\n')
-        product = fault_guard + healthy_product
-        native = {'pacman': 'case "$1" in -Dk) exit 0 ;; -Qq) printf "one\\ntwo\\n" ;; *) exit 17 ;; esac\n'}
+        dependency_guard = (
+            'if [[ "${OMG_PACMAN_DB_DIR:-}" == */dependency-db ]]; then\n'
+            '  printf "  ALPM local package database inconsistent (%s/local): native pacman -Dk failed: '
+            'missing omg-doctor-unavailable-687\\n" "$OMG_PACMAN_DB_DIR"\n'
+            '  printf "Error: doctor found 1 health issue(s)\\n" >&2; exit 1\n'
+            'fi\n'
+        )
+        fault_guard = (
+            'if [[ "${OMG_PACMAN_DB_DIR:-}" == */fault-db ]]; then\n'
+            '  printf "  ALPM local package database inconsistent (fixture): missing files\\n"\n'
+            '  printf "Error: doctor found 1 health issue(s)\\n" >&2; exit 1\n'
+            'fi\n'
+        )
+        product = dependency_guard + fault_guard + healthy_product
+        native = {'pacman':
+                  'case "$1" in\n'
+                  '  -Dk) if [[ "${2:-}" == --dbpath ]]; then\n'
+                  "    printf \"error: missing 'omg-doctor-unavailable-687>=1' dependency "
+                  "for 'omg-doctor-fixture'\\n\" >&2; exit 1; fi; exit 0 ;;\n"
+                  '  -Qq) printf "one\\ntwo\\n" ;;\n'
+                  '  *) exit 17 ;;\n'
+                  'esac\n'}
         result, evidence, logs = self.run_inventory(product, rows, native_commands=native, distro=distro)
         if distro == 'fedora':
             self.assertEqual(result.returncode, 1, result.stderr)
@@ -309,6 +327,12 @@ class OutputContracts(unittest.TestCase):
             self.assertEqual(evidence[0]['result'], 'FAIL',
                              'a fixed Git verdict must fail under the restricted PATH')
             self.assertIn('did not report absent Git/AUR tools', logs['doctor.log'])
+            ignored_dependency = fault_guard + healthy_product
+            result, evidence, logs = self.run_inventory(ignored_dependency, rows,
+                                                        native_commands=native, distro=distro)
+            self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+            self.assertIn('doctor accepted an ALPM database with a missing dependency',
+                          logs['doctor.log'])
         result, evidence, logs = self.run_inventory('printf "Doctor is healthy\\n"\n', rows,
                                                     native_commands=native, distro=distro)
         self.assertEqual(result.returncode, 1, result.stderr)

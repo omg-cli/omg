@@ -204,7 +204,7 @@ async fn add_native_infra_issues(
 ) {
     *issues += match distro {
         Distro::Debian | Distro::Ubuntu => check_debian_infra(),
-        Distro::Arch => check_arch_infra(),
+        Distro::Arch => check_arch_infra().await,
         Distro::Fedora => fedora_check.await,
         Distro::MacOS | Distro::Unknown => 0,
     };
@@ -472,7 +472,7 @@ fn apt_lists_entry_has_index(file_name: &str) -> bool {
 /// the pacman configuration file (`/etc/pacman.conf`) and the ALPM local
 /// package database directory (`/var/lib/pacman/local`).
 #[cfg(feature = "arch")]
-fn check_arch_infra() -> usize {
+async fn check_arch_infra() -> usize {
     if crate::core::paths::test_mode() {
         return 0;
     }
@@ -512,7 +512,14 @@ fn check_arch_infra() -> usize {
 
     let local_dir = crate::core::paths::pacman_local_dir();
     if local_dir.is_dir() {
-        match crate::package_managers::pacman_db::check_local_db_consistency(&local_dir) {
+        let check = async {
+            let packages =
+                crate::package_managers::pacman_db::check_local_db_consistency(&local_dir)?;
+            check_arch_native_db(&local_dir).await?;
+            Ok::<_, anyhow::Error>(packages)
+        }
+        .await;
+        match check {
             Ok(packages) => println!(
                 "  {} ALPM local package database ({}, {packages} packages verified)",
                 style::success("✓"),
@@ -541,9 +548,49 @@ fn check_arch_infra() -> usize {
     issues
 }
 
+/// The shared parser checks that entries are readable, but only ALPM checks
+/// cross-package dependencies, conflicts, and file ownership. `pacman -Dk`
+/// is read-only and offline; use the same local database that Doctor parsed.
+#[cfg(feature = "arch")]
+async fn check_arch_native_db(local_dir: &std::path::Path) -> Result<()> {
+    anyhow::ensure!(
+        local_dir.file_name().is_some_and(|name| name == "local"),
+        "ALPM local package database path must end in 'local' for native pacman -Dk"
+    );
+    let db_path = local_dir
+        .parent()
+        .context("ALPM local package database has no parent directory")?;
+    let mut command =
+        tokio::process::Command::from(crate::core::privilege::system_command("pacman")?);
+    command
+        .args(["-Dk", "--dbpath"])
+        .arg(db_path)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .context("native pacman -Dk timed out")?
+        .context("native pacman -Dk could not run")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr
+            .lines()
+            .find(|line| line.starts_with("error:"))
+            .or_else(|| stderr.lines().find(|line| !line.trim().is_empty()))
+            .map(|line| {
+                style::sanitize_terminal_text(line)
+                    .chars()
+                    .take(160)
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        anyhow::bail!("native pacman -Dk failed ({}): {detail}", output.status);
+    }
+    Ok(())
+}
+
 /// Check network connectivity to backend-appropriate mirrors
 #[cfg(not(feature = "arch"))]
-const fn check_arch_infra() -> usize {
+async fn check_arch_infra() -> usize {
     0
 }
 
