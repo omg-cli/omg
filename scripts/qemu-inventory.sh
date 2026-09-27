@@ -899,6 +899,30 @@ check_product_output() {
   fi
   if [[ "$code" == 0 ]]; then
     case "$assertion" in
+      task-executed)
+        if [[ ! -f smoke-task.marker || -L smoke-task.marker ]] \
+          || [[ $(cat smoke-task.marker) != omg-qemu-smoke-task ]] \
+          || [[ $(grep -Fxc 'smoke-task-ok' "$stdout" || true) != 1 ]]; then
+          printf 'assertion failed: omg run lacks Makefile smoke task execution evidence\n' >&2; return 1
+        fi ;;
+      parallel-tasks-executed)
+        if [[ ! -f parallel-one.done || -L parallel-one.done \
+              || ! -f parallel-two.done || -L parallel-two.done ]] \
+          || [[ $(cat parallel-one.done) != parallel-one \
+              || $(cat parallel-two.done) != parallel-two ]] \
+          || [[ $(grep -Fxc 'parallel-one-ok' "$stdout" || true) != 1 \
+              || $(grep -Fxc 'parallel-two-ok' "$stdout" || true) != 1 ]]; then
+          printf 'assertion failed: omg run --parallel lacks overlapping task execution evidence\n' >&2; return 1
+        fi ;;
+      all-tasks-executed)
+        if [[ ! -f smoke-task.marker || -L smoke-task.marker \
+              || ! -f npm-task.marker || -L npm-task.marker ]] \
+          || [[ $(cat smoke-task.marker) != omg-qemu-smoke-task \
+              || $(cat npm-task.marker) != npm-smoke-task ]] \
+          || [[ $(grep -Fxc 'smoke-task-ok' "$stdout" || true) != 1 \
+              || $(grep -Fxc 'npm-task-ok' "$stdout" || true) != 1 ]]; then
+          printf 'assertion failed: omg run --all lacks Make and npm task execution evidence\n' >&2; return 1
+        fi ;;
       config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults)
         check_config_oracle "$assertion" "$stdout" || return 1 ;;
       privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled)
@@ -1209,7 +1233,25 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in -|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  if [[ "$id" == run ]]; then
+    [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
+    jq -e '. == ["run", "smoke", "--using", "make"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == task-executed ]]; then
+    exit 2
+  fi
+  if [[ "$id" == run-parallel ]]; then
+    [[ "$a" == parallel-tasks-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
+    jq -e '. == ["run", "--parallel", "parallel-one,parallel-two"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == parallel-tasks-executed ]]; then
+    exit 2
+  fi
+  if [[ "$id" == run-all ]]; then
+    [[ "$a" == all-tasks-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
+    jq -e '. == ["run", "--all", "smoke"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == all-tasks-executed ]]; then
+    exit 2
+  fi
   case "$id" in
     install)
       [[ "$a" == package-dry-run-install && "$s" == read && "$resolved" == 0 ]] || exit 2
@@ -1496,7 +1538,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote+="; mkdir -p \"\$OMG_DATA_DIR\"; printf 'queued' > \"\$OMG_DATA_DIR/telemetry_queue.json\""
     fi
   fi
-  remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n' > Makefile"
+  remote+="; export NO_COLOR=1 LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 PATH=$quoted_binary_dir:\"\$PATH\"; git init -q; printf 'smoke:\n\t@printf omg-qemu-smoke-task > smoke-task.marker\n\t@echo smoke-task-ok\nparallel-one:\n\t@touch parallel-one.started\n\t@timeout 15 sh -c \"until test -e parallel-two.started; do sleep 0.05; done\"\n\t@printf parallel-one > parallel-one.done\n\t@echo parallel-one-ok\nparallel-two:\n\t@touch parallel-two.started\n\t@timeout 15 sh -c \"until test -e parallel-one.started; do sleep 0.05; done\"\n\t@printf parallel-two > parallel-two.done\n\t@echo parallel-two-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n' > Makefile"
+  if [[ "$case" == run-all ]]; then
+    remote+="; mkdir -p \"\$rowdir/run-all-bin\"; printf '#!/bin/sh\ncase \$1:\$2 in\n  --version:) echo 9.0.0 ;;\n  run:smoke) printf npm-smoke-task > npm-task.marker; echo npm-task-ok ;;\n  *) exit 96 ;;\nesac\n' > \"\$rowdir/run-all-bin/npm\"; printf '#!/bin/sh\necho v24.0.0\n' > \"\$rowdir/run-all-bin/node\"; chmod 755 \"\$rowdir/run-all-bin/npm\" \"\$rowdir/run-all-bin/node\"; export PATH=\"\$rowdir/run-all-bin:\$PATH\"; printf '%s\n' '{\"scripts\":{\"smoke\":\"echo npm-task-ok\"}}' > package.json"
+  fi
   if [[ "$assertions" == audit-source-failure || "$assertions" == sbom-source-failure ]]; then
     # DNF5 can satisfy an offline advisory query from a previous row's cache.
     # A daemon launched by an earlier inventory row can also answer the audit

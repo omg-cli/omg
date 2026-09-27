@@ -14,6 +14,62 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class OutputContracts(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_run_requires_the_make_task_to_execute(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('run\t'))
+        self.assertEqual(row.split('\t')[8], 'task-executed')
+        for product, expected, explanation in (
+            ('exit 0\n', 'FAIL', 'silent success'),
+            ("printf 'smoke-task-ok\\n'\n", 'FAIL', 'forged stdout'),
+            ('make smoke\n', 'PASS', 'executed task'),
+        ):
+            with self.subTest(explanation=explanation):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_run_parallel_requires_two_overlapping_tasks(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('run-parallel\t'))
+        self.assertEqual(row.split('\t')[8], 'parallel-tasks-executed')
+        concurrent = ('make parallel-one & first=$!\n'
+                      'make parallel-two & second=$!\n'
+                      'wait "$first" && wait "$second"\n')
+        for product, expected, explanation in (
+            ('exit 0\n', 'FAIL', 'silent success'),
+            ("printf 'parallel-one-ok\\nparallel-two-ok\\n'\n", 'FAIL', 'forged stdout'),
+            ('make parallel-one; make parallel-two; exit 0\n', 'FAIL', 'serial execution'),
+            (concurrent, 'PASS', 'overlapping execution'),
+        ):
+            with self.subTest(explanation=explanation):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_run_all_requires_make_and_node_task_dispatch(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('run-all\t'))
+        self.assertEqual(row.split('\t')[8], 'all-tasks-executed')
+        for product, expected, explanation in (
+            ('exit 0\n', 'FAIL', 'silent success'),
+            ('make smoke\n', 'FAIL', 'make only'),
+            ('npm run smoke\n', 'FAIL', 'npm only'),
+            ('make smoke && npm run smoke\n', 'PASS', 'both ecosystems'),
+        ):
+            with self.subTest(explanation=explanation):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_package_dry_runs_reject_success_without_a_preview(self):
         release = Path('/etc/os-release').read_text(encoding='utf-8')
         match = re.search(r'^ID=(\S+)$', release, re.MULTILINE)
