@@ -35,6 +35,8 @@ GUEST_FILES = {
     "aur-search-flags.json", "aur-fixture-events.jsonl", "aur-detailed.json",
     "aur-no-aur.json", "aur-basic.json", "aur-cert.log", "aur-fixture-preflight.log",
     "aur-fixture.stdout", "aur-fixture.stderr",
+    "doctor-connectivity-fallback.json", "doctor-connectivity-fallback.log",
+    "doctor-connectivity-cert.log",
     "daemon-advisory-shutdown.log",
     "daemon-direct-before-search.prom", "daemon-direct-after-search.prom",
     "daemon-direct-after-info.prom",
@@ -52,6 +54,12 @@ GUEST_FILES = {
     "installed-after.txt", "repository-hashes.txt", "guest-metadata.txt",
     "inventory-setup.txt", "container-engine.txt", "rust-toolchain.txt",
 }
+GUEST_FILES.update(
+    f"doctor-connectivity-{mode}.{suffix}"
+    for mode in ("primary", "alternate")
+    for suffix in ("stdout", "stderr", "events.jsonl", "preflight.log",
+                   "fixture.stdout", "fixture.stderr")
+)
 GUEST_FILES.update(
     f"daemon-invalid-{index}.{stream}"
     for index in range(7)

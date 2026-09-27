@@ -145,7 +145,7 @@ check_outdated_native_count() {
 
 # BEGIN DOCTOR BACKEND ORACLE
 check_doctor_native_backend() {
-  local distro=$1 output=$2 os_release=${3:-/etc/os-release} exec_receipt=${4:-} guest_id expected
+  local distro=$1 output=$2 os_release=${3:-/etc/os-release} exec_receipt=${4:-} restricted_path=${5:-false} guest_id expected
   if [[ ! -f "$os_release" ]]; then
     printf 'native doctor reference lacks an os-release file\n' >&2
     return 2
@@ -165,6 +165,27 @@ check_doctor_native_backend() {
     || [[ $(grep -Ec '^  (Arch Linux detected|Debian/Ubuntu detected \(apt backend\)|Fedora/RHEL detected \(dnf backend\))$' "$output") != 1 ]]; then
     printf 'assertion failed: doctor did not identify the native %s backend exactly once\n' "$distro" >&2
     return 1
+  fi
+  if grep -Eq 'dependency: (curl|tar)$' "$output"; then
+    printf 'assertion failed: doctor invented host curl or tar dependencies\n' >&2
+    return 1
+  fi
+  if [[ $(id -u) != 0 && $(grep -Fxc '  Found dependency: sudo' "$output") != 1 ]]; then
+    printf 'assertion failed: doctor did not verify trusted sudo for the unprivileged guest user\n' >&2
+    return 1
+  fi
+  if [[ "$distro" == debian || "$distro" == ubuntu ]] \
+    && [[ $(grep -Fxc '  Found dependency: apt-get' "$output") != 1 ]]; then
+    printf 'assertion failed: doctor did not verify trusted apt-get\n' >&2
+    return 1
+  fi
+  if [[ "$restricted_path" == true ]]; then
+    if [[ $(grep -Fc 'Optional tool unavailable: git' "$output") != 1 ]] \
+      || { [[ "$distro" == arch ]] \
+        && [[ $(grep -Fc 'Optional tool unavailable: makepkg' "$output") != 1 ]]; }; then
+      printf 'assertion failed: doctor did not report absent Git/AUR tools as optional\n' >&2
+      return 1
+    fi
   fi
   case "$distro" in
     arch)
@@ -763,6 +784,15 @@ if distro not in ('arch', 'debian', 'ubuntu', 'fedora'):
 text = Path(output).read_text()
 if text.count('Network Diagnostics\n') != 1 or text.count('DNS Resolution:\n') != 1:
     raise SystemExit('assertion failed: missing or duplicated doctor network sections')
+basic = text.split('Network Diagnostics\n', 1)[0]
+basic_failures = re.findall(r'^  Connectivity probes failed \((.+)\)$', basic, re.MULTILINE)
+basic_hosts = ['archlinux.org', 'kernel.org'] if distro == 'arch' else ['github.com', 'kernel.org']
+if (len(basic_failures) != 1 or
+        not basic_failures[0].startswith(basic_hosts[0] + ': ') or
+        '; ' + basic_hosts[1] + ': ' not in basic_failures[0] or
+        basic_failures[0].endswith(basic_hosts[1] + ': ') or
+        re.search(r'(?i)\bhealthy\b', basic_failures[0])):
+    raise SystemExit('assertion failed: offline doctor basic connectivity did not fail both independent endpoints')
 section = text.split('Network Diagnostics\n', 1)[1].split('DNS Resolution:\n', 1)
 mirror_rows = [re.fullmatch(r'  ([✓✗⚠]) (.+?) \((.+)\)', line) for line in section[0].splitlines() if line.strip()]
 dns_rows = [re.fullmatch(r'    ([✓✗]) (\S+) \((.+)\)', line) for line in section[1].splitlines() if line.startswith('    ')]
@@ -1793,6 +1823,26 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote+="; if [ \"\$fault_rc\" != 1 ] || ! grep -Fq 'ALPM local package database inconsistent (' doctor-fault.stdout.log; then printf 'assertion failed: doctor accepted a corrupt Arch local package entry\\n' >&2; assertion=1; fi"
     fi
   fi
+  if [[ "$assertions" == doctor-native-backend && "$case" == doctor ]]; then
+    # The release binary must remain healthy when optional host executables
+    # are absent from its PATH. Its backend and sudo checks still resolve real
+    # native system tools, so the second run cannot pass by skipping them.
+    remote+="; doctor_path=$quoted_binary_dir; for optional in curl tar git; do if env PATH=\"\$doctor_path\" /bin/bash -c 'command -v \"\$1\" >/dev/null' _ \"\$optional\"; then printf 'assertion failed: controlled doctor PATH still exposes %s\\n' \"\$optional\" >&2; execution_phase=dependency; rc=2; assertion=1; break; fi; done"
+    if [[ "$distro" == arch ]]; then
+      remote+="; if [ \"\$assertion\" = 0 ] && env PATH=\"\$doctor_path\" /bin/bash -c 'command -v makepkg >/dev/null'; then printf 'assertion failed: controlled doctor PATH still exposes makepkg\\n' >&2; execution_phase=dependency; rc=2; assertion=1; fi"
+    fi
+    if [[ "$distro" == fedora ]]; then
+      remote+="; if [ \"\$assertion\" = 0 ]; then run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve -o doctor.minimal.exec.log env PATH=\"\$doctor_path\" $quoted_binary doctor > doctor.minimal.stdout.log 2> doctor.minimal.stderr.log; fi"
+    else
+      remote+="; if [ \"\$assertion\" = 0 ]; then run_omg '$command_timeout' env PATH=\"\$doctor_path\" $quoted_binary doctor > doctor.minimal.stdout.log 2> doctor.minimal.stderr.log; fi"
+    fi
+    remote+="; if [ \"\$assertion\" = 0 ]; then cat doctor.minimal.stdout.log doctor.minimal.stderr.log >&2; if [ \"\$execution_phase\" != product ] || [ \"\$rc\" != 0 ]; then printf 'assertion failed: doctor could not run with optional tools absent\\n' >&2; assertion=1; fi; fi"
+    if [[ "$distro" == fedora ]]; then
+      remote+="; if [ \"\$assertion\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' doctor.minimal.stdout.log /etc/os-release doctor.minimal.exec.log true || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+    else
+      remote+="; if [ \"\$assertion\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' doctor.minimal.stdout.log /etc/os-release '' true || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+    fi
+  fi
   if [[ "$assertions" == info-native-package ]]; then
     remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_info_native_package '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
   fi
@@ -1845,7 +1895,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   start_centis=${uptime/./}
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
-  if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state ]]; then budget=$((budget + row_timeout + 5)); fi
+  if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state || "$assertions" == doctor-native-backend ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == outdated-native-count || "$assertions" == outdated-json-native-count ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == status-native-fast ]]; then budget=$((budget + 64)); fi

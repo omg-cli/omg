@@ -46,10 +46,10 @@ class DaemonContractTests(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, passed, result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'guest dependency setup requires POSIX bash')
-    def test_guest_query_tools_are_installed_with_benchmarks_disabled(self):
+    def test_guest_daemon_and_doctor_tools_are_installed_without_benchmark(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
-        setup = source.split('guest_tools=(jq)', 1)[1].split("printf 'daemon lifecycle start", 1)[0]
-        setup = 'guest_tools=(jq)' + setup
+        setup = source.split('guest_tools=(', 1)[1].split("printf 'daemon lifecycle start", 1)[0]
+        setup = 'guest_tools=(' + setup
         for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
             for benchmark in ('true', 'false'):
                 with self.subTest(distro=distro, benchmark=benchmark):
@@ -60,6 +60,9 @@ class DaemonContractTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     args = result.stdout.splitlines()
                     self.assertEqual(args.count('jq'), 1)
+                    self.assertEqual(args.count('openssl'), 1)
+                    self.assertEqual(args.count('python' if distro == 'arch' else 'python3'), 1)
+                    self.assertEqual(args.count('python3' if distro == 'arch' else 'python'), 0)
                     self.assertEqual(args.count('hyperfine'), int(benchmark == 'true'))
 
     def test_query_parity_receipt_is_mandatory(self):
@@ -241,6 +244,9 @@ class DaemonContractTests(unittest.TestCase):
         good = dict(schema_version=1, direct=True, foreground=True, ipc=True,
                     singleton=True, shutdown=True, restart=True, query_parity=True, sigint=True,
                     cleanup=True, backend_faults=['dnf-reason-refusal'])
+        doctor = dict(schema_version=1, distro='fedora', primary='github.com',
+                      alternate='kernel.org', real_cli=True, baseline_issues=0,
+                      fallback_issues=0)
         cases = [(good, True), (None, False)]
         for key in good:
             missing = dict(good)
@@ -258,11 +264,50 @@ class DaemonContractTests(unittest.TestCase):
                 root = Path(directory)
                 evidence = root / 'guest/evidence'
                 evidence.mkdir(parents=True)
+                (evidence / 'doctor-connectivity-fallback.json').write_text(json.dumps(doctor))
                 if receipt is not None:
                     (evidence / 'daemon-lifecycle.json').write_text(receipt)
                 result = subprocess.run([BASH, '-euc', gate], env=dict(os.environ, work=root.as_posix(), distro='fedora'),
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, expected, result.stderr)
+
+    def test_doctor_connectivity_receipt_rejects_missing_and_false_claims(self):
+        if not shutil.which('jq'):
+            self.skipTest('jq required')
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        gate = source.split('  doctor_receipt=', 1)[1].split('  if [[ "$distro" == arch ]]', 1)[0]
+        gate = 'doctor_receipt=' + gate
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            good = dict(schema_version=1, distro=distro,
+                        primary='archlinux.org' if distro == 'arch' else 'github.com',
+                        alternate='kernel.org', real_cli=True, baseline_issues=0,
+                        fallback_issues=0)
+            cases = [(good, True), (None, False),
+                     (dict(good, baseline_issues=1), False),
+                     (dict(good, fallback_issues=1), False),
+                     (dict(good, real_cli=False), False),
+                     (dict(good, primary='wrong.example'), False),
+                     (dict(good, distro='wrong'), False)]
+            for key in good:
+                missing = dict(good)
+                del missing[key]
+                cases.append((missing, False))
+                cases.append((dict(good, **{key: '0' if key.endswith('_issues') else 'true'}), False))
+            cases.extend([('{}\n' + json.dumps(good), False),
+                          (json.dumps(good) + '\n' + json.dumps(good), False),
+                          (json.dumps(dict(good, padding='x' * 4096)), False)])
+            for receipt, expected in cases:
+                with self.subTest(distro=distro, receipt=receipt), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    evidence = root / 'guest/evidence'
+                    evidence.mkdir(parents=True)
+                    if receipt is not None:
+                        (evidence / 'doctor-connectivity-fallback.json').write_text(
+                            receipt if isinstance(receipt, str) else json.dumps(receipt))
+                    result = subprocess.run([BASH, '-euc', gate],
+                                            env=dict(os.environ, work=root.as_posix(), distro=distro),
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode == 0, expected, result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'guest cleanup requires POSIX bash')
     def test_daemon_cleanup_removes_owned_state_and_rejects_incomplete_removal(self):

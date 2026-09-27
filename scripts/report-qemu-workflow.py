@@ -182,12 +182,24 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                     candidates = [parent / "rows" / f"{case}{suffix}.log"
                                   for suffix in (".stderr", ".stdout")]
                 elif case in ("lifecycle", "aarch64-lifecycle"):
-                    candidates = [parent / name for name in (
-                        "kvm-probe.log", "health-validation.log", "transactions.log",
-                        "transaction-validation.log", "guest-check.log", "boot.log",
-                        "guest/evidence/index-update.txt",
-                        "guest/evidence/daemon-direct.log",
-                        "guest/evidence/daemon-advisory-shutdown.log")]
+                    doctor_log = parent / "guest/evidence/doctor-connectivity-fallback.log"
+                    doctor_member = members_by_name.get(str(doctor_log))
+                    if doctor_member is not None and 0 < doctor_member.file_size <= 8 * 1024 * 1024:
+                        # Successful probes leave this log empty. On a Doctor
+                        # failure, keep its exact reason ahead of routine boot
+                        # and package setup output in the bounded issue excerpt.
+                        candidates = [parent / name for name in (
+                            "guest/evidence/doctor-connectivity-fallback.log",
+                            "guest/evidence/doctor-connectivity-primary.preflight.log",
+                            "guest/evidence/doctor-connectivity-alternate.preflight.log",
+                            "guest-check.log")]
+                    else:
+                        candidates = [parent / name for name in (
+                            "kvm-probe.log", "health-validation.log", "transactions.log",
+                            "transaction-validation.log", "guest-check.log", "boot.log",
+                            "guest/evidence/index-update.txt",
+                            "guest/evidence/daemon-direct.log",
+                            "guest/evidence/daemon-advisory-shutdown.log")]
                 else:
                     candidates = []
                 excerpts = []

@@ -30,6 +30,22 @@ TRANSACTION_PRIVATE = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_doctor_connectivity_evidence_is_bounded_to_guest_diagnostics(self):
+        names = ("doctor-connectivity-fallback.json", "doctor-connectivity-fallback.log",
+                 "doctor-connectivity-cert.log")
+        names += tuple(f"doctor-connectivity-{mode}.{suffix}"
+                       for mode in ("primary", "alternate")
+                       for suffix in ("stdout", "stderr", "events.jsonl", "preflight.log",
+                                      "fixture.stdout", "fixture.stderr"))
+        for name in names:
+            with self.subTest(name=name):
+                self.assertTrue(exporter.allowed_file(("run-test", "guest", "evidence", name)))
+                self.assertFalse(exporter.allowed_file(("run-test", name)))
+                self.assertFalse(exporter.allowed_file(("run-test", "guest", "evidence", "config", name)))
+                self.assertFalse(exporter.allowed_file(("run-test", "guest", "evidence", name + ".bak")))
+        for name in ("ca.key", "ca.pem", "server.key", "server.pem", "server.csr"):
+            self.assertFalse(exporter.allowed_file(("run-test", "guest", "evidence", name)))
+
     def test_aur_flag_evidence_exports_without_ephemeral_keys(self):
         for name in ("aur-search-flags.json", "aur-fixture-events.jsonl",
                      "aur-detailed.json", "aur-no-aur.json", "aur-basic.json",
@@ -191,6 +207,26 @@ class DescriptorTests(unittest.TestCase):
                 f"omg_info_requests_total {index}\n".encode(),
             )
         self.assertFalse((self.destination / (prefix + "daemon-direct-private.prom")).exists())
+
+    def test_doctor_connectivity_failure_logs_survive_export_without_keys(self):
+        prefix = "run-test/guest/evidence/"
+        names = ("doctor-connectivity-fallback.log",
+                 "doctor-connectivity-alternate.stdout",
+                 "doctor-connectivity-alternate.stderr",
+                 "doctor-connectivity-alternate.events.jsonl",
+                 "doctor-connectivity-alternate.preflight.log")
+        for name in names:
+            self.fixture(prefix + name, ("diagnostic:" + name).encode())
+        self.fixture(prefix + "ca.key", b"private-ca-key")
+        self.fixture(prefix + "server.key", b"private-server-key")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(set(report["copied"]), {prefix + name for name in names})
+        for name in names:
+            self.assertEqual((self.destination / (prefix + name)).read_bytes(),
+                             ("diagnostic:" + name).encode())
+        self.assertFalse((self.destination / (prefix + "ca.key")).exists())
+        self.assertFalse((self.destination / (prefix + "server.key")).exists())
 
     def test_symlink_hardlink_and_fifo_cannot_export_external_bytes(self):
         external = self.root / "private"
