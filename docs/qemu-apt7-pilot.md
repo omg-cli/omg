@@ -12,9 +12,11 @@ failure. The final result job fails when a selected guest or build fails.
 The pilot does not change the four required QEMU Matrix lanes. It does not run
 the published-release, ARM, network, PTY, nested-container, or native
 transaction-benchmark tiers. The trusted `QEMU Failure Reporting` workflow
-currently tracks QEMU Matrix and CI on `main`; inspect pilot artifacts and
-job conclusions directly. Keep the pilot manual until both hosted guest
-artifacts pass and their inventory admission receipts are reviewed.
+files a separate issue for each failed pilot guest on `main`, or a workflow
+issue when the build or setup fails before a guest runs. It uses validated job
+conclusions and links to the run; inspect guest artifacts for the actual
+failure. Keep the pilot manual until both hosted guest artifacts pass and
+their inventory admission receipts are reviewed.
 
 Image pins are in `tests/qemu-image-provenance/apt7-manifest.json`. Debian's
 dated Trixie image is checked against its SHA512 digest. Ubuntu's dated 26.04
