@@ -326,6 +326,12 @@ assert_rc 0 "$runner" "${family_args[@]}" --staged-dir "$scratch/valid" --eviden
 grep -Fxq 'OMG_PROBE_INDEX_CMD=pacman-key --init && pacman-key --populate archlinux && pacman -Syu --noconfirm' "$FAKE_ENGINE_ARGS" || fail "Arch setup must initialize trust and perform a full upgrade"
 unset FAKE_ENGINE_ARGS
 [[ "$(grep -c '"case_id"' "$(results_file "$scratch/family-evidence")")" -eq 3 ]] || fail "package family did not select three contracts"
+assert_rc 2 "$runner" "${family_args[@]}" --case release-package-rollback-tree \
+  --staged-dir "$scratch/valid" --evidence-dir "$scratch/rollback-qemu-only"
+grep -Fq 'no release contracts match' "$scratch/command.out" || fail 'QEMU-only rollback was selected for archive smoke'
+if grep -Fq '  release-package-rollback-tree' "$scratch/command.out"; then
+  fail 'QEMU-only rollback was advertised as an archive smoke contract'
+fi
 grep -R -q 'install --yes tree' "$scratch/family-evidence" || fail "install probe did not preserve canonical --yes"
 grep -R -q 'remove --yes tree' "$scratch/family-evidence" || fail "remove probe did not preserve canonical --yes"
 if grep -R -E '(install|remove) -y tree' "$scratch/family-evidence" >/dev/null; then
