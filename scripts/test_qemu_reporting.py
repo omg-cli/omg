@@ -1,11 +1,13 @@
 import copy
 import importlib.util
+import hashlib
 import io
 import json
 from pathlib import Path
 import stat
 import os
 import tempfile
+from contextlib import nullcontext
 from unittest.mock import patch
 import unittest
 import zipfile
@@ -28,6 +30,53 @@ class ReportingBoundaryTests(unittest.TestCase):
             info.external_attr = mode << 16
             archive.writestr(info, content)
         return output.getvalue()
+
+    def test_published_inventory_rechecks_exported_selection_and_admission(self):
+        profile = "hermetic,qemu,container,network,pty"
+        inventory = ("case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\t"
+                     "targets\tassertions\tcleanup\n"
+                     'search\t["search","tree"]\tread\t0\tpass\t-\thermetic\t'
+                     'hermetic:pass\t-\tnone\n').encode()
+        digest = hashlib.sha256(inventory).hexdigest()
+        policy = json.dumps({"profiles": {profile: profile.split(",")},
+                             "inventories": {digest: {"cases": [{
+                                 "id": "search", "tiers": ["hermetic"],
+                                 "network_scope": "offline", "allowed_skips": {},
+                             }]}}}).encode()
+        result = dict(case_id="qemu-arch-search", distro="arch", result="PASS",
+                      artifact_source="inventory", exit_code=0, elapsed_seconds=1,
+                      network_scope="offline")
+        admission = dict(schema_version=1, inventory_sha256=digest,
+                         counts=dict(selected=1, executed=1, passed=1, failed=0,
+                                     blocked=0, harness_error=0, skipped=0),
+                         allowed_skips={}, passed=True)
+        files = {
+            "run-a/cases.tsv": inventory,
+            "run-a/inventory/results.json": json.dumps([result]),
+            "run-a/inventory/summary.json": '{"complete":true,"pass":1,"fail":0,"skipped":0}',
+            "run-a/inventory-admission.json": json.dumps(admission),
+        }
+
+        def artifact(entries):
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w") as archive:
+                for name, value in entries.items():
+                    archive.writestr(name, value)
+            return output.getvalue()
+
+        self.assertIsNone(REPORT.published_inventory_admission(artifact(files), "arch", policy))
+        for missing in files:
+            with self.subTest(missing=missing), self.assertRaises(ValueError):
+                REPORT.published_inventory_admission(
+                    artifact({name: value for name, value in files.items() if name != missing}),
+                    "arch", policy)
+        tampered = dict(files, **{"run-a/inventory/results.json": json.dumps([
+            dict(result, result="SKIPPED", exit_code=-1)])})
+        with self.assertRaises(ValueError):
+            REPORT.published_inventory_admission(artifact(tampered), "arch", policy)
+        extra = dict(files, **{"run-b/results.json": "[]"})
+        with self.assertRaises(ValueError):
+            REPORT.published_inventory_admission(artifact(extra), "arch", policy)
 
     def test_projection_removes_untrusted_fields_without_extraction(self):
         row = dict(self.row(), command="do not execute", environment={"secret": "private"})
@@ -645,7 +694,8 @@ class ReportingBoundaryTests(unittest.TestCase):
                            jobs=None, prior_attempt_artifact=False,
                            retained_guest_artifacts=False, arm_rows=None, arm_log=None,
                             arm_first=False, arm_provenance_override=None,
-                            no_artifacts=False, artifact_listing_error=False):
+                             no_artifacts=False, artifact_listing_error=False,
+                             verify_published_inventory=False):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -761,11 +811,13 @@ class ReportingBoundaryTests(unittest.TestCase):
             path = Path(directory)
             event_path = path / "event.json"
             event_path.write_text(json.dumps(event))
+            admission_stub = (nullcontext() if verify_published_inventory else
+                              patch.object(REPORT, "published_inventory_admission"))
             with patch.dict(os.environ, GITHUB_REPOSITORY="owner/repo", GITHUB_EVENT_PATH=str(event_path),
-                            RUNNER_TEMP=directory, GITHUB_RUN_ID="50"), \
-                 patch.object(REPORT, "api", side_effect=api), \
-                 patch.object(REPORT, "canonical_case_ids", return_value={row["case_id"] for row in rows}), \
-                 patch.object(REPORT.subprocess, "run", side_effect=subprocess_run):
+                             RUNNER_TEMP=directory, GITHUB_RUN_ID="50"), \
+                  patch.object(REPORT, "api", side_effect=api), \
+                  patch.object(REPORT, "canonical_case_ids", return_value={row["case_id"] for row in rows}), \
+                  patch.object(REPORT.subprocess, "run", side_effect=subprocess_run), admission_stub:
                 if changed_attempt:
                     with self.assertRaisesRegex(ValueError, "identity or attempt mismatch"):
                         REPORT.main()
@@ -789,6 +841,37 @@ class ReportingBoundaryTests(unittest.TestCase):
             exit_code=0, elapsed_seconds=0)])
         self.assertNotIn("--failures-only", calls[0][3])
         self.assertEqual(catalog["failures"], [])
+
+    def test_published_success_missing_cli_evidence_reports_harness_failure(self):
+        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-lifecycle")
+                for distro in REPORT.DISTROS]
+        calls, catalog = self.run_report_fixture(
+            rows, conclusion="success", event_kind="workflow_dispatch", all_distros=True,
+            verify_published_inventory=True)
+        issue_calls = [call for call in calls if call[0] == "scripts/qa-file-issue.sh"]
+        self.assertEqual(len(issue_calls), 1)
+        self.assertEqual(issue_calls[0][1], [dict(
+            case_id="qemu-matrix-x86-workflow", distro="matrix", result="HARNESS_ERROR",
+            exit_code=1, elapsed_seconds=0)])
+        self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+        self.assertEqual(catalog["failures"], issue_calls[0][1])
+
+    def test_staged_schedule_does_not_require_published_inventory_receipt(self):
+        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
+                for distro in REPORT.DISTROS]
+        calls, catalog = self.run_report_fixture(
+            rows, conclusion="success", event_kind="schedule", all_distros=True,
+            provenance_override={"staged": True}, verify_published_inventory=True)
+        self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
+
+    def test_failed_guest_diagnostic_does_not_require_success_admission(self):
+        calls, catalog = self.run_report_fixture(
+            [self.row("FAIL")], conclusion="failure", event_kind="schedule",
+            verify_published_inventory=True)
+        issue_calls = [call for call in calls if call[0] == "scripts/qa-file-issue.sh"]
+        self.assertEqual(issue_calls[0][1][0]["case_id"], "qemu-arch-search")
+        self.assertFalse(catalog["evidence_invalid_or_unavailable"])
 
     def test_staged_main_success_never_closes_published_issue(self):
         calls, catalog = self.run_report_fixture([self.row("PASS")], conclusion="success")

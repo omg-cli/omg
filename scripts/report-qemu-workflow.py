@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Report QEMU evidence from a trusted workflow_run job without executing it."""
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -423,6 +424,43 @@ def published_provenance(content, distro, revision):
     return provenance["artifact_tag"], provenance["inventory_revision"]
 
 
+def published_inventory_admission(content, distro, policy_bytes):
+    """Re-admit the exported CLI selection before reporting published PASS rows."""
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        members = archive.infolist()
+        admissions = [member.filename for member in members
+                      if re.fullmatch(r"run-[A-Za-z0-9-]+/inventory-admission\.json", member.filename)]
+        if len(admissions) != 1:
+            raise ValueError("published guest lacks one inventory admission")
+        run_root = admissions[0].split("/", 1)[0]
+        if any((parts := PurePosixPath(member.filename).parts)
+               and parts[0].startswith("run-") and parts[0] != run_root
+               for member in members):
+            raise ValueError("published guest has multiple run roots")
+        names = {
+            "inventory": f"{run_root}/cases.tsv",
+            "results": f"{run_root}/inventory/results.json",
+            "summary": f"{run_root}/inventory/summary.json",
+            "admission": admissions[0],
+        }
+        content_by_name = {}
+        for key, name in names.items():
+            matches = [member for member in members if member.filename == name]
+            if len(matches) != 1 or matches[0].file_size > 1024 * 1024:
+                raise ValueError("published guest lacks bounded CLI evidence")
+            content_by_name[key] = archive.read(matches[0])
+    checker_path = Path(__file__).with_name("check-qemu-inventory.py")
+    spec = importlib.util.spec_from_file_location("qemu_inventory_admission", checker_path)
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    admitted = checker.admit_contents(
+        policy_bytes, content_by_name["inventory"], content_by_name["results"],
+        content_by_name["summary"], distro, "hermetic,qemu,container,network,pty")
+    receipt = json.loads(content_by_name["admission"], object_pairs_hook=unique_object)
+    if admitted["passed"] is not True or receipt != admitted:
+        raise ValueError("published CLI inventory failed admission")
+
+
 def failed_lane_guests(jobs):
     guests = set()
     for job in jobs:
@@ -569,9 +607,8 @@ def main():
     if type(run_id) is not int or run_id <= 0:
         raise ValueError("invalid run ID")
     run = identity(event, json.loads(api(f"repos/{repository}/actions/runs/{run_id}")), repository)
-    allowed_cases = canonical_case_ids(json.loads(
-        Path("tests/qemu-inventory-policy.json").read_text()
-    ))
+    policy_bytes = Path("tests/qemu-inventory-policy.json").read_bytes()
+    allowed_cases = canonical_case_ids(json.loads(policy_bytes))
     # Superseding an interactive run is not itself a product failure.
     if run["conclusion"] in ("cancelled", "skipped"):
         print("Cancelled/skipped run retained in Actions; no failure issue generated")
@@ -622,6 +659,8 @@ def main():
             rows.extend(artifact_rows)
             guest_artifacts.add(artifact["name"])
             if published_candidate and artifact["name"].startswith("qemu-evidence-"):
+                if published_provenance(content, guest[0], run["head_sha"]) is not None:
+                    published_inventory_admission(content, guest[0], policy_bytes)
                 if artifact["name"] in published_artifacts:
                     raise ValueError("duplicate published guest artifact")
                 published_artifacts[artifact["name"]] = content
