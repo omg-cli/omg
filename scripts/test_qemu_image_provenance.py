@@ -23,7 +23,8 @@ class ImageProvenanceTests(unittest.TestCase):
     def test_current_pins_have_exact_reviewed_policies(self):
         bash = os.environ.get("OMG_TEST_BASH") or shutil.which("bash")
         self.assertIsNotNone(bash)
-        lines = subprocess.check_output([bash, str(ROOT / "scripts/benchmark-qemu.sh"), "--print-pins"], text=True).splitlines()
+        lines = subprocess.check_output([bash, "scripts/benchmark-qemu.sh", "--print-pins"],
+                                        cwd=ROOT, text=True).splitlines()
         self.assertEqual(len(lines), 7)
         for line in lines:
             distro, arch, url, digest, algorithm, _ = line.split("\t")
@@ -66,7 +67,9 @@ class ImageProvenanceTests(unittest.TestCase):
         source = (ROOT / "scripts/benchmark-qemu.sh").read_text()
         self.assertLess(source.index('"$here/verify-qemu-image.py"'), source.index("qemu-img info base.qcow2"))
         workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
-        self.assertEqual(workflow.count("--image-policy tests/qemu-image-provenance/manifest.json"), 2)
+        self.assertEqual(workflow.count("--image-policy tests/qemu-image-provenance/manifest.json"), 1)
+        self.assertIn("default: tests/qemu-image-provenance/manifest.json", workflow)
+        self.assertIn('--image-policy "${{ inputs.image-policy }}"', workflow)
 
 
 if __name__ == "__main__":

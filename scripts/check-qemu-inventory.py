@@ -9,6 +9,8 @@ from pathlib import Path
 LIMIT = 1024 * 1024
 HEADER = "case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup"
 DISTROS = {"arch", "debian", "ubuntu", "fedora"}
+IDENTITIES = {"arch": "arch", "debian": "debian", "ubuntu": "ubuntu",
+              "fedora": "fedora", "debian13": "debian", "ubuntu2604": "ubuntu"}
 EXIT = re.compile(r"(?:0|[1-9][0-9]{0,2})\Z")
 MAPPED_EXIT = re.compile(r"(arch|debian|ubuntu|fedora):(0|[1-9][0-9]{0,2})\Z")
 
@@ -71,15 +73,18 @@ def inventory_exits(content, distro):
     return exits
 
 
-def admit_contents(policy_bytes, inventory_bytes, results_bytes, summary_bytes, distro, tiers):
+def admit_contents(policy_bytes, inventory_bytes, results_bytes, summary_bytes, distro, tiers, identity=None):
+    identity = identity or distro
+    if IDENTITIES.get(identity) != distro:
+        raise ValueError("inventory identity does not match guest backend")
     rules = json.loads(policy_bytes, object_pairs_hook=unique_object)
     digest = hashlib.sha256(inventory_bytes).hexdigest()
     selection = rules["inventories"][digest]
     exits = inventory_exits(inventory_bytes, distro)
     profile = rules["profiles"][tiers]
-    expected = {"qemu-" + distro + "-" + row["id"]: row
+    expected = {"qemu-" + identity + "-" + row["id"]: row
                 for row in selection["cases"] if set(row["tiers"]) & set(profile)}
-    if any(case.removeprefix("qemu-" + distro + "-") not in exits for case in expected):
+    if any(case.removeprefix("qemu-" + identity + "-") not in exits for case in expected):
         raise ValueError("selected case absent from inventory")
     rows = json.loads(results_bytes, object_pairs_hook=unique_object)
     completion = json.loads(summary_bytes, object_pairs_hook=unique_object)
@@ -96,7 +101,7 @@ def admit_contents(policy_bytes, inventory_bytes, results_bytes, summary_bytes, 
         if not isinstance(case, str) or case not in expected or case in seen:
             raise ValueError("duplicate, substituted or unknown case")
         seen.add(case)
-        if row.get("distro") != distro or row.get("artifact_source") != "inventory":
+        if row.get("distro") != identity or row.get("artifact_source") != "inventory":
             raise ValueError("foreign case identity")
         verdict = row.get("result")
         code = row.get("exit_code")
@@ -111,7 +116,7 @@ def admit_contents(policy_bytes, inventory_bytes, results_bytes, summary_bytes, 
         elif verdict in ("PASS", "FAIL"):
             if code < 0:
                 raise ValueError("executed case lacks an exit code")
-            if verdict == "PASS" and code != exits[case.removeprefix("qemu-" + distro + "-")]:
+            if verdict == "PASS" and code != exits[case.removeprefix("qemu-" + identity + "-")]:
                 raise ValueError("PASS exit disagrees with inventory")
             scope = expected[case]["network_scope"]
             if scope not in ("offline", "network") or row.get("network_scope") != scope:
@@ -133,8 +138,8 @@ def admit_contents(policy_bytes, inventory_bytes, results_bytes, summary_bytes, 
             "allowed_skips": skips, "passed": counts["executed"] > 0 and expected_summary["fail"] == 0}
 
 
-def admit(policy, inventory, results, summary, distro, tiers):
-    return admit_contents(read(policy), read(inventory), read(results), read(summary), distro, tiers)
+def admit(policy, inventory, results, summary, distro, tiers, identity=None):
+    return admit_contents(read(policy), read(inventory), read(results), read(summary), distro, tiers, identity)
 
 
 def main():
@@ -142,10 +147,12 @@ def main():
     for name in ("policy", "inventory", "results", "summary"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--distro", required=True, choices=("arch", "debian", "ubuntu", "fedora"))
+    parser.add_argument("--identity", choices=tuple(IDENTITIES))
     parser.add_argument("--tiers", required=True)
     args = parser.parse_args()
     try:
-        receipt = admit(args.policy, args.inventory, args.results, args.summary, args.distro, args.tiers)
+        receipt = admit(args.policy, args.inventory, args.results, args.summary,
+                        args.distro, args.tiers, args.identity)
         print(json.dumps(receipt, indent=2))
         return 0 if receipt["passed"] else 1
     except (ValueError, OSError, KeyError, TypeError):

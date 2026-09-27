@@ -48,7 +48,7 @@ while (($#)); do
     --allow-tcg) allow_tcg=true; shift ;;
     --help)
       cat <<'HELP'
-Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|ubuntu|fedora]
+Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|ubuntu|fedora|debian13|ubuntu2604]
   [--arch x86_64|aarch64] [--release vVERSION]
   [--staged-dir DIR | --release-dir DIR] [--inventory-file TSV]
   [--evidence-dir DIR] [--benchmark] [--benchmark-transactions COUNT]
@@ -83,7 +83,20 @@ HELP
   esac
 done
 [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
-case "$distro" in all|arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
+case "$distro" in
+  all|arch|debian|ubuntu|fedora)
+    guest_distro=$distro; archive_distro=$distro; expected_version=- ;;
+  debian13)
+    [[ -n "$staged_dir" || "$print_pins" == true ]] || { printf 'error: Debian 13 requires the staged Trixie archive\n' >&2; exit 2; }
+    guest_distro=debian; archive_distro=debian-trixie; expected_version=13 ;;
+  ubuntu2604)
+    [[ -n "$staged_dir" || "$print_pins" == true ]] || { printf 'error: Ubuntu 26.04 requires the staged Trixie archive\n' >&2; exit 2; }
+    guest_distro=ubuntu; archive_distro=debian-trixie; expected_version=26.04 ;;
+  *) exit 2 ;;
+esac
+if [[ "$distro" == debian13 || "$distro" == ubuntu2604 ]]; then
+  [[ "$arch" != aarch64 && "$arch" != arm64 ]] || { printf 'error: APT 7 pilot has no staged ARM archive\n' >&2; exit 2; }
+fi
 if [[ -z "$arch" ]]; then
   case "$(uname -m)" in
     x86_64|amd64) arch=x86_64 ;;
@@ -92,6 +105,10 @@ if [[ -z "$arch" ]]; then
   esac
 fi
 case "$arch" in x86_64|amd64) arch=x86_64 ;; aarch64|arm64) arch=aarch64 ;; *) exit 2 ;; esac
+if [[ "$archive_distro" == debian-trixie && "$arch" != x86_64 ]]; then
+  printf 'error: APT 7 pilot has no staged ARM archive\n' >&2
+  exit 2
+fi
 [[ -z "$staged_dir" || -d "$staged_dir" ]] || exit 2
 [[ -z "$release_dir" || ( -d "$release_dir" && -z "$staged_dir" ) ]] || exit 2
 tsv="${inventory_file:-$here/../tests/cli_behavior_inventory.tsv}"
@@ -154,6 +171,11 @@ pins_for() {
       image_hash=b0144c1c8e09b187b54af300c8ffc22f17b318d0aa6f5a2caba13f3102441572badbeb098458e599b6897bc80dad50fd0094d6e4b9da9f4a2bd63a8f4c99dea5
       hash_tool=sha512sum
       ssh_service=ssh ;;
+    debian13-x86_64)
+      image_url=https://cloud.debian.org/images/cloud/trixie/20260914-2601/debian-13-generic-amd64-20260914-2601.qcow2
+      image_hash=a733e7d49442a03e70d03e4eb5aaf3967f3efc69ef70952f9bb10fc1ee2c4876eb95956b5ad2d31350e5fada768feb651352535fb8cd1233f61998a5a7d2e93c
+      hash_tool=sha512sum
+      ssh_service=ssh ;;
     ubuntu-x86_64)
       image_url=https://cloud-images.ubuntu.com/noble/20260826/noble-server-cloudimg-amd64.img
       image_hash=d0fe84bb5f80853425fa6be28e2c106f30104c3cfe8611933f2e65c9b63f0e30
@@ -161,6 +183,10 @@ pins_for() {
     ubuntu-aarch64)
       image_url=https://cloud-images.ubuntu.com/noble/20260826/noble-server-cloudimg-arm64.img
       image_hash=afa139bac6f2629c1e1f2f8f34215f3a9ad9779801bcb945521ba1a45016743f
+      ssh_service=ssh ;;
+    ubuntu2604-x86_64)
+      image_url=https://cloud-images.ubuntu.com/releases/resolute/release-20260918/ubuntu-26.04-server-cloudimg-amd64.img
+      image_hash=4908fb59ccd4e87ae4e8e973b7ef56f535448eacb24a87fd787270c0048987bc
       ssh_service=ssh ;;
     fedora-x86_64)
       image_url=https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2
@@ -197,7 +223,8 @@ if [[ "$print_pins" == true ]]; then
   # Audit mode: list every pinned image without booting anything.
   # Honors --distro; always covers both arches so pin reviews see the
   # whole table (unsupported combos like arch/aarch64 print nothing).
-  for pin_distro in arch debian ubuntu fedora; do
+  for pin_distro in arch debian ubuntu fedora debian13 ubuntu2604; do
+    case "$distro:$pin_distro" in all:debian13|all:ubuntu2604) continue ;; esac
     [[ "$distro" == all || "$distro" == "$pin_distro" ]] || continue
     for pin_arch in x86_64 aarch64; do
       if pins_for "$pin_distro" "$pin_arch" 2>/dev/null; then
@@ -365,7 +392,7 @@ for tool in docker timeout sha256sum; do command -v "$tool" >/dev/null || exit 3
 [[ -n "$staged_dir" || -n "$release_dir" ]] || { command -v gh >/dev/null || exit 3; }
 timeout --kill-after=2s 15s docker version --format '{{.Server.Version}}' > "$work/engine-preflight.log" 2>&1 || exit 3
 { date -u; uname -a; cat /proc/loadavg; grep -E 'MemTotal|MemAvailable|SwapFree' /proc/meminfo; } > "$work/host-metadata.txt"
-archive="omg-${tag}-${arch}-linux-${distro}.tar.gz"
+archive="omg-${tag}-${arch}-linux-${archive_distro}.tar.gz"
 if [[ -n "$staged_dir" ]]; then
   cp "$staged_dir/$archive" "$staged_dir/$archive.sha256" "$work/release/"
 elif [[ -n "$release_dir" ]]; then
@@ -377,7 +404,7 @@ read -r digest filename extra < "$work/release/$archive.sha256"
 [[ "$digest" =~ ^[0-9a-f]{64}$ && "$filename" == "$archive" && -z "${extra:-}" ]]
 [[ $(wc -l < "$work/release/$archive.sha256") -eq 1 ]]
 (cd "$work/release" && sha256sum -c "$archive.sha256") > "$work/release-checksum.txt"
-printf 'distro=%s\narch=%s\nhost_arch=%s\naccel=%s\ntiming_scope=%s\nrelease=%s\nartifact_source=%s\nimage_url=%s\nimage_digest=%s\nfirmware=%s\nqemu=%s -machine %s\ncontroller=%s\ncase_id=%s\n' "$distro" "$arch" "$host_arch" "$qemu_accel" "$([[ "$qemu_accel" == kvm ]] && printf benchmark || printf correctness-only)" "$tag" "$source_kind" "$image_url" "$image_hash" "$firmware" "$qemu_bin" "$qemu_machine" "$controller_image" "$case_id" > "$work/metadata.txt"
+printf 'distro=%s\nguest_distro=%s\narchive_distro=%s\nexpected_version=%s\narch=%s\nhost_arch=%s\naccel=%s\ntiming_scope=%s\nrelease=%s\nartifact_source=%s\nimage_url=%s\nimage_digest=%s\nfirmware=%s\nqemu=%s -machine %s\ncontroller=%s\ncase_id=%s\n' "$distro" "$guest_distro" "$archive_distro" "$expected_version" "$arch" "$host_arch" "$qemu_accel" "$([[ "$qemu_accel" == kvm ]] && printf benchmark || printf correctness-only)" "$tag" "$source_kind" "$image_url" "$image_hash" "$firmware" "$qemu_bin" "$qemu_machine" "$controller_image" "$case_id" > "$work/metadata.txt"
 bash "$here/pull-qemu-controller.sh" "$controller_image" "$work/controller-pull-attempt.log" \
   > "$work/controller-pull.log" 2>&1 || exit 3
 started=true
@@ -617,10 +644,12 @@ cat > "$work/guest-check.sh" <<'GUEST'
 set -euo pipefail
 export LC_ALL=C NO_COLOR=1
 cd "$HOME"
-distro=$1; tag=$2; digest=$3; benchmark=$4; guest_arch=$5; expected_uname=$6; inventory_tiers=$7; accel=$8
+distro=$1; tag=$2; digest=$3; benchmark=$4; guest_arch=$5; expected_uname=$6; inventory_tiers=$7; accel=$8; archive_distro=$9; expected_version=${10}
 case "$accel" in kvm) daemon_timeout=240 ;; tcg) daemon_timeout=900 ;; *) exit 120 ;; esac
 actual_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)
 [[ "$actual_id" == "$distro" && $(uname -m) == "$expected_uname" ]] || exit 120
+actual_version=$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)
+[[ "$expected_version" == - || "$actual_version" == "$expected_version" ]] || exit 120
 mkdir -p evidence
 capture_audit_metadata() {
   timeout --kill-after=2s 5s sudo -n bash -c '
@@ -641,7 +670,12 @@ if [[ -e /var/log/omg || -L /var/log/omg ]]; then
 fi
 printf '%s  release.tar.gz\n' "$digest" | sha256sum -c -
 tar -xzf release.tar.gz
-bin="$HOME/omg-${tag}-${guest_arch}-linux-${distro}/omg"
+bin="$HOME/omg-${tag}-${guest_arch}-linux-${archive_distro}/omg"
+if [[ "$archive_distro" == debian-trixie ]]; then
+  ldd "$bin" > evidence/apt-abi.txt
+  grep -Eq 'libapt-pkg\.so\.7([ .]|$)' evidence/apt-abi.txt
+  ! grep -Eq 'libapt-pkg\.so\.6([ .]|$)' evidence/apt-abi.txt
+fi
 [[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 daemon="${bin%/*}/omgd"
 if [[ ! -x "$daemon" ]]; then
@@ -777,7 +811,7 @@ if [[ "$benchmark" == true ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/benchmark-hyperfine.sh bench@127.0.0.1:benchmark-hyperfine.sh
 fi
 rc=0
-timeout "$guest_timeout" docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 "bash guest-check.sh '$distro' '$tag' '$digest' '$benchmark' '$arch' '$guest_uname' '$inventory_tiers' '$qemu_accel'" > "$work/guest-check.log" 2>&1 || rc=$?
+timeout "$guest_timeout" docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 "bash guest-check.sh '$guest_distro' '$tag' '$digest' '$benchmark' '$arch' '$guest_uname' '$inventory_tiers' '$qemu_accel' '$archive_distro' '$expected_version'" > "$work/guest-check.log" 2>&1 || rc=$?
 timeout 60 docker exec -w /work/guest "$controller" scp -r "${opts[@]}" -P 2222 bench@127.0.0.1:evidence /work/guest/ > "$work/evidence-copy.log" 2>&1
 if [[ ! -f "$work/guest/evidence/exit-code" ]]; then
   printf 'Guest evidence receipt is missing (transport exit %s); see %s/evidence-copy.log and %s/guest-check.log\n' "$rc" "$work" "$work" >&2
@@ -791,7 +825,7 @@ fi
 if [[ "$rc" == 0 ]]; then
   # A zero guest exit alone is insufficient: require the daemon probe receipt.
   daemon_receipt="$work/guest/evidence/daemon-lifecycle.json"
-  if ! [[ -f "$daemon_receipt" && $(wc -c < "$daemon_receipt") -le 4096 ]] || ! jq -e -s --arg distro "$distro" '
+  if ! [[ -f "$daemon_receipt" && $(wc -c < "$daemon_receipt") -le 4096 ]] || ! jq -e -s --arg distro "$guest_distro" '
     length == 1 and (.[0] | type == "object") and (.[0] |
     .schema_version == 1 and .direct == true and .foreground == true and
     .ipc == true and .singleton == true and .shutdown == true and .restart == true and .query_parity == true and .sigint == true and .cleanup == true and
@@ -802,7 +836,7 @@ if [[ "$rc" == 0 ]]; then
   fi
   doctor_receipt="$work/guest/evidence/doctor-connectivity-fallback.json"
   if ! [[ -f "$doctor_receipt" && $(wc -c < "$doctor_receipt") -le 4096 ]] \
-    || ! jq -e -s --arg distro "$distro" '
+    || ! jq -e -s --arg distro "$guest_distro" '
       length == 1 and (.[0] |
       .schema_version == 1 and .distro == $distro and
       .primary == (if $distro == "arch" then "archlinux.org" else "github.com" end) and
@@ -832,7 +866,7 @@ if [[ "$rc" == 0 ]]; then
   fi
 fi
 if [[ "$benchmark" == true && "$rc" == 0 ]]; then
-  case "$distro" in
+  case "$guest_distro" in
     arch) expected_commands='{"info":["OMG","pacman"],"search":["OMG","pacman"],"explicit":["OMG","pacman"]}' ;;
     debian|ubuntu) expected_commands='{"info":["OMG","apt-cache","apt"],"search":["OMG","apt-cache","apt"],"explicit":["OMG","apt-mark"]}' ;;
     fedora) expected_commands='{"info":["OMG","rpm","dnf"],"search":["OMG","dnf"],"explicit":["OMG","dnf"]}' ;;
@@ -842,7 +876,7 @@ if [[ "$benchmark" == true && "$rc" == 0 ]]; then
     [[ -f "$benchmark_evidence/summary.json" && $(wc -c < "$benchmark_evidence/summary.json") -le 1048576 ]] || exit 1
     python3 "$work/record-benchmark-run.py" --validate-only --scenario info --scenario search \
       --scenario explicit --source "$benchmark_evidence" || exit 1
-    jq -e --arg distro "$distro" --argjson expected "$expected_commands" '
+    jq -e --arg distro "$guest_distro" --argjson expected "$expected_commands" '
       .schema_version == 2 and .complete == true and .distro == $distro and
       .operations == ["info","search","explicit"] and .daemon == "disabled" and
       (.commands | with_entries(.value |= map(.label))) == $expected and
@@ -867,14 +901,14 @@ fi
 if [[ "$transaction_samples" != 0 && "$rc" == 0 ]]; then
   transaction_rc=0
   timeout --kill-after=10s 21600 docker exec -w /work "$controller" bash /work/qemu-transactions.sh \
-    "$distro" "$tag" "$arch" "$transaction_samples" "$firmware" "$ssh_service" \
+    "$guest_distro" "$tag" "$arch" "$transaction_samples" "$firmware" "$ssh_service" \
     "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" \
     > "$work/transactions.log" 2>&1 || transaction_rc=$?
   if [[ "$transaction_rc" != 0 ]]; then
     rc=120
     summary="$work/transactions/summary.json"
     if [[ "$transaction_rc" == 10 && -f "$summary" && $(wc -c < "$summary") -le 1048576 ]] &&
-       jq -e --arg distro "$distro" --argjson count "$transaction_samples" '
+       jq -e --arg distro "$guest_distro" --argjson count "$transaction_samples" '
          .schema_version==2 and .kind=="transaction-suite" and .distro==$distro and
          .complete==false and .phase=="measurement-command" and
          (.results|length)==($count*4) and
@@ -888,7 +922,7 @@ if [[ "$transaction_samples" != 0 && "$rc" == 0 ]]; then
   elif ! (
     summary="$work/transactions/summary.json"
     [[ -f "$summary" && $(wc -c < "$summary") -le 1048576 ]] || exit 1
-    jq -e --arg distro "$distro" --argjson count "$transaction_samples" '
+    jq -e --arg distro "$guest_distro" --argjson count "$transaction_samples" '
       . as $s |
       ([range(1;$count+1) as $round |
         ["install-omg-","install-native-","remove-omg-","remove-native-"][] |
@@ -912,7 +946,7 @@ if [[ "$transaction_samples" != 0 && "$rc" == 0 ]]; then
       for tool in omg native; do
         label_name=OMG
         if [[ "$tool" == native ]]; then
-          case "$distro" in arch) label_name=pacman ;; debian|ubuntu) label_name=apt ;; fedora) label_name=dnf ;; esac
+          case "$guest_distro" in arch) label_name=pacman ;; debian|ubuntu) label_name=apt ;; fedora) label_name=dnf ;; esac
         fi
         for ((round=1;round<=transaction_samples;round++)); do
           printf -v trial_id '%s-%s-%03d' "$operation" "$tool" "$round"
@@ -932,7 +966,7 @@ if [[ "$transaction_samples" != 0 && "$rc" == 0 ]]; then
           jq -e --arg label_name "$label_name" '
             .results|length==1 and .[0].command==$label_name and (.[0].times|length)==1
           ' "$evidence/$operation.json" >/dev/null || exit 1
-          jq -e --arg distro "$distro" --arg operation "$operation" --arg tool "$tool" \
+          jq -e --arg distro "$guest_distro" --arg operation "$operation" --arg tool "$tool" \
             --arg version "$expected_version" --arg label_name "$label_name" --arg id "$trial_id" \
             --slurpfile suite "$summary" '
             .schema_version==2 and .kind=="transaction-trial" and .complete==true and
@@ -960,8 +994,8 @@ fi
 if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
   # TSV-driven rows run only on a healthy guest, inside the controller
   # (same netns; /work is bind-mounted). Evidence lands in $work/inventory.
-  inv_args=(--work /work --distro "$distro" --tiers "$inventory_tiers" --tag "$tag"
-    --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv)
+  inv_args=(--work /work --distro "$guest_distro" --identity "$distro" --tiers "$inventory_tiers" --tag "$tag"
+    --binary "/home/bench/omg-${tag}-${arch}-linux-${archive_distro}/omg" --tsv /work/cases.tsv)
   [[ "$inventory_mutations" == false ]] || inv_args+=(--allow-mutations)
   [[ "$inventory_isolation" == false ]] || inv_args+=(--isolate-hermetic --network-policy /work/inventory-policy.json)
   inventory_rc=0
@@ -1009,7 +1043,7 @@ if [[ -n "$inventory_policy" ]]; then
   policy_rc=0
   python3 "$here/check-qemu-inventory.py" --policy "$inventory_policy" --inventory "$tsv" \
     --results "$work/inventory/results.json" --summary "$work/inventory/summary.json" \
-    --distro "$distro" --tiers "$inventory_tiers" > "$work/inventory-admission.json" || policy_rc=$?
+    --distro "$guest_distro" --identity "$distro" --tiers "$inventory_tiers" > "$work/inventory-admission.json" || policy_rc=$?
   if [[ "$policy_rc" == 1 && "$inventory_product_failure" == true ]] &&
     jq -e '.schema_version == 1 and .passed == false and
            (.counts.failed | type == "number") and .counts.failed > 0 and
@@ -1024,7 +1058,7 @@ if [[ -n "$inventory_policy" ]]; then
   fi
 fi
 if [[ "$storage_faults" == true && "$rc" == 0 ]]; then
-  quoted_fault_binary=$(jq -rn --arg b "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" '$b | @sh')
+  quoted_fault_binary=$(jq -rn --arg b "/home/bench/omg-${tag}-${arch}-linux-${archive_distro}/omg" '$b | @sh')
   fault_setup='set -eu; token=$(cat /proc/sys/kernel/random/uuid); printf "%s\n" "$token" > /run/omg-qemu-storage-faults; chmod 444 /run/omg-qemu-storage-faults; exec unshare --mount --propagation private python3 - --binary "$1" --token "$token"'
   quoted_fault_setup=$(jq -rn --arg s "$fault_setup" '$s | @sh')
   fault_rc=0

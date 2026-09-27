@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "reviewed_on": "2026-09-27",
+  "review_expires": "2026-10-27",
+  "images": {
+    "debian13-x86_64": {
+      "publisher": "debian",
+      "url": "https://cloud.debian.org/images/cloud/trixie/20260914-2601/debian-13-generic-amd64-20260914-2601.qcow2",
+      "digest": "a733e7d49442a03e70d03e4eb5aaf3967f3efc69ef70952f9bb10fc1ee2c4876eb95956b5ad2d31350e5fada768feb651352535fb8cd1233f61998a5a7d2e93c",
+      "algorithm": "sha512",
+      "signature_policy": "publisher-unsigned-cloud-checksums",
+      "rationale": "Debian publishes this Trixie cloud image digest in its TLS-distributed SHA512SUMS; its signed CD checksum policy does not cover cloud images.",
+      "source": "https://cloud.debian.org/images/cloud/trixie/20260914-2601/SHA512SUMS"
+    },
+    "ubuntu2604-x86_64": {
+      "publisher": "ubuntu",
+      "url": "https://cloud-images.ubuntu.com/releases/resolute/release-20260918/ubuntu-26.04-server-cloudimg-amd64.img",
+      "digest": "4908fb59ccd4e87ae4e8e973b7ef56f535448eacb24a87fd787270c0048987bc",
+      "algorithm": "sha256",
+      "keyring": "ubuntu.gpg",
+      "keyring_sha256": "7d3205c5554f6690006751edae92f147c0c26d4e0bc33ce04709f3f94ca3679d",
+      "fingerprint": "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81",
+      "signature_policy": "checksum-detached",
+      "checksums": "ubuntu-2604-checksums",
+      "signature": "ubuntu-2604.sig",
+      "source": "https://cloud-images.ubuntu.com/releases/resolute/release-20260918/"
+    }
+  }
+}

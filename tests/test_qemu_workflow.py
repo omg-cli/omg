@@ -103,7 +103,10 @@ class QemuWorkflowTests(unittest.TestCase):
         guest = step('Run disposable guest lifecycle + read benchmarks + inventory rows')
         self.assertIn('STAGED: ${{ inputs.staged }}', guest)
         script = literal(guest, 'run', 8)
-        script = script.replace('${{ inputs.distro }}', 'arch').replace('${{ inputs.tag }}', 'v1.2.3')
+        script = (script.replace('${{ inputs.distro }}', 'arch')
+                  .replace('${{ inputs.tag }}', 'v1.2.3')
+                  .replace('${{ inputs.image-policy }}', 'tests/qemu-image-provenance/manifest.json')
+                  .replace('${{ inputs.shared-staged }}', 'false'))
         # The runner-isolation probe deliberately rejects WSL/DrvFs hosts such
         # as /mnt/c (a supported local QEMU environment), so stub only that
         # probe and keep asserting the step still runs it. The probe's own
@@ -263,7 +266,9 @@ class SecurityBoundaryTests(unittest.TestCase):
             self.assertNotIn('qemu-image-cache', workflow)
             self.assertNotIn('qemu-image-v1-', workflow)
             self.assertNotIn('--image-cache', workflow)
-            self.assertIn('--image-policy tests/qemu-image-provenance/manifest.json', workflow)
+        self.assertIn('--image-policy tests/qemu-image-provenance/manifest.json', PARENT)
+        self.assertIn('default: tests/qemu-image-provenance/manifest.json', LANE)
+        self.assertIn('--image-policy "${{ inputs.image-policy }}"', LANE)
 
     def test_all_distros_keep_daemon_release_compilation_and_unit_tests(self):
         self.assertEqual(TEXT.count('cargo test --lib --bins '), 4)
