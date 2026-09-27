@@ -76,6 +76,94 @@ fn explicit_shortcut_uses_the_same_isolated_state_as_explicit_count() {
     }
 }
 
+#[cfg(feature = "arch")]
+#[test]
+fn mock_fedora_sync_does_not_start_aur_metadata_io() {
+    let project = TestProject::for_distro("fedora");
+    let aur_metadata = project.data_dir.path().join("cache/aur/_meta");
+    assert!(!aur_metadata.exists());
+
+    let result = project.run_with_env(&["sync"], &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "8")]);
+    result.assert_success();
+    assert!(
+        !aur_metadata.exists(),
+        "non-Arch sync created AUR metadata state at {}",
+        aur_metadata.display()
+    );
+    project.close_checked();
+}
+
+#[test]
+fn mock_clean_refuses_mutation_before_native_package_helpers() {
+    for distro in ["arch", "debian", "fedora"] {
+        let project = TestProject::for_distro(distro);
+        project.mock_install("fixture-package", "1.0.0").unwrap();
+        let backend = match distro {
+            "arch" => "pacman",
+            "fedora" => "dnf",
+            _ => "apt",
+        };
+        let state = project
+            .data_dir
+            .path()
+            .join(format!("mock_state_{backend}.json"));
+        let before = std::fs::read(&state).unwrap();
+
+        let cache = project.pacman_root.path().join("var/cache/pacman/pkg");
+        std::fs::create_dir_all(&cache).unwrap();
+        let older = cache.join("fixture-package-1.0-1-x86_64.pkg.tar.zst");
+        let newer = cache.join("fixture-package-2.0-1-x86_64.pkg.tar.zst");
+        std::fs::write(&older, b"older native cache archive").unwrap();
+        std::fs::write(&newer, b"newer native cache archive").unwrap();
+
+        for args in [
+            &["clean", "--cache", "--yes"][..],
+            &["clean", "--orphans", "--yes"][..],
+        ] {
+            let result = project.run(args);
+            result.assert_failure();
+            assert!(
+                result.stderr.contains("Mock cleanup cannot mutate native"),
+                "{distro}: wrong cleanup refusal: {}",
+                result.combined_output()
+            );
+            assert_eq!(std::fs::read(&state).unwrap(), before);
+            assert_eq!(
+                std::fs::read(&older).unwrap(),
+                b"older native cache archive"
+            );
+            assert_eq!(
+                std::fs::read(&newer).unwrap(),
+                b"newer native cache archive"
+            );
+        }
+
+        let preview = project.run(&["clean", "--all", "--dry-run"]);
+        if distro == "debian" {
+            preview.assert_failure();
+            assert!(
+                preview.stderr.contains("not supported on the APT backend"),
+                "{distro}: unsupported cleanup reported the wrong result: {}",
+                preview.combined_output()
+            );
+        } else {
+            preview.assert_success();
+            assert!(preview.stdout.contains("No changes made (dry run)"));
+            assert!(preview.stdout.contains("mock has no native archives"));
+        }
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        assert_eq!(
+            std::fs::read(&older).unwrap(),
+            b"older native cache archive"
+        );
+        assert_eq!(
+            std::fs::read(&newer).unwrap(),
+            b"newer native cache archive"
+        );
+        project.close_checked();
+    }
+}
+
 #[test]
 fn prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments() {
     let project = TestProject::new();

@@ -1,15 +1,19 @@
 //! Database sync functionality for packages
 
 use crate::package_managers::get_package_manager;
+#[cfg(feature = "arch")]
+use crate::package_managers::{Backend, resolve_backend};
 use anyhow::Result;
 
 /// Synchronize package databases via the active system package manager
 pub async fn sync_databases() -> Result<()> {
+    #[cfg(feature = "arch")]
+    let backend = resolve_backend()?;
     let pm = get_package_manager()?;
     pm.sync().await?;
 
     #[cfg(feature = "arch")]
-    {
+    if backend == Backend::Arch {
         let aur_start = std::time::Instant::now();
         match crate::config::Settings::load() {
             Ok(settings) => {

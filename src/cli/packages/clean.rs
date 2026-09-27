@@ -39,6 +39,9 @@ pub async fn clean(
     yes: bool,
 ) -> Result<()> {
     let backend = crate::package_managers::resolve_backend()?;
+    if backend == crate::package_managers::Backend::Mock {
+        return clean_mock(orphans, cache, aur, all, dry_run);
+    }
     anyhow::ensure!(
         backend != crate::package_managers::Backend::MacOS,
         "Package cleanup is not implemented for the Homebrew backend"
@@ -337,6 +340,60 @@ pub async fn clean(
         }
         Ok(())
     }
+}
+
+fn clean_mock(orphans: bool, cache: bool, aur: bool, all: bool, dry_run: bool) -> Result<()> {
+    use crate::core::env::distro::{Distro, detect_distro};
+
+    let distro = detect_distro();
+    let requested = orphans || cache || aur || all;
+    if requested {
+        anyhow::ensure!(
+            dry_run,
+            "Mock cleanup cannot mutate native package databases or caches; use --dry-run"
+        );
+    }
+    match distro {
+        Distro::Arch => {}
+        Distro::Debian | Distro::Ubuntu => {
+            anyhow::ensure!(
+                !(cache || aur || all),
+                "Cache and AUR cleanup are not supported on the APT backend"
+            );
+        }
+        Distro::Fedora => {
+            anyhow::ensure!(!aur, "AUR cleanup is not available on Fedora");
+        }
+        Distro::MacOS => anyhow::bail!("Package cleanup is not implemented for Homebrew"),
+        Distro::Unknown => anyhow::bail!("Package cleanup requires a supported distribution"),
+    }
+
+    if !requested {
+        println!("Mock cleanup preview; use --orphans, --cache, or --all with --dry-run");
+        return Ok(());
+    }
+    crate::cli::modern_ui::print_phase_header("🧹", "Clean Preview", "dry run");
+    println!();
+    if orphans || all {
+        println!(
+            "  {} Would remove orphan packages (mock has no dependency graph)",
+            style::accent("→")
+        );
+    }
+    if cache || all {
+        println!(
+            "  {} Would clear package cache (mock has no native archives)",
+            style::accent("→")
+        );
+    }
+    if aur || (all && distro == Distro::Arch) {
+        println!(
+            "  {} Would clean AUR build directories (mock has no AUR cache)",
+            style::accent("→")
+        );
+    }
+    println!("  {} No changes made (dry run)", style::info("ℹ"));
+    Ok(())
 }
 
 #[cfg(feature = "fedora")]
