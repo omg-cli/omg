@@ -8,8 +8,8 @@ case "${1:-}" in
     printf 'version\n' >> "$OMG_QEMU_ENGINE_CAPTURE/calls"
     printf 'podman version fixture\n'
     ;;
-  run)
-    printf 'run\n' >> "$OMG_QEMU_ENGINE_CAPTURE/calls"
+  run|build)
+    printf '%s\n' "$1" >> "$OMG_QEMU_ENGINE_CAPTURE/calls"
     shift
     printf '%s\0' "$@" > "$OMG_QEMU_ENGINE_CAPTURE/argv"
     printf 'fake-container-id\n'
