@@ -433,11 +433,11 @@ native_package_snapshot() {
       inventory=$(pacman -Q) || return 1
       reasons=$(pacman -Qqe) || return 1 ;;
     debian|ubuntu)
-      inventory=$(dpkg-query -W '-f=${Package}\t${Version}\t${Status}\n') || return 1
+      inventory=$(dpkg-query -W '-f=${Package}\t${Version}\t${Status}\t${Architecture}\n') || return 1
       reasons=$(apt-mark showmanual) || return 1 ;;
     fedora)
-      inventory=$(rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n') || return 1
-      reasons=$(dnf --cacheonly --disable-repo='*' repoquery --installed --queryformat '%{name}\t%{reason}\n') || return 1 ;;
+      inventory=$(rpm -qa --qf '%{NAME}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n') || return 1
+      reasons=$(dnf --cacheonly --disable-repo='*' repoquery --installed --queryformat '%{name} %{arch} %{reason}\n') || return 1 ;;
     *) return 1 ;;
   esac
   [[ -n "$inventory" ]] || return 1

@@ -25,7 +25,8 @@ class OutputContracts(unittest.TestCase):
 case "$1:$2" in
   pacman:-R|dpkg:--purge|rpm:-e)
     [[ "${@: -1}" == tree ]] || exit 70
-    rm -f "$HOME/tree-state" "$OMG_QEMU_TEST_TREE_BINARY" ;;
+    rm -f "$HOME/tree-state" "$OMG_QEMU_TEST_TREE_BINARY" \
+      "$HOME/base-arch" "$HOME/base-epoch" "$HOME/base-dnf-arch" ;;
   *) exit 70 ;;
 esac
 ''',
@@ -43,8 +44,15 @@ esac
 esac
 ''',
             'dpkg-query': '''if [[ "$*" == *'${Version}'* ]]; then
-  printf 'base\t%s\tinstall ok installed\n' "$(cat "$HOME/base-state" 2>/dev/null || printf 1.0)"
-  if [[ -f "$HOME/tree-state" ]]; then printf 'tree\t2.0\tinstall ok installed\n'; fi
+  if [[ "$*" == *'${Architecture}'* ]]; then
+    printf 'base\t%s\tinstall ok installed\t%s\n' \
+      "$(cat "$HOME/base-state" 2>/dev/null || printf 1.0)" \
+      "$(cat "$HOME/base-arch" 2>/dev/null || printf amd64)"
+    if [[ -f "$HOME/tree-state" ]]; then printf 'tree\t2.0\tinstall ok installed\tamd64\n'; fi
+  else
+    printf 'base\t%s\tinstall ok installed\n' "$(cat "$HOME/base-state" 2>/dev/null || printf 1.0)"
+    if [[ -f "$HOME/tree-state" ]]; then printf 'tree\t2.0\tinstall ok installed\n'; fi
+  fi
 else
   printf 'base\tinstall ok installed\n'
   if [[ -f "$HOME/tree-state" ]]; then printf 'tree\tinstall ok installed\n'; fi
@@ -57,8 +65,16 @@ if [[ -f "$HOME/tree-state" ]]; then printf 'tree\n'; fi
             'rpm': '''case "$1:$2" in
   -qa:--qf)
     if [[ "$3" == *VERSION* ]]; then
-      printf 'base\t%s-1\n' "$(cat "$HOME/base-state" 2>/dev/null || printf 1.0)"
-      if [[ -f "$HOME/tree-state" ]]; then printf 'tree\t2.0-1\n'; fi
+      if [[ "$3" == *EPOCHNUM* && "$3" == *ARCH* ]]; then
+        printf 'base\t%s\t%s\t1\t%s\n' \
+          "$(cat "$HOME/base-epoch" 2>/dev/null || printf 0)" \
+          "$(cat "$HOME/base-state" 2>/dev/null || printf 1.0)" \
+          "$(cat "$HOME/base-arch" 2>/dev/null || printf x86_64)"
+        if [[ -f "$HOME/tree-state" ]]; then printf 'tree\t0\t2.0\t1\tx86_64\n'; fi
+      else
+        printf 'base\t%s-1\n' "$(cat "$HOME/base-state" 2>/dev/null || printf 1.0)"
+        if [[ -f "$HOME/tree-state" ]]; then printf 'tree\t2.0-1\n'; fi
+      fi
     else
       printf 'base\n'
       if [[ -f "$HOME/tree-state" ]]; then printf 'tree\n'; fi
@@ -68,8 +84,13 @@ if [[ -f "$HOME/tree-state" ]]; then printf 'tree\n'; fi
 esac
 ''',
             'dnf': '''printf 'base\t'
+if [[ "$*" == *'%{arch}'* ]]; then
+  printf '%s\t' "$(cat "$HOME/base-dnf-arch" 2>/dev/null || printf x86_64)"
+fi
 if [[ -f "$HOME/base-auto" ]]; then printf 'dependency\n'; else printf 'user\n'; fi
-if [[ -f "$HOME/tree-state" ]]; then printf 'tree\tuser\n'; fi
+if [[ -f "$HOME/tree-state" ]]; then
+  if [[ "$*" == *'%{arch}'* ]]; then printf 'tree\tx86_64\tuser\n'; else printf 'tree\tuser\n'; fi
+fi
 ''',
         }
         for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
@@ -101,6 +122,27 @@ esac
                                 ['PASS', 'FAIL'])
                     self.assertEqual(verdicts, expected, logs)
                     self.assertEqual(result.returncode, int(mutation != 'none'), result.stderr)
+        for distro, marker, value in (
+            ('debian', 'base-arch', 'arm64'),
+            ('ubuntu', 'base-arch', 'arm64'),
+            ('fedora', 'base-arch', 'aarch64'),
+            ('fedora', 'base-epoch', '1'),
+            ('fedora', 'base-dnf-arch', 'aarch64'),
+        ):
+            with self.subTest(distro=distro, marker=marker):
+                product = f'''[[ "$1" == install ]] || exit 70
+printf 2.0 > "$HOME/tree-state"
+printf '#!/bin/sh\\necho tree 2.0\\n' > "$OMG_QEMU_TEST_TREE_BINARY"
+chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
+printf %s {shlex.quote(value)} > "$HOME/{marker}"
+'''
+                result, evidence, logs = self.run_inventory(
+                    product, [rows[0]], native_commands=native, distro=distro,
+                    tiers='container', allow_mutations=True, fake_tree_binary=True)
+                self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('state changed outside tree',
+                              logs['release-package-install-tree.log'])
         blocked, evidence, logs = self.run_inventory(
             'exit 70\n', [rows[0]], native_commands=native, distro='debian',
             tiers='container', allow_mutations=True, fake_tree_binary=True,
