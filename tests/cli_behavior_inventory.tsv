@@ -98,9 +98,9 @@ team-pull	["team","pull"]	isolated-write	0	pass	team-push	hermetic	hermetic:pass
 team-members	["team","members"]	read	1	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 team-dashboard	["team","dashboard","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 team-roles-list	["team","roles","list"]	read	0	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
-team-golden-create	["team","golden-path","create","smoke"]	isolated-write	0	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
-team-golden-list	["team","golden-path","list"]	read	0	pass	team-golden-create	hermetic	hermetic:pass	-	tempdir-drop
-team-golden-delete	["team","golden-path","delete","smoke"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	-	tempdir-drop
+team-golden-create	["team","golden-path","create","smoke"]	isolated-write	0	pass	team-init	hermetic	hermetic:pass	golden-path-created	tempdir-drop
+team-golden-list	["team","golden-path","list"]	read	0	pass	team-golden-create	hermetic	hermetic:pass	golden-path-listed	tempdir-drop
+team-golden-delete	["team","golden-path","delete","smoke"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	golden-path-deleted	tempdir-drop
 team-compliance	["team","compliance"]	read	0	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 team-activity	["team","activity","--days","1"]	read	1	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 container-status	["container","status"]	read	arch:1,debian:1,ubuntu:1,fedora:0	pass	-	hermetic	hermetic:pass	-	tempdir-drop

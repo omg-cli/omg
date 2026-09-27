@@ -13,6 +13,19 @@ SPEC.loader.exec_module(POLICY)
 
 
 class PolicyTests(unittest.TestCase):
+    def test_golden_path_chain_requires_semantic_state_oracles(self):
+        with (ROOT / 'tests/cli_behavior_inventory.tsv').open(newline='') as source:
+            rows = {row['case']: row for row in csv.DictReader(source, delimiter='\t')}
+        for case, prerequisite, assertion in (
+            ('team-golden-create', 'team-init', 'golden-path-created'),
+            ('team-golden-list', 'team-golden-create', 'golden-path-listed'),
+            ('team-golden-delete', 'team-golden-list', 'golden-path-deleted'),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(rows[case]['requires'], prerequisite)
+                self.assertEqual(rows[case]['assertions'], assertion)
+                self.assertEqual(rows[case]['targets'], 'hermetic:pass')
+
     def test_current_inventory_has_exact_policy_case_set(self):
         inventory = ROOT / "tests/cli_behavior_inventory.tsv"
         rules = json.loads((ROOT / "tests/qemu-inventory-policy.json").read_text())
