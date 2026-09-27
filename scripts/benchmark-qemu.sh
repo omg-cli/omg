@@ -608,6 +608,7 @@ if [[ "$benchmark" == true ]]; then
 fi
 cp "$here/qemu-daemon-check.sh" "$work/qemu-daemon-check.sh"
 cp "$here/qemu-aur-check.sh" "$here/qemu-aur-fixture.py" "$work/"
+cp "$here/qemu-doctor-connectivity-check.sh" "$here/qemu-doctor-connectivity-fixture.py" "$work/"
 cp "$here/../tests/daemon_advisory_shutdown.sh" "$work/daemon-advisory-shutdown.sh"
 cat > "$work/guest-check.sh" <<'GUEST'
 #!/usr/bin/env bash
@@ -675,8 +676,8 @@ version=$("${version_cmd[@]}")
 [[ $(awk '$1 == "Version:" {print $2}' evidence/omg-info.txt) == "$version" ]]
 # Exercise both direct daemon startup and the actual CLI foreground launcher
 # while the package databases and installed fixture are available.
-guest_tools=(jq)
-[[ "$distro" != arch ]] || guest_tools+=(python openssl)
+guest_tools=(jq openssl)
+if [[ "$distro" == arch ]]; then guest_tools+=(python); else guest_tools+=(python3); fi
 [[ "$benchmark" != true ]] || guest_tools+=(hyperfine)
 case "$distro" in
   arch) sudo -n pacman -S --noconfirm --needed "${guest_tools[@]}" || exit 120 ;;
@@ -685,6 +686,14 @@ case "$distro" in
 esac
 printf 'daemon lifecycle start accel=%s timeout=%s\n' "$accel" "$daemon_timeout"
 OMG_QEMU_ACCEL="$accel" timeout --kill-after=5s "$daemon_timeout" bash "$HOME/qemu-daemon-check.sh" "$bin" "$HOME/evidence"
+doctor_probe_rc=0
+timeout --kill-after=5s 90s bash "$HOME/qemu-doctor-connectivity-check.sh" "$bin" "$distro" "$HOME/evidence" \
+  > evidence/doctor-connectivity-fallback.log 2>&1 || doctor_probe_rc=$?
+if [[ "$doctor_probe_rc" != 0 ]]; then
+  printf 'Doctor connectivity fallback failed (exit %s); evidence/doctor-connectivity-fallback.log follows:\n' "$doctor_probe_rc" >&2
+  tail -n 40 evidence/doctor-connectivity-fallback.log >&2
+  exit "$doctor_probe_rc"
+fi
 if [[ "$distro" == arch ]]; then
   timeout --kill-after=5s 120s bash "$HOME/qemu-aur-check.sh" "$bin" "$HOME/evidence"
 fi
@@ -751,6 +760,8 @@ opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHo
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
+timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
+  /work/qemu-doctor-connectivity-check.sh /work/qemu-doctor-connectivity-fixture.py bench@127.0.0.1:
 if [[ "$distro" == arch ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-aur-check.sh /work/qemu-aur-fixture.py bench@127.0.0.1:
 fi
@@ -784,6 +795,17 @@ if [[ "$rc" == 0 ]]; then
     .backend_faults == (if $distro == "fedora" then ["dnf-reason-refusal"] else [] end))
   ' "$daemon_receipt" >/dev/null; then
     printf 'Missing or incomplete daemon lifecycle evidence\n' >&2
+    exit 1
+  fi
+  doctor_receipt="$work/guest/evidence/doctor-connectivity-fallback.json"
+  if ! [[ -f "$doctor_receipt" && $(wc -c < "$doctor_receipt") -le 4096 ]] \
+    || ! jq -e -s --arg distro "$distro" '
+      length == 1 and (.[0] |
+      .schema_version == 1 and .distro == $distro and
+      .primary == (if $distro == "arch" then "archlinux.org" else "github.com" end) and
+      .alternate == "kernel.org" and .real_cli == true and
+      .baseline_issues == 0 and .fallback_issues == 0)' "$doctor_receipt" >/dev/null; then
+    printf 'Missing or incomplete Doctor connectivity fallback evidence\n' >&2
     exit 1
   fi
   if [[ "$distro" == arch ]]; then

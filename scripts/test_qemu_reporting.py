@@ -95,6 +95,27 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertIn("daemon failed to restart", diagnostics[(row["case_id"], "arch")])
         self.assertNotIn("unrelated run", diagnostics[(row["case_id"], "arch")])
 
+    def test_doctor_connectivity_failure_is_named_in_lifecycle_issue_excerpt(self):
+        row = dict(self.row(), case_id="qemu-fedora-lifecycle", distro="fedora",
+                   result="PRODUCT_FAIL")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run/results.json", json.dumps([row]))
+            archive.writestr("run/guest/evidence/doctor-connectivity-fallback.log",
+                             "assertion failed: Doctor alternate did not report kernel.org reachable")
+            archive.writestr("run/guest-check.log",
+                             "Doctor connectivity fallback failed (exit 1)")
+            archive.writestr("run/kvm-probe.log", "routine KVM probe")
+            archive.writestr("run/transactions.log", "unrelated transaction setup")
+        diagnostics = {}
+        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
+        excerpt = diagnostics[(row["case_id"], "fedora")]
+        self.assertIn("doctor-connectivity-fallback.log", excerpt)
+        self.assertIn("kernel.org reachable", excerpt)
+        self.assertIn("Doctor connectivity fallback failed", excerpt)
+        self.assertNotIn("routine KVM probe", excerpt)
+        self.assertNotIn("unrelated transaction setup", excerpt)
+
     def test_fedora_metadata_refresh_failure_includes_native_output(self):
         row = dict(self.row(), case_id="qemu-fedora-lifecycle", distro="fedora",
                    result="HARNESS_ERROR")

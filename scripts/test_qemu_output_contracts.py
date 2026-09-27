@@ -426,6 +426,8 @@ fi
                 (correct.replace(basic, ''), expected_count, 'FAIL'),
                 (correct.replace(basic_hosts[1] + ': connection error: refused',
                                  'unknown.example: connection error: refused', 1), expected_count, 'FAIL'),
+                (correct.replace(basic_hosts[1] + ': connection error: refused',
+                                 basic_hosts[1] + ': healthy', 1), expected_count, 'FAIL'),
                 (correct.replace(f'  ✗ {mirrors[0][0]}', f'  ✓ {mirrors[0][0]}'), expected_count, 'FAIL'),
                 (correct.replace(mirrors[0][1], 'https://wrong.example'), expected_count, 'FAIL'),
                 (correct.replace(f'    ✗ {hosts[-1]}', '    ✗ wrong.example'), expected_count, 'FAIL'),
