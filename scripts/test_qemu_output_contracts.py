@@ -85,6 +85,15 @@ while :; do sleep .05; done
                                       good['golden-path-deleted']).returncode, 0)
             self.assertNotEqual(check('golden-path-listed', template,
                                       'No custom templates\n').returncode, 0)
+            flagged = (template + '[[templates]]\nname = "flagged"\ncreated_at = 1700000001\n'
+                       'packages = ["ripgrep"]\n[templates.runtimes]\n'
+                       'node = "20"\npython = "3.12"\n')
+            receipt = "Golden path 'flagged' created!\nNode: 20\nPython: 3.12\nPackages: ripgrep\n"
+            self.assertEqual(check('golden-path-flags', flagged, receipt).returncode, 0)
+            for broken in (flagged.replace('node = "20"', 'node = "22"'),
+                           flagged.replace('packages = ["ripgrep"]', 'packages = []'),
+                           template):
+                self.assertNotEqual(check('golden-path-flags', broken, receipt).returncode, 0)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_tree_install_remove_rows_reject_collateral_package_and_reason_changes(self):
@@ -1939,35 +1948,28 @@ esac
         row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
                    if line.startswith('generate-man\t'))
         page = '.TH "omg" "1"\n.SH "NAME"\nomg\\-command\n.SH "SYNOPSIS"\nomg\n'
-        pages = (
-            'omg.1', 'omg-search.1', 'omg-install.1', 'omg-update.1',
-            'omg-doctor.1', 'omg-audit.1', 'omg-audit-licenses.1',
-            'omg-run.1', 'omg-workspace.1', 'omg-workspace-list.1',
-            'omg-env.1', 'omg-env-capture.1', 'omg-team.1',
-            'omg-team-golden-path.1', 'omg-container.1',
-            'omg-container-build.1', 'omg-snapshot.1',
-            'omg-snapshot-create.1', 'omg-generate-man.1',
-        ) + tuple(f'omg-fixture-{index}.1' for index in range(21))
-        self.assertEqual(len(pages), 40)
+        pages = tuple((ROOT / 'tests/man_page_inventory.txt').read_text().splitlines())
+        self.assertEqual(len(pages), 140)
         product = f'''[[ "$1" == generate-man && "$2" == --output ]] || exit 70
 mkdir -p "$3"
 for name in {shlex.join(pages)}; do
   printf %s {shlex.quote(page)} > "$3/$name"
 done
-printf 'Generated 40 man pages\\n'
+printf 'Generated {len(pages)} man pages\\n'
 '''
         for mutation, expected in (
             ('', 'PASS'),
             ('sed -i "/SYNOPSIS/d" "$3/omg-team.1"\n', 'FAIL'),
-            ('rm "$3/omg-generate-man.1"\n', 'FAIL'),
+            ('rm "$3/omg-team-golden-path-create.1"\n', 'FAIL'),
             ('mv "$3/omg-audit-licenses.1" "$3/omg-unrelated.1"\n', 'FAIL'),
             ('find "$3" -type f ! -name omg.1 ! -name omg-generate-man.1 -delete\n'
              'printf "Generated 2 man pages\\n"; exit 0\n', 'FAIL'),
-            ('printf "Generated 41 man pages\\n"; exit 0\n', 'FAIL'),
+            ('touch "$3/omg-invented.1"\n', 'FAIL'),
+            ('printf "Generated 141 man pages\\n"; exit 0\n', 'FAIL'),
         ):
             with self.subTest(mutation=mutation):
-                command = product.replace("printf 'Generated 40 man pages\\n'", mutation +
-                                          "printf 'Generated 40 man pages\\n'")
+                announcement = f"printf 'Generated {len(pages)} man pages\\n'"
+                command = product.replace(announcement, mutation + announcement)
                 result, evidence, logs = self.run_inventory(command, [row])
                 self.assertEqual(evidence[0]['result'], expected, logs)
                 self.assertEqual(result.returncode, int(expected == 'FAIL'))
@@ -1996,6 +1998,39 @@ exit 70
                     result, evidence, logs = self.run_inventory(product, [row])
                     self.assertEqual(evidence[0]['result'], expected, logs)
                     self.assertEqual(result.returncode, int(expected == 'FAIL'))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_enterprise_export_requires_five_private_evidence_files(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('enterprise-audit-export-flags\t'))
+        product = '''[[ "$1:$2:$3:$4:$5:$6:$7:$8" == enterprise:audit-export:--framework:iso27001:--period:2025-Q1:--output:./enterprise-evidence-flags ]] || exit 70
+mkdir enterprise-evidence-flags
+printf '%s' '{"unavailable_evidence":[{"artifact":"access-control-matrix","reason":"unavailable"}]}' > enterprise-evidence-flags/limitations.json
+printf '[]' > enterprise-evidence-flags/change-log.json
+printf '{}' > enterprise-evidence-flags/policy-enforcement.json
+printf 'package,version,description\\nbash,1,shell\\n' > enterprise-evidence-flags/installed-packages.csv
+printf '%s' '{"bomFormat":"CycloneDX","specVersion":"1.5","components":[{"name":"bash"}]}' > enterprise-evidence-flags/sbom-inventory.json
+chmod 600 enterprise-evidence-flags/*
+printf 'Audit evidence exported: iso27001 2025-Q1\\n'
+'''
+        for mutation, expected in (
+            ('', 'PASS'),
+            ('rm enterprise-evidence-flags/sbom-inventory.json\n', 'FAIL'),
+            ('chmod 644 enterprise-evidence-flags/limitations.json\n', 'FAIL'),
+            ('printf invalid > enterprise-evidence-flags/change-log.json\n', 'FAIL'),
+        ):
+            with self.subTest(mutation=mutation):
+                result, evidence, logs = self.run_inventory(product + mutation, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'))
+        for mutation, expected in (('', 'PASS'), ('mkdir enterprise-evidence-flags\n', 'FAIL')):
+            with self.subTest(distro='debian', mutation=mutation):
+                product = mutation + '''printf 'Error: Installed-package export requires the Arch package backend\\n' >&2
+exit 1
+'''
+                result, evidence, logs = self.run_inventory(product, [row], distro='debian')
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'))
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_team_compliance_refusal_never_writes_an_unevaluated_report(self):
@@ -2029,7 +2064,10 @@ exit 1
             root = Path(directory)
             for name in ('home', 'bin', 'guest'):
                 (root / name).mkdir()
-            for name, content in (home_files or {}).items():
+            guest_files = {'man_page_inventory.txt':
+                           (ROOT / 'tests/man_page_inventory.txt').read_bytes()}
+            guest_files.update(home_files or {})
+            for name, content in guest_files.items():
                 (root / 'home' / name).write_bytes(content)
             for name, content in (native_commands or {}).items():
                 tool = root / 'bin' / name

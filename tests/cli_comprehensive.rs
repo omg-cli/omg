@@ -316,11 +316,16 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
         ("daemon-foreground", Assertion::DaemonForegroundLifecycle),
         ("clean-orphans-native", Assertion::NativeAptOrphanRemoved),
         ("generate-man", Assertion::ManPagesGenerated),
+        ("team-golden-create-flags", Assertion::GoldenPathFlags),
         ("audit-export", Assertion::AuditExportAbsoluteRefusal),
         ("audit-export-flags", Assertion::AuditExportAbsoluteRefusal),
         (
             "enterprise-audit-export",
             Assertion::AuditExportAbsoluteRefusal,
+        ),
+        (
+            "enterprise-audit-export-flags",
+            Assertion::EnterpriseAuditExportEvidence,
         ),
         ("team-compliance-export", Assertion::TeamComplianceNoReport),
     ] {
@@ -638,6 +643,7 @@ enum Assertion {
     GoldenPathCreated,
     GoldenPathListed,
     GoldenPathDeleted,
+    GoldenPathFlags,
     PrivacyOptedOut,
     PrivacyStatusDisabled,
     PrivacyOptedIn,
@@ -651,6 +657,7 @@ enum Assertion {
     AllTasksExecuted,
     ManPagesGenerated,
     AuditExportAbsoluteRefusal,
+    EnterpriseAuditExportEvidence,
     TeamComplianceNoReport,
 }
 
@@ -734,6 +741,7 @@ impl Assertion {
             "golden-path-created" => Self::GoldenPathCreated,
             "golden-path-listed" => Self::GoldenPathListed,
             "golden-path-deleted" => Self::GoldenPathDeleted,
+            "golden-path-flags" => Self::GoldenPathFlags,
             "privacy-opted-out" => Self::PrivacyOptedOut,
             "privacy-status-disabled" => Self::PrivacyStatusDisabled,
             "privacy-opted-in" => Self::PrivacyOptedIn,
@@ -747,6 +755,7 @@ impl Assertion {
             "all-tasks-executed" => Self::AllTasksExecuted,
             "man-pages-generated" => Self::ManPagesGenerated,
             "audit-export-absolute-refusal" => Self::AuditExportAbsoluteRefusal,
+            "enterprise-audit-export-evidence" => Self::EnterpriseAuditExportEvidence,
             "team-compliance-no-report" => Self::TeamComplianceNoReport,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
@@ -1649,6 +1658,29 @@ fn behavior_inventory_runs_in_hermetic_state() {
         };
         for assertion in &case.assertions {
             match assertion {
+                Assertion::GoldenPathFlags => {
+                    let stored = std::fs::read_to_string(config_dir.join("golden-paths.toml"))
+                        .ok()
+                        .and_then(|body| body.parse::<toml::Value>().ok());
+                    let flagged = stored.as_ref().and_then(|document| document.get("templates"))
+                        .and_then(toml::Value::as_array)
+                        .and_then(|templates| templates.iter().find(|template| {
+                            template.get("name").and_then(toml::Value::as_str) == Some("flagged")
+                        }));
+                    let state_ok = flagged.is_some_and(|template| {
+                        template.get("runtimes").and_then(toml::Value::as_table)
+                            .is_some_and(|runtimes| {
+                                runtimes.len() == 2
+                                    && runtimes.get("node").and_then(toml::Value::as_str) == Some("20")
+                                    && runtimes.get("python").and_then(toml::Value::as_str) == Some("3.12")
+                            })
+                            && template.get("packages").and_then(toml::Value::as_array)
+                                .is_some_and(|packages| packages.len() == 1 && packages[0].as_str() == Some("ripgrep"))
+                    });
+                    if !state_ok || !result.stdout.contains("Golden path 'flagged' created!") {
+                        issues.push("golden path flags were not persisted".to_string());
+                    }
+                }
                 Assertion::GoldenPathCreated
                 | Assertion::GoldenPathListed
                 | Assertion::GoldenPathDeleted => {
@@ -1680,7 +1712,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                                                 && item
                                                     .get("runtimes")
                                                     .and_then(toml::Value::as_table)
-                                                    .is_some_and(|runtimes| runtimes.is_empty())
+                                                    .is_some_and(toml::map::Map::is_empty)
                                                 && item
                                                     .get("packages")
                                                     .and_then(toml::Value::as_array)
@@ -1751,21 +1783,28 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 Assertion::ManPagesGenerated => {
                     use std::collections::BTreeSet;
 
+                    fn collect_pages(command: &clap::Command, prefix: &str, pages: &mut BTreeSet<String>) {
+                        for subcommand in command.get_subcommands().filter(|cmd| !cmd.is_hide_set()) {
+                            let name = format!("{prefix}-{}", subcommand.get_name());
+                            pages.insert(format!("{name}.1"));
+                            collect_pages(subcommand, &name, pages);
+                        }
+                    }
+
                     let man_dir = project.path().join("man");
                     let pages = std::fs::read_dir(&man_dir)
                         .ok()
                         .and_then(|entries| entries.collect::<Result<Vec<_>, _>>().ok());
                     let command = Cli::command();
                     let mut expected_pages = BTreeSet::from(["omg.1".to_string()]);
-                    for subcommand in command.get_subcommands().filter(|cmd| !cmd.is_hide_set()) {
-                        let name = subcommand.get_name();
-                        expected_pages.insert(format!("omg-{name}.1"));
-                        for nested in subcommand
-                            .get_subcommands()
-                            .filter(|cmd| !cmd.is_hide_set())
-                        {
-                            expected_pages.insert(format!("omg-{name}-{}.1", nested.get_name()));
-                        }
+                    collect_pages(&command, "omg", &mut expected_pages);
+                    let manifest_pages = include_str!("man_page_inventory.txt")
+                        .lines()
+                        .filter(|name| cfg!(feature = "license") || !name.starts_with("omg-account"))
+                        .map(str::to_string)
+                        .collect::<BTreeSet<_>>();
+                    if expected_pages != manifest_pages {
+                        issues.push("man page inventory differs from the Clap command tree".to_string());
                     }
                     let actual_pages = pages.as_ref().map(|entries| {
                         entries
@@ -1813,7 +1852,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         })
                         .collect::<Vec<_>>();
                     if !only_real_pages || !has_sections
-                        || announced != vec![pages.as_ref().map_or(0, |entries| entries.len())]
+                        || announced != vec![pages.as_ref().map_or(0, Vec::len)]
                     {
                         issues.push("generate-man did not create and count real man pages".to_string());
                     }
@@ -1832,6 +1871,58 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         || !no_artifacts
                     {
                         issues.push("absolute-path audit export did not refuse before writing".to_string());
+                    }
+                }
+                Assertion::EnterpriseAuditExportEvidence => {
+                    use std::collections::BTreeSet;
+
+                    let directory = project.path().join("enterprise-evidence-flags");
+                    let expected = BTreeSet::from([
+                        "limitations.json", "change-log.json", "policy-enforcement.json",
+                        "installed-packages.csv", "sbom-inventory.json",
+                    ]);
+                    let files = std::fs::read_dir(&directory)
+                        .ok()
+                        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>().ok());
+                    let actual = files.as_ref().map(|entries| {
+                        entries.iter().map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .collect::<BTreeSet<_>>()
+                    });
+                    let private_files = files.as_ref().is_some_and(|entries| {
+                        entries.len() == expected.len() && entries.iter().all(|entry| {
+                            entry.metadata().is_ok_and(|metadata| {
+                                metadata.is_file() && metadata.permissions().mode() & 0o077 == 0
+                            }) && entry.file_type().is_ok_and(|kind| kind.is_file())
+                        })
+                    });
+                    let json = |name| {
+                        std::fs::read_to_string(directory.join(name)).ok()
+                            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                    };
+                    let contents = json("limitations.json").is_some_and(|value| {
+                        value["unavailable_evidence"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| item["artifact"] == "access-control-matrix")
+                        })
+                    }) && json("change-log.json").is_some_and(serde_json::Value::is_array)
+                        && json("policy-enforcement.json").is_some_and(serde_json::Value::is_object)
+                        && json("sbom-inventory.json").is_some_and(|value| {
+                            value["bomFormat"] == "CycloneDX"
+                                && value["components"].as_array().is_some_and(|items| !items.is_empty())
+                        })
+                        && csv::Reader::from_path(directory.join("installed-packages.csv"))
+                            .ok().is_some_and(|mut reader| {
+                                reader.headers().is_ok_and(|headers| {
+                                    headers.iter().collect::<Vec<_>>()
+                                        == ["package", "version", "description"]
+                                }) && reader.records().next().is_some_and(Result::is_ok)
+                            });
+                    if actual.as_ref().map(|files| files.iter().map(String::as_str).collect::<BTreeSet<_>>())
+                        != Some(expected) || !private_files || !contents
+                        || !result.stdout.contains("Audit evidence exported")
+                        || !result.stdout.contains("iso27001")
+                        || !result.stdout.contains("2025-Q1")
+                    {
+                        issues.push("enterprise audit export omitted private evidence files".to_string());
                     }
                 }
                 Assertion::TeamComplianceNoReport => {

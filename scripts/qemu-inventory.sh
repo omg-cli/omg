@@ -990,6 +990,18 @@ templates = document.get('templates')
 valid = set(document) == {'templates'} and isinstance(templates, list)
 if assertion == 'golden-path-deleted':
     valid = valid and templates == []
+elif assertion == 'golden-path-flags':
+    valid = valid and len(templates) == 2 and all(isinstance(item, dict) for item in templates)
+    if valid:
+        by_name = {item.get('name'): item for item in templates}
+        flagged = by_name.get('flagged', {})
+        valid = (set(by_name) == {'smoke', 'flagged'}
+                 and by_name['smoke'].get('runtimes') == {}
+                 and by_name['smoke'].get('packages') == []
+                 and set(flagged) == {'name', 'runtimes', 'packages', 'created_at'}
+                 and flagged['runtimes'] == {'node': '20', 'python': '3.12'}
+                 and flagged['packages'] == ['ripgrep']
+                 and type(flagged['created_at']) is int and flagged['created_at'] > 0)
 else:
     valid = valid and len(templates) == 1 and isinstance(templates[0], dict)
     if valid:
@@ -1016,38 +1028,32 @@ PY
     golden-path-deleted)
       [[ $(grep -Fc "Deleted template 'smoke'" "$output") == 1 ]] \
         && ! grep -Fq "Template 'smoke' not found" "$output" ;;
+    golden-path-flags)
+      [[ $(grep -Fc "Golden path 'flagged' created!" "$output") == 1 ]] \
+        && grep -Fq 'Node: 20' "$output" && grep -Fq 'Python: 3.12' "$output" \
+        && grep -Fq 'Packages: ripgrep' "$output" ;;
     *) return 2 ;;
   esac || { printf 'assertion failed: golden path output disagrees with the private template state\n' >&2; return 1; }
 }
 check_file_output_oracle() {
-  local assertion=$1 code=$2 stdout=$3 stderr=$4 file count announced
+  local assertion=$1 code=$2 stdout=$3 stderr=$4 distro=${5:-arch} file count announced
   case "$assertion" in
     man-pages-generated)
-      local -a required_pages=(
-        omg.1 omg-search.1 omg-install.1 omg-update.1 omg-doctor.1
-        omg-audit.1 omg-audit-licenses.1 omg-run.1 omg-workspace.1
-        omg-workspace-list.1 omg-env.1 omg-env-capture.1 omg-team.1
-        omg-team-golden-path.1 omg-container.1 omg-container-build.1
-        omg-snapshot.1 omg-snapshot-create.1 omg-generate-man.1
-      )
       if [[ "$code" != 0 || ! -d man || -L man
-        || ! -f man/omg.1 || -L man/omg.1 ]] \
+        || ! -f man/omg.1 || -L man/omg.1
+        || ! -f "$HOME/man_page_inventory.txt" || -L "$HOME/man_page_inventory.txt" ]] \
         || ! grep -Eiq '^\.TH[[:space:]]+"?omg"?[[:space:]]' man/omg.1; then
         printf 'assertion failed: generate-man omitted its main page\n' >&2
         return 1
       fi
-      for file in "${required_pages[@]}"; do
-        if [[ ! -f "man/$file" || -L "man/$file" ]]; then
-          printf 'assertion failed: generate-man omitted required page %s\n' "$file" >&2
-          return 1
-        fi
-      done
       count=$(find man -maxdepth 1 -type f -name 'omg*.1' | wc -l)
       announced=$(sed -nE 's/^.*Generated ([0-9]+) man pages$/\1/p' "$stdout")
-      if [[ "$count" -lt 40 || "$announced" != "$count" ]] \
+      if [[ "$announced" != "$count" ]] \
+        || ! cmp -s "$HOME/man_page_inventory.txt" \
+          <(find man -maxdepth 1 -type f -name 'omg*.1' -printf '%f\n' | LC_ALL=C sort) \
         || find man -mindepth 1 -maxdepth 1 ! -type f | grep -q . \
         || find man -maxdepth 1 -type f ! -name 'omg*.1' | grep -q .; then
-        printf 'assertion failed: generated man page count or file set disagrees with the CLI surface\n' >&2
+        printf 'assertion failed: generated man page count or file set disagrees with the reviewed CLI manifest\n' >&2
         return 1
       fi
       while IFS= read -r file; do
@@ -1058,6 +1064,61 @@ check_file_output_oracle() {
           return 1
         fi
       done < <(find man -maxdepth 1 -type f -name 'omg*.1' -print) ;;
+    enterprise-audit-export-evidence)
+      if [[ "$distro" != arch ]]; then
+        if [[ "$code" != 1 || -e enterprise-evidence-flags || -L enterprise-evidence-flags ]] \
+          || ! grep -Fq 'Installed-package export requires the Arch package backend' "$stderr"; then
+          printf 'assertion failed: unsupported enterprise export left evidence behind\n' >&2
+          return 1
+        fi
+        return 0
+      fi
+      if [[ "$code" != 0 || ! -d enterprise-evidence-flags || -L enterprise-evidence-flags ]] \
+        || ! grep -Fq 'Audit evidence exported' "$stdout" \
+        || ! grep -Fq 'iso27001' "$stdout" || ! grep -Fq '2025-Q1' "$stdout"; then
+        printf 'assertion failed: enterprise export omitted its success receipt\n' >&2
+        return 1
+      fi
+      if ! python3 - enterprise-evidence-flags <<'PY'
+import csv
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1])
+expected = {'limitations.json', 'change-log.json', 'policy-enforcement.json',
+            'installed-packages.csv', 'sbom-inventory.json'}
+files = list(root.iterdir())
+if {path.name for path in files} != expected or len(files) != len(expected):
+    sys.exit(1)
+for path in files:
+    metadata = path.lstat()
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077):
+        sys.exit(1)
+limitations = json.loads((root / 'limitations.json').read_text())
+if not any(item.get('artifact') == 'access-control-matrix'
+           and item.get('reason') for item in limitations.get('unavailable_evidence', [])):
+    sys.exit(1)
+if not isinstance(json.loads((root / 'change-log.json').read_text()), list):
+    sys.exit(1)
+if not isinstance(json.loads((root / 'policy-enforcement.json').read_text()), dict):
+    sys.exit(1)
+sbom = json.loads((root / 'sbom-inventory.json').read_text())
+if (sbom.get('bomFormat') != 'CycloneDX' or sbom.get('specVersion') != '1.5'
+        or not isinstance(sbom.get('components'), list) or not sbom['components']):
+    sys.exit(1)
+with (root / 'installed-packages.csv').open(newline='') as stream:
+    reader = csv.DictReader(stream)
+    if reader.fieldnames != ['package', 'version', 'description'] or not list(reader):
+        sys.exit(1)
+PY
+      then
+        printf 'assertion failed: enterprise export lacks five private, valid evidence files\n' >&2
+        return 1
+      fi ;;
     audit-export-absolute-refusal)
       if [[ "$code" != 1 ]] || ! grep -Fq 'Absolute paths not allowed' "$stderr" \
         || grep -Eq 'Audit evidence exported|Evidence exported to' "$stdout" \
@@ -1090,8 +1151,8 @@ check_product_output() {
     printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
   fi
   case "$assertion" in
-    man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report)
-      check_file_output_oracle "$assertion" "$code" "$stdout" "$stderr" || return 1 ;;
+    man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence)
+      check_file_output_oracle "$assertion" "$code" "$stdout" "$stderr" "$distro" || return 1 ;;
   esac
   if [[ "$assertion" == license-* ]]; then
     local mode=${assertion#license-} report=$stdout
@@ -1354,7 +1415,7 @@ PY
         fi ;;
       config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults)
         check_config_oracle "$assertion" "$stdout" || return 1 ;;
-      golden-path-created|golden-path-listed|golden-path-deleted)
+      golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags)
         check_golden_path_state "$assertion" "$stdout" || return 1 ;;
       privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled)
         check_privacy_oracle "$assertion" "$stdout" || return 1 ;;
@@ -1561,12 +1622,13 @@ ssh_port=2222
 ssh_user=bench
 while (($#)); do
   case "$1" in
-    --work|--distro|--tiers|--tag|--binary|--tsv|--row-timeout|--ssh-port|--ssh-user|--network-policy)
+    --work|--distro|--tiers|--tag|--binary|--tsv|--row-timeout|--ssh-port|--ssh-user|--network-policy|--man-page-inventory)
       [[ $# -ge 2 && -n "$2" ]] || exit 2
       case "$1" in
         --work) work=$2 ;; --distro) distro=$2 ;; --tiers) tiers=$2 ;;
         --tag) tag=$2 ;; --binary) binary=$2 ;; --tsv) tsv=$2 ;;
         --network-policy) network_policy=$2 ;;
+        --man-page-inventory) man_page_inventory=$2 ;;
         --row-timeout) row_timeout=$2 ;; --ssh-port) ssh_port=$2 ;; --ssh-user) ssh_user=$2 ;;
       esac
       shift 2 ;;
@@ -1578,6 +1640,8 @@ while (($#)); do
   esac
 done
 [[ -n "$work" && -n "$distro" && -n "$tiers" && -n "$tag" && -n "$binary" && -n "$tsv" ]] || exit 2
+man_page_inventory=${man_page_inventory:-"$(dirname "$0")/../tests/man_page_inventory.txt"}
+[[ -f "$man_page_inventory" && ! -L "$man_page_inventory" ]] || exit 2
 [[ "$row_timeout" =~ ^[0-9]+$ && "$row_timeout" -gt 0 ]] || exit 2
 case "$distro" in arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
 for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3; done
@@ -1610,7 +1674,7 @@ out="$root/inventory"
 # Refuse to overwrite evidence from a previous invocation.
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" > "$out/input-sha256.txt"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$man_page_inventory" > "$out/input-sha256.txt"
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
   '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
@@ -1705,7 +1769,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence) ;; *) exit 2 ;; esac
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-remove:workspace-project-removed|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
@@ -1723,10 +1787,14 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     enterprise-audit-export)
       [[ "$a" == audit-export-absolute-refusal && "$s" == controlled-error && "$resolved" == 1 ]] || exit 2
       jq -e '. == ["enterprise","audit-export","--output","${ROOT}/enterprise-evidence"]' <<< "$aj" >/dev/null || exit 2 ;;
+    enterprise-audit-export-flags)
+      [[ "$a" == enterprise-audit-export-evidence && "$s" == isolated-write
+        && "$e" == 'arch:0,debian:1,ubuntu:1,fedora:1' ]] || exit 2
+      jq -e '. == ["enterprise","audit-export","--framework","iso27001","--period","2025-Q1","--output","./enterprise-evidence-flags"]' <<< "$aj" >/dev/null || exit 2 ;;
     team-compliance-export)
       [[ "$a" == team-compliance-no-report && "$s" == controlled-error && "$resolved" == 1 && "$r" == team-init ]] || exit 2
       jq -e '. == ["team","compliance","--export","${ROOT}/compliance.json"]' <<< "$aj" >/dev/null || exit 2 ;;
-    *) [[ "$a" != man-pages-generated && "$a" != audit-export-absolute-refusal && "$a" != team-compliance-no-report ]] || exit 2 ;;
+    *) [[ "$a" != man-pages-generated && "$a" != audit-export-absolute-refusal && "$a" != team-compliance-no-report && "$a" != enterprise-audit-export-evidence ]] || exit 2 ;;
   esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
@@ -1789,7 +1857,10 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
       [[ "$a" == golden-path-listed && "$r" == team-golden-create ]] || exit 2 ;;
     team-golden-delete)
       [[ "$a" == golden-path-deleted && "$r" == team-golden-list ]] || exit 2 ;;
-    *) [[ "$a" != golden-path-created && "$a" != golden-path-listed && "$a" != golden-path-deleted ]] || exit 2 ;;
+    team-golden-create-flags)
+      [[ "$a" == golden-path-flags && "$r" == team-golden-list && "$resolved" == 0 ]] || exit 2
+      jq -e '. == ["team","golden-path","create","flagged","--node","20","--python","3.12","--packages","ripgrep"]' <<< "$aj" >/dev/null || exit 2 ;;
+    *) [[ "$a" != golden-path-created && "$a" != golden-path-listed && "$a" != golden-path-deleted && "$a" != golden-path-flags ]] || exit 2 ;;
   esac
   case "$id" in
     config-set)

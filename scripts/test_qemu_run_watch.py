@@ -37,6 +37,12 @@ FAKE_WATCHER = textwrap.dedent("""\
     if mode == 'early-double':
         task()
     print('Watching for changes...', flush=True)
+    if mode == 'timer':
+        time.sleep(.45)
+        print('File changed, re-running', flush=True)
+        task()
+        while True:
+            time.sleep(.05)
     while Path('src/watch-trigger.txt').read_text() != 'changed once\\n':
         time.sleep(.02)
     if mode != 'no-rerun':
@@ -74,10 +80,10 @@ class RunWatchCheck(unittest.TestCase):
         self.binary.write_text(FAKE_WATCHER)
         self.binary.chmod(0o755)
 
-    def probe(self, mode):
+    def probe(self, mode, quiet="0.3"):
         return subprocess.run(
             [sys.executable, str(HELPER), str(self.binary), str(self.fixture),
-             "--phase-timeout", "0.8", "--quiet-seconds", "0.3",
+             "--phase-timeout", "0.8", "--quiet-seconds", quiet,
              "--shutdown-timeout", "0.5"],
             env={**os.environ, "WATCH_MODE": mode}, capture_output=True,
             text=True, timeout=5,
@@ -120,6 +126,12 @@ class RunWatchCheck(unittest.TestCase):
                         time.sleep(.05)
                     else:
                         self.fail("watch background child survived helper cleanup")
+
+    def test_unsolicited_timed_rerun_fails_before_the_source_edit(self):
+        result = self.probe("timer", quiet="0.6")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("pre-edit quiet interval", result.stderr)
+        self.assertFalse((self.fixture / "watch-evidence.json").exists())
 
 
 if __name__ == "__main__":

@@ -164,12 +164,12 @@ audit-fix-flags	["audit","fix","--dry-run","--yes","--min-severity","high"]	read
 audit-export-flags	["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]	isolated-write	1	pass	-	hermetic	hermetic:pass	audit-export-absolute-refusal	tempdir-drop
 run-parallel	["run","--parallel","parallel-one,parallel-two"]	read	0	pass	-	hermetic	hermetic:pass	parallel-tasks-executed	tempdir-drop
 run-all	["run","--all","smoke"]	read	0	pass	-	hermetic	hermetic:pass	all-tasks-executed	tempdir-drop
-team-golden-create-flags	["team","golden-path","create","flagged","--node","20","--python","3.12","--packages","ripgrep"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	-	tempdir-drop
+team-golden-create-flags	["team","golden-path","create","flagged","--node","20","--python","3.12","--packages","ripgrep"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	golden-path-flags	tempdir-drop
 team-compliance-export	["team","compliance","--export","${ROOT}/compliance.json"]	controlled-error	1	pass	team-init	hermetic	hermetic:pass	team-compliance-no-report	tempdir-drop
 team-compliance-enforce	["team","compliance","--enforce"]	read	0	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 enterprise-reports-type	["enterprise","reports","--report-type","quarterly"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 enterprise-policy-scope	["enterprise","policy","show","--scope","global"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-enterprise-audit-export-flags	["enterprise","audit-export","--framework","iso27001","--period","2025-Q1","--output","./enterprise-evidence-flags"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+enterprise-audit-export-flags	["enterprise","audit-export","--framework","iso27001","--period","2025-Q1","--output","./enterprise-evidence-flags"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	enterprise-audit-export-evidence	tempdir-drop
 enterprise-license-scan-export	["enterprise","license-scan","--export","json"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-enterprise-json	tempdir-drop
 history-flags	["history","--limit","3","--search","pacman","--type","install","--from","2024-01-01","--to","2026-12-31"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 rollback-yes	["rollback","--yes"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -195,7 +195,7 @@ container-build-argv	["container","build","--dockerfile","Dockerfile","--tag","s
 container-run-detached	["container","run","--name","smoke","--detach","--env","SMOKE=1","--volume","/tmp:/tmp","--workdir","/tmp","debian:bookworm"]	service-mutation	-	declared	-	nested-container	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
 container-run-interactive	["container","run","--interactive","--name","smoke-tty","debian:bookworm"]	interactive	-	declared	-	nested-container,pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
 container-shell-flags	["container","shell","--image","debian:bookworm","--workdir","/tmp","--env","SMOKE=1","--volume","/tmp:/tmp"]	interactive	-	declared	-	nested-container,pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
-container-build-flags	["container","build","--dockerfile","Dockerfile","--tag","smoke:latest","--no-cache","--build-arg","SMOKE=1","--target","dev"]	service-mutation	-	declared	-	nested-container	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
+container-build-flags	["container","build","--dockerfile","Dockerfile.nested","--tag","smoke:nested","--no-cache","--build-arg","SMOKE=1","--target","dev"]	service-mutation	-	declared	-	nested-container	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
 clean-yes	["clean","--all","--dry-run","--yes"]	read	arch:0,debian:1,ubuntu:1,fedora:0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 install-review	["install","--review","--dry-run","pacman"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 update-review	["update","--check","--review"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop

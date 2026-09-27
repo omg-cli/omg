@@ -33,8 +33,8 @@ def marker_count(path):
     return len(lines)
 
 
-def run(binary, fixture, phase_timeout=20.0, quiet_seconds=1.5,
-        shutdown_timeout=5.0):
+def run(binary, fixture, phase_timeout=20.0, quiet_seconds=8.0,
+        shutdown_timeout=5.0, rerun_timeout=4.0):
     fixture = fixture.resolve(strict=True)
     trigger = fixture / "src" / "watch-trigger.txt"
     marker = fixture / "watch-runs.marker"
@@ -108,7 +108,7 @@ def run(binary, fixture, phase_timeout=20.0, quiet_seconds=1.5,
         trigger.write_text("changed once\n", encoding="utf-8")
         wait_until("source-edit rerun", lambda content, count:
                    RERUN in content and content.count(TASK_OUTPUT) == 2 and count == 2,
-                   phase_timeout)
+                   min(phase_timeout, rerun_timeout))
         quiet("post-edit quiet interval", 2)
         os.write(master, b"\x03")
         deadline = time.monotonic() + shutdown_timeout
@@ -172,14 +172,16 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("fixture", type=Path)
     parser.add_argument("--phase-timeout", type=float, default=20.0)
-    parser.add_argument("--quiet-seconds", type=float, default=1.5)
+    parser.add_argument("--quiet-seconds", type=float, default=8.0)
     parser.add_argument("--shutdown-timeout", type=float, default=5.0)
+    parser.add_argument("--rerun-timeout", type=float, default=4.0)
     args = parser.parse_args()
-    if min(args.phase_timeout, args.quiet_seconds, args.shutdown_timeout) <= 0:
+    if min(args.phase_timeout, args.quiet_seconds, args.shutdown_timeout,
+           args.rerun_timeout) <= 0:
         parser.error("timeouts must be positive")
     try:
         return run(args.binary, args.fixture, args.phase_timeout,
-                   args.quiet_seconds, args.shutdown_timeout)
+                   args.quiet_seconds, args.shutdown_timeout, args.rerun_timeout)
     except (WatchFailure, OSError, UnicodeError) as error:
         print(f"assertion failed: run --watch: {error}", file=sys.stderr)
         return 1
