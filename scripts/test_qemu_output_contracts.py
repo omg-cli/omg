@@ -223,6 +223,39 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
                 self.assertEqual(result.returncode, int(expected != ['PASS', 'PASS']), result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_arch_update_rows_require_bounded_native_fixture_receipt(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if line.startswith(('update-fast\t', 'update-turbo\t'))]
+        product = (
+            '[[ "$1" == update && "$3" == --yes ]] || exit 9\n'
+            'case "$2" in\n'
+            '  --fast) printf "Fast System Update\\nSynced\\nUpgraded 1 package\\n" ;;\n'
+            '  --turbo) printf "TURBO System Update\\ncached, no sync\\nUpgraded 1 package\\n" ;;\n'
+            '  *) exit 9 ;;\n'
+            'esac\n'
+        )
+        sudo = '[[ "$1" != -n ]] || shift\nexec "$@"\n'
+        for row in rows:
+            mode = row.split('\t', 1)[0].removeprefix('update-')
+            for after_marker in (True, False):
+                with self.subTest(mode=mode, after_marker=after_marker):
+                    fixture = (
+                        '#!/usr/bin/env bash\n'
+                        'mode=$1; binary=$2\n'
+                        'printf "OMG_QEMU_UPDATE_FIXTURE:before:%s:1\\n" "$mode"\n'
+                        '"$binary" update "--$mode" --yes\n'
+                    )
+                    if after_marker:
+                        fixture += 'printf "OMG_QEMU_UPDATE_FIXTURE:after:%s:2:native-upgrade\\n" "$mode"\n'
+                    result, evidence, logs = self.run_inventory(
+                        product, [row], distro='arch', tiers='container',
+                        allow_mutations=True, native_commands={'sudo': sudo},
+                        home_files={'qemu-arch-update-fixture.sh': fixture.encode()})
+                    self.assertEqual(evidence[0]['result'], 'PASS' if after_marker else 'FAIL', logs)
+                    self.assertEqual(result.returncode, 0 if after_marker else 1, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_apt_fast_and_turbo_require_a_native_version_upgrade(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         rows = [line for line in inventory.splitlines()
