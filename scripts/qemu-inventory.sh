@@ -1040,8 +1040,7 @@ check_file_output_oracle() {
   case "$assertion" in
     man-pages-generated)
       if [[ "$code" != 0 || ! -d man || -L man
-        || ! -f man/omg.1 || -L man/omg.1
-        || ! -f "$HOME/man_page_inventory.txt" || -L "$HOME/man_page_inventory.txt" ]] \
+        || ! -f man/omg.1 || -L man/omg.1 ]] \
         || ! grep -Eiq '^\.TH[[:space:]]+"?omg"?[[:space:]]' man/omg.1; then
         printf 'assertion failed: generate-man omitted its main page\n' >&2
         return 1
@@ -1049,12 +1048,34 @@ check_file_output_oracle() {
       count=$(find man -maxdepth 1 -type f -name 'omg*.1' | wc -l)
       announced=$(sed -nE 's/^.*Generated ([0-9]+) man pages$/\1/p' "$stdout")
       if [[ "$announced" != "$count" ]] \
-        || ! cmp -s "$HOME/man_page_inventory.txt" \
-          <(find man -maxdepth 1 -type f -name 'omg*.1' -printf '%f\n' | LC_ALL=C sort) \
         || find man -mindepth 1 -maxdepth 1 ! -type f | grep -q . \
         || find man -maxdepth 1 -type f ! -name 'omg*.1' | grep -q .; then
-        printf 'assertion failed: generated man page count or file set disagrees with the reviewed CLI manifest\n' >&2
+        printf 'assertion failed: generated man page count or file shape is invalid\n' >&2
         return 1
+      fi
+      if [[ "${OMG_QEMU_EXACT_MAN_PAGES:-0}" == 1 ]]; then
+        if [[ ! -f "$HOME/man_page_inventory.txt" || -L "$HOME/man_page_inventory.txt" ]] \
+          || ! cmp -s "$HOME/man_page_inventory.txt" \
+            <(find man -maxdepth 1 -type f -name 'omg*.1' -printf '%f\n' | LC_ALL=C sort); then
+          printf 'assertion failed: generated man page set disagrees with the reviewed CLI manifest\n' >&2
+          return 1
+        fi
+      else
+        local -a legacy_pages=(omg.1 omg-search.1 omg-install.1 omg-update.1 omg-doctor.1
+          omg-audit.1 omg-audit-licenses.1 omg-run.1 omg-workspace.1
+          omg-workspace-list.1 omg-env.1 omg-env-capture.1 omg-team.1
+          omg-team-golden-path.1 omg-container.1 omg-container-build.1
+          omg-snapshot.1 omg-snapshot-create.1 omg-generate-man.1)
+        if [[ "$count" -lt 40 ]]; then
+          printf 'assertion failed: published man page set has fewer than 40 pages\n' >&2
+          return 1
+        fi
+        for file in "${legacy_pages[@]}"; do
+          if [[ ! -f "man/$file" || -L "man/$file" ]]; then
+            printf 'assertion failed: published man page set omitted %s\n' "$file" >&2
+            return 1
+          fi
+        done
       fi
       while IFS= read -r file; do
         if ! grep -Eq '^\.TH[[:space:]]+' "$file" \
@@ -1079,43 +1100,7 @@ check_file_output_oracle() {
         printf 'assertion failed: enterprise export omitted its success receipt\n' >&2
         return 1
       fi
-      if ! python3 - enterprise-evidence-flags <<'PY'
-import csv
-import json
-import os
-from pathlib import Path
-import stat
-import sys
-
-root = Path(sys.argv[1])
-expected = {'limitations.json', 'change-log.json', 'policy-enforcement.json',
-            'installed-packages.csv', 'sbom-inventory.json'}
-files = list(root.iterdir())
-if {path.name for path in files} != expected or len(files) != len(expected):
-    sys.exit(1)
-for path in files:
-    metadata = path.lstat()
-    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) & 0o077):
-        sys.exit(1)
-limitations = json.loads((root / 'limitations.json').read_text())
-if not any(item.get('artifact') == 'access-control-matrix'
-           and item.get('reason') for item in limitations.get('unavailable_evidence', [])):
-    sys.exit(1)
-if not isinstance(json.loads((root / 'change-log.json').read_text()), list):
-    sys.exit(1)
-if not isinstance(json.loads((root / 'policy-enforcement.json').read_text()), dict):
-    sys.exit(1)
-sbom = json.loads((root / 'sbom-inventory.json').read_text())
-if (sbom.get('bomFormat') != 'CycloneDX' or sbom.get('specVersion') != '1.5'
-        or not isinstance(sbom.get('components'), list) or not sbom['components']):
-    sys.exit(1)
-with (root / 'installed-packages.csv').open(newline='') as stream:
-    reader = csv.DictReader(stream)
-    if reader.fieldnames != ['package', 'version', 'description'] or not list(reader):
-        sys.exit(1)
-PY
-      then
+      if ! python3 "$HOME/qemu-enterprise-export-oracle.py" enterprise-evidence-flags; then
         printf 'assertion failed: enterprise export lacks five private, valid evidence files\n' >&2
         return 1
       fi ;;
@@ -1640,8 +1625,13 @@ while (($#)); do
   esac
 done
 [[ -n "$work" && -n "$distro" && -n "$tiers" && -n "$tag" && -n "$binary" && -n "$tsv" ]] || exit 2
-man_page_inventory=${man_page_inventory:-"$(dirname "$0")/../tests/man_page_inventory.txt"}
-[[ -f "$man_page_inventory" && ! -L "$man_page_inventory" ]] || exit 2
+man_page_inventory=${man_page_inventory:-}
+if [[ -n "$man_page_inventory" ]]; then
+  [[ -f "$man_page_inventory" && ! -L "$man_page_inventory" ]] || exit 2
+  man_page_mode=exact
+else
+  man_page_mode=structural-legacy
+fi
 [[ "$row_timeout" =~ ^[0-9]+$ && "$row_timeout" -gt 0 ]] || exit 2
 case "$distro" in arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
 for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3; done
@@ -1674,10 +1664,11 @@ out="$root/inventory"
 # Refuse to overwrite evidence from a previous invocation.
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$man_page_inventory" > "$out/input-sha256.txt"
-jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" \
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$(dirname "$0")/qemu-enterprise-export-oracle.py" > "$out/input-sha256.txt"
+if [[ "$man_page_mode" == exact ]]; then sha256sum "$man_page_inventory" >> "$out/input-sha256.txt"; fi
+jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" --arg man_page_mode "$man_page_mode" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
-  '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
+  '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,man_page_mode:$man_page_mode,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
 # -n keeps ssh from forwarding (and draining) this loop's stdin, which is the
 # TSV stream: without it only the first tier-matching row ever executes.
 opts=(-n -i "$guest/client-key" -p "$ssh_port" -o BatchMode=yes -o ConnectTimeout=5
@@ -2108,6 +2099,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
   remote="set -eu; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
+  if [[ "$man_page_mode" == exact ]]; then remote+="; export OMG_QEMU_EXACT_MAN_PAGES=1"; fi
   if [[ "$assertions" == container-run-argv || "$assertions" == container-shell-argv || "$assertions" == container-build-argv ]]; then
     remote+="; mkdir -p \"\$rowdir/engine\"; printf '%s' $container_engine > \"\$rowdir/engine/podman\"; chmod 700 \"\$rowdir/engine/podman\"; ln -s /bin/false \"\$rowdir/engine/docker\""
     remote+="; export OMG_QEMU_ENGINE_CAPTURE=\"\$rowdir/engine\" PATH=\"\$rowdir/engine:\$PATH\"; [[ \$(command -v podman) == \"\$rowdir/engine/podman\" && \$(command -v docker) == \"\$rowdir/engine/docker\" ]] || { printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"

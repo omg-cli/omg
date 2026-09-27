@@ -592,7 +592,10 @@ if [[ -n "$inventory_tiers" ]]; then
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
   cp "$here/qemu-arch-update-fixture.sh" "$work/qemu-arch-update-fixture.sh"
   cp "$here/qemu-run-watch-check.py" "$work/qemu-run-watch-check.py"
-  cp "$here/../tests/man_page_inventory.txt" "$work/man_page_inventory.txt"
+  cp "$here/qemu-enterprise-export-oracle.py" "$work/qemu-enterprise-export-oracle.py"
+  if [[ "$source_kind" == staged ]]; then
+    cp "$here/../tests/man_page_inventory.txt" "$work/man_page_inventory.txt"
+  fi
   cp "$here/qemu-fedora-update-fixture.sh" "$work/qemu-fedora-update-fixture.sh"
   cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"
   cp "$tsv" "$work/cases.tsv"
@@ -774,7 +777,10 @@ if [[ -n "$inventory_tiers" ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fedora-update-fixture.sh bench@127.0.0.1:qemu-fedora-update-fixture.sh
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fingerprint-oracle.py bench@127.0.0.1:qemu-fingerprint-oracle.py
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-run-watch-check.py bench@127.0.0.1:qemu-run-watch-check.py
-  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/man_page_inventory.txt bench@127.0.0.1:man_page_inventory.txt
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-enterprise-export-oracle.py bench@127.0.0.1:qemu-enterprise-export-oracle.py
+  if [[ "$source_kind" == staged ]]; then
+    timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/man_page_inventory.txt bench@127.0.0.1:man_page_inventory.txt
+  fi
 fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/daemon-advisory-shutdown.sh bench@127.0.0.1:daemon-advisory-shutdown.sh
 if [[ "$benchmark" == true ]]; then
@@ -965,8 +971,10 @@ if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
   # TSV-driven rows run only on a healthy guest, inside the controller
   # (same netns; /work is bind-mounted). Evidence lands in $work/inventory.
   inv_args=(--work /work --distro "$distro" --tiers "$inventory_tiers" --tag "$tag"
-    --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv
-    --man-page-inventory /work/man_page_inventory.txt)
+    --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv)
+  if [[ "$source_kind" == staged ]]; then
+    inv_args+=(--man-page-inventory /work/man_page_inventory.txt)
+  fi
   [[ "$inventory_mutations" == false ]] || inv_args+=(--allow-mutations)
   [[ "$inventory_isolation" == false ]] || inv_args+=(--isolate-hermetic --network-policy /work/inventory-policy.json)
   inventory_rc=0

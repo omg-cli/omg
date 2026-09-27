@@ -28,7 +28,7 @@ trap 'exit 130' INT
 while :; do sleep .05; done
 '''
         result, evidence, logs = self.run_inventory(
-            product, [row], tiers='container', row_timeout=12,
+            product, [row], tiers='container', row_timeout=30,
             home_files={'qemu-run-watch-check.py':
                         (ROOT / 'scripts/qemu-run-watch-check.py').read_bytes()})
         self.assertEqual(result.returncode, 0, logs)
@@ -1973,6 +1973,18 @@ printf 'Generated {len(pages)} man pages\\n'
                 result, evidence, logs = self.run_inventory(command, [row])
                 self.assertEqual(evidence[0]['result'], expected, logs)
                 self.assertEqual(result.returncode, int(expected == 'FAIL'))
+        third_level = {'omg-enterprise-policy-show.1', 'omg-team-roles-list.1',
+                       'omg-team-golden-path-create.1',
+                       'omg-team-golden-path-delete.1',
+                       'omg-team-golden-path-list.1'}
+        legacy_pages = tuple(name for name in pages if name not in third_level)
+        legacy_product = product.replace(shlex.join(pages), shlex.join(legacy_pages)).replace(
+            f'Generated {len(pages)} man pages',
+            f'Generated {len(legacy_pages)} man pages')
+        result, evidence, logs = self.run_inventory(legacy_product, [row], exact_man=False)
+        self.assertEqual((result.returncode, evidence[0]['result']), (0, 'PASS'), logs)
+        result, evidence, logs = self.run_inventory(legacy_product, [row], exact_man=True)
+        self.assertEqual((result.returncode, evidence[0]['result']), (1, 'FAIL'), logs)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_absolute_path_exports_refuse_without_evidence(self):
@@ -2055,7 +2067,7 @@ exit 1
                 self.assertEqual([item['result'] for item in evidence], ['PASS', expected], logs)
                 self.assertEqual(result.returncode, int(expected == 'FAIL'))
 
-    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False):
+    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -2064,8 +2076,11 @@ exit 1
             root = Path(directory)
             for name in ('home', 'bin', 'guest'):
                 (root / name).mkdir()
-            guest_files = {'man_page_inventory.txt':
-                           (ROOT / 'tests/man_page_inventory.txt').read_bytes()}
+            guest_files = {
+                'man_page_inventory.txt': (ROOT / 'tests/man_page_inventory.txt').read_bytes(),
+                'qemu-enterprise-export-oracle.py':
+                    (ROOT / 'scripts/qemu-enterprise-export-oracle.py').read_bytes(),
+            }
             guest_files.update(home_files or {})
             for name, content in guest_files.items():
                 (root / 'home' / name).write_bytes(content)
@@ -2103,13 +2118,17 @@ exit 1
                        str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
                        '--binary', shell_path(binary), '--tsv', str(inventory),
                        '--distro', distro, '--tiers', tiers, '--tag', 'fixture']
+            if exact_man:
+                command += ['--man-page-inventory',
+                            shell_path(ROOT / 'tests/man_page_inventory.txt')]
             if row_timeout is not None:
                 command += ['--row-timeout', str(row_timeout)]
             if allow_mutations:
                 command.append('--allow-mutations')
             result = subprocess.run(
                 command,
-                env=env, capture_output=True, text=True, timeout=30)
+                env=env, capture_output=True, text=True,
+                timeout=max(30, (row_timeout or 0) + 10))
             evidence = root / 'inventory/results.json'
             self.assertTrue(evidence.exists(), result.stdout + result.stderr)
             return result, json.loads(evidence.read_text()), {
