@@ -172,6 +172,20 @@ load_release_cases() {
       printf 'error: invalid release contract identifier %q.\n' "$id" >&2
       return 3
     }
+    if [[ "$id" == release-package-rollback-tree ]]; then
+      # QEMU owns the dynamic history ID and native version oracle for this row.
+      # Keep its shape explicit so a changed release contract cannot disappear
+      # from archive smoke without a deliberate executor review.
+      if [[ "$args" != '["rollback","--yes"]' || "$safety" != package-mutation \
+        || "$expected_exit" != 0 || "$ux" != pass \
+        || "$requires" != release-package-remove-tree || "$tiers" != container \
+        || "$targets" != arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable \
+        || "$assertions" != native-apt-tree-rollback || "$cleanup" != container-prune ]]; then
+        printf 'error: QEMU-only rollback contract changed; review archive smoke coverage.\n' >&2
+        return 3
+      fi
+      continue
+    fi
     [[ "$ux" == "pass" ]] || continue
     [[ ",$tiers," == *",$tier,"* ]] || continue
     [[ "$targets" != "hermetic:pass" ]] || continue
@@ -190,7 +204,7 @@ load_release_cases() {
   if [[ ${#selected_cases[@]} -eq 0 ]]; then
     printf 'error: no release contracts match case=%q family=%q tier=%q.\n' "$case_id" "$family" "$tier" >&2
     printf 'valid release contracts:\n' >&2
-    awk -F '\t' '$1 ~ /^release-/ && $5 == "pass" && $8 != "hermetic:pass" { print "  " $1 }' "$inventory" >&2
+    awk -F '\t' '$1 ~ /^release-/ && $1 != "release-package-rollback-tree" && $5 == "pass" && $8 != "hermetic:pass" { print "  " $1 }' "$inventory" >&2
     return 2
   fi
   for id in "${selected_cases[@]}"; do
