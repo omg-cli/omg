@@ -318,7 +318,10 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
         ("generate-man", Assertion::ManPagesGenerated),
         ("audit-export", Assertion::AuditExportAbsoluteRefusal),
         ("audit-export-flags", Assertion::AuditExportAbsoluteRefusal),
-        ("enterprise-audit-export", Assertion::AuditExportAbsoluteRefusal),
+        (
+            "enterprise-audit-export",
+            Assertion::AuditExportAbsoluteRefusal,
+        ),
         ("team-compliance-export", Assertion::TeamComplianceNoReport),
     ] {
         let case = cases
@@ -1558,8 +1561,11 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .expect("seed isolated bash package");
             command_env.push(("OMG_DATA_DIR", path.to_str().expect("UTF-8 mock path")));
         }
-        let container_capture = matches!(case.id.as_str(),
-            "container-run-detached-argv" | "container-shell-argv" | "container-build-argv").then(|| {
+        let container_capture = matches!(
+            case.id.as_str(),
+            "container-run-detached-argv" | "container-shell-argv" | "container-build-argv"
+        )
+        .then(|| {
             let capture = project.create_dir(&format!("container-engine-capture-{}", case.id));
             let podman = project.path().join("bin/podman");
             std::fs::write(
