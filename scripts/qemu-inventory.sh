@@ -183,6 +183,10 @@ check_doctor_native_backend() {
         printf 'assertion failed: doctor omitted or duplicated the healthy Fedora package database result\n' >&2
         return 1
       fi
+      if [[ $(grep -Fxc '  RPM installed package database nonempty' "$output") != 1 ]]; then
+        printf 'assertion failed: doctor did not verify a nonempty RPM installed package database\n' >&2
+        return 1
+      fi
       if [[ -n "$exec_receipt" ]]; then
         if [[ ! -f "$exec_receipt" ]]; then
           printf 'native doctor DNF execution receipt is missing\n' >&2
@@ -193,6 +197,12 @@ check_doctor_native_backend() {
           printf 'assertion failed: doctor did not execute the trusted offline DNF5 package database check\n' >&2
           return 1
         fi
+        local rpm_exec_line
+        if ! rpm_exec_line=$(grep -Em 1 'execve\("(/usr/bin|/usr/sbin)/rpm", \["[^"]+", "-qa"\], .*\) = 0$' "$exec_receipt"); then
+          printf 'assertion failed: doctor did not execute the trusted RPM installed package query\n' >&2
+          return 1
+        fi
+        printf 'Fedora doctor RPM execution receipt: %s\n' "$rpm_exec_line" >&2
         printf 'Fedora doctor DNF execution receipt: %s\n' "$dnf_exec_line" >&2
       fi ;;
   esac

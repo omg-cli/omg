@@ -178,7 +178,8 @@ class OutputContracts(unittest.TestCase):
                        'dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)'),
             'ubuntu': ('Debian/Ubuntu detected (apt backend)',
                        'dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)'),
-            'fedora': ('Fedora/RHEL detected (dnf backend)', 'DNF local package database healthy'),
+            'fedora': ('Fedora/RHEL detected (dnf backend)',
+                       'RPM installed package database nonempty\n  DNF local package database healthy'),
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -193,6 +194,7 @@ class OutputContracts(unittest.TestCase):
                         healthy += f'  {health}\n'
                     output.write_text(healthy, encoding='utf-8')
                     trace.write_text(
+                        '122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n'
                         '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
                         '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
                         encoding='utf-8')
@@ -205,13 +207,22 @@ class OutputContracts(unittest.TestCase):
                     passed = probe()
                     self.assertEqual(passed.returncode, 0, passed.stderr)
                     if distro == 'fedora':
+                        self.assertIn('Fedora doctor RPM execution receipt: 122 execve(', passed.stderr)
                         self.assertIn('Fedora doctor DNF execution receipt: 123 execve(', passed.stderr)
                         output.write_text(f'  {identity}\n', encoding='utf-8')
                         self.assertEqual(probe().returncode, 1, 'Fedora identity alone is not native health proof')
                         output.write_text(healthy, encoding='utf-8')
+                        trace.write_text(
+                            '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
+                            '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
+                            encoding='utf-8')
+                        self.assertEqual(probe().returncode, 1, 'Fedora health text without an RPM query is not proof')
+                        trace.write_text('122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n', encoding='utf-8')
+                        self.assertEqual(probe().returncode, 1, 'Fedora health text without an offline DNF check is not proof')
                         trace.write_text('123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "check"], 0x7ffd) = 0\n', encoding='utf-8')
                         self.assertEqual(probe().returncode, 1, 'Fedora health text without an offline DNF exec is not proof')
                         trace.write_text(
+                            '122 execve("/usr/bin/rpm", ["/usr/bin/rpm", "-qa"], 0x7ffd) = 0\n'
                             '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
                             '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
                             encoding='utf-8')
@@ -240,7 +251,8 @@ class OutputContracts(unittest.TestCase):
         health = {'arch': '  ALPM local package database (/var/lib/pacman/local)\n',
                   'debian': '  dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)\n',
                   'ubuntu': '  dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)\n',
-                  'fedora': '  DNF local package database healthy\n'}[distro]
+                  'fedora': '  RPM installed package database nonempty\n'
+                            '  DNF local package database healthy\n'}[distro]
         healthy = f'  {identity}\n{health}'
         product = 'printf %s ' + shlex.quote(healthy) + '\n'
         result, evidence, logs = self.run_inventory(product, rows, distro=distro)

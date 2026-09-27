@@ -323,14 +323,68 @@ async fn check_fedora_infra() -> usize {
             None
         }
     };
-    if let Err(error) = crate::core::privilege::trusted_program("rpm") {
-        println!("  {} RPM backend unavailable: {error}", style::error("✗"));
-        issues += 1;
+    let rpm = match crate::core::privilege::system_command("rpm") {
+        Ok(command) => Some(command),
+        Err(error) => {
+            println!("  {} RPM backend unavailable: {error}", style::error("✗"));
+            issues += 1;
+            None
+        }
+    };
+    if let Some(command) = rpm {
+        issues += check_fedora_installed_db(command, Duration::from_secs(15)).await;
     }
     if let Some(command) = dnf {
         issues += check_fedora_package_db(command, Duration::from_secs(15)).await;
     }
     issues
+}
+
+/// `dnf check` accepts an empty RPM database as consistent. Require RPM to
+/// enumerate at least one installed package as a separate read-only check.
+async fn check_fedora_installed_db(command: std::process::Command, deadline: Duration) -> usize {
+    let mut command = tokio::process::Command::from(command);
+    command.arg("-qa").kill_on_drop(true);
+    match tokio::time::timeout(deadline, command.output()).await {
+        Ok(Ok(output))
+            if output.status.success() && !output.stdout.iter().all(u8::is_ascii_whitespace) =>
+        {
+            println!(
+                "  {}",
+                style::success("RPM installed package database nonempty")
+            );
+            0
+        }
+        Ok(Ok(output)) if output.status.success() => {
+            println!(
+                "  {} RPM installed package database is empty",
+                style::error("✗")
+            );
+            1
+        }
+        Ok(Ok(output)) => {
+            println!(
+                "  {} RPM installed package query failed ({})",
+                style::error("✗"),
+                output.status
+            );
+            1
+        }
+        Ok(Err(error)) => {
+            println!(
+                "  {} RPM installed package query failed: {error}",
+                style::error("✗")
+            );
+            1
+        }
+        Err(_) => {
+            println!(
+                "  {} RPM installed package query timed out",
+                style::error("✗")
+            );
+            1
+        }
+    }
 }
 
 async fn check_fedora_package_db(command: std::process::Command, deadline: Duration) -> usize {
@@ -1316,5 +1370,33 @@ mod tests {
         assert_eq!(doctor_issues, 1);
         let error = finish_doctor(doctor_issues, 0).expect_err("failed DNF must fail doctor");
         assert!(error.to_string().contains("1 health issue"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fedora_empty_rpm_inventory_is_a_health_issue() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::TempDir::new().expect("isolated RPM fixture");
+        let program = fixture.path().join("rpm");
+        let probe = || {
+            check_fedora_installed_db(std::process::Command::new(&program), Duration::from_secs(2))
+        };
+        for (script, expected) in [
+            (
+                "#!/bin/sh\n[ \"$1\" = -qa ] && printf 'filesystem-1-1\\n'\n",
+                0,
+            ),
+            ("#!/bin/sh\n[ \"$1\" = -qa ]\n", 1),
+            ("#!/bin/sh\nexit 23\n", 1),
+        ] {
+            std::fs::write(&program, script).expect("RPM fixture");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+                .expect("executable RPM fixture");
+            assert_eq!(probe().await, expected);
+        }
+        let doctor_issues = probe().await;
+        assert_eq!(doctor_issues, 1);
+        assert!(finish_doctor(doctor_issues, 0).is_err());
     }
 }
