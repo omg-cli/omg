@@ -262,29 +262,58 @@ impl HomebrewPackageManager {
         }
     }
 
+    /// Paths used by the live backend. Doctor probes these exact paths so a
+    /// second Homebrew installation cannot make the selected backend look
+    /// healthy while its own package inventory is empty.
+    pub(crate) fn prefix(&self) -> &Path {
+        &self.prefix
+    }
+
+    pub(crate) fn cellar(&self) -> &Path {
+        &self.cellar
+    }
+
+    pub(crate) fn caskroom(&self) -> PathBuf {
+        self.prefix.join(CASKROOM_DIR)
+    }
+
+    pub(crate) fn brew_executable(&self) -> PathBuf {
+        self.prefix.join("bin").join("brew")
+    }
+
     /// Detect Homebrew installation prefix
     ///
     /// Homebrew uses different installation paths based on CPU architecture:
     /// - ARM (Apple Silicon): `/opt/homebrew`
     /// - Intel (`x86_64`): `/usr/local`
     ///
-    /// This method checks for the Cellar directory in each location and returns
-    /// the first valid prefix found, defaulting to ARM if neither exists.
+    /// The executable is the installation authority, including before the
+    /// first formula creates a Cellar. Prefer the current binary architecture
+    /// when both Homebrew installations exist (for example under Rosetta).
     fn detect_prefix() -> PathBuf {
-        // Check ARM prefix first (modern Macs)
         let arm_path = PathBuf::from(HOMEBREW_PREFIX_ARM);
-        if arm_path.join(CELLAR_DIR).exists() {
-            return arm_path;
-        }
-
-        // Fall back to Intel prefix
         let intel_path = PathBuf::from(HOMEBREW_PREFIX_INTEL);
-        if intel_path.join(CELLAR_DIR).exists() {
-            return intel_path;
+        if cfg!(target_arch = "aarch64") {
+            Self::select_prefix(&arm_path, &intel_path)
+        } else {
+            Self::select_prefix(&intel_path, &arm_path)
         }
+    }
 
-        // Default to ARM prefix (most common on modern Macs)
-        arm_path
+    fn select_prefix(preferred: &Path, alternate: &Path) -> PathBuf {
+        for path in [preferred, alternate] {
+            if path.join("bin").join("brew").is_file() {
+                return path.to_path_buf();
+            }
+        }
+        // Preserve access to a damaged installation's inventory for read
+        // operations; doctor reports its missing executable as an issue.
+        for path in [preferred, alternate] {
+            if path.join(CELLAR_DIR).is_dir() {
+                return path.to_path_buf();
+            }
+        }
+        preferred.to_path_buf()
     }
 
     /// Get the cache directory for storing formula index
@@ -560,7 +589,7 @@ impl HomebrewPackageManager {
             }
         }
 
-        let caskroom = self.prefix.join(CASKROOM_DIR);
+        let caskroom = self.caskroom();
         if caskroom.exists() {
             let mut entries = fs::read_dir(&caskroom).await?;
             while let Some(entry) = entries.next_entry().await? {
@@ -797,7 +826,7 @@ impl HomebrewPackageManager {
         }
 
         // Sort by score (descending) - highest relevance first
-        results.sort_by(|a, b| b.0.cmp(&a.0));
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         // Take top 50 results to avoid overwhelming the user
         results.truncate(50);
@@ -833,7 +862,7 @@ impl HomebrewPackageManager {
 
     fn list_installed_sync(&self) -> Result<Vec<String>> {
         let mut names = Vec::new();
-        for root in [&self.cellar, &self.prefix.join(CASKROOM_DIR)] {
+        for root in [&self.cellar, &self.caskroom()] {
             if !root.exists() {
                 continue;
             }
@@ -854,7 +883,7 @@ impl HomebrewPackageManager {
         let cellar_mtime = std::fs::metadata(&self.cellar)
             .ok()
             .and_then(|metadata| metadata.modified().ok());
-        let caskroom_mtime = std::fs::metadata(self.prefix.join(CASKROOM_DIR))
+        let caskroom_mtime = std::fs::metadata(self.caskroom())
             .ok()
             .and_then(|metadata| metadata.modified().ok());
         (cellar_mtime, caskroom_mtime)
@@ -919,7 +948,7 @@ impl HomebrewPackageManager {
             .map(|argument| (*argument).to_owned())
             .collect::<Vec<_>>();
         crate::core::security::audit::record_operation("brew", &targets, "attempt")?;
-        let brew_path = self.prefix.join("bin").join("brew");
+        let brew_path = self.brew_executable();
 
         let mut cmd = tokio::process::Command::new(&brew_path);
         cmd.args(args);
@@ -1229,6 +1258,39 @@ mod tests {
             prefix == std::path::Path::new(HOMEBREW_PREFIX_ARM)
                 || prefix == std::path::Path::new(HOMEBREW_PREFIX_INTEL)
         );
+    }
+
+    #[test]
+    fn prefix_selection_prefers_running_architecture_and_existing_brew() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let preferred = root.path().join("preferred");
+        let alternate = root.path().join("alternate");
+        std::fs::create_dir_all(preferred.join("bin"))?;
+        std::fs::create_dir_all(alternate.join("bin"))?;
+
+        // A fresh Homebrew install can have an executable before its first
+        // formula creates a Cellar.
+        std::fs::write(preferred.join("bin/brew"), b"brew")?;
+        assert_eq!(
+            HomebrewPackageManager::select_prefix(&preferred, &alternate),
+            preferred
+        );
+
+        // A second architecture's Cellar cannot override the executable for
+        // the architecture of the running OMG binary.
+        std::fs::create_dir_all(alternate.join(CELLAR_DIR))?;
+        std::fs::write(alternate.join("bin/brew"), b"brew")?;
+        assert_eq!(
+            HomebrewPackageManager::select_prefix(&preferred, &alternate),
+            preferred
+        );
+
+        std::fs::remove_file(preferred.join("bin/brew"))?;
+        assert_eq!(
+            HomebrewPackageManager::select_prefix(&preferred, &alternate),
+            alternate
+        );
+        Ok(())
     }
 
     #[tokio::test]

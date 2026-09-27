@@ -108,26 +108,34 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
             &mut warnings,
         );
     }
+    #[cfg(any(feature = "macos", target_os = "macos"))]
+    if matches!(distro, Distro::MacOS) {
+        issues += check_macos_infra().await;
+    }
 
     // 3b. Backend-specific infrastructure (what the compiled backend itself
     //     reads — no invented checks).
     add_native_infra_issues(distro, &mut issues, check_fedora_infra()).await;
 
-    // 4. Daemon Status. A down daemon only limits speed, never
-    // correctness, so it warns without failing the run.
-    match check_daemon().await {
-        DaemonStatus::Running => {
-            println!("  {}", style::success("Daemon is running"));
-        }
-        DaemonStatus::Down => {
-            println!(
-                "  {}",
-                style::warning("Daemon is not running (run 'omg daemon')")
-            );
-            warnings += 1;
-        }
-        DaemonStatus::SocketStale => {
-            warnings += 1;
+    // 4. Daemon Status. The daemon accelerates Linux reads; macOS uses its
+    // direct Homebrew backend and should not warn users to start one.
+    if matches!(distro, Distro::MacOS) {
+        println!("  {}", style::dim("Daemon is not used on macOS"));
+    } else {
+        match check_daemon().await {
+            DaemonStatus::Running => {
+                println!("  {}", style::success("Daemon is running"));
+            }
+            DaemonStatus::Down => {
+                println!(
+                    "  {}",
+                    style::warning("Daemon is not running (run 'omg daemon')")
+                );
+                warnings += 1;
+            }
+            DaemonStatus::SocketStale => {
+                warnings += 1;
+            }
         }
     }
 
@@ -264,6 +272,22 @@ fn supported_distro_label(distro: Distro) -> Option<&'static str> {
         Distro::MacOS => Some("macOS detected (Homebrew backend)"),
         Distro::Unknown => None,
     }
+}
+
+fn doctor_dependencies(distro: Distro) -> Vec<&'static str> {
+    let mut deps = vec!["git", "curl", "tar"];
+    // Homebrew's supported macOS prefixes need sudo only for the initial
+    // installation, not routine package operations.
+    if !matches!(distro, Distro::MacOS) {
+        deps.push("sudo");
+    }
+    if matches!(distro, Distro::Debian | Distro::Ubuntu) {
+        deps.push("apt-get");
+    }
+    if matches!(distro, Distro::Arch) {
+        deps.push("makepkg");
+    }
+    deps
 }
 
 /// Whether a lists-dir entry is a package index the apt backend can parse:
@@ -469,6 +493,117 @@ async fn check_fedora_package_db(command: std::process::Command, deadline: Durat
             1
         }
     }
+}
+
+/// Check the same Homebrew installation that the package backend reads and
+/// executes. A working `brew` elsewhere on PATH cannot validate that backend.
+#[cfg(any(feature = "macos", target_os = "macos"))]
+async fn check_macos_infra() -> usize {
+    if crate::core::paths::test_mode() {
+        return 0;
+    }
+
+    let manager = crate::package_managers::homebrew::HomebrewPackageManager::new();
+    let caskroom = manager.caskroom();
+    let brew = manager.brew_executable();
+    check_homebrew_paths(
+        &brew,
+        [
+            ("--prefix", manager.prefix()),
+            ("--cellar", manager.cellar()),
+            ("--caskroom", &caskroom),
+        ],
+    )
+    .await
+}
+
+#[cfg(any(feature = "macos", target_os = "macos"))]
+async fn check_homebrew_paths(
+    brew: &std::path::Path,
+    expected: [(&str, &std::path::Path); 3],
+) -> usize {
+    if !brew.is_file() {
+        println!(
+            "  {} Homebrew executable missing ({})",
+            style::error("✗"),
+            brew.display()
+        );
+        return 1;
+    }
+
+    let mut issues = 0;
+    for (option, path) in expected {
+        match query_homebrew_path(brew, option, Duration::from_secs(5)).await {
+            Ok(actual) if actual == path => {
+                if option != "--prefix" {
+                    match std::fs::read_dir(path) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            println!(
+                                "  {} Homebrew {option} inventory cannot be read: {error}",
+                                style::error("✗")
+                            );
+                            issues += 1;
+                            continue;
+                        }
+                    }
+                }
+                println!(
+                    "  {} Homebrew {option} matches backend ({})",
+                    style::success("✓"),
+                    path.display()
+                );
+            }
+            Ok(actual) => {
+                println!(
+                    "  {} Homebrew {option} differs from backend: brew={}, omg={}",
+                    style::error("✗"),
+                    style::sanitize_terminal_text(&actual.display().to_string())
+                        .chars()
+                        .take(160)
+                        .collect::<String>(),
+                    path.display()
+                );
+                issues += 1;
+            }
+            Err(error) => {
+                println!("  {} Homebrew {option} failed: {error}", style::error("✗"));
+                issues += 1;
+            }
+        }
+    }
+    issues
+}
+
+#[cfg(any(feature = "macos", target_os = "macos"))]
+async fn query_homebrew_path(
+    brew: &std::path::Path,
+    option: &str,
+    deadline: Duration,
+) -> Result<std::path::PathBuf> {
+    use anyhow::{bail, ensure};
+
+    let mut command = tokio::process::Command::new(brew);
+    command.arg(option).kill_on_drop(true);
+    let output = tokio::time::timeout(deadline, command.output())
+        .await
+        .with_context(|| format!("{option} timed out after {deadline:?}"))?
+        .with_context(|| format!("could not execute {option}"))?;
+    if !output.status.success() {
+        let detail = style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));
+        let detail: String = detail.chars().take(160).collect();
+        bail!("exit {}: {detail}", output.status);
+    }
+    let value = String::from_utf8(output.stdout).context("Homebrew path was not UTF-8")?;
+    let value = value.strip_suffix('\n').unwrap_or(&value);
+    ensure!(
+        !value.is_empty()
+            && !value.chars().any(|ch| matches!(ch, '\n' | '\r'))
+            && value.starts_with('/'),
+        "Homebrew returned an invalid path"
+    );
+    Ok(std::path::PathBuf::from(value))
 }
 
 /// Whether an APT lists entry carries a package index. Modern APT acquires
@@ -1213,6 +1348,92 @@ pub fn enable_turbo_mode() -> Result<()> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn doctor_dependencies_match_native_backend() {
+        assert_eq!(doctor_dependencies(Distro::MacOS), ["git", "curl", "tar"]);
+        assert!(doctor_dependencies(Distro::Arch).contains(&"makepkg"));
+        assert!(doctor_dependencies(Distro::Ubuntu).contains(&"apt-get"));
+        assert!(doctor_dependencies(Distro::Fedora).contains(&"sudo"));
+    }
+
+    #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
+    fn fake_brew(prefix: &std::path::Path, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = prefix.join("bin");
+        std::fs::create_dir_all(&bin).expect("fake brew bin");
+        let brew = bin.join("brew");
+        std::fs::write(&brew, script).expect("fake brew executable");
+        std::fs::set_permissions(&brew, std::fs::Permissions::from_mode(0o755))
+            .expect("executable mode");
+        brew
+    }
+
+    #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
+    #[tokio::test]
+    async fn homebrew_doctor_requires_real_matching_backend_paths() {
+        let root = tempfile::tempdir().expect("temporary prefix");
+        let cellar = root.path().join("Cellar");
+        let caskroom = root.path().join("Caskroom");
+        let expected = || {
+            [
+                ("--prefix", root.path()),
+                ("--cellar", cellar.as_path()),
+                ("--caskroom", caskroom.as_path()),
+            ]
+        };
+        let brew = root.path().join("bin/brew");
+        assert_eq!(check_homebrew_paths(&brew, expected()).await, 1);
+
+        let valid = "#!/bin/sh\nprefix=${0%/bin/brew}\ncase \"$1\" in\n  --prefix) printf '%s\\n' \"$prefix\";;\n  --cellar) printf '%s/Cellar\\n' \"$prefix\";;\n  --caskroom) printf '%s/Caskroom\\n' \"$prefix\";;\n  *) exit 64;;\nesac\n";
+        let brew = fake_brew(root.path(), valid);
+        assert_eq!(check_homebrew_paths(&brew, expected()).await, 0);
+
+        std::fs::write(&cellar, b"not a directory").expect("bad inventory path");
+        assert_eq!(check_homebrew_paths(&brew, expected()).await, 1);
+        std::fs::remove_file(&cellar).expect("remove bad inventory path");
+
+        let mismatch = valid.replace("'%s/Caskroom\\n' \"$prefix\"", "'/other/Caskroom\\n'");
+        fake_brew(root.path(), &mismatch);
+        let count = check_homebrew_paths(&brew, expected()).await;
+        assert_eq!(count, 1, "mismatched cask inventory must be an issue");
+        assert!(finish_doctor(count, 0).is_err());
+
+        let failed = valid.replace(
+            "--cellar) printf '%s/Cellar\\n' \"$prefix\";;",
+            "--cellar) printf 'broken' >&2; exit 23;;",
+        );
+        fake_brew(root.path(), &failed);
+        assert_eq!(check_homebrew_paths(&brew, expected()).await, 1);
+    }
+
+    #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
+    #[tokio::test]
+    async fn homebrew_doctor_bounds_hung_probe_and_rejects_bad_output() {
+        let root = tempfile::tempdir().expect("temporary prefix");
+        let brew = fake_brew(
+            root.path(),
+            "#!/bin/sh\nsleep 1\nprintf '/opt/homebrew\\n'\n",
+        );
+        let timeout = query_homebrew_path(&brew, "--prefix", Duration::from_millis(20)).await;
+        assert!(
+            timeout
+                .expect_err("hung brew must fail")
+                .to_string()
+                .contains("timed out")
+        );
+
+        fake_brew(
+            root.path(),
+            "#!/bin/sh\nprintf '/opt/homebrew\\n/other\\n'\n",
+        );
+        assert!(
+            query_homebrew_path(&brew, "--prefix", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
 
     async fn serve_probe_response(
         response: &'static [u8],

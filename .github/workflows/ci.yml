@@ -724,6 +724,22 @@ jobs:
         run: |
           cargo test --test macos_tests --no-default-features --features macos,pgp,license --locked -- --test-threads=1
 
+      - name: Verify native Homebrew doctor
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/target/release:$PATH"
+          export NO_COLOR=1 OMG_TEST_MODE=0
+          report="$RUNNER_TEMP/omg-macos-doctor.log"
+          if ./target/release/omg doctor >"$report" 2>&1; then
+            cat "$report"
+          else
+            cat "$report"
+            exit 1
+          fi
+          test "$(grep -Fc 'Homebrew --prefix matches backend' "$report")" -eq 1
+          test "$(grep -Fc 'Homebrew --cellar matches backend' "$report")" -eq 1
+          test "$(grep -Fc 'Homebrew --caskroom matches backend' "$report")" -eq 1
+
       - name: Verify binary
         run: |
           ./target/release/omg --version
