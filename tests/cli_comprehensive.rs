@@ -610,6 +610,9 @@ enum Assertion {
     RuntimeVersionRemoved,
     RuntimeListState,
     RuntimeSwitchState,
+    TaskExecuted,
+    ParallelTasksExecuted,
+    AllTasksExecuted,
 }
 
 impl Assertion {
@@ -681,6 +684,9 @@ impl Assertion {
             "runtime-version-removed" => Self::RuntimeVersionRemoved,
             "runtime-list-state" => Self::RuntimeListState,
             "runtime-switch-state" => Self::RuntimeSwitchState,
+            "task-executed" => Self::TaskExecuted,
+            "parallel-tasks-executed" => Self::ParallelTasksExecuted,
+            "all-tasks-executed" => Self::AllTasksExecuted,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1173,7 +1179,7 @@ fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
 
-    project.create_file("Makefile", ".PHONY: smoke overlap\nsmoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n");
+    project.create_file("Makefile", ".PHONY: smoke overlap parallel-one parallel-two\nsmoke:\n\t@printf omg-qemu-smoke-task > smoke-task.marker\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\nparallel-one:\n\t@touch parallel-one.started\n\t@timeout 15 sh -c 'until test -e parallel-two.started; do sleep 0.05; done'\n\t@printf parallel-one > parallel-one.done\n\t@echo parallel-one-ok\nparallel-two:\n\t@touch parallel-two.started\n\t@timeout 15 sh -c 'until test -e parallel-one.started; do sleep 0.05; done'\n\t@printf parallel-two > parallel-two.done\n\t@echo parallel-two-ok\n");
     project.create_file(
         "workspace-overlap.sh",
         include_str!("../scripts/workspace-overlap-fixture.sh"),
@@ -1272,6 +1278,7 @@ fn has_ansi(text: &str) -> bool {
 #[cfg(feature = "arch")] // This inventory fixture explicitly seeds a pacman database.
 fn behavior_inventory_runs_in_hermetic_state() {
     use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::time::Instant;
 
     let project = TestProject::for_distro("arch");
@@ -1362,6 +1369,28 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .exit_for(Distro::Arch)
         };
         let args: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
+        if case.id == "run-all" {
+            let prior_marker = project.path().join("smoke-task.marker");
+            if prior_marker.exists() {
+                std::fs::remove_file(prior_marker).expect("remove earlier run marker");
+            }
+            project.create_file(
+                "package.json",
+                "{\"scripts\":{\"smoke\":\"echo npm-task-ok\"}}\n",
+            );
+            for (name, body) in [
+                (
+                    "npm",
+                    "#!/bin/sh\ncase $1:$2 in\n  --version:) echo 9.0.0 ;;\n  run:smoke) printf npm-smoke-task > npm-task.marker; echo npm-task-ok ;;\n  *) exit 96 ;;\nesac\n",
+                ),
+                ("node", "#!/bin/sh\necho v24.0.0\n"),
+            ] {
+                let stub = project.path().join("bin").join(name);
+                std::fs::write(&stub, body).expect("write isolated task-runner stub");
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700))
+                    .expect("make task-runner stub executable");
+            }
+        }
         let privacy_case = matches!(
             case.id.as_str(),
             "privacy-opt-out" | "privacy-status" | "privacy-opt-in"
@@ -1503,6 +1532,37 @@ fn behavior_inventory_runs_in_hermetic_state() {
         };
         for assertion in &case.assertions {
             match assertion {
+                Assertion::TaskExecuted => {
+                    if !std::fs::read_to_string(project.path().join("smoke-task.marker"))
+                        .is_ok_and(|contents| contents == "omg-qemu-smoke-task")
+                        || !result.stdout.lines().any(|line| line == "smoke-task-ok")
+                    {
+                        issues.push("run did not execute its Make task".to_string());
+                    }
+                }
+                Assertion::ParallelTasksExecuted => {
+                    if [("parallel-one.done", "parallel-one"),
+                        ("parallel-two.done", "parallel-two")]
+                        .iter().any(|(file, expected)|
+                            !std::fs::read_to_string(project.path().join(file))
+                                .is_ok_and(|contents| contents == *expected))
+                        || !result.stdout.lines().any(|line| line == "parallel-one-ok")
+                        || !result.stdout.lines().any(|line| line == "parallel-two-ok")
+                    {
+                        issues.push("parallel tasks did not overlap and finish".to_string());
+                    }
+                }
+                Assertion::AllTasksExecuted => {
+                    if !std::fs::read_to_string(project.path().join("smoke-task.marker"))
+                        .is_ok_and(|contents| contents == "omg-qemu-smoke-task")
+                        || !std::fs::read_to_string(project.path().join("npm-task.marker"))
+                            .is_ok_and(|contents| contents == "npm-smoke-task")
+                        || !result.stdout.lines().any(|line| line == "smoke-task-ok")
+                        || !result.stdout.lines().any(|line| line == "npm-task-ok")
+                    {
+                        issues.push("run --all missed a Make or npm task".to_string());
+                    }
+                }
                 Assertion::PrivacyOptedOut => {
                     if !config_value_is(&config_file, "false")
                         || !privacy_data_dir
