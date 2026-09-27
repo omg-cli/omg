@@ -1383,26 +1383,39 @@ PY
   fi
   return 0
 }
-check_container_run_argv() {
-  local root=$1 index
-  local -a actual=() expected=(
-    --detach --name smoke -w /tmp/omg-smoke -e SMOKE=1
-    -v "$root:/tmp/omg-smoke" -- debian:bookworm sh -c 'printf smoke'
-  )
+check_container_engine_argv() {
+  local root=$1 assertion=$2 index operation
+  local -a actual=() expected=()
+  case "$assertion" in
+    container-run-argv)
+      operation=run
+      expected=(--detach --name smoke -w /tmp/omg-smoke -e SMOKE=1
+        -v "$root:/tmp/omg-smoke" -- debian:bookworm sh -c 'printf smoke') ;;
+    container-shell-argv)
+      operation=run
+      expected=(--rm -it --name "$(basename "$root")-dev" -w /tmp
+        -e TERM=xterm-256color -e SMOKE=1
+        -v "$root:/app" -v "$root:/tmp/omg-smoke" -- debian:bookworm /bin/bash) ;;
+    container-build-argv)
+      operation=build
+      expected=(-f Dockerfile -t smoke:latest --no-cache --build-arg SMOKE=1
+        --target dev -- "$root") ;;
+    *) return 2 ;;
+  esac
   if [[ ! -f "$root/engine/calls" || -L "$root/engine/calls" \
         || ! -f "$root/engine/argv" || -L "$root/engine/argv" \
-        || $(cat "$root/engine/calls") != $'version\nrun' ]]; then
+        || $(cat "$root/engine/calls") != "$(printf 'version\n%s' "$operation")" ]]; then
     printf 'assertion failed: fake container engine was not probed and invoked exactly once\n' >&2
     return 1
   fi
   mapfile -d '' -t actual < "$root/engine/argv"
   if [[ ${#actual[@]} -ne ${#expected[@]} ]]; then
-    printf 'assertion failed: detached container engine argv length differs from the exact contract\n' >&2
+    printf 'assertion failed: container engine argv length differs from the exact contract\n' >&2
     return 1
   fi
   for index in "${!expected[@]}"; do
     if [[ "${actual[$index]}" != "${expected[$index]}" ]]; then
-      printf 'assertion failed: detached container engine argv differs at position %s\n' "$index" >&2
+      printf 'assertion failed: container engine argv differs at position %s\n' "$index" >&2
       return 1
     fi
   done
@@ -1580,7 +1593,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv|container-shell-argv|container-build-argv) ;; *) exit 2 ;; esac
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-remove:workspace-project-removed|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
@@ -1753,7 +1766,13 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   if [[ "$id" == container-run-detached-argv ]]; then
     [[ "$a" == container-run-argv && "$s" == isolated-write && "$resolved" == 0 && "$t" == hermetic && "$tg" == hermetic:pass ]] || exit 2
     jq -e '. == ["container","run","--name","smoke","--detach","--env","SMOKE=1","--volume","${ROOT}:/tmp/omg-smoke","--workdir","/tmp/omg-smoke","debian:bookworm","--","sh","-c","printf smoke"]' <<< "$aj" >/dev/null || exit 2
-  elif [[ "$a" == container-run-argv ]]; then
+  elif [[ "$id" == container-shell-argv ]]; then
+    [[ "$a" == container-shell-argv && "$s" == isolated-write && "$resolved" == 0 && "$t" == hermetic && "$tg" == hermetic:pass ]] || exit 2
+    jq -e '. == ["container","shell","--image","debian:bookworm","--workdir","/tmp","--env","SMOKE=1","--volume","${ROOT}:/tmp/omg-smoke"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$id" == container-build-argv ]]; then
+    [[ "$a" == container-build-argv && "$s" == isolated-write && "$resolved" == 0 && "$t" == hermetic && "$tg" == hermetic:pass ]] || exit 2
+    jq -e '. == ["container","build","--dockerfile","Dockerfile","--tag","smoke:latest","--no-cache","--build-arg","SMOKE=1","--target","dev"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == container-run-argv || "$a" == container-shell-argv || "$a" == container-build-argv ]]; then
     exit 2
   fi
   case "$cleanup" in tempdir-drop|none|container-prune|host-state-restore|vm-revert|daemon-stop) ;; *) exit 2 ;; esac
@@ -1879,10 +1898,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
   remote="set -eu; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
-  if [[ "$assertions" == container-run-argv ]]; then
+  if [[ "$assertions" == container-run-argv || "$assertions" == container-shell-argv || "$assertions" == container-build-argv ]]; then
     remote+="; mkdir -p \"\$rowdir/engine\"; printf '%s' $container_engine > \"\$rowdir/engine/podman\"; chmod 700 \"\$rowdir/engine/podman\"; ln -s /bin/false \"\$rowdir/engine/docker\""
     remote+="; export OMG_QEMU_ENGINE_CAPTURE=\"\$rowdir/engine\" PATH=\"\$rowdir/engine:\$PATH\"; [[ \$(command -v podman) == \"\$rowdir/engine/podman\" && \$(command -v docker) == \"\$rowdir/engine/docker\" ]] || { printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
-    remote+="; $(declare -f check_container_run_argv)"
+    remote+="; $(declare -f check_container_engine_argv)"
+    if [[ "$assertions" == container-build-argv ]]; then
+      remote+="; printf 'FROM scratch\\n' > \"\$rowdir/Dockerfile\""
+    fi
   fi
   if [[ "$assertions" == fingerprint:* || "$case" == team-init || "$case" == snapshot-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/fingerprint-config\" OMG_DATA_DIR=\"\$rowdir/fingerprint-data\" OMG_CACHE_DIR=\"\$rowdir/fingerprint-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
@@ -2116,8 +2138,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; rollback_final=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native APT cleanup after-state is unavailable\n' >&2; execution_phase=dependency; rc=2; assertion=1; rollback_final=missing; }"
     remote+="; if [[ \"\$rollback_before\" != \"\$rollback_final\" ]]; then printf 'assertion failed: rollback fixture changed the native installed-package baseline\n' >&2; assertion=1; fi"
   fi
-  if [[ "$assertions" == container-run-argv ]]; then
-    remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_container_run_argv \"\$rowdir\"; then assertion=1; fi"
+  if [[ "$assertions" == container-run-argv || "$assertions" == container-shell-argv || "$assertions" == container-build-argv ]]; then
+    remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_container_engine_argv \"\$rowdir\" '$assertions'; then assertion=1; fi"
   fi
   if [[ "$assertions" == package-dry-run-* ]]; then
     if [[ "$assertions" != package-dry-run-install && "$assertions" != package-dry-run-recursive || "$assertions" == package-dry-run-recursive && "$distro" == arch ]]; then

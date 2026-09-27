@@ -241,6 +241,11 @@ class PolicyTests(unittest.TestCase):
             "id": "container-run-detached-argv", "tiers": ["hermetic"],
             "allowed_skips": {}, "network_scope": "offline",
         })
+        for case_id in ("container-shell-argv", "container-build-argv"):
+            self.assertEqual(by_id[case_id], {
+                "id": case_id, "tiers": ["hermetic"],
+                "allowed_skips": {}, "network_scope": "offline",
+            })
         for case_id in ("container-run-detached", "container-run-interactive",
                         "container-shell-flags", "container-build-flags"):
             self.assertEqual(set(by_id[case_id]["allowed_skips"]),

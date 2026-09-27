@@ -607,6 +607,8 @@ enum Assertion {
     NativeAptTreeRollback,
     NativeAptOrphanRemoved,
     ContainerRunArgv,
+    ContainerShellArgv,
+    ContainerBuildArgv,
     SelfUpdateDowngradeRefusal,
     EnvShareMissingLock,
     DiffMissingLock,
@@ -695,6 +697,8 @@ impl Assertion {
             "native-apt-tree-rollback" => Self::NativeAptTreeRollback,
             "native-apt-orphan-removed" => Self::NativeAptOrphanRemoved,
             "container-run-argv" => Self::ContainerRunArgv,
+            "container-shell-argv" => Self::ContainerShellArgv,
+            "container-build-argv" => Self::ContainerBuildArgv,
             "self-update-downgrade-refusal" => Self::SelfUpdateDowngradeRefusal,
             "env-share-missing-lock" => Self::EnvShareMissingLock,
             "diff-missing-lock" => Self::DiffMissingLock,
@@ -1531,8 +1535,9 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .expect("seed isolated bash package");
             command_env.push(("OMG_DATA_DIR", path.to_str().expect("UTF-8 mock path")));
         }
-        let container_capture = (case.id == "container-run-detached-argv").then(|| {
-            let capture = project.create_dir("container-engine-capture");
+        let container_capture = matches!(case.id.as_str(),
+            "container-run-detached-argv" | "container-shell-argv" | "container-build-argv").then(|| {
+            let capture = project.create_dir(&format!("container-engine-capture-{}", case.id));
             let podman = project.path().join("bin/podman");
             std::fs::write(
                 &podman,
@@ -1543,6 +1548,9 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .expect("make isolated container engine stub executable");
             capture
         });
+        if case.id == "container-build-argv" {
+            project.create_file("Dockerfile", "FROM scratch\n");
+        }
         if let Some(capture) = &container_capture {
             command_env.push((
                 "OMG_QEMU_ENGINE_CAPTURE",
@@ -2152,36 +2160,50 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         issues.push("container init did not report its generated Debian scaffold".to_string());
                     }
                 }
-                Assertion::ContainerRunArgv => {
+                Assertion::ContainerRunArgv | Assertion::ContainerShellArgv | Assertion::ContainerBuildArgv => {
                     let capture = container_capture
                         .as_ref()
                         .expect("container argv assertion has an isolated fake engine");
-                    let expected_args = [
-                        "--detach".to_string(),
-                        "--name".to_string(),
-                        "smoke".to_string(),
-                        "-w".to_string(),
-                        "/tmp/omg-smoke".to_string(),
-                        "-e".to_string(),
-                        "SMOKE=1".to_string(),
-                        "-v".to_string(),
-                        format!("{root}:/tmp/omg-smoke"),
-                        "--".to_string(),
-                        "debian:bookworm".to_string(),
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        "printf smoke".to_string(),
-                    ];
+                    let (operation, expected_args) = match case.id.as_str() {
+                        "container-run-detached-argv" => ("run", vec![
+                            "--detach".to_string(), "--name".to_string(), "smoke".to_string(),
+                            "-w".to_string(), "/tmp/omg-smoke".to_string(),
+                            "-e".to_string(), "SMOKE=1".to_string(), "-v".to_string(),
+                            format!("{root}:/tmp/omg-smoke"), "--".to_string(),
+                            "debian:bookworm".to_string(), "sh".to_string(),
+                            "-c".to_string(), "printf smoke".to_string(),
+                        ]),
+                        "container-shell-argv" => ("run", vec![
+                            "--rm".to_string(), "-it".to_string(), "--name".to_string(),
+                            format!("{}-dev", project.path().file_name().unwrap().to_string_lossy()
+                                .trim_matches(['.', '_', '-'])),
+                            "-w".to_string(), "/tmp".to_string(),
+                            "-e".to_string(), "TERM=xterm-256color".to_string(),
+                            "-e".to_string(), "SMOKE=1".to_string(),
+                            "-v".to_string(), format!("{root}:/app"),
+                            "-v".to_string(), format!("{root}:/tmp/omg-smoke"),
+                            "--".to_string(), "debian:bookworm".to_string(),
+                            "/bin/bash".to_string(),
+                        ]),
+                        "container-build-argv" => ("build", vec![
+                            "-f".to_string(), "Dockerfile".to_string(),
+                            "-t".to_string(), "smoke:latest".to_string(),
+                            "--no-cache".to_string(), "--build-arg".to_string(),
+                            "SMOKE=1".to_string(), "--target".to_string(),
+                            "dev".to_string(), "--".to_string(), root.clone(),
+                        ]),
+                        _ => unreachable!("validated container assertion row"),
+                    };
                     let expected_argv: Vec<u8> = expected_args
                         .iter()
                         .flat_map(|arg| arg.as_bytes().iter().copied().chain(std::iter::once(0)))
                         .collect();
                     if !std::fs::read_to_string(capture.join("calls"))
-                        .is_ok_and(|calls| calls == "version\nrun\n")
+                        .is_ok_and(|calls| calls == format!("version\n{operation}\n"))
                         || !std::fs::read(capture.join("argv"))
                             .is_ok_and(|argv| argv == expected_argv)
                     {
-                        issues.push("detached container command did not delegate exact argv".to_string());
+                        issues.push("container command did not delegate exact argv".to_string());
                     }
                 }
                 Assertion::UpdateFastOutput

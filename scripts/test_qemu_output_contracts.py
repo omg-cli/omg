@@ -292,6 +292,40 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
                     self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_container_shell_and_build_require_exact_fake_engine_argv(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        for case, operation, correct, faults in (
+            ('container-shell-argv', 'shell',
+             'podman run --rm -it --name "$(basename "$PWD")-dev" -w /tmp '
+             '-e TERM=xterm-256color -e SMOKE=1 -v "$PWD:/app" '
+             '-v "$PWD:/tmp/omg-smoke" -- debian:bookworm /bin/bash\n',
+             ('--rm ', '-it ', 'SMOKE=1', ':/app', 'debian:bookworm', '/bin/bash')),
+            ('container-build-argv', 'build',
+             'podman build -f Dockerfile -t smoke:latest --no-cache '
+             '--build-arg SMOKE=1 --target dev -- "$PWD"\n',
+             ('-f Dockerfile ', '-t smoke:latest ', '--no-cache ',
+              '--build-arg SMOKE=1 ', '--target dev ', '"$PWD"')),
+        ):
+            rows = [line for line in inventory.splitlines()
+                    if line.startswith(case + '\t')]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].split('\t')[8], case)
+            prefix = (f'[[ "$1:$2" == container:{operation} ]] || exit 95\n'
+                      'podman --version >/dev/null\n')
+            variants = [('correct', prefix + correct, 'PASS'),
+                        ('no engine call', 'echo claimed-success\n', 'FAIL'),
+                        ('duplicate engine call', prefix + correct + correct, 'FAIL')]
+            for omitted in faults:
+                self.assertIn(omitted, correct)
+                variants.append((f'omit {omitted}', prefix + correct.replace(omitted, '', 1), 'FAIL'))
+            for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+                for label, product, expected in variants:
+                    with self.subTest(case=case, distro=distro, variant=label):
+                        result, evidence, logs = self.run_inventory(product, rows, distro=distro)
+                        self.assertEqual(evidence[0]['result'], expected, logs)
+                        self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_diff_rows_require_the_requested_missing_lockfile_diagnostic(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         rows = [line for line in inventory.splitlines()
