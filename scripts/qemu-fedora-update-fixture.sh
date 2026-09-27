@@ -120,7 +120,7 @@ else
 fi
 printf 'OMG_QEMU_UPDATE_FIXTURE:before:%s:1\n' "$mode"
 phase=product
-sudo -H -u "$guest_user" -- "$binary" update "--$mode"
+sudo -H -u "$guest_user" -- "$binary" update "--$mode" --yes
 phase=verification
 [[ $(rpm -q --qf '%{VERSION}\n' "$package") == 2 ]] || { echo 'OMG did not upgrade fixture to version 2' >&2; exit 1; }
 rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' |

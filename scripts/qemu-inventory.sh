@@ -1964,7 +1964,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; printf keep-selected > \"\$versions/$runtime_version/sentinel\"; printf keep-active > \"\$versions/$runtime_active/sentinel\"; printf keep-pending > \"\$versions/8.8.8/.omg-installing\"; printf keep-external > \"\$rowdir/external-runtime/sentinel\""
     remote+="; printf '#!/bin/sh\\nprintf runtime-fixture\\n' > \"\$versions/$runtime_version/bin/$runtime_launcher\"; chmod 755 \"\$versions/$runtime_version/bin/$runtime_launcher\"; ln -s \"\$rowdir/external-runtime\" \"\$versions/7.7.7\"; ln -s \"\$versions/$runtime_active\" \"\$versions/current\"; $(declare -f check_runtime_state); $(declare -f check_runtime_usage)"
   fi
-  if [[ "$distro" == fedora && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
+  if [[ "$distro" == arch && "$safety" == package-mutation && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
+    # A loopback repository exposes a versioned native ALPM upgrade while
+    # keeping every other installed package outside the transaction.
+    remote+="; run_omg '$command_timeout' sudo -n bash \"\$HOME/qemu-arch-update-fixture.sh\" '${case#update-}' $quoted_binary '$ssh_user' > command.stdout.log 2> command.stderr.log; assertion=0"
+  elif [[ "$distro" == fedora && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     # Keep the real OMG path, but bound native DNF to a local versioned RPM.
     # The root-owned helper restores system repo policy and checks the RPMDB
     # plus native DNF history before it can report success.
@@ -2017,10 +2021,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; expected_network_delta=\$(check_doctor_network_output '$distro' command.stdout.log) || assertion=1"
     remote+="; if [[ \"\$baseline_phase\" != product || \"\$assertion\" != 0 ]] || ! check_doctor_issue_delta \"\$baseline_rc\" doctor.baseline.stdout.log doctor.baseline.stderr.log \"\$rc\" command.stderr.log \"\$expected_network_delta\"; then printf 'assertion failed: doctor network issue count did not match failed probes\n' >&2; assertion=1; fi"
   fi
-  if [[ "$distro" == fedora && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
+  if [[ ( "$distro" == fedora || "$distro" == arch && "$safety" == package-mutation ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; if [[ \"\$rc\" == 120 ]] && grep -Fq 'OMG_QEMU_FIXTURE_SETUP_FAILED' command.stderr.log; then execution_phase=dependency; fi"
     remote+="; if [[ \"\$rc\" == 121 ]] && grep -Fq 'OMG_QEMU_FIXTURE_CLEANUP_FAILED' command.stderr.log; then execution_phase=dependency; fi"
-    remote+="; if [[ \"\$rc\" == 0 ]] && { ! grep -Fxq 'OMG_QEMU_UPDATE_FIXTURE:before:${case#update-}:1' command.stdout.log || ! grep -Fxq 'OMG_QEMU_UPDATE_FIXTURE:after:${case#update-}:2:native-upgrade' command.stdout.log; }; then printf 'assertion failed: bounded Fedora update lacks native before/after evidence\\n' >&2; assertion=1; fi"
+    remote+="; if [[ \"\$rc\" == 0 ]] && { ! grep -Fxq 'OMG_QEMU_UPDATE_FIXTURE:before:${case#update-}:1' command.stdout.log || ! grep -Fxq 'OMG_QEMU_UPDATE_FIXTURE:after:${case#update-}:2:native-upgrade' command.stdout.log; }; then printf 'assertion failed: bounded native update lacks before/after evidence\\n' >&2; assertion=1; fi"
   fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]]; then if ! check_apt_update_fixture; then assertion=1; fi; if ! apt_after=\$(native_package_snapshot '$distro'); then printf 'assertion failed: APT package/reason after-state is unavailable\\n' >&2; execution_phase=dependency; rc=2; assertion=1; elif ! check_apt_update_delta \"\$apt_before\" \"\$apt_after\"; then assertion=1; fi; fi"
