@@ -694,6 +694,50 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
                                                    distro=distro).returncode, 0)
 
     @unittest.skipIf(os.name == 'nt', 'Doctor guest oracle requires a POSIX shell')
+    def test_fedora_doctor_rpm_fault_rejects_false_green_product(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        begin = source.index('check_doctor_issue_delta() {')
+        end = source.index('check_doctor_network_output() {', begin)
+        oracle = source[begin:end]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline_out = root / 'baseline.out'
+            baseline_err = root / 'baseline.err'
+            fault_out = root / 'fault.out'
+            fault_err = root / 'fault.err'
+            baseline_out.write_text('System is healthy\n', encoding='utf-8')
+            baseline_err.write_text('', encoding='utf-8')
+            fault = ('  Fedora/RHEL detected (dnf backend)\n'
+                     '  ✗ RPM installed package database is empty\n'
+                     '  DNF local package database healthy\n')
+            healthy = ('  Fedora/RHEL detected (dnf backend)\n'
+                       '  RPM installed package database nonempty\n'
+                       '  DNF local package database healthy\nSystem is healthy\n')
+
+            def probe(product_rc):
+                script = oracle + '\ncheck_fedora_doctor_rpm_fault "$1" "$2" "$3" "$4" "$5" "$6"\n'
+                return subprocess.run(
+                    [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c', script, '_',
+                     '0', str(baseline_out), str(baseline_err), str(product_rc),
+                     str(fault_out), str(fault_err)],
+                    cwd=root, capture_output=True, text=True, timeout=10)
+
+            fault_out.write_text(fault, encoding='utf-8')
+            fault_err.write_text('Error: doctor found 1 health issue(s)\n', encoding='utf-8')
+            self.assertEqual(probe(1).returncode, 0)
+
+            # A fake product that keeps reporting health under the native
+            # empty-RPMDB fixture must fail the same oracle used by QEMU.
+            fault_out.write_text(healthy, encoding='utf-8')
+            fault_err.write_text('', encoding='utf-8')
+            self.assertNotEqual(probe(0).returncode, 0)
+
+            fault_out.write_text(fault, encoding='utf-8')
+            self.assertNotEqual(probe(0).returncode, 0)
+            fault_err.write_text('Error: doctor found 2 health issue(s)\n', encoding='utf-8')
+            self.assertNotEqual(probe(1).returncode, 0)
+
+    @unittest.skipIf(os.name == 'nt', 'Doctor guest oracle requires a POSIX shell')
     def test_doctor_backend_oracle_rejects_wrong_guest_and_false_health(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('# BEGIN DOCTOR BACKEND ORACLE')

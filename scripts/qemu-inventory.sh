@@ -904,6 +904,78 @@ check_doctor_issue_delta() {
   [[ "$variant_rc" == 1 && "$variant_count" =~ ^[1-9][0-9]*$ ]] || return 1
   (( variant_count == baseline_count + expected_delta ))
 }
+check_fedora_doctor_rpm_fault() {
+  local baseline_rc=$1 baseline_out=$2 baseline_err=$3 fault_rc=$4 fault_out=$5 fault_err=$6
+  if [[ "$fault_rc" != 1 ]] \
+    || [[ $(grep -Fxc '  ✗ RPM installed package database is empty' "$fault_out") != 1 ]] \
+    || [[ $(grep -Fxc '  DNF local package database healthy' "$fault_out") != 1 ]] \
+    || grep -Fq 'RPM installed package database nonempty' "$fault_out"; then
+    printf 'assertion failed: doctor accepted or misreported the isolated empty Fedora RPMDB\n' >&2
+    return 1
+  fi
+  if ! check_doctor_issue_delta "$baseline_rc" "$baseline_out" "$baseline_err" "$fault_rc" "$fault_err" 1; then
+    printf 'assertion failed: Fedora RPMDB fault did not add exactly one doctor health issue\n' >&2
+    return 1
+  fi
+}
+run_fedora_doctor_rpm_fault() {
+  local binary=$1 deadline=$2 guest_user=$3 outer_ns native_before native_after native_packages
+  local helper_rc helper_phase fault_product_rc
+  if ! outer_ns=$(/usr/bin/readlink /proc/self/ns/mnt) \
+    || ! native_packages=$(HOME=/ /usr/bin/rpm -qa); then
+    printf 'native Fedora RPMDB reference is unavailable\n' >&2
+    execution_phase=dependency
+    rc=2
+    assertion=1
+    return 0
+  fi
+  native_before=$(printf '%s\n' "$native_packages" | LC_ALL=C sort | sha256sum)
+  run_omg "$deadline" /usr/bin/sudo -n /usr/bin/unshare --mount --propagation private -- \
+    /usr/bin/bash "$HOME/qemu-fedora-doctor-fault.sh" "$binary" "$rowdir" "$guest_user" "$outer_ns" \
+    > doctor-fault.harness.stdout.log 2> doctor-fault.harness.stderr.log
+  helper_rc=$rc
+  helper_phase=$execution_phase
+  cat doctor-fault.harness.stdout.log
+  cat doctor-fault.harness.stderr.log >&2
+  if [[ -f doctor-fault.native-dnf.log ]]; then sed -n '1,20p' doctor-fault.native-dnf.log >&2; fi
+  if [[ -f doctor-fault.stdout.log ]]; then cat doctor-fault.stdout.log; fi
+  if [[ -f doctor-fault.stderr.log ]]; then cat doctor-fault.stderr.log >&2; fi
+  if [[ "$helper_phase" != product ]]; then
+    execution_phase=executor
+    rc=$helper_rc
+    assertion=1
+  elif [[ "$helper_rc" != 0 ]]; then
+    execution_phase=dependency
+    rc=2
+    assertion=1
+  else
+    fault_product_rc=$(sed -nE 's/^OMG_QEMU_DOCTOR_FAULT_PRODUCT_EXIT:([0-9]{1,3})$/\1/p' doctor-fault.harness.stdout.log)
+    if [[ ! "$fault_product_rc" =~ ^[0-9]{1,3}$ ]]; then
+      printf 'assertion failed: Fedora doctor fault completion receipt is missing or duplicated\n' >&2
+      execution_phase=dependency
+      rc=2
+      assertion=1
+    elif ! check_fedora_doctor_rpm_fault 0 command.stdout.log command.stderr.log \
+      "$fault_product_rc" doctor-fault.stdout.log doctor-fault.stderr.log; then
+      assertion=1
+    fi
+  fi
+  if ! native_packages=$(HOME=/ /usr/bin/rpm -qa); then
+    printf 'native Fedora RPMDB after-state is unavailable\n' >&2
+    execution_phase=dependency
+    rc=2
+    assertion=1
+    return 0
+  fi
+  native_after=$(printf '%s\n' "$native_packages" | LC_ALL=C sort | sha256sum)
+  if [[ "$native_before" != "$native_after" ]]; then
+    printf 'assertion failed: Fedora RPMDB changed outside the private fixture namespace\n' >&2
+    execution_phase=dependency
+    rc=2
+    assertion=1
+  fi
+  return 0
+}
 check_doctor_network_output() {
   python3 - "$1" "$2" <<'PY'
 import re
@@ -1829,6 +1901,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: doctor network fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/network-config\" OMG_DATA_DIR=\"\$rowdir/network-data\" OMG_CACHE_DIR=\"\$rowdir/network-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
     remote+="; $(declare -f check_doctor_issue_delta); $(declare -f check_doctor_network_output)"
   fi
+  if [[ "$assertions" == doctor-native-backend && "$distro" == fedora ]]; then
+    remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: Fedora doctor fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
+    remote+="; $(declare -f check_doctor_issue_delta); $(declare -f check_fedora_doctor_rpm_fault); $(declare -f run_fedora_doctor_rpm_fault)"
+  fi
   if [[ "$case" == config-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/config\""
   fi
@@ -2084,6 +2160,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote+="; mkdir -p fault-db/local/broken-1.0-1; printf '%%NAME%%\\nbroken\\n\\n%%VERSION%%\\n1.0-1\\n' > fault-db/local/broken-1.0-1/desc"
       remote+="; fault_rc=0; OMG_PACMAN_DB_DIR=\"\$rowdir/fault-db\" OMG_DISABLE_DAEMON=1 timeout --kill-after=5s '$row_timeout' $quoted_binary doctor > doctor-fault.stdout.log 2> doctor-fault.stderr.log || fault_rc=\$?"
       remote+="; if [ \"\$fault_rc\" != 1 ] || ! grep -Fq 'ALPM local package database inconsistent (' doctor-fault.stdout.log; then printf 'assertion failed: doctor accepted a corrupt Arch local package entry\\n' >&2; assertion=1; fi"
+    elif [[ "$distro" == fedora ]]; then
+      remote+="; if [[ \"\$assertion\" == 0 && \"\$execution_phase\" == product && \"\$rc\" == 0 ]]; then run_fedora_doctor_rpm_fault $quoted_binary '$row_timeout' '$ssh_user'; fi"
     fi
   fi
   if [[ "$assertions" == doctor-native-backend && "$case" == doctor ]]; then
@@ -2159,6 +2237,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
   if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state || "$assertions" == doctor-native-backend ]]; then budget=$((budget + row_timeout + 5)); fi
+  if [[ "$assertions" == doctor-native-backend && "$distro" == fedora ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == outdated-native-count || "$assertions" == outdated-json-native-count ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == status-native-fast ]]; then budget=$((budget + 64)); fi
