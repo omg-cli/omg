@@ -1838,9 +1838,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     fi
     remote+="; if [ \"\$assertion\" = 0 ]; then cat doctor.minimal.stdout.log doctor.minimal.stderr.log >&2; if [ \"\$execution_phase\" != product ] || [ \"\$rc\" != 0 ]; then printf 'assertion failed: doctor could not run with optional tools absent\\n' >&2; assertion=1; fi; fi"
     if [[ "$distro" == fedora ]]; then
-      remote+="; if [ \"\$assertion\" = 0 ] && ! check_doctor_native_backend '$distro' doctor.minimal.stdout.log /etc/os-release doctor.minimal.exec.log true; then assertion=1; fi"
+      remote+="; if [ \"\$assertion\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' doctor.minimal.stdout.log /etc/os-release doctor.minimal.exec.log true || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     else
-      remote+="; if [ \"\$assertion\" = 0 ] && ! check_doctor_native_backend '$distro' doctor.minimal.stdout.log /etc/os-release '' true; then assertion=1; fi"
+      remote+="; if [ \"\$assertion\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' doctor.minimal.stdout.log /etc/os-release '' true || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     fi
   fi
   if [[ "$assertions" == info-native-package ]]; then
