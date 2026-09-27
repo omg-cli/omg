@@ -176,6 +176,39 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
                     self.assertEqual(result.returncode, expected, result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_container_run_detached_requires_exact_fake_engine_argv(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if line.startswith('container-run-detached-argv\t')]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].split('\t')[8], 'container-run-argv')
+        run = ('podman run --detach --name smoke -w /tmp/omg-smoke -e SMOKE=1 '
+               '-v "$(dirname "$OMG_QEMU_ENGINE_CAPTURE"):/tmp/omg-smoke" '
+               '-- debian:bookworm sh -c "printf smoke"\n')
+        base = ('[[ "$1:$2" == container:run ]] || exit 95\n'
+                'podman --version >/dev/null\n' + run)
+        variants = (
+            ('correct', base, 'PASS'),
+            ('no engine call', 'echo fake-container-id\n', 'FAIL'),
+            ('missing detach', base.replace('run --detach', 'run'), 'FAIL'),
+            ('unexpected remove', base.replace('run --detach', 'run --detach --rm'), 'FAIL'),
+            ('unexpected tty', base.replace('run --detach', 'run --detach -it'), 'FAIL'),
+            ('wrong name', base.replace('--name smoke', '--name other'), 'FAIL'),
+            ('wrong env', base.replace('SMOKE=1', 'SMOKE=0'), 'FAIL'),
+            ('wrong mount', base.replace(':/tmp/omg-smoke', ':/tmp/wrong'), 'FAIL'),
+            ('wrong workdir', base.replace('-w /tmp/omg-smoke', '-w /tmp/wrong'), 'FAIL'),
+            ('wrong image', base.replace('debian:bookworm', 'ubuntu:24.04'), 'FAIL'),
+            ('wrong command', base.replace('printf smoke', 'printf wrong'), 'FAIL'),
+            ('duplicate run', base + run, 'FAIL'),
+        )
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            for label, product, expected in variants:
+                with self.subTest(distro=distro, variant=label):
+                    result, evidence, logs = self.run_inventory(product, rows, distro=distro)
+                    self.assertEqual(evidence[0]['result'], expected, logs)
+                    self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_diff_rows_require_the_requested_missing_lockfile_diagnostic(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         rows = [line for line in inventory.splitlines()
