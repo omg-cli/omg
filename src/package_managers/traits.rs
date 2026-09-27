@@ -28,6 +28,7 @@ pub trait PackageManager: Send + Sync {
                 .map(|package| super::types::SecurityPackage {
                     name: package.name,
                     version: package.version.to_string(),
+                    advisory_source: None,
                     architecture: None,
                     description: package.description,
                     licenses: Vec::new(),

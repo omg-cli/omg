@@ -129,55 +129,86 @@ pub(crate) async fn scan_installed_in(
         .security_inventory()
         .await
         .map_err(|error| anyhow::anyhow!("Failed to list packages: {error}"))?;
+    scan_inventory_in(installed, scanner, log_path).await
+}
+
+async fn scan_inventory_in(
+    installed: Vec<crate::package_managers::types::SecurityPackage>,
+    scanner: &dyn VulnerabilitySource,
+    log_path: &std::path::Path,
+) -> Result<SecurityAuditResult> {
     let mut result = SecurityAuditResult {
         total_vulnerabilities: 0,
         high_severity: 0,
         vulnerabilities: Vec::new(),
     };
-    let mut pending = stream::iter(installed)
-        .map(|package| async move {
+    let mut by_advisory: std::collections::BTreeMap<
+        (String, String),
+        Vec<crate::package_managers::types::SecurityPackage>,
+    > = std::collections::BTreeMap::new();
+    for package in installed {
+        let identity = {
+            let (name, version) = package.advisory_identity();
+            (name.to_owned(), version.to_owned())
+        };
+        by_advisory.entry(identity).or_default().push(package);
+    }
+    let mut pending = stream::iter(by_advisory)
+        .map(|((advisory_name, advisory_version), packages)| async move {
             let findings = async {
-                let version = crate::package_managers::types::parse_version(&package.version)
+                let version = crate::package_managers::types::parse_version(&advisory_version)
                     .ok_or_else(|| {
-                        anyhow::anyhow!("Unsupported installed version: {}", package.version)
+                        anyhow::anyhow!("Unsupported advisory version: {advisory_version}")
                     })?;
-                Ok::<_, anyhow::Error>(scanner.scan_package(&package.name, &version).await?)
+                Ok::<_, anyhow::Error>(scanner.scan_package(&advisory_name, &version).await?)
             }
             .await;
-            (package, findings)
+            ((advisory_name, advisory_version), packages, findings)
         })
         .buffer_unordered(32);
-    while let Some((package, findings)) = pending.next().await {
-        let name = package.name.clone();
+    while let Some(((advisory_name, advisory_version), packages, findings)) = pending.next().await {
+        let binary_name = &packages[0].name;
         let findings = findings.map_err(|error| {
-            anyhow::anyhow!("Failed to scan package {name} for vulnerabilities: {error}")
+            let source_detail =
+                if advisory_name != *binary_name || advisory_version != packages[0].version {
+                    format!(" (advisory source {advisory_name} {advisory_version})")
+                } else {
+                    String::new()
+                };
+            anyhow::anyhow!(
+                "Failed to scan package {binary_name} for vulnerabilities: {error}{source_detail}"
+            )
         })?;
         if findings.is_empty() {
             continue;
         }
-        let findings: Vec<_> = findings
-            .into_iter()
-            .map(|finding| {
-                if finding
-                    .score
-                    .as_deref()
-                    .and_then(parse_severity_score)
-                    .is_some_and(|score| score >= 7.0)
-                {
-                    result.high_severity += 1;
-                }
-                Vulnerability {
-                    id: finding.id,
-                    summary: finding.summary,
-                    score: finding.score,
-                    advisory_severity: None,
-                    native_advisory: None,
-                    affected_installed: vec![InstalledIdentity::from(&package)],
-                }
-            })
-            .collect();
-        result.total_vulnerabilities += findings.len();
-        result.vulnerabilities.push((name, findings));
+        for package in packages {
+            let package_findings: Vec<_> = findings
+                .iter()
+                .map(|finding| {
+                    if finding
+                        .score
+                        .as_deref()
+                        .and_then(parse_severity_score)
+                        .is_some_and(|score| score >= 7.0)
+                    {
+                        result.high_severity += 1;
+                    }
+                    Vulnerability {
+                        id: finding.id.clone(),
+                        summary: finding.summary.clone(),
+                        score: finding.score.clone(),
+                        advisory_severity: None,
+                        native_advisory: None,
+                        affected_installed: vec![InstalledIdentity::from(&package)],
+                    }
+                })
+                .collect();
+            result.total_vulnerabilities += package_findings.len();
+            result
+                .vulnerabilities
+                .push((package.name, package_findings));
+        }
     }
     // Completion order must not leak into CLI/daemon result ordering.
     result
@@ -212,6 +243,83 @@ async fn log_completed_scan(result: &SecurityAuditResult, path: &std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn osv_queries_source_identity_but_attributes_findings_to_installed_binary() {
+        use crate::core::security::vulnerability::{VulnerabilityError, VulnerabilityReport};
+        use crate::package_managers::types::{SecurityPackage, Version, VersionDisplay};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Mutex;
+
+        struct RecordingSource(Mutex<Vec<(String, String)>>);
+        impl VulnerabilitySource for RecordingSource {
+            fn scan_package<'a>(
+                &'a self,
+                name: &'a str,
+                version: &'a Version,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Vec<VulnerabilityReport>, VulnerabilityError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((name.to_owned(), version.version_string()));
+                    Ok(vec![VulnerabilityReport {
+                        id: "CVE-fixture".into(),
+                        summary: "source finding".into(),
+                        score: Some("8.0".into()),
+                    }])
+                })
+            }
+        }
+
+        let scanner = RecordingSource(Mutex::new(Vec::new()));
+        let package = SecurityPackage {
+            name: "libacl1".into(),
+            version: "2.3.2-2+b1".into(),
+            advisory_source: Some(("acl".into(), "2.3.2-2".into())),
+            architecture: Some("amd64".into()),
+            description: String::new(),
+            licenses: Vec::new(),
+        };
+        let mut second_binary = package.clone();
+        second_binary.name = "libacl2".into();
+        second_binary.version = "2.3.2-2+b2".into();
+        let directory = tempfile::tempdir().unwrap();
+        let audit = scan_inventory_in(
+            vec![package, second_binary],
+            &scanner,
+            &directory.path().join("audit.jsonl"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scanner.0.into_inner().unwrap(),
+            [("acl".into(), "2.3.2-2".into())]
+        );
+        assert_eq!(audit.total_vulnerabilities, 2);
+        assert_eq!(audit.high_severity, 2);
+        assert_eq!(audit.vulnerabilities[0].0, "libacl1");
+        assert_eq!(audit.vulnerabilities[1].0, "libacl2");
+        assert_eq!(
+            audit.vulnerabilities[0].1[0].affected_installed[0].name,
+            "libacl1"
+        );
+        assert_eq!(
+            audit.vulnerabilities[0].1[0].affected_installed[0].version,
+            "2.3.2-2+b1"
+        );
+        assert_eq!(
+            audit.vulnerabilities[1].1[0].affected_installed[0].version,
+            "2.3.2-2+b2"
+        );
+    }
 
     #[test]
     fn published_severity_filters_without_inventing_a_cvss_score() {
