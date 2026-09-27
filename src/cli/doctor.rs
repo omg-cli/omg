@@ -61,10 +61,20 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     }
 
     // 2. Internet Connectivity (basic check)
-    if check_internet(distro).await {
-        println!("  {}", style::success("Internet connectivity"));
+    let (endpoint, connectivity) = check_internet(distro).await;
+    if connectivity == EndpointProbe::Healthy {
+        println!(
+            "  {}",
+            style::success(&format!("Internet connectivity ({endpoint} reachable)"))
+        );
     } else {
-        println!("  {}", style::error("No internet connection"));
+        println!(
+            "  {}",
+            style::error(&format!(
+                "Connectivity probe to {endpoint} failed ({})",
+                connectivity.diagnostic()
+            ))
+        );
         issues += 1;
     }
 
@@ -606,26 +616,68 @@ fn check_eol_runtimes() -> Result<usize> {
     Ok(issues)
 }
 
-async fn check_internet(distro: Distro) -> bool {
-    if crate::core::paths::test_mode() {
-        return true;
+#[derive(Debug, PartialEq, Eq)]
+enum EndpointProbe {
+    Healthy,
+    HttpStatus(u16),
+    DeadlineExceeded(Duration),
+    RequestTimeout,
+    ConnectFailure(String),
+    RequestFailure(String),
+}
+
+impl EndpointProbe {
+    fn diagnostic(&self) -> String {
+        match self {
+            Self::Healthy => "healthy".to_owned(),
+            Self::HttpStatus(status) => format!("HTTP {status}"),
+            Self::DeadlineExceeded(deadline) => format!("deadline exceeded after {deadline:?}"),
+            Self::RequestTimeout => "request timed out".to_owned(),
+            Self::ConnectFailure(error) => format!("connection error: {error}"),
+            Self::RequestFailure(error) => format!("request error: {error}"),
+        }
     }
+}
+
+fn bounded_request_error(error: reqwest::Error) -> String {
+    // A redirect or proxy error can contain an untrusted URL. Remove the URL
+    // and bound terminal-safe detail before including it in doctor output.
+    style::sanitize_terminal_text(&error.without_url().to_string())
+        .chars()
+        .take(160)
+        .collect()
+}
+
+async fn probe_endpoint(client: &reqwest::Client, url: &str, deadline: Duration) -> EndpointProbe {
+    match tokio::time::timeout(deadline, client.get(url).send()).await {
+        Ok(Ok(response)) if !mirror_status_is_issue(response.status()) => EndpointProbe::Healthy,
+        Ok(Ok(response)) => EndpointProbe::HttpStatus(response.status().as_u16()),
+        Ok(Err(error)) if error.is_timeout() => EndpointProbe::RequestTimeout,
+        Ok(Err(error)) if error.is_connect() => {
+            EndpointProbe::ConnectFailure(bounded_request_error(error))
+        }
+        Ok(Err(error)) => EndpointProbe::RequestFailure(bounded_request_error(error)),
+        Err(_) => EndpointProbe::DeadlineExceeded(deadline),
+    }
+}
+
+async fn check_internet(distro: Distro) -> (&'static str, EndpointProbe) {
     // Backend-appropriate probe target: only the Arch backend has a fixed
     // upstream host (archlinux.org) in this codebase; other backends get
     // their repos from system configuration, so probe GitHub — already a
     // doctor mirror endpoint — as the neutral connectivity target.
-    let url = if matches!(distro, Distro::Arch) {
-        "https://archlinux.org"
+    let (endpoint, url) = if matches!(distro, Distro::Arch) {
+        ("archlinux.org", "https://archlinux.org")
     } else {
-        "https://github.com"
+        ("github.com", "https://github.com")
     };
-    let client = shared_client();
-    let request = client.get(url).send();
-    tokio::time::timeout(Duration::from_secs(2), request)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .is_some()
+    if crate::core::paths::test_mode() {
+        return (endpoint, EndpointProbe::Healthy);
+    }
+    (
+        endpoint,
+        probe_endpoint(shared_client(), url, Duration::from_secs(2)).await,
+    )
 }
 
 fn check_command(cmd: &str) -> bool {
@@ -861,6 +913,116 @@ pub fn enable_turbo_mode() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_probe_response(
+        response: &'static [u8],
+        delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local probe listener");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("probe connection");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.expect("probe request read");
+                assert!(count > 0, "probe request ended before headers");
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 8192, "probe request headers too large");
+            }
+            tokio::time::sleep(delay).await;
+            if delay.is_zero() {
+                socket
+                    .write_all(response)
+                    .await
+                    .expect("probe response write");
+            } else {
+                // The timeout test intentionally drops the client request.
+                let _ = socket.write_all(response).await;
+            }
+        });
+        (url, server)
+    }
+
+    async fn finish_probe_server(mut server: tokio::task::JoinHandle<()>) {
+        match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+            Ok(result) => result.expect("local probe server"),
+            Err(_) => {
+                server.abort();
+                panic!("local probe server did not finish");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connectivity_probe_distinguishes_http_status_and_transport_failures() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local probe client");
+        const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        const ERROR: &[u8] =
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (url, server) = serve_probe_response(OK, Duration::ZERO).await;
+        assert_eq!(
+            probe_endpoint(&client, &url, Duration::from_secs(1)).await,
+            EndpointProbe::Healthy
+        );
+        finish_probe_server(server).await;
+
+        let (url, server) = serve_probe_response(ERROR, Duration::ZERO).await;
+        let status = probe_endpoint(&client, &url, Duration::from_secs(1)).await;
+        assert_eq!(status, EndpointProbe::HttpStatus(500));
+        assert_eq!(status.diagnostic(), "HTTP 500");
+        finish_probe_server(server).await;
+
+        let unlistening = tokio::net::TcpSocket::new_v4().expect("refused probe socket");
+        unlistening
+            .bind("127.0.0.1:0".parse().expect("loopback address"))
+            .expect("reserve unlistening port");
+        let url = format!(
+            "http://{}",
+            unlistening.local_addr().expect("reserved address")
+        );
+        let refused = probe_endpoint(&client, &url, Duration::from_secs(1)).await;
+        assert!(matches!(refused, EndpointProbe::ConnectFailure(_)));
+        assert!(refused.diagnostic().starts_with("connection error: "));
+
+        let deadline = Duration::from_millis(50);
+        let (url, server) = serve_probe_response(OK, Duration::from_millis(250)).await;
+        let elapsed = probe_endpoint(&client, &url, deadline).await;
+        assert_eq!(elapsed, EndpointProbe::DeadlineExceeded(deadline));
+        assert_eq!(elapsed.diagnostic(), "deadline exceeded after 50ms");
+        server.abort();
+        let result = server.await;
+        assert!(result.is_ok() || result.is_err_and(|error| error.is_cancelled()));
+
+        let short_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("short-timeout client");
+        let (url, server) = serve_probe_response(OK, Duration::from_millis(250)).await;
+        let timed_out = probe_endpoint(&short_client, &url, Duration::from_secs(1)).await;
+        assert_eq!(timed_out, EndpointProbe::RequestTimeout);
+        assert_eq!(timed_out.diagnostic(), "request timed out");
+        server.abort();
+        let result = server.await;
+        assert!(result.is_ok() || result.is_err_and(|error| error.is_cancelled()));
+
+        let (url, server) =
+            serve_probe_response(b"not an HTTP response\r\n\r\n", Duration::ZERO).await;
+        let malformed = probe_endpoint(&client, &url, Duration::from_secs(1)).await;
+        assert!(matches!(malformed, EndpointProbe::RequestFailure(_)));
+        assert!(malformed.diagnostic().starts_with("request error: "));
+        finish_probe_server(server).await;
+    }
 
     #[test]
     fn apt_index_detection_accepts_plain_and_compressed_entries() {
