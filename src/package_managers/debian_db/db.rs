@@ -34,6 +34,7 @@ use crate::runtimes::common::{BudgetedWriter, decode_xz_to};
 /// TTL for cache eviction safety net (30 minutes)
 const CACHE_TTL_SECS: u64 = 30 * 60;
 const MAX_INDEX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DEBIAN_IDENTITY_VALUE_BYTES: usize = 64 * 1024;
 
 fn read_index_snapshot(path: &Path, limit: u64) -> Result<AlignedVec> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1356,6 +1357,10 @@ fn parse_paragraph_str(
                 current_field.is_some(),
                 "deb822 continuation has no preceding field"
             );
+            anyhow::ensure!(
+                !current_field.is_some_and(is_unfoldable_debian_field),
+                "Debian simple field cannot contain continuation lines"
+            );
             let value = line.trim_start();
             match current_field {
                 Some(field)
@@ -1454,6 +1459,7 @@ fn parse_paragraph_str(
         "Invalid Debian Package name: {}",
         bounded_deb822_excerpt(&name)
     );
+    validate_debian_version_and_architecture(&version, &architecture)?;
     Ok(DebianPackage {
         name,
         version,
@@ -1490,6 +1496,70 @@ fn valid_debian_package_name(name: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'+' | b'-' | b'.'))
+}
+
+fn is_unfoldable_debian_field(field: &str) -> bool {
+    ["Package", "Version", "Architecture", "Source", "Status"]
+        .iter()
+        .any(|identity| field.eq_ignore_ascii_case(identity))
+}
+
+fn validate_debian_version_and_architecture(version: &str, architecture: &str) -> Result<()> {
+    anyhow::ensure!(
+        valid_debian_version(version),
+        "Invalid Debian Version: {}",
+        bounded_deb822_excerpt(version)
+    );
+    anyhow::ensure!(
+        valid_debian_architecture(architecture),
+        "Invalid Debian Architecture: {}",
+        bounded_deb822_excerpt(architecture)
+    );
+    Ok(())
+}
+
+fn valid_debian_version(version: &str) -> bool {
+    if version.is_empty() || version.len() > MAX_DEBIAN_IDENTITY_VALUE_BYTES {
+        return false;
+    }
+    let (upstream_and_revision, has_epoch) = if let Some((epoch, rest)) = version.split_once(':') {
+        if epoch.is_empty()
+            || !epoch.bytes().all(|byte| byte.is_ascii_digit())
+            || epoch.parse::<i32>().is_err()
+        {
+            return false;
+        }
+        (rest, true)
+    } else {
+        (version, false)
+    };
+    let (upstream, revision) = upstream_and_revision
+        .rsplit_once('-')
+        .map_or((upstream_and_revision, None), |(upstream, revision)| {
+            (upstream, Some(revision))
+        });
+    !upstream.is_empty()
+        && upstream.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'+' | b'-' | b'~')
+                || (has_epoch && byte == b':')
+        })
+        && revision.is_none_or(|revision| {
+            !revision.is_empty()
+                && revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'~'))
+        })
+}
+
+fn valid_debian_architecture(architecture: &str) -> bool {
+    let bytes = architecture.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_DEBIAN_IDENTITY_VALUE_BYTES
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
 fn bounded_deb822_excerpt(value: &str) -> String {
@@ -1936,11 +2006,16 @@ pub fn validate_dpkg_status_at(path: &Path) -> Result<usize> {
 
 fn validate_deb822_fields(paragraph: &str) -> Result<()> {
     let mut seen_fields = HashSet::with_capacity(24);
+    let mut current_field: Option<&str> = None;
     for line in paragraph.lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
             anyhow::ensure!(
-                !seen_fields.is_empty(),
+                current_field.is_some(),
                 "deb822 continuation has no preceding field"
+            );
+            anyhow::ensure!(
+                !current_field.is_some_and(is_unfoldable_debian_field),
+                "Debian simple field cannot contain continuation lines"
             );
             continue;
         }
@@ -1960,6 +2035,7 @@ fn validate_deb822_fields(paragraph: &str) -> Result<()> {
             "Duplicate deb822 field: {}",
             bounded_deb822_excerpt(key)
         );
+        current_field = Some(key);
     }
     anyhow::ensure!(!seen_fields.is_empty(), "dpkg entry has no fields");
     Ok(())
@@ -2024,6 +2100,7 @@ fn parse_security_inventory(
             !version.is_empty() && !architecture.is_empty(),
             "Installed dpkg entry '{name}' lacks version or architecture"
         );
+        validate_debian_version_and_architecture(&version, &architecture)?;
         anyhow::ensure!(
             identities.insert((name.clone(), architecture.clone())),
             "Duplicate installed dpkg identity: {name}:{architecture}"
@@ -2048,11 +2125,7 @@ fn parse_security_inventory(
                     (source, version.as_str())
                 };
             anyhow::ensure!(
-                valid_debian_package_name(source_name)
-                    && !source_version.is_empty()
-                    && !source_version
-                        .bytes()
-                        .any(|byte| byte.is_ascii_whitespace() || byte == b')'),
+                valid_debian_package_name(source_name) && valid_debian_version(source_version),
                 "Invalid dpkg Source identity for '{name}'"
             );
             (source_name != name || source_version != version)
@@ -3652,6 +3725,150 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn debian_versions_and_architectures_follow_native_grammars_in_live_and_doctor() {
+        let directory = tempfile::tempdir().expect("isolated Debian metadata");
+        let index = directory.path().join("mirror_Packages");
+        let status = directory.path().join("status");
+        let write_identity = |version: &str, architecture: &str| {
+            std::fs::write(
+                &index,
+                format!("Package: fixture\nVersion: {version}\nArchitecture: {architecture}\n\n"),
+            )
+            .expect("write Packages entry");
+            std::fs::write(
+                &status,
+                format!("Package: fixture\nStatus: install ok installed\nVersion: {version}\nArchitecture: {architecture}\n"),
+            )
+            .expect("write dpkg status entry");
+        };
+
+        // Include versions from native Debian dpkg and valid epoch, tilde,
+        // revision, foreign-architecture, and architecture-independent forms.
+        for (version, architecture) in [
+            ("2.41-12+deb13u4", "amd64"),
+            ("14.2.0-19", "i386"),
+            ("3.13.5-2+deb13u5", "all"),
+            ("20250419", "arm64"),
+            ("2:1.0~rc1-3", "hurd-amd64"),
+            ("1:2:3-4", "musl-linux-riscv64"),
+            ("1.0-1-2", "riscv64"),
+            ("v1", "amd64"),
+        ] {
+            write_identity(version, architecture);
+            assert_eq!(parse_packages_file_sync(&index).unwrap().len(), 1);
+            assert_eq!(
+                validate_apt_package_indexes_at(directory.path()).unwrap(),
+                1
+            );
+            assert_eq!(validate_dpkg_status_at(&status).unwrap(), 1);
+        }
+
+        for (version, architecture, invalid_field) in [
+            ("1 bad", "amd64", "Version"),
+            ("1.0-", "amd64", "Version"),
+            (":1", "amd64", "Version"),
+            ("x:1", "amd64", "Version"),
+            ("1/2", "amd64", "Version"),
+            ("1.0-1:2", "amd64", "Version"),
+            ("1_2", "amd64", "Version"),
+            ("999999999999999999999999999:1", "amd64", "Version"),
+            ("1", "amd64 bad", "Architecture"),
+            ("1", "amd64/other", "Architecture"),
+            ("1", "x86_64", "Architecture"),
+            ("1", "-amd64", "Architecture"),
+            ("1", "émd64", "Architecture"),
+        ] {
+            write_identity(version, architecture);
+            let error =
+                parse_packages_file_sync(&index).expect_err("reject malformed APT identity");
+            assert!(
+                error.to_string().contains(invalid_field),
+                "{version} {architecture}"
+            );
+            let error = validate_apt_package_indexes_at(directory.path())
+                .expect_err("Doctor rejects malformed APT identity");
+            assert!(
+                error.root_cause().to_string().contains(invalid_field),
+                "{version} {architecture}"
+            );
+            let error = validate_dpkg_status_at(&status)
+                .expect_err("Doctor rejects malformed dpkg identity");
+            assert!(
+                error.to_string().contains(invalid_field),
+                "{version} {architecture}"
+            );
+        }
+
+        for field in ["Package", "Version", "Architecture", "Source"] {
+            let continuation =
+                "Package: fixture\nVersion: 1\nArchitecture: amd64\nSource: fixture\n"
+                    .replace(&format!("{field}: "), &format!("{field}: valid\n folded "));
+            std::fs::write(&index, &continuation).expect("write folded APT identity");
+            std::fs::write(
+                &status,
+                format!("Status: install ok installed\n{continuation}"),
+            )
+            .expect("write folded dpkg identity");
+            let error = parse_packages_file_sync(&index).expect_err("reject folded APT identity");
+            assert!(error.to_string().contains("simple field"), "{field}");
+            let error = validate_apt_package_indexes_at(directory.path())
+                .expect_err("Doctor rejects folded APT identity");
+            assert!(
+                error.root_cause().to_string().contains("simple field"),
+                "{field}"
+            );
+            let error =
+                validate_dpkg_status_at(&status).expect_err("Doctor rejects folded dpkg identity");
+            assert!(error.to_string().contains("simple field"), "{field}");
+        }
+
+        std::fs::write(
+            &status,
+            "Package: fixture\nStatus: install ok installed\n folded garbage\nVersion: 1\nArchitecture: amd64\n",
+        )
+        .expect("write folded dpkg status");
+        assert!(
+            validate_dpkg_status_at(&status)
+                .expect_err("reject folded Status")
+                .to_string()
+                .contains("simple field")
+        );
+
+        for (version, architecture, invalid_field) in [
+            (
+                "1".repeat(MAX_DEBIAN_IDENTITY_VALUE_BYTES + 1),
+                "amd64".to_string(),
+                "Version",
+            ),
+            (
+                "1".to_string(),
+                "a".repeat(MAX_DEBIAN_IDENTITY_VALUE_BYTES + 1),
+                "Architecture",
+            ),
+        ] {
+            write_identity(&version, &architecture);
+            let error = parse_packages_file_sync(&index).expect_err("reject oversized APT value");
+            assert!(error.to_string().contains(invalid_field));
+            let error = validate_dpkg_status_at(&status).expect_err("reject oversized dpkg value");
+            assert!(error.to_string().contains(invalid_field));
+        }
+
+        write_identity("1", "amd64");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&status)
+            .expect("open dpkg status entry")
+            .write_all(b"Source: fixture (1 bad)\n")
+            .expect("append malformed source version");
+        assert!(
+            validate_dpkg_status_at(&status)
+                .expect_err("reject malformed Source version")
+                .to_string()
+                .contains("Source identity")
+        );
     }
 
     #[test]
