@@ -1922,6 +1922,81 @@ esac
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_generated_man_pages_require_real_content_and_matching_count(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('generate-man\t'))
+        page = '.TH "omg" "1"\n.SH "NAME"\nomg\\-command\n.SH "SYNOPSIS"\nomg\n'
+        product = '''[[ "$1" == generate-man && "$2" == --output ]] || exit 70
+mkdir -p "$3"
+printf %s $OMG_QEMU_MAN_PAGE > "$3/omg.1"
+printf %s $OMG_QEMU_MAN_PAGE > "$3/omg-generate-man.1"
+printf 'Generated 2 man pages\\n'
+'''
+        # The fixture deliberately uses literal generated content, so an exit
+        # zero plus a directory cannot satisfy the row.
+        product = product.replace('$OMG_QEMU_MAN_PAGE', shlex.quote(page))
+        for mutation, expected in (
+            ('', 'PASS'),
+            ('sed -i "/SYNOPSIS/d" "$3/omg.1"\n', 'FAIL'),
+            ('rm "$3/omg-generate-man.1"\n', 'FAIL'),
+            ('printf "Generated 3 man pages\\n"; exit 0\n', 'FAIL'),
+        ):
+            with self.subTest(mutation=mutation):
+                command = product.replace("printf 'Generated 2 man pages\\n'", mutation +
+                                          "printf 'Generated 2 man pages\\n'")
+                result, evidence, logs = self.run_inventory(command, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_absolute_path_exports_refuse_without_evidence(self):
+        rows = [line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                if line.startswith(('audit-export\t', 'audit-export-flags\t',
+                                    'enterprise-audit-export\t'))]
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            for mutation, expected in (
+                ('', 'PASS'),
+                ('printf "Error: unrelated failure\\n" >&2\n', 'FAIL'),
+                ('mkdir -p "${@: -1}"\n', 'FAIL'),
+            ):
+                with self.subTest(row=row.split('\t', 1)[0], mutation=mutation):
+                    product = mutation + '''if [[ "$*" == *export* ]]; then
+  printf 'Error: Absolute paths not allowed\\n' >&2
+  exit 1
+fi
+exit 70
+'''
+                    if mutation.startswith('printf'):
+                        product = mutation + 'exit 1\n'
+                    result, evidence, logs = self.run_inventory(product, [row])
+                    self.assertEqual(evidence[0]['result'], expected, logs)
+                    self.assertEqual(result.returncode, int(expected == 'FAIL'))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_team_compliance_refusal_never_writes_an_unevaluated_report(self):
+        rows = [line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                if line.startswith(('team-init\t', 'team-compliance-export\t'))]
+        self.assertEqual(len(rows), 2)
+        for mutation, expected in (
+            ('', 'PASS'),
+            ('printf "Error: unrelated failure\\n" >&2; exit 1\n', 'FAIL'),
+            ('printf fabricated > "$4"\n', 'FAIL'),
+        ):
+            with self.subTest(mutation=mutation):
+                product = '''[[ "$1" == team ]] || exit 70
+if [[ "$2" == init ]]; then exit 0; fi
+[[ "$2" == compliance && "$3" == --export ]] || exit 70
+''' + mutation
+                if not mutation.startswith('printf "Error: unrelated'):
+                    product += '''printf "Error: No compliance data is available to export to '%s'; compliance evidence requires an evaluated report\\n" "$4" >&2
+exit 1
+'''
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([item['result'] for item in evidence], ['PASS', expected], logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'))
+
     def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False):
         def shell_path(path):
             value = path.as_posix()

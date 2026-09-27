@@ -315,6 +315,11 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
         ("update-turbo", Assertion::UpdateTurboOutput),
         ("daemon-foreground", Assertion::DaemonForegroundLifecycle),
         ("clean-orphans-native", Assertion::NativeAptOrphanRemoved),
+        ("generate-man", Assertion::ManPagesGenerated),
+        ("audit-export", Assertion::AuditExportAbsoluteRefusal),
+        ("audit-export-flags", Assertion::AuditExportAbsoluteRefusal),
+        ("enterprise-audit-export", Assertion::AuditExportAbsoluteRefusal),
+        ("team-compliance-export", Assertion::TeamComplianceNoReport),
     ] {
         let case = cases
             .iter()
@@ -641,6 +646,9 @@ enum Assertion {
     WatchTaskRerun,
     ParallelTasksExecuted,
     AllTasksExecuted,
+    ManPagesGenerated,
+    AuditExportAbsoluteRefusal,
+    TeamComplianceNoReport,
 }
 
 impl Assertion {
@@ -734,6 +742,9 @@ impl Assertion {
             "watch-task-rerun" => Self::WatchTaskRerun,
             "parallel-tasks-executed" => Self::ParallelTasksExecuted,
             "all-tasks-executed" => Self::AllTasksExecuted,
+            "man-pages-generated" => Self::ManPagesGenerated,
+            "audit-export-absolute-refusal" => Self::AuditExportAbsoluteRefusal,
+            "team-compliance-no-report" => Self::TeamComplianceNoReport,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1720,6 +1731,82 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         || !result.stdout.lines().any(|line| line == "npm-task-ok")
                     {
                         issues.push("run --all missed a Make or npm task".to_string());
+                    }
+                }
+                Assertion::ManPagesGenerated => {
+                    let man_dir = project.path().join("man");
+                    let pages = std::fs::read_dir(&man_dir)
+                        .ok()
+                        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>().ok());
+                    let only_real_pages = man_dir
+                        .symlink_metadata()
+                        .is_ok_and(|metadata| metadata.file_type().is_dir())
+                        && pages.as_ref().is_some_and(|entries| {
+                            entries.len() >= 2
+                                && entries.iter().all(|entry| {
+                                    entry.file_type().is_ok_and(|kind| kind.is_file())
+                                        && entry.file_name().to_str().is_some_and(|name| {
+                                            name.starts_with("omg") && name.ends_with(".1")
+                                        })
+                                })
+                        });
+                    let has_sections = ["omg.1", "omg-generate-man.1"].iter().all(|name| {
+                        std::fs::read_to_string(man_dir.join(name)).is_ok_and(|page| {
+                            page.lines().any(|line| {
+                                line.starts_with(".TH ")
+                                    && line.to_ascii_lowercase().contains("omg")
+                            })
+                                && ["NAME", "SYNOPSIS"].iter().all(|section| {
+                                    page.lines().any(|line| {
+                                        line.strip_prefix(".SH ")
+                                            .is_some_and(|title| title.trim_matches('"') == *section)
+                                    })
+                                })
+                        })
+                    });
+                    let announced = result
+                        .stdout
+                        .lines()
+                        .filter_map(|line| {
+                            line.split_once("Generated ")?
+                                .1
+                                .strip_suffix(" man pages")?
+                                .parse::<usize>()
+                                .ok()
+                        })
+                        .collect::<Vec<_>>();
+                    if !only_real_pages || !has_sections
+                        || announced != vec![pages.as_ref().map_or(0, |entries| entries.len())]
+                    {
+                        issues.push("generate-man did not create and count real man pages".to_string());
+                    }
+                }
+                Assertion::AuditExportAbsoluteRefusal => {
+                    let no_artifacts = ["audit-evidence", "audit-evidence-flags", "enterprise-evidence"]
+                        .iter()
+                        .all(|name| {
+                            project.path().join(name).symlink_metadata().is_err_and(|error| {
+                                error.kind() == std::io::ErrorKind::NotFound
+                            })
+                        });
+                    if !result.stderr.contains("Absolute paths not allowed")
+                        || result.stdout.contains("Audit evidence exported")
+                        || result.stdout.contains("Evidence exported to")
+                        || !no_artifacts
+                    {
+                        issues.push("absolute-path audit export did not refuse before writing".to_string());
+                    }
+                }
+                Assertion::TeamComplianceNoReport => {
+                    let path = project.path().join("compliance.json");
+                    if !path.symlink_metadata().is_err_and(|error| {
+                        error.kind() == std::io::ErrorKind::NotFound
+                    }) || !result.stderr.contains(&format!(
+                        "No compliance data is available to export to '{}'",
+                        path.display()
+                    )) || !result.stderr.contains("compliance evidence requires an evaluated report")
+                    {
+                        issues.push("team compliance export fabricated an unevaluated report".to_string());
                     }
                 }
                 Assertion::PrivacyOptedOut => {

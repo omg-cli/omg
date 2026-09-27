@@ -1019,6 +1019,51 @@ PY
     *) return 2 ;;
   esac || { printf 'assertion failed: golden path output disagrees with the private template state\n' >&2; return 1; }
 }
+check_file_output_oracle() {
+  local assertion=$1 code=$2 stdout=$3 stderr=$4 file count announced
+  case "$assertion" in
+    man-pages-generated)
+      if [[ "$code" != 0 || ! -d man || -L man
+        || ! -f man/omg.1 || -L man/omg.1
+        || ! -f man/omg-generate-man.1 || -L man/omg-generate-man.1 ]] \
+        || ! grep -Eiq '^\.TH[[:space:]]+"?omg"?[[:space:]]' man/omg.1; then
+        printf 'assertion failed: generate-man omitted its real main and subcommand pages\n' >&2
+        return 1
+      fi
+      for file in man/omg.1 man/omg-generate-man.1; do
+        if ! grep -Eq '^\.SH[[:space:]]+"?NAME"?$' "$file" \
+          || ! grep -Eq '^\.SH[[:space:]]+"?SYNOPSIS"?$' "$file"; then
+          printf 'assertion failed: generated man page lacks NAME or SYNOPSIS content\n' >&2
+          return 1
+        fi
+      done
+      count=$(find man -maxdepth 1 -type f -name 'omg*.1' | wc -l)
+      announced=$(sed -nE 's/^.*Generated ([0-9]+) man pages$/\1/p' "$stdout")
+      if [[ "$count" -lt 2 || "$announced" != "$count" ]] \
+        || find man -maxdepth 1 -type l -name 'omg*.1' | grep -q .; then
+        printf 'assertion failed: generated man page count disagrees with real files\n' >&2
+        return 1
+      fi ;;
+    audit-export-absolute-refusal)
+      if [[ "$code" != 1 ]] || ! grep -Fq 'Absolute paths not allowed' "$stderr" \
+        || grep -Eq 'Audit evidence exported|Evidence exported to' "$stdout" \
+        || [[ -e audit-evidence || -L audit-evidence
+              || -e audit-evidence-flags || -L audit-evidence-flags
+              || -e enterprise-evidence || -L enterprise-evidence ]]; then
+        printf 'assertion failed: absolute-path export did not refuse before creating evidence\n' >&2
+        return 1
+      fi ;;
+    team-compliance-no-report)
+      if [[ "$code" != 1 || -e compliance.json || -L compliance.json ]] \
+        || ! grep -Fq "No compliance data is available to export to '$rowdir/compliance.json'" "$stderr" \
+        || ! grep -Fq 'compliance evidence requires an evaluated report' "$stderr" \
+        || grep -Fq 'Evidence exported' "$stdout"; then
+        printf 'assertion failed: team compliance export fabricated an unevaluated report\n' >&2
+        return 1
+      fi ;;
+    *) return 2 ;;
+  esac
+}
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
   if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
@@ -1030,6 +1075,10 @@ check_product_output() {
   if [[ "$code" != 0 ]] && ! grep -q '[^[:space:]]' "$stderr"; then
     printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
   fi
+  case "$assertion" in
+    man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report)
+      check_file_output_oracle "$assertion" "$code" "$stdout" "$stderr" || return 1 ;;
+  esac
   if [[ "$assertion" == license-* ]]; then
     local mode=${assertion#license-} report=$stdout
     if [[ "$distro" != arch ]]; then
@@ -1637,10 +1686,27 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv|container-shell-argv|container-build-argv) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report) ;; *) exit 2 ;; esac
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-remove:workspace-project-removed|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
+  case "$id" in
+    generate-man)
+      [[ "$a" == man-pages-generated && "$s" == isolated-write && "$resolved" == 0 ]] || exit 2
+      jq -e '. == ["generate-man","--output","${ROOT}/man"]' <<< "$aj" >/dev/null || exit 2 ;;
+    audit-export)
+      [[ "$a" == audit-export-absolute-refusal && "$s" == isolated-write && "$resolved" == 1 ]] || exit 2
+      jq -e '. == ["audit","export","--output","${ROOT}/audit-evidence"]' <<< "$aj" >/dev/null || exit 2 ;;
+    audit-export-flags)
+      [[ "$a" == audit-export-absolute-refusal && "$s" == isolated-write && "$resolved" == 1 ]] || exit 2
+      jq -e '. == ["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]' <<< "$aj" >/dev/null || exit 2 ;;
+    enterprise-audit-export)
+      [[ "$a" == audit-export-absolute-refusal && "$s" == controlled-error && "$resolved" == 1 ]] || exit 2
+      jq -e '. == ["enterprise","audit-export","--output","${ROOT}/enterprise-evidence"]' <<< "$aj" >/dev/null || exit 2 ;;
+    team-compliance-export)
+      [[ "$a" == team-compliance-no-report && "$s" == controlled-error && "$resolved" == 1 && "$r" == team-init ]] || exit 2
+      jq -e '. == ["team","compliance","--export","${ROOT}/compliance.json"]' <<< "$aj" >/dev/null || exit 2 ;;
+    *) [[ "$a" != man-pages-generated && "$a" != audit-export-absolute-refusal && "$a" != team-compliance-no-report ]] || exit 2 ;;
   esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
@@ -2019,7 +2085,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; mkdir -p project/critical; printf '%s%s\n' '-----BEGIN ' 'PRIVATE KEY-----' > project/critical/key.pem"
   fi
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
-  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_product_output)"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_product_output)"
   if [[ "$assertions" == package-dry-run-* ]]; then
     remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f check_native_remove_preview)"
   fi
