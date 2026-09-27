@@ -1150,21 +1150,18 @@ fn parse_minimal_package_info(paragraph: &str, expected_name: &str) -> Option<(S
 
         collecting_description = false;
         let key = &line[..colon_pos];
-        let value = line[colon_pos + 1..].trim_start();
+        let value = line[colon_pos + 1..].trim();
 
-        match key.as_bytes() {
-            b"Package" => {
-                if value != expected_name {
-                    return None;
-                }
-                name_matches = true;
+        if key.eq_ignore_ascii_case("Package") {
+            if value != expected_name {
+                return None;
             }
-            b"Version" => version = value.to_string(),
-            b"Description" => {
-                description = value.to_string();
-                collecting_description = true;
-            }
-            _ => {}
+            name_matches = true;
+        } else if key.eq_ignore_ascii_case("Version") {
+            version = value.to_string();
+        } else if key.eq_ignore_ascii_case("Description") {
+            description = value.to_string();
+            collecting_description = true;
         }
     }
 
@@ -1326,20 +1323,32 @@ fn parse_paragraph_str(
     let mut size = 0u64;
     let mut sha256 = String::new();
     let mut homepage = String::new();
-    let mut current_field = None;
+    let mut current_field: Option<&str> = None;
     let mut required_fields = [0u8; 3];
+    let mut seen_fields: Vec<&str> = Vec::with_capacity(24);
 
     for line in paragraph.lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
+            anyhow::ensure!(
+                current_field.is_some(),
+                "deb822 continuation has no preceding field"
+            );
             let value = line.trim_start();
             match current_field {
-                Some("Description") if !description.is_empty() => {
+                Some(field)
+                    if field.eq_ignore_ascii_case("Description") && !description.is_empty() =>
+                {
                     description.push('\n');
                     if value != "." {
                         description.push_str(value);
                     }
                 }
-                Some("Depends" | "Pre-Depends") => append_dependencies(value, &mut depends),
+                Some(field)
+                    if field.eq_ignore_ascii_case("Depends")
+                        || field.eq_ignore_ascii_case("Pre-Depends") =>
+                {
+                    append_dependencies(value, &mut depends);
+                }
                 _ => {}
             }
             continue;
@@ -1348,44 +1357,65 @@ fn parse_paragraph_str(
             continue;
         }
 
-        let colon_pos = memchr::memchr(b':', line.as_bytes())
-            .with_context(|| format!("Invalid deb822 field without a colon: {line}"))?;
+        let colon_pos = memchr::memchr(b':', line.as_bytes()).with_context(|| {
+            format!(
+                "Invalid deb822 field without a colon: {}",
+                bounded_deb822_excerpt(line)
+            )
+        })?;
         let key = &line[..colon_pos];
-        let value = line[colon_pos + 1..].trim_start();
+        let value = line[colon_pos + 1..].trim();
+        anyhow::ensure!(
+            valid_deb822_field_name(key),
+            "Invalid deb822 field name: {}",
+            bounded_deb822_excerpt(key)
+        );
+        anyhow::ensure!(
+            !seen_fields
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(key)),
+            "Duplicate deb822 field: {}",
+            bounded_deb822_excerpt(key)
+        );
+        seen_fields.push(key);
         current_field = Some(key);
 
-        match key.as_bytes() {
-            b"Package" => {
-                required_fields[0] = required_fields[0].saturating_add(1);
-                name = value.to_string();
-            }
-            b"Version" => {
-                required_fields[1] = required_fields[1].saturating_add(1);
-                version = value.to_string();
-            }
-            b"Description" => description = value.to_string(),
-            b"Section" => section = value.to_string(),
-            b"Priority" => priority = value.to_string(),
-            b"Installed-Size" => {
-                installed_size = value
-                    .parse()
-                    .with_context(|| format!("Invalid Installed-Size value: {value}"))?;
-            }
-            b"Maintainer" => maintainer = value.to_string(),
-            b"Architecture" => {
-                required_fields[2] = required_fields[2].saturating_add(1);
-                architecture = value.to_string();
-            }
-            b"Depends" | b"Pre-Depends" => append_dependencies(value, &mut depends),
-            b"Filename" => filename = value.to_string(),
-            b"Size" => {
-                size = value
-                    .parse()
-                    .with_context(|| format!("Invalid Size value: {value}"))?;
-            }
-            b"SHA256" => sha256 = value.to_string(),
-            b"Homepage" => homepage = value.to_string(),
-            _ => {}
+        if key.eq_ignore_ascii_case("Package") {
+            required_fields[0] = required_fields[0].saturating_add(1);
+            name = value.to_string();
+        } else if key.eq_ignore_ascii_case("Version") {
+            required_fields[1] = required_fields[1].saturating_add(1);
+            version = value.to_string();
+        } else if key.eq_ignore_ascii_case("Description") {
+            description = value.to_string();
+        } else if key.eq_ignore_ascii_case("Section") {
+            section = value.to_string();
+        } else if key.eq_ignore_ascii_case("Priority") {
+            priority = value.to_string();
+        } else if key.eq_ignore_ascii_case("Installed-Size") {
+            installed_size = value.parse().with_context(|| {
+                format!(
+                    "Invalid Installed-Size value: {}",
+                    bounded_deb822_excerpt(value)
+                )
+            })?;
+        } else if key.eq_ignore_ascii_case("Maintainer") {
+            maintainer = value.to_string();
+        } else if key.eq_ignore_ascii_case("Architecture") {
+            required_fields[2] = required_fields[2].saturating_add(1);
+            architecture = value.to_string();
+        } else if key.eq_ignore_ascii_case("Depends") || key.eq_ignore_ascii_case("Pre-Depends") {
+            append_dependencies(value, &mut depends);
+        } else if key.eq_ignore_ascii_case("Filename") {
+            filename = value.to_string();
+        } else if key.eq_ignore_ascii_case("Size") {
+            size = value.parse().with_context(|| {
+                format!("Invalid Size value: {}", bounded_deb822_excerpt(value))
+            })?;
+        } else if key.eq_ignore_ascii_case("SHA256") {
+            sha256 = value.to_string();
+        } else if key.eq_ignore_ascii_case("Homepage") {
+            homepage = value.to_string();
         }
     }
 
@@ -1417,6 +1447,19 @@ fn parse_paragraph_str(
         suite: suite.to_string(),
         source_key: source_key.to_string(),
     })
+}
+
+fn valid_deb822_field_name(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    !bytes.is_empty()
+        && !matches!(bytes[0], b'#' | b'-')
+        && bytes
+            .iter()
+            .all(|byte| matches!(*byte, 0x21..=0x39 | 0x3b..=0x7e))
+}
+
+fn bounded_deb822_excerpt(value: &str) -> String {
+    value.chars().take(160).collect()
 }
 
 pub fn get_detailed_packages() -> Result<Vec<DebianPackage>> {
@@ -1801,7 +1844,9 @@ fn parse_status_paragraph(paragraph: &str) -> Option<(String, String, String, St
 
     for line in paragraph.lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
-            if current_field == Some("Description") && !description.is_empty() {
+            if current_field.is_some_and(|field: &str| field.eq_ignore_ascii_case("Description"))
+                && !description.is_empty()
+            {
                 let value = line.trim_start();
                 description.push('\n');
                 if value != "." {
@@ -1815,15 +1860,17 @@ fn parse_status_paragraph(paragraph: &str) -> Option<(String, String, String, St
             continue;
         };
         let key = &line[..colon_pos];
-        let value = line[colon_pos + 1..].trim_start();
+        let value = line[colon_pos + 1..].trim();
         current_field = Some(key);
 
-        match key.as_bytes() {
-            b"Package" => name = value.to_string(),
-            b"Version" => version = value.to_string(),
-            b"Description" => description = value.to_string(),
-            b"Architecture" => arch = value.to_string(),
-            _ => {}
+        if key.eq_ignore_ascii_case("Package") {
+            name = value.to_string();
+        } else if key.eq_ignore_ascii_case("Version") {
+            version = value.to_string();
+        } else if key.eq_ignore_ascii_case("Description") {
+            description = value.to_string();
+        } else if key.eq_ignore_ascii_case("Architecture") {
+            arch = value.to_string();
         }
     }
 
@@ -1853,6 +1900,40 @@ pub fn validate_dpkg_status_at(path: &Path) -> Result<usize> {
     Ok(packages.len())
 }
 
+fn validate_deb822_fields(paragraph: &str) -> Result<()> {
+    let mut seen_fields: Vec<&str> = Vec::with_capacity(24);
+    for line in paragraph.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            anyhow::ensure!(
+                !seen_fields.is_empty(),
+                "deb822 continuation has no preceding field"
+            );
+            continue;
+        }
+        let (key, _) = line.split_once(':').with_context(|| {
+            format!(
+                "Invalid deb822 field without a colon: {}",
+                bounded_deb822_excerpt(line)
+            )
+        })?;
+        anyhow::ensure!(
+            valid_deb822_field_name(key),
+            "Invalid deb822 field name: {}",
+            bounded_deb822_excerpt(key)
+        );
+        anyhow::ensure!(
+            !seen_fields
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(key)),
+            "Duplicate deb822 field: {}",
+            bounded_deb822_excerpt(key)
+        );
+        seen_fields.push(key);
+    }
+    anyhow::ensure!(!seen_fields.is_empty(), "dpkg entry has no fields");
+    Ok(())
+}
+
 fn parse_security_inventory(
     contents: &str,
 ) -> Result<Vec<crate::package_managers::types::SecurityPackage>> {
@@ -1862,9 +1943,12 @@ fn parse_security_inventory(
         if paragraph.trim().is_empty() {
             continue;
         }
-        let mut statuses = paragraph
-            .lines()
-            .filter_map(|line| line.strip_prefix("Status:"));
+        validate_deb822_fields(paragraph)?;
+        let mut statuses = paragraph.lines().filter_map(|line| {
+            line.split_once(':')
+                .filter(|(key, _)| key.eq_ignore_ascii_case("Status"))
+                .map(|(_, value)| value)
+        });
         let status = statuses.next().context("dpkg entry lacks Status")?;
         anyhow::ensure!(
             statuses.next().is_none(),
@@ -1880,6 +1964,8 @@ fn parse_security_inventory(
                 && fields[1] == "ok",
             "Invalid or broken dpkg package status: {status}"
         );
+        let (name, version, description, architecture) =
+            parse_status_paragraph(paragraph).context("dpkg entry lacks a package name")?;
         if matches!(fields[2], "not-installed" | "config-files") {
             continue;
         }
@@ -1898,8 +1984,6 @@ fn parse_security_inventory(
                 "Installed dpkg entry must contain exactly one {field} field"
             );
         }
-        let (name, version, description, architecture) = parse_status_paragraph(paragraph)
-            .context("Installed dpkg entry lacks a package name")?;
         anyhow::ensure!(
             !version.is_empty() && !architecture.is_empty(),
             "Installed dpkg entry '{name}' lacks version or architecture"
@@ -2383,7 +2467,7 @@ pub(crate) fn best_update_versions(
 fn status_paragraph_is_installed(paragraph: &str) -> bool {
     let Some(status) = paragraph
         .lines()
-        .find_map(|line| line.strip_prefix("Status:"))
+        .find_map(|line| deb822_field_value(line, "Status"))
     else {
         return false;
     };
@@ -2419,6 +2503,11 @@ fn status_paragraphs(content: &str) -> impl Iterator<Item = &str> {
     content.split("\n\n")
 }
 
+fn deb822_field_value<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    let (name, value) = line.split_once(':')?;
+    name.eq_ignore_ascii_case(field).then(|| value.trim())
+}
+
 fn dependencies_from_status(content: &str, package_name: &str) -> (Vec<String>, Vec<String>) {
     let mut dependencies = Vec::new();
     let mut reverse_deps = Vec::new();
@@ -2432,11 +2521,10 @@ fn dependencies_from_status(content: &str, package_name: &str) -> (Vec<String>, 
         let mut current_deps = Vec::new();
 
         for line in paragraph.lines() {
-            if let Some(pkg) = line.strip_prefix("Package: ") {
+            if let Some(pkg) = deb822_field_value(line, "Package") {
                 current_pkg = pkg.trim().to_string();
-            } else if let Some(deps_str) = line
-                .strip_prefix("Depends: ")
-                .or_else(|| line.strip_prefix("Pre-Depends: "))
+            } else if let Some(deps_str) = deb822_field_value(line, "Depends")
+                .or_else(|| deb822_field_value(line, "Pre-Depends"))
             {
                 append_dependency_names(deps_str, &mut current_deps);
             }
@@ -2503,9 +2591,10 @@ fn package_size_from_status(content: &str, package_name: &str) -> Result<Option<
         }
         let mut in_package = false;
         for line in paragraph.lines() {
-            if let Some(pkg) = line.strip_prefix("Package: ") {
+            if let Some(pkg) = deb822_field_value(line, "Package") {
                 in_package = pkg.trim() == package_name;
-            } else if in_package && let Some(size_str) = line.strip_prefix("Installed-Size: ") {
+            } else if in_package && let Some(size_str) = deb822_field_value(line, "Installed-Size")
+            {
                 return Ok(Some(status_size_bytes(size_str, package_name)?));
             }
         }
@@ -2525,9 +2614,9 @@ fn packages_with_sizes_from_status(content: &str) -> Result<Vec<(String, i64)>> 
         let mut current_size: i64 = 0;
 
         for line in paragraph.lines() {
-            if let Some(pkg) = line.strip_prefix("Package: ") {
+            if let Some(pkg) = deb822_field_value(line, "Package") {
                 current_pkg = pkg.trim().to_string();
-            } else if let Some(size_str) = line.strip_prefix("Installed-Size: ") {
+            } else if let Some(size_str) = deb822_field_value(line, "Installed-Size") {
                 current_size = status_size_bytes(size_str, &current_pkg)?;
             }
         }
@@ -2597,12 +2686,12 @@ fn installed_version_from_status(content: &str, package_name: &str) -> Option<St
         .find_map(|paragraph| {
             let name = paragraph
                 .lines()
-                .find_map(|line| line.strip_prefix("Package: "))?
+                .find_map(|line| deb822_field_value(line, "Package"))?
                 .trim();
             (name == package_name).then(|| {
                 paragraph
                     .lines()
-                    .find_map(|line| line.strip_prefix("Version: "))
+                    .find_map(|line| deb822_field_value(line, "Version"))
                     .map(str::trim)
                     .map(str::to_string)
             })?
@@ -2626,9 +2715,10 @@ fn auto_installed_names_from_extended_states(content: &str) -> AHashSet<String> 
     let mut auto_installed = AHashSet::new();
     let mut current_pkg = String::new();
     for line in content.lines() {
-        if let Some(name) = line.strip_prefix("Package: ") {
+        if let Some(name) = deb822_field_value(line, "Package") {
             current_pkg = name.trim().to_string();
-        } else if line.starts_with("Auto-Installed: 1") && !current_pkg.is_empty() {
+        } else if deb822_field_value(line, "Auto-Installed") == Some("1") && !current_pkg.is_empty()
+        {
             auto_installed.insert(std::mem::take(&mut current_pkg));
         }
     }
@@ -2728,11 +2818,10 @@ fn dependency_map_from_status(content: &str) -> HashMap<String, Vec<String>> {
         let mut current_pkg = String::new();
         let mut current_deps: Vec<String> = Vec::new();
         for line in paragraph.lines() {
-            if let Some(pkg) = line.strip_prefix("Package: ") {
+            if let Some(pkg) = deb822_field_value(line, "Package") {
                 current_pkg = pkg.trim().to_string();
-            } else if let Some(deps_str) = line
-                .strip_prefix("Depends: ")
-                .or_else(|| line.strip_prefix("Pre-Depends: "))
+            } else if let Some(deps_str) = deb822_field_value(line, "Depends")
+                .or_else(|| deb822_field_value(line, "Pre-Depends"))
             {
                 append_dependency_names(deps_str, &mut current_deps);
             }
@@ -4076,6 +4165,46 @@ mod tests {
     }
 
     #[test]
+    fn packages_fields_are_case_insensitive_and_duplicates_are_rejected() {
+        let dir = tempfile::tempdir().expect("index fixture");
+        let path = dir.path().join("fixture_Packages");
+        std::fs::write(
+            &path,
+            "package: fixture\nversion: 1 \narchitecture: all\ndescription: valid\n",
+        )
+        .expect("case-insensitive index");
+        let packages = parse_packages_file_sync(&path).expect("valid deb822 fields");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "fixture");
+        assert_eq!(packages[0].version, "1");
+        assert_eq!(packages[0].architecture, "all");
+        assert_eq!(packages[0].description, "valid");
+        assert_eq!(
+            parse_minimal_package_info(
+                "Package: fixture\nversion: 1\ndescription: valid\n",
+                "fixture"
+            ),
+            Some(("1".into(), "valid".into()))
+        );
+        assert_eq!(validate_apt_package_indexes_at(dir.path()).unwrap(), 1);
+
+        for duplicate in ["Package: spoofed\n", "Description: second\n"] {
+            std::fs::write(
+                &path,
+                format!(
+                    "package: fixture\nversion: 1\narchitecture: all\ndescription: valid\n{duplicate}"
+                ),
+            )
+            .expect("duplicate index");
+            assert!(parse_packages_file_sync(&path).is_err(), "{duplicate}");
+            assert!(
+                validate_apt_package_indexes_at(dir.path()).is_err(),
+                "{duplicate}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_packages_file_sync_accepts_sha256_checked_xz() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("fixture_Packages.xz");
@@ -4109,6 +4238,59 @@ mod tests {
         std::fs::write(&path, "Package: apt\nStatus: install reinstreq half-configured\nVersion: 1\nArchitecture: amd64\n")
             .expect("broken status");
         assert!(validate_dpkg_status_at(&path).is_err());
+    }
+
+    #[test]
+    fn doctor_status_validates_case_insensitive_and_residual_control_fields() {
+        let dir = tempfile::tempdir().expect("status fixture");
+        let path = dir.path().join("status");
+        let installed =
+            "package: apt\nstatus: install ok installed\nversion: 1\narchitecture: amd64\n";
+        std::fs::write(&path, installed).expect("case-insensitive status");
+        assert_eq!(validate_dpkg_status_at(&path).unwrap(), 1);
+
+        std::fs::write(&path, format!("{installed}Status: install ok installed\n"))
+            .expect("duplicate status");
+        assert!(validate_dpkg_status_at(&path).is_err());
+
+        let residual = "Package: removed\nStatus: deinstall ok config-files\n";
+        std::fs::write(&path, format!("{installed}\n{residual}")).expect("valid residual");
+        assert_eq!(validate_dpkg_status_at(&path).unwrap(), 1);
+
+        for damaged in [
+            "Package: removed\npackage: spoofed\nStatus: deinstall ok config-files\n",
+            "Package: removed\nStatus: deinstall ok config-files\nmalformed\n",
+        ] {
+            std::fs::write(&path, format!("{installed}\n{damaged}")).expect("damaged residual");
+            assert!(validate_dpkg_status_at(&path).is_err(), "{damaged}");
+        }
+    }
+
+    #[test]
+    fn installed_status_consumers_share_case_insensitive_field_reading() {
+        let status = "package: apt\nstatus: install ok installed \nversion: 1 \narchitecture: amd64\ndepends: libfixture\ninstalled-size: 2\n";
+        assert!(status_paragraph_is_installed(status));
+        assert_eq!(
+            installed_version_from_status(status, "apt").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            dependencies_from_status(status, "apt").0,
+            vec!["libfixture"]
+        );
+        assert_eq!(package_size_from_status(status, "apt").unwrap(), Some(2048));
+        assert_eq!(
+            packages_with_sizes_from_status(status).unwrap(),
+            vec![("apt".into(), 2048)]
+        );
+        assert_eq!(
+            dependency_map_from_status(status)["apt"],
+            vec!["libfixture"]
+        );
+        assert!(
+            auto_installed_names_from_extended_states("package: apt\nauto-installed: 1 \n")
+                .contains("apt")
+        );
     }
 
     #[test]
