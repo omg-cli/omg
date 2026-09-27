@@ -145,7 +145,7 @@ check_outdated_native_count() {
 
 # BEGIN DOCTOR BACKEND ORACLE
 check_doctor_native_backend() {
-  local distro=$1 output=$2 os_release=${3:-/etc/os-release} guest_id expected
+  local distro=$1 output=$2 os_release=${3:-/etc/os-release} exec_receipt=${4:-} guest_id expected
   if [[ ! -f "$os_release" ]]; then
     printf 'native doctor reference lacks an os-release file\n' >&2
     return 2
@@ -177,6 +177,33 @@ check_doctor_native_backend() {
         || ! grep -Fq 'APT package indexes (/var/lib/apt/lists)' "$output"; then
         printf 'assertion failed: doctor omitted an APT or dpkg health check\n' >&2
         return 1
+      fi ;;
+    fedora)
+      if [[ $(grep -Fxc '  DNF local package database healthy' "$output") != 1 ]]; then
+        printf 'assertion failed: doctor omitted or duplicated the healthy Fedora package database result\n' >&2
+        return 1
+      fi
+      if [[ $(grep -Fxc '  RPM installed package database nonempty' "$output") != 1 ]]; then
+        printf 'assertion failed: doctor did not verify a nonempty RPM installed package database\n' >&2
+        return 1
+      fi
+      if [[ -n "$exec_receipt" ]]; then
+        if [[ ! -f "$exec_receipt" ]]; then
+          printf 'native doctor DNF execution receipt is missing\n' >&2
+          return 2
+        fi
+        local dnf_exec_line
+        if ! dnf_exec_line=$(grep -Em 1 'execve\("(/usr/bin|/usr/sbin)/dnf5", \["[^"]+", "--cacheonly", "--disable-repo=\*", "check"\], .*\) = 0$' "$exec_receipt"); then
+          printf 'assertion failed: doctor did not execute the trusted offline DNF5 package database check\n' >&2
+          return 1
+        fi
+        local rpm_exec_line
+        if ! rpm_exec_line=$(grep -Em 1 'execve\("(/usr/bin|/usr/sbin)/rpm", \["[^"]+", "-qa"\], .*\) = 0$' "$exec_receipt"); then
+          printf 'assertion failed: doctor did not execute the trusted RPM installed package query\n' >&2
+          return 1
+        fi
+        printf 'Fedora doctor RPM execution receipt: %s\n' "$rpm_exec_line" >&2
+        printf 'Fedora doctor DNF execution receipt: %s\n' "$dnf_exec_line" >&2
       fi ;;
   esac
 }
@@ -1715,6 +1742,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg '$command_timeout' sudo -n bash \"\$HOME/qemu-fedora-update-fixture.sh\" '${case#update-}' $quoted_binary '$ssh_user' > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == daemon-foreground ]]; then
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
+  elif [[ "$distro" == fedora && "$case" == doctor ]]; then
+    remote+="; if ! command -v strace >/dev/null || ! strace --seccomp-bpf -f -qq -e trace=execve -o doctor.preflight.log true; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+    remote+="; run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve -o doctor.exec.log $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   else
     remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   fi
@@ -1744,7 +1774,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: counter fixture cleanup failed\\n' >&2; assertion=1; fi"
   fi
   if [[ "$assertions" == doctor-native-backend ]]; then
-    remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+    if [[ "$distro" == fedora ]]; then
+      remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log /etc/os-release doctor.exec.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+    else
+      remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+    fi
   fi
   if [[ "$assertions" == info-native-package ]]; then
     remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_info_native_package '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
