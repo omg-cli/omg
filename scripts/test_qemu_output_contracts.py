@@ -1867,6 +1867,33 @@ esac
             self.assertEqual(self.run_oracle(assertion=assertion, tree_oracle_status=0).returncode, 0)
             self.assertNotEqual(self.run_oracle(assertion=assertion, tree_oracle_status=1).returncode, 0)
 
+    @unittest.skipIf(os.name == 'nt', 'DNF reason oracle needs a POSIX shell')
+    def test_fedora_update_allows_only_the_oracle_install_reason_to_change(self):
+        source = (ROOT / 'scripts/qemu-fedora-update-fixture.sh').read_text(encoding='utf-8')
+        begin = source.index('# BEGIN DNF REASON DELTA ORACLE')
+        end = source.index('# END DNF REASON DELTA ORACLE', begin)
+        function = source[begin:end]
+        before = 'bash|x86_64|User\nomg-qemu-update-oracle|noarch|External\n'
+        cases = (
+            ('omg-qemu-update-oracle|noarch|User\nbash|x86_64|User\n', True),
+            ('bash|x86_64|Dependency\nomg-qemu-update-oracle|noarch|User\n', False),
+            ('omg-qemu-update-oracle|noarch|User\n', False),
+            ('bash|x86_64|User\ncurl|x86_64|Dependency\nomg-qemu-update-oracle|noarch|User\n', False),
+        )
+        for after, accepted in cases:
+            with self.subTest(after=after), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'before').write_text(before, encoding='utf-8', newline='\n')
+                (root / 'after').write_text(after, encoding='utf-8', newline='\n')
+                result = subprocess.run(
+                    [shutil.which('bash'), '-c',
+                     'package=omg-qemu-update-oracle\n' + function +
+                     '\ncheck_reason_delta before after'],
+                    cwd=root, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                if not accepted:
+                    self.assertIn('changed DNF install reasons', result.stderr)
+
     def test_release_search_requires_an_exact_ranked_official_result(self):
         valid = '  | Search\n    tree\n  tree 2.1.3  Official\n  tree-sitter 1.0  Official\n'
         self.assertEqual(self.run_oracle(assertion='search-official-tree-output', stdout=valid).returncode, 0)

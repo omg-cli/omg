@@ -35,6 +35,37 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+
+snapshot_install_reasons() {
+  local output=$1
+  dnf --cacheonly --disable-repo='*' repoquery --installed \
+    --queryformat '%{name}|%{arch}|%{reason}\n' > "$output" || return 1
+  awk -F '|' 'NF != 3 || $1 == "" || $2 == "" || $3 == "" { bad = 1 }
+    END { if (NR == 0 || bad) exit 1 }' "$output" || return 1
+  # DNF omits RPM's gpg-pubkey pseudo packages. Every other installed
+  # name/architecture must have a native reason before we trust this oracle.
+  rpm -qa --qf '%{NAME}|%{ARCH}\n' |
+    awk -F '|' '$1 != "gpg-pubkey" { print }' | LC_ALL=C sort > "$output.rpm" || return 1
+  awk -F '|' '$1 != "gpg-pubkey" { print $1 "|" $2 }' "$output" |
+    LC_ALL=C sort > "$output.pairs" || return 1
+  cmp -s "$output.rpm" "$output.pairs"
+}
+
+# BEGIN DNF REASON DELTA ORACLE
+check_reason_delta() {
+  local before=$1 after=$2
+  awk -F '|' -v package="$package" '$1 != package { print }' "$before" |
+    LC_ALL=C sort > "$before.other" || return 1
+  awk -F '|' -v package="$package" '$1 != package { print }' "$after" |
+    LC_ALL=C sort > "$after.other" || return 1
+  if ! cmp -s "$before.other" "$after.other"; then
+    echo 'OMG changed DNF install reasons outside bounded fixture' >&2
+    diff -u "$before.other" "$after.other" >&2 || true
+    return 1
+  fi
+}
+# END DNF REASON DELTA ORACLE
+
 if [[ -e "$config" ]]; then cp -a "$config" "$base/original-dnf.conf"; had_config=true; fi
 mkdir -p "$base/repo" "$base/repos"
 chmod 755 "$base/repo" "$base/repos"
@@ -71,6 +102,8 @@ rpm -Uvh --nosignature "$v1" > "$base/install-v1.log" 2>&1 || { cat "$base/insta
 [[ $(rpm -q --qf '%{VERSION}\n' "$package") == 1 ]] || exit 120
 rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' |
   grep -v "^$package|" | LC_ALL=C sort > "$base/system-before.tsv"
+snapshot_install_reasons "$base/reasons-before.tsv" ||
+  { echo 'native DNF install reasons unavailable before update' >&2; exit 120; }
 cat > "$base/repos/$repo_id.repo" <<REPO
 [$repo_id]
 name=OMG QEMU bounded update
@@ -126,6 +159,9 @@ phase=verification
 rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' |
   grep -v "^$package|" | LC_ALL=C sort > "$base/system-after.tsv"
 cmp "$base/system-before.tsv" "$base/system-after.tsv" || { echo 'OMG changed packages outside bounded fixture' >&2; exit 1; }
+snapshot_install_reasons "$base/reasons-after.tsv" ||
+  { echo 'native DNF install reasons unavailable after update' >&2; echo 'OMG_QEMU_FIXTURE_SETUP_FAILED' >&2; exit 120; }
+check_reason_delta "$base/reasons-before.tsv" "$base/reasons-after.tsv" || exit 1
 dnf history info --json last > "$base/history.json"
 jq -e --arg package "$package" '
   type == "array" and length == 1 and .[0].status == "Ok" and
