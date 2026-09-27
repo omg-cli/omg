@@ -598,7 +598,9 @@ enum Assertion {
     SearchOfficialTreeOutput,
     NativeTreeInstalled,
     NativeTreeAbsent,
+    NativeAptTreeRollback,
     NativeAptOrphanRemoved,
+    ContainerRunArgv,
     SelfUpdateDowngradeRefusal,
     EnvShareMissingLock,
     DiffMissingLock,
@@ -680,7 +682,9 @@ impl Assertion {
             "search-official-tree-output" => Self::SearchOfficialTreeOutput,
             "native-tree-installed" => Self::NativeTreeInstalled,
             "native-tree-absent" => Self::NativeTreeAbsent,
+            "native-apt-tree-rollback" => Self::NativeAptTreeRollback,
             "native-apt-orphan-removed" => Self::NativeAptOrphanRemoved,
+            "container-run-argv" => Self::ContainerRunArgv,
             "self-update-downgrade-refusal" => Self::SelfUpdateDowngradeRefusal,
             "env-share-missing-lock" => Self::EnvShareMissingLock,
             "diff-missing-lock" => Self::DiffMissingLock,
@@ -1516,6 +1520,24 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .expect("seed isolated bash package");
             command_env.push(("OMG_DATA_DIR", path.to_str().expect("UTF-8 mock path")));
         }
+        let container_capture = (case.id == "container-run-detached-argv").then(|| {
+            let capture = project.create_dir("container-engine-capture");
+            let podman = project.path().join("bin/podman");
+            std::fs::write(
+                &podman,
+                include_str!("../scripts/qemu-container-fake-engine.sh"),
+            )
+            .expect("write isolated container engine stub");
+            std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o700))
+                .expect("make isolated container engine stub executable");
+            capture
+        });
+        if let Some(capture) = &container_capture {
+            command_env.push((
+                "OMG_QEMU_ENGINE_CAPTURE",
+                capture.to_str().expect("UTF-8 container capture path"),
+            ));
+        }
         let started = Instant::now();
         let result = project.run_with_env(&args, &command_env);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -2028,6 +2050,38 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         issues.push("workspace command did not persist the expected private workspace state".to_string());
                     }
                 }
+                Assertion::ContainerRunArgv => {
+                    let capture = container_capture
+                        .as_ref()
+                        .expect("container argv assertion has an isolated fake engine");
+                    let expected_args = [
+                        "--detach".to_string(),
+                        "--name".to_string(),
+                        "smoke".to_string(),
+                        "-w".to_string(),
+                        "/tmp/omg-smoke".to_string(),
+                        "-e".to_string(),
+                        "SMOKE=1".to_string(),
+                        "-v".to_string(),
+                        format!("{root}:/tmp/omg-smoke"),
+                        "--".to_string(),
+                        "debian:bookworm".to_string(),
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "printf smoke".to_string(),
+                    ];
+                    let expected_argv: Vec<u8> = expected_args
+                        .iter()
+                        .flat_map(|arg| arg.as_bytes().iter().copied().chain(std::iter::once(0)))
+                        .collect();
+                    if !std::fs::read_to_string(capture.join("calls"))
+                        .is_ok_and(|calls| calls == "version\nrun\n")
+                        || !std::fs::read(capture.join("argv"))
+                            .is_ok_and(|argv| argv == expected_argv)
+                    {
+                        issues.push("detached container command did not delegate exact argv".to_string());
+                    }
+                }
                 Assertion::UpdateFastOutput
                 | Assertion::UpdateTurboOutput
                 | Assertion::DaemonForegroundLifecycle
@@ -2035,6 +2089,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::SearchOfficialTreeOutput
                 | Assertion::NativeTreeInstalled
                 | Assertion::NativeTreeAbsent
+                | Assertion::NativeAptTreeRollback
                 | Assertion::NativeAptOrphanRemoved
                 | Assertion::NativeCount
                 | Assertion::StatusNativeFast
