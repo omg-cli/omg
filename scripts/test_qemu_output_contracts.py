@@ -13,6 +13,111 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_tree_install_remove_rows_reject_collateral_package_and_reason_changes(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if line.startswith(('release-package-install-tree\t',
+                                    'release-package-remove-tree\t'))]
+        self.assertEqual(len(rows), 2)
+        native = {
+            'sudo': '''[[ "$1" != -n ]] || shift
+case "$1:$2" in
+  pacman:-R|dpkg:--purge|rpm:-e)
+    [[ "${@: -1}" == tree ]] || exit 70
+    rm -f "$HOME/tree-state" "$OMG_QEMU_TEST_TREE_BINARY" ;;
+  *) exit 70 ;;
+esac
+''',
+            'pacman': '''case "$1" in
+  -Qq)
+    if [[ "${2:-}" == tree ]]; then [[ -f "$HOME/tree-state" ]] && printf 'tree\n';
+    else printf 'base\n'; [[ ! -f "$HOME/tree-state" ]] || printf 'tree\n'; fi ;;
+  -Q)
+    printf 'base %s\n' "$(cat "$HOME/base-state" 2>/dev/null || printf 1.0)"
+    if [[ -f "$HOME/tree-state" ]]; then printf 'tree 2.0\n'; fi ;;
+  -Qqe)
+    if [[ ! -f "$HOME/base-auto" ]]; then printf 'base\n'; fi
+    if [[ -f "$HOME/tree-state" ]]; then printf 'tree\n'; fi ;;
+  *) exit 70 ;;
+esac
+''',
+            'dpkg-query': '''if [[ "$*" == *'${Version}'* ]]; then
+  printf 'base\t%s\tinstall ok installed\n' "$(cat "$HOME/base-state" 2>/dev/null || printf 1.0)"
+  if [[ -f "$HOME/tree-state" ]]; then printf 'tree\t2.0\tinstall ok installed\n'; fi
+else
+  printf 'base\tinstall ok installed\n'
+  if [[ -f "$HOME/tree-state" ]]; then printf 'tree\tinstall ok installed\n'; fi
+fi
+''',
+            'apt-mark': '''[[ "$1" == showmanual ]] || exit 70
+if [[ ! -f "$HOME/base-auto" ]]; then printf 'base\n'; fi
+if [[ -f "$HOME/tree-state" ]]; then printf 'tree\n'; fi
+''',
+            'rpm': '''case "$1:$2" in
+  -qa:--qf)
+    if [[ "$3" == *VERSION* ]]; then
+      printf 'base\t%s-1\n' "$(cat "$HOME/base-state" 2>/dev/null || printf 1.0)"
+      if [[ -f "$HOME/tree-state" ]]; then printf 'tree\t2.0-1\n'; fi
+    else
+      printf 'base\n'
+      if [[ -f "$HOME/tree-state" ]]; then printf 'tree\n'; fi
+    fi ;;
+  -q:tree) [[ -f "$HOME/tree-state" ]] ;;
+  *) exit 70 ;;
+esac
+''',
+            'dnf': '''printf 'base\t'
+if [[ -f "$HOME/base-auto" ]]; then printf 'dependency\n'; else printf 'user\n'; fi
+if [[ -f "$HOME/tree-state" ]]; then printf 'tree\tuser\n'; fi
+''',
+        }
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            for mutation in ('none', 'install-package', 'install-reason',
+                             'remove-package', 'remove-reason'):
+                with self.subTest(distro=distro, mutation=mutation):
+                    action, _, kind = mutation.partition('-')
+                    product = '''case "$1" in
+  install)
+    printf 2.0 > "$HOME/tree-state"
+    printf '#!/bin/sh\\necho tree 2.0\\n' > "$OMG_QEMU_TEST_TREE_BINARY"
+    chmod 755 "$OMG_QEMU_TEST_TREE_BINARY" ;;
+  remove)
+    rm -f "$HOME/tree-state" "$OMG_QEMU_TEST_TREE_BINARY" ;;
+  *) exit 70 ;;
+esac
+'''
+                    if mutation != 'none':
+                        product += (f'if [[ "$1" == {action} ]]; then '
+                                    + ('printf 9.0 > "$HOME/base-state"'
+                                       if kind == 'package' else ': > "$HOME/base-auto"')
+                                    + '; fi\n')
+                    result, evidence, logs = self.run_inventory(
+                        product, rows, native_commands=native, distro=distro,
+                        tiers='container', allow_mutations=True, fake_tree_binary=True)
+                    verdicts = [item['result'] for item in evidence]
+                    expected = (['PASS', 'PASS'] if mutation == 'none' else
+                                ['FAIL', 'PASS'] if action == 'install' else
+                                ['PASS', 'FAIL'])
+                    self.assertEqual(verdicts, expected, logs)
+                    self.assertEqual(result.returncode, int(mutation != 'none'), result.stderr)
+        blocked, evidence, logs = self.run_inventory(
+            'exit 70\n', [rows[0]], native_commands=native, distro='debian',
+            tiers='container', allow_mutations=True, fake_tree_binary=True,
+            home_files={'tree-state': b'2.0', 'tree-binary': b'preexisting'})
+        self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+        self.assertNotEqual(blocked.returncode, 0)
+        failed_cleanup = dict(native, sudo='exit 71\n')
+        cleanup, evidence, logs = self.run_inventory(
+            '''[[ "$1" == install ]] || exit 70
+printf 2.0 > "$HOME/tree-state"
+printf '#!/bin/sh\\necho tree 2.0\\n' > "$OMG_QEMU_TEST_TREE_BINARY"
+chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
+''', [rows[0]], native_commands=failed_cleanup, distro='debian',
+            tiers='container', allow_mutations=True, fake_tree_binary=True)
+        self.assertEqual(evidence[0]['result'], 'HARNESS_ERROR', logs)
+        self.assertNotEqual(cleanup.returncode, 0)
+
     @unittest.skipIf(os.name == 'nt', 'APT rollback oracle requires POSIX jq')
     def test_apt_rollback_requires_unique_native_history_and_tree_only_delta(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
@@ -178,6 +283,10 @@ else
   exit 1
 fi
 ''',
+            'apt-mark': '''[[ "$1" == showmanual ]] || exit 70
+if [[ ! -f "$HOME/base-auto" ]]; then printf 'base\\n'; fi
+if [[ -f "$HOME/tree-state" ]]; then printf 'tree\\n'; fi
+''',
             'apt-cache': 'printf "tree:\\n  Candidate: 2.0\\n"\n',
             'apt-get': f'''[[ "$1" == -s && "$2" == upgrade ]] || exit 70
 pin={quoted_pin}
@@ -217,6 +326,17 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
         self.assertEqual(evidence[0]['result'], 'FAIL', logs)
         self.assertIn('APT update changed installed packages other than tree', logs['update-fast.log'])
         self.assertFalse(pin.exists(), 'extra-package rejection leaked the pin')
+        result, evidence, logs = self.run_inventory(
+            f'[[ -f {quoted_pin} ]] || exit 73\n'
+            'printf "Fast System Update\\nSynced\\nUpgraded 1 package\\n"\n'
+            'printf 2.0 > "$HOME/tree-state"\n'
+            ': > "$HOME/base-auto"\n',
+            [fast_row], native_commands=native,
+            home_files={'tree_fixture.deb': b'fixture'},
+            distro='debian', tiers='container', allow_mutations=True)
+        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+        self.assertIn('install reasons', logs['update-fast.log'])
+        self.assertFalse(pin.exists(), 'reason-change rejection leaked the pin')
         # A pre-existing native tree is a setup conflict, never this fixture's
         # package to purge. The host may independently have /usr/bin/tree.
         with tempfile.TemporaryDirectory() as directory:
@@ -1485,7 +1605,7 @@ esac
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
-    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False):
+    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -1507,7 +1627,15 @@ esac
             binary.write_text('#!/bin/bash\n' + product, encoding='utf-8', newline='\n')
             binary.chmod(0o755)
             ssh = root / 'bin/ssh'
-            ssh.write_text('#!/usr/bin/env bash\nexec bash -c "${@: -1}"\n', encoding='utf-8', newline='\n')
+            if fake_tree_binary:
+                ssh.write_text(
+                    '#!/usr/bin/env bash\n'
+                    'remote=${@: -1}\n'
+                    'remote=${remote//\\/usr\\/bin\\/tree/$OMG_QEMU_TEST_TREE_BINARY}\n'
+                    'exec bash -c "$remote"\n', encoding='utf-8', newline='\n')
+            else:
+                ssh.write_text('#!/usr/bin/env bash\nexec bash -c "${@: -1}"\n',
+                               encoding='utf-8', newline='\n')
             ssh.chmod(0o755)
             inventory = root / 'cases.tsv'
             inventory.write_text(
@@ -1516,6 +1644,8 @@ esac
             env = dict(os.environ, HOME=shell_path(root / 'home'),
                        GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
                        PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
+            if fake_tree_binary:
+                env['OMG_QEMU_TEST_TREE_BINARY'] = shell_path(root / 'home/tree-binary')
             command = [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'),
                        str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
                        '--binary', shell_path(binary), '--tsv', str(inventory),

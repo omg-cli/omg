@@ -369,15 +369,6 @@ check_apt_update_fixture() {
   fi
 }
 
-apt_installed_snapshot() {
-  local inventory installed
-  inventory=$(dpkg-query -W '-f=${Package}\t${Status}\t${Version}\n') || return 1
-  [[ -n "$inventory" ]] || return 1
-  installed=$(awk -F '\t' '$2 == "install ok installed" { print }' <<< "$inventory") || return 1
-  [[ -n "$installed" ]] || return 1
-  LC_ALL=C sort <<< "$installed"
-}
-
 apt_tree_removal_id() {
   local history=$1 version=$2
   jq -er --arg version "$version" '
@@ -411,7 +402,7 @@ check_apt_update_delta() {
   before_other=$(awk -F '\t' '$1 != "tree" { print }' <<< "$before") || return 1
   after_other=$(awk -F '\t' '$1 != "tree" { print }' <<< "$after") || return 1
   if [[ "$before_other" != "$after_other" ]]; then
-    printf 'assertion failed: APT update changed installed packages other than tree\n' >&2
+    printf 'assertion failed: APT update changed installed packages other than tree or their install reasons\n' >&2
     return 1
   fi
 }
@@ -453,6 +444,30 @@ native_package_snapshot() {
   printf 'installed packages\n%s\ninstall reasons\n%s\n' \
     "$(printf '%s\n' "$inventory" | LC_ALL=C sort)" \
     "$(printf '%s\n' "$reasons" | LC_ALL=C sort)"
+}
+
+check_native_tree_only_delta() {
+  local before=$1 after=$2 before_other after_other
+  before_other=$(awk '$1 != "tree" { print }' <<< "$before") || return 1
+  after_other=$(awk '$1 != "tree" { print }' <<< "$after") || return 1
+  if [[ "$before_other" != "$after_other" ]]; then
+    printf 'assertion failed: native package or install-reason state changed outside tree\n' >&2
+    return 1
+  fi
+}
+
+cleanup_native_tree_fixture() {
+  local distro=$1
+  case "$distro" in
+    arch)
+      if pacman -Qq tree >/dev/null 2>&1; then sudo -n pacman -R --noconfirm tree >/dev/null || return 1; fi ;;
+    debian|ubuntu)
+      sudo -n dpkg --purge tree >/dev/null || return 1 ;;
+    fedora)
+      if rpm -q tree >/dev/null 2>&1; then sudo -n rpm -e tree >/dev/null || return 1; fi ;;
+    *) return 1 ;;
+  esac
+  check_native_tree_state "$distro" absent
 }
 
 native_installed_version() {
@@ -1824,7 +1839,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f check_native_remove_preview)"
   fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
-    remote+="; $(declare -f check_apt_tree_absent); $(declare -f prepare_apt_update_fixture); $(declare -f check_apt_update_fixture); $(declare -f apt_installed_snapshot); $(declare -f check_apt_update_delta); $(declare -f cleanup_apt_update_fixture)"
+    remote+="; $(declare -f check_apt_tree_absent); $(declare -f prepare_apt_update_fixture); $(declare -f check_apt_update_fixture); $(declare -f native_package_snapshot); $(declare -f check_apt_update_delta); $(declare -f cleanup_apt_update_fixture)"
   fi
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
@@ -1837,8 +1852,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == clean-orphans-native ]]; then
     remote+="; $(declare -f prepare_native_apt_orphan); $(declare -f check_native_apt_orphan_removed)"
   fi
-  if [[ "$case" == release-package-install-tree || "$case" == clean-orphans-native ]]; then
+  if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree || "$case" == clean-orphans-native ]]; then
     remote+="; if ! check_native_tree_state '$distro' absent; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+  fi
+  if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree ]]; then
+    remote+="; $(declare -f native_package_snapshot); $(declare -f check_native_tree_only_delta); $(declare -f cleanup_native_tree_fixture)"
+    remote+="; tree_before=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package baseline is unavailable\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+    remote+="; tree_owned=1; tree_exit_cleanup() { local original=\$?; if [[ \"\$tree_owned\" == 1 ]] && ! cleanup_native_tree_fixture '$distro'; then printf 'assertion failed: native tree cleanup failed on exit\n' >&2; exit 71; fi; rm -f \"\$status_file\"; exit \"\$original\"; }; trap tree_exit_cleanup EXIT"
   fi
   if [[ "$case" == release-package-rollback-tree ]]; then
     remote+="; $(declare -f check_apt_tree_absent); $(declare -f native_package_snapshot); $(declare -f apt_tree_removal_id); $(declare -f check_apt_tree_restoration); $(declare -f check_apt_tree_only_delta); export OMG_DATA_DIR=\"\$rowdir/rollback-data\" OMG_DISABLE_DAEMON=1"
@@ -1952,7 +1972,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   elif [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; export OMG_DISABLE_DAEMON=1; apt_fixture_installed=0; apt_fixture_pin_created=0"
     remote+="; apt_fixture_exit_cleanup() { if [[ \"\$apt_fixture_installed\" == 1 || \"\$apt_fixture_pin_created\" == 1 ]]; then cleanup_apt_update_fixture '$distro' >/dev/null 2>&1 || true; fi; rm -f \"\$status_file\"; }; trap apt_fixture_exit_cleanup EXIT"
-    remote+="; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\" || ! apt_before=\$(apt_installed_snapshot); then if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT setup cleanup failed\\n' >&2; fi; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+    remote+="; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\" || ! apt_before=\$(native_package_snapshot '$distro'); then if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT setup cleanup failed\\n' >&2; fi; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == release-package-rollback-tree ]]; then
     remote+="; run_omg '$command_timeout' $quoted_binary rollback \"\$rollback_id\" --yes > command.stdout.log 2> command.stderr.log; assertion=0"
@@ -1966,6 +1986,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
+  if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree ]]; then
+    remote+="; tree_after=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package after-state is unavailable\n' >&2; execution_phase=dependency; rc=2; assertion=1; tree_after=missing; }"
+    remote+="; tree_delta_ok=1; if ! check_native_tree_only_delta \"\$tree_before\" \"\$tree_after\"; then tree_delta_ok=0; assertion=1; fi"
+    remote+="; if ! cleanup_native_tree_fixture '$distro'; then printf 'assertion failed: native tree fixture cleanup failed\n' >&2; execution_phase=dependency; rc=2; assertion=1; else tree_owned=0; fi"
+    remote+="; tree_final=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package cleanup after-state is unavailable\n' >&2; execution_phase=dependency; rc=2; assertion=1; tree_final=missing; }"
+    remote+="; if [[ \"\$tree_before\" != \"\$tree_final\" ]]; then printf 'assertion failed: native tree row did not restore its package/reason baseline\n' >&2; assertion=1; if [[ \"\$tree_delta_ok\" == 1 ]]; then execution_phase=dependency; rc=2; fi; fi"
+  fi
   if [[ "$case" == release-package-rollback-tree ]]; then
     remote+="; restored=\$(dpkg-query -W '-f=\${Status}\t\${Version}' tree 2>/dev/null) || restored=missing"
     remote+="; if [[ \"\$restored\" != \"\$(printf 'install ok installed\t%s' \"\$rollback_version\")\" ]]; then printf 'assertion failed: rollback did not restore native tree version %s (found %s)\n' \"\$rollback_version\" \"\$restored\" >&2; assertion=1; fi"
@@ -1996,7 +2023,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if [[ \"\$rc\" == 0 ]] && { ! grep -Fxq 'OMG_QEMU_UPDATE_FIXTURE:before:${case#update-}:1' command.stdout.log || ! grep -Fxq 'OMG_QEMU_UPDATE_FIXTURE:after:${case#update-}:2:native-upgrade' command.stdout.log; }; then printf 'assertion failed: bounded Fedora update lacks native before/after evidence\\n' >&2; assertion=1; fi"
   fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
-    remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]]; then if ! check_apt_update_fixture; then assertion=1; fi; if ! apt_after=\$(apt_installed_snapshot); then printf 'assertion failed: APT installed-package after-state is unavailable\\n' >&2; execution_phase=dependency; rc=2; assertion=1; elif ! check_apt_update_delta \"\$apt_before\" \"\$apt_after\"; then assertion=1; fi; fi"
+    remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]]; then if ! check_apt_update_fixture; then assertion=1; fi; if ! apt_after=\$(native_package_snapshot '$distro'); then printf 'assertion failed: APT package/reason after-state is unavailable\\n' >&2; execution_phase=dependency; rc=2; assertion=1; elif ! check_apt_update_delta \"\$apt_before\" \"\$apt_after\"; then assertion=1; fi; fi"
     remote+="; if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT update fixture cleanup failed\\n' >&2; execution_phase=dependency; rc=2; assertion=1; fi"
   fi
   if [[ -n "$counter" ]]; then
