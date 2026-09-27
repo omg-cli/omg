@@ -46,6 +46,10 @@ pub async fn remove(packages: &[String], recursive: bool, yes: bool, dry_run: bo
 // reject unsupported recursion. Keep one cross-feature contract at the call site.
 #[cfg_attr(feature = "arch", allow(clippy::unnecessary_wraps))]
 fn validate_removal_mode(recursive: bool) -> Result<()> {
+    #[cfg(feature = "arch")]
+    if super::mock_arch_backend()? {
+        return Ok(());
+    }
     dispatch_backend! {
         debian: {
             anyhow::ensure!(!recursive, "Recursive removal is not supported by the Debian backend");
@@ -102,6 +106,10 @@ async fn remove_packages(packages: &[String], recursive: bool) -> Result<()> {
     )
 )]
 async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> {
+    #[cfg(feature = "arch")]
+    if super::mock_arch_backend()? {
+        return arch::remove_dry_run(packages, recursive);
+    }
     dispatch_backend! {
         debian: { debian::remove_dry_run(packages); Ok(()) },
         arch: { arch::remove_dry_run(packages, recursive) },

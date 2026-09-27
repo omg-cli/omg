@@ -57,6 +57,14 @@ macro_rules! dispatch_backend {
 }
 pub(crate) use dispatch_backend;
 
+#[cfg(feature = "arch")]
+fn mock_arch_backend() -> anyhow::Result<bool> {
+    Ok(
+        crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Mock
+            && crate::core::env::distro::detect_distro() == crate::core::env::distro::Distro::Arch,
+    )
+}
+
 /// Execute a `Cmd<()>` in fallback context (non-Elm mode).
 ///
 /// This provides a simple println-based execution for reliability

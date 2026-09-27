@@ -31,6 +31,12 @@ pub async fn update(
     no_sync: bool,
     aur_only: bool,
 ) -> Result<()> {
+    #[cfg(feature = "arch")]
+    if aur_only && super::mock_arch_backend()? {
+        // The mock has no AUR network lane. Preserve Arch's read-only
+        // --aur-only check without routing an official update through ALPM.
+        return arch::update(check_only, yes, dry_run, no_sync, aur_only).await;
+    }
     dispatch_backend! {
         debian: {
             if aur_only { anyhow::bail!("--aur-only is supported only on Arch Linux"); }

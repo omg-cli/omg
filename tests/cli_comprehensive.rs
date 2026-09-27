@@ -93,6 +93,37 @@ fn mock_fedora_sync_does_not_start_aur_metadata_io() {
     project.close_checked();
 }
 
+#[cfg(feature = "arch")]
+#[test]
+fn mock_arch_read_only_flags_keep_arch_semantics_without_native_access() {
+    let project = TestProject::for_distro("arch");
+    project.mock_install("bash", "5.2.0").unwrap();
+    let state = project.data_dir.path().join("mock_state_pacman.json");
+    let before = std::fs::read(&state).unwrap();
+
+    let removal = project.run(&["remove", "--recursive", "--yes", "--dry-run", "bash"]);
+    removal.assert_success();
+    assert!(removal.stdout.contains("bash"));
+    assert!(
+        removal
+            .stdout
+            .contains("Additional unneeded dependencies would also be removed"),
+        "recursive dry run omitted the dependency scope: {}",
+        removal.combined_output()
+    );
+
+    let update = project.run(&["update", "--check", "--aur-only"]);
+    update.assert_success();
+    assert!(
+        update.stdout.contains("AUR only"),
+        "AUR-only check did not retain its selected scope: {}",
+        update.combined_output()
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), before);
+    assert!(!project.data_dir.path().join("cache/aur/_meta").exists());
+    project.close_checked();
+}
+
 #[test]
 fn mock_clean_refuses_mutation_before_native_package_helpers() {
     for distro in ["arch", "debian", "fedora"] {
