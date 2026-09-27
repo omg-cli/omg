@@ -78,7 +78,7 @@ audit-licenses	["audit","licenses","--format","json"]	read	arch:0,debian:1,ubunt
 audit-fix	["audit","fix","--dry-run"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
 audit-export	["audit","export","--output","${ROOT}/audit-evidence"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-eol	["audit","eol"]	read	0	pass	-	hermetic	hermetic:pass	audit-eol-state	tempdir-drop
-run	["run","smoke","--using","make"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+run	["run","smoke","--using","make"]	read	0	pass	-	hermetic	hermetic:pass	task-executed	tempdir-drop
 new	["new","rust","smoke-app"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 tool-install	["tool","install","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 tool-list	["tool","list"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -162,8 +162,8 @@ audit-licenses-filter-policy	["audit","licenses","--format","json","--filter","m
 audit-licenses-export	["audit","licenses","--format","csv","--export","${ROOT}/licenses-export.csv"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-fix-flags	["audit","fix","--dry-run","--yes","--min-severity","high"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
 audit-export-flags	["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-run-parallel	["run","--parallel","smoke"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-run-all	["run","--all","smoke"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+run-parallel	["run","--parallel","parallel-one,parallel-two"]	read	0	pass	-	hermetic	hermetic:pass	parallel-tasks-executed	tempdir-drop
+run-all	["run","--all","smoke"]	read	0	pass	-	hermetic	hermetic:pass	all-tasks-executed	tempdir-drop
 team-golden-create-flags	["team","golden-path","create","flagged","--node","20","--python","3.12","--packages","ripgrep"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	-	tempdir-drop
 team-compliance-export	["team","compliance","--export","${ROOT}/compliance.json"]	controlled-error	1	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 team-compliance-enforce	["team","compliance","--enforce"]	read	0	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
