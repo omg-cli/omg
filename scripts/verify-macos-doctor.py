@@ -69,19 +69,26 @@ def path_without_sudo(binary: Path, original: str, scratch: Path) -> str:
     return controlled
 
 
-def path_without_omg(binary: Path, env: dict[str, str]) -> str:
-    """Remove only paths Doctor accepts as OMG's executable directory."""
-    home = Path(env.get("HOME", str(Path.home())))
-    accepted = {binary.parent, Path(env["OMG_DATA_DIR"]) / "bin", home / ".local/bin"}
-    entries = [entry for entry in env["PATH"].split(os.pathsep) if entry]
-    if not any(Path(entry) in accepted for entry in entries):
-        raise AssertionError("baseline PATH has no OMG directory to remove")
-    remaining = [
-        entry for entry in entries if Path(entry) not in accepted
-    ]
-    if not remaining:
-        raise AssertionError("removing OMG left no usable PATH entries")
-    return os.pathsep.join(remaining)
+def path_without_omg(env: dict[str, str], scratch: Path) -> str:
+    """Keep host tools available through aliases while removing every omg."""
+    if shutil.which("omg", path=env["PATH"]) is None:
+        raise AssertionError("baseline PATH has no omg executable to remove")
+    aliases = scratch / "without-omg-bin"
+    aliases.mkdir()
+    for directory in env["PATH"].split(os.pathsep):
+        source = Path(directory)
+        if not directory or not source.is_dir():
+            continue
+        for entry in source.iterdir():
+            target = aliases / entry.name
+            if entry.name == "omg" or target.exists() or target.is_symlink():
+                continue
+            if entry.is_file() and os.access(entry, os.X_OK):
+                target.symlink_to(entry.resolve())
+    controlled = str(aliases)
+    if shutil.which("omg", path=controlled) is not None:
+        raise AssertionError("controlled Doctor PATH still resolves omg")
+    return controlled
 
 
 def check_native_doctor(binary: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -141,6 +148,9 @@ def main() -> None:
     binary = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="omg-macos-doctor-") as scratch:
         data = Path(scratch) / "data"
+        alias_dir = Path(scratch) / "omg-alias-bin"
+        alias_dir.mkdir()
+        (alias_dir / "omg").symlink_to(binary)
         for runtime, version in (("node", "16.20.2"), ("python", "3.12.14")):
             versions = data / "versions" / runtime
             (versions / version).mkdir(parents=True)
@@ -153,7 +163,7 @@ def main() -> None:
             address = f"http://127.0.0.1:{proxy.server_address[1]}"
             env = os.environ.copy()
             env.update({
-                "PATH": f"{binary.parent}:{env.get('PATH', '')}",
+                "PATH": f"{binary.parent}:{alias_dir}:{env.get('PATH', '')}",
                 "NO_COLOR": "1",
                 "OMG_DATA_DIR": str(data),
                 "OMG_TEST_MODE": "0",
@@ -169,12 +179,12 @@ def main() -> None:
             try:
                 baseline = check_native_doctor(binary, env)
                 missing_path_env = env.copy()
-                missing_path_env["PATH"] = path_without_omg(binary, env)
+                missing_path_env["PATH"] = path_without_omg(env, Path(scratch))
                 missing_path = run_doctor(binary, missing_path_env)
                 require(missing_path.returncode == 1 and
                         issue_count(missing_path) == issue_count(baseline) + 1,
                         missing_path, "removing OMG from PATH must add exactly one issue")
-                require(len(re.findall(r"^  OMG bin directory not in PATH$",
+                require(len(re.findall(r"^  omg executable not found on PATH$",
                                        missing_path.stdout, re.MULTILINE)) == 1,
                         missing_path, "Doctor must name the missing OMG PATH exactly once")
                 require("PATH configured correctly" not in missing_path.stdout,

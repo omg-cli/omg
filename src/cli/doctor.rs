@@ -712,6 +712,18 @@ fn network_targets(
     }
 }
 
+fn count_usable_dns_addresses<T>(addresses: impl Iterator<Item = T>) -> std::io::Result<usize> {
+    let count = addresses.count();
+    if count == 0 {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "resolver returned no addresses",
+        ))
+    } else {
+        Ok(count)
+    }
+}
+
 #[cfg(any(feature = "macos", target_os = "macos"))]
 async fn validate_homebrew_api_response(
     mut response: reqwest::Response,
@@ -817,7 +829,7 @@ async fn check_network(distro: Distro) -> usize {
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
                 std::net::ToSocketAddrs::to_socket_addrs(lookup.as_str())
-                    .map(std::iter::Iterator::count)
+                    .and_then(count_usable_dns_addresses)
             }),
         )
         .await;
@@ -1430,6 +1442,19 @@ mod tests {
         assert_eq!(network_targets(Distro::Fedora).0, GENERIC_MIRROR_ENDPOINTS);
     }
 
+    #[test]
+    fn dns_lookup_without_addresses_is_an_issue() {
+        let empty = count_usable_dns_addresses(std::iter::empty::<std::net::SocketAddr>());
+        assert_eq!(
+            empty
+                .expect_err("an empty successful lookup must fail")
+                .kind(),
+            std::io::ErrorKind::AddrNotAvailable
+        );
+        let one = std::net::SocketAddr::from(([127, 0, 0, 1], 443));
+        assert_eq!(count_usable_dns_addresses(std::iter::once(one)).unwrap(), 1);
+    }
+
     #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
     fn fake_brew(prefix: &std::path::Path, script: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1486,41 +1511,54 @@ mod tests {
     async fn homebrew_doctor_matches_backend_selected_repository_cellar() {
         let root = tempfile::tempdir().expect("temporary prefix");
         let prefix = root.path();
-        let primary = prefix.join("Cellar");
-        let fallback = prefix.join("Homebrew/Cellar");
+        let prefix_cellar = prefix.join("Cellar");
+        let repository_cellar = prefix.join("Homebrew/Cellar");
         let caskroom = prefix.join("Caskroom");
         let script = "#!/bin/sh\nprefix=${0%/bin/brew}\ncase \"$1\" in\n  --prefix) printf '%s\\n' \"$prefix\";;\n  --cellar) printf '%s/Homebrew/Cellar\\n' \"$prefix\";;\n  --caskroom) printf '%s/Caskroom\\n' \"$prefix\";;\n  *) exit 64;;\nesac\n";
         let brew = fake_brew(prefix, script);
-        std::fs::create_dir_all(fallback.join("wget/1.0"))
-            .expect("fallback inventory contains a package");
+        std::fs::create_dir_all(repository_cellar.join("wget/1.0"))
+            .expect("repository inventory contains a package");
         assert_eq!(
             check_homebrew_paths(
                 &brew,
                 [
                     ("--prefix", prefix),
-                    ("--cellar", fallback.as_path()),
+                    ("--cellar", repository_cellar.as_path()),
                     ("--caskroom", caskroom.as_path()),
                 ],
             )
             .await,
             0,
-            "Doctor must validate the fallback inventory selected by the backend"
+            "Doctor must validate the repository inventory selected by the backend"
         );
 
-        std::fs::create_dir_all(primary.join("curl/2.0"))
+        std::fs::create_dir_all(prefix_cellar.join("curl/2.0"))
             .expect("prefix inventory contains a package");
         assert_eq!(
             check_homebrew_paths(
                 &brew,
                 [
                     ("--prefix", prefix),
-                    ("--cellar", primary.as_path()),
+                    ("--cellar", repository_cellar.as_path()),
+                    ("--caskroom", caskroom.as_path()),
+                ],
+            )
+            .await,
+            0,
+            "a prefix Cellar must not override Homebrew's repository Cellar"
+        );
+        assert_eq!(
+            check_homebrew_paths(
+                &brew,
+                [
+                    ("--prefix", prefix),
+                    ("--cellar", prefix_cellar.as_path()),
                     ("--caskroom", caskroom.as_path()),
                 ],
             )
             .await,
             1,
-            "a mismatched nonempty prefix Cellar must remain an issue"
+            "Doctor must reject a different Cellar from the selected backend"
         );
     }
 
