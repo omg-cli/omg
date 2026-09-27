@@ -949,6 +949,64 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(calls[0][1], expected)
         self.assertEqual(catalog["failures"], expected)
 
+    def test_arm_health_and_x86_guest_failure_both_survive_unavailable_artifacts(self):
+        for distro in ("arch", "ubuntu"):
+            for unavailable in (dict(no_artifacts=True), dict(artifact_listing_error=True)):
+                with self.subTest(distro=distro, unavailable=unavailable):
+                    jobs = [
+                        {"name": "ARM guest runner KVM health", "conclusion": "failure",
+                         "id": 11, "steps": []},
+                        {"name": f"QEMU behavioral verification / Distro lane ({distro}) / "
+                                 f"QEMU guest ({distro})", "conclusion": "failure",
+                         "id": 12, "steps": []},
+                        {"name": "QEMU behavioral verification / QEMU matrix result",
+                         "conclusion": "failure", "id": 13, "steps": []},
+                    ]
+                    calls, catalog = self.run_report_fixture([], jobs=jobs, **unavailable)
+                    expected = [
+                        dict(case_id="qemu-arm-runner-kvm-health", distro="ubuntu",
+                             result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0),
+                        dict(case_id="qemu-matrix-x86-workflow", distro=distro,
+                             arch="x86_64", result="HARNESS_ERROR", exit_code=1,
+                             elapsed_seconds=0),
+                    ]
+                    self.assertEqual(calls[0][1], expected)
+                    self.assertEqual(catalog["failures"], expected)
+                    self.assertEqual(catalog["evidence_invalid_or_unavailable"],
+                                     "artifact_listing_error" in unavailable)
+
+    def test_arm_health_failure_survives_detailed_x86_guest_failure(self):
+        jobs = [
+            {"name": "ARM guest runner KVM health", "conclusion": "failure",
+             "id": 11, "steps": []},
+            {"name": "QEMU behavioral verification / Distro lane (arch) / QEMU guest (arch)",
+             "conclusion": "failure", "id": 12, "steps": []},
+        ]
+        calls, catalog = self.run_report_fixture([self.row()], jobs=jobs)
+        expected = [
+            dict(self.row(), arch="x86_64"),
+            dict(case_id="qemu-arm-runner-kvm-health", distro="ubuntu",
+                 result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0),
+        ]
+        self.assertEqual(calls[0][1], expected)
+        self.assertEqual(catalog["failures"], expected)
+
+    def test_mixed_health_and_guest_failure_overflow_keeps_catalog_identities(self):
+        failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(25)]
+        jobs = [
+            {"name": "ARM guest runner KVM health", "conclusion": "failure",
+             "id": 11, "steps": []},
+            {"name": "QEMU behavioral verification / Distro lane (fedora) / QEMU guest (fedora)",
+             "conclusion": "failure", "id": 12, "steps": []},
+        ]
+        calls, catalog = self.run_report_fixture(failures, jobs=jobs)
+        self.assertEqual(len(catalog["failures"]), 27)
+        self.assertEqual({row["case_id"] for row in catalog["failures"]} -
+                         {row["case_id"] for row in failures},
+                         {"qemu-arm-runner-kvm-health", "qemu-matrix-x86-workflow"})
+        self.assertEqual(len(calls[0][1]), 1)
+        self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-workflow")
+
     def test_failed_native_ci_before_qemu_uses_ci_prerequisite_identity(self):
         jobs = [
             {"name": "Linux (debian-trixie)", "conclusion": "failure", "id": 11,

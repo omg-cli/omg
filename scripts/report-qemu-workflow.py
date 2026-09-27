@@ -389,7 +389,9 @@ def projection(rows, verified_published):
 
     detailed = {(row["distro"], row.get("arch", "x86_64"))
                 for row in selected.values()
-                if not aggregate(row["case_id"]) and row["result"] in FAILURES}
+                if (not aggregate(row["case_id"])
+                    and row["case_id"] != "qemu-arm-runner-kvm-health"
+                    and row["result"] in FAILURES)}
     selected = {key: row for key, row in selected.items()
                 if not aggregate(row["case_id"]) or row["result"] not in FAILURES
                 or ((row["distro"], row.get("arch", "x86_64")) not in detailed
@@ -477,10 +479,18 @@ def workflow_receipt(jobs, conclusion):
 
 
 def failed_guest_receipts(jobs, receipt):
-    if receipt["result"] not in FAILURES or receipt["case_id"] == "qemu-arm-runner-kvm-health":
+    if receipt["result"] not in FAILURES:
         return []
-    return [dict(receipt, distro=distro, arch=arch)
-            for distro, arch in sorted(failed_lane_guests(jobs))]
+    health_failed = receipt["case_id"] == "qemu-arm-runner-kvm-health"
+    # ARM health is a separate prerequisite. Derive the guest aggregate from
+    # the remaining jobs so a concurrent x86 failure keeps its own identity.
+    guest_receipt = workflow_receipt(
+        [job for job in jobs if job["name"] != "ARM guest runner KVM health"],
+        "failure",
+    ) if health_failed else receipt
+    guests = [dict(guest_receipt, distro=distro, arch=arch)
+              for distro, arch in sorted(failed_lane_guests(jobs))]
+    return [receipt, *guests] if health_failed else guests
 
 
 def ci_non_qemu_failure(run, jobs):
