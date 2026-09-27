@@ -380,18 +380,20 @@ def projection(rows, verified_published):
             selected[key] = dict(row, result="HARNESS_ERROR" if row["result"] == "BLOCKED" else row["result"])
         elif verified_published and row["result"] == "PASS" and key not in selected:
             selected[key] = row
-    # The matrix job emits an aggregate receipt whenever a lane fails. Once
-    # detailed evidence identifies that failure, filing both adds no diagnosis.
-    # Keep the aggregate when it is the only failure (and keep PASS closures).
+    # A detailed failure replaces only the aggregate for that same guest.
+    # Another failed distro may have stopped before exporting its artifact.
     def aggregate(case_id):
         return case_id == "qemu-matrix-workflow" or (
             case_id.startswith("qemu-matrix-") and case_id.endswith("-workflow")
         )
 
-    if any(not aggregate(row["case_id"]) and row["result"] in FAILURES
-           for row in selected.values()):
-        selected = {key: row for key, row in selected.items()
-                    if not aggregate(row["case_id"]) or row["result"] not in FAILURES}
+    detailed = {(row["distro"], row.get("arch", "x86_64"))
+                for row in selected.values()
+                if not aggregate(row["case_id"]) and row["result"] in FAILURES}
+    selected = {key: row for key, row in selected.items()
+                if not aggregate(row["case_id"]) or row["result"] not in FAILURES
+                or ((row["distro"], row.get("arch", "x86_64")) not in detailed
+                    and (row["distro"] != "matrix" or not detailed))}
     return list(selected.values())
 
 
@@ -419,6 +421,26 @@ def published_provenance(content, distro, revision):
     return provenance["artifact_tag"], provenance["inventory_revision"]
 
 
+def failed_lane_guests(jobs):
+    guests = set()
+    for job in jobs:
+        if job.get("conclusion") not in ("failure", "timed_out", "cancelled", "action_required"):
+            continue
+        name = job["name"]
+        lane = re.search(r"(?:^|/)\s*Distro lane \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
+        if lane:
+            guests.add((lane.group(1), "x86_64"))
+            continue
+        arm = re.search(r"QEMU guest arm64 \((arch|debian|ubuntu|fedora)\)", name)
+        if arm:
+            guests.add((arm.group(1), "aarch64"))
+        else:
+            x86 = re.search(r"QEMU guest \((arch|debian|ubuntu|fedora)\)", name)
+            if x86:
+                guests.add((x86.group(1), "x86_64"))
+    return guests
+
+
 def workflow_receipt(jobs, conclusion):
     """Return an aggregate identity scoped to the architecture actually run.
 
@@ -430,20 +452,11 @@ def workflow_receipt(jobs, conclusion):
     arm_health = None
     x86_selected = False
     arm_selected = False
-    failed_lane_distros = set()
     for job in jobs:
         if not isinstance(job, dict) or not isinstance(job.get("name"), str):
             raise ValueError("invalid workflow job")
         name = job["name"]
         job_conclusion = job.get("conclusion")
-        if job_conclusion in ("failure", "timed_out", "cancelled", "action_required"):
-            lane = re.search(r"(?:^|/)\s*Distro lane \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
-            if lane:
-                failed_lane_distros.add(lane.group(1))
-            else:
-                arm_guest = re.search(r"QEMU guest arm64 \((arch|debian|ubuntu|fedora)\)", name)
-                if arm_guest:
-                    failed_lane_distros.add(arm_guest.group(1))
         if name == "ARM guest runner KVM health":
             arm_health = job_conclusion
             arm_selected = job_conclusion != "skipped"
@@ -456,10 +469,18 @@ def workflow_receipt(jobs, conclusion):
                     result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
     scope = "all" if arm_selected and x86_selected else "arm" if arm_selected else "x86"
     passed = conclusion == "success"
+    failed_lane_distros = {distro for distro, _ in failed_lane_guests(jobs)}
     distro = next(iter(failed_lane_distros)) if len(failed_lane_distros) == 1 else "matrix"
     return dict(case_id=f"qemu-matrix-{scope}-workflow", distro=distro,
                 result="PASS" if passed else "HARNESS_ERROR",
                 exit_code=0 if passed else 1, elapsed_seconds=0)
+
+
+def failed_guest_receipts(jobs, receipt):
+    if receipt["result"] not in FAILURES or receipt["case_id"] == "qemu-arm-runner-kvm-health":
+        return []
+    return [dict(receipt, distro=distro, arch=arch)
+            for distro, arch in sorted(failed_lane_guests(jobs))]
 
 
 def ci_non_qemu_failure(run, jobs):
@@ -625,9 +646,15 @@ def main():
     qemu_failed = qemu_job_failed(run, job_rows)
     receipt = workflow_receipt(job_rows, run["conclusion"])
     selected = [receipt if row["case_id"] == "qemu-matrix-workflow" else row for row in selected]
+    guest_receipts = failed_guest_receipts(job_rows, receipt) if qemu_failed else []
     if evidence_error:
         if qemu_failed or not ci_failed:
-            selected.append(workflow_receipt(job_rows, "failure"))
+            selected.extend(guest_receipts or [workflow_receipt(job_rows, "failure")])
+    elif guest_receipts:
+        selected = [row for row in selected
+                    if not (row["distro"] == "matrix" and row["result"] in FAILURES
+                            and row["case_id"].startswith("qemu-matrix-"))]
+        selected = projection([*selected, *guest_receipts], verified_published)
     elif run["conclusion"] != "success" and not any(row["result"] in FAILURES for row in selected):
         if qemu_failed or not ci_failed:
             selected.append(receipt)

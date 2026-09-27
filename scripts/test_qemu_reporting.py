@@ -545,11 +545,16 @@ class ReportingBoundaryTests(unittest.TestCase):
         for case_id in ("qemu-matrix-workflow", "qemu-matrix-x86-workflow",
                         "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow"):
             with self.subTest(case_id=case_id):
-                aggregate = dict(self.row(), case_id=case_id, distro="ubuntu")
+                aggregate = dict(self.row(), case_id=case_id)
                 for rows in ([aggregate, self.row()], [self.row(), aggregate]):
                     self.assertEqual(REPORT.projection(rows, False), [self.row()])
                 self.assertEqual(REPORT.projection([aggregate], False), [aggregate])
                 self.assertEqual(REPORT.projection([aggregate, self.row("PASS")], False), [aggregate])
+
+    def test_detailed_failure_does_not_hide_another_distro_aggregate(self):
+        fedora = dict(self.row(), case_id="qemu-matrix-x86-workflow", distro="fedora",
+                      result="HARNESS_ERROR")
+        self.assertEqual(REPORT.projection([self.row(), fedora], False), [self.row(), fedora])
 
     def test_failure_overflow_preserves_every_identity_with_bounded_issues(self):
         failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(26)]
@@ -926,6 +931,23 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(len(calls[0][1]), 1)
         self.assertEqual(calls[0][1][0]["distro"], "fedora")
         self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-x86-workflow")
+
+    def test_mixed_detailed_failure_and_missing_guest_artifact_keep_both_distros(self):
+        jobs = [
+            {"name": "QEMU behavioral verification / Distro lane (arch) / QEMU guest (arch)",
+             "conclusion": "failure", "id": 11, "steps": []},
+            {"name": "QEMU behavioral verification / Distro lane (fedora) / QEMU guest (fedora)",
+             "conclusion": "failure", "id": 12, "steps": []},
+            {"name": "QEMU behavioral verification / QEMU matrix result",
+             "conclusion": "failure", "id": 13, "steps": []},
+        ]
+        calls, catalog = self.run_report_fixture([self.row()], jobs=jobs)
+        expected = [dict(self.row(), arch="x86_64"),
+                    dict(case_id="qemu-matrix-x86-workflow", distro="fedora",
+                         arch="x86_64", result="HARNESS_ERROR", exit_code=1,
+                         elapsed_seconds=0)]
+        self.assertEqual(calls[0][1], expected)
+        self.assertEqual(catalog["failures"], expected)
 
     def test_failed_native_ci_before_qemu_uses_ci_prerequisite_identity(self):
         jobs = [
