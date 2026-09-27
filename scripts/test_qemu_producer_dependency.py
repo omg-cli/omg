@@ -49,6 +49,21 @@ class QemuProducerDependency(unittest.TestCase):
         final = job_block(ci, 'ci-success')
         self.assertRegex(final, r'needs: \[[^\]]*\bqemu\b')
 
+    def test_native_failure_still_schedules_guests_after_a_successful_quick_gate(self):
+        ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        qemu = job_block(ci, 'qemu')
+        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu]', qemu)
+        condition = re.search(r'^    if: >-\n((?:      .*\n)+)', qemu, re.MULTILINE)
+        self.assertIsNotNone(condition)
+        expression = condition.group(1)
+        self.assertIn('!cancelled()', expression)
+        self.assertIn("needs.quick-gate.result == 'success'", expression)
+        self.assertIn("needs.quick-gate.outputs.should-build == 'true'", expression)
+        self.assertIn("github.event_name == 'push'", expression)
+        self.assertIn("github.event_name == 'pull_request'", expression)
+        self.assertNotIn('needs.linux-matrix.result', expression)
+        self.assertNotIn('needs.ubuntu.result', expression)
+
     def test_reusable_guests_do_not_start_a_second_automatic_workflow(self):
         matrix = (ROOT / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')
         triggers = matrix.split('\non:\n', 1)[1].split('\nconcurrency:', 1)[0]
