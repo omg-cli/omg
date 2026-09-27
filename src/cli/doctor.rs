@@ -1590,9 +1590,10 @@ mod tests {
     }
 
     async fn serve_probe_response(
-        response: &'static [u8],
+        response: &[u8],
         delay: Duration,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        let response = response.to_vec();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("local probe listener");
@@ -1613,12 +1614,12 @@ mod tests {
             tokio::time::sleep(delay).await;
             if delay.is_zero() {
                 socket
-                    .write_all(response)
+                    .write_all(&response)
                     .await
                     .expect("probe response write");
             } else {
                 // The timeout test intentionally drops the client request.
-                let _ = socket.write_all(response).await;
+                let _ = socket.write_all(&response).await;
             }
         });
         (url, server)
@@ -1635,7 +1636,7 @@ mod tests {
 
     #[cfg(any(feature = "macos", target_os = "macos"))]
     #[tokio::test]
-    async fn homebrew_api_probe_requires_bounded_typed_complete_json() {
+    async fn homebrew_api_probe_requires_bounded_typed_plausible_catalogs() {
         use crate::package_managers::homebrew::HomebrewIndexKind;
 
         let client = reqwest::Client::builder()
@@ -1649,9 +1650,37 @@ mod tests {
         const EMPTY: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[]";
         const EXCESS_LENGTH: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n";
+        for (kind, count) in [
+            (HomebrewIndexKind::Formula, 4_000),
+            (HomebrewIndexKind::Cask, 2_000),
+        ] {
+            let entries: Vec<_> = (0..count)
+                .map(|index| match kind {
+                    HomebrewIndexKind::Formula => serde_json::json!({
+                        "name": format!("formula-{index}"),
+                        "versions": {"stable": "1.0"}
+                    }),
+                    HomebrewIndexKind::Cask => serde_json::json!({
+                        "token": format!("cask-{index}"),
+                        "version": "1.0"
+                    }),
+                })
+                .collect();
+            let mut wire = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+            wire.extend(serde_json::to_vec(&entries).expect("valid catalog fixture"));
+            let (url, server) = serve_probe_response(&wire, Duration::ZERO).await;
+            let response = client.get(&url).send().await.expect("local API response");
+            assert!(
+                validate_homebrew_api_response(response, kind, 2_000_000)
+                    .await
+                    .is_ok(),
+                "full-sized typed catalog must pass"
+            );
+            finish_probe_server(server).await;
+        }
         for (wire, kind, limit, should_pass) in [
-            (FORMULA, HomebrewIndexKind::Formula, 1024, true),
-            (CASK, HomebrewIndexKind::Cask, 1024, true),
+            (FORMULA, HomebrewIndexKind::Formula, 1024, false),
+            (CASK, HomebrewIndexKind::Cask, 1024, false),
             (FORMULA, HomebrewIndexKind::Cask, 1024, false),
             (CASK, HomebrewIndexKind::Formula, 1024, false),
             (HTML, HomebrewIndexKind::Formula, 1024, false),

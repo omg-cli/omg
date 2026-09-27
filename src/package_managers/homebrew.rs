@@ -49,6 +49,13 @@ const INSTALL_RECEIPT: &str = "INSTALL_RECEIPT.json";
 const FORMULA_API: &str = "https://formulae.brew.sh/api/formula.json";
 /// Homebrew cask API endpoint
 const CASK_API: &str = "https://formulae.brew.sh/api/cask.json";
+// Homebrew documents these as all-current-package endpoints:
+// https://formulae.brew.sh/docs/api/
+// These full indexes currently contain thousands of distinct entries.
+// Conservative floors reject a syntactically valid but severely incomplete
+// response before it can make Doctor green or overwrite a useful local cache.
+const MIN_EXPECTED_FORMULAS: usize = 4_000;
+const MIN_EXPECTED_CASKS: usize = 2_000;
 const FORMULA_CACHE_FILE: &str = "formula.jws.json";
 const CASK_CACHE_FILE: &str = "cask.jws.json";
 const HOMEBREW_CACHE_TTL_SECS: u64 = 604_800;
@@ -175,14 +182,40 @@ pub(crate) fn validate_homebrew_index(kind: HomebrewIndexKind, body: &[u8]) -> R
         HomebrewIndexKind::Formula => {
             let formulas: Vec<FormulaInfo> =
                 serde_json::from_slice(body).context("Homebrew formula index is not parseable")?;
-            anyhow::ensure!(!formulas.is_empty(), "Homebrew formula index is empty");
+            validate_formula_catalog(&formulas)?;
         }
         HomebrewIndexKind::Cask => {
             let casks: Vec<CaskInfo> =
                 serde_json::from_slice(body).context("Homebrew cask index is not parseable")?;
-            anyhow::ensure!(!casks.is_empty(), "Homebrew cask index is empty");
+            validate_cask_catalog(&casks)?;
         }
     }
+    Ok(())
+}
+
+fn validate_formula_catalog(formulas: &[FormulaInfo]) -> Result<()> {
+    let distinct = formulas
+        .iter()
+        .map(|formula| formula.name.as_str())
+        .collect::<AHashSet<_>>()
+        .len();
+    anyhow::ensure!(
+        distinct >= MIN_EXPECTED_FORMULAS,
+        "Homebrew formula index has only {distinct} distinct entries; expected at least {MIN_EXPECTED_FORMULAS}"
+    );
+    Ok(())
+}
+
+fn validate_cask_catalog(casks: &[CaskInfo]) -> Result<()> {
+    let distinct = casks
+        .iter()
+        .map(|cask| cask.token.as_str())
+        .collect::<AHashSet<_>>()
+        .len();
+    anyhow::ensure!(
+        distinct >= MIN_EXPECTED_CASKS,
+        "Homebrew cask index has only {distinct} distinct entries; expected at least {MIN_EXPECTED_CASKS}"
+    );
     Ok(())
 }
 
@@ -461,6 +494,8 @@ impl HomebrewPackageManager {
             Self::read_homebrew_api_payload::<Vec<FormulaInfo>>(&formula_path),
             Self::read_homebrew_api_payload::<Vec<CaskInfo>>(&cask_path)
         )?;
+        validate_formula_catalog(&formulas)?;
+        validate_cask_catalog(&casks)?;
 
         tracing::debug!(
             "Loaded {} formulas and {} casks from Homebrew cache",
@@ -501,6 +536,8 @@ impl HomebrewPackageManager {
         let (formulas, casks): (Vec<FormulaInfo>, Vec<CaskInfo>) =
             rkyv::from_bytes::<(Vec<FormulaInfo>, Vec<CaskInfo>), rkyv::rancor::Error>(&data)
                 .map_err(|e| anyhow::anyhow!("Invalid rkyv cache: {e}"))?;
+        validate_formula_catalog(&formulas)?;
+        validate_cask_catalog(&casks)?;
 
         Ok(Some(Self::build_cache(formulas, casks)))
     }
@@ -544,6 +581,8 @@ impl HomebrewPackageManager {
             .json()
             .await
             .context("Failed to parse cask API response")?;
+        validate_formula_catalog(&formulas)?;
+        validate_cask_catalog(&casks)?;
 
         tracing::debug!(
             "Fetched {} formulas and {} casks",
@@ -1407,18 +1446,26 @@ mod tests {
         let cache_root = tempfile::tempdir()?;
         let api_dir = cache_root.path().join("api");
         std::fs::create_dir_all(&api_dir)?;
-        let formula_payload = serde_json::json!([{
-            "name": "wget",
-            "desc": "Internet file retriever",
-            "homepage": "https://www.gnu.org/software/wget/",
-            "versions": {"stable": "1.0"}
-        }]);
-        let cask_payload = serde_json::json!([{
-            "token": "firefox",
-            "desc": null,
-            "homepage": "https://www.mozilla.org/firefox/",
-            "version": "146.0"
-        }]);
+        let formula_payload = serde_json::Value::Array(
+            (0..MIN_EXPECTED_FORMULAS)
+                .map(|index| {
+                    serde_json::json!({
+                        "name": if index == 0 { "wget".to_string() } else { format!("formula-{index}") },
+                        "versions": {"stable": "1.0"}
+                    })
+                })
+                .collect(),
+        );
+        let cask_payload = serde_json::Value::Array(
+            (0..MIN_EXPECTED_CASKS)
+                .map(|index| {
+                    serde_json::json!({
+                        "token": if index == 0 { "firefox".to_string() } else { format!("cask-{index}") },
+                        "version": "1.0"
+                    })
+                })
+                .collect(),
+        );
         for (name, payload) in [
             (FORMULA_CACHE_FILE, formula_payload),
             (CASK_CACHE_FILE, cask_payload),
@@ -1442,12 +1489,37 @@ mod tests {
                 .block_on(manager.load_from_homebrew_cache())?
                 .context("expected current Homebrew API cache")?;
 
-            assert_eq!(cache.formulas.len(), 1);
-            assert_eq!(cache.casks.len(), 1);
+            assert_eq!(cache.formulas.len(), MIN_EXPECTED_FORMULAS);
+            assert_eq!(cache.casks.len(), MIN_EXPECTED_CASKS);
             assert!(cache.formula_map.contains_key("wget"));
             assert!(cache.cask_map.contains_key("firefox"));
+
+            std::fs::write(
+                api_dir.join(FORMULA_CACHE_FILE),
+                serde_json::json!({
+                    "payload": "[{\"name\":\"wget\",\"versions\":{\"stable\":\"1.0\"}}]"
+                })
+                .to_string(),
+            )?;
+            assert!(
+                runtime
+                    .block_on(manager.load_from_homebrew_cache())
+                    .is_err(),
+                "a partial native cache must not become the OMG package index"
+            );
             Ok(())
         })
+    }
+
+    #[test]
+    fn repeated_catalog_entries_do_not_fake_completeness() {
+        let repeated = serde_json::json!({
+            "name": "wget",
+            "versions": {"stable": "1.0"}
+        });
+        let catalog = vec![repeated; MIN_EXPECTED_FORMULAS];
+        let body = serde_json::to_vec(&catalog).expect("catalog fixture");
+        assert!(validate_homebrew_index(HomebrewIndexKind::Formula, &body).is_err());
     }
 
     #[test]
