@@ -850,6 +850,16 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
                 self.assertEqual(evidence[0]['result'], 'FAIL', logs)
                 self.assertIn('controlled Doctor PATH probe', logs['doctor.log'])
         if distro == 'arch':
+            stalled = product.replace(
+                'if [[ "${HTTPS_PROXY:-}" == http://127.0.0.1:1 ]]; then\n',
+                'if [[ "${HTTPS_PROXY:-}" == http://127.0.0.1:1 ]]; then sleep 3; fi\n'
+                'if [[ "${HTTPS_PROXY:-}" == http://127.0.0.1:1 ]]; then\n', 1)
+            result, evidence, logs = self.run_inventory(
+                stalled, rows, native_commands=native, distro=distro, row_timeout=1)
+            self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+            self.assertEqual(evidence[0]['exit_code'], 124,
+                             'a timed-out probe must retain its executor identity')
+            self.assertIn('did not execute as a product run', logs['doctor.log'])
             silent_fault = healthy_product
             result, evidence, logs = self.run_inventory(silent_fault, rows,
                                                         native_commands=native, distro=distro)
