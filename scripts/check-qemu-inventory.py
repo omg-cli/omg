@@ -71,9 +71,8 @@ def inventory_exits(content, distro):
     return exits
 
 
-def admit(policy, inventory, results, summary, distro, tiers):
-    rules = json.loads(read(policy), object_pairs_hook=unique_object)
-    inventory_bytes = read(inventory)
+def admit_contents(policy_bytes, inventory_bytes, results_bytes, summary_bytes, distro, tiers):
+    rules = json.loads(policy_bytes, object_pairs_hook=unique_object)
     digest = hashlib.sha256(inventory_bytes).hexdigest()
     selection = rules["inventories"][digest]
     exits = inventory_exits(inventory_bytes, distro)
@@ -82,8 +81,8 @@ def admit(policy, inventory, results, summary, distro, tiers):
                 for row in selection["cases"] if set(row["tiers"]) & set(profile)}
     if any(case.removeprefix("qemu-" + distro + "-") not in exits for case in expected):
         raise ValueError("selected case absent from inventory")
-    rows = json.loads(read(results), object_pairs_hook=unique_object)
-    completion = json.loads(read(summary), object_pairs_hook=unique_object)
+    rows = json.loads(results_bytes, object_pairs_hook=unique_object)
+    completion = json.loads(summary_bytes, object_pairs_hook=unique_object)
     if not isinstance(rows, list) or not rows or len(rows) != len(expected):
         raise ValueError("missing or extra selected cases")
     counts = dict(selected=len(expected), executed=0, passed=0, failed=0,
@@ -132,6 +131,10 @@ def admit(policy, inventory, results, summary, distro, tiers):
         raise ValueError("inventory summary disagrees with case evidence")
     return {"schema_version": 1, "inventory_sha256": digest, "counts": counts,
             "allowed_skips": skips, "passed": counts["executed"] > 0 and expected_summary["fail"] == 0}
+
+
+def admit(policy, inventory, results, summary, distro, tiers):
+    return admit_contents(read(policy), read(inventory), read(results), read(summary), distro, tiers)
 
 
 def main():

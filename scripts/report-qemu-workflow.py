@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Report QEMU evidence from a trusted workflow_run job without executing it."""
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -380,18 +381,22 @@ def projection(rows, verified_published):
             selected[key] = dict(row, result="HARNESS_ERROR" if row["result"] == "BLOCKED" else row["result"])
         elif verified_published and row["result"] == "PASS" and key not in selected:
             selected[key] = row
-    # The matrix job emits an aggregate receipt whenever a lane fails. Once
-    # detailed evidence identifies that failure, filing both adds no diagnosis.
-    # Keep the aggregate when it is the only failure (and keep PASS closures).
+    # A detailed failure replaces only the aggregate for that same guest.
+    # Another failed distro may have stopped before exporting its artifact.
     def aggregate(case_id):
         return case_id == "qemu-matrix-workflow" or (
             case_id.startswith("qemu-matrix-") and case_id.endswith("-workflow")
         )
 
-    if any(not aggregate(row["case_id"]) and row["result"] in FAILURES
-           for row in selected.values()):
-        selected = {key: row for key, row in selected.items()
-                    if not aggregate(row["case_id"]) or row["result"] not in FAILURES}
+    detailed = {(row["distro"], row.get("arch", "x86_64"))
+                for row in selected.values()
+                if (not aggregate(row["case_id"])
+                    and row["case_id"] != "qemu-arm-runner-kvm-health"
+                    and row["result"] in FAILURES)}
+    selected = {key: row for key, row in selected.items()
+                if not aggregate(row["case_id"]) or row["result"] not in FAILURES
+                or ((row["distro"], row.get("arch", "x86_64")) not in detailed
+                    and (row["distro"] != "matrix" or not detailed))}
     return list(selected.values())
 
 
@@ -419,6 +424,63 @@ def published_provenance(content, distro, revision):
     return provenance["artifact_tag"], provenance["inventory_revision"]
 
 
+def published_inventory_admission(content, distro, policy_bytes):
+    """Re-admit the exported CLI selection before reporting published PASS rows."""
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        members = archive.infolist()
+        admissions = [member.filename for member in members
+                      if re.fullmatch(r"run-[A-Za-z0-9-]+/inventory-admission\.json", member.filename)]
+        if len(admissions) != 1:
+            raise ValueError("published guest lacks one inventory admission")
+        run_root = admissions[0].split("/", 1)[0]
+        if any((parts := PurePosixPath(member.filename).parts)
+               and parts[0].startswith("run-") and parts[0] != run_root
+               for member in members):
+            raise ValueError("published guest has multiple run roots")
+        names = {
+            "inventory": f"{run_root}/cases.tsv",
+            "results": f"{run_root}/inventory/results.json",
+            "summary": f"{run_root}/inventory/summary.json",
+            "admission": admissions[0],
+        }
+        content_by_name = {}
+        for key, name in names.items():
+            matches = [member for member in members if member.filename == name]
+            if len(matches) != 1 or matches[0].file_size > 1024 * 1024:
+                raise ValueError("published guest lacks bounded CLI evidence")
+            content_by_name[key] = archive.read(matches[0])
+    checker_path = Path(__file__).with_name("check-qemu-inventory.py")
+    spec = importlib.util.spec_from_file_location("qemu_inventory_admission", checker_path)
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    admitted = checker.admit_contents(
+        policy_bytes, content_by_name["inventory"], content_by_name["results"],
+        content_by_name["summary"], distro, "hermetic,qemu,container,network,pty")
+    receipt = json.loads(content_by_name["admission"], object_pairs_hook=unique_object)
+    if admitted["passed"] is not True or receipt != admitted:
+        raise ValueError("published CLI inventory failed admission")
+
+
+def failed_lane_guests(jobs):
+    guests = set()
+    for job in jobs:
+        if job.get("conclusion") not in ("failure", "timed_out", "cancelled", "action_required"):
+            continue
+        name = job["name"]
+        lane = re.search(r"(?:^|/)\s*Distro lane \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
+        if lane:
+            guests.add((lane.group(1), "x86_64"))
+            continue
+        arm = re.search(r"QEMU guest arm64 \((arch|debian|ubuntu|fedora)\)", name)
+        if arm:
+            guests.add((arm.group(1), "aarch64"))
+        else:
+            x86 = re.search(r"QEMU guest \((arch|debian|ubuntu|fedora)\)", name)
+            if x86:
+                guests.add((x86.group(1), "x86_64"))
+    return guests
+
+
 def workflow_receipt(jobs, conclusion):
     """Return an aggregate identity scoped to the architecture actually run.
 
@@ -430,20 +492,11 @@ def workflow_receipt(jobs, conclusion):
     arm_health = None
     x86_selected = False
     arm_selected = False
-    failed_lane_distros = set()
     for job in jobs:
         if not isinstance(job, dict) or not isinstance(job.get("name"), str):
             raise ValueError("invalid workflow job")
         name = job["name"]
         job_conclusion = job.get("conclusion")
-        if job_conclusion in ("failure", "timed_out", "cancelled", "action_required"):
-            lane = re.search(r"(?:^|/)\s*Distro lane \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
-            if lane:
-                failed_lane_distros.add(lane.group(1))
-            else:
-                arm_guest = re.search(r"QEMU guest arm64 \((arch|debian|ubuntu|fedora)\)", name)
-                if arm_guest:
-                    failed_lane_distros.add(arm_guest.group(1))
         if name == "ARM guest runner KVM health":
             arm_health = job_conclusion
             arm_selected = job_conclusion != "skipped"
@@ -456,10 +509,26 @@ def workflow_receipt(jobs, conclusion):
                     result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
     scope = "all" if arm_selected and x86_selected else "arm" if arm_selected else "x86"
     passed = conclusion == "success"
+    failed_lane_distros = {distro for distro, _ in failed_lane_guests(jobs)}
     distro = next(iter(failed_lane_distros)) if len(failed_lane_distros) == 1 else "matrix"
     return dict(case_id=f"qemu-matrix-{scope}-workflow", distro=distro,
                 result="PASS" if passed else "HARNESS_ERROR",
                 exit_code=0 if passed else 1, elapsed_seconds=0)
+
+
+def failed_guest_receipts(jobs, receipt):
+    if receipt["result"] not in FAILURES:
+        return []
+    health_failed = receipt["case_id"] == "qemu-arm-runner-kvm-health"
+    # ARM health is a separate prerequisite. Derive the guest aggregate from
+    # the remaining jobs so a concurrent x86 failure keeps its own identity.
+    guest_receipt = workflow_receipt(
+        [job for job in jobs if job["name"] != "ARM guest runner KVM health"],
+        "failure",
+    ) if health_failed else receipt
+    guests = [dict(guest_receipt, distro=distro, arch=arch)
+              for distro, arch in sorted(failed_lane_guests(jobs))]
+    return [receipt, *guests] if health_failed else guests
 
 
 def ci_non_qemu_failure(run, jobs):
@@ -538,9 +607,8 @@ def main():
     if type(run_id) is not int or run_id <= 0:
         raise ValueError("invalid run ID")
     run = identity(event, json.loads(api(f"repos/{repository}/actions/runs/{run_id}")), repository)
-    allowed_cases = canonical_case_ids(json.loads(
-        Path("tests/qemu-inventory-policy.json").read_text()
-    ))
+    policy_bytes = Path("tests/qemu-inventory-policy.json").read_bytes()
+    allowed_cases = canonical_case_ids(json.loads(policy_bytes))
     # Superseding an interactive run is not itself a product failure.
     if run["conclusion"] in ("cancelled", "skipped"):
         print("Cancelled/skipped run retained in Actions; no failure issue generated")
@@ -591,6 +659,8 @@ def main():
             rows.extend(artifact_rows)
             guest_artifacts.add(artifact["name"])
             if published_candidate and artifact["name"].startswith("qemu-evidence-"):
+                if published_provenance(content, guest[0], run["head_sha"]) is not None:
+                    published_inventory_admission(content, guest[0], policy_bytes)
                 if artifact["name"] in published_artifacts:
                     raise ValueError("duplicate published guest artifact")
                 published_artifacts[artifact["name"]] = content
@@ -625,9 +695,15 @@ def main():
     qemu_failed = qemu_job_failed(run, job_rows)
     receipt = workflow_receipt(job_rows, run["conclusion"])
     selected = [receipt if row["case_id"] == "qemu-matrix-workflow" else row for row in selected]
+    guest_receipts = failed_guest_receipts(job_rows, receipt) if qemu_failed else []
     if evidence_error:
         if qemu_failed or not ci_failed:
-            selected.append(workflow_receipt(job_rows, "failure"))
+            selected.extend(guest_receipts or [workflow_receipt(job_rows, "failure")])
+    elif guest_receipts:
+        selected = [row for row in selected
+                    if not (row["distro"] == "matrix" and row["result"] in FAILURES
+                            and row["case_id"].startswith("qemu-matrix-"))]
+        selected = projection([*selected, *guest_receipts], verified_published)
     elif run["conclusion"] != "success" and not any(row["result"] in FAILURES for row in selected):
         if qemu_failed or not ci_failed:
             selected.append(receipt)

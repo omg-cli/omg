@@ -161,7 +161,8 @@ make_stage() {
   rm -rf "$destination"
   mkdir -p "$destination/root/$directory"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$destination/root/$directory/omg"
-  chmod 700 "$destination/root/$directory/omg"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$destination/root/$directory/omgd"
+  chmod 700 "$destination/root/$directory/omg" "$destination/root/$directory/omgd"
   tar -czf "$destination/$archive" -C "$destination/root" "$directory"
   printf '%s  %s\n' "$(sha256sum "$destination/$archive" | awk '{print $1}')" "$archive" > "$destination/${archive}.sha256"
 }
@@ -325,6 +326,12 @@ assert_rc 0 "$runner" "${family_args[@]}" --staged-dir "$scratch/valid" --eviden
 grep -Fxq 'OMG_PROBE_INDEX_CMD=pacman-key --init && pacman-key --populate archlinux && pacman -Syu --noconfirm' "$FAKE_ENGINE_ARGS" || fail "Arch setup must initialize trust and perform a full upgrade"
 unset FAKE_ENGINE_ARGS
 [[ "$(grep -c '"case_id"' "$(results_file "$scratch/family-evidence")")" -eq 3 ]] || fail "package family did not select three contracts"
+assert_rc 2 "$runner" "${family_args[@]}" --case release-package-rollback-tree \
+  --staged-dir "$scratch/valid" --evidence-dir "$scratch/rollback-qemu-only"
+grep -Fq 'no release contracts match' "$scratch/command.out" || fail 'QEMU-only rollback was selected for archive smoke'
+if grep -Fq '  release-package-rollback-tree' "$scratch/command.out"; then
+  fail 'QEMU-only rollback was advertised as an archive smoke contract'
+fi
 grep -R -q 'install --yes tree' "$scratch/family-evidence" || fail "install probe did not preserve canonical --yes"
 grep -R -q 'remove --yes tree' "$scratch/family-evidence" || fail "remove probe did not preserve canonical --yes"
 if grep -R -E '(install|remove) -y tree' "$scratch/family-evidence" >/dev/null; then
@@ -343,6 +350,31 @@ grep -q '"result":"PASS"' "$result" || fail "result omits pass classification"
 grep -q '"artifact_source":"staged"' "$result" || fail "staged result is indistinguishable from a published release"
 grep -q '"exit_code":0' "$result" || fail "result omits exit code"
 grep -Eq '"elapsed_seconds":[0-9]+' "$result" || fail "result omits elapsed seconds"
+probe="$(find "$scratch/pass-evidence" -name probe.sh -type f -print -quit)"
+[[ -n "$probe" ]] || fail "release probe was not preserved"
+probe_root="$scratch/probe-root"
+probe_package="$probe_root/omg-v9.9.9-x86_64-linux-arch"
+mkdir -p "$probe_package"
+cat > "$probe_package/omg" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version) printf 'omg 9.9.9\n' ;;
+  search) printf '  tree 1.0\n' ;;
+  *) exit 2 ;;
+esac
+EOF
+printf '#!/usr/bin/env bash\nprintf "omgd 9.9.9\\n"\n' > "$probe_package/omgd"
+chmod 700 "$probe_package/omg" "$probe_package/omgd"
+probe_env=(OMG_SMOKE_PROBE_KIND=search-tree OMG_PROBE_VERSION_NUM=9.9.9
+  OMG_PROBE_BIN=omg-v9.9.9-x86_64-linux-arch/omg OMG_PROBE_INDEX_CMD=true
+  OMG_PROBE_REMOVED_ASSERT=true OMG_PROBE_ROOT="$probe_root")
+assert_rc 0 env "${probe_env[@]}" bash "$probe"
+printf '#!/usr/bin/env bash\nprintf "omgd 9.9.8\\n"\n' > "$probe_package/omgd"
+assert_rc 1 env "${probe_env[@]}" bash "$probe"
+rm "$probe_package/omgd"
+if env "${probe_env[@]}" bash "$probe" > "$scratch/command.out" 2>&1; then
+  fail "release probe accepted an archive without omgd"
+fi
 assert_rc 0 "$runner" "${base_args[@]}" --staged-dir "$scratch/valid" --evidence-dir "$scratch/pass-evidence"
 [[ "$(find "$scratch/pass-evidence" -mindepth 2 -maxdepth 2 -name results.json -type f | wc -l)" -eq 2 ]] || fail "a later invocation replaced prior aggregate evidence"
 
@@ -745,15 +777,18 @@ case "${1:-}" in
   *) exit 2 ;;
 esac
 EOF
+printf '#!/usr/bin/env bash\nprintf "omgd 9.9.9\\n"\n' > "$scratch/fake-omgd-good"
+printf '#!/usr/bin/env bash\nprintf "omgd 9.9.8\\n"\n' > "$scratch/fake-omgd-bad-version"
 
 make_macos_stage() {
-  local destination=$1 body_file=$2
+  local destination=$1 body_file=$2 daemon_file=${3:-$scratch/fake-omgd-good}
   local directory="omg-v9.9.9-aarch64-darwin"
   local archive="$directory.tar.gz"
   rm -rf "$destination"
   mkdir -p "$destination/root/$directory"
   cp "$body_file" "$destination/root/$directory/omg"
-  chmod 700 "$destination/root/$directory/omg"
+  cp "$daemon_file" "$destination/root/$directory/omgd"
+  chmod 700 "$destination/root/$directory/omg" "$destination/root/$directory/omgd"
   tar -czf "$destination/$archive" -C "$destination/root" "$directory"
   printf '%s  %s\n' "$(sha256sum "$destination/$archive" | awk '{print $1}')" "$archive" > "$destination/${archive}.sha256"
 }
@@ -818,6 +853,12 @@ make_macos_stage "$scratch/macos-bad-version" "$scratch/fake-omg-bad-version"
 make_macos_pins "$scratch/macos-bad-version" "$scratch/native-pins"
 assert_rc 1 "$runner" --release v9.9.9 --distro macos --executor native --case release-package-search-tree --staged-dir "$scratch/macos-bad-version" --evidence-dir "$scratch/native-version-fail"
 grep -q '"result":"PRODUCT_FAIL"' "$(results_file "$scratch/native-version-fail")" || fail "native version mismatch was not blamed on the product"
+
+: > "$FAKE_BREW_STATE"
+make_macos_stage "$scratch/macos-bad-daemon" "$scratch/fake-omg-good" "$scratch/fake-omgd-bad-version"
+make_macos_pins "$scratch/macos-bad-daemon" "$scratch/native-pins"
+assert_rc 1 "$runner" --release v9.9.9 --distro macos --executor native --case release-package-search-tree --staged-dir "$scratch/macos-bad-daemon" --evidence-dir "$scratch/native-daemon-version-fail"
+grep -q '"result":"PRODUCT_FAIL"' "$(results_file "$scratch/native-daemon-version-fail")" || fail "packaged daemon version mismatch was not blamed on the product"
 
 mkdir -p "$scratch/macbin"
 for tool in awk basename bash cat chmod cp date dirname env find grep gzip head mktemp mkdir mv rm tail tar tee tr wc; do
@@ -978,15 +1019,15 @@ inv_verdict sbom-inventory-lies sbom-unmarked FAIL
 inv_verdict sbom-inventory-lies sbom-silent FAIL
 export FAKE_INVENTORY_ALLOW_MUTATIONS=1
 run_inventory update-modes 0 \
-  "$(inv_row update-fast '["update","--fast"]' 0 - update-fast-output package-mutation)" \
-  "$(inv_row update-turbo '["update","--turbo"]' 0 - update-turbo-output package-mutation)"
-inv_verdict update-modes update-fast PASS
-inv_verdict update-modes update-turbo PASS
+  "$(inv_row update-fast-contract '["update","--fast"]' 0 - update-fast-output package-mutation)" \
+  "$(inv_row update-turbo-contract '["update","--turbo"]' 0 - update-turbo-output package-mutation)"
+inv_verdict update-modes update-fast-contract PASS
+inv_verdict update-modes update-turbo-contract PASS
 run_inventory update-mode-lies 1 \
-  "$(inv_row update-fast '["update-standard-sync"]' 0 - update-fast-output package-mutation)" \
-  "$(inv_row update-turbo '["update-standard-cached"]' 0 - update-turbo-output package-mutation)"
-inv_verdict update-mode-lies update-fast FAIL
-inv_verdict update-mode-lies update-turbo FAIL
+  "$(inv_row update-fast-contract '["update-standard-sync"]' 0 - update-fast-output package-mutation)" \
+  "$(inv_row update-turbo-contract '["update-standard-cached"]' 0 - update-turbo-output package-mutation)"
+inv_verdict update-mode-lies update-fast-contract FAIL
+inv_verdict update-mode-lies update-turbo-contract FAIL
 mkdir -p "$scratch/inventory-home"
 cat > "$scratch/inventory-home/qemu-daemon-check.sh" <<'EOF'
 #!/usr/bin/env bash

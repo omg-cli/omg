@@ -8,7 +8,7 @@ why	["why","pacman"]	read	arch:0,debian:0,ubuntu:0,fedora:1	pass	-	hermetic	herm
 outdated	["outdated"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	outdated-native-count	tempdir-drop
 size	["size","--limit","3"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 blame	["blame","pacman"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-diff	["diff","missing.lock"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+diff	["diff","missing.lock"]	controlled-error	1	pass	-	hermetic	hermetic:pass	diff-missing-lock	tempdir-drop
 snapshot-create	["snapshot","create","--message","smoke"]	isolated-write	0	pass	-	hermetic	hermetic:pass	fingerprint:snapshot-create	tempdir-drop
 snapshot-list	["snapshot","list"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 snapshot-restore	["snapshot","restore","missing","--dry-run"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -32,8 +32,8 @@ hooks-install	["hooks","install"]	isolated-write	0	pass	-	hermetic	hermetic:pass
 hooks-status	["hooks","status"]	read	0	pass	hooks-install	hermetic	hermetic:pass	-	tempdir-drop
 hooks-run	["hooks","run","pre-commit"]	controlled-error	0	pass	hooks-install	hermetic	hermetic:pass	-	tempdir-drop
 hooks-uninstall	["hooks","uninstall"]	isolated-write	0	pass	hooks-install	hermetic	hermetic:pass	hooks-absent	tempdir-drop
-workspace-init	["workspace","init","smoke"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-workspace-add	["workspace","add",".","--name","fixture"]	isolated-write	0	pass	workspace-init	hermetic	hermetic:pass	-	tempdir-drop
+workspace-init	["workspace","init","smoke"]	isolated-write	0	pass	-	hermetic	hermetic:pass	workspace-initialized	tempdir-drop
+workspace-add	["workspace","add",".","--name","fixture"]	isolated-write	0	pass	workspace-init	hermetic	hermetic:pass	workspace-project-added	tempdir-drop
 workspace-list	["workspace","list"]	read	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
 workspace-run	["workspace","run","true"]	read	1	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
 workspace-diff	["workspace","diff","main"]	read	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
@@ -144,7 +144,7 @@ remove-flags	["remove","--recursive","--yes","--dry-run","bash"]	read	arch:0,deb
 update-dry-run-yes	["update","--dry-run","--yes"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 why-reverse	["why","--reverse","pacman"]	read	arch:0,debian:0,ubuntu:0,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 size-tree	["size","--tree","pacman"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-diff-from	["diff","--from","missing.lock","missing-b.lock"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+diff-from	["diff","--from","missing.lock","missing-b.lock"]	controlled-error	1	pass	-	hermetic	hermetic:pass	diff-missing-lock	tempdir-drop
 snapshot-restore-yes	["snapshot","restore","missing","--yes","--dry-run"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 ci-init-advanced	["ci","init","github","--advanced"]	isolated-write	0	pass	-	hermetic	hermetic:pass	ci-github-workflow-advanced	tempdir-drop
 clean-flags	["clean","--orphans","--cache","--aur","--dry-run"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -176,10 +176,11 @@ rollback-yes	["rollback","--yes"]	controlled-error	1	pass	-	hermetic	hermetic:pa
 release-package-search-tree	["search","tree"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:known-defect	search-official-tree-output	none
 release-package-install-tree	["install","--yes","tree"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:known-defect	native-tree-installed	container-prune
 release-package-remove-tree	["remove","--yes","tree"]	package-mutation	0	pass	release-package-install-tree	container	arch:pass,debian:pass,ubuntu:pass,fedora:known-defect	native-tree-absent	container-prune
+release-package-rollback-tree	["rollback","--yes"]	package-mutation	0	pass	release-package-remove-tree	container	arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable	native-apt-tree-rollback	container-prune
 clean-orphans-native	["clean","--orphans","--yes"]	package-mutation	0	pass	release-package-install-tree	container	arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable	native-apt-orphan-removed	container-prune
 daemon-foreground	["daemon","--foreground"]	service-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	daemon-foreground-lifecycle	daemon-stop
-update-turbo	["update","--turbo"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-turbo-output	none
-update-fast	["update","--fast"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-fast-output	none
+update-turbo	["update","--turbo","--yes"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-turbo-output	none
+update-fast	["update","--fast","--yes"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-fast-output	none
 doctor-network	["doctor","--network"]	controlled-error	1	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-network-state	tempdir-drop
 doctor-eol	["doctor","--eol"]	controlled-error	1	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-eol-state	tempdir-drop
 doctor-turbo	["doctor","--turbo"]	read	-	declared	-	qemu	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
@@ -188,6 +189,7 @@ env-share-flags	["env","share","--public","--description","Probe Gist"]	service-
 env-share-missing-lock	["env","share"]	controlled-error	1	pass	-	hermetic	hermetic:pass	env-share-missing-lock	tempdir-drop
 self-update-force	["self-update","--force"]	service-mutation	-	declared	-	network	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	host-state-restore
 self-update-version	["self-update","--version","0.0.1"]	controlled-error	1	pass	-	hermetic	hermetic:pass	self-update-downgrade-refusal	tempdir-drop
+container-run-detached-argv	["container","run","--name","smoke","--detach","--env","SMOKE=1","--volume","${ROOT}:/tmp/omg-smoke","--workdir","/tmp/omg-smoke","debian:bookworm","--","sh","-c","printf smoke"]	isolated-write	0	pass	-	hermetic	hermetic:pass	container-run-argv	tempdir-drop
 container-run-detached	["container","run","--name","smoke","--detach","--env","SMOKE=1","--volume","/tmp:/tmp","--workdir","/tmp","debian:bookworm"]	service-mutation	-	declared	-	nested-container	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
 container-run-interactive	["container","run","--interactive","--name","smoke-tty","debian:bookworm"]	interactive	-	declared	-	nested-container,pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
 container-shell-flags	["container","shell","--image","debian:bookworm","--workdir","/tmp","--env","SMOKE=1","--volume","/tmp:/tmp"]	interactive	-	declared	-	nested-container,pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune

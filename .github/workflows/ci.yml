@@ -856,7 +856,11 @@ jobs:
   qemu:
     name: QEMU behavioral verification
     needs: [quick-gate, linux-matrix, ubuntu]
-    if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true'
+    if: >-
+      !cancelled() &&
+      (github.event_name == 'push' || github.event_name == 'pull_request') &&
+      needs.quick-gate.result == 'success' &&
+      needs.quick-gate.outputs.should-build == 'true'
     uses: ./.github/workflows/qemu-matrix.yml
     permissions:
       contents: read

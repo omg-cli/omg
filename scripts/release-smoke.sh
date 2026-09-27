@@ -172,6 +172,20 @@ load_release_cases() {
       printf 'error: invalid release contract identifier %q.\n' "$id" >&2
       return 3
     }
+    if [[ "$id" == release-package-rollback-tree ]]; then
+      # QEMU owns the dynamic history ID and native version oracle for this row.
+      # Keep its shape explicit so a changed release contract cannot disappear
+      # from archive smoke without a deliberate executor review.
+      if [[ "$args" != '["rollback","--yes"]' || "$safety" != package-mutation \
+        || "$expected_exit" != 0 || "$ux" != pass \
+        || "$requires" != release-package-remove-tree || "$tiers" != container \
+        || "$targets" != arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable \
+        || "$assertions" != native-apt-tree-rollback || "$cleanup" != container-prune ]]; then
+        printf 'error: QEMU-only rollback contract changed; review archive smoke coverage.\n' >&2
+        return 3
+      fi
+      continue
+    fi
     [[ "$ux" == "pass" ]] || continue
     [[ ",$tiers," == *",$tier,"* ]] || continue
     [[ "$targets" != "hermetic:pass" ]] || continue
@@ -190,7 +204,7 @@ load_release_cases() {
   if [[ ${#selected_cases[@]} -eq 0 ]]; then
     printf 'error: no release contracts match case=%q family=%q tier=%q.\n' "$case_id" "$family" "$tier" >&2
     printf 'valid release contracts:\n' >&2
-    awk -F '\t' '$1 ~ /^release-/ && $5 == "pass" && $8 != "hermetic:pass" { print "  " $1 }' "$inventory" >&2
+    awk -F '\t' '$1 ~ /^release-/ && $1 != "release-package-rollback-tree" && $5 == "pass" && $8 != "hermetic:pass" { print "  " $1 }' "$inventory" >&2
     return 2
   fi
   for id in "${selected_cases[@]}"; do
@@ -330,9 +344,12 @@ write_probe() {
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 bin="${OMG_PROBE_ROOT:-/probe}/${OMG_PROBE_BIN}"
+daemon_bin="${bin%/omg}/omgd"
 bash -c "${OMG_PROBE_INDEX_CMD}" || exit 120
 version_line="$(printf '%s\n' "$("$bin" --version)" | head -n 1 | tr -d '[:space:]')"
 [[ "$version_line" == "omg${OMG_PROBE_VERSION_NUM}" ]]
+daemon_version_line="$(printf '%s\n' "$("$daemon_bin" --version)" | head -n 1 | tr -d '[:space:]')"
+[[ "$daemon_version_line" == "omgd${OMG_PROBE_VERSION_NUM}" ]]
 bash -c "${OMG_PROBE_REMOVED_ASSERT}" || exit 120
 case "$OMG_SMOKE_PROBE_KIND" in
   search-tree)
@@ -651,6 +668,10 @@ run_distro() (
   fi
   if [[ ! -f "$stage/omg-${tag}${distro_suffix}/omg" ]]; then
     record_harness_error "$distro" "release artifact does not contain the expected binary"
+    return 3
+  fi
+  if [[ ! -f "$stage/omg-${tag}${distro_suffix}/omgd" ]]; then
+    record_harness_error "$distro" "release artifact does not contain the expected daemon binary"
     return 3
   fi
   if [[ "$executor" == "native" ]]; then

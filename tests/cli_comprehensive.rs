@@ -305,6 +305,8 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
     for (id, assertion) in [
         ("hooks-install", Assertion::HooksInstalled),
         ("hooks-install-force", Assertion::HooksInstalled),
+        ("workspace-init", Assertion::WorkspaceInitialized),
+        ("workspace-add", Assertion::WorkspaceProjectAdded),
         ("workspace-run-parallel-all", Assertion::WorkspaceAllOutput),
         ("update-fast", Assertion::UpdateFastOutput),
         ("update-turbo", Assertion::UpdateTurboOutput),
@@ -326,6 +328,8 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
 fn behavior_inventory_keeps_offline_refusal_assertions() {
     let cases = behavior_cases();
     for (id, assertion) in [
+        ("diff", Assertion::DiffMissingLock),
+        ("diff-from", Assertion::DiffMissingLock),
         ("self-update-version", Assertion::SelfUpdateDowngradeRefusal),
         ("env-share-missing-lock", Assertion::EnvShareMissingLock),
     ] {
@@ -353,7 +357,9 @@ fn behavior_inventory_keeps_offline_refusal_assertions() {
 fn needs_isolated_fixture(case: &BehaviorCase) -> bool {
     matches!(
         case.id.as_str(),
-        "env-export-missing-lock"
+        "diff"
+            | "diff-from"
+            | "env-export-missing-lock"
             | "env-plan-missing-manifest"
             | "env-share-missing-lock"
             | "ci-init"
@@ -364,10 +370,10 @@ fn needs_isolated_fixture(case: &BehaviorCase) -> bool {
 #[test]
 fn missing_lock_rows_run_without_the_shared_fixture() {
     let cases = behavior_cases();
-    for case in cases
-        .iter()
-        .filter(|case| case.assertions.contains(&Assertion::EnvShareMissingLock))
-    {
+    for case in cases.iter().filter(|case| {
+        case.assertions.contains(&Assertion::EnvShareMissingLock)
+            || case.assertions.contains(&Assertion::DiffMissingLock)
+    }) {
         assert!(
             needs_isolated_fixture(case),
             "{} asserts a missing-lock refusal and must run in an isolated fixture",
@@ -576,6 +582,8 @@ enum Assertion {
     Fingerprint(String),
     WorkspaceFilteredOutput,
     WorkspaceAllOutput,
+    WorkspaceInitialized,
+    WorkspaceProjectAdded,
     CiGithubWorkflow,
     CiGithubWorkflowAdvanced,
     PackageDryRunInstall,
@@ -590,9 +598,12 @@ enum Assertion {
     SearchOfficialTreeOutput,
     NativeTreeInstalled,
     NativeTreeAbsent,
+    NativeAptTreeRollback,
     NativeAptOrphanRemoved,
+    ContainerRunArgv,
     SelfUpdateDowngradeRefusal,
     EnvShareMissingLock,
+    DiffMissingLock,
     NativeCount,
     StatusNativeFast,
     StatusNativeFull,
@@ -655,6 +666,8 @@ impl Assertion {
             "json-stdout" => Self::JsonStdout,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
+            "workspace-initialized" => Self::WorkspaceInitialized,
+            "workspace-project-added" => Self::WorkspaceProjectAdded,
             "ci-github-workflow" => Self::CiGithubWorkflow,
             "ci-github-workflow-advanced" => Self::CiGithubWorkflowAdvanced,
             "package-dry-run-install" => Self::PackageDryRunInstall,
@@ -669,9 +682,12 @@ impl Assertion {
             "search-official-tree-output" => Self::SearchOfficialTreeOutput,
             "native-tree-installed" => Self::NativeTreeInstalled,
             "native-tree-absent" => Self::NativeTreeAbsent,
+            "native-apt-tree-rollback" => Self::NativeAptTreeRollback,
             "native-apt-orphan-removed" => Self::NativeAptOrphanRemoved,
+            "container-run-argv" => Self::ContainerRunArgv,
             "self-update-downgrade-refusal" => Self::SelfUpdateDowngradeRefusal,
             "env-share-missing-lock" => Self::EnvShareMissingLock,
+            "diff-missing-lock" => Self::DiffMissingLock,
             "native-count" => Self::NativeCount,
             "status-native-fast" => Self::StatusNativeFast,
             "status-native-full" => Self::StatusNativeFull,
@@ -1504,6 +1520,24 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .expect("seed isolated bash package");
             command_env.push(("OMG_DATA_DIR", path.to_str().expect("UTF-8 mock path")));
         }
+        let container_capture = (case.id == "container-run-detached-argv").then(|| {
+            let capture = project.create_dir("container-engine-capture");
+            let podman = project.path().join("bin/podman");
+            std::fs::write(
+                &podman,
+                include_str!("../scripts/qemu-container-fake-engine.sh"),
+            )
+            .expect("write isolated container engine stub");
+            std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o700))
+                .expect("make isolated container engine stub executable");
+            capture
+        });
+        if let Some(capture) = &container_capture {
+            command_env.push((
+                "OMG_QEMU_ENGINE_CAPTURE",
+                capture.to_str().expect("UTF-8 container capture path"),
+            ));
+        }
         let started = Instant::now();
         let result = project.run_with_env(&args, &command_env);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1972,6 +2006,82 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         issues.push("env share did not refuse without an omg.lock".to_string());
                     }
                 }
+                Assertion::DiffMissingLock => {
+                    let missing = project.path().join("missing.lock");
+                    if missing.symlink_metadata().is_ok()
+                        || !result
+                            .stderr
+                            .contains("Failed to inspect lockfile missing.lock")
+                    {
+                        issues.push("diff did not refuse the requested missing lockfile".to_string());
+                    }
+                }
+                Assertion::WorkspaceInitialized | Assertion::WorkspaceProjectAdded => {
+                    let workspace_file = project.path().join("omg-workspace.toml");
+                    let workspace = workspace_file
+                        .symlink_metadata()
+                        .ok()
+                        .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                        .and_then(|_| std::fs::read_to_string(&workspace_file).ok())
+                        .and_then(|contents| toml::from_str::<toml::Value>(&contents).ok());
+                    let valid = workspace.is_some_and(|workspace| {
+                        let projects = workspace.get("projects").and_then(toml::Value::as_table);
+                        workspace.get("name").and_then(toml::Value::as_str) == Some("smoke")
+                            && workspace
+                                .get("created_at")
+                                .and_then(toml::Value::as_str)
+                                .is_some_and(|timestamp| !timestamp.is_empty())
+                            && if matches!(assertion, Assertion::WorkspaceInitialized) {
+                                projects.is_none_or(toml::map::Map::is_empty)
+                            } else {
+                                projects.is_some_and(|projects| {
+                                    projects.len() == 1
+                                        && projects.get("fixture").is_some_and(|fixture| {
+                                            fixture.get("path").and_then(toml::Value::as_str)
+                                                == Some(".")
+                                                && fixture.get("depends_on").is_none_or(|deps| {
+                                                    deps.as_array().is_some_and(Vec::is_empty)
+                                                })
+                                        })
+                                })
+                            }
+                    });
+                    if !valid {
+                        issues.push("workspace command did not persist the expected private workspace state".to_string());
+                    }
+                }
+                Assertion::ContainerRunArgv => {
+                    let capture = container_capture
+                        .as_ref()
+                        .expect("container argv assertion has an isolated fake engine");
+                    let expected_args = [
+                        "--detach".to_string(),
+                        "--name".to_string(),
+                        "smoke".to_string(),
+                        "-w".to_string(),
+                        "/tmp/omg-smoke".to_string(),
+                        "-e".to_string(),
+                        "SMOKE=1".to_string(),
+                        "-v".to_string(),
+                        format!("{root}:/tmp/omg-smoke"),
+                        "--".to_string(),
+                        "debian:bookworm".to_string(),
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "printf smoke".to_string(),
+                    ];
+                    let expected_argv: Vec<u8> = expected_args
+                        .iter()
+                        .flat_map(|arg| arg.as_bytes().iter().copied().chain(std::iter::once(0)))
+                        .collect();
+                    if !std::fs::read_to_string(capture.join("calls"))
+                        .is_ok_and(|calls| calls == "version\nrun\n")
+                        || !std::fs::read(capture.join("argv"))
+                            .is_ok_and(|argv| argv == expected_argv)
+                    {
+                        issues.push("detached container command did not delegate exact argv".to_string());
+                    }
+                }
                 Assertion::UpdateFastOutput
                 | Assertion::UpdateTurboOutput
                 | Assertion::DaemonForegroundLifecycle
@@ -1979,6 +2089,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::SearchOfficialTreeOutput
                 | Assertion::NativeTreeInstalled
                 | Assertion::NativeTreeAbsent
+                | Assertion::NativeAptTreeRollback
                 | Assertion::NativeAptOrphanRemoved
                 | Assertion::NativeCount
                 | Assertion::StatusNativeFast

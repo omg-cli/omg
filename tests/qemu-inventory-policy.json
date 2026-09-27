@@ -36607,7 +36607,7 @@
         }
       ]
     },
-    "9860cc9fd13b1149194ce9116daceaf28349bf00dc4baa653a3cbe5a9bb397c2": {
+    "bff39bc333c01c48f07d1081f4f3156e439aa2f362784447823c6ad400a743b3": {
       "releases": [],
       "cases": [
         {
@@ -38010,6 +38010,18 @@
           "network_scope": "network"
         },
         {
+          "id": "release-package-rollback-tree",
+          "tiers": [
+            "container"
+          ],
+          "allowed_skips": {
+            "arch": "APT-only-rollback-fixture",
+            "fedora": "APT-only-rollback-fixture"
+          },
+          "network_scope": "network",
+          "network_reason": "Replays native tree install and remove, then restores the recorded version through APT."
+        },
+        {
           "id": "clean-orphans-native",
           "tiers": [
             "container"
@@ -38352,6 +38364,14 @@
           "id": "runtime-go-switch-installed",
           "tiers": [
             "container"
+          ],
+          "allowed_skips": {},
+          "network_scope": "offline"
+        },
+        {
+          "id": "container-run-detached-argv",
+          "tiers": [
+            "hermetic"
           ],
           "allowed_skips": {},
           "network_scope": "offline"
