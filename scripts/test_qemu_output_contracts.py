@@ -1927,24 +1927,35 @@ esac
         row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
                    if line.startswith('generate-man\t'))
         page = '.TH "omg" "1"\n.SH "NAME"\nomg\\-command\n.SH "SYNOPSIS"\nomg\n'
-        product = '''[[ "$1" == generate-man && "$2" == --output ]] || exit 70
+        pages = (
+            'omg.1', 'omg-search.1', 'omg-install.1', 'omg-update.1',
+            'omg-doctor.1', 'omg-audit.1', 'omg-audit-licenses.1',
+            'omg-run.1', 'omg-workspace.1', 'omg-workspace-list.1',
+            'omg-env.1', 'omg-env-capture.1', 'omg-team.1',
+            'omg-team-golden-path.1', 'omg-container.1',
+            'omg-container-build.1', 'omg-snapshot.1',
+            'omg-snapshot-create.1', 'omg-generate-man.1',
+        ) + tuple(f'omg-fixture-{index}.1' for index in range(21))
+        self.assertEqual(len(pages), 40)
+        product = f'''[[ "$1" == generate-man && "$2" == --output ]] || exit 70
 mkdir -p "$3"
-printf %s $OMG_QEMU_MAN_PAGE > "$3/omg.1"
-printf %s $OMG_QEMU_MAN_PAGE > "$3/omg-generate-man.1"
-printf 'Generated 2 man pages\\n'
+for name in {shlex.join(pages)}; do
+  printf %s {shlex.quote(page)} > "$3/$name"
+done
+printf 'Generated 40 man pages\\n'
 '''
-        # The fixture deliberately uses literal generated content, so an exit
-        # zero plus a directory cannot satisfy the row.
-        product = product.replace('$OMG_QEMU_MAN_PAGE', shlex.quote(page))
         for mutation, expected in (
             ('', 'PASS'),
-            ('sed -i "/SYNOPSIS/d" "$3/omg.1"\n', 'FAIL'),
+            ('sed -i "/SYNOPSIS/d" "$3/omg-team.1"\n', 'FAIL'),
             ('rm "$3/omg-generate-man.1"\n', 'FAIL'),
-            ('printf "Generated 3 man pages\\n"; exit 0\n', 'FAIL'),
+            ('mv "$3/omg-audit-licenses.1" "$3/omg-unrelated.1"\n', 'FAIL'),
+            ('find "$3" -type f ! -name omg.1 ! -name omg-generate-man.1 -delete\n'
+             'printf "Generated 2 man pages\\n"; exit 0\n', 'FAIL'),
+            ('printf "Generated 41 man pages\\n"; exit 0\n', 'FAIL'),
         ):
             with self.subTest(mutation=mutation):
-                command = product.replace("printf 'Generated 2 man pages\\n'", mutation +
-                                          "printf 'Generated 2 man pages\\n'")
+                command = product.replace("printf 'Generated 40 man pages\\n'", mutation +
+                                          "printf 'Generated 40 man pages\\n'")
                 result, evidence, logs = self.run_inventory(command, [row])
                 self.assertEqual(evidence[0]['result'], expected, logs)
                 self.assertEqual(result.returncode, int(expected == 'FAIL'))

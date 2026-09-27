@@ -1023,27 +1023,41 @@ check_file_output_oracle() {
   local assertion=$1 code=$2 stdout=$3 stderr=$4 file count announced
   case "$assertion" in
     man-pages-generated)
+      local -a required_pages=(
+        omg.1 omg-search.1 omg-install.1 omg-update.1 omg-doctor.1
+        omg-audit.1 omg-audit-licenses.1 omg-run.1 omg-workspace.1
+        omg-workspace-list.1 omg-env.1 omg-env-capture.1 omg-team.1
+        omg-team-golden-path.1 omg-container.1 omg-container-build.1
+        omg-snapshot.1 omg-snapshot-create.1 omg-generate-man.1
+      )
       if [[ "$code" != 0 || ! -d man || -L man
-        || ! -f man/omg.1 || -L man/omg.1
-        || ! -f man/omg-generate-man.1 || -L man/omg-generate-man.1 ]] \
+        || ! -f man/omg.1 || -L man/omg.1 ]] \
         || ! grep -Eiq '^\.TH[[:space:]]+"?omg"?[[:space:]]' man/omg.1; then
-        printf 'assertion failed: generate-man omitted its real main and subcommand pages\n' >&2
+        printf 'assertion failed: generate-man omitted its main page\n' >&2
         return 1
       fi
-      for file in man/omg.1 man/omg-generate-man.1; do
-        if ! grep -Eq '^\.SH[[:space:]]+"?NAME"?$' "$file" \
-          || ! grep -Eq '^\.SH[[:space:]]+"?SYNOPSIS"?$' "$file"; then
-          printf 'assertion failed: generated man page lacks NAME or SYNOPSIS content\n' >&2
+      for file in "${required_pages[@]}"; do
+        if [[ ! -f "man/$file" || -L "man/$file" ]]; then
+          printf 'assertion failed: generate-man omitted required page %s\n' "$file" >&2
           return 1
         fi
       done
       count=$(find man -maxdepth 1 -type f -name 'omg*.1' | wc -l)
       announced=$(sed -nE 's/^.*Generated ([0-9]+) man pages$/\1/p' "$stdout")
-      if [[ "$count" -lt 2 || "$announced" != "$count" ]] \
-        || find man -maxdepth 1 -type l -name 'omg*.1' | grep -q .; then
-        printf 'assertion failed: generated man page count disagrees with real files\n' >&2
+      if [[ "$count" -lt 40 || "$announced" != "$count" ]] \
+        || find man -mindepth 1 -maxdepth 1 ! -type f | grep -q . \
+        || find man -maxdepth 1 -type f ! -name 'omg*.1' | grep -q .; then
+        printf 'assertion failed: generated man page count or file set disagrees with the CLI surface\n' >&2
         return 1
-      fi ;;
+      fi
+      while IFS= read -r file; do
+        if ! grep -Eq '^\.TH[[:space:]]+' "$file" \
+          || ! grep -Eq '^\.SH[[:space:]]+"?NAME"?$' "$file" \
+          || ! grep -Eq '^\.SH[[:space:]]+"?SYNOPSIS"?$' "$file"; then
+          printf 'assertion failed: generated man page lacks TH, NAME, or SYNOPSIS content: %s\n' "$file" >&2
+          return 1
+        fi
+      done < <(find man -maxdepth 1 -type f -name 'omg*.1' -print) ;;
     audit-export-absolute-refusal)
       if [[ "$code" != 1 ]] || ! grep -Fq 'Absolute paths not allowed' "$stderr" \
         || grep -Eq 'Audit evidence exported|Evidence exported to' "$stdout" \

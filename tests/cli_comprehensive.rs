@@ -1734,27 +1734,49 @@ fn behavior_inventory_runs_in_hermetic_state() {
                     }
                 }
                 Assertion::ManPagesGenerated => {
+                    use std::collections::BTreeSet;
+
                     let man_dir = project.path().join("man");
                     let pages = std::fs::read_dir(&man_dir)
                         .ok()
                         .and_then(|entries| entries.collect::<Result<Vec<_>, _>>().ok());
+                    let command = Cli::command();
+                    let mut expected_pages = BTreeSet::from(["omg.1".to_string()]);
+                    for subcommand in command.get_subcommands().filter(|cmd| !cmd.is_hide_set()) {
+                        let name = subcommand.get_name();
+                        expected_pages.insert(format!("omg-{name}.1"));
+                        for nested in subcommand
+                            .get_subcommands()
+                            .filter(|cmd| !cmd.is_hide_set())
+                        {
+                            expected_pages.insert(format!("omg-{name}-{}.1", nested.get_name()));
+                        }
+                    }
+                    let actual_pages = pages.as_ref().map(|entries| {
+                        entries
+                            .iter()
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .collect::<BTreeSet<_>>()
+                    });
                     let only_real_pages = man_dir
                         .symlink_metadata()
                         .is_ok_and(|metadata| metadata.file_type().is_dir())
                         && pages.as_ref().is_some_and(|entries| {
-                            entries.len() >= 2
+                            entries.len() == expected_pages.len()
                                 && entries.iter().all(|entry| {
                                     entry.file_type().is_ok_and(|kind| kind.is_file())
                                         && entry.file_name().to_str().is_some_and(|name| {
                                             name.starts_with("omg") && name.ends_with(".1")
                                         })
                                 })
-                        });
-                    let has_sections = ["omg.1", "omg-generate-man.1"].iter().all(|name| {
+                        })
+                        && actual_pages.as_ref() == Some(&expected_pages);
+                    let has_sections = expected_pages.iter().all(|name| {
                         std::fs::read_to_string(man_dir.join(name)).is_ok_and(|page| {
                             page.lines().any(|line| {
                                 line.starts_with(".TH ")
-                                    && line.to_ascii_lowercase().contains("omg")
+                                    && (name != "omg.1"
+                                        || line.to_ascii_lowercase().contains("omg"))
                             })
                                 && ["NAME", "SYNOPSIS"].iter().all(|section| {
                                     page.lines().any(|line| {
