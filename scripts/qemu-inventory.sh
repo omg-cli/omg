@@ -1690,6 +1690,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-remove:workspace-project-removed|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
+  esac
   case "$id" in
     generate-man)
       [[ "$a" == man-pages-generated && "$s" == isolated-write && "$resolved" == 0 ]] || exit 2
