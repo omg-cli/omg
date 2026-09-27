@@ -3,9 +3,14 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 
 LIMIT = 1024 * 1024
+HEADER = "case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup"
+DISTROS = {"arch", "debian", "ubuntu", "fedora"}
+EXIT = re.compile(r"(?:0|[1-9][0-9]{0,2})\Z")
+MAPPED_EXIT = re.compile(r"(arch|debian|ubuntu|fedora):(0|[1-9][0-9]{0,2})\Z")
 
 
 def unique_object(pairs):
@@ -27,13 +32,56 @@ def read(path):
     return content
 
 
+def resolve_exit(cell, distro):
+    if EXIT.fullmatch(cell):
+        value = int(cell)
+        if value <= 255:
+            return value
+    entries = cell.split(",")
+    if len(entries) != 4:
+        raise ValueError("invalid expected exit")
+    values = {}
+    for entry in entries:
+        match = MAPPED_EXIT.fullmatch(entry)
+        if not match or match[1] in values or int(match[2]) > 255:
+            raise ValueError("invalid per-distro expected exit")
+        values[match[1]] = int(match[2])
+    if set(values) != DISTROS:
+        raise ValueError("incomplete per-distro expected exit")
+    return values[distro]
+
+
+def inventory_exits(content, distro):
+    lines = content.decode("utf-8").split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    if not lines or lines[0] != HEADER:
+        raise ValueError("invalid inventory header")
+    exits = {}
+    for line in lines[1:]:
+        fields = line.split("\t")
+        if len(fields) != 10 or any(not field for field in fields):
+            raise ValueError("invalid inventory row")
+        case, cell, ux = fields[0], fields[3], fields[4]
+        if case in exits or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", case):
+            raise ValueError("duplicate or invalid inventory case")
+        if ux not in ("pass", "declared"):
+            raise ValueError("invalid expected UX")
+        exits[case] = None if ux == "declared" else resolve_exit(cell, distro)
+    return exits
+
+
 def admit(policy, inventory, results, summary, distro, tiers):
     rules = json.loads(read(policy), object_pairs_hook=unique_object)
-    digest = hashlib.sha256(read(inventory)).hexdigest()
+    inventory_bytes = read(inventory)
+    digest = hashlib.sha256(inventory_bytes).hexdigest()
     selection = rules["inventories"][digest]
+    exits = inventory_exits(inventory_bytes, distro)
     profile = rules["profiles"][tiers]
     expected = {"qemu-" + distro + "-" + row["id"]: row
                 for row in selection["cases"] if set(row["tiers"]) & set(profile)}
+    if any(case.removeprefix("qemu-" + distro + "-") not in exits for case in expected):
+        raise ValueError("selected case absent from inventory")
     rows = json.loads(read(results), object_pairs_hook=unique_object)
     completion = json.loads(read(summary), object_pairs_hook=unique_object)
     if not isinstance(rows, list) or not rows or len(rows) != len(expected):
@@ -64,6 +112,8 @@ def admit(policy, inventory, results, summary, distro, tiers):
         elif verdict in ("PASS", "FAIL"):
             if code < 0:
                 raise ValueError("executed case lacks an exit code")
+            if verdict == "PASS" and code != exits[case.removeprefix("qemu-" + distro + "-")]:
+                raise ValueError("PASS exit disagrees with inventory")
             scope = expected[case]["network_scope"]
             if scope not in ("offline", "network") or row.get("network_scope") != scope:
                 raise ValueError("case did not run in its required network scope")
