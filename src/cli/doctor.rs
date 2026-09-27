@@ -105,12 +105,7 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
 
     // 3b. Backend-specific infrastructure (what the compiled backend itself
     //     reads — no invented checks).
-    if debian_backend {
-        issues += check_debian_infra();
-    }
-    if arch_backend {
-        issues += check_arch_infra();
-    }
+    add_native_infra_issues(distro, &mut issues, check_fedora_infra()).await;
 
     // 4. Daemon Status. A down daemon only limits speed, never
     // correctness, so it warns without failing the run.
@@ -193,6 +188,20 @@ fn finish_doctor(issues: usize, warnings: usize) -> Result<()> {
         );
         Err(anyhow::anyhow!("doctor found {issues} health issue(s)"))
     }
+}
+
+/// Add backend health failures to the same count that controls the CLI verdict.
+async fn add_native_infra_issues(
+    distro: Distro,
+    issues: &mut usize,
+    fedora_check: impl std::future::Future<Output = usize>,
+) {
+    *issues += match distro {
+        Distro::Debian | Distro::Ubuntu => check_debian_infra(),
+        Distro::Arch => check_arch_infra(),
+        Distro::Fedora => fedora_check.await,
+        Distro::MacOS | Distro::Unknown => 0,
+    };
 }
 
 /// Distro detected for this doctor run.
@@ -296,6 +305,90 @@ fn check_debian_infra() -> usize {
     }
 
     issues
+}
+
+/// Check the tools and local package database used by the Fedora backend.
+/// Repository metadata is irrelevant to this check; it must not refresh repos.
+async fn check_fedora_infra() -> usize {
+    if crate::core::paths::test_mode() {
+        return 0;
+    }
+
+    let mut issues = 0;
+    let dnf = match crate::core::privilege::system_command("dnf") {
+        Ok(command) => Some(command),
+        Err(error) => {
+            println!("  {} DNF backend unavailable: {error}", style::error("✗"));
+            issues += 1;
+            None
+        }
+    };
+    if let Err(error) = crate::core::privilege::trusted_program("rpm") {
+        println!("  {} RPM backend unavailable: {error}", style::error("✗"));
+        issues += 1;
+    }
+    if let Some(command) = dnf {
+        issues += check_fedora_package_db(command, Duration::from_secs(15)).await;
+    }
+    issues
+}
+
+async fn check_fedora_package_db(command: std::process::Command, deadline: Duration) -> usize {
+    // Fedora's dnf executable resolves to dnf5; RHEL-family DNF4 uses the
+    // older spelling. Both support --cacheonly and `check`.
+    let disable_repo = if command.get_program().to_string_lossy().ends_with("dnf5") {
+        "--disable-repo=*"
+    } else {
+        "--disablerepo=*"
+    };
+    let mut command = tokio::process::Command::from(command);
+    command
+        .args(["--cacheonly", disable_repo, "check"])
+        .kill_on_drop(true);
+    match tokio::time::timeout(deadline, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            println!("  {}", style::success("DNF local package database healthy"));
+            0
+        }
+        Ok(Ok(output)) => {
+            let detail = if output.stderr.is_empty() {
+                &output.stdout
+            } else {
+                &output.stderr
+            };
+            let detail = String::from_utf8_lossy(detail);
+            let detail = detail
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| {
+                    style::sanitize_terminal_text(line)
+                        .chars()
+                        .take(160)
+                        .collect::<String>()
+                });
+            println!(
+                "  {} DNF local package database check failed ({}){}",
+                style::error("✗"),
+                output.status,
+                detail.map(|line| format!(": {line}")).unwrap_or_default()
+            );
+            1
+        }
+        Ok(Err(error)) => {
+            println!(
+                "  {} DNF local package database check failed: {error}",
+                style::error("✗")
+            );
+            1
+        }
+        Err(_) => {
+            println!(
+                "  {} DNF local package database check timed out",
+                style::error("✗")
+            );
+            1
+        }
+    }
 }
 
 /// Whether an APT lists entry carries a package index. Modern APT acquires
@@ -1183,5 +1276,45 @@ mod tests {
         assert!(finish_doctor(0, 2).is_ok());
         let err = finish_doctor(3, 0).expect_err("issues must produce Err");
         assert!(err.to_string().contains('3'), "err: {err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fedora_local_db_check_requires_exact_offline_command_and_success() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::TempDir::new().expect("isolated DNF fixture");
+        let program = fixture.path().join("dnf5");
+        for (name, repo_flag) in [("dnf5", "--disable-repo=*"), ("dnf", "--disablerepo=*")] {
+            let program = fixture.path().join(name);
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\n[ \"$1\" = --cacheonly ] && [ \"$2\" = '{repo_flag}' ] && [ \"$3\" = check ] && [ \"$#\" = 3 ]\n"
+                ),
+            )
+            .expect("DNF fixture");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+                .expect("executable DNF fixture");
+            assert_eq!(
+                check_fedora_package_db(
+                    std::process::Command::new(&program),
+                    Duration::from_secs(2)
+                )
+                .await,
+                0,
+                "{name} should use its documented offline flags"
+            );
+        }
+        std::fs::write(&program, b"#!/bin/sh\nexit 23\n").expect("failing DNF fixture");
+        let issues =
+            check_fedora_package_db(std::process::Command::new(&program), Duration::from_secs(2))
+                .await;
+        assert_eq!(issues, 1);
+        let mut doctor_issues = 0;
+        add_native_infra_issues(Distro::Fedora, &mut doctor_issues, async { issues }).await;
+        assert_eq!(doctor_issues, 1);
+        let error = finish_doctor(doctor_issues, 0).expect_err("failed DNF must fail doctor");
+        assert!(error.to_string().contains("1 health issue"));
     }
 }

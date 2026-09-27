@@ -178,12 +178,13 @@ class OutputContracts(unittest.TestCase):
                        'dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)'),
             'ubuntu': ('Debian/Ubuntu detected (apt backend)',
                        'dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)'),
-            'fedora': ('Fedora/RHEL detected (dnf backend)', ''),
+            'fedora': ('Fedora/RHEL detected (dnf backend)', 'DNF local package database healthy'),
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             release = root / 'os-release'
             output = root / 'doctor.out'
+            trace = root / 'doctor.exec.log'
             for distro, (identity, health) in expected.items():
                 with self.subTest(distro=distro):
                     release.write_text(f'ID={distro}\n', encoding='utf-8')
@@ -191,13 +192,29 @@ class OutputContracts(unittest.TestCase):
                     if health:
                         healthy += f'  {health}\n'
                     output.write_text(healthy, encoding='utf-8')
-                    command = oracle + '\ncheck_doctor_native_backend "$1" "$2" "$3"\n'
+                    trace.write_text(
+                        '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
+                        '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
+                        encoding='utf-8')
+                    command = oracle + '\ncheck_doctor_native_backend "$1" "$2" "$3" "$4"\n'
                     def probe():
                         return subprocess.run(
                             [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
-                             command, '_', distro, str(output), str(release)],
+                             command, '_', distro, str(output), str(release), str(trace) if distro == 'fedora' else ''],
                             cwd=root, capture_output=True, text=True, timeout=10)
-                    self.assertEqual(probe().returncode, 0)
+                    passed = probe()
+                    self.assertEqual(passed.returncode, 0, passed.stderr)
+                    if distro == 'fedora':
+                        self.assertIn('Fedora doctor DNF execution receipt: 123 execve(', passed.stderr)
+                        output.write_text(f'  {identity}\n', encoding='utf-8')
+                        self.assertEqual(probe().returncode, 1, 'Fedora identity alone is not native health proof')
+                        output.write_text(healthy, encoding='utf-8')
+                        trace.write_text('123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "check"], 0x7ffd) = 0\n', encoding='utf-8')
+                        self.assertEqual(probe().returncode, 1, 'Fedora health text without an offline DNF exec is not proof')
+                        trace.write_text(
+                            '123 execve("/usr/bin/dnf5", ["/usr/bin/dnf5", "--cacheonly", '
+                            '"--disable-repo=*", "check"], 0x7ffd /* 1 var */) = 0\n',
+                            encoding='utf-8')
                     output.write_text('  Arch Linux detected\n' if distro != 'arch'
                                       else '  Fedora/RHEL detected (dnf backend)\n', encoding='utf-8')
                     self.assertEqual(probe().returncode, 1)
@@ -223,12 +240,17 @@ class OutputContracts(unittest.TestCase):
         health = {'arch': '  ALPM local package database (/var/lib/pacman/local)\n',
                   'debian': '  dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)\n',
                   'ubuntu': '  dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)\n',
-                  'fedora': ''}[distro]
+                  'fedora': '  DNF local package database healthy\n'}[distro]
         healthy = f'  {identity}\n{health}'
         product = 'printf %s ' + shlex.quote(healthy) + '\n'
-        result, evidence, _ = self.run_inventory(product, rows, distro=distro)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(evidence[0]['result'], 'PASS')
+        result, evidence, logs = self.run_inventory(product, rows, distro=distro)
+        if distro == 'fedora':
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(evidence[0]['result'], 'FAIL')
+            self.assertIn('did not execute the trusted offline DNF5', logs['doctor.log'])
+        else:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(evidence[0]['result'], 'PASS')
         result, evidence, logs = self.run_inventory('printf "Doctor is healthy\\n"\n', rows, distro=distro)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(evidence[0]['result'], 'FAIL')
