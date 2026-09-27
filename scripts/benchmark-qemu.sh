@@ -587,6 +587,7 @@ if [[ -n "$inventory_tiers" ]]; then
   # The inventory executor runs inside the controller (same netns as the
   # guest); /work is bind-mounted there.
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
+  cp "$here/qemu-container-fake-engine.sh" "$work/qemu-container-fake-engine.sh"
   cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
   cp "$here/qemu-arch-update-fixture.sh" "$work/qemu-arch-update-fixture.sh"

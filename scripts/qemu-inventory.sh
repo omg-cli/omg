@@ -1326,6 +1326,30 @@ PY
   fi
   return 0
 }
+check_container_run_argv() {
+  local root=$1 index
+  local -a actual=() expected=(
+    --detach --name smoke -w /tmp/omg-smoke -e SMOKE=1
+    -v "$root:/tmp/omg-smoke" -- debian:bookworm sh -c 'printf smoke'
+  )
+  if [[ ! -f "$root/engine/calls" || -L "$root/engine/calls" \
+        || ! -f "$root/engine/argv" || -L "$root/engine/argv" \
+        || $(cat "$root/engine/calls") != $'version\nrun' ]]; then
+    printf 'assertion failed: fake container engine was not probed and invoked exactly once\n' >&2
+    return 1
+  fi
+  mapfile -d '' -t actual < "$root/engine/argv"
+  if [[ ${#actual[@]} -ne ${#expected[@]} ]]; then
+    printf 'assertion failed: detached container engine argv length differs from the exact contract\n' >&2
+    return 1
+  fi
+  for index in "${!expected[@]}"; do
+    if [[ "${actual[$index]}" != "${expected[$index]}" ]]; then
+      printf 'assertion failed: detached container engine argv differs at position %s\n' "$index" >&2
+      return 1
+    fi
+  done
+}
 # END PRODUCT OUTPUT ORACLE
 # BEGIN ROW LOG
 write_row_log() {
@@ -1378,6 +1402,8 @@ for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3
 overlap_fixture=$(jq -rn --rawfile fixture "$(dirname "$0")/workspace-overlap-fixture.sh" '$fixture | @sh')
 license_oracle_path="$(dirname "$0")/qemu-license-oracle.py"
 license_oracle=$(jq -rn --rawfile fixture "$license_oracle_path" '$fixture | @sh')
+container_engine_path="$(dirname "$0")/qemu-container-fake-engine.sh"
+container_engine=$(jq -rn --rawfile fixture "$container_engine_path" '$fixture | @sh')
 [[ "$binary" == /* && "$binary" != *$'\n'* ]] || exit 2
 [[ "$ssh_user" =~ ^[a-z_][a-z0-9_-]*$ && "$ssh_port" =~ ^[0-9]+$ ]] || exit 2
 [[ "$tiers" =~ ^[a-z,-]+$ && "$tiers" != ,* && "$tiers" != *, && "$tiers" != *,,* ]] || exit 2
@@ -1402,7 +1428,7 @@ out="$root/inventory"
 # Refuse to overwrite evidence from a previous invocation.
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" > "$out/input-sha256.txt"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" > "$out/input-sha256.txt"
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
   '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
@@ -1497,7 +1523,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv) ;; *) exit 2 ;; esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
     jq -e '. == ["run", "smoke", "--using", "make"]' <<< "$aj" >/dev/null || exit 2
@@ -1657,6 +1683,12 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     jq -e '. == ["rollback", "--yes"]' <<< "$aj" >/dev/null || exit 2
   fi
   if [[ "$a" == native-apt-orphan-removed ]]; then [[ "$id" == clean-orphans-native ]] || exit 2; fi
+  if [[ "$id" == container-run-detached-argv ]]; then
+    [[ "$a" == container-run-argv && "$s" == isolated-write && "$resolved" == 0 && "$t" == hermetic && "$tg" == hermetic:pass ]] || exit 2
+    jq -e '. == ["container","run","--name","smoke","--detach","--env","SMOKE=1","--volume","${ROOT}:/tmp/omg-smoke","--workdir","/tmp/omg-smoke","debian:bookworm","--","sh","-c","printf smoke"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == container-run-argv ]]; then
+    exit 2
+  fi
   case "$cleanup" in tempdir-drop|none|container-prune|host-state-restore|vm-revert|daemon-stop) ;; *) exit 2 ;; esac
   row_args["$id"]="$aj"; row_requires["$id"]="$r"
   row_tier["$id"]="$t"; row_safety["$id"]="$s"; row_ux["$id"]="$u"
@@ -1780,6 +1812,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
   remote="set -eu; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
+  if [[ "$assertions" == container-run-argv ]]; then
+    remote+="; mkdir -p \"\$rowdir/engine\"; printf '%s' $container_engine > \"\$rowdir/engine/podman\"; chmod 700 \"\$rowdir/engine/podman\"; ln -s /bin/false \"\$rowdir/engine/docker\""
+    remote+="; export OMG_QEMU_ENGINE_CAPTURE=\"\$rowdir/engine\" PATH=\"\$rowdir/engine:\$PATH\"; [[ \$(command -v podman) == \"\$rowdir/engine/podman\" && \$(command -v docker) == \"\$rowdir/engine/docker\" ]] || { printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+    remote+="; $(declare -f check_container_run_argv)"
+  fi
   if [[ "$assertions" == fingerprint:* || "$case" == team-init || "$case" == snapshot-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/fingerprint-config\" OMG_DATA_DIR=\"\$rowdir/fingerprint-data\" OMG_CACHE_DIR=\"\$rowdir/fingerprint-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
   fi
@@ -2006,6 +2043,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if ! rollback_cleanup; then printf 'assertion failed: native APT rollback fixture cleanup failed\n' >&2; execution_phase=dependency; rc=2; assertion=1; else rollback_owned=0; fi"
     remote+="; rollback_final=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native APT cleanup after-state is unavailable\n' >&2; execution_phase=dependency; rc=2; assertion=1; rollback_final=missing; }"
     remote+="; if [[ \"\$rollback_before\" != \"\$rollback_final\" ]]; then printf 'assertion failed: rollback fixture changed the native installed-package baseline\n' >&2; assertion=1; fi"
+  fi
+  if [[ "$assertions" == container-run-argv ]]; then
+    remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_container_run_argv \"\$rowdir\"; then assertion=1; fi"
   fi
   if [[ "$assertions" == package-dry-run-* ]]; then
     if [[ "$assertions" != package-dry-run-install && "$assertions" != package-dry-run-recursive || "$assertions" == package-dry-run-recursive && "$distro" == arch ]]; then
