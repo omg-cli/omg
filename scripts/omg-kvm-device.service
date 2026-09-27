@@ -1,0 +1,11 @@
+[Unit]
+Description=Provision private KVM device for the OMG Ubuntu WSL runner
+After=systemd-udev-trigger.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/libexec/omg-kvm-device.py setup
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

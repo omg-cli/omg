@@ -25,7 +25,9 @@ hosted reporter closes an issue only after a qualifying passing push to
   `/dev/kvm` (check `stat -c '%G' /dev/kvm`), then restart the runner service
   so its existing process inherits the new group. Verify the service process's
   groups and read/write access as that account. A temporary device ACL can
-  disappear if WSL recreates `/dev/kvm` between workflow steps.
+  disappear if another WSL distro updates the shared `/dev/kvm` between
+  workflow steps. OMG's Ubuntu WSL runner uses the private ext4 alias in
+  [Local CI runner](./local-ci-runner.md) instead.
 - ARM legs: an aarch64 host with working KVM; a runner label alone does not
   prove `/dev/kvm` is available. KVM
   cannot cross architectures, so x86_64 hosts fail ARM legs closed

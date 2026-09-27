@@ -55,7 +55,7 @@ boundary against malicious code.
 
 Use a dedicated Ubuntu 24.04 WSL 2 distro on Windows, not the development Arch
 distro. The runner account is `omgci`; it owns `/home/omgci/actions-runner` and
-belongs to the `docker` and `kvm` groups. Docker runs as a systemd service.
+belongs to the `docker` group. Docker runs as a systemd service.
 Its `/etc/wsl.conf` enables systemd and disables automatic Windows-drive mounts
 and Windows process interop. This reduces accidental access to host files, but
 does not replace the organization runner-group restriction.
@@ -71,26 +71,46 @@ sudo umount /mnt/c
 test ! -e /mnt/c/Users
 ```
 
-Install the ACL utility before enabling QEMU jobs. WSL can expose `/dev/kvm`
-with a group other than `kvm`, even when `omgci` belongs to that group. The
-workflow grants `omgci` access to this device when needed; it requires
-`setfacl` and must not widen access to all local users:
+WSL 2 distros [share the device tree](https://learn.microsoft.com/en-us/windows/wsl/about).
+Starting another distro can change `/dev/kvm`'s group and
+remove the runner's ACL while a job is already executing; this happened within
+four seconds between the QEMU preflight and controller launch. Provision a
+separate character node on the Ubuntu distro's ext4 filesystem instead. The
+repo-owned helper [creates a character node with the live device's major/minor](https://man7.org/linux/man-pages/man2/mknod.2.html), permits only
+`root:omgci` with mode `0660`, and verifies `KVM_GET_API_VERSION == 12`. It
+rejects an existing wrong node, symlink, or inherited extended ACL. Do not put
+this alias under `/run`:
+that WSL mount has [`nodev`](https://man7.org/linux/man-pages/man2/mount.2.html),
+so a device node there cannot be opened.
+
+From a checkout of this repository, install the root-owned helper and systemd
+unit in the Ubuntu runner distro. Run these commands there before starting the
+runner service:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y acl
-command -v setfacl
-sudo setfacl -m u:omgci:rw /dev/kvm
+sudo install -D -o root -g root -m 0755 scripts/omg-kvm-device.py /usr/local/libexec/omg-kvm-device.py
+sudo install -D -o root -g root -m 0644 scripts/omg-kvm-device.service /etc/systemd/system/omg-kvm-device.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now omg-kvm-device.service
+sudo -u omgci python3 /usr/local/libexec/omg-kvm-device.py check
 ```
+
+Both commands must succeed. The helper's `check` also runs in the QEMU job;
+the job fails if the alias disappears, changes ownership, or stops opening KVM.
+The alias is on ext4 and stays restricted even when another WSL distro changes
+the shared `/dev/kvm` inode. Re-run the install commands after updating the
+helper or unit in this repository.
+[Docker's `--device` mapping](https://docs.docker.com/reference/cli/docker/container/run/#add-host-device-to-container---device)
+exposes that private host node as `/dev/kvm` in the QEMU controller.
 
 Before registration, verify these from PowerShell:
 
 ```powershell
 wsl.exe --distribution Ubuntu-24.04 --user omgci --exec bash -lc 'test "$(id -un)" = omgci; docker info --format "{{.ServerVersion}}"; test ! -e /mnt/c/Users; sudo -n true'
-wsl.exe --distribution Ubuntu-24.04 --user omgci --exec python3 -c 'import fcntl,os; f=os.open("/dev/kvm",os.O_RDWR); print(fcntl.ioctl(f,0xAE00,0)); os.close(f)'
+wsl.exe --distribution Ubuntu-24.04 --user omgci --exec python3 /usr/local/libexec/omg-kvm-device.py check
 ```
 
-The KVM API check must print `12`. Download the current x64 Linux runner from
+The KVM API check must report `12`. Download the current x64 Linux runner from
 the official `actions/runner` release, verify its SHA-256 from that release's
 asset metadata, and extract it under `/home/omgci/actions-runner`. Obtain a
 short-lived organization registration token from GitHub. Register as `omgci`
@@ -103,9 +123,23 @@ cd /home/omgci/actions-runner
   --runnergroup omg-local-ci --labels omg-local-ci-x64 \
   --work _work --replace
 sudo ./svc.sh install omgci
+mapfile -t units < <(systemctl list-unit-files --no-legend 'actions.runner.*.service' | awk '{print $1}')
+test "${#units[@]}" -eq 1
+unit="${units[0]}"
+sudo install -d -o root -g root -m 0755 "/etc/systemd/system/$unit.d"
+sudo install -o root -g root -m 0644 scripts/omg-runner-kvm-dependency.conf \
+  "/etc/systemd/system/$unit.d/10-kvm-device.conf"
+sudo systemctl daemon-reload
 sudo ./svc.sh start
 sudo ./svc.sh status
 ```
+
+The unit's [requirement and ordering dependencies](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)
+make alias setup a prerequisite of every runner start.
+If KVM is absent or the alias is wrong, the runner does not start; repair the
+device or the service instead of widening `/dev/kvm` permissions. On an
+already-registered runner, install the same drop-in and restart its runner
+service during a quiet period so the dependency takes effect.
 
 Do not commit or log the registration token. The systemd service starts when
 this WSL distro starts. On the maintainer PC, the Windows scheduled task
