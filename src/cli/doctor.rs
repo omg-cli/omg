@@ -981,16 +981,20 @@ mod tests {
         assert_eq!(status.diagnostic(), "HTTP 500");
         finish_probe_server(server).await;
 
-        let unlistening = tokio::net::TcpSocket::new_v4().expect("refused probe socket");
-        unlistening
-            .bind("127.0.0.1:0".parse().expect("loopback address"))
-            .expect("reserve unlistening port");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("refused probe listener");
         let url = format!(
             "http://{}",
-            unlistening.local_addr().expect("reserved address")
+            listener.local_addr().expect("listener address")
         );
+        // Close the listener: a bound, non-listening socket need not refuse on every OS.
+        drop(listener);
         let refused = probe_endpoint(&client, &url, Duration::from_secs(1)).await;
-        assert!(matches!(refused, EndpointProbe::ConnectFailure(_)));
+        assert!(
+            matches!(refused, EndpointProbe::ConnectFailure(_)),
+            "closed loopback listener must refuse the connection: {refused:?}"
+        );
         assert!(refused.diagnostic().starts_with("connection error: "));
 
         let deadline = Duration::from_millis(50);
