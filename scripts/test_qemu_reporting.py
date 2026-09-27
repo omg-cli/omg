@@ -940,6 +940,21 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)  # issue helper and telemetry
         self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "ci")
 
+    def test_failed_ci_success_gate_with_skipped_qemu_stays_outside_qemu(self):
+        jobs = [
+            {"name": "QEMU behavioral verification", "conclusion": "skipped", "id": 11,
+             "steps": []},
+            {"name": "CI Success", "conclusion": "failure", "id": 12,
+             "steps": [{"name": "Evaluate required jobs", "conclusion": "failure", "number": 3}]},
+        ]
+        calls, catalog = self.run_report_fixture(
+            [], workflow_path=".github/workflows/ci.yml", no_artifacts=True,
+            jobs=jobs)
+        self.assertEqual([row["case_id"] for row in catalog["failures"]],
+                         ["ci-non-qemu-workflow"])
+        self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "ci")
+        self.assertIn("Evaluate required jobs", calls[0][2]["matrix-ci-non-qemu-workflow"])
+
     def test_failed_qemu_guest_inside_ci_keeps_qemu_identity(self):
         jobs = [
             {"name": "QEMU behavioral verification / Distro lane (arch) / QEMU guest (arch)",

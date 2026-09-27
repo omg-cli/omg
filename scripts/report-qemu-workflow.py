@@ -454,11 +454,15 @@ def ci_non_qemu_failure(run, jobs):
     """Keep failed CI jobs distinct from the QEMU job's result."""
     return (run["path"] == ".github/workflows/ci.yml"
             and run["conclusion"] != "success"
-            and any(isinstance(job.get("name"), str)
-                    and not job["name"].startswith("QEMU behavioral verification")
-                    and job["name"] != "CI Success"
-                    and job.get("conclusion") in ("failure", "timed_out", "cancelled", "action_required")
-                    for job in jobs))
+            and (any(isinstance(job.get("name"), str)
+                     and not job["name"].startswith("QEMU behavioral verification")
+                     and job["name"] != "CI Success"
+                     and job.get("conclusion") in ("failure", "timed_out", "cancelled", "action_required")
+                     for job in jobs)
+                 or (not qemu_job_failed(run, jobs)
+                     and any(job.get("name") == "CI Success"
+                             and job.get("conclusion") in ("failure", "timed_out", "action_required")
+                             for job in jobs))))
 
 
 def qemu_job_failed(run, jobs):
@@ -639,7 +643,7 @@ def main():
         return 0
     details = {"ci": [], "qemu-matrix": []}
     for job in jobs["jobs"][:100]:
-        if job["conclusion"] not in ("success", "skipped") and job["name"] != "CI Success":
+        if job["conclusion"] not in ("success", "skipped"):
             source = ("qemu-matrix" if run["path"] == ".github/workflows/qemu-matrix.yml"
                       or job["name"].startswith("QEMU behavioral verification") else "ci")
             name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", job["name"])[:120]
