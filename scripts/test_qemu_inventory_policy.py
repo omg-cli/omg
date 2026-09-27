@@ -41,7 +41,11 @@ class PolicyTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.inventory = self.root / "cases.tsv"
-        self.inventory.write_bytes(b"fixture inventory\n")
+        self.inventory.write_bytes(
+            b"case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup\n"
+            b"required\t[\"doctor\"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\tnone\n"
+            b"optional\t[\"doctor\",\"--turbo\"]\tread\t-\tdeclared\t-\thermetic\tarch:pending\t-\tnone\n"
+        )
         self.policy = self.root / "policy.json"
         self.policy.write_text(json.dumps({"profiles": {"hermetic": ["hermetic"]}, "inventories": {
             hashlib.sha256(self.inventory.read_bytes()).hexdigest(): {"cases": [
@@ -56,15 +60,79 @@ class PolicyTests(unittest.TestCase):
                           result="SKIPPED", exit_code=-1)]
         self.summary.write_text('{"complete":true,"pass":1,"fail":0,"skipped":1}')
 
-    def admit(self):
+    def repolicy_inventory(self, content):
+        self.inventory.write_bytes(content.encode("utf-8"))
+        rules = json.loads(self.policy.read_text())
+        cases = next(iter(rules["inventories"].values()))
+        rules["inventories"] = {hashlib.sha256(self.inventory.read_bytes()).hexdigest(): cases}
+        self.policy.write_text(json.dumps(rules))
+
+    def admit(self, distro="arch"):
         self.results.write_text(json.dumps(self.rows))
-        return POLICY.admit(self.policy, self.inventory, self.results, self.summary, "arch", "hermetic")
+        return POLICY.admit(self.policy, self.inventory, self.results, self.summary, distro, "hermetic")
 
     def test_counts_separate_executed_from_selected(self):
         receipt = self.admit()
         self.assertTrue(receipt["passed"])
         self.assertEqual(receipt["counts"], dict(selected=2, executed=1, passed=1, failed=0,
                                                blocked=0, harness_error=0, skipped=1))
+
+    def test_wrong_pass_exit_is_rejected(self):
+        self.rows[0]["exit_code"] = 1
+        with self.assertRaises(ValueError):
+            self.admit()
+
+    def test_pass_accepts_intentional_nonzero_scalar_and_mapped_exits(self):
+        content = self.inventory.read_text().replace("\t0\tpass\t", "\t2\tpass\t", 1)
+        self.repolicy_inventory(content)
+        self.rows[0]["exit_code"] = 2
+        self.assertTrue(self.admit()["passed"])
+        self.rows[0]["exit_code"] = 0
+        with self.assertRaises(ValueError):
+            self.admit()
+
+        mapping = "arch:1,debian:0,ubuntu:0,fedora:125"
+        self.repolicy_inventory(content.replace("\t2\tpass\t", f"\t{mapping}\tpass\t", 1))
+        self.rows[0]["exit_code"] = 1
+        self.assertTrue(self.admit()["passed"])
+        self.rows[0]["exit_code"] = 2
+        with self.assertRaises(ValueError):
+            self.admit()
+
+        rules = json.loads(self.policy.read_text())
+        cases = next(iter(rules["inventories"].values()))["cases"]
+        cases[1]["allowed_skips"]["fedora"] = "declared-cli-shape-only"
+        self.policy.write_text(json.dumps(rules))
+        for row in self.rows:
+            row["case_id"] = row["case_id"].replace("qemu-arch-", "qemu-fedora-")
+            row["distro"] = "fedora"
+        self.rows[0]["exit_code"] = 125
+        self.assertTrue(self.admit("fedora")["passed"])
+        self.rows[0]["exit_code"] = 0
+        with self.assertRaises(ValueError):
+            self.admit("fedora")
+
+    def test_declared_case_cannot_report_pass(self):
+        self.rows[1].update(result="PASS", exit_code=0, network_scope="offline")
+        self.summary.write_text('{"complete":true,"pass":2,"fail":0,"skipped":0}')
+        with self.assertRaises(ValueError):
+            self.admit()
+
+    def test_rehashed_malformed_inventory_cannot_admit_pass(self):
+        original = self.inventory.read_text()
+        required = original.splitlines()[1]
+        malformed = (
+            original + required + "\n",
+            original.replace("\t0\tpass\t", "\t0\tpass\tEXTRA\t", 1),
+            original.replace("\t0\tpass\t", "\tpass\t", 1),
+            original.replace("\t0\tpass\t", "\tarch:1,arch:0,ubuntu:0,fedora:0\tpass\t", 1),
+            original.replace("\t0\tpass\t", "\tarch:1,debian:0,ubuntu:0,fedora:256\tpass\t", 1),
+        )
+        for content in malformed:
+            with self.subTest(content=content.splitlines()[1]):
+                self.repolicy_inventory(content)
+                with self.assertRaises(ValueError):
+                    self.admit()
 
     def test_missing_duplicate_substituted_and_unapproved_skip_fail(self):
         original = self.rows[:]
