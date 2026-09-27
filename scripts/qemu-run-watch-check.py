@@ -52,6 +52,13 @@ def run(binary, fixture, phase_timeout=20.0, quiet_seconds=1.5,
     output = bytearray()
     status = None
 
+    def group_exists():
+        try:
+            os.killpg(child, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
     def poll():
         nonlocal status
         if status is None:
@@ -114,6 +121,14 @@ def run(binary, fixture, phase_timeout=20.0, quiet_seconds=1.5,
             raise WatchFailure("watch process did not stop after Ctrl+C")
         if marker_count(marker) != 2:
             raise WatchFailure("watch task changed during shutdown")
+        # The direct watcher may exit 130 while a task or helper it launched
+        # remains in its PTY process group. Give ordinary shutdown a moment,
+        # then refuse to claim Ctrl+C cleaned up a surviving child.
+        deadline = time.monotonic() + 0.5
+        while group_exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if group_exists():
+            raise WatchFailure("watch subprocesses remained after Ctrl+C")
         receipt.write_text(json.dumps({
             "schema_version": 1,
             "initial_runs": 1,
@@ -128,23 +143,26 @@ def run(binary, fixture, phase_timeout=20.0, quiet_seconds=1.5,
         sys.stderr.buffer.write(output[-8192:])
         raise
     finally:
-        if status is None:
+        if status is None or group_exists():
             try:
                 os.killpg(child, signal.SIGTERM)
             except ProcessLookupError:
                 pass
             deadline = time.monotonic() + 1.0
             while time.monotonic() < deadline:
-                pid, observed = os.waitpid(child, os.WNOHANG)
-                if pid:
-                    status = observed
+                if status is None:
+                    pid, observed = os.waitpid(child, os.WNOHANG)
+                    if pid:
+                        status = observed
+                if status is not None and not group_exists():
                     break
                 time.sleep(0.05)
-            if status is None:
+            if group_exists():
                 try:
                     os.killpg(child, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+            if status is None:
                 os.waitpid(child, 0)
         os.close(master)
 

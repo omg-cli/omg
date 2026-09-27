@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 
@@ -47,6 +48,14 @@ FAKE_WATCHER = textwrap.dedent("""\
         if mode == 'storm':
             time.sleep(.12)
             task()
+    if mode == 'background-leak':
+        child = os.fork()
+        if child == 0:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            while True:
+                time.sleep(.05)
+        Path('watch-background.pid').write_text(str(child))
     while True:
         time.sleep(.05)
     """)
@@ -86,7 +95,8 @@ class RunWatchCheck(unittest.TestCase):
         })
 
     def test_false_green_watchers_do_not_write_receipt(self):
-        for mode in ("no-rerun", "fake-print", "early-double", "storm", "no-sigint"):
+        for mode in ("no-rerun", "fake-print", "early-double", "storm",
+                     "no-sigint", "background-leak"):
             with self.subTest(mode=mode):
                 marker = self.fixture / "watch-runs.marker"
                 receipt = self.fixture / "watch-evidence.json"
@@ -97,6 +107,19 @@ class RunWatchCheck(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, (mode, result.stderr))
                 self.assertIn("assertion failed: run --watch:", result.stderr)
                 self.assertFalse(receipt.exists(), mode)
+                if mode == "background-leak":
+                    pid = int((self.fixture / "watch-background.pid").read_text())
+                    deadline = time.monotonic() + 1.0
+                    while time.monotonic() < deadline:
+                        observed = subprocess.run(
+                            ["ps", "-o", "stat=", "-p", str(pid)],
+                            capture_output=True, text=True, check=False,
+                        )
+                        if not observed.stdout.strip() or observed.stdout.lstrip().startswith("Z"):
+                            break
+                        time.sleep(.05)
+                    else:
+                        self.fail("watch background child survived helper cleanup")
 
 
 if __name__ == "__main__":
