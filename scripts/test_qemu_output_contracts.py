@@ -173,7 +173,7 @@ class OutputContracts(unittest.TestCase):
         end = source.index('# END DOCTOR BACKEND ORACLE', begin)
         oracle = source[begin:end]
         expected = {
-            'arch': ('Arch Linux detected', 'ALPM local package database (/var/lib/pacman/local)'),
+            'arch': ('Arch Linux detected', 'ALPM local package database (/var/lib/pacman/local, 2 packages verified)'),
             'debian': ('Debian/Ubuntu detected (apt backend)',
                        'dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)'),
             'ubuntu': ('Debian/Ubuntu detected (apt backend)',
@@ -186,6 +186,11 @@ class OutputContracts(unittest.TestCase):
             release = root / 'os-release'
             output = root / 'doctor.out'
             trace = root / 'doctor.exec.log'
+            (root / 'bin').mkdir()
+            pacman = root / 'bin/pacman'
+            pacman.write_text('#!/usr/bin/env bash\ncase "$1" in -Dk) exit 0 ;; -Qq) printf "one\\ntwo\\n" ;; *) exit 17 ;; esac\n', encoding='utf-8')
+            pacman.chmod(0o755)
+            env = dict(os.environ, PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
             for distro, (identity, health) in expected.items():
                 with self.subTest(distro=distro):
                     release.write_text(f'ID={distro}\n', encoding='utf-8')
@@ -203,9 +208,13 @@ class OutputContracts(unittest.TestCase):
                         return subprocess.run(
                             [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
                              command, '_', distro, str(output), str(release), str(trace) if distro == 'fedora' else ''],
-                            cwd=root, capture_output=True, text=True, timeout=10)
+                            cwd=root, env=env, capture_output=True, text=True, timeout=10)
                     passed = probe()
                     self.assertEqual(passed.returncode, 0, passed.stderr)
+                    if distro == 'arch':
+                        pacman.write_text('#!/usr/bin/env bash\nexit 17\n', encoding='utf-8')
+                        self.assertEqual(probe().returncode, 2)
+                        pacman.write_text('#!/usr/bin/env bash\ncase "$1" in -Dk) exit 0 ;; -Qq) printf "one\\ntwo\\n" ;; *) exit 17 ;; esac\n', encoding='utf-8')
                     if distro == 'fedora':
                         self.assertIn('Fedora doctor RPM execution receipt: 122 execve(', passed.stderr)
                         self.assertIn('Fedora doctor DNF execution receipt: 123 execve(', passed.stderr)
@@ -248,14 +257,17 @@ class OutputContracts(unittest.TestCase):
                     'debian': 'Debian/Ubuntu detected (apt backend)',
                     'ubuntu': 'Debian/Ubuntu detected (apt backend)',
                     'fedora': 'Fedora/RHEL detected (dnf backend)'}[distro]
-        health = {'arch': '  ALPM local package database (/var/lib/pacman/local)\n',
+        health = {'arch': '  ALPM local package database (/var/lib/pacman/local, 2 packages verified)\n',
                   'debian': '  dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)\n',
                   'ubuntu': '  dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)\n',
                   'fedora': '  RPM installed package database nonempty\n'
                             '  DNF local package database healthy\n'}[distro]
         healthy = f'  {identity}\n{health}'
-        product = 'printf %s ' + shlex.quote(healthy) + '\n'
-        result, evidence, logs = self.run_inventory(product, rows, distro=distro)
+        product = ('if [[ -n "${OMG_PACMAN_DB_DIR:-}" ]]; then '
+                   'printf "  ALPM local package database inconsistent (fixture): missing files\\n"; exit 1; fi\n'
+                   'printf %s ' + shlex.quote(healthy) + '\n')
+        native = {'pacman': 'case "$1" in -Dk) exit 0 ;; -Qq) printf "one\\ntwo\\n" ;; *) exit 17 ;; esac\n'}
+        result, evidence, logs = self.run_inventory(product, rows, native_commands=native, distro=distro)
         if distro == 'fedora':
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertEqual(evidence[0]['result'], 'FAIL')
@@ -263,7 +275,14 @@ class OutputContracts(unittest.TestCase):
         else:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(evidence[0]['result'], 'PASS')
-        result, evidence, logs = self.run_inventory('printf "Doctor is healthy\\n"\n', rows, distro=distro)
+        if distro == 'arch':
+            silent_fault = 'printf %s ' + shlex.quote(healthy) + '\n'
+            result, evidence, logs = self.run_inventory(silent_fault, rows,
+                                                        native_commands=native, distro=distro)
+            self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+            self.assertIn('doctor accepted a corrupt Arch local package entry', logs['doctor.log'])
+        result, evidence, logs = self.run_inventory('printf "Doctor is healthy\\n"\n', rows,
+                                                    native_commands=native, distro=distro)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(evidence[0]['result'], 'FAIL')
         self.assertIn('doctor did not identify', logs['doctor.log'])

@@ -5,6 +5,8 @@
 
 mod db;
 
+pub(crate) use db::check_local_db_consistency;
+
 pub use db::{
     AlpmCatalogEpoch, CachedUpdate, LocalDbEpoch, LocalDbPackage, SyncDbEpoch, SyncDbPackage,
     check_updates_cached, get_counts_fast, get_detailed_packages, get_explicit_count,

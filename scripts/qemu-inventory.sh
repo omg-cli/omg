@@ -168,8 +168,16 @@ check_doctor_native_backend() {
   fi
   case "$distro" in
     arch)
-      grep -Fq 'ALPM local package database (/var/lib/pacman/local)' "$output" || {
-        printf 'assertion failed: doctor omitted the Arch package database health check\n' >&2
+      local native_count native_packages native_status=0
+      timeout --kill-after=2s 30s pacman -Dk > native-doctor-db.raw 2> native-doctor-db.stderr || native_status=$?
+      [[ "$native_status" == 0 ]] || {
+        printf 'native doctor reference found an inconsistent Arch package database\n' >&2
+        return 2
+      }
+      native_packages=$(timeout --kill-after=2s 30s pacman -Qq) || return 2
+      native_count=$(printf '%s\n' "$native_packages" | wc -l)
+      grep -Fq "ALPM local package database (/var/lib/pacman/local, $native_count packages verified)" "$output" || {
+        printf 'assertion failed: doctor disagrees with native Arch package database health\n' >&2
         return 1
       } ;;
     debian|ubuntu)
@@ -1778,6 +1786,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log /etc/os-release doctor.exec.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     else
       remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+    fi
+    if [[ "$distro" == arch ]]; then
+      remote+="; mkdir -p fault-db/local/broken-1.0-1; printf '%%NAME%%\\nbroken\\n\\n%%VERSION%%\\n1.0-1\\n' > fault-db/local/broken-1.0-1/desc"
+      remote+="; fault_rc=0; OMG_PACMAN_DB_DIR=\"\$rowdir/fault-db\" OMG_DISABLE_DAEMON=1 timeout --kill-after=5s '$row_timeout' $quoted_binary doctor > doctor-fault.stdout.log 2> doctor-fault.stderr.log || fault_rc=\$?"
+      remote+="; if [ \"\$fault_rc\" != 1 ] || ! grep -Fq 'ALPM local package database inconsistent (' doctor-fault.stdout.log; then printf 'assertion failed: doctor accepted a corrupt Arch local package entry\\n' >&2; assertion=1; fi"
     fi
   fi
   if [[ "$assertions" == info-native-package ]]; then
