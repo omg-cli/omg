@@ -489,6 +489,41 @@ fn parse_desc_manual(content: &str, repo: &str) -> Result<SyncDbPackage> {
     Ok(pkg)
 }
 
+/// Doctor deliberately uses the same parser as package queries. The parser
+/// tolerates damaged entries so ordinary queries remain available; doctor
+/// checks that none of those entries were silently omitted.
+pub(crate) fn check_local_db_consistency(path: &Path) -> Result<usize> {
+    let mut directories = 0;
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("Failed to read local package database {}", path.display()))?
+    {
+        let entry = entry.context("Failed to enumerate local package database")?;
+        if !entry.metadata()?.is_dir() {
+            continue;
+        }
+        directories += 1;
+        anyhow::ensure!(
+            directories <= 20_000,
+            "local package database has too many entries"
+        );
+        for required in ["desc", "files"] {
+            anyhow::ensure!(
+                entry.path().join(required).is_file(),
+                "local package entry {} lacks {required}",
+                entry.file_name().to_string_lossy()
+            );
+        }
+    }
+    anyhow::ensure!(directories > 0, "local package database is empty");
+    let parsed = parse_local_db(path)?;
+    anyhow::ensure!(
+        parsed.len() == directories,
+        "local package database parsed {} of {directories} entries",
+        parsed.len()
+    );
+    Ok(directories)
+}
+
 /// Parse the local package database (/var/lib/pacman/local/)
 /// Returns a `HashMap` of package name -> `LocalDbPackage`
 pub fn parse_local_db(path: &Path) -> Result<HashMap<String, LocalDbPackage>> {
@@ -2202,6 +2237,25 @@ mod tests {
             format!("%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%REASON%\n{reason}\n{extra}"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn doctor_rejects_local_entries_that_package_queries_skip() {
+        let temp = tempfile::TempDir::new().unwrap();
+        write_local_desc(&temp, "healthy-1.0-1", "0", "");
+        let healthy = temp.path().join("healthy-1.0-1");
+        std::fs::write(healthy.join("files"), "%FILES%\nusr/bin/healthy\n").unwrap();
+        assert_eq!(check_local_db_consistency(temp.path()).unwrap(), 1);
+
+        std::fs::remove_file(healthy.join("files")).unwrap();
+        assert!(check_local_db_consistency(temp.path()).is_err());
+        std::fs::write(healthy.join("files"), "%FILES%\nusr/bin/healthy\n").unwrap();
+
+        let corrupt = temp.path().join("corrupt-1.0-1");
+        std::fs::create_dir(&corrupt).unwrap();
+        std::fs::write(corrupt.join("desc"), "%VERSION%\n1.0-1\n").unwrap();
+        std::fs::write(corrupt.join("files"), "%FILES%\nusr/bin/corrupt\n").unwrap();
+        assert!(check_local_db_consistency(temp.path()).is_err());
     }
 
     /// Parse the fixture db and apply the canonical orphan rule with

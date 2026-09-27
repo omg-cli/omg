@@ -506,11 +506,21 @@ fn check_arch_infra() -> usize {
 
     let local_dir = crate::core::paths::pacman_local_dir();
     if local_dir.is_dir() {
-        println!(
-            "  {} ALPM local package database ({})",
-            style::success("✓"),
-            local_dir.display()
-        );
+        match crate::package_managers::pacman_db::check_local_db_consistency(&local_dir) {
+            Ok(packages) => println!(
+                "  {} ALPM local package database ({}, {packages} packages verified)",
+                style::success("✓"),
+                local_dir.display()
+            ),
+            Err(error) => {
+                println!(
+                    "  {} ALPM local package database inconsistent ({}): {error}",
+                    style::error("✗"),
+                    local_dir.display()
+                );
+                issues += 1;
+            }
+        }
     } else {
         println!(
             "  {} ALPM local package database missing ({})",
