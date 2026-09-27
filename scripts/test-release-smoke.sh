@@ -1019,15 +1019,15 @@ inv_verdict sbom-inventory-lies sbom-unmarked FAIL
 inv_verdict sbom-inventory-lies sbom-silent FAIL
 export FAKE_INVENTORY_ALLOW_MUTATIONS=1
 run_inventory update-modes 0 \
-  "$(inv_row update-fast '["update","--fast"]' 0 - update-fast-output package-mutation)" \
-  "$(inv_row update-turbo '["update","--turbo"]' 0 - update-turbo-output package-mutation)"
-inv_verdict update-modes update-fast PASS
-inv_verdict update-modes update-turbo PASS
+  "$(inv_row update-fast-contract '["update","--fast"]' 0 - update-fast-output package-mutation)" \
+  "$(inv_row update-turbo-contract '["update","--turbo"]' 0 - update-turbo-output package-mutation)"
+inv_verdict update-modes update-fast-contract PASS
+inv_verdict update-modes update-turbo-contract PASS
 run_inventory update-mode-lies 1 \
-  "$(inv_row update-fast '["update-standard-sync"]' 0 - update-fast-output package-mutation)" \
-  "$(inv_row update-turbo '["update-standard-cached"]' 0 - update-turbo-output package-mutation)"
-inv_verdict update-mode-lies update-fast FAIL
-inv_verdict update-mode-lies update-turbo FAIL
+  "$(inv_row update-fast-contract '["update-standard-sync"]' 0 - update-fast-output package-mutation)" \
+  "$(inv_row update-turbo-contract '["update-standard-cached"]' 0 - update-turbo-output package-mutation)"
+inv_verdict update-mode-lies update-fast-contract FAIL
+inv_verdict update-mode-lies update-turbo-contract FAIL
 mkdir -p "$scratch/inventory-home"
 cat > "$scratch/inventory-home/qemu-daemon-check.sh" <<'EOF'
 #!/usr/bin/env bash
