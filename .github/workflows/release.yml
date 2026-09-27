@@ -390,42 +390,61 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-  smoke-linux:
-    name: "Staged ${{ matrix.distro }} release smoke"
-    needs: [build-arch, build-fedora]
+  smoke-arch:
+    name: "Staged Arch release smoke"
+    needs: build-arch
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - distro: arch
-            artifact: arch-build
-          - distro: fedora
-            artifact: fedora-build
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ matrix.artifact }}
+          name: arch-build
           path: staged-release
-      - name: Exercise staged Linux release
-        env:
-          DISTRO: ${{ matrix.distro }}
+      - name: Exercise staged Arch release
         run: |
           set -euo pipefail
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
           test -n "$VERSION"
           ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
-            --distro "$DISTRO" --evidence-dir staged-linux-smoke-evidence
-      - name: Preserve staged Linux smoke evidence
+            --distro arch --evidence-dir staged-arch-smoke-evidence
+      - name: Preserve staged Arch smoke evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: staged-linux-smoke-${{ matrix.distro }}
-          path: staged-linux-smoke-evidence/
+          name: staged-linux-smoke-arch
+          path: staged-arch-smoke-evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  smoke-fedora:
+    name: "Staged Fedora release smoke"
+    needs: build-fedora
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fedora-build
+          path: staged-release
+      - name: Exercise staged Fedora release
+        run: |
+          set -euo pipefail
+          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          test -n "$VERSION"
+          ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
+            --distro fedora --evidence-dir staged-fedora-smoke-evidence
+      - name: Preserve staged Fedora smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staged-linux-smoke-fedora
+          path: staged-fedora-smoke-evidence/
           retention-days: 14
           if-no-files-found: error
 
@@ -479,7 +498,7 @@ jobs:
     name: "Create Release"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: [build-arch, build-debian, build-ubuntu, build-fedora, build-macos, smoke-apt, smoke-linux, smoke-macos]
+    needs: [build-arch, build-debian, build-ubuntu, build-fedora, build-macos, smoke-apt, smoke-arch, smoke-fedora, smoke-macos]
     permissions:
       contents: write
       id-token: write

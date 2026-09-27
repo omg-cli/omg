@@ -115,12 +115,17 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
     def test_every_rebuilt_release_platform_is_smoked_before_publication(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
         publish = job_block(release, 'release')
-        self.assertIn('smoke-apt, smoke-linux, smoke-macos]', publish)
-        linux = job_block(release, 'smoke-linux')
-        for distro, artifact in (('arch', 'arch-build'), ('fedora', 'fedora-build')):
+        self.assertIn('smoke-apt, smoke-arch, smoke-fedora, smoke-macos]', publish)
+        for distro in ('arch', 'fedora'):
             with self.subTest(distro=distro):
-                self.assertIn(f'distro: {distro}\n            artifact: {artifact}', linux)
-        self.assertIn('--staged-dir staged-release', linux)
+                linux = job_block(release, f'smoke-{distro}')
+                other = 'fedora' if distro == 'arch' else 'arch'
+                self.assertIn(f'needs: build-{distro}', linux)
+                self.assertNotIn(f'build-{other}', linux)
+                self.assertIn(f'name: {distro}-build', linux)
+                self.assertIn('--staged-dir staged-release', linux)
+                self.assertIn(f'--distro {distro}', linux)
+                self.assertIn(f'name: staged-linux-smoke-{distro}', linux)
         macos = job_block(release, 'smoke-macos')
         self.assertIn('name: macos-build', macos)
         self.assertIn('needs.build-macos.outputs.archive_sha256', macos)
