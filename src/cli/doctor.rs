@@ -36,6 +36,8 @@ const HOMEBREW_MIRROR_ENDPOINTS: &[(&str, &str)] = &[
     ("GitHub", "https://github.com"),
 ];
 const HOMEBREW_DNS_HOSTS: &[&str] = &["formulae.brew.sh", "github.com"];
+#[cfg(any(feature = "macos", target_os = "macos"))]
+const HOMEBREW_API_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 fn mirror_status_is_issue(status: reqwest::StatusCode) -> bool {
     !status.is_success() && !status.is_redirection()
@@ -726,20 +728,78 @@ fn network_targets(
     }
 }
 
+#[cfg(any(feature = "macos", target_os = "macos"))]
+async fn validate_homebrew_api_response(
+    mut response: reqwest::Response,
+    kind: crate::package_managers::homebrew::HomebrewIndexKind,
+    limit: usize,
+) -> Result<()> {
+    // The current official formula and cask indexes are about 31 and 19 MiB.
+    // Bound decoded bytes as well as the advertised length so compression or
+    // a misbehaving server cannot turn a Doctor probe into an unbounded read.
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length <= limit as u64),
+        "Homebrew API response exceeds {limit} bytes"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            chunk.len() <= limit - body.len(),
+            "Homebrew API response exceeds {limit} bytes"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    crate::package_managers::homebrew::validate_homebrew_index(kind, &body)
+}
+
 async fn check_network(distro: Distro) -> usize {
-    let client = shared_client();
     let mut issues = 0;
     let (endpoints, dns_hosts) = network_targets(distro);
 
     for (name, url) in endpoints {
         let start = std::time::Instant::now();
-        let result = tokio::time::timeout(Duration::from_secs(5), client.get(*url).send()).await;
+        let is_homebrew_index = matches!(distro, Distro::MacOS)
+            && matches!(*name, "Homebrew formula API" | "Homebrew cask API");
+        // The shared client has a 15-second request timeout. Full indexes
+        // need the same read-stall-aware download client as the live backend.
+        let client = if is_homebrew_index {
+            crate::core::http::download_client()
+        } else {
+            shared_client()
+        };
+        // Full Homebrew indexes are tens of MiB. This longer bound applies
+        // only to the opt-in API validation, including its response body.
+        let deadline = if is_homebrew_index {
+            Duration::from_mins(3)
+        } else {
+            Duration::from_secs(5)
+        };
+        let result = tokio::time::timeout(deadline, async {
+            let response = client.get(*url).send().await?;
+            let status = response.status();
+            #[cfg(any(feature = "macos", target_os = "macos"))]
+            if is_homebrew_index && status.is_success() {
+                let kind = match *name {
+                    "Homebrew formula API" => {
+                        crate::package_managers::homebrew::HomebrewIndexKind::Formula
+                    }
+                    "Homebrew cask API" => {
+                        crate::package_managers::homebrew::HomebrewIndexKind::Cask
+                    }
+                    _ => unreachable!("Homebrew index name was checked above"),
+                };
+                validate_homebrew_api_response(response, kind, HOMEBREW_API_BODY_LIMIT).await?;
+            }
+            Ok::<_, anyhow::Error>(status)
+        })
+        .await;
 
         match result {
-            Ok(Ok(response)) => {
+            Ok(Ok(status)) => {
                 let latency = start.elapsed().as_millis();
-                let status = response.status();
-                if mirror_status_is_issue(status) {
+                if mirror_status_is_issue(status) || (is_homebrew_index && !status.is_success()) {
                     println!(
                         "  {} {} (HTTP {})",
                         style::warning("⚠"),
@@ -1447,6 +1507,49 @@ mod tests {
 
     #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
     #[tokio::test]
+    async fn homebrew_doctor_matches_backend_selected_repository_cellar() {
+        let root = tempfile::tempdir().expect("temporary prefix");
+        let prefix = root.path();
+        let primary = prefix.join("Cellar");
+        let fallback = prefix.join("Homebrew/Cellar");
+        let caskroom = prefix.join("Caskroom");
+        let script = "#!/bin/sh\nprefix=${0%/bin/brew}\ncase \"$1\" in\n  --prefix) printf '%s\\n' \"$prefix\";;\n  --cellar) printf '%s/Homebrew/Cellar\\n' \"$prefix\";;\n  --caskroom) printf '%s/Caskroom\\n' \"$prefix\";;\n  *) exit 64;;\nesac\n";
+        let brew = fake_brew(prefix, script);
+        std::fs::create_dir_all(fallback.join("wget/1.0"))
+            .expect("fallback inventory contains a package");
+        assert_eq!(
+            check_homebrew_paths(
+                &brew,
+                [
+                    ("--prefix", prefix),
+                    ("--cellar", fallback.as_path()),
+                    ("--caskroom", caskroom.as_path()),
+                ],
+            )
+            .await,
+            0,
+            "Doctor must validate the fallback inventory selected by the backend"
+        );
+
+        std::fs::create_dir_all(primary.join("curl/2.0"))
+            .expect("prefix inventory contains a package");
+        assert_eq!(
+            check_homebrew_paths(
+                &brew,
+                [
+                    ("--prefix", prefix),
+                    ("--cellar", primary.as_path()),
+                    ("--caskroom", caskroom.as_path()),
+                ],
+            )
+            .await,
+            1,
+            "a mismatched nonempty prefix Cellar must remain an issue"
+        );
+    }
+
+    #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
+    #[tokio::test]
     async fn homebrew_doctor_bounds_hung_probe_and_rejects_bad_output() {
         let root = tempfile::tempdir().expect("temporary prefix");
         let brew = fake_brew(
@@ -1513,6 +1616,41 @@ mod tests {
         } else {
             server.abort();
             panic!("local probe server did not finish");
+        }
+    }
+
+    #[cfg(any(feature = "macos", target_os = "macos"))]
+    #[tokio::test]
+    async fn homebrew_api_probe_requires_bounded_typed_complete_json() {
+        use crate::package_managers::homebrew::HomebrewIndexKind;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local Homebrew API client");
+        const FORMULA: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[{\"name\":\"wget\",\"versions\":{\"stable\":\"1.0\"}}]";
+        const CASK: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[{\"token\":\"firefox\",\"desc\":null,\"version\":\"1.0\"}]";
+        const HTML: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<html>proxy login</html>";
+        const TRUNCATED: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[{\"name\":\"wget\"";
+        const EMPTY: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[]";
+        const EXCESS_LENGTH: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n";
+        for (wire, kind, limit, should_pass) in [
+            (FORMULA, HomebrewIndexKind::Formula, 1024, true),
+            (CASK, HomebrewIndexKind::Cask, 1024, true),
+            (FORMULA, HomebrewIndexKind::Cask, 1024, false),
+            (CASK, HomebrewIndexKind::Formula, 1024, false),
+            (HTML, HomebrewIndexKind::Formula, 1024, false),
+            (TRUNCATED, HomebrewIndexKind::Formula, 1024, false),
+            (EMPTY, HomebrewIndexKind::Cask, 1024, false),
+            (FORMULA, HomebrewIndexKind::Formula, 32, false),
+            (EXCESS_LENGTH, HomebrewIndexKind::Formula, 1024, false),
+        ] {
+            let (url, server) = serve_probe_response(wire, Duration::ZERO).await;
+            let response = client.get(&url).send().await.expect("local API response");
+            let result = validate_homebrew_api_response(response, kind, limit).await;
+            assert_eq!(result.is_ok(), should_pass, "fixture {wire:?}: {result:?}");
+            finish_probe_server(server).await;
         }
     }
 

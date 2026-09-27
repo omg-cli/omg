@@ -161,6 +161,31 @@ struct CaskInfo {
     version: Option<String>,
 }
 
+/// The two full-index responses consumed by the live Homebrew backend.
+#[derive(Clone, Copy)]
+pub(crate) enum HomebrewIndexKind {
+    Formula,
+    Cask,
+}
+
+/// Doctor uses the live backend's typed response shapes rather than treating
+/// an HTTP 200 with an HTML login page or partial JSON as a healthy API.
+pub(crate) fn validate_homebrew_index(kind: HomebrewIndexKind, body: &[u8]) -> Result<()> {
+    match kind {
+        HomebrewIndexKind::Formula => {
+            let formulas: Vec<FormulaInfo> =
+                serde_json::from_slice(body).context("Homebrew formula index is not parseable")?;
+            anyhow::ensure!(!formulas.is_empty(), "Homebrew formula index is empty");
+        }
+        HomebrewIndexKind::Cask => {
+            let casks: Vec<CaskInfo> =
+                serde_json::from_slice(body).context("Homebrew cask index is not parseable")?;
+            anyhow::ensure!(!casks.is_empty(), "Homebrew cask index is empty");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct HomebrewApiEnvelope {
     payload: String,
@@ -248,7 +273,12 @@ impl HomebrewPackageManager {
     #[must_use]
     pub fn new() -> Self {
         let prefix = Self::detect_prefix();
-        let cellar = prefix.join(CELLAR_DIR);
+        let repository = if prefix == Path::new(HOMEBREW_PREFIX_INTEL) {
+            prefix.join("Homebrew")
+        } else {
+            prefix.clone()
+        };
+        let cellar = Self::select_cellar(&prefix, &repository);
 
         Self {
             prefix,
@@ -279,6 +309,20 @@ impl HomebrewPackageManager {
 
     pub(crate) fn brew_executable(&self) -> PathBuf {
         self.prefix.join("bin").join("brew")
+    }
+
+    /// Homebrew uses the repository's Cellar when the prefix Cellar has not
+    /// been created yet. Keep any existing prefix entry, including a broken
+    /// symlink or unreadable directory, so Doctor can report it rather than
+    /// silently switching the inventory to a different location.
+    fn select_cellar(prefix: &Path, repository: &Path) -> PathBuf {
+        let cellar = prefix.join(CELLAR_DIR);
+        match std::fs::symlink_metadata(&cellar) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                repository.join(CELLAR_DIR)
+            }
+            _ => cellar,
+        }
     }
 
     /// Detect Homebrew installation prefix
@@ -1289,6 +1333,37 @@ mod tests {
         assert_eq!(
             HomebrewPackageManager::select_prefix(&preferred, &alternate),
             alternate
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cellar_fallback_is_the_inventory_the_backend_reads() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let prefix = root.path().join("prefix");
+        let repository = prefix.join("Homebrew");
+        let fallback = repository.join(CELLAR_DIR);
+        std::fs::create_dir_all(fallback.join("wget/1.0"))?;
+
+        let selected = HomebrewPackageManager::select_cellar(&prefix, &repository);
+        assert_eq!(selected, fallback);
+        let manager = HomebrewPackageManager {
+            prefix: prefix.clone(),
+            cellar: selected,
+            cache: Arc::new(RwLock::new(None)),
+            client: crate::core::http::download_client().clone(),
+        };
+        let installed = manager.read_installed_packages().await?;
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].name, "wget");
+        assert_eq!(installed[0].version, "1.0");
+
+        let primary = prefix.join(CELLAR_DIR);
+        std::fs::create_dir_all(primary.join("curl/2.0"))?;
+        assert_eq!(
+            HomebrewPackageManager::select_cellar(&prefix, &repository),
+            primary,
+            "a present prefix Cellar must not be hidden by the fallback"
         );
         Ok(())
     }
