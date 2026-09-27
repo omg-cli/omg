@@ -807,15 +807,27 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
             healthy += '  Found dependency: sudo\n'
         if distro in ('debian', 'ubuntu'):
             healthy += '  Found dependency: apt-get\n'
-        healthy_product = ('printf %s ' + shlex.quote(healthy) + '\n'
-                   'if command -v git >/dev/null; then echo "  Optional tool available: git"; '
-                   'else echo "  Optional tool unavailable: git (project and Git integration)"; fi\n'
-                   'if [[ "$1" == doctor ]] && [[ "' + distro + '" == arch ]]; then '
-                   'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
-                   'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
+        healthy_prefix = ('printf %s ' + shlex.quote(healthy) + '\n'
+                          'if command -v git >/dev/null; then echo "  Optional tool available: git"; '
+                          'else echo "  Optional tool unavailable: git (project and Git integration)"; fi\n'
+                          'if [[ "$1" == doctor ]] && [[ "' + distro + '" == arch ]]; then '
+                          'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
+                          'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
+        healthy_product = healthy_prefix + 'printf "  PATH configured correctly\\nSystem is healthy with warnings.\\n"\n'
         fault_guard = ('if [[ -n "${OMG_PACMAN_DB_DIR:-}" ]]; then '
                        'printf "  ALPM local package database inconsistent (fixture): missing files\\n"; exit 1; fi\n')
-        product = fault_guard + healthy_product
+        proxy_logic = ('if [[ "${HTTPS_PROXY:-}" == http://127.0.0.1:1 ]]; then\n'
+                   '  printf "  Connectivity probes failed (controlled proxy refusal)\\n"\n'
+                   '  if [[ ":$PATH:" == *":${0%/*}:"* ]]; then\n'
+                   '    printf "  PATH configured correctly\\n→ Found 1 issue(s). Please review.\\n"\n'
+                   '    printf "Error: doctor found 1 health issue(s)\\n" >&2\n'
+                   '  else\n'
+                   '    printf "  omg executable not found on PATH\\n→ Found 2 issue(s). Please review.\\n"\n'
+                   '    printf "Error: doctor found 2 health issue(s)\\n" >&2\n'
+                   '  fi\n'
+                   '  exit 1\n'
+                   'fi\n')
+        product = fault_guard + healthy_prefix + proxy_logic + 'printf "  PATH configured correctly\\nSystem is healthy with warnings.\\n"\n'
         native = {'pacman': 'case "$1" in -Dk) exit 0 ;; -Qq) printf "one\\ntwo\\n" ;; *) exit 17 ;; esac\n'}
         result, evidence, logs = self.run_inventory(product, rows, native_commands=native, distro=distro)
         if distro == 'fedora':
@@ -825,6 +837,18 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
         else:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(evidence[0]['result'], 'PASS')
+            for false_green in (
+                product.replace('  omg executable not found on PATH',
+                                '  PATH configured correctly'),
+                product.replace('Found 2 issue(s)', 'Found 1 issue(s)')
+                       .replace('doctor found 2 health issue(s)',
+                                'doctor found 1 health issue(s)'),
+            ):
+                result, evidence, logs = self.run_inventory(
+                    false_green, rows, native_commands=native, distro=distro)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                self.assertIn('controlled Doctor PATH probe', logs['doctor.log'])
         if distro == 'arch':
             silent_fault = healthy_product
             result, evidence, logs = self.run_inventory(silent_fault, rows,
