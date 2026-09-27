@@ -139,11 +139,11 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
             issues += 1;
         }
         PathStatus::Shadowed(found) => {
+            let found = style::sanitize_terminal_text(&found.display().to_string());
             println!(
                 "  {}",
                 style::error(&format!(
-                    "PATH resolves a different omg executable first: {}",
-                    found.display()
+                    "PATH resolves a different omg executable first: \"{found}\""
                 ))
             );
             issues += 1;
