@@ -55,7 +55,7 @@ privacy-status	["privacy","status"]	read	0	pass	privacy-opt-out	hermetic	hermeti
 privacy-export	["privacy","export","--output","${ROOT}/privacy.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	artifact:privacy.json	tempdir-drop
 privacy-opt-in	["privacy","opt-in"]	isolated-write	0	pass	privacy-opt-out	hermetic	hermetic:pass	privacy-opted-in	tempdir-drop
 privacy-status-enabled	["privacy","status"]	read	0	pass	privacy-opt-in	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	privacy-status-enabled	tempdir-drop
-generate-man	["generate-man","--output","${ROOT}/man"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+generate-man	["generate-man","--output","${ROOT}/man"]	isolated-write	0	pass	-	hermetic	hermetic:pass	man-pages-generated	tempdir-drop
 daemon-status	["daemon-status"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 completions	["completions","bash","--stdout"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 complete	["complete","--shell","bash","--current","se","--last","omg"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -76,7 +76,7 @@ audit-slsa	["audit","slsa","${ROOT}/project/README.md"]	controlled-error	2	pass	
 audit-slsa-identity	["audit","slsa","--certificate-identity","dev@example.invalid","${ROOT}/project/README.md"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-licenses	["audit","licenses","--format","json"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-audit-json	tempdir-drop
 audit-fix	["audit","fix","--dry-run"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
-audit-export	["audit","export","--output","${ROOT}/audit-evidence"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit-export	["audit","export","--output","${ROOT}/audit-evidence"]	isolated-write	1	pass	-	hermetic	hermetic:pass	audit-export-absolute-refusal	tempdir-drop
 audit-eol	["audit","eol"]	read	0	pass	-	hermetic	hermetic:pass	audit-eol-state	tempdir-drop
 run	["run","smoke","--using","make"]	read	0	pass	-	hermetic	hermetic:pass	task-executed	tempdir-drop
 new	["new","rust","smoke-app"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -120,7 +120,7 @@ account-unlink	["account","unlink"]	isolated-write	0	pass	-	hermetic	hermetic:pa
 fleet-status	["fleet","status"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 enterprise-reports	["enterprise","reports"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 enterprise-policy-show	["enterprise","policy","show"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-enterprise-audit-export	["enterprise","audit-export","--output","${ROOT}/enterprise-evidence"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+enterprise-audit-export	["enterprise","audit-export","--output","${ROOT}/enterprise-evidence"]	controlled-error	1	pass	-	hermetic	hermetic:pass	audit-export-absolute-refusal	tempdir-drop
 enterprise-license-scan	["enterprise","license-scan"]	controlled-error	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-enterprise-text	tempdir-drop
 history	["history","--limit","3"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 rollback	["rollback"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -161,11 +161,11 @@ audit-log-flags	["audit","log","--limit","3","--severity","error","--export","${
 audit-licenses-filter-policy	["audit","licenses","--format","json","--filter","mit","--check-policy"]	read	1	pass	-	hermetic	hermetic:pass	license-audit-mit-json	tempdir-drop
 audit-licenses-export	["audit","licenses","--format","csv","--export","${ROOT}/licenses-export.csv"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-audit-csv	tempdir-drop
 audit-fix-flags	["audit","fix","--dry-run","--yes","--min-severity","high"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
-audit-export-flags	["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit-export-flags	["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]	isolated-write	1	pass	-	hermetic	hermetic:pass	audit-export-absolute-refusal	tempdir-drop
 run-parallel	["run","--parallel","parallel-one,parallel-two"]	read	0	pass	-	hermetic	hermetic:pass	parallel-tasks-executed	tempdir-drop
 run-all	["run","--all","smoke"]	read	0	pass	-	hermetic	hermetic:pass	all-tasks-executed	tempdir-drop
 team-golden-create-flags	["team","golden-path","create","flagged","--node","20","--python","3.12","--packages","ripgrep"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	-	tempdir-drop
-team-compliance-export	["team","compliance","--export","${ROOT}/compliance.json"]	controlled-error	1	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
+team-compliance-export	["team","compliance","--export","${ROOT}/compliance.json"]	controlled-error	1	pass	team-init	hermetic	hermetic:pass	team-compliance-no-report	tempdir-drop
 team-compliance-enforce	["team","compliance","--enforce"]	read	0	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 enterprise-reports-type	["enterprise","reports","--report-type","quarterly"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 enterprise-policy-scope	["enterprise","policy","show","--scope","global"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
