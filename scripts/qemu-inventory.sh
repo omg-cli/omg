@@ -977,6 +977,48 @@ check_runtime_state() {
     return 2
   fi
 }
+check_golden_path_state() {
+  local assertion=$1 output=$2 store="$OMG_CONFIG_DIR/golden-paths.toml"
+  if [[ ! -f "$store" || -L "$store" ]] || ! python3 - "$assertion" "$store" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+assertion, path = sys.argv[1:]
+document = tomllib.loads(pathlib.Path(path).read_text())
+templates = document.get('templates')
+valid = set(document) == {'templates'} and isinstance(templates, list)
+if assertion == 'golden-path-deleted':
+    valid = valid and templates == []
+else:
+    valid = valid and len(templates) == 1 and isinstance(templates[0], dict)
+    if valid:
+        template = templates[0]
+        valid = (set(template) == {'name', 'runtimes', 'packages', 'created_at'}
+                 and template['name'] == 'smoke'
+                 and template['runtimes'] == {}
+                 and template['packages'] == []
+                 and type(template['created_at']) is int
+                 and template['created_at'] > 0)
+if not valid:
+    sys.exit(1)
+PY
+  then
+    printf 'assertion failed: golden path store lacks the expected private template state\n' >&2
+    return 1
+  fi
+  case "$assertion" in
+    golden-path-created)
+      [[ $(grep -Fc "Golden path 'smoke' created!" "$output") == 1 ]] ;;
+    golden-path-listed)
+      [[ $(grep -Fc '1 custom template(s)' "$output") == 1 \
+        && $(grep -Fc 'smoke - runtimes: [], packages: 0' "$output") == 1 ]] ;;
+    golden-path-deleted)
+      [[ $(grep -Fc "Deleted template 'smoke'" "$output") == 1 ]] \
+        && ! grep -Fq "Template 'smoke' not found" "$output" ;;
+    *) return 2 ;;
+  esac || { printf 'assertion failed: golden path output disagrees with the private template state\n' >&2; return 1; }
+}
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
   if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
@@ -1244,6 +1286,8 @@ PY
         fi ;;
       config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults)
         check_config_oracle "$assertion" "$stdout" || return 1 ;;
+      golden-path-created|golden-path-listed|golden-path-deleted)
+        check_golden_path_state "$assertion" "$stdout" || return 1 ;;
       privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled)
         check_privacy_oracle "$assertion" "$stdout" || return 1 ;;
       hooks-installed|hooks-absent)
@@ -1593,7 +1637,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv|container-shell-argv|container-build-argv) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv|container-shell-argv|container-build-argv) ;; *) exit 2 ;; esac
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-remove:workspace-project-removed|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
@@ -1651,6 +1695,15 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     snapshot-create|migrate-export|migrate-import|env-capture|env-check|team-status|team-push|team-pull)
       [[ "$a" == "fingerprint:$id" ]] || exit 2 ;;
     *) [[ "$a" != fingerprint:* ]] || exit 2 ;;
+  esac
+  case "$id" in
+    team-golden-create)
+      [[ "$a" == golden-path-created && "$r" == team-init ]] || exit 2 ;;
+    team-golden-list)
+      [[ "$a" == golden-path-listed && "$r" == team-golden-create ]] || exit 2 ;;
+    team-golden-delete)
+      [[ "$a" == golden-path-deleted && "$r" == team-golden-list ]] || exit 2 ;;
+    *) [[ "$a" != golden-path-created && "$a" != golden-path-listed && "$a" != golden-path-deleted ]] || exit 2 ;;
   esac
   case "$id" in
     config-set)
@@ -1909,6 +1962,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == fingerprint:* || "$case" == team-init || "$case" == snapshot-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/fingerprint-config\" OMG_DATA_DIR=\"\$rowdir/fingerprint-data\" OMG_CACHE_DIR=\"\$rowdir/fingerprint-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
   fi
+  if [[ "$case" == team-golden-* ]]; then
+    remote+="; export OMG_CONFIG_DIR=\"\$rowdir/golden-config\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
+  fi
   if [[ "$assertions" == doctor-eol-state || "$assertions" == audit-eol-state ]]; then
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: EOL fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/eol-config\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/eol-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
     remote+="; mkdir -p \"\$OMG_DATA_DIR/versions/node/16.20.2\" \"\$OMG_DATA_DIR/versions/python/3.12.14\"; ln -s 16.20.2 \"\$OMG_DATA_DIR/versions/node/current\"; ln -s 3.12.14 \"\$OMG_DATA_DIR/versions/python/current\""
@@ -1963,7 +2019,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; mkdir -p project/critical; printf '%s%s\n' '-----BEGIN ' 'PRIVATE KEY-----' > project/critical/key.pem"
   fi
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
-  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_privacy_oracle); $(declare -f check_product_output)"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_product_output)"
   if [[ "$assertions" == package-dry-run-* ]]; then
     remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f check_native_remove_preview)"
   fi

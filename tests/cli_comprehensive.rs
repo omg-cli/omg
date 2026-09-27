@@ -627,6 +627,9 @@ enum Assertion {
     ConfigValidatePersisted,
     ConfigPathIsolated,
     ConfigResetDefaults,
+    GoldenPathCreated,
+    GoldenPathListed,
+    GoldenPathDeleted,
     PrivacyOptedOut,
     PrivacyStatusDisabled,
     PrivacyOptedIn,
@@ -717,6 +720,9 @@ impl Assertion {
             "config-validate-persisted" => Self::ConfigValidatePersisted,
             "config-path-isolated" => Self::ConfigPathIsolated,
             "config-reset-defaults" => Self::ConfigResetDefaults,
+            "golden-path-created" => Self::GoldenPathCreated,
+            "golden-path-listed" => Self::GoldenPathListed,
+            "golden-path-deleted" => Self::GoldenPathDeleted,
             "privacy-opted-out" => Self::PrivacyOptedOut,
             "privacy-status-disabled" => Self::PrivacyStatusDisabled,
             "privacy-opted-in" => Self::PrivacyOptedIn,
@@ -1436,8 +1442,14 @@ fn behavior_inventory_runs_in_hermetic_state() {
             case.id.as_str(),
             "privacy-opt-out" | "privacy-status" | "privacy-opt-in"
         );
+        let golden_path_case = matches!(
+            case.id.as_str(),
+            "team-golden-create" | "team-golden-list" | "team-golden-delete"
+        );
         let config_dir = project.path().join(if privacy_case {
             "privacy-state"
+        } else if golden_path_case {
+            "golden-path-state"
         } else if case.id == "config-path" {
             "config-path-only"
         } else {
@@ -1456,7 +1468,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
         ];
-        if case.id.starts_with("config-") || privacy_case {
+        if case.id.starts_with("config-") || privacy_case || golden_path_case {
             command_env.push((
                 "OMG_CONFIG_DIR",
                 config_dir.to_str().expect("UTF-8 config path"),
@@ -1611,6 +1623,74 @@ fn behavior_inventory_runs_in_hermetic_state() {
         };
         for assertion in &case.assertions {
             match assertion {
+                Assertion::GoldenPathCreated
+                | Assertion::GoldenPathListed
+                | Assertion::GoldenPathDeleted => {
+                    let stored = std::fs::read_to_string(config_dir.join("golden-paths.toml"))
+                        .ok()
+                        .and_then(|text| text.parse::<toml::Value>().ok());
+                    let templates = stored
+                        .as_ref()
+                        .and_then(|value| value.get("templates"))
+                        .and_then(toml::Value::as_array);
+                    let shape_ok = stored
+                        .as_ref()
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|document| {
+                            document.len() == 1 && document.contains_key("templates")
+                        });
+                    let state_ok = match assertion {
+                        Assertion::GoldenPathDeleted => {
+                            shape_ok && templates.is_some_and(Vec::is_empty)
+                        }
+                        _ => {
+                            shape_ok
+                                && templates.is_some_and(|items| {
+                                    items.len() == 1
+                                        && items[0].as_table().is_some_and(|item| {
+                                            item.len() == 4
+                                                && item.get("name").and_then(toml::Value::as_str)
+                                                    == Some("smoke")
+                                                && item
+                                                    .get("runtimes")
+                                                    .and_then(toml::Value::as_table)
+                                                    .is_some_and(|runtimes| runtimes.is_empty())
+                                                && item
+                                                    .get("packages")
+                                                    .and_then(toml::Value::as_array)
+                                                    .is_some_and(Vec::is_empty)
+                                                && item
+                                                    .get("created_at")
+                                                    .and_then(toml::Value::as_integer)
+                                                    .is_some_and(|timestamp| timestamp > 0)
+                                        })
+                                })
+                        }
+                    };
+                    let output_ok = match assertion {
+                        Assertion::GoldenPathCreated => {
+                            result.stdout.matches("Golden path 'smoke' created!").count() == 1
+                        }
+                        Assertion::GoldenPathListed => {
+                            result.stdout.matches("1 custom template(s)").count() == 1
+                                && result
+                                    .stdout
+                                    .matches("smoke - runtimes: [], packages: 0")
+                                    .count()
+                                    == 1
+                        }
+                        Assertion::GoldenPathDeleted => {
+                            result.stdout.matches("Deleted template 'smoke'").count() == 1
+                                && !result.stdout.contains("Template 'smoke' not found")
+                        }
+                        _ => unreachable!(),
+                    };
+                    if !state_ok || !output_ok {
+                        issues.push(format!(
+                            "golden path {assertion:?} lacks the expected private state or output"
+                        ));
+                    }
+                }
                 Assertion::TaskExecuted => {
                     if !std::fs::read_to_string(project.path().join("smoke-task.marker"))
                         .is_ok_and(|contents| contents == "omg-qemu-smoke-task")

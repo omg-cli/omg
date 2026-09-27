@@ -34,6 +34,58 @@ while :; do sleep .05; done
         self.assertEqual(result.returncode, 0, logs)
         self.assertEqual(evidence[0]['result'], 'PASS', logs)
 
+    @unittest.skipIf(os.name == 'nt', 'Guest oracle needs POSIX Bash and Python 3')
+    def test_golden_path_oracle_rejects_false_success_and_stale_state(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        oracle = source[source.index('check_golden_path_state() {'):
+                        source.index('check_product_output() {')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'config'
+            config.mkdir()
+            store = config / 'golden-paths.toml'
+            output = root / 'output.log'
+
+            def check(assertion, contents, message):
+                if contents is None:
+                    store.unlink(missing_ok=True)
+                else:
+                    store.write_text(contents, encoding='utf-8')
+                output.write_text(message, encoding='utf-8')
+                return subprocess.run(
+                    ['bash', '-c', oracle + '\n'
+                     + 'export OMG_CONFIG_DIR="$PWD/config"\n'
+                     + 'check_golden_path_state "$1" output.log', '_', assertion],
+                    cwd=root, capture_output=True, text=True)
+
+            template = ('[[templates]]\nname = "smoke"\ncreated_at = 1700000000\n'
+                        'packages = []\n[templates.runtimes]\n')
+            good = {
+                'golden-path-created': "Golden path 'smoke' created!\n",
+                'golden-path-listed': '1 custom template(s)\nsmoke - runtimes: [], packages: 0\n',
+                'golden-path-deleted': "Deleted template 'smoke'\n",
+            }
+            for assertion, message in good.items():
+                state = 'templates = []\n' if assertion == 'golden-path-deleted' else template
+                with self.subTest(assertion=assertion):
+                    self.assertEqual(check(assertion, state, message).returncode, 0)
+                    self.assertNotEqual(check(assertion, None, message).returncode, 0)
+                    self.assertNotEqual(check(assertion, state, '').returncode, 0)
+            for state in (
+                template.replace('"smoke"', '"wrong"'),
+                template.replace('1700000000', '0'),
+                template + template,
+                template.replace('packages = []', 'packages = ["curl"]'),
+                'templates = []\n',
+            ):
+                with self.subTest(state=state):
+                    self.assertNotEqual(check('golden-path-created', state,
+                                              good['golden-path-created']).returncode, 0)
+            self.assertNotEqual(check('golden-path-deleted', template,
+                                      good['golden-path-deleted']).returncode, 0)
+            self.assertNotEqual(check('golden-path-listed', template,
+                                      'No custom templates\n').returncode, 0)
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_tree_install_remove_rows_reject_collateral_package_and_reason_changes(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
