@@ -40,9 +40,34 @@ impl ConfirmationAction {
         match self {
             Self::InstallPackage(package_name) => format!("Install {package_name}?"),
             Self::UpdateSystem => "Install all available package updates?".to_string(),
-            Self::CleanCache => "Remove package caches and orphaned packages?".to_string(),
+            Self::CleanCache => "Remove downloaded package caches?".to_string(),
             Self::RemoveOrphans => "Remove every orphaned package?".to_string(),
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CacheCleanRequest {
+    orphans: bool,
+    cache: bool,
+    aur: bool,
+    all: bool,
+}
+
+fn cache_clean_request(backend: crate::package_managers::Backend) -> Result<CacheCleanRequest> {
+    use crate::package_managers::Backend;
+    match backend {
+        Backend::Arch | Backend::Fedora => Ok(CacheCleanRequest {
+            orphans: false,
+            cache: true,
+            aur: false,
+            all: false,
+        }),
+        Backend::Debian => {
+            anyhow::bail!("Package cache cleanup is not supported on the APT backend")
+        }
+        Backend::MacOS => anyhow::bail!("Package cache cleanup is not implemented for Homebrew"),
+        Backend::Mock => anyhow::bail!("Package cache cleanup is unavailable in test mode"),
     }
 }
 
@@ -470,7 +495,16 @@ impl App {
 
     pub async fn clean_cache() -> Result<()> {
         // TUI button press is the confirmation; skip the CLI prompt.
-        crate::cli::packages::clean(true, true, true, false, false, true).await
+        let request = cache_clean_request(crate::package_managers::resolve_backend()?)?;
+        crate::cli::packages::clean(
+            request.orphans,
+            request.cache,
+            request.aur,
+            request.all,
+            false,
+            true,
+        )
+        .await
     }
 
     #[allow(
@@ -754,6 +788,35 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_button_requests_only_cache_on_supported_backends() {
+        use crate::package_managers::Backend;
+
+        assert_eq!(
+            ConfirmationAction::CleanCache.prompt(),
+            "Remove downloaded package caches?"
+        );
+        for backend in [Backend::Arch, Backend::Fedora] {
+            assert_eq!(
+                cache_clean_request(backend).unwrap(),
+                CacheCleanRequest {
+                    orphans: false,
+                    cache: true,
+                    aur: false,
+                    all: false,
+                }
+            );
+        }
+        for (backend, guidance) in [
+            (Backend::Debian, "APT backend"),
+            (Backend::MacOS, "Homebrew"),
+            (Backend::Mock, "test mode"),
+        ] {
+            let error = cache_clean_request(backend).unwrap_err().to_string();
+            assert!(error.contains(guidance), "{backend:?}: {error}");
+        }
+    }
 
     fn test_app() -> App {
         let mut app = App::new_detached().with_tab(Tab::Packages);

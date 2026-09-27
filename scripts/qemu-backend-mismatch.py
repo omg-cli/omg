@@ -29,6 +29,25 @@ DATABASE_PATHS = {
     "fedora": ("/usr/lib/sysimage/rpm", "/var/lib/rpm"),
 }
 FAKE_ID = {"arch": "fedora", "debian": "fedora", "ubuntu": "fedora", "fedora": "debian"}
+NATIVE_EXECUTABLES = {
+    "arch": ("pacman", "pacman-conf"),
+    "debian": ("apt", "apt-get", "apt-cache", "dpkg", "dpkg-query"),
+    "ubuntu": ("apt", "apt-get", "apt-cache", "dpkg", "dpkg-query"),
+    "fedora": ("dnf", "dnf5", "rpm", "rpmdb"),
+}
+PROBES = (
+    ("doctor", ("doctor",)),
+    ("info", ("info", "bash")),
+    ("search", ("search", "bash")),
+    ("status", ("status",)),
+    ("explicit_count", ("ec",)),
+    ("install_dry_run", ("install", "--dry-run", "bash")),
+    ("remove_dry_run", ("remove", "--dry-run", "bash")),
+    ("update_check", ("update", "--check")),
+    ("clean_dry_run", ("clean", "--cache", "--dry-run")),
+    ("dash", ("dash",)),
+    ("omgd", ()),
+)
 
 
 def database_snapshot(distro):
@@ -56,6 +75,12 @@ def database_snapshot(distro):
     return digest.hexdigest()
 
 
+def native_db_access(trace_text, distro):
+    return (any(f'"{path}' in trace_text for path in DATABASE_PATHS[distro])
+            or any(re.search(rf'execve\("[^"]*/{tool}"', trace_text)
+                   for tool in NATIVE_EXECUTABLES[distro]))
+
+
 def validate_receipt(receipt, distro):
     if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
         raise ValueError("invalid backend mismatch receipt")
@@ -69,11 +94,13 @@ def validate_receipt(receipt, distro):
         raise ValueError("native package database snapshots are missing")
     if receipt.get("db_before") != receipt.get("db_after"):
         raise ValueError("native package database changed")
-    if receipt.get("info_native_db_access") is not False:
-        raise ValueError("info read the native package database")
-    for name in ("doctor", "info", "omgd"):
+    for name, _ in PROBES:
         if receipt.get(f"{name}_exit") != 1 or receipt.get(f"{name}_mismatch") is not True:
             raise ValueError(f"{name} did not fail with an actionable mismatch")
+        if receipt.get(f"{name}_native_db_access") is not False:
+            raise ValueError(f"{name} accessed the native package database")
+    if receipt.get("omgd_state_created") is not False:
+        raise ValueError("omgd created runtime or cache state")
 
 
 def run(binary_name, distro):
@@ -101,7 +128,7 @@ def run(binary_name, distro):
     os.chown(root, account.pw_uid, account.pw_gid)
     fixture = root / "os-release"
     fixture.write_text(f"ID={FAKE_ID[distro]}\nNAME=OMG-QEMU-backend-mismatch\n")
-    trace = root / "info.trace"
+    trace_probe_path = root / "preflight.trace"
     receipt = {"schema_version": 1, "distro": distro, "fixture_distro": FAKE_ID[distro],
                "complete": False, "failure_kind": "harness"}
     try:
@@ -121,23 +148,27 @@ def run(binary_name, distro):
                   "--clear-groups", "--no-new-privs", "--bounding-set=-all",
                   "--inh-caps=-all", "--ambient-caps=-all"]
         trace_probe = subprocess.run(
-            ["strace", "-f", "-qq", "-e", "trace=execve,%file", "-o", str(trace)]
+            ["strace", "--kill-on-exit", "-f", "-qq", "-e", "trace=execve,%file", "-o", str(trace_probe_path)]
             + prefix + ["/usr/bin/true"], env=env, cwd=root, capture_output=True,
             text=True, timeout=10, check=False)
-        if trace_probe.returncode != 0 or 'execve("/usr/bin/true"' not in trace.read_text():
+        if (trace_probe.returncode != 0 or not trace_probe_path.is_file()
+                or 'execve("/usr/bin/true"' not in trace_probe_path.read_text()):
             raise RuntimeError("strace fixture cannot trace a privilege-dropped command")
         expected_feature = FAKE_ID[distro]
-        for name, command in (("doctor", [str(binary), "doctor"]),
-                              ("info", [str(binary), "info", "bash"]),
-                              ("omgd", [str(daemon)])):
-            argv = prefix + command
+        for name, args in PROBES:
+            command = [str(daemon if name == "omgd" else binary), *args]
+            trace = root / f"{name}.trace"
+            argv = ["strace", "--kill-on-exit", "-f", "-qq", "-e", "trace=execve,%file", "-o", str(trace)]
+            argv += prefix + command
             command_env = env.copy()
             if name == "omgd":
                 command_env["HOME"] = str(root / "daemon-home")
-                command_env["OMG_DATA_DIR"] = str(root / "daemon-data")
+                command_env["OMG_CONFIG_DIR"] = str(root / "daemon-config")
+                command_env["OMG_CACHE_DIR"] = str(root / "daemon-cache")
+                command_env["OMG_DATA_DIR"] = str(root / "daemon-cli-data")
+                command_env["OMG_DAEMON_DATA_DIR"] = str(root / "daemon-data")
                 command_env["XDG_RUNTIME_DIR"] = str(root / "daemon-runtime")
-            if name == "info":
-                argv = ["strace", "-f", "-qq", "-e", "trace=execve,%file", "-o", str(trace)] + argv
+                command_env["OMG_SOCKET_PATH"] = str(root / "daemon-runtime/omg.sock")
             result = subprocess.run(argv, env=command_env, cwd=root, capture_output=True, text=True,
                                     timeout=45, check=False)
             output = result.stdout + result.stderr
@@ -145,28 +176,22 @@ def run(binary_name, distro):
             receipt[f"{name}_mismatch"] = ("package backend" in output.lower()
                 and f"--features {expected_feature}," in output)
             receipt[f"{name}_output"] = output[-4096:]
+            if not trace.is_file():
+                raise RuntimeError(f"{name} syscall trace is missing")
+            trace_text = trace.read_text()
+            if f'execve("{command[0]}"' not in trace_text:
+                raise RuntimeError(f"{name} syscall trace did not execute the submitted binary")
+            receipt[f"{name}_native_db_access"] = native_db_access(trace_text, distro)
+            if receipt[f"{name}_native_db_access"]:
+                raise ProductFailure(f"{name} accessed the native package database before refusing")
             if result.returncode != 1 or not receipt[f"{name}_mismatch"]:
                 raise ProductFailure(f"{name} did not refuse the wrong backend with build guidance")
-            if name == "omgd" and any((root / leaf).exists() for leaf in
-                                      ("daemon-home", "daemon-data", "daemon-runtime")):
-                raise ProductFailure("omgd created runtime state before rejecting the backend")
-
-        if not trace.is_file():
-            raise RuntimeError("info syscall trace is missing")
-        trace_text = trace.read_text()
-        if f'execve("{binary}"' not in trace_text:
-            raise RuntimeError("info syscall trace did not execute the submitted binary")
-        native_paths = DATABASE_PATHS[distro]
-        native_executables = {
-            "arch": ("pacman", "pacman-conf"),
-            "debian": ("apt", "apt-get", "apt-cache", "dpkg", "dpkg-query"),
-            "ubuntu": ("apt", "apt-get", "apt-cache", "dpkg", "dpkg-query"),
-            "fedora": ("dnf", "dnf5", "rpm", "rpmdb"),
-        }[distro]
-        receipt["info_native_db_access"] = (any(f'"{path}' in trace_text for path in native_paths)
-            or any(re.search(rf'execve\("[^"]*/{tool}"', trace_text) for tool in native_executables))
-        if receipt["info_native_db_access"]:
-            raise ProductFailure("info accessed the native package database before refusing")
+            if name == "omgd":
+                receipt["omgd_state_created"] = any((root / leaf).exists() for leaf in
+                    ("daemon-home", "daemon-config", "daemon-cache", "daemon-cli-data",
+                     "daemon-data", "daemon-runtime"))
+                if receipt["omgd_state_created"]:
+                    raise ProductFailure("omgd created socket, runtime, or cache state before rejecting the backend")
         try:
             receipt["db_after"] = database_snapshot(distro)
         except (OSError, RuntimeError) as error:

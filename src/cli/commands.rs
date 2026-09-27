@@ -166,7 +166,7 @@ pub(crate) async fn available_package_names() -> Result<Vec<String>> {
             | crate::package_managers::Backend::Mock
     ) {
         crate::package_managers::get_package_manager()?
-            .search("")
+            .package_index()
             .await?
             .into_iter()
             .map(|package| package.name)
