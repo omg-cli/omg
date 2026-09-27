@@ -694,6 +694,31 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
                                                    distro=distro).returncode, 0)
 
     @unittest.skipIf(os.name == 'nt', 'Doctor guest oracle requires a POSIX shell')
+    def test_fedora_doctor_fault_requires_successful_empty_rpm_query(self):
+        source = (ROOT / 'scripts/qemu-fedora-doctor-fault.sh').read_text(encoding='utf-8')
+        probe_source = source[:source.index('[[ $# == 4 ]]')]
+        with tempfile.TemporaryDirectory() as directory:
+            rpm_probe = Path(directory) / 'rpm-probe'
+
+            def probe(body):
+                rpm_probe.write_text('#!/bin/sh\n[ "$1" = rpm ] && [ "$2" = -qa ] || exit 99\n'
+                                     + body, encoding='utf-8')
+                rpm_probe.chmod(0o755)
+                return subprocess.run(
+                    [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                     probe_source + '\nrequire_empty_rpm_inventory "$1"\n', '_', str(rpm_probe)],
+                    capture_output=True, text=True, timeout=10)
+
+            self.assertEqual(probe('exit 0\n').returncode, 0)
+            failed = probe('exit 23\n')
+            self.assertEqual(failed.returncode, 120)
+            self.assertIn('guest RPM query failed against isolated fixture', failed.stderr)
+            self.assertNotIn('did not see the empty fixture', failed.stderr)
+            populated = probe('printf "package-1-1\\n"\n')
+            self.assertEqual(populated.returncode, 120)
+            self.assertIn('guest RPM query did not see the empty fixture', populated.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Doctor guest oracle requires a POSIX shell')
     def test_fedora_doctor_rpm_fault_rejects_false_green_product(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('check_doctor_issue_delta() {')

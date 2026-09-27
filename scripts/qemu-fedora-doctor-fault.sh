@@ -8,6 +8,11 @@ setup_failed() {
   printf 'OMG_QEMU_DOCTOR_FAULT_SETUP_FAILED: %s\n' "$*" >&2
   exit 120
 }
+require_empty_rpm_inventory() {
+  local packages
+  packages=$("$@" rpm -qa) || setup_failed 'guest RPM query failed against isolated fixture'
+  [[ -z "$packages" ]] || setup_failed 'guest RPM query did not see the empty fixture'
+}
 
 [[ $# == 4 ]] || setup_failed 'expected binary, row directory, guest user, and outer mount namespace'
 binary=$1
@@ -67,7 +72,7 @@ guest=(setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs
   env HOME="$guest_home" USER="$guest_user" LOGNAME="$guest_user" NO_COLOR=1 LC_ALL=C
   OMG_TEST_MODE=0 OMG_DISABLE_DAEMON=1)
 [[ "$("${guest[@]}" id -u)" == "$uid" ]] || setup_failed 'could not drop guest privileges'
-[[ -z $("${guest[@]}" rpm -qa) ]] || setup_failed 'guest RPM query did not see the empty fixture'
+require_empty_rpm_inventory "${guest[@]}"
 if ! "${guest[@]}" dnf --cacheonly '--disable-repo=*' check \
   > "$rowdir/doctor-fault.native-dnf.log" 2>&1; then
   setup_failed 'offline native DNF check did not accept the isolated empty RPMDB'
