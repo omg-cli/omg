@@ -107,6 +107,26 @@ esac
             home_files={'tree-state': b'2.0', 'tree-binary': b'preexisting'})
         self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
         self.assertNotEqual(blocked.returncode, 0)
+        failed_after_snapshot = dict(native)
+        failed_after_snapshot['dpkg-query'] = native['dpkg-query'].replace(
+            "if [[ \"$*\" == *'${Version}'* ]]; then",
+            "if [[ \"$*\" == *'${Version}'* ]]; then\n"
+            '  if [[ -f "$HOME/fail-next-snapshot" ]]; then\n'
+            '    rm -f "$HOME/fail-next-snapshot"\n'
+            '    exit 70\n'
+            '  fi')
+        after_snapshot, evidence, logs = self.run_inventory(
+            '''[[ "$1" == install ]] || exit 70
+printf 2.0 > "$HOME/tree-state"
+printf '#!/bin/sh\\necho tree 2.0\\n' > "$OMG_QEMU_TEST_TREE_BINARY"
+chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
+: > "$HOME/fail-next-snapshot"
+''', [rows[0]], native_commands=failed_after_snapshot, distro='debian',
+            tiers='container', allow_mutations=True, fake_tree_binary=True)
+        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+        self.assertNotEqual(after_snapshot.returncode, 0)
+        self.assertIn('native package after-state is unavailable',
+                      logs['release-package-install-tree.log'])
         failed_cleanup = dict(native, sudo='exit 71\n')
         cleanup, evidence, logs = self.run_inventory(
             '''[[ "$1" == install ]] || exit 70
