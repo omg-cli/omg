@@ -50,11 +50,31 @@ def verify_candidate(environment, version, description):
     require(len(search) == 1 and search[0]["name"] == "omg-pin-probe", search)
     require(search[0]["version"] == version and search[0]["description"] == description, search)
 
-    native_plan = run(["apt-get", "-s", "install", "--", "omg-pin-probe"], environment)
-    preview = run([binary, "install", "--dry-run", "omg-pin-probe"], environment)
-    require(native_plan.strip() in preview, f"preview differs from APT\n{native_plan}\n{preview}")
-    require(f"Inst omg-pin-probe ({version} " in native_plan, native_plan)
+
+
+def verify_dry_run_uses_system_config(environment):
+    # The isolated pocket is selected through caller-controlled APT_CONFIG.
+    # Real privileged APT operations and OMG's preview both scrub that value,
+    # so compare preview with native APT under the same system configuration.
+    system_environment = dict(environment)
+    system_environment.pop("APT_CONFIG", None)
+    native_plan = run(["/usr/bin/apt-get", "-s", "install", "--", "bash"], system_environment)
+    require(native_plan.strip(), "native system APT simulation was empty")
+    preview = run([binary, "install", "--dry-run", "bash"], environment)
+    require(native_plan.strip() in preview, f"preview differs from system APT\n{native_plan}\n{preview}")
     require("No changes will be made (dry run)" in preview, preview)
+
+    isolated_only = subprocess.run(
+        [binary, "install", "--dry-run", "omg-pin-probe"],
+        env=environment, text=True, capture_output=True, timeout=45, check=False,
+    )
+    require(
+        isolated_only.returncode != 0
+        and "APT install simulation failed" in isolated_only.stderr
+        and "omg-pin-probe" in isolated_only.stderr,
+        "preview unexpectedly inherited the untrusted isolated APT_CONFIG: "
+        f"{isolated_only.stdout}\n{isolated_only.stderr}",
+    )
 
 
 with tempfile.TemporaryDirectory(prefix="omg-apt-pin-") as temporary:
@@ -113,10 +133,11 @@ with tempfile.TemporaryDirectory(prefix="omg-apt-pin-") as temporary:
     environment.pop("OMG_TEST_MODE", None)
     environment.pop("OMG_TEST_DISTRO", None)
     run(["apt-get", "update"], environment)
+    verify_dry_run_uses_system_config(environment)
     verify_candidate(environment, "1.1-1", "isolated security candidate")
     (root / "preferences").write_text(
         "Package: omg-pin-probe\nPin: version 2.0-1~bpo\nPin-Priority: 1001\n"
     )
     if args.scenario in ("backports", "both"):
         verify_candidate(environment, "2.0-1~bpo", "isolated backports candidate")
-    print(f"PASS: native APT {args.scenario} candidate, pocket metadata, and preview parity")
+    print(f"PASS: native APT {args.scenario} candidate, pocket metadata, and system preview parity")
