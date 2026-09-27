@@ -127,20 +127,11 @@ jobs:
           path: omg-v*.tar.gz*
 
   build-debian:
-    name: "Build ${{ matrix.distro }}"
+    name: "Build Debian"
     needs: gate-on-ci
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - distro: debian
-            image: debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931
-          - distro: debian-trixie
-            image: debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
-    container:
-      image: ${{ matrix.image }}
+    container: debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931
     env:
       DEBIAN_FRONTEND: noninteractive
       CARGO_HOME: /usr/local/cargo
@@ -185,7 +176,7 @@ jobs:
 
       - name: Package
         env:
-          DISTRO: ${{ matrix.distro }}
+          DISTRO: debian
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
@@ -197,7 +188,72 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ matrix.distro }}-build
+          name: debian-build
+          path: omg-v*.tar.gz*
+
+  build-debian-trixie:
+    name: "Build Debian Trixie"
+    needs: gate-on-ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CARGO_HOME: /usr/local/cargo
+      RUSTUP_HOME: /usr/local/rustup
+    steps:
+      - name: Install Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            git \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libapt-pkg-dev \
+            clang \
+            cmake
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
+            -o /tmp/rustup-init
+          echo "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init" | sha256sum --check
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --profile minimal --default-toolchain 1.95.0
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          export PATH="$CARGO_HOME/bin:$PATH"
+          cargo build --release --no-default-features --features debian,pgp,license --locked
+
+      - name: Package
+        env:
+          DISTRO: debian-trixie
+        run: |
+          export PATH="$CARGO_HOME/bin:$PATH"
+          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          PACKAGE="omg-v${VERSION}-x86_64-linux-${DISTRO}"
+          mkdir -p "$PACKAGE"
+          cp target/release/omg target/release/omgd README.md LICENSE "$PACKAGE/"
+          tar -czvf "${PACKAGE}.tar.gz" "$PACKAGE"
+          sha256sum "${PACKAGE}.tar.gz" > "${PACKAGE}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debian-trixie-build
           path: omg-v*.tar.gz*
 
   build-ubuntu:
@@ -342,39 +398,23 @@ jobs:
   # PUBLISH RELEASE
   # ════════════════════════════════════════════════════════════════════════════
 
-  smoke-apt:
-    name: "Staged APT smoke (${{ matrix.distro }}, ABI ${{ matrix.abi }})"
-    needs: [build-debian, build-ubuntu]
+  smoke-apt-debian:
+    name: "Staged Debian APT smoke (ABI 6)"
+    needs: build-debian
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - distro: debian
-            abi: '6'
-            artifact: debian-build
-          - distro: ubuntu
-            abi: '6'
-            artifact: ubuntu-build
-          - distro: debian
-            abi: '7'
-            artifact: debian-trixie-build
-          - distro: ubuntu
-            abi: '7'
-            artifact: debian-trixie-build
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ matrix.artifact }}
+          name: debian-build
           path: staged-release
       - name: Exercise staged APT release
         env:
-          DISTRO: ${{ matrix.distro }}
-          APT_ABI: ${{ matrix.abi }}
+          DISTRO: debian
+          APT_ABI: '6'
         run: |
           set -euo pipefail
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
@@ -385,7 +425,75 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: staged-apt-smoke-${{ matrix.distro }}-${{ matrix.abi }}
+          name: staged-apt-smoke-debian-6
+          path: apt-smoke-evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  smoke-apt-ubuntu:
+    name: "Staged Ubuntu APT smoke (ABI 6)"
+    needs: build-ubuntu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ubuntu-build
+          path: staged-release
+      - name: Exercise staged APT release
+        env:
+          DISTRO: ubuntu
+          APT_ABI: '6'
+        run: |
+          set -euo pipefail
+          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          test -n "$VERSION"
+          ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
+            --distro "$DISTRO" --apt-abi "$APT_ABI" --evidence-dir apt-smoke-evidence
+      - name: Preserve staged APT smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staged-apt-smoke-ubuntu-6
+          path: apt-smoke-evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  smoke-apt-trixie:
+    name: "Staged ${{ matrix.distro }} APT smoke (ABI 7)"
+    needs: build-debian-trixie
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian, ubuntu]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debian-trixie-build
+          path: staged-release
+      - name: Exercise staged APT release
+        env:
+          DISTRO: ${{ matrix.distro }}
+          APT_ABI: '7'
+        run: |
+          set -euo pipefail
+          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          test -n "$VERSION"
+          ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
+            --distro "$DISTRO" --apt-abi "$APT_ABI" --evidence-dir apt-smoke-evidence
+      - name: Preserve staged APT smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staged-apt-smoke-${{ matrix.distro }}-7
           path: apt-smoke-evidence/
           retention-days: 14
           if-no-files-found: error
@@ -498,7 +606,7 @@ jobs:
     name: "Create Release"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: [build-arch, build-debian, build-ubuntu, build-fedora, build-macos, smoke-apt, smoke-arch, smoke-fedora, smoke-macos]
+    needs: [build-arch, build-debian, build-debian-trixie, build-ubuntu, build-fedora, build-macos, smoke-apt-debian, smoke-apt-ubuntu, smoke-apt-trixie, smoke-arch, smoke-fedora, smoke-macos]
     permissions:
       contents: write
       id-token: write

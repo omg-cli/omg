@@ -19,7 +19,7 @@ PLATFORMS = ('x86_64-linux-arch', 'x86_64-linux-debian',
 
 class ReleaseCollection(unittest.TestCase):
     def test_resync_rejects_wrong_platform_even_when_counts_match(self):
-        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        workflow = (ROOT / '.github/workflows/release.yml').read_text(encoding='utf-8')
         script = step_script(workflow, 'Download and verify published release')
         validation = script.split('--dir release\n', 1)[1].split('for archive in', 1)[0]
         for substituted in (False, True):
@@ -43,7 +43,7 @@ class ReleaseCollection(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, not substituted, result.stdout + result.stderr)
 
     def test_published_resync_requires_six_archive_checksum_pairs(self):
-        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        workflow = (ROOT / '.github/workflows/release.yml').read_text(encoding='utf-8')
         script = step_script(workflow, 'Download and verify published release')
         start = script.index('if (( ${#archives[@]}')
         end = script.index('\nfi', start) + len('\nfi')
@@ -58,13 +58,18 @@ class ReleaseCollection(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
 
     def test_publication_requires_apt_smoke_and_preserves_failure(self):
-        workflow = (ROOT / '.github/workflows/release.yml').read_text()
-        block = job_block(workflow, 'smoke-apt')
-        self.assertIn('smoke-apt', job_block(workflow, 'release').split('steps:', 1)[0])
-        self.assertIn('name: ${{ matrix.artifact }}', block)
-        self.assertIn('if: always()', block)
-        script = step_script(block, 'Exercise staged APT release')
-        for distro, abi in [('debian', '6'), ('ubuntu', '6'), ('debian', '7'), ('ubuntu', '7')]:
+        workflow = (ROOT / '.github/workflows/release.yml').read_text(encoding='utf-8')
+        for job, distro, abi, artifact in (
+            ('smoke-apt-debian', 'debian', '6', 'debian-build'),
+            ('smoke-apt-ubuntu', 'ubuntu', '6', 'ubuntu-build'),
+            ('smoke-apt-trixie', 'debian', '7', 'debian-trixie-build'),
+            ('smoke-apt-trixie', 'ubuntu', '7', 'debian-trixie-build'),
+        ):
+            block = job_block(workflow, job)
+            self.assertIn(job, job_block(workflow, 'release').split('steps:', 1)[0])
+            self.assertIn(f'name: {artifact}', block)
+            self.assertIn('if: always()', block)
+            script = step_script(block, 'Exercise staged APT release')
             for outcome in (0, 19):
                 with self.subTest(distro=distro, abi=abi, outcome=outcome), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -84,14 +89,12 @@ class ReleaseCollection(unittest.TestCase):
                                       '--evidence-dir', 'apt-smoke-evidence'])
 
     def test_release_package_step_emits_both_distinct_apt_pairs(self):
-        workflow = (ROOT / '.github/workflows/release.yml').read_text()
-        block = job_block(workflow, 'build-debian')
-        self.assertIn('image: ${{ matrix.image }}', block)
-        self.assertIn('name: ${{ matrix.distro }}-build', block)
-        self.assertIn('DISTRO: ${{ matrix.distro }}', block)
+        workflow = (ROOT / '.github/workflows/release.yml').read_text(encoding='utf-8')
         for distro, image in (('debian', 'bookworm'), ('debian-trixie', 'trixie')):
-            self.assertIn(f'- distro: {distro}\n', block)
-            self.assertIn(f'image: debian:{image}@sha256:', block)
+            block = job_block(workflow, f'build-{distro}')
+            self.assertIn(f'container: debian:{image}@sha256:', block)
+            self.assertIn(f'name: {distro}-build', block)
+            self.assertIn(f'DISTRO: {distro}', block)
             with self.subTest(distro=distro), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / 'target/release').mkdir(parents=True)
@@ -111,8 +114,9 @@ class ReleaseCollection(unittest.TestCase):
                 with tarfile.open(archive) as bundle:
                     for name, payload in files.items():
                         self.assertEqual(bundle.extractfile(f'{package}/{name}').read(), payload)
-                self.assertEqual((root / (archive.name + '.sha256')).read_text(),
-                                 f'{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n')
+                digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+                self.assertIn((root / (archive.name + '.sha256')).read_text(),
+                              (f'{digest}  {archive.name}\n', f'{digest} *{archive.name}\n'))
 
     def test_complete_bundle_and_invalid_variants(self):
         for case in ('complete', 'missing-trixie', 'duplicate-trixie',

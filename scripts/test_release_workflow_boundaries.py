@@ -115,7 +115,9 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
     def test_every_rebuilt_release_platform_is_smoked_before_publication(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
         publish = job_block(release, 'release')
-        self.assertIn('smoke-apt, smoke-arch, smoke-fedora, smoke-macos]', publish)
+        for job in ('smoke-apt-debian', 'smoke-apt-ubuntu', 'smoke-apt-trixie',
+                    'smoke-arch', 'smoke-fedora', 'smoke-macos'):
+            self.assertIn(job, publish.split('steps:', 1)[0])
         for distro in ('arch', 'fedora'):
             with self.subTest(distro=distro):
                 linux = job_block(release, f'smoke-{distro}')
@@ -132,6 +134,30 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         self.assertIn('test "$actual" = "$ARCHIVE_SHA256"', macos)
         self.assertIn('--staged-dir staged-release', macos)
         self.assertIn('--executor native', macos)
+
+    def test_apt_smoke_depends_only_on_its_archive_builder(self):
+        release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
+        publish = job_block(release, 'release').split('steps:', 1)[0]
+        for job, build, artifact in (
+            ('smoke-apt-debian', 'build-debian', 'debian-build'),
+            ('smoke-apt-ubuntu', 'build-ubuntu', 'ubuntu-build'),
+            ('smoke-apt-trixie', 'build-debian-trixie', 'debian-trixie-build'),
+        ):
+            with self.subTest(job=job):
+                smoke = job_block(release, job)
+                self.assertEqual(re.search(r'^    needs: (.+)$', smoke, re.M)[1], build)
+                self.assertIn(f'name: {artifact}', smoke)
+                self.assertIn('if: always()', smoke)
+                self.assertIn(job, publish)
+                self.assertIn(build, publish)
+        for build in ('build-debian', 'build-ubuntu', 'build-debian-trixie'):
+            self.assertEqual(re.search(r'^    needs: (.+)$', job_block(release, build), re.M)[1],
+                             'gate-on-ci')
+        self.assertNotIn('matrix:', job_block(release, 'build-debian'))
+        self.assertNotIn('matrix:', job_block(release, 'build-debian-trixie'))
+        trixie = job_block(release, 'smoke-apt-trixie')
+        self.assertIn('fail-fast: false', trixie)
+        self.assertIn('distro: [debian, ubuntu]', trixie)
 
     def test_fixture_and_single_tag_gate_all_smoke_jobs(self):
         text = (WORKFLOWS / 'release-smoke.yml').read_text()
