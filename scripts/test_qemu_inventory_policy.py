@@ -220,6 +220,14 @@ class PolicyTests(unittest.TestCase):
             "id": "doctor-eol", "tiers": ["container"],
             "allowed_skips": {}, "network_scope": "offline",
         })
+        self.assertEqual(by_id["container-run-detached-argv"], {
+            "id": "container-run-detached-argv", "tiers": ["hermetic"],
+            "allowed_skips": {}, "network_scope": "offline",
+        })
+        for case_id in ("container-run-detached", "container-run-interactive",
+                        "container-shell-flags", "container-build-flags"):
+            self.assertEqual(set(by_id[case_id]["allowed_skips"]),
+                             {"arch", "debian", "ubuntu", "fedora"})
         for runtime in ("node", "python", "go"):
             with self.subTest(runtime=runtime):
                 self.assertEqual(by_id[f"runtime-{runtime}-uninstall"], {
