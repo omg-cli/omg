@@ -90,16 +90,18 @@ runner service:
 ```bash
 sudo install -D -o root -g root -m 0755 scripts/omg-kvm-device.py /usr/local/libexec/omg-kvm-device.py
 sudo install -D -o root -g root -m 0644 scripts/omg-kvm-device.service /etc/systemd/system/omg-kvm-device.service
+sudo install -D -o root -g root -m 0644 scripts/omg-runner-kvm-dependency.conf /usr/local/share/omg-runner-kvm-dependency.conf
 sudo systemctl daemon-reload
 sudo systemctl enable --now omg-kvm-device.service
 sudo -u omgci python3 /usr/local/libexec/omg-kvm-device.py check
 ```
 
-Both commands must succeed. The helper's `check` also runs in the QEMU job;
+The service start and helper check must succeed. The helper's `check` also
+runs in the QEMU job;
 the job fails if the alias disappears, changes ownership, or stops opening KVM.
 The alias is on ext4 and stays restricted even when another WSL distro changes
 the shared `/dev/kvm` inode. Re-run the install commands after updating the
-helper or unit in this repository.
+helper, unit, or runner dependency in this repository.
 [Docker's `--device` mapping](https://docs.docker.com/reference/cli/docker/container/run/#add-host-device-to-container---device)
 exposes that private host node as `/dev/kvm` in the QEMU controller.
 
@@ -127,7 +129,7 @@ mapfile -t units < <(systemctl list-unit-files --no-legend 'actions.runner.*.ser
 test "${#units[@]}" -eq 1
 unit="${units[0]}"
 sudo install -d -o root -g root -m 0755 "/etc/systemd/system/$unit.d"
-sudo install -o root -g root -m 0644 scripts/omg-runner-kvm-dependency.conf \
+sudo install -o root -g root -m 0644 /usr/local/share/omg-runner-kvm-dependency.conf \
   "/etc/systemd/system/$unit.d/10-kvm-device.conf"
 sudo systemctl daemon-reload
 sudo ./svc.sh start
