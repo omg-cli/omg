@@ -256,6 +256,46 @@ class ReportingBoundaryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     REPORT.archive_rows(self.archive(name, content, mode), {self.row()["case_id"]})
 
+    def test_missing_guest_provenance_admits_only_setup_lifecycle_failure(self):
+        lifecycle = dict(self.row(), case_id="qemu-debian-aarch64-lifecycle",
+                         distro="debian", result="HARNESS_ERROR")
+        archive = self.archive("run-setup-123/results.json", json.dumps([lifecycle]))
+        self.assertEqual(REPORT.archive_rows(
+            archive, {lifecycle["case_id"]}, guest=("debian", "aarch64"), revision="a" * 40),
+            [dict(lifecycle, arch="aarch64")])
+        inventory = dict(lifecycle, case_id="qemu-debian-search")
+        for path, row in (("run/inventory/results.json", inventory),
+                          ("run-setup-123/results.json", inventory),
+                          ("run/results.json", lifecycle)):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ValueError, "lacks provenance"):
+                    REPORT.archive_rows(self.archive(path, json.dumps([row])),
+                                        {row["case_id"]}, guest=("debian", "aarch64"),
+                                        revision="a" * 40)
+
+    def test_guest_rows_cannot_claim_another_artifact_distro(self):
+        row = dict(self.row(), case_id="qemu-ubuntu-search", distro="ubuntu")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run/inventory/results.json", json.dumps([row]))
+            archive.writestr("provenance.json", json.dumps(dict(
+                harness_revision="a" * 40, distro="debian", arch="aarch64")))
+        with self.assertRaisesRegex(ValueError, "distro differs"):
+            REPORT.archive_rows(output.getvalue(), {row["case_id"]},
+                                guest=("debian", "aarch64"), revision="a" * 40)
+
+    def test_guest_rows_cannot_claim_another_artifact_architecture(self):
+        row = dict(self.row(), case_id="qemu-debian-search", distro="debian",
+                   arch="x86_64")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run/inventory/results.json", json.dumps([row]))
+            archive.writestr("provenance.json", json.dumps(dict(
+                harness_revision="a" * 40, distro="debian", arch="aarch64")))
+        with self.assertRaisesRegex(ValueError, "architecture differs"):
+            REPORT.archive_rows(output.getvalue(), {row["case_id"]},
+                                guest=("debian", "aarch64"), revision="a" * 40)
+
     def test_duplicate_json_keys_cannot_replace_a_failure_with_success(self):
         payload = json.dumps([self.row()]).replace('"result": "FAIL"', '"result": "FAIL", "result": "PASS"')
         with self.assertRaises(ValueError):
@@ -300,6 +340,17 @@ class ReportingBoundaryTests(unittest.TestCase):
         other = dict(self.row(), case_id="qemu-debian-search", distro="debian")
         selected = REPORT.projection([lifecycle, *placeholders, other], False)
         self.assertEqual(selected, [lifecycle, other])
+
+    def test_arm_blocked_placeholders_cannot_suppress_x86_failure(self):
+        arm_lifecycle = dict(self.row(), case_id="qemu-debian-aarch64-lifecycle",
+                             distro="debian", arch="aarch64", result="HARNESS_ERROR")
+        arm_blocked = dict(self.row(), case_id="qemu-debian-search", distro="debian",
+                           arch="aarch64", result="BLOCKED", exit_code=-1,
+                           elapsed_seconds=0)
+        x86_failure = dict(self.row(), case_id="qemu-debian-search", distro="debian",
+                           arch="x86_64")
+        self.assertEqual(REPORT.projection([arm_lifecycle, arm_blocked, x86_failure], False),
+                         [arm_lifecycle, x86_failure])
 
     def test_executed_inventory_block_survives_alongside_a_lifecycle_failure(self):
         lifecycle = dict(self.row(), case_id="qemu-arch-lifecycle", result="HARNESS_ERROR", exit_code=1)
@@ -401,7 +452,8 @@ class ReportingBoundaryTests(unittest.TestCase):
                            workflow_path=".github/workflows/qemu-matrix.yml", all_distros=False,
                            latest_tag="v0.1.224", provenance_override=None, commit_shas=None,
                            jobs=None, prior_attempt_artifact=False,
-                           retained_guest_artifacts=False):
+                           retained_guest_artifacts=False, arm_rows=None, arm_log=None,
+                           arm_first=False, arm_provenance_override=None):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -412,6 +464,8 @@ class ReportingBoundaryTests(unittest.TestCase):
         output = io.BytesIO()
         with zipfile.ZipFile(output, "w") as archive:
             archive.writestr("run/inventory/results.json", "{" if corrupt else json.dumps(rows))
+            archive.writestr("provenance.json", json.dumps(dict(
+                harness_revision=run["head_sha"], distro="arch", arch="x86_64", staged=True)))
             if case_log is not None:
                 archive.writestr(f"run/inventory/rows/{log_case}.stderr.log", case_log)
         payload = output.getvalue()
@@ -430,9 +484,30 @@ class ReportingBoundaryTests(unittest.TestCase):
                     if provenance_override:
                         provenance.update(provenance_override)
                     archive.writestr("provenance.json", json.dumps(provenance))
+                    if case_log is not None and distro == "debian":
+                        archive.writestr(f"run/inventory/rows/{log_case}.stderr.log", case_log)
                 payloads[identifier] = output.getvalue()
                 artifacts.append(dict(artifact, id=identifier, name=f"qemu-evidence-{distro}",
                                       size_in_bytes=len(payloads[identifier])))
+        if arm_rows is not None:
+            arm_distro = arm_rows[0]["distro"]
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w") as archive:
+                archive.writestr("run/inventory/results.json", json.dumps(arm_rows))
+                provenance = dict(harness_revision=run["head_sha"], distro=arm_distro,
+                                  arch="aarch64", staged=True)
+                if arm_provenance_override:
+                    provenance.update(arm_provenance_override)
+                archive.writestr("provenance.json", json.dumps(provenance))
+                if arm_log is not None:
+                    archive.writestr(f"run/inventory/rows/{log_case}.stderr.log", arm_log)
+            payloads[40] = output.getvalue()
+            arm_artifact = dict(artifact, id=40, name=f"qemu-arm-evidence-{arm_distro}",
+                                size_in_bytes=len(payloads[40]))
+            if arm_first:
+                artifacts.insert(0, arm_artifact)
+            else:
+                artifacts.append(arm_artifact)
         if prior_attempt_artifact:
             artifacts.insert(0, dict(artifact, id=29, name="qemu-workflow-report",
                                      created_at="2026-09-19T23:00:00Z", expired=False))
@@ -513,7 +588,7 @@ class ReportingBoundaryTests(unittest.TestCase):
             event_kind="workflow_dispatch", all_distros=True)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], "scripts/qa-file-issue.sh")
-        self.assertEqual(calls[0][1], rows + [dict(
+        self.assertEqual(calls[0][1], [dict(row, arch="x86_64") for row in rows] + [dict(
             case_id="qemu-matrix-x86-workflow", distro="matrix", result="PASS",
             exit_code=0, elapsed_seconds=0)])
         self.assertNotIn("--failures-only", calls[0][3])
@@ -542,8 +617,8 @@ class ReportingBoundaryTests(unittest.TestCase):
             rows, conclusion="success", event_kind="schedule", all_distros=True,
             main_shas=["b" * 40])
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][1], [failure])
-        self.assertEqual(catalog["failures"], [failure])
+        self.assertEqual(calls[0][1], [dict(failure, arch="x86_64")])
+        self.assertEqual(catalog["failures"], [dict(failure, arch="x86_64")])
 
     def test_new_attempt_during_download_aborts_before_any_issue_mutation(self):
         calls, catalog = self.run_report_fixture([self.row()], changed_attempt=True)
@@ -555,7 +630,7 @@ class ReportingBoundaryTests(unittest.TestCase):
         for helper_fails in (False, True):
             with self.subTest(helper_fails=helper_fails):
                 calls, catalog = self.run_report_fixture(failures, helper_fails=helper_fails)
-                self.assertEqual(catalog["failures"], failures)
+                self.assertEqual(catalog["failures"], [dict(row, arch="x86_64") for row in failures])
                 self.assertEqual(catalog["source_sha"], "a" * 40)
                 self.assertEqual(catalog["attempt"], 2)
                 self.assertFalse(catalog["evidence_invalid_or_unavailable"])
@@ -572,6 +647,51 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertNotIn("private-token", transcript)
         self.assertIn("actions/runs/50", transcript)
 
+    def test_same_case_failure_on_both_architectures_keeps_two_diagnoses(self):
+        x86 = dict(self.row(), case_id="qemu-debian-search", distro="debian", exit_code=3)
+        arm = dict(x86, exit_code=17)
+        for arm_first in (False, True):
+            with self.subTest(arm_first=arm_first):
+                calls, catalog = self.run_report_fixture(
+                    [x86], all_distros=True, arm_rows=[arm], arm_first=arm_first,
+                    case_log="x86 package result is wrong", arm_log="ARM package result is wrong")
+                self.assertEqual(len(calls), 1)
+                reported = {row["arch"]: row for row in calls[0][1]}
+                self.assertEqual(set(reported), {"x86_64", "aarch64"})
+                self.assertEqual(reported["x86_64"]["exit_code"], 3)
+                self.assertEqual(reported["aarch64"]["exit_code"], 17)
+                self.assertEqual(len(catalog["failures"]), 2)
+                transcripts = calls[0][2]
+                self.assertIn("x86 package result is wrong",
+                              transcripts["debian-qemu-debian-search"])
+                self.assertNotIn("ARM package result is wrong",
+                                 transcripts["debian-qemu-debian-search"])
+                self.assertIn("ARM package result is wrong",
+                              transcripts["debian-aarch64-qemu-debian-search"])
+                self.assertNotIn("x86 package result is wrong",
+                                 transcripts["debian-aarch64-qemu-debian-search"])
+
+    def test_arm_failure_survives_same_case_x86_pass(self):
+        passed = dict(self.row("PASS"), case_id="qemu-debian-search", distro="debian")
+        failed = dict(passed, result="PRODUCT_FAIL", exit_code=2)
+        calls, catalog = self.run_report_fixture(
+            [passed], all_distros=True, arm_rows=[failed], arm_log="ARM-only break")
+        self.assertEqual(calls[0][1], [dict(failed, arch="aarch64")])
+        self.assertEqual(catalog["failures"], [dict(failed, arch="aarch64")])
+
+    def test_arm_provenance_mismatch_becomes_workflow_harness_failure(self):
+        case = dict(self.row(), case_id="qemu-debian-search", distro="debian")
+        for override in ({"arch": "x86_64"}, {"distro": "ubuntu"},
+                         {"harness_revision": "b" * 40}):
+            with self.subTest(override=override):
+                calls, catalog = self.run_report_fixture(
+                    [case], all_distros=True, arm_rows=[case],
+                    arm_provenance_override=override)
+                self.assertEqual(len(catalog["failures"]), 1)
+                self.assertEqual(catalog["failures"][0]["result"], "HARNESS_ERROR")
+                self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+                self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-x86-workflow")
+
     def test_counter_mismatch_and_reference_failure_reach_issue_helper_distinctly(self):
         for result, code, diagnostic in (
             ('FAIL', 0, 'native counter tc expected=188 actual=0'),
@@ -586,7 +706,7 @@ class ReportingBoundaryTests(unittest.TestCase):
                 # trusted reporter intentionally projects them to HARNESS_ERROR.
                 # Product mismatches must remain FAIL, including exit-zero ones.
                 expected = dict(row, result='HARNESS_ERROR' if result == 'BLOCKED' else result)
-                self.assertEqual(calls[0][1], [expected])
+                self.assertEqual(calls[0][1], [dict(expected, arch="x86_64")])
                 transcript = calls[0][2]['arch-qemu-arch-total-shortcut']
                 self.assertIn(diagnostic, transcript)
                 self.assertIn('Commit: ' + 'a' * 40, transcript)
@@ -675,6 +795,19 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIsNone(catalog)
 
+    def test_retained_arm_artifact_requires_the_successful_arm_job(self):
+        artifact = dict(name="qemu-arm-evidence-debian",
+                        created_at="2026-09-19T23:10:00Z")
+        run = dict(run_started_at="2026-09-20T00:00:00Z")
+        job = dict(name="QEMU guest arm64 (debian)", conclusion="success",
+                   started_at="2026-09-19T23:00:00Z",
+                   completed_at="2026-09-19T23:20:00Z")
+        self.assertTrue(REPORT.retained_guest_artifact(artifact, run, [job]))
+        self.assertFalse(REPORT.retained_guest_artifact(
+            artifact, run, [dict(job, conclusion="failure")]))
+        self.assertFalse(REPORT.retained_guest_artifact(
+            artifact, run, [dict(job, name="QEMU guest (debian)")]))
+
     def test_published_provenance_mismatch_files_harness_error_without_closure(self):
         rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
                 for distro in REPORT.DISTROS]
@@ -695,7 +828,8 @@ class ReportingBoundaryTests(unittest.TestCase):
         for options in (dict(all_distros=True, provenance_override={"staged": True}),
                         dict(all_distros=False)):
             with self.subTest(options=options):
-                calls, catalog = self.run_report_fixture(rows, conclusion="success",
+                selected_rows = rows if options["all_distros"] else rows[:1]
+                calls, catalog = self.run_report_fixture(selected_rows, conclusion="success",
                     event_kind="workflow_dispatch", **options)
                 self.assertEqual(calls, [])
                 self.assertIsNone(catalog)

@@ -47,7 +47,31 @@ grep -q "issue comment 7" "$CALL_LOG" || fail "dedup-comment issued no comment c
 grep -q "issue create" "$CALL_LOG" && fail "dedup-comment must not create"
 grep -q "filed=0 updated=1 closed=0 errors=0" <<< "$out" || fail "dedup-comment bad summary: $out"
 
+# A legacy x86 issue must remain the x86 identity while the same ARM case
+# gets its own issue, diagnostic path, and runnable staged-ARM command.
+printf '%s' '[{"case_id":"qemu-debian-search","distro":"debian","arch":"x86_64","result":"PRODUCT_FAIL","exit_code":3,"elapsed_seconds":2},{"case_id":"qemu-debian-search","distro":"debian","arch":"aarch64","result":"PRODUCT_FAIL","exit_code":17,"elapsed_seconds":2}]' > "$results"
+export FAKE_ISSUES_JSON='[{"number":7,"state":"open","body":"<!-- omg-qa-fingerprint: qemu-matrix:debian:qemu-debian-search -->"}]' FAKE_COMMENTS_JSON='[]'
+mkdir -p "$scratch/arch-evidence/debian-qemu-debian-search" "$scratch/arch-evidence/debian-aarch64-qemu-debian-search"
+printf 'x86 failure only\n' > "$scratch/arch-evidence/debian-qemu-debian-search/transcript.txt"
+printf 'ARM failure only\n' > "$scratch/arch-evidence/debian-aarch64-qemu-debian-search/transcript.txt"
+: > "$CALL_LOG"
+out=$(bash "$runner" "$results" --run-url https://run/arch --source qemu-matrix --evidence-dir "$scratch/arch-evidence")
+grep -q 'filed=1 updated=1 closed=0 errors=0' <<< "$out" || fail "dual-arch report lost an identity: $out"
+grep -q 'issue comment 7' "$CALL_LOG" || fail "x86 failure did not reuse legacy issue"
+grep -q 'omg-qa-fingerprint: qemu-matrix:debian:qemu-debian-search:aarch64' "$CALL_LOG" || fail "ARM fingerprint is not distinct"
+grep -q -- '--arch aarch64 --release <same-tag-as-run> --staged-dir <arm64-binaries>' "$CALL_LOG" || fail "ARM runbook is not executable"
+grep -q 'ARM failure only' "$CALL_LOG" || fail "ARM excerpt did not reach issue"
+grep -q 'x86 failure only' "$CALL_LOG" || fail "x86 excerpt did not reach legacy issue"
+export FAKE_ISSUES_JSON='[{"number":7,"state":"open","body":"<!-- omg-qa-fingerprint: qemu-matrix:debian:qemu-debian-search -->\n- run: https://run/arch"},{"number":8,"state":"open","body":"<!-- omg-qa-fingerprint: qemu-matrix:debian:qemu-debian-search:aarch64 -->\n- run: https://run/arch"}]'
+export FAKE_COMMENTS_JSON='Still failing on [https://run/arch](https://run/arch): PRODUCT_FAIL.'
+: > "$CALL_LOG"
+out=$(bash "$runner" "$results" --run-url https://run/arch --source qemu-matrix --evidence-dir "$scratch/arch-evidence")
+grep -q 'filed=0 updated=0 closed=0 errors=0' <<< "$out" || fail "dual-arch replay was not idempotent: $out"
+grep -q 'issue create\|issue comment' "$CALL_LOG" && fail "dual-arch replay duplicated an issue"
+
 # 3. Run URL already recorded on the issue -> complete silence.
+printf '%s' '[{"case_id":"search-tree","distro":"arch","result":"PRODUCT_FAIL","exit_code":1,"elapsed_seconds":2}]' > "$results"
+export FAKE_ISSUES_JSON='[{"number":7,"body":"<!-- omg-qa-fingerprint: qemu:arch:search-tree -->"}]'
 export FAKE_COMMENTS_JSON='Still failing on [https://run/2](https://run/2): PRODUCT_FAIL.'
 : > "$CALL_LOG"
 out=$(bash "$runner" "$results" --run-url https://run/2 --source qemu); assert_rc 0 "$?" "same-run-skip"
@@ -68,6 +92,15 @@ if bash "$runner" "$results" --run-url https://run/4 --source qemu 2>/dev/null; 
   fail "schema violation must fail"
 fi
 [[ -s "$CALL_LOG" ]] && fail "schema violation must not call gh"
+
+# Omitted architecture means legacy x86, so spelling it explicitly cannot
+# smuggle a second contradictory result for the same guest case.
+printf '%s' '[{"case_id":"qemu-debian-search","distro":"debian","result":"PASS","exit_code":0,"elapsed_seconds":1},{"case_id":"qemu-debian-search","distro":"debian","arch":"x86_64","result":"PRODUCT_FAIL","exit_code":1,"elapsed_seconds":1}]' > "$results"
+: > "$CALL_LOG"
+if bash "$runner" "$results" --run-url https://run/duplicate-x86 --source qemu-matrix 2>/dev/null; then
+  fail "implicit and explicit x86 duplicate was accepted"
+fi
+[[ -s "$CALL_LOG" ]] && fail "duplicate x86 result reached GitHub"
 
 # Workflow-wide failures have no guest distro. Keep that identity explicit,
 # while refusing to use the matrix identity for ordinary cases.

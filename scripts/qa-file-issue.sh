@@ -62,7 +62,11 @@ fi
 runbook_for() {
   case "$source" in
     qemu-matrix)
-      printf 'Rerun this leg: `./scripts/benchmark-qemu.sh --distro %s --release <same-tag-as-run> [--arch aarch64] --staged-dir <staged-binaries>`.\nFull per-case evidence (transcripts, guest logs, metadata) is in this run'"'"'s uploaded `qemu-*evidence-*` artifacts; paths below are relative to the evidence root.\n' "$1" ;;
+      if [[ "$2" == aarch64 ]]; then
+        printf 'Rerun this leg: `./scripts/benchmark-qemu.sh --distro %s --arch aarch64 --release <same-tag-as-run> --staged-dir <arm64-binaries>`.\nFull per-case evidence (transcripts, guest logs, metadata) is in this run'"'"'s uploaded `qemu-arm-evidence-*` artifacts; paths below are relative to the evidence root.\n' "$1"
+      else
+        printf 'Rerun this leg: `./scripts/benchmark-qemu.sh --distro %s --release <same-tag-as-run> --staged-dir <staged-binaries>`.\nFull per-case evidence (transcripts, guest logs, metadata) is in this run'"'"'s uploaded `qemu-evidence-*` artifacts; paths below are relative to the evidence root.\n' "$1"
+      fi ;;
     release-smoke)
       printf 'Rerun this leg: `./scripts/release-smoke.sh --distro %s --release <same-tag-as-run>%s`.\nFull per-case evidence (transcripts, metadata, result.json) is in this run'"'"'s uploaded `release-smoke-*` artifacts; paths below are relative to the evidence root.\n' "$1" "$2" ;;
     *) printf 'Full per-case evidence is in this run'"'"'s uploaded artifacts; paths below are relative to the evidence root.\n' ;;
@@ -85,25 +89,38 @@ filed=0; updated=0; closed=0; errors=0
 while IFS= read -r row; do
   case_id=$(jq -r '.case_id' <<< "$row")
   distro=$(jq -r '.distro' <<< "$row")
+  row_arch=$(jq -r '.arch // empty' <<< "$row")
+  arch=${row_arch:-x86_64}
   result=$(jq -r '.result' <<< "$row")
   exit_code=$(jq -r '.exit_code' <<< "$row")
   elapsed=$(jq -r '.elapsed_seconds' <<< "$row")
   fingerprint="$source:$distro:$case_id"
+  if [[ "$arch" == aarch64 ]]; then fingerprint+=":aarch64"; fi
   marker="<!-- omg-qa-fingerprint: $fingerprint -->"
   existing=$(jq -r --arg m "$marker" '[.[] | select((.state // "open" | ascii_downcase) == "open" and .body != null and (.body | contains($m))) | .number] | first // empty' <<< "$open_issues")
   excerpt=""; excerpt_source=""
   src_tmp="$(mktemp)"
-  if excerpt_text="$(excerpt_for "$case_id" "$distro" 3>"$src_tmp")"; then
+  if excerpt_text="$(excerpt_for "$case_id" "$distro" "$arch" 3>"$src_tmp")"; then
     excerpt="$excerpt_text"
     excerpt_source="$(cat "$src_tmp")"
   fi
   rm -f "$src_tmp"
   if [[ -z "$existing" ]]; then
     title="[qa] $case_id fails on $distro ($source)"
+    if [[ "$arch" == aarch64 ]]; then title="[qa] $case_id fails on $distro/aarch64 ($source)"; fi
     runbook_distro=$distro
     if [[ "$distro" == matrix ]]; then
       title="[qa] $case_id fails in QEMU workflow ($source)"
       runbook_distro=all
+    fi
+    runbook_option=$arch
+    if [[ "$source" != qemu-matrix ]]; then
+      runbook_option=""
+      if [[ "$distro" == macos ]]; then runbook_option=' --executor native'; fi
+    fi
+    arch_detail=""
+    if [[ -n "$row_arch" ]]; then
+      printf -v arch_detail -- '- architecture: `%s`\n' "$row_arch"
     fi
     followup=$(jq -r --arg m "$marker" '[.[] | select((.state // "" | ascii_downcase) == "closed" and .body != null and (.body | contains($m))) | .number] | max // empty' <<< "$open_issues")
     body=$(cat <<EOF
@@ -112,7 +129,7 @@ Automated QA failure. Excerpts are scrubbed of secrets; full logs are in the run
 
 - case: \`$case_id\`
 - distro: \`$distro\`
-- result: \`$result\` (exit $exit_code, ${elapsed}s)
+$arch_detail- result: \`$result\` (exit $exit_code, ${elapsed}s)
 - source: \`$source\`
 - run: $run_url
 EOF
@@ -123,7 +140,7 @@ EOF
     if [[ -n "$excerpt" ]]; then
       body+=$(printf '\n\n### Failure excerpt (`%s`, tail)\n````log\n%s\n````' "$excerpt_source" "$excerpt")
     fi
-    body+=$(printf '\n\n### Agent runbook\n%s\nResolve criteria: verify the fix in a pull request and link this issue with a GitHub closing keyword. A passing retry alone does not close it. A recurrence while open lands as a new comment; after a close it files a follow-up like this one.' "$(runbook_for "$runbook_distro" "$([[ "$distro" == macos ]] && printf ' --executor native' || printf '')")")
+    body+=$(printf '\n\n### Agent runbook\n%s\nResolve criteria: verify the fix in a pull request and link this issue with a GitHub closing keyword. A passing retry alone does not close it. A recurrence while open lands as a new comment; after a close it files a follow-up like this one.' "$(runbook_for "$runbook_distro" "$runbook_option")")
     if [[ "$dry_run" == true ]]; then
       printf 'would create: %s\n' "$title"
     elif gh issue create --repo "$repo" --title "$title" --label "$label" --body "$body" >/dev/null; then
@@ -150,6 +167,7 @@ EOF
       continue
     fi
     comment=$(printf 'Still failing on [%s](%s): `%s` (exit %s, %ss).' "$run_url" "$run_url" "$result" "$exit_code" "$elapsed")
+    if [[ "$arch" == aarch64 ]]; then comment+=" Guest architecture: aarch64."; fi
     if [[ -n "$excerpt" ]]; then
       comment+=$(printf '\n\n### Failure excerpt (`%s`, tail)\n````log\n%s\n````' "$excerpt_source" "$excerpt")
     fi
