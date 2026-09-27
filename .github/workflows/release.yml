@@ -304,6 +304,8 @@ jobs:
     needs: gate-on-ci
     runs-on: macos-14
     timeout-minutes: 30
+    outputs:
+      archive_sha256: ${{ steps.package.outputs.archive_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -319,6 +321,7 @@ jobs:
         run: cargo build --release --no-default-features --features macos,pgp,license --locked
 
       - name: Package
+        id: package
         run: |
           VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
           mkdir -p "omg-v${VERSION}-aarch64-darwin"
@@ -327,6 +330,8 @@ jobs:
           cp README.md LICENSE "omg-v${VERSION}-aarch64-darwin/"
           tar -czf "omg-v${VERSION}-aarch64-darwin.tar.gz" "omg-v${VERSION}-aarch64-darwin"
           shasum -a 256 "omg-v${VERSION}-aarch64-darwin.tar.gz" > "omg-v${VERSION}-aarch64-darwin.tar.gz.sha256"
+          digest=$(shasum -a 256 "omg-v${VERSION}-aarch64-darwin.tar.gz" | awk '{print $1}')
+          echo "archive_sha256=$digest" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -385,11 +390,96 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  smoke-linux:
+    name: "Staged ${{ matrix.distro }} release smoke"
+    needs: [build-arch, build-fedora]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: arch
+            artifact: arch-build
+          - distro: fedora
+            artifact: fedora-build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: staged-release
+      - name: Exercise staged Linux release
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          set -euo pipefail
+          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          test -n "$VERSION"
+          ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
+            --distro "$DISTRO" --evidence-dir staged-linux-smoke-evidence
+      - name: Preserve staged Linux smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staged-linux-smoke-${{ matrix.distro }}
+          path: staged-linux-smoke-evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  smoke-macos:
+    name: "Staged macOS release smoke"
+    needs: build-macos
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-build
+          path: staged-release
+      - name: Install GNU timeout
+        run: brew install coreutils
+      - name: Pin staged macOS archive to builder digest
+        env:
+          ARCHIVE_SHA256: ${{ needs.build-macos.outputs.archive_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          archive="omg-v${VERSION}-aarch64-darwin.tar.gz"
+          test -f "staged-release/$archive"
+          actual=$(shasum -a 256 "staged-release/$archive" | awk '{print $1}')
+          test "$actual" = "$ARCHIVE_SHA256"
+          printf '%s  %s\n' "$ARCHIVE_SHA256" "$archive" > smoke-digest-pins.txt
+      - name: Exercise staged macOS release
+        env:
+          OMG_SMOKE_DIGEST_PIN_FILE: ${{ github.workspace }}/smoke-digest-pins.txt
+        run: |
+          set -euo pipefail
+          VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
+          ./scripts/release-smoke.sh --release "v$VERSION" --staged-dir staged-release \
+            --distro macos --executor native --evidence-dir staged-macos-smoke-evidence
+      - name: Preserve staged macOS smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staged-macos-smoke
+          path: staged-macos-smoke-evidence/
+          retention-days: 14
+          if-no-files-found: error
+
   release:
     name: "Create Release"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: [build-arch, build-debian, build-ubuntu, build-fedora, build-macos, smoke-apt]
+    needs: [build-arch, build-debian, build-ubuntu, build-fedora, build-macos, smoke-apt, smoke-linux, smoke-macos]
     permissions:
       contents: write
       id-token: write
