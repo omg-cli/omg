@@ -160,7 +160,7 @@ rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' |
   grep -v "^$package|" | LC_ALL=C sort > "$base/system-after.tsv"
 cmp "$base/system-before.tsv" "$base/system-after.tsv" || { echo 'OMG changed packages outside bounded fixture' >&2; exit 1; }
 snapshot_install_reasons "$base/reasons-after.tsv" ||
-  { echo 'native DNF install reasons unavailable after update' >&2; echo 'OMG_QEMU_FIXTURE_SETUP_FAILED' >&2; exit 120; }
+  { echo 'native DNF install reasons unavailable after update' >&2; exit 1; }
 check_reason_delta "$base/reasons-before.tsv" "$base/reasons-after.tsv" || exit 1
 dnf history info --json last > "$base/history.json"
 jq -e --arg package "$package" '
