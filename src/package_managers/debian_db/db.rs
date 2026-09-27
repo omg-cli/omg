@@ -1449,6 +1449,11 @@ fn parse_paragraph_str(
             "Invalid package entry: missing or duplicate '{field}' field in Packages file"
         );
     }
+    anyhow::ensure!(
+        valid_debian_package_name(&name),
+        "Invalid Debian Package name: {}",
+        bounded_deb822_excerpt(&name)
+    );
     Ok(DebianPackage {
         name,
         version,
@@ -1476,6 +1481,15 @@ fn valid_deb822_field_name(key: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| matches!(*byte, 0x21..=0x39 | 0x3b..=0x7e))
+}
+
+fn valid_debian_package_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() >= 2
+        && matches!(bytes[0], b'a'..=b'z' | b'0'..=b'9')
+        && bytes
+            .iter()
+            .all(|byte| matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'+' | b'-' | b'.'))
 }
 
 fn bounded_deb822_excerpt(value: &str) -> String {
@@ -1983,6 +1997,11 @@ fn parse_security_inventory(
         );
         let (name, version, description, architecture) =
             parse_status_paragraph(paragraph).context("dpkg entry lacks a package name")?;
+        anyhow::ensure!(
+            valid_debian_package_name(&name),
+            "Invalid dpkg Package name: {}",
+            bounded_deb822_excerpt(&name)
+        );
         if matches!(fields[2], "not-installed" | "config-files") {
             continue;
         }
@@ -2029,11 +2048,7 @@ fn parse_security_inventory(
                     (source, version.as_str())
                 };
             anyhow::ensure!(
-                source_name.len() >= 2
-                    && source_name.as_bytes()[0].is_ascii_alphanumeric()
-                    && source_name.bytes().all(|byte| byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'+' | b'-' | b'.'))
+                valid_debian_package_name(source_name)
                     && !source_version.is_empty()
                     && !source_version
                         .bytes()
@@ -3556,6 +3571,87 @@ mod tests {
         paragraph.push_str("x-repository-field-2047: spoofed\n");
         assert!(parse_paragraph_str(&paragraph, "main", "stable", "fixture").is_err());
         assert!(parse_security_inventory(&paragraph).is_err());
+    }
+
+    #[test]
+    fn debian_package_names_follow_policy_in_live_indexes_and_doctor() {
+        let directory = tempfile::tempdir().expect("isolated Debian metadata");
+        let index = directory.path().join("mirror_Packages");
+        let status = directory.path().join("status");
+
+        // These names occur in native Debian's installed dpkg database. The
+        // final name also guards Policy's permitted repeated periods.
+        for name in [
+            "libc6",
+            "libstdc++6",
+            "python3.13-minimal",
+            "ca-certificates",
+            "a..b",
+        ] {
+            std::fs::write(
+                &index,
+                format!("Package: {name}\nVersion: 1\nArchitecture: amd64\n\n"),
+            )
+            .expect("write Packages entry");
+            let packages = parse_packages_file_sync(&index).expect("live Packages reader");
+            assert_eq!(packages.len(), 1, "{name}");
+            assert_eq!(packages[0].name, name);
+            assert_eq!(
+                validate_apt_package_indexes_at(directory.path()).unwrap(),
+                1
+            );
+
+            std::fs::write(
+                &status,
+                format!("Package: {name}\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n"),
+            )
+            .expect("write dpkg status entry");
+            assert_eq!(validate_dpkg_status_at(&status).unwrap(), 1, "{name}");
+        }
+
+        for name in [
+            "invalid name",
+            "Upper",
+            "a",
+            "_apt",
+            "-bad",
+            ".bad",
+            "package/name",
+            "éclair",
+            "foo\tbar",
+        ] {
+            std::fs::write(
+                &index,
+                format!("Package: {name}\nVersion: 1\nArchitecture: amd64\n\n"),
+            )
+            .expect("write malformed Packages entry");
+            let error = parse_packages_file_sync(&index).expect_err("reject malformed live name");
+            assert!(
+                error.to_string().contains("Invalid Debian Package name"),
+                "{name}"
+            );
+            let error = validate_apt_package_indexes_at(directory.path())
+                .expect_err("Doctor rejects malformed Packages name");
+            assert!(
+                error
+                    .root_cause()
+                    .to_string()
+                    .contains("Invalid Debian Package name"),
+                "{name}"
+            );
+
+            std::fs::write(
+                &status,
+                format!("Package: {name}\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n"),
+            )
+            .expect("write malformed dpkg status entry");
+            let error = validate_dpkg_status_at(&status)
+                .expect_err("Doctor rejects malformed dpkg Package name");
+            assert!(
+                error.to_string().contains("Invalid dpkg Package name"),
+                "{name}"
+            );
+        }
     }
 
     #[test]
