@@ -307,6 +307,9 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
         ("hooks-install-force", Assertion::HooksInstalled),
         ("workspace-init", Assertion::WorkspaceInitialized),
         ("workspace-add", Assertion::WorkspaceProjectAdded),
+        ("workspace-list", Assertion::WorkspaceProjectListed),
+        ("workspace-remove", Assertion::WorkspaceProjectRemoved),
+        ("container-init", Assertion::ContainerInitScaffold),
         ("workspace-run-parallel-all", Assertion::WorkspaceAllOutput),
         ("update-fast", Assertion::UpdateFastOutput),
         ("update-turbo", Assertion::UpdateTurboOutput),
@@ -584,6 +587,9 @@ enum Assertion {
     WorkspaceAllOutput,
     WorkspaceInitialized,
     WorkspaceProjectAdded,
+    WorkspaceProjectListed,
+    WorkspaceProjectRemoved,
+    ContainerInitScaffold,
     CiGithubWorkflow,
     CiGithubWorkflowAdvanced,
     PackageDryRunInstall,
@@ -669,6 +675,9 @@ impl Assertion {
             "workspace-all-output" => Self::WorkspaceAllOutput,
             "workspace-initialized" => Self::WorkspaceInitialized,
             "workspace-project-added" => Self::WorkspaceProjectAdded,
+            "workspace-project-listed" => Self::WorkspaceProjectListed,
+            "workspace-project-removed" => Self::WorkspaceProjectRemoved,
+            "container-init-scaffold" => Self::ContainerInitScaffold,
             "ci-github-workflow" => Self::CiGithubWorkflow,
             "ci-github-workflow-advanced" => Self::CiGithubWorkflowAdvanced,
             "package-dry-run-install" => Self::PackageDryRunInstall,
@@ -2018,7 +2027,10 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         issues.push("diff did not refuse the requested missing lockfile".to_string());
                     }
                 }
-                Assertion::WorkspaceInitialized | Assertion::WorkspaceProjectAdded => {
+                Assertion::WorkspaceInitialized
+                | Assertion::WorkspaceProjectAdded
+                | Assertion::WorkspaceProjectListed
+                | Assertion::WorkspaceProjectRemoved => {
                     let workspace_file = project.path().join("omg-workspace.toml");
                     let workspace = workspace_file
                         .symlink_metadata()
@@ -2033,7 +2045,10 @@ fn behavior_inventory_runs_in_hermetic_state() {
                                 .get("created_at")
                                 .and_then(toml::Value::as_str)
                                 .is_some_and(|timestamp| !timestamp.is_empty())
-                            && if matches!(assertion, Assertion::WorkspaceInitialized) {
+                            && if matches!(
+                                assertion,
+                                Assertion::WorkspaceInitialized | Assertion::WorkspaceProjectRemoved
+                            ) {
                                 projects.is_none_or(toml::map::Map::is_empty)
                             } else {
                                 projects.is_some_and(|projects| {
@@ -2050,6 +2065,91 @@ fn behavior_inventory_runs_in_hermetic_state() {
                     });
                     if !valid {
                         issues.push("workspace command did not persist the expected private workspace state".to_string());
+                    }
+                    if matches!(assertion, Assertion::WorkspaceProjectListed) {
+                        let lines: Vec<_> = result.stdout.lines().collect();
+                        let numbered_projects = lines
+                            .iter()
+                            .filter(|line| {
+                                line.trim_start().split_once(". ").is_some_and(|(number, _)| {
+                                    number.parse::<usize>().is_ok()
+                                })
+                            })
+                            .count();
+                        if lines.iter().filter(|line| **line == "OMG Workspace: smoke").count() != 1
+                            || lines.iter().filter(|line| **line == "  1. fixture → .").count() != 1
+                            || numbered_projects != 1
+                            || result.stdout.contains("No projects in workspace")
+                        {
+                            issues.push("workspace list did not render its one persisted project".to_string());
+                        }
+                    } else if matches!(assertion, Assertion::WorkspaceProjectRemoved)
+                        && result
+                            .stdout
+                            .lines()
+                            .filter(|line| *line == "✓ Removed project 'fixture'")
+                            .count()
+                            != 1
+                    {
+                        issues.push("workspace remove did not report the removed fixture".to_string());
+                    }
+                }
+                Assertion::ContainerInitScaffold => {
+                    let read_regular = |name: &str| {
+                        let path = project.path().join(name);
+                        path.symlink_metadata()
+                            .ok()
+                            .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                            .and_then(|_| std::fs::read_to_string(path).ok())
+                    };
+                    let scaffold = read_regular("Dockerfile.omg").is_some_and(|text| {
+                        let lines: Vec<_> = text.lines().collect();
+                        let directives: Vec<_> = lines
+                            .iter()
+                            .filter_map(|line| line.split_once(' ').map(|(directive, _)| directive))
+                            .filter(|directive| {
+                                matches!(
+                                    *directive,
+                                    "FROM" | "RUN" | "WORKDIR" | "COPY" | "ADD" | "CMD" | "ENTRYPOINT"
+                                )
+                            })
+                            .collect();
+                        lines.first() == Some(&"FROM debian:bookworm")
+                            && lines.last() == Some(&"CMD [\"/bin/bash\"]")
+                            && directives == ["FROM", "RUN", "WORKDIR", "COPY", "CMD"]
+                            && [
+                                "RUN apt-get update && apt-get install -y \\",
+                                "    curl wget git build-essential ca-certificates \\",
+                                "    && rm -rf /var/lib/apt/lists/*",
+                            ]
+                            .iter()
+                            .all(|required| lines.iter().filter(|line| *line == required).count() == 1)
+                            && !text.contains("# WARNING: no pinned digest")
+                    });
+                    let ignored = read_regular(".dockerignore").is_some_and(|text| {
+                        text.lines().collect::<Vec<_>>().ends_with(&[
+                            "# added by omg container init",
+                            ".git", ".env", ".env.*", "!.env.example", "*.pem", "*.key",
+                            "id_rsa*", ".omg/",
+                        ])
+                    });
+                    if !scaffold || !ignored {
+                        issues.push("container init omitted its Debian scaffold or final credential exclusions".to_string());
+                    }
+                    if result
+                        .stdout
+                        .lines()
+                        .filter(|line| *line == "  ✓ Created Dockerfile.omg")
+                        .count()
+                        != 1
+                        || result
+                            .stdout
+                            .lines()
+                            .filter(|line| line.contains("Base image: debian:bookworm"))
+                            .count()
+                            != 1
+                    {
+                        issues.push("container init did not report its generated Debian scaffold".to_string());
                     }
                 }
                 Assertion::ContainerRunArgv => {

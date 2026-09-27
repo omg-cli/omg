@@ -339,6 +339,88 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
                 self.assertEqual(result.returncode, int(expected != ['PASS', 'PASS']), result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_workspace_list_and_remove_reject_false_green_results(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if line.startswith(('workspace-init\t', 'workspace-add\t',
+                                    'workspace-list\t', 'workspace-remove\t'))]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual([row.split('\t')[8] for row in rows[-2:]],
+                         ['workspace-project-listed', 'workspace-project-removed'])
+        product = '''case "$2" in
+  init) printf 'name = "smoke"\\ncreated_at = "2026-09-27T00:00:00Z"\\n' > omg-workspace.toml ;;
+  add) printf '[projects.fixture]\\npath = "."\\n' >> omg-workspace.toml ;;
+  list) printf 'OMG Workspace: smoke\\n  1. fixture → .\\n' ;;
+  remove) sed -i '/^\\[projects.fixture\\]/,$d' omg-workspace.toml
+          printf "✓ Removed project 'fixture'\\n" ;;
+esac
+'''
+        for label, altered, expected in (
+            ('correct', product, ['PASS'] * 4),
+            ('list silent', product.replace("list) printf 'OMG Workspace: smoke\\n  1. fixture → .\\n' ;;",
+                                            'list) : ;;'), ['PASS', 'PASS', 'FAIL', 'PASS']),
+            ('list wrong project', product.replace('1. fixture → .', '1. other → .'),
+             ['PASS', 'PASS', 'FAIL', 'PASS']),
+            ('list invented extra project', product.replace('1. fixture → .\\n',
+                                                            '1. fixture → .\\n  2. other → .\\n'),
+             ['PASS', 'PASS', 'FAIL', 'PASS']),
+            ('remove silent', product.replace("remove) sed -i '/^\\[projects.fixture\\]/,$d' omg-workspace.toml",
+                                              'remove) :'), ['PASS', 'PASS', 'PASS', 'FAIL']),
+            ('remove wrong report', product.replace("Removed project 'fixture'", "Removed project 'other'"),
+             ['PASS', 'PASS', 'PASS', 'FAIL']),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(altered, rows)
+                self.assertEqual([row['result'] for row in evidence], expected, logs)
+                self.assertEqual(result.returncode, int('FAIL' in expected), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_container_init_requires_scaffold_and_final_secret_exclusions(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        row = next(line for line in inventory.splitlines() if line.startswith('container-init\t'))
+        self.assertEqual(row.split('\t')[8], 'container-init-scaffold')
+        product = '''if [[ "$1:$2:$3:$4" != container:init:--base:debian:bookworm ]]; then exit 9; fi
+cat > Dockerfile.omg <<'DOCKERFILE'
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \\
+    curl wget git build-essential ca-certificates \\
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY . .
+CMD ["/bin/bash"]
+DOCKERFILE
+cat > .dockerignore <<'IGNORE'
+# added by omg container init
+.git
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+.omg/
+IGNORE
+printf '  ✓ Created Dockerfile.omg\\n│ Base image: debian:bookworm │\\n'
+'''
+        for label, altered, expected in (
+            ('correct', product, 'PASS'),
+            ('missing Dockerfile', product.replace('cat > Dockerfile.omg', 'cat > ignored'), 'FAIL'),
+            ('wrong base', product.replace('FROM debian:bookworm', 'FROM ubuntu:24.04'), 'FAIL'),
+            ('missing build dependencies', product.replace('curl wget git build-essential ca-certificates',
+                                                           'curl wget git'), 'FAIL'),
+            ('missing ignore', product.replace('cat > .dockerignore', 'cat > other-ignore'), 'FAIL'),
+            ('late exception', product + "printf '!*.key\\n' >> .dockerignore\n", 'FAIL'),
+            ('extra build command', product.replace('WORKDIR /app', 'RUN echo unexpected\nWORKDIR /app'), 'FAIL'),
+            ('silent output', product.replace("printf '  ✓ Created Dockerfile.omg\\n│ Base image: debian:bookworm │\\n'",
+                                               ':'), 'FAIL'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(altered, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_arch_update_rows_require_bounded_native_fixture_receipt(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         rows = [line for line in inventory.splitlines()

@@ -36,6 +36,19 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(rows["team-status"]["requires"], "team-push")
         self.assertEqual(rows["team-pull"]["requires"], "team-push")
 
+    def test_workspace_and_container_scaffold_rows_require_semantic_assertions(self):
+        with (ROOT / "tests/cli_behavior_inventory.tsv").open(newline="") as source:
+            rows = {row["case"]: row for row in csv.DictReader(source, delimiter="\t")}
+        for case, assertion, prerequisite in (
+            ("workspace-list", "workspace-project-listed", "workspace-add"),
+            ("workspace-remove", "workspace-project-removed", "workspace-add"),
+            ("container-init", "container-init-scaffold", "-"),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(rows[case]["assertions"], assertion)
+                self.assertEqual(rows[case]["requires"], prerequisite)
+                self.assertEqual(rows[case]["targets"], "hermetic:pass")
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

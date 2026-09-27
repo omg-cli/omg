@@ -1139,7 +1139,7 @@ check_product_output() {
   fi
   if [[ "$code" == 0 ]]; then
     case "$assertion" in
-      workspace-initialized|workspace-project-added)
+      workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed)
         if [[ ! -f omg-workspace.toml || -L omg-workspace.toml ]] \
           || ! python3 - "$assertion" <<'PY'
 import pathlib
@@ -1151,7 +1151,7 @@ assert workspace.get('name') == 'smoke'
 assert isinstance(workspace.get('created_at'), str) and workspace['created_at']
 projects = workspace.get('projects', {})
 assert isinstance(projects, dict)
-if sys.argv[1] == 'workspace-initialized':
+if sys.argv[1] in ('workspace-initialized', 'workspace-project-removed'):
     assert projects == {}
 else:
     assert set(projects) == {'fixture'}
@@ -1160,6 +1160,49 @@ else:
 PY
         then
           printf 'assertion failed: workspace command did not persist the expected private workspace state\n' >&2; return 1
+        fi
+        if [[ "$assertion" == workspace-project-listed ]]; then
+          if [[ $(grep -Fxc 'OMG Workspace: smoke' "$stdout" || true) != 1 ]] \
+            || [[ $(grep -Fxc '  1. fixture → .' "$stdout" || true) != 1 ]] \
+            || [[ $(grep -Ec '^[[:space:]]*[0-9]+\. ' "$stdout" || true) != 1 ]] \
+            || grep -Fq 'No projects in workspace' "$stdout"; then
+            printf 'assertion failed: workspace list did not render the persisted fixture project\n' >&2; return 1
+          fi
+        elif [[ "$assertion" == workspace-project-removed ]]; then
+          if [[ $(grep -Fxc "✓ Removed project 'fixture'" "$stdout" || true) != 1 ]]; then
+            printf 'assertion failed: workspace remove did not report the removed fixture project\n' >&2; return 1
+          fi
+        fi ;;
+      container-init-scaffold)
+        if [[ ! -f Dockerfile.omg || -L Dockerfile.omg || ! -f .dockerignore || -L .dockerignore ]] \
+          || ! python3 - <<'PY'
+from pathlib import Path
+
+dockerfile = Path('Dockerfile.omg').read_text()
+lines = dockerfile.splitlines()
+assert lines[0] == 'FROM debian:bookworm'
+assert sum(line.startswith('FROM ') for line in lines) == 1
+assert lines[-1] == 'CMD ["/bin/bash"]'
+assert [line.split(' ', 1)[0] for line in lines if line.startswith(
+    ('RUN ', 'COPY ', 'ADD ', 'FROM ', 'CMD ', 'ENTRYPOINT '))] == [
+    'FROM', 'RUN', 'COPY', 'CMD']
+for line in ('RUN apt-get update && apt-get install -y \\',
+             '    curl wget git build-essential ca-certificates \\',
+             '    && rm -rf /var/lib/apt/lists/*',
+             'WORKDIR /app', 'COPY . .', 'CMD ["/bin/bash"]'):
+    assert lines.count(line) == 1, line
+assert not any(line.startswith(('# WARNING: no pinned digest', 'ENV NODE_VERSION=',
+                                'ENV GO_VERSION=', 'ENV PYTHON_VERSION=')) for line in lines)
+protection = ['# added by omg container init', '.git', '.env', '.env.*',
+              '!.env.example', '*.pem', '*.key', 'id_rsa*', '.omg/']
+assert Path('.dockerignore').read_text().splitlines()[-len(protection):] == protection
+PY
+        then
+          printf 'assertion failed: container init omitted its Debian scaffold or final credential exclusions\n' >&2; return 1
+        fi
+        if [[ $(grep -Fxc '  ✓ Created Dockerfile.omg' "$stdout" || true) != 1 ]] \
+          || [[ $(grep -Fc 'Base image: debian:bookworm' "$stdout" || true) != 1 ]]; then
+          printf 'assertion failed: container init did not report the generated Debian scaffold\n' >&2; return 1
         fi ;;
       task-executed)
         if [[ ! -f smoke-task.marker || -L smoke-task.marker ]] \
@@ -1537,7 +1580,11 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv) ;; *) exit 2 ;; esac
+  case "$id:$a" in
+    workspace-list:workspace-project-listed|workspace-remove:workspace-project-removed|container-init:container-init-scaffold) ;;
+    workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
+  esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
     jq -e '. == ["run", "smoke", "--using", "make"]' <<< "$aj" >/dev/null || exit 2

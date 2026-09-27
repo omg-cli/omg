@@ -34,12 +34,12 @@ hooks-run	["hooks","run","pre-commit"]	controlled-error	0	pass	hooks-install	her
 hooks-uninstall	["hooks","uninstall"]	isolated-write	0	pass	hooks-install	hermetic	hermetic:pass	hooks-absent	tempdir-drop
 workspace-init	["workspace","init","smoke"]	isolated-write	0	pass	-	hermetic	hermetic:pass	workspace-initialized	tempdir-drop
 workspace-add	["workspace","add",".","--name","fixture"]	isolated-write	0	pass	workspace-init	hermetic	hermetic:pass	workspace-project-added	tempdir-drop
-workspace-list	["workspace","list"]	read	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
+workspace-list	["workspace","list"]	read	0	pass	workspace-add	hermetic	hermetic:pass	workspace-project-listed	tempdir-drop
 workspace-run	["workspace","run","true"]	read	1	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
 workspace-diff	["workspace","diff","main"]	read	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
 workspace-check	["workspace","check"]	read	1	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
 workspace-status	["workspace","status"]	read	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
-workspace-remove	["workspace","remove","fixture"]	isolated-write	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
+workspace-remove	["workspace","remove","fixture"]	isolated-write	0	pass	workspace-add	hermetic	hermetic:pass	workspace-project-removed	tempdir-drop
 hook-env	["hook-env","--shell","bash"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 daemon	["daemon","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 config	["config"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -112,7 +112,7 @@ container-images	["container","images"]	read	arch:1,debian:1,ubuntu:1,fedora:0	p
 container-pull	["container","pull","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 container-stop	["container","stop","missing"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 container-exec	["container","exec","missing","--","true"]	controlled-error	arch:1,debian:1,ubuntu:1,fedora:125	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-container-init	["container","init","--base","debian:bookworm"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+container-init	["container","init","--base","debian:bookworm"]	isolated-write	0	pass	-	hermetic	hermetic:pass	container-init-scaffold	tempdir-drop
 account-link	["account","link","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 account-link-stdin	["account","link","--token-stdin"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 account-status	["account","status"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
