@@ -289,22 +289,6 @@ fn supported_distro_label(distro: Distro) -> Option<&'static str> {
     }
 }
 
-fn doctor_dependencies(distro: Distro) -> Vec<&'static str> {
-    let mut deps = vec!["git", "curl", "tar"];
-    // Homebrew's supported macOS prefixes need sudo only for the initial
-    // installation, not routine package operations.
-    if !matches!(distro, Distro::MacOS) {
-        deps.push("sudo");
-    }
-    if matches!(distro, Distro::Debian | Distro::Ubuntu) {
-        deps.push("apt-get");
-    }
-    if matches!(distro, Distro::Arch) {
-        deps.push("makepkg");
-    }
-    deps
-}
-
 /// Whether a lists-dir entry is a package index the apt backend can parse:
 /// the name carries `_Packages` and the encoding is one
 /// `package_managers::debian_db` reads (uncompressed, lz4, gz, xz).
@@ -1423,14 +1407,6 @@ pub fn enable_turbo_mode() -> Result<()> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[test]
-    fn doctor_dependencies_match_native_backend() {
-        assert_eq!(doctor_dependencies(Distro::MacOS), ["git", "curl", "tar"]);
-        assert!(doctor_dependencies(Distro::Arch).contains(&"makepkg"));
-        assert!(doctor_dependencies(Distro::Ubuntu).contains(&"apt-get"));
-        assert!(doctor_dependencies(Distro::Fedora).contains(&"sudo"));
-    }
 
     #[test]
     fn doctor_network_targets_match_selected_backend() {

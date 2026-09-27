@@ -69,7 +69,22 @@ def path_without_sudo(binary: Path, original: str, scratch: Path) -> str:
     return controlled
 
 
-def check_native_doctor(binary: Path, env: dict[str, str]) -> None:
+def path_without_omg(binary: Path, env: dict[str, str]) -> str:
+    """Remove only paths Doctor accepts as OMG's executable directory."""
+    home = Path(env.get("HOME", str(Path.home())))
+    accepted = {binary.parent, Path(env["OMG_DATA_DIR"]) / "bin", home / ".local/bin"}
+    entries = [entry for entry in env["PATH"].split(os.pathsep) if entry]
+    if not any(Path(entry) in accepted for entry in entries):
+        raise AssertionError("baseline PATH has no OMG directory to remove")
+    remaining = [
+        entry for entry in entries if Path(entry) not in accepted
+    ]
+    if not remaining:
+        raise AssertionError("removing OMG left no usable PATH entries")
+    return os.pathsep.join(remaining)
+
+
+def check_native_doctor(binary: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     baseline = run_doctor(binary, env)
     require(baseline.returncode == 1, baseline, "blocked connectivity must fail Doctor")
     require(issue_count(baseline) == 1, baseline, "only the blocked connectivity should be an issue")
@@ -117,6 +132,7 @@ def check_native_doctor(binary: Path, env: dict[str, str]) -> None:
             "network issue count must match all failed HTTP and DNS probes")
     require(sum("formulae.brew.sh:443" in request for request in RejectingProxy.requests) >= 2,
             network, "both Homebrew API requests must reach the controlled proxy")
+    return baseline
 
 
 def main() -> None:
@@ -151,7 +167,18 @@ def main() -> None:
                 "no_proxy": "",
             })
             try:
-                check_native_doctor(binary, env)
+                baseline = check_native_doctor(binary, env)
+                missing_path_env = env.copy()
+                missing_path_env["PATH"] = path_without_omg(binary, env)
+                missing_path = run_doctor(binary, missing_path_env)
+                require(missing_path.returncode == 1 and
+                        issue_count(missing_path) == issue_count(baseline) + 1,
+                        missing_path, "removing OMG from PATH must add exactly one issue")
+                require(len(re.findall(r"^  OMG bin directory not in PATH$",
+                                       missing_path.stdout, re.MULTILINE)) == 1,
+                        missing_path, "Doctor must name the missing OMG PATH exactly once")
+                require("PATH configured correctly" not in missing_path.stdout,
+                        missing_path, "Doctor must not report a healthy PATH when OMG is absent")
                 no_sudo_env = env.copy()
                 no_sudo_env["PATH"] = path_without_sudo(binary, env["PATH"], Path(scratch))
                 no_sudo = run_doctor(binary, no_sudo_env)
