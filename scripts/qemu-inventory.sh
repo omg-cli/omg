@@ -369,6 +369,25 @@ check_apt_update_fixture() {
   fi
 }
 
+apt_installed_snapshot() {
+  local inventory installed
+  inventory=$(dpkg-query -W '-f=${Package}\t${Status}\t${Version}\n') || return 1
+  [[ -n "$inventory" ]] || return 1
+  installed=$(awk -F '\t' '$2 == "install ok installed" { print }' <<< "$inventory") || return 1
+  [[ -n "$installed" ]] || return 1
+  LC_ALL=C sort <<< "$installed"
+}
+
+check_apt_update_delta() {
+  local before=$1 after=$2 before_other after_other
+  before_other=$(awk -F '\t' '$1 != "tree" { print }' <<< "$before") || return 1
+  after_other=$(awk -F '\t' '$1 != "tree" { print }' <<< "$after") || return 1
+  if [[ "$before_other" != "$after_other" ]]; then
+    printf 'assertion failed: APT update changed installed packages other than tree\n' >&2
+    return 1
+  fi
+}
+
 cleanup_apt_update_fixture() {
   local pin=/etc/apt/preferences.d/omg-qemu-tree.pref failed=0
   if [[ "${apt_fixture_installed:-0}" == 1 ]]; then
@@ -1773,7 +1792,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f check_native_remove_preview)"
   fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
-    remote+="; $(declare -f check_apt_tree_absent); $(declare -f prepare_apt_update_fixture); $(declare -f check_apt_update_fixture); $(declare -f cleanup_apt_update_fixture)"
+    remote+="; $(declare -f check_apt_tree_absent); $(declare -f prepare_apt_update_fixture); $(declare -f check_apt_update_fixture); $(declare -f apt_installed_snapshot); $(declare -f check_apt_update_delta); $(declare -f cleanup_apt_update_fixture)"
   fi
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
@@ -1887,7 +1906,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   elif [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; export OMG_DISABLE_DAEMON=1; apt_fixture_installed=0; apt_fixture_pin_created=0"
     remote+="; apt_fixture_exit_cleanup() { if [[ \"\$apt_fixture_installed\" == 1 || \"\$apt_fixture_pin_created\" == 1 ]]; then cleanup_apt_update_fixture '$distro' >/dev/null 2>&1 || true; fi; rm -f \"\$status_file\"; }; trap apt_fixture_exit_cleanup EXIT"
-    remote+="; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\"; then if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT setup cleanup failed\\n' >&2; fi; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+    remote+="; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\" || ! apt_before=\$(apt_installed_snapshot); then if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT setup cleanup failed\\n' >&2; fi; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == daemon-foreground ]]; then
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
@@ -1919,7 +1938,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if [[ \"\$rc\" == 0 ]] && { ! grep -Fxq 'OMG_QEMU_UPDATE_FIXTURE:before:${case#update-}:1' command.stdout.log || ! grep -Fxq 'OMG_QEMU_UPDATE_FIXTURE:after:${case#update-}:2:native-upgrade' command.stdout.log; }; then printf 'assertion failed: bounded Fedora update lacks native before/after evidence\\n' >&2; assertion=1; fi"
   fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
-    remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_apt_update_fixture; then assertion=1; fi"
+    remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]]; then if ! check_apt_update_fixture; then assertion=1; fi; if ! apt_after=\$(apt_installed_snapshot); then printf 'assertion failed: APT installed-package after-state is unavailable\\n' >&2; execution_phase=dependency; rc=2; assertion=1; elif ! check_apt_update_delta \"\$apt_before\" \"\$apt_after\"; then assertion=1; fi; fi"
     remote+="; if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT update fixture cleanup failed\\n' >&2; execution_phase=dependency; rc=2; assertion=1; fi"
   fi
   if [[ -n "$counter" ]]; then

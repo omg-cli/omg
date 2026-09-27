@@ -109,7 +109,10 @@ esac
   *) exit 70 ;;
 esac
 ''',
-            'dpkg-query': '''if [[ "$*" == *'${Package}'* ]]; then
+            'dpkg-query': '''if [[ "$*" == *'${Package}'* && "$*" == *'${Version}'* ]]; then
+  printf 'base\\tinstall ok installed\\t%s\\n' "$(cat "$HOME/base-state" 2>/dev/null || printf 1.0)"
+  if [[ -f "$HOME/tree-state" ]]; then printf 'tree\\tinstall ok installed\\t%s\\n' "$(cat "$HOME/tree-state")"; fi
+elif [[ "$*" == *'${Package}'* ]]; then
   printf 'base\\tinstall ok installed\\n'
   if [[ -f "$HOME/tree-state" ]]; then printf 'tree\\tinstall ok installed\\n'; fi
 elif [[ -f "$HOME/tree-state" ]]; then
@@ -145,6 +148,18 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
                     self.assertEqual(evidence[0]['result'], expected, logs)
                     self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
                     self.assertFalse(pin.exists(), 'APT pin survived a completed row')
+        message = 'Fast System Update\nSynced\nUpgraded 1 packages\n'
+        product = (f'[[ -f {quoted_pin} ]] || exit 73\n'
+                   f'printf %s {shlex.quote(message)}\n'
+                   'printf 2.0 > "$HOME/tree-state"\n'
+                   'printf 2.0 > "$HOME/base-state"\n')
+        result, evidence, logs = self.run_inventory(
+            product, [fast_row], native_commands=native,
+            home_files={'tree_fixture.deb': b'fixture'},
+            distro='debian', tiers='container', allow_mutations=True)
+        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+        self.assertIn('APT update changed installed packages other than tree', logs['update-fast.log'])
+        self.assertFalse(pin.exists(), 'extra-package rejection leaked the pin')
         # A pre-existing native tree is a setup conflict, never this fixture's
         # package to purge. The host may independently have /usr/bin/tree.
         with tempfile.TemporaryDirectory() as directory:
