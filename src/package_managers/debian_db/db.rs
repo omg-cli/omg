@@ -11,9 +11,9 @@
 
 #![cfg(any(feature = "debian", feature = "debian-pure"))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufReader, Read};
+use std::io::{self, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -1091,16 +1091,15 @@ fn read_packages_file_content(path: &Path) -> Result<String> {
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("lz4"))
     {
-        read_index_text_bounded(
-            lz4_flex::frame::FrameDecoder::new(reader),
-            MAX_INDEX_SNAPSHOT_BYTES,
-        )
+        read_lz4_index_text_bounded(reader, MAX_INDEX_SNAPSHOT_BYTES)
     } else if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
     {
+        // A gzip file may contain multiple members; the single-member decoder
+        // would silently omit packages or corruption after the first one.
         read_index_text_bounded(
-            flate2::read::GzDecoder::new(reader),
+            flate2::read::MultiGzDecoder::new(reader),
             MAX_INDEX_SNAPSHOT_BYTES,
         )
     } else if path
@@ -1114,6 +1113,30 @@ fn read_packages_file_content(path: &Path) -> Result<String> {
     } else {
         read_index_text_bounded(reader, MAX_INDEX_SNAPSHOT_BYTES)
     }
+}
+
+fn read_lz4_index_text_bounded(mut reader: BufReader<fs::File>, limit: u64) -> Result<String> {
+    // FrameDecoder reports EOF at each frame boundary. Recreate it for each
+    // following frame so neither the backend nor Doctor can ignore later data.
+    let mut decoded = BudgetedWriter::new(Vec::new(), limit);
+    let mut frames = 0usize;
+    loop {
+        let mut header = [0u8; 7];
+        if reader.read(&mut header[..1])? == 0 {
+            break;
+        }
+        reader.read_exact(&mut header[1..])?;
+        let input = Cursor::new(header).chain(reader);
+        let mut decoder = lz4_flex::frame::FrameDecoder::new(input);
+        io::copy(&mut decoder, &mut decoded)?;
+        let (header, remaining) = decoder.into_inner().into_inner();
+        anyhow::ensure!(header.position() == 7, "Incomplete LZ4 frame header");
+        reader = remaining;
+        frames += 1;
+    }
+    anyhow::ensure!(frames > 0, "Empty LZ4 Packages index");
+    String::from_utf8(decoded.into_inner())
+        .map_err(|error| anyhow::anyhow!("Invalid UTF-8 in LZ4-compressed Packages file: {error}"))
 }
 
 fn read_index_text_bounded(reader: impl Read, limit: u64) -> Result<String> {
@@ -1325,7 +1348,7 @@ fn parse_paragraph_str(
     let mut homepage = String::new();
     let mut current_field: Option<&str> = None;
     let mut required_fields = [0u8; 3];
-    let mut seen_fields: Vec<&str> = Vec::with_capacity(24);
+    let mut seen_fields = HashSet::with_capacity(24);
 
     for line in paragraph.lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
@@ -1371,13 +1394,10 @@ fn parse_paragraph_str(
             bounded_deb822_excerpt(key)
         );
         anyhow::ensure!(
-            !seen_fields
-                .iter()
-                .any(|seen| seen.eq_ignore_ascii_case(key)),
+            seen_fields.insert(key.to_ascii_lowercase()),
             "Duplicate deb822 field: {}",
             bounded_deb822_excerpt(key)
         );
-        seen_fields.push(key);
         current_field = Some(key);
 
         if key.eq_ignore_ascii_case("Package") {
@@ -1901,7 +1921,7 @@ pub fn validate_dpkg_status_at(path: &Path) -> Result<usize> {
 }
 
 fn validate_deb822_fields(paragraph: &str) -> Result<()> {
-    let mut seen_fields: Vec<&str> = Vec::with_capacity(24);
+    let mut seen_fields = HashSet::with_capacity(24);
     for line in paragraph.lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
             anyhow::ensure!(
@@ -1922,13 +1942,10 @@ fn validate_deb822_fields(paragraph: &str) -> Result<()> {
             bounded_deb822_excerpt(key)
         );
         anyhow::ensure!(
-            !seen_fields
-                .iter()
-                .any(|seen| seen.eq_ignore_ascii_case(key)),
+            seen_fields.insert(key.to_ascii_lowercase()),
             "Duplicate deb822 field: {}",
             bounded_deb822_excerpt(key)
         );
-        seen_fields.push(key);
     }
     anyhow::ensure!(!seen_fields.is_empty(), "dpkg entry has no fields");
     Ok(())
@@ -3523,6 +3540,25 @@ mod tests {
     }
 
     #[test]
+    fn package_and_status_parsers_handle_many_distinct_fields_and_fold_duplicate_case() {
+        use std::fmt::Write as _;
+
+        let mut paragraph = String::from(
+            "Package: fixture\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n",
+        );
+        for number in 0..2048 {
+            writeln!(paragraph, "X-Repository-Field-{number}: value")
+                .expect("append valid custom field");
+        }
+        assert!(parse_paragraph_str(&paragraph, "main", "stable", "fixture").is_ok());
+        assert_eq!(parse_security_inventory(&paragraph).unwrap().len(), 1);
+
+        paragraph.push_str("x-repository-field-2047: spoofed\n");
+        assert!(parse_paragraph_str(&paragraph, "main", "stable", "fixture").is_err());
+        assert!(parse_security_inventory(&paragraph).is_err());
+    }
+
+    #[test]
     fn package_index_text_read_is_bounded() {
         assert_eq!(
             read_index_text_bounded(std::io::Cursor::new("abc"), 3).expect("at budget"),
@@ -4216,6 +4252,127 @@ mod tests {
         let packages = parse_packages_file_sync(&path).expect("decode SHA-256 checked index");
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "fixture");
+    }
+
+    fn compressed_packages_member(format: &str, content: &str) -> Vec<u8> {
+        use std::io::Write as _;
+
+        match format {
+            "gz" => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder
+                    .write_all(content.as_bytes())
+                    .expect("write gzip member");
+                encoder.finish().expect("finish gzip member")
+            }
+            "lz4" => {
+                let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+                encoder
+                    .write_all(content.as_bytes())
+                    .expect("write LZ4 frame");
+                encoder.finish().expect("finish LZ4 frame")
+            }
+            "xz" => {
+                let mut compressed = Vec::new();
+                lzma_rs::xz_compress(&mut content.as_bytes(), &mut compressed)
+                    .expect("write XZ stream");
+                compressed
+            }
+            _ => unreachable!("unsupported test format"),
+        }
+    }
+
+    #[test]
+    fn compressed_packages_indexes_consume_all_concatenated_members() {
+        const FIRST: &str = "Package: first\nVersion: 1\nArchitecture: amd64\n\n";
+        const SECOND: &str = "Package: second\nVersion: 2\nArchitecture: amd64\n\n";
+        for format in ["gz", "lz4", "xz"] {
+            let directory = tempfile::tempdir().expect("isolated Packages index");
+            let path = directory.path().join(format!("mirror_Packages.{format}"));
+            let mut compressed = compressed_packages_member(format, FIRST);
+            compressed.extend(compressed_packages_member(format, SECOND));
+            std::fs::write(&path, compressed).expect("write concatenated index");
+
+            let packages = parse_packages_file_sync(&path).expect("parse every member");
+            let names: Vec<_> = packages
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect();
+            assert_eq!(names, ["first", "second"], "{format}");
+            assert_eq!(
+                validate_apt_package_indexes_at(directory.path()).unwrap(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_packages_indexes_reject_corrupt_later_member() {
+        const FIRST: &str = "Package: first\nVersion: 1\nArchitecture: amd64\n\n";
+        const SECOND: &str = "Package: broken\nArchitecture: amd64\n\n";
+        for format in ["gz", "lz4", "xz"] {
+            let directory = tempfile::tempdir().expect("isolated Packages index");
+            let path = directory.path().join(format!("mirror_Packages.{format}"));
+            let mut compressed = compressed_packages_member(format, FIRST);
+            compressed.extend(compressed_packages_member(format, SECOND));
+            std::fs::write(&path, compressed).expect("write concatenated index");
+
+            assert!(
+                parse_packages_file_sync(&path).is_err(),
+                "{format} live parser"
+            );
+            assert!(
+                validate_apt_package_indexes_at(directory.path()).is_err(),
+                "{format} Doctor validation"
+            );
+        }
+    }
+
+    #[test]
+    fn concatenated_compressed_members_share_one_decompression_budget() {
+        let mut compressed = compressed_packages_member("gz", "abc");
+        compressed.extend(compressed_packages_member("gz", "def"));
+        let decoder = flate2::read::MultiGzDecoder::new(compressed.as_slice());
+        assert_eq!(read_index_text_bounded(decoder, 6).unwrap(), "abcdef");
+
+        let decoder = flate2::read::MultiGzDecoder::new(compressed.as_slice());
+        assert!(read_index_text_bounded(decoder, 5).is_err());
+
+        let directory = tempfile::tempdir().expect("isolated LZ4 index");
+        let path = directory.path().join("mirror_Packages.lz4");
+        let mut compressed = compressed_packages_member("lz4", "abc");
+        compressed.extend(compressed_packages_member("lz4", "def"));
+        std::fs::write(&path, compressed).expect("write concatenated LZ4 index");
+        let reader = BufReader::new(fs::File::open(&path).expect("open LZ4 index"));
+        assert_eq!(read_lz4_index_text_bounded(reader, 6).unwrap(), "abcdef");
+        let reader = BufReader::new(fs::File::open(&path).expect("open LZ4 index"));
+        assert!(read_lz4_index_text_bounded(reader, 5).is_err());
+    }
+
+    #[test]
+    fn compressed_packages_indexes_reject_truncated_later_stream() {
+        const FIRST: &str = "Package: first\nVersion: 1\nArchitecture: amd64\n\n";
+        for (format, incomplete_header) in [
+            ("gz", &[0x1f, 0x8b, 0x08][..]),
+            ("lz4", &[0x04, 0x22, 0x4d, 0x18][..]),
+            ("xz", &[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00][..]),
+        ] {
+            let directory = tempfile::tempdir().expect("isolated Packages index");
+            let path = directory.path().join(format!("mirror_Packages.{format}"));
+            let mut compressed = compressed_packages_member(format, FIRST);
+            compressed.extend_from_slice(incomplete_header);
+            std::fs::write(&path, compressed).expect("write truncated stream");
+
+            assert!(
+                parse_packages_file_sync(&path).is_err(),
+                "{format} live parser"
+            );
+            assert!(
+                validate_apt_package_indexes_at(directory.path()).is_err(),
+                "{format} Doctor validation"
+            );
+        }
     }
 
     #[test]
