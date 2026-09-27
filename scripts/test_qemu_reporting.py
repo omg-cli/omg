@@ -541,6 +541,15 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(issues[0]["distro"], "matrix")
         self.assertEqual(issues[0]["result"], "HARNESS_ERROR")
 
+    def test_failure_overflow_keeps_distinct_ci_prerequisite_issue(self):
+        failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(26)]
+        ci = dict(case_id="ci-non-qemu-workflow", distro="matrix",
+                  result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
+        issues, catalog = REPORT.bound_issue_updates([*failures, ci])
+        self.assertEqual(catalog, [*failures, ci])
+        self.assertEqual([row["case_id"] for row in issues],
+                         ["qemu-matrix-workflow", "ci-non-qemu-workflow"])
+
     def test_issue_limit_boundary_keeps_individual_diagnoses(self):
         for count in (0, 1, 25):
             failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(count)]
@@ -609,7 +618,8 @@ class ReportingBoundaryTests(unittest.TestCase):
                            latest_tag="v0.1.224", provenance_override=None, commit_shas=None,
                            jobs=None, prior_attempt_artifact=False,
                            retained_guest_artifacts=False, arm_rows=None, arm_log=None,
-                           arm_first=False, arm_provenance_override=None):
+                            arm_first=False, arm_provenance_override=None,
+                            no_artifacts=False, artifact_listing_error=False):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -627,6 +637,8 @@ class ReportingBoundaryTests(unittest.TestCase):
         payload = output.getvalue()
         artifacts = [artifact]
         payloads = {30: payload}
+        if no_artifacts:
+            artifacts, payloads = [], {}
         if all_distros:
             artifacts, payloads = [], {}
             for identifier, distro in enumerate(REPORT.DISTROS, 30):
@@ -699,6 +711,8 @@ class ReportingBoundaryTests(unittest.TestCase):
                     current["run_attempt"] += 1
                 return json.dumps(current)
             if "/artifacts?" in path:
+                if artifact_listing_error:
+                    raise ValueError("artifact listing unavailable")
                 return json.dumps(dict(total_count=len(artifacts), artifacts=artifacts))
             if "/artifacts/" in path and path.endswith("/zip"):
                 return payloads[int(path.split('/')[-2])]
@@ -891,6 +905,98 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(len(calls[0][1]), 1)
         self.assertEqual(calls[0][1][0]["distro"], "fedora")
         self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-x86-workflow")
+
+    def test_failed_native_ci_before_qemu_uses_ci_prerequisite_identity(self):
+        jobs = [
+            {"name": "Linux (debian-trixie)", "conclusion": "failure", "id": 11,
+             "steps": [{"name": "Run unit tests", "conclusion": "failure", "number": 13}]},
+            {"name": "QEMU behavioral verification", "conclusion": "skipped", "id": 12,
+             "steps": []},
+            {"name": "CI Success", "conclusion": "failure", "id": 13, "steps": []},
+        ]
+        calls, catalog = self.run_report_fixture(
+            [], workflow_path=".github/workflows/ci.yml", no_artifacts=True,
+            jobs=jobs)
+        self.assertEqual(len(catalog["failures"]), 1)
+        self.assertEqual(catalog["failures"][0]["case_id"], "ci-non-qemu-workflow")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1][0]["case_id"], "ci-non-qemu-workflow")
+        self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "ci")
+
+    def test_failed_native_ci_with_unavailable_artifacts_does_not_invent_qemu_failure(self):
+        jobs = [
+            {"name": "Linux (debian-trixie)", "conclusion": "failure", "id": 11,
+             "steps": []},
+            {"name": "QEMU behavioral verification", "conclusion": "skipped", "id": 12,
+             "steps": []},
+            {"name": "CI Success", "conclusion": "failure", "id": 13, "steps": []},
+        ]
+        calls, catalog = self.run_report_fixture(
+            [], workflow_path=".github/workflows/ci.yml", jobs=jobs,
+            artifact_listing_error=True)
+        self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+        self.assertEqual([row["case_id"] for row in catalog["failures"]],
+                         ["ci-non-qemu-workflow"])
+        self.assertEqual(len(calls), 2)  # issue helper and telemetry
+        self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "ci")
+
+    def test_failed_qemu_guest_inside_ci_keeps_qemu_identity(self):
+        jobs = [
+            {"name": "QEMU behavioral verification / Distro lane (arch) / QEMU guest (arch)",
+             "conclusion": "failure", "id": 11, "steps": []},
+            {"name": "CI Success", "conclusion": "failure", "id": 12, "steps": []},
+        ]
+        calls, catalog = self.run_report_fixture(
+            [self.row()], workflow_path=".github/workflows/ci.yml", jobs=jobs)
+        self.assertEqual(catalog["failures"][0]["case_id"], "qemu-arch-search")
+        self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "qemu-matrix")
+
+    def test_failed_native_ci_after_successful_qemu_keeps_ci_identity(self):
+        jobs = [
+            {"name": "QEMU behavioral verification / QEMU matrix result",
+             "conclusion": "success", "id": 11, "steps": []},
+            {"name": "Docs audit", "conclusion": "failure", "id": 12, "steps": []},
+            {"name": "CI Success", "conclusion": "failure", "id": 13, "steps": []},
+        ]
+        calls, catalog = self.run_report_fixture(
+            [self.row("PASS")], workflow_path=".github/workflows/ci.yml", jobs=jobs)
+        self.assertEqual([row["case_id"] for row in catalog["failures"]],
+                         ["ci-non-qemu-workflow"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "ci")
+
+    def test_parallel_ci_and_qemu_failures_keep_both_identities(self):
+        jobs = [
+            {"name": "QEMU behavioral verification / Distro lane (arch) / QEMU guest (arch)",
+             "conclusion": "failure", "id": 11, "steps": []},
+            {"name": "Docs audit", "conclusion": "failure", "id": 12, "steps": []},
+            {"name": "CI Success", "conclusion": "failure", "id": 13, "steps": []},
+        ]
+        calls, catalog = self.run_report_fixture(
+            [self.row()], workflow_path=".github/workflows/ci.yml", jobs=jobs)
+        self.assertEqual({row["case_id"] for row in catalog["failures"]},
+                         {"qemu-arch-search", "ci-non-qemu-workflow"})
+        self.assertEqual({call[3][call[3].index("--source") + 1] for call in calls},
+                         {"qemu-matrix", "ci"})
+        qemu_transcript = calls[0][2]["arch-qemu-arch-search"]
+        ci_transcript = calls[0][2]["matrix-ci-non-qemu-workflow"]
+        self.assertIn("QEMU guest (arch)", qemu_transcript)
+        self.assertNotIn("Docs audit", qemu_transcript)
+        self.assertIn("Docs audit", ci_transcript)
+        self.assertNotIn("QEMU guest (arch)", ci_transcript)
+
+    def test_qemu_parent_failure_without_children_is_not_a_ci_prerequisite(self):
+        jobs = [
+            {"name": "QEMU behavioral verification", "conclusion": "failure",
+             "id": 11, "steps": []},
+            {"name": "CI Success", "conclusion": "failure", "id": 12, "steps": []},
+        ]
+        calls, catalog = self.run_report_fixture(
+            [], workflow_path=".github/workflows/ci.yml", no_artifacts=True,
+            jobs=jobs)
+        self.assertEqual([row["case_id"] for row in catalog["failures"]],
+                         ["qemu-matrix-x86-workflow"])
+        self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "qemu-matrix")
 
     def test_cancelled_run_makes_no_issue_updates(self):
         calls, catalog = self.run_report_fixture([self.row()], conclusion="cancelled")

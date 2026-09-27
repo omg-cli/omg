@@ -122,6 +122,21 @@ if bash "$runner" "$results" --run-url https://run/invalid-matrix --source qemu-
 fi
 [[ -s "$CALL_LOG" ]] && fail "invalid matrix case contacted GitHub"
 
+# A non-QEMU CI job can fail before or after QEMU. Its issue keeps the
+# failure history without claiming a guest failure.
+printf '%s' '[{"case_id":"ci-non-qemu-workflow","distro":"matrix","result":"HARNESS_ERROR","exit_code":1,"elapsed_seconds":0}]' > "$results"
+: > "$CALL_LOG"; export FAKE_ISSUES_JSON='[]'
+out=$(bash "$runner" "$results" --run-url https://run/ci-prerequisite --source ci)
+assert_rc 0 "$?" "ci-prerequisite"
+grep -Fq 'fails outside QEMU in CI' "$CALL_LOG" || fail "CI failure claimed a QEMU guest"
+grep -Fq 'omg-qa-fingerprint: ci:matrix:ci-non-qemu-workflow' "$CALL_LOG" || fail "CI failure fingerprint is not distinct"
+if grep -Fq 'benchmark-qemu.sh' "$CALL_LOG"; then fail "CI prerequisite received a QEMU runbook"; fi
+: > "$CALL_LOG"
+if bash "$runner" "$results" --run-url https://run/ci-wrong-source --source qemu-matrix 2>/dev/null; then
+  fail "QEMU source accepted a native CI prerequisite identity"
+fi
+[[ -s "$CALL_LOG" ]] && fail "wrong-source CI case contacted GitHub"
+
 # 6. Clean run files nothing (and closes nothing when no issue is open).
 printf '%s' '[{"case_id":"x","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":1}]' > "$results"
 : > "$CALL_LOG"

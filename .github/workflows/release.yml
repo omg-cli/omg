@@ -18,6 +18,7 @@ on:
 concurrency:
   group: release
   cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read

@@ -47,8 +47,13 @@ for tool in jq gh; do command -v "$tool" >/dev/null || exit 3; done
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/qa-evidence-lib.sh"
 # Validate once, before any GitHub operations or filtering.
 rows="$(qa_result_rows "$results")"
-if [[ "$source" != qemu-matrix ]] && jq -e 'any(.[]; .distro == "matrix")' <<< "$rows" >/dev/null; then
-  printf 'error: matrix identity is only valid for QEMU workflow reports\n' >&2
+if { [[ "$source" != qemu-matrix && "$source" != ci ]] \
+     && jq -e 'any(.[]; .distro == "matrix")' <<< "$rows" >/dev/null; } \
+  || { [[ "$source" == ci ]] \
+     && jq -e 'any(.[]; .distro != "matrix" or .case_id != "ci-non-qemu-workflow")' <<< "$rows" >/dev/null; } \
+  || { [[ "$source" == qemu-matrix ]] \
+     && jq -e 'any(.[]; .case_id == "ci-non-qemu-workflow")' <<< "$rows" >/dev/null; }; then
+  printf 'error: matrix identity does not match its workflow source\n' >&2
   exit 2
 fi
 failures="$(jq -ce 'map(select(.result == "PRODUCT_FAIL" or .result == "HARNESS_ERROR" or .result == "FAIL"))' <<< "$rows")"
@@ -69,6 +74,8 @@ runbook_for() {
       fi ;;
     release-smoke)
       printf 'Rerun this leg: `./scripts/release-smoke.sh --distro %s --release <same-tag-as-run>%s`.\nFull per-case evidence (transcripts, metadata, result.json) is in this run'"'"'s uploaded `release-smoke-*` artifacts; paths below are relative to the evidence root.\n' "$1" "$2" ;;
+    ci)
+      printf 'Inspect the failed non-QEMU CI job and its uploaded logs at the linked commit. The QEMU result, if it ran, is recorded separately.\n' ;;
     *) printf 'Full per-case evidence is in this run'"'"'s uploaded artifacts; paths below are relative to the evidence root.\n' ;;
   esac
 }
@@ -110,7 +117,11 @@ while IFS= read -r row; do
     if [[ "$arch" == aarch64 ]]; then title="[qa] $case_id fails on $distro/aarch64 ($source)"; fi
     runbook_distro=$distro
     if [[ "$distro" == matrix ]]; then
-      title="[qa] $case_id fails in QEMU workflow ($source)"
+      if [[ "$source" == ci ]]; then
+        title="[qa] $case_id fails outside QEMU in CI ($source)"
+      else
+        title="[qa] $case_id fails in QEMU workflow ($source)"
+      fi
       runbook_distro=all
     fi
     runbook_option=$arch
