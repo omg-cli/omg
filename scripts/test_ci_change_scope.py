@@ -46,7 +46,9 @@ class ScopeTests(unittest.TestCase):
             '.github/workflows/qemu-lane.yml',
             '.github/workflows/qemu-report.yml',
             'scripts/qemu-daemon-check.sh',
+            'scripts/ci-smoke-report.py',
             'scripts/report-qemu-workflow.py',
+            'scripts/test_ci_smoke_report.py',
             'scripts/test_qemu_runner_isolation.py',
             'tests/qemu-inventory-policy.json',
             'docs/local-ci-runner.md',
@@ -116,6 +118,35 @@ class ScopeTests(unittest.TestCase):
                 event(git('rev-parse', 'HEAD')), root), (True, True))
             with self.assertRaises(subprocess.CalledProcessError):
                 scope.requires_build('pull_request', event('f' * 40), root)
+
+    def test_real_git_sentry_reporting_paths_do_not_require_rust_instrumentation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.check_output(['git', '-c', 'user.name=Test', '-c',
+                    'user.email=test@example.invalid', *args], cwd=root).decode().strip()
+
+            git('init', '-q')
+            (root / 'scripts').mkdir()
+            (root / 'src').mkdir()
+            (root / 'src/lib.rs').write_text('pub fn value() -> u8 { 1 }\n')
+            git('add', '.')
+            git('commit', '-qm', 'base')
+            base = git('rev-parse', 'HEAD')
+
+            (root / 'scripts/ci-smoke-report.py').write_text('print("report")\n')
+            (root / 'scripts/test_ci_smoke_report.py').write_text('print("test")\n')
+            git('add', '.')
+            git('commit', '-qm', 'reporter tests')
+            def event():
+                return {'pull_request': {'base': {'sha': base},
+                                         'head': {'sha': git('rev-parse', 'HEAD')}}}
+            self.assertEqual(scope.classify_scope('pull_request', event(), root), (True, False))
+
+            (root / 'src/lib.rs').write_text('pub fn value() -> u8 { 2 }\n')
+            git('commit', '-qam', 'Rust change')
+            self.assertEqual(scope.classify_scope('pull_request', event(), root), (True, True))
 
 
 if __name__ == '__main__':

@@ -22,7 +22,9 @@ QEMU_COVERAGE_IRRELEVANT = {
     '.github/workflows/qemu-report.yml',
     'scripts/benchmark-qemu.sh',
     'scripts/check-qemu-runner-isolation.py',
+    'scripts/ci-smoke-report.py',
     'scripts/report-qemu-workflow.py',
+    'scripts/test_ci_smoke_report.py',
     'scripts/test_qemu_runner_isolation.py',
     'tests/qemu-inventory-policy.json',
 }
