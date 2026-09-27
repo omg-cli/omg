@@ -951,12 +951,11 @@ mod tests {
     }
 
     async fn finish_probe_server(mut server: tokio::task::JoinHandle<()>) {
-        match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
-            Ok(result) => result.expect("local probe server"),
-            Err(_) => {
-                server.abort();
-                panic!("local probe server did not finish");
-            }
+        if let Ok(result) = tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+            result.expect("local probe server");
+        } else {
+            server.abort();
+            panic!("local probe server did not finish");
         }
     }
 
