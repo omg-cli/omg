@@ -450,6 +450,29 @@ def workflow_receipt(jobs, conclusion):
                 exit_code=0 if passed else 1, elapsed_seconds=0)
 
 
+def ci_non_qemu_failure(run, jobs):
+    """Keep failed CI jobs distinct from the QEMU job's result."""
+    return (run["path"] == ".github/workflows/ci.yml"
+            and run["conclusion"] != "success"
+            and (any(isinstance(job.get("name"), str)
+                     and not job["name"].startswith("QEMU behavioral verification")
+                     and job["name"] != "CI Success"
+                     and job.get("conclusion") in ("failure", "timed_out", "cancelled", "action_required")
+                     for job in jobs)
+                 or (not qemu_job_failed(run, jobs)
+                     and any(job.get("name") == "CI Success"
+                             and job.get("conclusion") in ("failure", "timed_out", "action_required")
+                             for job in jobs))))
+
+
+def qemu_job_failed(run, jobs):
+    return (run["path"] == ".github/workflows/qemu-matrix.yml"
+            or any(isinstance(job.get("name"), str)
+                   and job["name"].startswith("QEMU behavioral verification")
+                   and job.get("conclusion") in ("failure", "timed_out", "cancelled", "action_required")
+                   for job in jobs))
+
+
 def bound_issue_updates(selected):
     """Bound issue creation without dropping the validated diagnostic catalog."""
     failures = [row for row in selected if row["result"] in FAILURES]
@@ -459,7 +482,8 @@ def bound_issue_updates(selected):
                      result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
     passes = [row for row in selected
               if row["result"] == "PASS" and row["case_id"] != "qemu-matrix-workflow"]
-    return [aggregate, *passes], failures
+    ci = [row for row in selected if row["case_id"] == "ci-non-qemu-workflow"]
+    return [aggregate, *ci, *passes], failures
 
 
 def write_failure_catalog(directory, run, repository, failures, evidence_error):
@@ -585,12 +609,19 @@ def main():
     except (ValueError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError):
         selected = []
         evidence_error = True
+    ci_failed = ci_non_qemu_failure(run, job_rows)
+    qemu_failed = qemu_job_failed(run, job_rows)
     receipt = workflow_receipt(job_rows, run["conclusion"])
     selected = [receipt if row["case_id"] == "qemu-matrix-workflow" else row for row in selected]
     if evidence_error:
-        selected.append(workflow_receipt(job_rows, "failure"))
+        if qemu_failed or not ci_failed:
+            selected.append(workflow_receipt(job_rows, "failure"))
     elif run["conclusion"] != "success" and not any(row["result"] in FAILURES for row in selected):
-        selected.append(receipt)
+        if qemu_failed or not ci_failed:
+            selected.append(receipt)
+    if ci_failed:
+        selected.append(dict(case_id="ci-non-qemu-workflow", distro="matrix",
+                             result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0))
     if not selected:
         print("No authoritative case updates to report")
         return 0
@@ -610,15 +641,17 @@ def main():
     if not selected:
         print("No authoritative case updates to report")
         return 0
-    details = []
+    details = {"ci": [], "qemu-matrix": []}
     for job in jobs["jobs"][:100]:
         if job["conclusion"] not in ("success", "skipped"):
+            source = ("qemu-matrix" if run["path"] == ".github/workflows/qemu-matrix.yml"
+                      or job["name"].startswith("QEMU behavioral verification") else "ci")
             name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", job["name"])[:120]
-            details.append(f"Job {job['id']}: {name} ({job['conclusion']})")
+            details[source].append(f"Job {job['id']}: {name} ({job['conclusion']})")
             for step in job.get("steps", [])[:100]:
                 if step["conclusion"] not in ("success", "skipped"):
                     name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", step["name"])[:120]
-                    details.append(f"  Step {step['number']}: {name} ({step['conclusion']})")
+                    details[source].append(f"  Step {step['number']}: {name} ({step['conclusion']})")
     selected, failure_catalog = bound_issue_updates(selected)
     report_directory = Path(os.environ["RUNNER_TEMP"]) / "qemu-issue-report"
     write_failure_catalog(report_directory, run, repository, failure_catalog, evidence_error)
@@ -634,8 +667,6 @@ def main():
     if len(failure_catalog) > 25:
         catalog_note += "More than 25 cases failed; this aggregate bounds issue creation without discarding case evidence.\n"
     with tempfile.TemporaryDirectory() as directory:
-        results = Path(directory) / "results.json"
-        results.write_text(json.dumps(selected) + "\n")
         for row in selected:
             if row["result"] in FAILURES:
                 arch = row.get("arch", "x86_64")
@@ -649,18 +680,28 @@ def main():
                     f"Observed: {row['result']}, exit {row['exit_code']}, elapsed {row['elapsed_seconds']}s\n"
                     f"Evidence invalid/unavailable: {evidence_error}\n"
                     "Exit status alone does not establish the root cause. Inspect the linked run's logs and artifacts.\n"
-                    + "\n".join(details[:6]) + "\n"
+                     + "\n".join(details["ci" if row["case_id"] == "ci-non-qemu-workflow"
+                                         else "qemu-matrix"][:6]) + "\n"
                     + "Case diagnostic (untrusted log excerpt, redacted by issue helper):\n"
                     + diagnostics.get((row["case_id"], row["distro"], arch),
                                       "No case log available; inspect linked artifacts.")
                     + "\n" + catalog_note)
         run_url = f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}"
-        helper = ["bash", "scripts/qa-file-issue.sh", str(results), "--repo", repository,
-                  "--source", "qemu-matrix", "--run-url", run_url]
-        if not verified_published:
-            helper.append("--failures-only")
-        subprocess.run(helper, check=True, timeout=180)
+        for source in ("qemu-matrix", "ci"):
+            source_rows = [row for row in selected
+                           if (row["case_id"] == "ci-non-qemu-workflow") == (source == "ci")]
+            if not source_rows:
+                continue
+            results = Path(directory) / f"results-{source}.json"
+            results.write_text(json.dumps(source_rows) + "\n")
+            helper = ["bash", "scripts/qa-file-issue.sh", str(results), "--repo", repository,
+                      "--source", source, "--run-url", run_url]
+            if not verified_published:
+                helper.append("--failures-only")
+            subprocess.run(helper, check=True, timeout=180)
         if run["event"] == "pull_request" or evidence_error:
+            results = Path(directory) / "results-all.json"
+            results.write_text(json.dumps(selected) + "\n")
             subprocess.run(["bash", "scripts/report-smoke-sentry.sh", str(results)], check=True, timeout=20)
     print(f"Reported run {run_id}, attempt {run['run_attempt']}, commit {run['head_sha']}")
     return 0
