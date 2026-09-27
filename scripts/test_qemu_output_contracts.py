@@ -107,6 +107,27 @@ fi
                         distro='debian', tiers='container', allow_mutations=True)
                     self.assertEqual(evidence[0]['result'], expected, logs)
                     self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+        # A pre-existing native tree is a setup conflict, never this fixture's
+        # package to purge. The host may independently have /usr/bin/tree.
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'baseline-purged'
+            guarded = dict(native)
+            guarded['dpkg'] = native['dpkg'].replace(
+                '--purge) rm -f "$HOME/tree-state" ;;',
+                f'--purge) : > {shlex.quote(str(marker))}; rm -f "$HOME/tree-state" ;;')
+            result, evidence, logs = self.run_inventory(
+                ':\n', [rows[0]], native_commands=guarded,
+                home_files={'tree_fixture.deb': b'fixture', 'tree-state': b'2.0'},
+                distro='debian', tiers='container', allow_mutations=True)
+            self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+            self.assertFalse(marker.exists(), 'setup failure purged the pre-existing package')
+        failing_simulation = dict(native)
+        failing_simulation['apt-get'] = native['apt-get'] + 'exit 43\n'
+        result, evidence, logs = self.run_inventory(
+            ':\n', [rows[0]], native_commands=failing_simulation,
+            home_files={'tree_fixture.deb': b'fixture'},
+            distro='debian', tiers='container', allow_mutations=True)
+        self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_run_requires_the_make_task_to_execute(self):

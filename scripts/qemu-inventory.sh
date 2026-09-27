@@ -311,14 +311,27 @@ check_native_tree_state() {
   fi
 }
 
+# The APT fixture checks the guest's dpkg database directly. The output
+# contract harness runs on hosts that may have an unrelated /usr/bin/tree.
+check_apt_tree_absent() {
+  local distro=$1 inventory
+  [[ "$distro" == debian || "$distro" == ubuntu ]] || return 1
+  inventory=$(dpkg-query -W '-f=${Package}\t${Status}\n') || return 1
+  [[ -n "$inventory" ]] || return 1
+  if grep -Fxq $'tree\tinstall ok installed' <<< "$inventory"; then
+    printf 'assertion failed: native APT database already has tree installed\n' >&2
+    return 1
+  fi
+}
+
 # The lifecycle already downloaded the native tree archive and removed tree.
 # Repack that exact payload with an older version so both APT update modes must
 # complete a real upgrade. The guest is disposable; never use a host package.
 prepare_apt_update_fixture() {
-  local distro=$1 rowdir=$2 archive candidate installed
+  local distro=$1 rowdir=$2 archive candidate installed simulation
   local archives=("$HOME"/tree_*.deb)
   [[ ${#archives[@]} == 1 && -f "${archives[0]}" && ! -L "${archives[0]}" ]] || return 1
-  check_native_tree_state "$distro" absent || return 1
+  check_apt_tree_absent "$distro" || return 1
   archive=${archives[0]}
   mkdir -p "$rowdir/tree-old-package" || return 1
   dpkg-deb --raw-extract "$archive" "$rowdir/tree-old-package" >/dev/null || return 1
@@ -326,13 +339,15 @@ prepare_apt_update_fixture() {
   sed -i 's/^Version: .*/Version: 0.0.1/' "$rowdir/tree-old-package/DEBIAN/control" || return 1
   grep -Fxq 'Version: 0.0.1' "$rowdir/tree-old-package/DEBIAN/control" || return 1
   dpkg-deb --build "$rowdir/tree-old-package" "$rowdir/tree-old.deb" >/dev/null || return 1
+  apt_fixture_installed=1
   sudo -n dpkg --install "$rowdir/tree-old.deb" >/dev/null || return 1
   installed=$(dpkg-query -W '-f=${Status}\t${Version}\n' tree 2>/dev/null) || return 1
   [[ "$installed" == $'install ok installed\t0.0.1' ]] || return 1
   candidate=$(apt-cache policy tree | awk '$1 == "Candidate:" { print $2; exit }') || return 1
   [[ -n "$candidate" && "$candidate" != '(none)' ]] || return 1
   dpkg --compare-versions "$candidate" gt 0.0.1 || return 1
-  apt-get -s upgrade | grep -Eq '^[[:space:]]*Inst tree \[0\.0\.1\]' || return 1
+  simulation=$(apt-get -s upgrade) || return 1
+  grep -Eq '^[[:space:]]*Inst tree \[0\.0\.1\]' <<< "$simulation" || return 1
 }
 
 check_apt_update_fixture() {
@@ -348,7 +363,7 @@ check_apt_update_fixture() {
 
 cleanup_apt_update_fixture() {
   sudo -n dpkg --purge tree >/dev/null || return 1
-  check_native_tree_state "$1" absent
+  check_apt_tree_absent "$1"
 }
 
 # Compare the installed package database around a dry run. Repository metadata
@@ -1738,7 +1753,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f check_native_remove_preview)"
   fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
-    remote+="; $(declare -f check_native_tree_state); $(declare -f prepare_apt_update_fixture); $(declare -f check_apt_update_fixture); $(declare -f cleanup_apt_update_fixture)"
+    remote+="; $(declare -f check_apt_tree_absent); $(declare -f prepare_apt_update_fixture); $(declare -f check_apt_update_fixture); $(declare -f cleanup_apt_update_fixture)"
   fi
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
@@ -1850,7 +1865,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # plus native DNF history before it can report success.
     remote+="; run_omg '$command_timeout' sudo -n bash \"\$HOME/qemu-fedora-update-fixture.sh\" '${case#update-}' $quoted_binary '$ssh_user' > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
-    remote+="; export OMG_DISABLE_DAEMON=1; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\"; then cleanup_apt_update_fixture '$distro' >/dev/null 2>&1 || true; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+    remote+="; export OMG_DISABLE_DAEMON=1; apt_fixture_installed=0; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\"; then if [[ \"\$apt_fixture_installed\" == 1 ]]; then cleanup_apt_update_fixture '$distro' >/dev/null 2>&1 || true; fi; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == daemon-foreground ]]; then
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
