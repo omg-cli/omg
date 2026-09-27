@@ -180,17 +180,19 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                 case = row["case_id"].removeprefix(f"qemu-{row['distro']}-")
                 if parent.name == "inventory":
                     candidates = [parent / "rows" / f"{case}{suffix}.log"
-                                  for suffix in (".stderr", "", ".stdout")]
+                                  for suffix in (".stderr", ".stdout")]
                 elif case in ("lifecycle", "aarch64-lifecycle"):
                     candidates = [parent / name for name in (
                         "kvm-probe.log", "health-validation.log", "transactions.log",
                         "transaction-validation.log", "guest-check.log", "boot.log",
+                        "guest/evidence/index-update.txt",
                         "guest/evidence/daemon-direct.log",
                         "guest/evidence/daemon-advisory-shutdown.log")]
                 else:
                     candidates = []
                 excerpts = []
                 if case in ("lifecycle", "aarch64-lifecycle"):
+                    receipt = None
                     summary = members_by_name.get(str(parent / "transactions/summary.json"))
                     if summary is not None and summary.file_size <= 1024 * 1024:
                         try:
@@ -217,7 +219,14 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                                             raw = archive.read(member)
                                             if raw.strip():
                                                 excerpts.append((name, diagnostic_excerpt(raw)))
-                                if not excerpts:
+                                if trial["result"] == "HARNESS_ERROR":
+                                    name = f"transactions/trials/{trial_id}/boot.qemu-startup.log"
+                                    member = members_by_name.get(str(parent / name))
+                                    if member is not None and member.file_size <= 8 * 1024 * 1024:
+                                        raw = archive.read(member)
+                                        if raw.strip():
+                                            excerpts.append((name, diagnostic_excerpt(raw)))
+                                if not excerpts or trial["result"] == "HARNESS_ERROR":
                                     serial_name = f"transactions/trials/{trial_id}/serial.log"
                                     serial = members_by_name.get(str(parent / serial_name))
                                     if serial is not None and serial.file_size <= 8 * 1024 * 1024:
@@ -232,6 +241,16 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                                             excerpts.append((serial_name, diagnostic_excerpt(
                                                 "\n".join(signals[-4:] + priority[-4:]).encode("utf-8"))))
                                 break
+                    if not excerpts and isinstance(receipt, dict):
+                        startup = {"preparation": "prepare-install-boot.qemu-startup.log",
+                                   "restore": "resume-boot.qemu-startup.log"}.get(receipt.get("phase"))
+                        if startup:
+                            name = f"transactions/{startup}"
+                            member = members_by_name.get(str(parent / name))
+                            if member is not None and member.file_size <= 8 * 1024 * 1024:
+                                raw = archive.read(member)
+                                if raw.strip():
+                                    excerpts.append((name, diagnostic_excerpt(raw)))
                 if excerpts:
                     # A measured command failure has a more precise cause than
                     # earlier guest probes. Preserve the full excerpt budget.
@@ -249,8 +268,13 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                     if not raw.strip():
                         continue
                     excerpts.append((candidate.name, diagnostic_excerpt(raw)))
-                    if parent.name == "inventory":
-                        break
+                if parent.name == "inventory" and not excerpts:
+                    candidate = parent / "rows" / f"{case}.log"
+                    member = members_by_name.get(str(candidate))
+                    if member is not None and member.file_size <= 8 * 1024 * 1024:
+                        raw = archive.read(member)
+                        if raw.strip():
+                            excerpts.append((candidate.name, diagnostic_excerpt(raw)))
                 if not excerpts and case in ("lifecycle", "aarch64-lifecycle"):
                     # A setup failure can occur before boot.log or any guest
                     # case log exists. Report the latest available setup stage

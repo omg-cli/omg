@@ -89,9 +89,16 @@ stop_guest() {
   return 1
 }
 start_clone() {
-  local disk=$1 vars=$2 serial=$3 log=$4
+  local disk=$1 vars=$2 serial=$3 log=$4 rc=0
   [[ ! -e qemu.pid ]] || return 1
-  timeout --kill-after=5s 360 bash /work/boot.sh "${boot_args[@]}" "$disk" "$vars" "$serial" > "$log" 2>&1
+  rm -f -- qemu-startup.log
+  timeout --kill-after=5s 360 bash /work/boot.sh "${boot_args[@]}" "$disk" "$vars" "$serial" > "$log" 2>&1 || rc=$?
+  # boot.sh reuses this controller log on every clone. Preserve each launch
+  # before the next trial can overwrite the evidence for a failed boot.
+  if [[ -f qemu-startup.log && ! -L qemu-startup.log ]]; then
+    cp -- qemu-startup.log "${log%.log}.qemu-startup.log" || return 3
+  fi
+  return "$rc"
 }
 freeze_base() {
   local source=$1 operation=$2 vars=$3
