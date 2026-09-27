@@ -26,9 +26,9 @@ omg run test                    # run the task this project already defines
 omg audit scan                  # fetch advisories and show vulnerability evidence
 ```
 
-The daemon is optional for package operations. It keeps package indexes, vulnerability
-results, and status snapshots warm. In published v0.1.223, `omg audit scan`
-requires `omgd`; the current main checkout adds direct scanning when the daemon is absent.
+The daemon is optional for package operations and vulnerability scanning in
+published v0.1.224. It keeps package indexes, vulnerability results, and status
+snapshots warm; `omg audit scan` scans directly when the daemon is absent.
 
 ## Why OMG
 
@@ -104,8 +104,8 @@ flowchart LR
 
 `omg` remains the product entry point and owns direct execution. `omgd` keeps
 derived state warm and serves the same shared security engine over local Unix IPC.
-Stopping the daemon does not disable ordinary package operations. In published
-v0.1.223, `omg audit scan` still needs `omgd`; the main checkout can scan directly.
+Stopping the daemon does not disable ordinary package operations or
+`omg audit scan` in published v0.1.224.
 
 ## Install
 
@@ -138,8 +138,8 @@ and uninstalling.
 | Platform | Package path | Release status |
 | :--- | :--- | :--- |
 | Arch Linux x86_64 | ALPM plus first-class AUR pipeline | Supported; broadest package-security coverage |
-| Debian 12 / Ubuntu 24.04 x86_64 | APT 6 database | Supported by published v0.1.223 release binaries |
-| Debian 13 / Ubuntu 26.04 x86_64 | APT 7 database | Current main checkout supports the Trixie archive mapping; v0.1.223 has no APT 7 artifact |
+| Debian 12 / Ubuntu 24.04 x86_64 | APT 6 database | Supported by published v0.1.224 release binaries |
+| Debian 13 / Ubuntu 26.04 x86_64 | APT 7 database | Published v0.1.224 Trixie archive; QEMU guest lifecycle pending |
 | Fedora x86_64 | Direct RPM state plus DNF repository operations | Experimental |
 | Apple silicon macOS | Policy-gated Homebrew integration | Supported on ARM64 |
 | Windows | A supported Linux distribution in WSL | No native Windows build |
@@ -168,7 +168,7 @@ omg run test
 
 # Inspect the machine
 omg audit scan
-omg audit sbom                  # system-package inventory; Arch in v0.1.223
+omg audit sbom                  # system-package inventory on supported Linux backends
 omg history
 ```
 
