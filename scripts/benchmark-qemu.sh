@@ -595,7 +595,10 @@ if [[ -n "$inventory_tiers" ]]; then
   cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"
   cp "$tsv" "$work/cases.tsv"
   if [[ "$inventory_isolation" == true ]]; then
-    cp "$inventory_policy" "$work/inventory-policy.json"
+    # Resolve the exact reviewed snapshot on the host before any guest row.
+    # Only the digest-bound scope projection crosses into the controller.
+    python3 "$here/check-qemu-inventory.py" --policy "$inventory_policy" \
+      --inventory "$tsv" --network-scopes > "$work/inventory-scopes.json"
   fi
 fi
 if [[ "$benchmark" == true ]]; then
@@ -963,7 +966,7 @@ if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
   inv_args=(--work /work --distro "$distro" --tiers "$inventory_tiers" --tag "$tag"
     --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv)
   [[ "$inventory_mutations" == false ]] || inv_args+=(--allow-mutations)
-  [[ "$inventory_isolation" == false ]] || inv_args+=(--isolate-hermetic --network-policy /work/inventory-policy.json)
+  [[ "$inventory_isolation" == false ]] || inv_args+=(--isolate-hermetic --network-policy /work/inventory-scopes.json)
   inventory_rc=0
   timeout --kill-after=5s 3600 docker exec -w /work "$controller" bash /work/qemu-inventory.sh "${inv_args[@]}" > "$work/inventory.log" 2>&1 || inventory_rc=$?
   # Validate identity and values even for interrupted reports. Partial

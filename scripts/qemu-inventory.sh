@@ -1417,9 +1417,9 @@ if [[ "$isolate_hermetic" == true ]]; then
   [[ -f "$network_policy" && ! -L "$network_policy" && $(wc -c < "$network_policy") -le 1048576 ]] || exit 2
   inventory_digest=$(sha256sum "$tsv"); inventory_digest=${inventory_digest%% *}
   scopes=$(jq -ce --arg digest "$inventory_digest" '
-    .inventories[$digest].cases | select(type=="array" and length>0) |
-    if all(.[]; .network_scope=="offline" or .network_scope=="network") then
-      map({key:.id,value:.network_scope}) | from_entries else error("invalid network scope") end' "$network_policy")
+    select(.inventory_sha256 == $digest) | .scopes |
+    select(type=="object" and length>0 and
+           all(.[]; .=="offline" or .=="network"))' "$network_policy")
 fi
 
 root=$(cd "$work" && pwd)
