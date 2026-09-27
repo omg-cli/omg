@@ -479,6 +479,11 @@ case "$1" in
           invalid) printf '%s\n' '{"schema_version":1,"ipc":false}' > "$work/guest/evidence/daemon-lifecycle.json" ;;
           missing) ;;
         esac
+        case ${FAKE_QEMU_DOCTOR_RECEIPT:-valid} in
+          valid) printf '%s\n' '{"schema_version":1,"distro":"arch","primary":"archlinux.org","alternate":"kernel.org","real_cli":true,"baseline_issues":0,"fallback_issues":0}' > "$work/guest/evidence/doctor-connectivity-fallback.json" ;;
+          invalid) printf '%s\n' '{"schema_version":1,"distro":"arch","primary":"archlinux.org","alternate":"kernel.org","real_cli":false,"baseline_issues":0,"fallback_issues":0}' > "$work/guest/evidence/doctor-connectivity-fallback.json" ;;
+          missing) ;;
+        esac
         case ${FAKE_QEMU_AUR_RECEIPT:-valid} in
           valid|wrong-events)
             printf '%s\n' '{"schema_version":1,"arch":true,"real_cli":true,"tls_fixture":true,"detailed_metadata":true,"no_aur_suppressed":true,"basic_metadata_absent":true,"expected_connects":2,"expected_requests":2,"unexpected_events":0}' > "$work/guest/evidence/aur-search-flags.json"
@@ -537,9 +542,10 @@ done
 [[ -n "$child_result" ]] || fail 'interrupted QEMU child did not record its exit'
 
 export FAKE_QEMU_INFO_EXIT=0 FAKE_QEMU_STATE="$scratch/qemu-controller"
-for scenario in pass pull-failure product-failure product-exit-three timeout signaled cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-aur invalid-aur wrong-aur-events kernel-crash controller-oom missing-health; do
+for scenario in pass pull-failure product-failure product-exit-three timeout signaled cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-doctor invalid-doctor missing-aur invalid-aur wrong-aur-events kernel-crash controller-oom missing-health; do
   export FAKE_QEMU_PULL_EXIT=0
   export FAKE_QEMU_DAEMON_RECEIPT=valid
+  export FAKE_QEMU_DOCTOR_RECEIPT=valid
   export FAKE_QEMU_AUR_RECEIPT=valid
   export FAKE_QEMU_GUEST_EXIT=0 FAKE_QEMU_CLEANUP_FAIL=0 FAKE_QEMU_MISSING_RECEIPT=0
   export FAKE_QEMU_SERIAL='Linux version 6.12 fixture' FAKE_QEMU_OOM=false FAKE_QEMU_HEALTH_MISSING=0
@@ -550,6 +556,8 @@ for scenario in pass pull-failure product-failure product-exit-three timeout sig
     pull-failure) export FAKE_QEMU_PULL_EXIT=1; expected_rc=3; expected_result=HARNESS_ERROR ;;
     missing-daemon) export FAKE_QEMU_DAEMON_RECEIPT=missing; expected_rc=1; expected_result=HARNESS_ERROR ;;
     invalid-daemon) export FAKE_QEMU_DAEMON_RECEIPT=invalid; expected_rc=1; expected_result=HARNESS_ERROR ;;
+    missing-doctor) export FAKE_QEMU_DOCTOR_RECEIPT=missing; expected_rc=1; expected_result=HARNESS_ERROR ;;
+    invalid-doctor) export FAKE_QEMU_DOCTOR_RECEIPT=invalid; expected_rc=1; expected_result=HARNESS_ERROR ;;
     missing-aur) export FAKE_QEMU_AUR_RECEIPT=missing; expected_rc=1; expected_result=HARNESS_ERROR ;;
     invalid-aur) export FAKE_QEMU_AUR_RECEIPT=invalid; expected_rc=1; expected_result=HARNESS_ERROR ;;
     wrong-aur-events) export FAKE_QEMU_AUR_RECEIPT=wrong-events; expected_rc=1; expected_result=HARNESS_ERROR ;;
