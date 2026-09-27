@@ -66,14 +66,17 @@ class FixtureHandler(socketserver.BaseRequestHandler):
                 self.request.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 return
             self.server.record("connect", host)
-            if host == self.server.primary:
-                self.server.primary_seen.set()
             healthy = (host == "fixture.invalid" or
                        (self.server.mode == "primary" and host == self.server.primary) or
                        (self.server.mode == "alternate" and host == "kernel.org"))
             if not healthy:
                 self.server.record("denied", host)
                 self.request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                if host == self.server.primary:
+                    # Release the alternate only after the primary denial is
+                    # both logged and sent; the checker copies this log as soon
+                    # as Doctor exits.
+                    self.server.primary_seen.set()
                 return
             if host == "kernel.org" and self.server.mode == "alternate":
                 # The healthy alternate must not finish before the primary is
