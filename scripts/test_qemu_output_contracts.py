@@ -286,9 +286,9 @@ class OutputContracts(unittest.TestCase):
                    'if [[ "$1" == doctor ]] && [[ "' + distro + '" == arch ]]; then '
                    'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
                    'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
-        product = ('if [[ -n "${OMG_PACMAN_DB_DIR:-}" ]]; then '
-                   'printf "  ALPM local package database inconsistent (fixture): missing files\\n"; exit 1; fi\n'
-                   + healthy_product)
+        fault_guard = ('if [[ -n "${OMG_PACMAN_DB_DIR:-}" ]]; then '
+                       'printf "  ALPM local package database inconsistent (fixture): missing files\\n"; exit 1; fi\n')
+        product = fault_guard + healthy_product
         native = {'pacman': 'case "$1" in -Dk) exit 0 ;; -Qq) printf "one\\ntwo\\n" ;; *) exit 17 ;; esac\n'}
         result, evidence, logs = self.run_inventory(product, rows, native_commands=native, distro=distro)
         if distro == 'fedora':
@@ -304,7 +304,7 @@ class OutputContracts(unittest.TestCase):
                                                         native_commands=native, distro=distro)
             self.assertEqual(evidence[0]['result'], 'FAIL', logs)
             self.assertIn('doctor accepted a corrupt Arch local package entry', logs['doctor.log'])
-            spoofed = 'printf %s ' + shlex.quote(healthy + '  Optional tool available: git\n') + '\n'
+            spoofed = fault_guard + 'printf %s ' + shlex.quote(healthy + '  Optional tool available: git\n') + '\n'
             result, evidence, logs = self.run_inventory(spoofed, rows, native_commands=native, distro=distro)
             self.assertEqual(evidence[0]['result'], 'FAIL',
                              'a fixed Git verdict must fail under the restricted PATH')
