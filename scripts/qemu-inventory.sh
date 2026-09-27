@@ -2174,7 +2174,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
   if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state ]]; then budget=$((budget + row_timeout + 5)); fi
-  if [[ "$assertions" == doctor-native-backend ]]; then budget=$((budget + 5 * (row_timeout + 5))); fi
+  if [[ "$assertions" == doctor-native-backend ]]; then
+    # Four PATH variants plus the minimal-PATH run; Arch also exercises a
+    # corrupt local database. Each run owns a separate row_timeout deadline.
+    doctor_extra_runs=5
+    if [[ "$distro" == arch ]]; then doctor_extra_runs=6; fi
+    budget=$((budget + doctor_extra_runs * (row_timeout + 5)))
+  fi
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == outdated-native-count || "$assertions" == outdated-json-native-count ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == status-native-fast ]]; then budget=$((budget + 64)); fi
