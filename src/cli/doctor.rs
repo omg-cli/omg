@@ -480,7 +480,6 @@ async fn check_arch_infra() -> usize {
     let mut issues = 0;
 
     let conf_path = crate::core::paths::pacman_conf_path();
-    let mut db_path: Option<String> = None;
     if conf_path.exists() {
         match crate::core::pacman_conf::PacmanConfig::parse(&conf_path) {
             Ok(config) => {
@@ -490,7 +489,6 @@ async fn check_arch_infra() -> usize {
                     conf_path.display(),
                     config.repos.len()
                 );
-                db_path = config.db_path;
             }
             Err(e) => {
                 println!(
@@ -510,7 +508,23 @@ async fn check_arch_infra() -> usize {
         issues += 1;
     }
 
-    let local_dir = crate::core::paths::pacman_local_dir();
+    issues + check_arch_local_db().await
+}
+
+#[cfg(feature = "arch")]
+async fn check_arch_local_db() -> usize {
+    let local_dir = match crate::core::paths::pacman_local_dir_result() {
+        Ok(local_dir) => local_dir,
+        Err(error) => {
+            println!(
+                "  {} ALPM local package database path could not be resolved: {error}",
+                style::error("✗")
+            );
+            return 1;
+        }
+    };
+
+    let mut issues = 0;
     if local_dir.is_dir() {
         let check = async {
             let packages =
@@ -543,7 +557,9 @@ async fn check_arch_infra() -> usize {
         issues += 1;
     }
 
-    issues += check_pacman_lock(db_path.as_deref());
+    if let Some(db_path) = local_dir.parent() {
+        issues += check_pacman_lock(db_path);
+    }
 
     issues
 }
@@ -728,8 +744,8 @@ fn any_manager_running(proc_root: &std::path::Path, self_pid: u32) -> bool {
 /// mid-transaction and doctor stays quiet; a lock with no manager behind
 /// it blocks every future transaction until removed.
 #[cfg(feature = "arch")]
-fn check_pacman_lock(db_path: Option<&str>) -> usize {
-    let lock = std::path::Path::new(db_path.unwrap_or("/var/lib/pacman")).join("db.lck");
+fn check_pacman_lock(db_path: &std::path::Path) -> usize {
+    let lock = db_path.join("db.lck");
     if !lock.exists() {
         return 0;
     }
@@ -1438,10 +1454,9 @@ mod tests {
             return;
         }
         let dir = tempfile::TempDir::new().expect("isolated db dir");
-        let dir_str = dir.path().to_string_lossy().into_owned();
-        assert_eq!(check_pacman_lock(Some(&dir_str)), 0);
+        assert_eq!(check_pacman_lock(dir.path()), 0);
         std::fs::write(dir.path().join("db.lck"), b"").expect("stale lock");
-        assert_eq!(check_pacman_lock(Some(&dir_str)), 1);
+        assert_eq!(check_pacman_lock(dir.path()), 1);
     }
 
     // W3-A-02: every supported backend distro must get a healthy OS verdict;

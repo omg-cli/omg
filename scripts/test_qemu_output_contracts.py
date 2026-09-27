@@ -286,11 +286,16 @@ class OutputContracts(unittest.TestCase):
                    'if [[ "$1" == doctor ]] && [[ "' + distro + '" == arch ]]; then '
                    'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
                    'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
-        dependency_guard = (
-            'if [[ "${OMG_PACMAN_DB_DIR:-}" == */dependency-db ]]; then\n'
-            '  printf "  ALPM local package database inconsistent (%s/local): native pacman -Dk failed: '
-            'missing omg-doctor-unavailable-687\\n" "$OMG_PACMAN_DB_DIR"\n'
-            '  printf "Error: doctor found 1 health issue(s)\\n" >&2; exit 1\n'
+        config_guard = (
+            'if [[ "${OMG_PACMAN_CONF:-}" == */dependency-pacman.conf ]]; then\n'
+            '  config_db="${OMG_PACMAN_CONF%/dependency-pacman.conf}/dependency-db"\n'
+            '  if grep -Fq "%DEPENDS%" "$config_db/local/omg-doctor-fixture-1.0-1/desc"; then\n'
+            '    printf "  ALPM local package database inconsistent (%s/local): native pacman -Dk failed: '
+            'missing omg-doctor-unavailable-687\\n" "$config_db"\n'
+            '    printf "Error: doctor found 1 health issue(s)\\n" >&2; exit 1\n'
+            '  fi\n'
+            '  printf "  ALPM local package database (%s/local, 1 packages verified)\\n" "$config_db"\n'
+            '  printf "System is healthy with 1 warning(s).\\n"; exit 0\n'
             'fi\n'
         )
         fault_guard = (
@@ -299,12 +304,14 @@ class OutputContracts(unittest.TestCase):
             '  printf "Error: doctor found 1 health issue(s)\\n" >&2; exit 1\n'
             'fi\n'
         )
-        product = dependency_guard + fault_guard + healthy_product
+        product = config_guard + fault_guard + healthy_product
         native = {'pacman':
                   'case "$1" in\n'
-                  '  -Dk) if [[ "${2:-}" == --dbpath ]]; then\n'
-                  "    printf \"error: missing 'omg-doctor-unavailable-687>=1' dependency "
-                  "for 'omg-doctor-fixture'\\n\" >&2; exit 1; fi; exit 0 ;;\n"
+                  '  -Dk) if [[ "${2:-}" == --config ]]; then\n'
+                  '    if grep -Fq "%DEPENDS%" dependency-db/local/omg-doctor-fixture-1.0-1/desc; then\n'
+                  "      printf \"error: missing 'omg-doctor-unavailable-687>=1' dependency "
+                  "for 'omg-doctor-fixture'\\n\" >&2; exit 1; fi\n"
+                  '    exit 0; fi; exit 0 ;;\n'
                   '  -Qq) printf "one\\ntwo\\n" ;;\n'
                   '  *) exit 17 ;;\n'
                   'esac\n'}
@@ -327,7 +334,13 @@ class OutputContracts(unittest.TestCase):
             self.assertEqual(evidence[0]['result'], 'FAIL',
                              'a fixed Git verdict must fail under the restricted PATH')
             self.assertIn('did not report absent Git/AUR tools', logs['doctor.log'])
-            ignored_dependency = fault_guard + healthy_product
+            ignored_dependency = (
+                'if [[ "${OMG_PACMAN_CONF:-}" == */dependency-pacman.conf ]]; then\n'
+                '  config_db="${OMG_PACMAN_CONF%/dependency-pacman.conf}/dependency-db"\n'
+                '  printf "  ALPM local package database (%s/local, 1 packages verified)\\n" "$config_db"\n'
+                '  printf "System is healthy with 1 warning(s).\\n"; exit 0\n'
+                'fi\n'
+            ) + fault_guard + healthy_product
             result, evidence, logs = self.run_inventory(ignored_dependency, rows,
                                                         native_commands=native, distro=distro)
             self.assertEqual(evidence[0]['result'], 'FAIL', logs)
