@@ -1056,13 +1056,27 @@ fn path_status(
         let Some(found) = matches.next() else {
             continue;
         };
-        return match (found.canonicalize(), current_exe.canonicalize()) {
-            (Ok(selected), Ok(running)) if selected == running => PathStatus::Current,
-            (Ok(_), Ok(_)) => PathStatus::Shadowed(found),
-            _ => PathStatus::Unverifiable,
+        return match same_executable_file(&found, current_exe) {
+            Some(true) => PathStatus::Current,
+            Some(false) => PathStatus::Shadowed(found),
+            None => PathStatus::Unverifiable,
         };
     }
     PathStatus::Missing
+}
+
+#[cfg(unix)]
+fn same_executable_file(found: &std::path::Path, running: &std::path::Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let found = found.metadata().ok()?;
+    let running = running.metadata().ok()?;
+    Some(found.dev() == running.dev() && found.ino() == running.ino())
+}
+
+#[cfg(not(unix))]
+fn same_executable_file(found: &std::path::Path, running: &std::path::Path) -> Option<bool> {
+    Some(found.canonicalize().ok()? == running.canonicalize().ok()?)
 }
 
 fn check_shell_hook() -> bool {
@@ -1623,6 +1637,16 @@ mod tests {
             path_status(&relative, fixture.path(), &current),
             PathStatus::Current,
             "a relative PATH entry launches the current OMG from this directory"
+        );
+
+        let hardlink_bin = fixture.path().join("hardlink-bin");
+        std::fs::create_dir(&hardlink_bin).expect("hardlink bin");
+        std::fs::hard_link(&current, hardlink_bin.join("omg")).expect("same executable hardlink");
+        let hardlinked = std::env::join_paths([&hardlink_bin, &bin]).expect("hardlink PATH");
+        assert_eq!(
+            path_status(&hardlinked, fixture.path(), &current),
+            PathStatus::Current,
+            "an earlier hardlink to the running binary is not a shadow"
         );
 
         let shadowed = std::env::join_paths([&stale, &bin]).expect("shadowed PATH");
