@@ -330,9 +330,12 @@ write_probe() {
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 bin="${OMG_PROBE_ROOT:-/probe}/${OMG_PROBE_BIN}"
+daemon_bin="${bin%/omg}/omgd"
 bash -c "${OMG_PROBE_INDEX_CMD}" || exit 120
 version_line="$(printf '%s\n' "$("$bin" --version)" | head -n 1 | tr -d '[:space:]')"
 [[ "$version_line" == "omg${OMG_PROBE_VERSION_NUM}" ]]
+daemon_version_line="$(printf '%s\n' "$("$daemon_bin" --version)" | head -n 1 | tr -d '[:space:]')"
+[[ "$daemon_version_line" == "omgd${OMG_PROBE_VERSION_NUM}" ]]
 bash -c "${OMG_PROBE_REMOVED_ASSERT}" || exit 120
 case "$OMG_SMOKE_PROBE_KIND" in
   search-tree)
@@ -651,6 +654,10 @@ run_distro() (
   fi
   if [[ ! -f "$stage/omg-${tag}${distro_suffix}/omg" ]]; then
     record_harness_error "$distro" "release artifact does not contain the expected binary"
+    return 3
+  fi
+  if [[ ! -f "$stage/omg-${tag}${distro_suffix}/omgd" ]]; then
+    record_harness_error "$distro" "release artifact does not contain the expected daemon binary"
     return 3
   fi
   if [[ "$executor" == "native" ]]; then

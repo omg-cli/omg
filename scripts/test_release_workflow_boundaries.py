@@ -112,6 +112,22 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             self.assertIn('branches: [main]', push[1], workflow)
             self.assertNotRegex(push[1], r'paths(?:-ignore)?:', workflow)
 
+    def test_every_rebuilt_release_platform_is_smoked_before_publication(self):
+        release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
+        publish = job_block(release, 'release')
+        self.assertIn('smoke-apt, smoke-linux, smoke-macos]', publish)
+        linux = job_block(release, 'smoke-linux')
+        for distro, artifact in (('arch', 'arch-build'), ('fedora', 'fedora-build')):
+            with self.subTest(distro=distro):
+                self.assertIn(f'distro: {distro}\n            artifact: {artifact}', linux)
+        self.assertIn('--staged-dir staged-release', linux)
+        macos = job_block(release, 'smoke-macos')
+        self.assertIn('name: macos-build', macos)
+        self.assertIn('needs.build-macos.outputs.archive_sha256', macos)
+        self.assertIn('test "$actual" = "$ARCHIVE_SHA256"', macos)
+        self.assertIn('--staged-dir staged-release', macos)
+        self.assertIn('--executor native', macos)
+
     def test_fixture_and_single_tag_gate_all_smoke_jobs(self):
         text = (WORKFLOWS / 'release-smoke.yml').read_text()
         for job in ('smoke', 'smoke-macos'):
