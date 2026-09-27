@@ -24,6 +24,19 @@ const GENERIC_MIRROR_ENDPOINTS: &[(&str, &str)] = &[
 const ARCH_DNS_HOSTS: &[&str] = &["archlinux.org", "aur.archlinux.org", "github.com"];
 const GENERIC_DNS_HOSTS: &[&str] = &["kernel.org", "github.com"];
 
+const HOMEBREW_MIRROR_ENDPOINTS: &[(&str, &str)] = &[
+    (
+        "Homebrew formula API",
+        "https://formulae.brew.sh/api/formula.json",
+    ),
+    (
+        "Homebrew cask API",
+        "https://formulae.brew.sh/api/cask.json",
+    ),
+    ("GitHub", "https://github.com"),
+];
+const HOMEBREW_DNS_HOSTS: &[&str] = &["formulae.brew.sh", "github.com"];
+
 fn mirror_status_is_issue(status: reqwest::StatusCode) -> bool {
     !status.is_success() && !status.is_redirection()
 }
@@ -181,7 +194,7 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     if network {
         println!();
         println!("{}", style::header("Network Diagnostics"));
-        issues += check_network(arch_backend).await;
+        issues += check_network(distro).await;
     }
 
     // 8. EOL runtime checks (if requested)
@@ -700,16 +713,23 @@ const fn check_arch_infra() -> usize {
     0
 }
 
-async fn check_network(arch_backend: bool) -> usize {
+fn network_targets(
+    distro: Distro,
+) -> (
+    &'static [(&'static str, &'static str)],
+    &'static [&'static str],
+) {
+    match distro {
+        Distro::Arch => (ARCH_MIRROR_ENDPOINTS, ARCH_DNS_HOSTS),
+        Distro::MacOS => (HOMEBREW_MIRROR_ENDPOINTS, HOMEBREW_DNS_HOSTS),
+        _ => (GENERIC_MIRROR_ENDPOINTS, GENERIC_DNS_HOSTS),
+    }
+}
+
+async fn check_network(distro: Distro) -> usize {
     let client = shared_client();
     let mut issues = 0;
-
-    // Arch-only mirrors (archlinux.org, AUR) do not apply to other backends.
-    let endpoints: &[(&str, &str)] = if arch_backend {
-        ARCH_MIRROR_ENDPOINTS
-    } else {
-        GENERIC_MIRROR_ENDPOINTS
-    };
+    let (endpoints, dns_hosts) = network_targets(distro);
 
     for (name, url) in endpoints {
         let start = std::time::Instant::now();
@@ -745,11 +765,6 @@ async fn check_network(arch_backend: bool) -> usize {
     // DNS resolution test
     println!();
     println!("  {}", style::dim("DNS Resolution:"));
-    let dns_hosts: &[&str] = if arch_backend {
-        ARCH_DNS_HOSTS
-    } else {
-        GENERIC_DNS_HOSTS
-    };
     for host in dns_hosts {
         // A dead resolver blocks ToSocketAddrs forever and would hang the
         // whole doctor run, so resolve off the executor with a hard timeout.
@@ -1355,6 +1370,28 @@ mod tests {
         assert!(doctor_dependencies(Distro::Arch).contains(&"makepkg"));
         assert!(doctor_dependencies(Distro::Ubuntu).contains(&"apt-get"));
         assert!(doctor_dependencies(Distro::Fedora).contains(&"sudo"));
+    }
+
+    #[test]
+    fn doctor_network_targets_match_selected_backend() {
+        let (mac_endpoints, mac_dns) = network_targets(Distro::MacOS);
+        assert_eq!(
+            mac_endpoints,
+            [
+                (
+                    "Homebrew formula API",
+                    "https://formulae.brew.sh/api/formula.json"
+                ),
+                (
+                    "Homebrew cask API",
+                    "https://formulae.brew.sh/api/cask.json"
+                ),
+                ("GitHub", "https://github.com"),
+            ]
+        );
+        assert_eq!(mac_dns, ["formulae.brew.sh", "github.com"]);
+        assert_eq!(network_targets(Distro::Arch).0, ARCH_MIRROR_ENDPOINTS);
+        assert_eq!(network_targets(Distro::Fedora).0, GENERIC_MIRROR_ENDPOINTS);
     }
 
     #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
