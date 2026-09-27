@@ -20,10 +20,7 @@ use common::*;
 // DOCTOR COMMAND E2E TESTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Contract pinned at src/cli/doctor.rs:37-124: `doctor` always exits 0 and
-// unconditionally prints the "OMG Doctor" header, the "Checking system health..."
-// banner, and one verdict line per dependency (git/curl/tar/sudo) — either
-// "Found dependency: <dep>" or "Missing dependency: <dep>".
+// In test mode, Doctor prints the health banner and a Git capability verdict.
 #[test]
 fn test_doctor_runs_diagnostics() {
     init_test_env();
@@ -43,8 +40,7 @@ fn test_doctor_runs_diagnostics() {
     );
 }
 
-// Every mandatory dependency must get an explicit Found/Missing verdict line,
-// so a doctor that silently skips a check cannot pass.
+// Git is an optional capability. Host curl and tar are not OMG dependencies.
 #[test]
 fn test_doctor_checks_environment() {
     init_test_env();
@@ -54,11 +50,11 @@ fn test_doctor_checks_environment() {
     result.assert_success();
 
     let output = result.stdout;
-    for dep in ["git", "curl", "tar", "sudo"] {
+    assert!(output.contains("Optional tool available: git"), "{output}");
+    for unused in ["dependency: curl", "dependency: tar"] {
         assert!(
-            output.contains(&format!("Found dependency: {dep}"))
-                || output.contains(&format!("Missing dependency: {dep}")),
-            "Doctor must report a verdict for dependency '{dep}': {output}"
+            !output.contains(unused),
+            "Doctor invented {unused}: {output}"
         );
     }
 }

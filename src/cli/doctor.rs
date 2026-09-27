@@ -45,7 +45,6 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     let mut warnings = 0;
     let distro = detected_distro();
     let arch_backend = matches!(distro, Distro::Arch);
-    let debian_backend = matches!(distro, Distro::Debian | Distro::Ubuntu);
 
     // 1. OS Check — every supported backend distro is healthy; only an
     //    unsupported system is an issue (W3-A-02: a supported Debian system
@@ -79,29 +78,35 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
         }
     }
 
-    // 3. Dependencies (backend-appropriate: the live Debian backend shells
-    //    out to `apt-get` via the privilege module; Arch uses makepkg for AUR builds)
-    let mut deps = vec!["git", "curl", "tar", "sudo"];
-    if debian_backend {
-        deps.push("apt-get");
+    // 3. Executables required by the selected backend. Privileged operations
+    //    resolve root-controlled system tools independently of the caller's
+    //    PATH; doctor must make its verdict using that same resolver. Runtime
+    //    downloads and archive extraction use Rust libraries, not curl/tar.
+    if matches!(distro, Distro::Debian | Distro::Ubuntu) {
+        check_required_system_command("apt-get", &mut issues);
+    }
+    if matches!(
+        distro,
+        Distro::Arch | Distro::Debian | Distro::Ubuntu | Distro::Fedora
+    ) && !crate::core::is_root()
+    {
+        check_required_system_command("sudo", &mut issues);
+    }
+    // Git supports project, hook, and team commands on every backend; Arch
+    // additionally uses it for AUR checkouts. Neither is required to read or
+    // mutate an official package database.
+    if supported_distro_label(distro).is_some() {
+        check_optional_command("git", "project and Git integration", &mut warnings);
     }
     if arch_backend {
-        deps.push("makepkg");
-    }
-    for dep in deps {
-        if check_command(dep) {
-            println!("  {}", style::success(&format!("Found dependency: {dep}")));
-        } else {
-            if dep == "makepkg" {
-                println!(
-                    "  {} Missing dependency: makepkg (install 'base-devel' package for AUR builds)",
-                    style::error("✗")
-                );
-            } else {
-                println!("  {}", style::error(&format!("Missing dependency: {dep}")));
-            }
-            issues += 1;
-        }
+        // Arch documents makepkg as part of pacman. base-devel supplies the
+        // build tools for AUR packages; installing it does not repair a
+        // missing makepkg executable.
+        check_optional_command(
+            "makepkg",
+            "Arch AUR builds (provided by pacman)",
+            &mut warnings,
+        );
     }
 
     // 3b. Backend-specific infrastructure (what the compiled backend itself
@@ -884,11 +889,37 @@ async fn probe_connectivity(
     })
 }
 
-fn check_command(cmd: &str) -> bool {
-    if crate::core::paths::test_mode() {
-        return true;
+fn check_optional_command(cmd: &str, purpose: &str, warnings: &mut usize) {
+    let available = if crate::core::paths::test_mode() {
+        true
+    } else {
+        which::which(cmd).is_ok()
+    };
+    if available {
+        println!(
+            "  {}",
+            style::success(&format!("Optional tool available: {cmd}"))
+        );
+    } else {
+        println!(
+            "  {}",
+            style::warning(&format!("Optional tool unavailable: {cmd} ({purpose})"))
+        );
+        *warnings += 1;
     }
-    which::which(cmd).is_ok()
+}
+
+fn check_required_system_command(cmd: &str, issues: &mut usize) {
+    if crate::core::paths::test_mode() {
+        println!("  {}", style::success(&format!("Found dependency: {cmd}")));
+        return;
+    }
+    if crate::core::privilege::trusted_program(cmd).is_ok() {
+        println!("  {}", style::success(&format!("Found dependency: {cmd}")));
+    } else {
+        println!("  {}", style::error(&format!("Missing dependency: {cmd}")));
+        *issues += 1;
+    }
 }
 
 /// Daemon reachability. `Down` means no socket at all; `SocketStale`
