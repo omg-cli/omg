@@ -142,7 +142,8 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
             println!(
                 "  {}",
                 style::error(&format!(
-                    "PATH resolves a different omg executable first: {found:?}"
+                    "PATH resolves a different omg executable first: {}",
+                    found.display()
                 ))
             );
             issues += 1;
