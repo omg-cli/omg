@@ -29,7 +29,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify pilot selection, pins and evidence contracts
-        run: python3 -m unittest scripts.test_qemu_apt7_pilot -q
+        run: python3 -m unittest scripts.test_qemu_apt7_pilot scripts.test_qemu_apt7_reporting -q
       - id: select
         env:
           GUEST: ${{ inputs.guest }}
@@ -110,6 +110,8 @@ jobs:
     permissions:
       contents: read
       actions: read
+    secrets:
+      OMG_SMOKE_SENTRY_DSN: ${{ secrets.OMG_SMOKE_SENTRY_DSN }}
     with:
       distro: ${{ matrix.guest }}
       staged: true

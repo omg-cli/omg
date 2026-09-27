@@ -47,12 +47,20 @@ for tool in jq gh; do command -v "$tool" >/dev/null || exit 3; done
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/qa-evidence-lib.sh"
 # Validate once, before any GitHub operations or filtering.
 rows="$(qa_result_rows "$results")"
-if { [[ "$source" != qemu-matrix && "$source" != ci ]] \
+if { [[ "$source" != qemu-matrix && "$source" != qemu-apt7 && "$source" != ci ]] \
      && jq -e 'any(.[]; .distro == "matrix")' <<< "$rows" >/dev/null; } \
   || { [[ "$source" == ci ]] \
      && jq -e 'any(.[]; .distro != "matrix" or .case_id != "ci-non-qemu-workflow")' <<< "$rows" >/dev/null; } \
   || { [[ "$source" == qemu-matrix ]] \
      && jq -e 'any(.[]; .case_id == "ci-non-qemu-workflow")' <<< "$rows" >/dev/null; }; then
+  printf 'error: matrix identity does not match its workflow source\n' >&2
+  exit 2
+fi
+if [[ "$source" == qemu-apt7 ]] && jq -e 'any(.[];
+  ((.distro == "debian13" and .case_id == "qemu-debian13-lifecycle") or
+   (.distro == "ubuntu2604" and .case_id == "qemu-ubuntu2604-lifecycle") or
+   (.distro == "matrix" and .case_id == "qemu-apt7-workflow")) | not
+)' <<< "$rows" >/dev/null; then
   printf 'error: matrix identity does not match its workflow source\n' >&2
   exit 2
 fi
@@ -76,6 +84,8 @@ runbook_for() {
       printf 'Rerun this leg: `./scripts/release-smoke.sh --distro %s --release <same-tag-as-run>%s`.\nFull per-case evidence (transcripts, metadata, result.json) is in this run'"'"'s uploaded `release-smoke-*` artifacts; paths below are relative to the evidence root.\n' "$1" "$2" ;;
     ci)
       printf 'Inspect the failed non-QEMU CI job and its uploaded logs at the linked commit. The QEMU result, if it ran, is recorded separately.\n' ;;
+    qemu-apt7)
+      printf 'Rerun the manual `QEMU APT 7 pilot` workflow at the same revision and select the affected guest. Inspect the linked run and its `qemu-evidence-debian13` or `qemu-evidence-ubuntu2604` artifact for the actual failure.\n' ;;
     *) printf 'Full per-case evidence is in this run'"'"'s uploaded artifacts; paths below are relative to the evidence root.\n' ;;
   esac
 }

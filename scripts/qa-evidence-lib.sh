@@ -9,8 +9,8 @@ set -euo pipefail
 qa_result_rows() {
   jq -ce '
   def identifier: type == "string" and test("^[a-z0-9][a-z0-9-]{0,127}$");
-  def distro: type == "string" and IN("arch", "debian", "ubuntu", "fedora", "macos");
-  def matrix_case: IN("qemu-matrix-workflow", "qemu-matrix-x86-workflow", "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow", "ci-non-qemu-workflow");
+  def distro: type == "string" and IN("arch", "debian", "ubuntu", "fedora", "macos", "debian13", "ubuntu2604");
+  def matrix_case: IN("qemu-matrix-workflow", "qemu-matrix-x86-workflow", "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow", "ci-non-qemu-workflow", "qemu-apt7-workflow");
   if type != "array" then error("results must be an array") else . end |
   if length > 10000 then error("too many results") else . end |
   if (map([.distro, .case_id, (.arch // "x86_64")]) | unique | length) != length
