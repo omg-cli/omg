@@ -43,6 +43,10 @@ class CargoFixtureTests(unittest.TestCase):
             (root / 'second').mkdir()
             script = '''set -euo pipefail
 boot_args=()
+# start_clone reads the derived clone boot timeout, which the real script
+# defines at top level. The harness must supply it or `set -u` aborts.
+SSH_WAIT_BUDGET=$(( 120 * (12 + 2) ))
+clone_boot_timeout=$(( SSH_WAIT_BUDGET + 180 ))
 timeout() {
   if [[ "$5" == first-disk ]]; then
     printf 'first clone QEMU failure\\n' > qemu-startup.log
