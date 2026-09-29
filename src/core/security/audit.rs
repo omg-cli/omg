@@ -580,9 +580,11 @@ impl AuditLogger {
 ///
 /// The on-disk JSONL path is escaped by `serde_json`, but a plaintext tracing
 /// subscriber writes the message verbatim, so a newline, carriage return, or
-/// ANSI escape in a caller-supplied description would let that caller forge
-/// additional log records or repaint the operator's terminal.
+/// ANSI escape in a description, resource or displayed error/path would let
+/// that caller forge additional log records or repaint the operator's terminal.
+/// Bound the raw text at the same UTF-8-safe byte limit as stored audit fields.
 fn tracing_safe_audit_text(value: &str) -> String {
+    let value = bounded_audit_str(value);
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
@@ -600,15 +602,19 @@ fn tracing_safe_audit_text(value: &str) -> String {
     escaped
 }
 
-fn bounded_audit_field(value: &str) -> String {
+fn bounded_audit_str(value: &str) -> &str {
     if value.len() <= MAX_AUDIT_FIELD_BYTES {
-        return value.to_string();
+        return value;
     }
     let mut end = MAX_AUDIT_FIELD_BYTES;
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    value[..end].to_string()
+    &value[..end]
+}
+
+fn bounded_audit_field(value: &str) -> String {
+    bounded_audit_str(value).to_string()
 }
 
 fn rotated_path(path: &Path, index: usize) -> PathBuf {
@@ -711,6 +717,7 @@ fn with_audit_read_lock<T>(
         }
         Err(error) => {
             if let Err(unlock_error) = unlock_result {
+                let unlock_error = tracing_safe_audit_text(&unlock_error.to_string());
                 tracing::warn!("Failed to unlock audit log after read error: {unlock_error}");
             }
             Err(error)
@@ -891,6 +898,7 @@ static AUDIT_QUEUE: std::sync::LazyLock<std::sync::mpsc::SyncSender<AuditQueueMe
                 }
             })
         {
+            let error = tracing_safe_audit_text(&error.to_string());
             tracing::error!("Failed to start audit writer thread: {error}");
         }
         sender
@@ -913,7 +921,7 @@ pub(crate) fn init_audit_logger_in(log_path: impl AsRef<Path>) -> Result<(), Aud
             let quarantined = quarantine_corrupt_audit_log(log_path)?;
             tracing::warn!(
                 "Audit log was corrupt; quarantined to {} and started fresh log",
-                quarantined.display()
+                tracing_safe_audit_text(&quarantined.display().to_string())
             );
             AuditLogger::new_in(log_path)?
         }
@@ -942,6 +950,7 @@ fn record_global(
 ) {
     let Ok(mut guard) = AUDIT_LOGGER.lock() else {
         mark_audit_incomplete();
+        let resource = tracing_safe_audit_text(resource);
         tracing::error!("Audit logger state is poisoned; dropping event {event} for {resource}");
         return;
     };
@@ -956,7 +965,7 @@ fn record_global(
                 if let Ok(quarantined) = quarantine_corrupt_audit_log(&log_path) {
                     tracing::warn!(
                         "Audit log was corrupt; quarantined to {} and started fresh log",
-                        quarantined.display()
+                        tracing_safe_audit_text(&quarantined.display().to_string())
                     );
                     if let Ok(logger) = AuditLogger::new() {
                         remember_audit_marker(&logger);
@@ -966,6 +975,8 @@ fn record_global(
             }
             Err(error) => {
                 mark_audit_incomplete_at_or_log(&paths::data_dir().join("audit/incomplete"));
+                let resource = tracing_safe_audit_text(resource);
+                let error = tracing_safe_audit_text(&error.to_string());
                 tracing::warn!(
                     "Audit logger unavailable, dropping event {event} for {resource}: {error}"
                 );
@@ -979,6 +990,8 @@ fn record_global(
     };
     if let Err(error) = logger.log(event, severity, resource, description) {
         mark_audit_incomplete_at_or_log(&logger.log_path.with_file_name("incomplete"));
+        let resource = tracing_safe_audit_text(resource);
+        let error = tracing_safe_audit_text(&error.to_string());
         tracing::warn!("Failed to persist audit event {event} for {resource}: {error}");
     }
 }
@@ -2048,6 +2061,7 @@ fn remember_audit_marker(logger: &AuditLogger) {
 
 fn mark_audit_incomplete_at_or_log(path: &Path) {
     if let Err(error) = mark_audit_incomplete_at(path) {
+        let error = tracing_safe_audit_text(&error.to_string());
         tracing::error!("Cannot persist audit incompleteness marker: {error}");
     }
 }
@@ -2153,12 +2167,16 @@ mod completeness_tests {
     struct MessageVisitor(String);
 
     impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(&mut self, _field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            let _ = std::fmt::Write::write_fmt(&mut self.0, format_args!("{value:?}"));
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                let _ = std::fmt::Write::write_fmt(&mut self.0, format_args!("{value:?}"));
+            }
         }
 
-        fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
-            self.0.push_str(value);
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0.push_str(value);
+            }
         }
     }
 
@@ -2228,6 +2246,169 @@ mod completeness_tests {
         assert_eq!(disk.lines().count(), 1, "disk record must be one line");
         assert!(disk.contains("Installed pkg\\nInjected: fake success"));
         Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct PlaintextCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for PlaintextCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_plaintext(action: impl FnOnce()) -> String {
+        let capture = PlaintextCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, action);
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn plaintext_failed_append_escapes_resource_and_error_path() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let log_path = directory
+            .path()
+            .join("audit\nPATH_FORGED\r\t\u{1b}[2J.jsonl");
+        super::init_audit_logger_in(&log_path)?;
+        std::fs::create_dir(&log_path)?;
+        let resource = "pkg\nRESOURCE_FORGED\r\t\u{1b}[2J";
+        let rendered = capture_plaintext(|| {
+            super::record_global(
+                super::AuditEventType::SecurityAudit,
+                super::AuditSeverity::Error,
+                resource,
+                "forced append failure",
+            );
+        });
+        let marker = log_path.with_file_name("incomplete");
+        let incomplete = super::ensure_complete_collection(&marker).is_err();
+        *super::AUDIT_LOGGER.lock().unwrap() = None;
+        *super::AUDIT_INCOMPLETE_MARKER.write().unwrap() = None;
+
+        assert!(
+            incomplete,
+            "a failed write must still mark collection incomplete"
+        );
+        assert_eq!(rendered.lines().count(), 1, "{rendered:?}");
+        assert!(rendered.contains("Failed to persist audit event"));
+        assert!(rendered.contains("pkg\\nRESOURCE_FORGED\\r\\t\\u{1b}[2J"));
+        assert!(rendered.contains("audit\\nPATH_FORGED\\r\\t\\u{1b}[2J.jsonl"));
+        assert!(
+            rendered
+                .trim_end_matches('\n')
+                .chars()
+                .all(|c| !c.is_control())
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn plaintext_quarantine_escapes_path_and_preserves_corrupt_bytes() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let log_path = directory
+            .path()
+            .join("audit\nQUARANTINE_FORGED\u{1b}[2J.jsonl");
+        std::fs::write(&log_path, "broken-json\n")?;
+        let rendered = capture_plaintext(|| {
+            super::init_audit_logger_in(&log_path).expect("corrupt file must be quarantined");
+        });
+        *super::AUDIT_LOGGER.lock().unwrap() = None;
+        *super::AUDIT_INCOMPLETE_MARKER.write().unwrap() = None;
+
+        assert_eq!(rendered.lines().count(), 1, "{rendered:?}");
+        assert!(rendered.contains("audit\\nQUARANTINE_FORGED\\u{1b}[2J.jsonl.corrupt-"));
+        assert!(
+            rendered
+                .trim_end_matches('\n')
+                .chars()
+                .all(|c| !c.is_control())
+        );
+        let quarantined = std::fs::read_dir(directory.path())?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(std::fs::read(&quarantined[0])?, b"broken-json\n");
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_success_keeps_original_jsonl_fields() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let log_path = directory.path().join("audit.jsonl");
+        let mut logger = super::AuditLogger::new_in(&log_path)?;
+        let resource = "pkg\nRESOURCE_ORIGINAL\r\t\u{1b}[2J";
+        let description = "installed\nDESCRIPTION_ORIGINAL\r\t\u{1b}[2J";
+        let rendered = capture_plaintext(|| {
+            logger
+                .log(
+                    super::AuditEventType::PackageInstall,
+                    super::AuditSeverity::Info,
+                    resource,
+                    description,
+                )
+                .expect("successful write");
+        });
+        assert_eq!(rendered.lines().count(), 1, "{rendered:?}");
+        assert!(rendered.contains("installed\\nDESCRIPTION_ORIGINAL\\r\\t\\u{1b}[2J"));
+        let disk = std::fs::read_to_string(&log_path)?;
+        assert_eq!(disk.lines().count(), 1);
+        let entry: serde_json::Value = serde_json::from_str(&disk)?;
+        assert_eq!(entry["resource"], resource);
+        assert_eq!(entry["description"], description);
+        assert!(logger.verify_integrity()?.chain_valid);
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_rendering_bounds_fields_at_utf8_boundaries() {
+        let boundary = "é".repeat(2048);
+        assert_eq!(
+            super::tracing_safe_audit_text(&format!("{boundary}ignored\nFORGED")),
+            boundary
+        );
+        let prefix = "a".repeat(4095);
+        assert_eq!(
+            super::tracing_safe_audit_text(&format!("{prefix}éignored")),
+            prefix
+        );
+        assert_eq!(
+            super::tracing_safe_audit_text("\u{0}\u{7f}\n\r\t"),
+            "\\u{0}\\u{7f}\\n\\r\\t"
+        );
+    }
+
+    #[test]
+    fn plaintext_message_capture_ignores_unrelated_fields() {
+        let capture = MessageCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            tracing::warn!(resource = "unrelated", "message only");
+        });
+        assert_eq!(*capture.0.lock().unwrap(), ["message only"]);
     }
 
     #[test]
