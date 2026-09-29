@@ -1308,6 +1308,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
     use std::time::Instant;
 
     let project = TestProject::for_distro("arch");
+    let proxy = RejectedProxy::new();
     let (home, path) = prepare_behavior_fixture(&project);
     let evidence_dir =
         std::env::var_os("OMG_CLI_BEHAVIOR_EVIDENCE_DIR").map(std::path::PathBuf::from);
@@ -1441,6 +1442,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
         ];
+        // All proxy spellings and bypass variables are child-local.
+        command_env.extend(proxy.env());
         if case.id.starts_with("config-") || privacy_case {
             command_env.push((
                 "OMG_CONFIG_DIR",
@@ -2161,6 +2164,12 @@ fn behavior_inventory_runs_in_hermetic_state() {
     if let Some(dir) = evidence_dir {
         std::fs::write(dir.join("index.tsv"), index).expect("write CLI behavior index");
     }
+    assert_eq!(
+        proxy.requests(),
+        0,
+        "hermetic inventory attempted network access"
+    );
+    project.close_checked();
     assert!(
         failures.is_empty(),
         "CLI behavior inventory failures:\n{}",
@@ -2282,17 +2291,18 @@ mod install_tests {
     // `!success || ...` disjunction also passed when install wrongly succeeded.
     #[test]
     fn test_install_nonexistent() {
-        let result = run_omg(&[
-            "install",
-            "--yes",
-            "package-that-definitely-does-not-exist-12345",
-        ]);
-        result.assert_failure();
+        let project = TestProject::new();
+        let proxy = RejectedProxy::new();
+        let name = "package-that-definitely-does-not-exist-12345";
+        #[cfg(feature = "arch")]
+        project.seed_missing_aur_index(name);
+        let result = project.run_with_env(&["install", "--yes", name], &proxy.env());
+        assert_eq!(result.exit_code, 1, "{}", result.combined_output());
         let combined = result.combined_output();
-        assert!(
-            combined.to_lowercase().contains("not found"),
-            "Failure must name the missing package cause: {combined}"
-        );
+        assert!(combined.to_lowercase().contains("not found"), "{combined}");
+        assert!(!combined.contains("transport failed"), "{combined}");
+        assert_eq!(proxy.requests(), 0, "missing rejection reached network");
+        project.close_checked();
     }
 
     // Contract: dry-run exits 0 and explicitly promises no changes
