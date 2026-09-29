@@ -23,6 +23,11 @@ opts=(-i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5
 scp_opts=(-i client-key -P 2222 -o BatchMode=yes -o ConnectTimeout=5
   -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
 bin="/home/bench/omg-${tag}-${arch}-linux-${distro}/omg"
+# Must exceed the readiness wait inside /work/boot.sh (120 * (12 + 2) = 1680s)
+# so its diagnostics can actually print. Keep in step with SSH_WAIT_BUDGET and
+# BOOT_TIMEOUT in benchmark-qemu.sh.
+SSH_WAIT_BUDGET=$(( 120 * (12 + 2) ))
+clone_boot_timeout=$(( SSH_WAIT_BUDGET + 180 ))
 current_id=
 failure_result=HARNESS_ERROR
 failure_exit=
@@ -93,7 +98,13 @@ start_clone() {
   local disk=$1 vars=$2 serial=$3 log=$4 rc=0
   [[ ! -e qemu.pid ]] || return 1
   rm -f -- qemu-startup.log
-  timeout --kill-after=5s 360 bash /work/boot.sh "${boot_args[@]}" "$disk" "$vars" "$serial" > "$log" 2>&1 || rc=$?
+  # This must exceed the readiness wait inside /work/boot.sh, which spins for
+  # 120 * (12s ssh timeout + 2s retry delay) = 1680s before printing the
+  # QEMU-state / serial-banner / last-guest-lines diagnostics. The old hardcoded
+  # 360 killed the clone first, so a slow boot produced an empty log and no
+  # diagnostics at all. Keep in step with SSH_WAIT_BUDGET in benchmark-qemu.sh;
+  # scripts/test_qemu_output_contracts.py asserts the ordering.
+  timeout --kill-after=5s "$clone_boot_timeout" bash /work/boot.sh "${boot_args[@]}" "$disk" "$vars" "$serial" > "$log" 2>&1 || rc=$?
   # boot.sh reuses this controller log on every clone. Preserve each launch
   # before the next trial can overwrite the evidence for a failed boot.
   if [[ -f qemu-startup.log && ! -L qemu-startup.log ]]; then

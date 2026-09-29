@@ -573,12 +573,25 @@ for attempt in {1..120}; do
 done
 exit 1
 BOOT
-boot_timeout=700
+# The guest-side readiness waits below can each spin for
+# SSH_WAIT_ATTEMPTS * (SSH_ATTEMPT_TIMEOUT + SSH_RETRY_DELAY) seconds before
+# they give up and print diagnostics. Any host-side `timeout` wrapped around
+# boot.sh MUST exceed that, or the kernel/serial/QEMU-state diagnostics in
+# wait_ssh are unreachable precisely when they are needed.
+SSH_WAIT_ATTEMPTS=120
+SSH_ATTEMPT_TIMEOUT=12
+SSH_RETRY_DELAY=2
+SSH_WAIT_BUDGET=$(( SSH_WAIT_ATTEMPTS * (SSH_ATTEMPT_TIMEOUT + SSH_RETRY_DELAY) ))
+# Margin for image I/O and the pre-SSH setup steps in boot.sh.
+BOOT_TIMEOUT=$(( SSH_WAIT_BUDGET + 180 ))
+boot_timeout=$BOOT_TIMEOUT
 guest_timeout=600
+printf 'ssh_wait_budget=%s boot_timeout=%s guest_timeout=%s\n' \
+  "$SSH_WAIT_BUDGET" "$boot_timeout" "$guest_timeout" >> "$work/metadata.txt"
 if [[ "$qemu_accel" == tcg ]]; then
   # Emulation is an explicit local correctness audit. Keep it bounded without
   # imposing native KVM startup deadlines on a software-emulated guest.
-  boot_timeout=1800
+  boot_timeout=$(( BOOT_TIMEOUT * 2 ))
   guest_timeout=2400
 fi
 printf 'boot_timeout=%s guest_timeout=%s\n' "$boot_timeout" "$guest_timeout" >> "$work/metadata.txt"
