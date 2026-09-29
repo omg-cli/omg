@@ -155,6 +155,12 @@ AUR packages are community-maintained and not officially verified.
    allow_aur = false  # Disable AUR if not needed
    ```
 
+   `require_pgp` currently gates on the security grade OMG assigns to a source,
+   not on a signature. A non-AUR source is graded `Verified` without any PGP
+   evidence, so the setting blocks AUR packages and nothing else. Treat it as
+   "official sources only" until verification evidence is threaded through the
+   grade; see `require_pgp` in `src/core/security/policy.rs`.
+
 3. **Review Audit Logs:**
 
    ```bash

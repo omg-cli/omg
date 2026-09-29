@@ -153,7 +153,11 @@ minimum_grade = "Community"
 # 3. If package is in banned_packages, installation is blocked
 # 4. If license not in allowed_licenses (and list is non-empty), blocked
 # 5. If AUR package and allow_aur=false, installation is blocked
-# 6. If unsigned package and require_pgp=true, installation is blocked
+# 6. If the package grade is below Verified and require_pgp=true, install is blocked.
+#    This checks the grade OMG assigns to the source, not a signature. Today a
+#    non-AUR source is graded Verified without any PGP evidence, so require_pgp
+#    currently blocks AUR packages and nothing else. Read it as "official source
+#    only" until verification evidence is threaded through the grade.
 #
 # Override policies:
 # - Use `omg install --force` to bypass policy (not recommended)
