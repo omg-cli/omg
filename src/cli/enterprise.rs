@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use crate::cli::security::{LicenseCategory, spreadsheet_safe_cell};
+#[cfg(feature = "arch")]
+use crate::cli::security::LicenseCategory;
+use crate::cli::security::spreadsheet_safe_cell;
 use crate::core::license;
 
 fn artifact_stamp() -> String {
@@ -444,6 +446,11 @@ struct LicenseViolation {
 /// substring of "LGPL-2.1" while still naming GPL in the reason.
 ///
 /// `scripts/qemu-license-oracle.py` mirrors this mapping.
+///
+/// Gated to the `arch` feature because its only caller is the ALPM-backed
+/// scan below; without this the function is dead code on every other backend
+/// and `clippy -D warnings` fails the debian, fedora and macOS lanes.
+#[cfg(feature = "arch")]
 fn enterprise_license_review_reason(license: &str) -> Option<&'static str> {
     match LicenseCategory::from_license(license) {
         LicenseCategory::StrongCopyleft => {
@@ -568,6 +575,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "arch")]
     fn enterprise_review_reason_classifies_the_copyleft_family() {
         // The three cases a "GPL" substring test got wrong.
         assert_eq!(
@@ -588,6 +596,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "arch")]
     fn enterprise_review_reason_matches_the_audit_classifier() {
         // AGPL and ordinary copyleft must agree with `omg audit`, and
         // permissive or unknown licenses must not be flagged for review.
