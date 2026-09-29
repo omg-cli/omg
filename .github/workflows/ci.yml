@@ -202,9 +202,11 @@ jobs:
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
-      # Ubuntu 24.04 and 26.04 share the Ubuntu contract selection. Their
-      # separate jobs and artifacts retain the OS-version distinction.
-      OMG_CONTRACT_PLATFORM: ${{ matrix.platform == 'ubuntu-2604' && 'ubuntu' || matrix.platform }}
+      # The platform id is the matrix entry itself. Remapping ubuntu-2604 to
+      # `ubuntu` would collide with the separate host job below that already
+      # uses that id, and would drop the platform from the native-skip
+      # allowlist that admits root-only skips inside containers.
+      OMG_CONTRACT_PLATFORM: ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
