@@ -104,6 +104,23 @@ fn doctor_debian_mock_does_not_report_os_as_issue() {
     result.assert_stdout_contains("System is healthy! Ready to rock.");
 }
 
+#[test]
+fn doctor_macos_does_not_require_sudo_or_warn_about_daemon() {
+    let project = TestProject::for_distro("macos");
+    let result = project.run_with_env(&["doctor"], &[("NO_COLOR", "1")]);
+
+    assert_eq!(
+        result.exit_code, 0,
+        "healthy mocked macOS environment must exit 0\nstdout: {}\nstderr: {}",
+        result.stdout, result.stderr
+    );
+    result.assert_stdout_contains("macOS detected (Homebrew backend)");
+    result.assert_stdout_contains("Daemon is not used on macOS");
+    assert!(!result.stdout.contains("Found dependency: sudo"));
+    assert!(!result.stdout.contains("run 'omg daemon'"));
+    result.assert_stdout_contains("System is healthy! Ready to rock.");
+}
+
 /// init --defaults with SHELL=zsh installs the exact zsh hook into $HOME/.zshrc,
 /// skips daemon startup in test mode, does not add the on-shell-init pgrep line,
 /// and prints the config path it touched.
