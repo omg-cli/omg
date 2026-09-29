@@ -521,6 +521,24 @@ pub(crate) fn check_local_db_consistency(path: &Path) -> Result<usize> {
         "local package database parsed {} of {directories} entries",
         parsed.len()
     );
+    for package in parsed.values() {
+        for dependency in &package.depends {
+            anyhow::ensure!(
+                DependencyRelation::parse(dependency).is_some(),
+                "invalid dependency {dependency} in {}",
+                package.name
+            );
+        }
+        for provision in &package.provides {
+            anyhow::ensure!(
+                DependencyRelation::parse(provision).is_some_and(|relation| relation
+                    .constraint
+                    .is_none_or(|(operator, _)| operator == "=")),
+                "invalid provision {provision} in {}",
+                package.name
+            );
+        }
+    }
     Ok(directories)
 }
 
@@ -1326,7 +1344,7 @@ pub fn list_local_cached() -> Result<Vec<LocalDbPackage>> {
 pub struct UnsatisfiedDependency {
     /// The installed package that declares the dependency.
     pub package: String,
-    /// The base dependency name, with any version constraint stripped.
+    /// The declared dependency, including its constraint (or malformed input).
     pub dependency: String,
 }
 
@@ -1342,35 +1360,191 @@ pub fn unsatisfied_local_dependencies(path: &Path) -> Vec<UnsatisfiedDependency>
     }
 }
 
-/// Report dependencies declared by an already-parsed database that nothing
-/// installed satisfies.
-///
-/// Virtual packages are resolved through `%PROVIDES%`, and a package depending on
-/// itself is ignored. `optdepends` are deliberately not checked: pacman treats
-/// them as optional.
-///
-/// This is a consistency check over the parsed database, not a version
-/// comparison: it answers "is anything installed that could satisfy this name".
+/// Parse a required dependency or provision. Malformed relations are never
+/// satisfiers; unlike optional dependencies, descriptions are not valid here.
+#[derive(Clone, Copy)]
+struct DependencyRelation<'a> {
+    name: &'a str,
+    constraint: Option<(&'a str, &'a str)>,
+}
+
+impl<'a> DependencyRelation<'a> {
+    fn parse(raw: &'a str) -> Option<Self> {
+        let end = raw.find(['<', '>', '=']).unwrap_or(raw.len());
+        let name = &raw[..end];
+        if name.is_empty()
+            || name.starts_with(['-', '.'])
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"@._+-".contains(&b))
+        {
+            return None;
+        }
+        let constraint = if end == raw.len() {
+            None
+        } else {
+            let rest = &raw[end..];
+            let operator_len = if rest.starts_with("<=") || rest.starts_with(">=") {
+                2
+            } else {
+                1
+            };
+            let (operator, version) = rest.split_at(operator_len);
+            if version.is_empty()
+                || !version
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".+_:~-".contains(&b))
+            {
+                return None;
+            }
+            Some((operator, version))
+        };
+        Some(Self { name, constraint })
+    }
+
+    fn accepts(self, version: Option<&str>) -> bool {
+        let Some((operator, required)) = self.constraint else {
+            return true;
+        };
+        let Some(version) = version else {
+            return false;
+        };
+        let ordering = dependency_version_cmp(version, required);
+        match operator {
+            "=" => ordering.is_eq(),
+            ">=" => !ordering.is_lt(),
+            "<=" => !ordering.is_gt(),
+            ">" => ordering.is_gt(),
+            "<" => ordering.is_lt(),
+            _ => false,
+        }
+    }
+}
+
+/// ALPM EVR ordering, using byte segments rather than integer conversions.
+/// Release participates only when both operands declare it. The ordering of
+/// separators and trailing alpha segments follows libalpm/version.c.
+fn dependency_version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parts(raw: &str) -> (&str, &str, Option<&str>) {
+        let (epoch, rest) = raw
+            .split_once(':')
+            .filter(|(epoch, _)| epoch.bytes().all(|b| b.is_ascii_digit()))
+            .map_or(("0", raw), |(epoch, rest)| {
+                (if epoch.is_empty() { "0" } else { epoch }, rest)
+            });
+        let (version, release) = rest
+            .rsplit_once('-')
+            .map_or((rest, None), |(v, r)| (v, Some(r)));
+        (epoch, version, release)
+    }
+    fn segments(mut a: &[u8], mut b: &[u8]) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if a == b {
+            return Ordering::Equal;
+        }
+        while !a.is_empty() && !b.is_empty() {
+            let sa = a.iter().take_while(|c| !c.is_ascii_alphanumeric()).count();
+            let sb = b.iter().take_while(|c| !c.is_ascii_alphanumeric()).count();
+            a = &a[sa..];
+            b = &b[sb..];
+            if a.is_empty() || b.is_empty() {
+                break;
+            }
+            if sa != sb {
+                return sa.cmp(&sb);
+            }
+            let numeric = a[0].is_ascii_digit();
+            let length = |s: &[u8]| {
+                s.iter()
+                    .take_while(|c| {
+                        if numeric {
+                            c.is_ascii_digit()
+                        } else {
+                            c.is_ascii_alphabetic()
+                        }
+                    })
+                    .count()
+            };
+            let la = length(a);
+            let lb = length(b);
+            if lb == 0 {
+                return if numeric {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+            }
+            let (mut va, mut vb) = (&a[..la], &b[..lb]);
+            if numeric {
+                va = &va[va.iter().take_while(|c| **c == b'0').count()..];
+                vb = &vb[vb.iter().take_while(|c| **c == b'0').count()..];
+                if va.len() != vb.len() {
+                    return va.len().cmp(&vb.len());
+                }
+            }
+            let order = va.cmp(vb);
+            if !order.is_eq() {
+                return order;
+            }
+            a = &a[la..];
+            b = &b[lb..];
+        }
+        if a.is_empty() && b.is_empty() {
+            Ordering::Equal
+        } else if (a.is_empty() && !b[0].is_ascii_alphabetic())
+            || a.first().is_some_and(u8::is_ascii_alphabetic)
+        {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
+    }
+    let (ea, va, ra) = parts(a);
+    let (eb, vb, rb) = parts(b);
+    segments(ea.as_bytes(), eb.as_bytes())
+        .then_with(|| segments(va.as_bytes(), vb.as_bytes()))
+        .then_with(|| match (ra, rb) {
+            (Some(a), Some(b)) => segments(a.as_bytes(), b.as_bytes()),
+            _ => std::cmp::Ordering::Equal,
+        })
+}
+
+/// Resolve literal and virtual dependencies, including constraints and self
+/// references. Optional dependencies are not checked. This does not validate
+/// file ownership or package conflicts.
 fn unsatisfied_dependencies(
     packages: &HashMap<String, LocalDbPackage>,
 ) -> Vec<UnsatisfiedDependency> {
-    let provided: std::collections::HashSet<&str> = packages
-        .values()
-        .flat_map(|package| package.provides.iter().map(String::as_str))
-        .collect();
-
+    let mut provided: HashMap<&str, Vec<Option<&str>>> = HashMap::new();
+    for package in packages.values() {
+        for raw in &package.provides {
+            if let Some(provision) = DependencyRelation::parse(raw) {
+                let version = match provision.constraint {
+                    None => None,
+                    Some(("=", version)) => Some(version),
+                    _ => continue, // Provisions may declare equality, not a range.
+                };
+                provided.entry(provision.name).or_default().push(version);
+            }
+        }
+    }
     let mut missing = Vec::new();
     for package in packages.values() {
         for depend in &package.depends {
-            let target = dependency_base_name(depend);
-            if target == package.name || packages.contains_key(target) || provided.contains(target)
-            {
-                continue;
-            }
-            missing.push(UnsatisfiedDependency {
-                package: package.name.clone(),
-                dependency: target.to_owned(),
+            let satisfied = DependencyRelation::parse(depend).is_some_and(|relation| {
+                packages
+                    .get(relation.name)
+                    .is_some_and(|literal| relation.accepts(Some(&literal.version.to_string())))
+                    || provided.get(relation.name).is_some_and(|versions| {
+                        versions.iter().any(|version| relation.accepts(*version))
+                    })
             });
+            if !satisfied {
+                missing.push(UnsatisfiedDependency {
+                    package: package.name.clone(),
+                    dependency: depend.clone(),
+                });
+            }
         }
     }
     missing.sort_by(|a, b| {
@@ -2382,6 +2556,122 @@ mod tests {
             }],
             "expected only the unmet name, with constraints and self-references resolved"
         );
+    }
+
+    #[test]
+    fn consistency_versioned_provider_satisfies_matching_soname() {
+        let temp = tempfile::TempDir::new().unwrap();
+        write_local_desc(&temp, "app", "0", "\n%DEPENDS%\nlibfoo.so=1-64\n");
+        write_local_desc(&temp, "provider", "1", "\n%PROVIDES%\nlibfoo.so=1-64\n");
+        assert!(unsatisfied_dependencies(&parse_local_db(temp.path()).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn consistency_constraints_and_malformed_relations() {
+        let temp = tempfile::TempDir::new().unwrap();
+        write_local_desc(&temp, "app", "0", "");
+        write_local_desc(&temp, "literal", "1", "");
+        write_local_desc(
+            &temp,
+            "provider",
+            "1",
+            "\n%PROVIDES%\nvirtual=2.0-3\nplain\ninvalid>=9\n",
+        );
+        let mut packages = parse_local_db(temp.path()).unwrap();
+        let cases = [
+            ("literal>=1.0", true),
+            ("literal=1.0", true),
+            ("literal=1.0-2", false),
+            ("literal>1.0", false),
+            ("literal<2", true),
+            ("literal<=1.0-1", true),
+            ("virtual=2.0", true),
+            ("virtual>=2.0-3", true),
+            ("virtual>2.0-3", false),
+            ("virtual<=2.0-2", false),
+            ("plain", true),
+            ("plain>=1", false),
+            ("missing=1", false),
+            ("invalid>=1", false),
+            ("app>9", false),
+            ("app", true),
+            ("literal>=", false),
+            ("literal==1", false),
+            ("literal: description", false),
+            ("", false),
+        ];
+        for (dependency, satisfied) in cases {
+            packages.get_mut("app").unwrap().depends = vec![dependency.to_owned()];
+            let missing = unsatisfied_dependencies(&packages);
+            assert_eq!(missing.is_empty(), satisfied, "{dependency}");
+            if !satisfied {
+                assert_eq!(missing[0].dependency, dependency);
+            }
+        }
+        // Any of multiple providers may satisfy the requirement; do not let a
+        // same-name literal with the wrong version mask a virtual provider.
+        packages.get_mut("literal").unwrap().provides =
+            vec!["plain=3".to_owned(), "virtual=4".to_owned()];
+        packages
+            .get_mut("provider")
+            .unwrap()
+            .provides
+            .push("literal=5".to_owned());
+        packages.get_mut("app").unwrap().depends = vec![
+            "plain>=3".to_owned(),
+            "virtual>=4".to_owned(),
+            "literal>=5".to_owned(),
+        ];
+        assert!(unsatisfied_dependencies(&packages).is_empty());
+    }
+
+    #[test]
+    fn consistency_version_ordering_matches_native_alpm() {
+        let versions = [
+            "1",
+            "1.0",
+            "1.0-1",
+            "1.0-2",
+            "1.0alpha",
+            "1.0beta",
+            "1.0rc1",
+            "1.0.1",
+            "1..0",
+            "1_0",
+            "01.0",
+            "2:1.0-1",
+            "1:9.0-9",
+            "1.18446744073709551616000-1",
+            "1.9",
+            "1.10",
+            "1.0~rc1",
+            "1.0+git",
+            "1-64",
+            "2-64",
+        ];
+        for a in versions {
+            for b in versions {
+                assert_eq!(
+                    dependency_version_cmp(a, b),
+                    alpm::vercmp(a, b),
+                    "{a} versus {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn consistency_structural_check_rejects_malformed_relations() {
+        for extra in [
+            "\n%DEPENDS%\nliteral>=\n",
+            "\n%PROVIDES%\nvirtual>=1\n",
+            "\n%PROVIDES%\nvirtual==1\n",
+        ] {
+            let temp = tempfile::TempDir::new().unwrap();
+            write_local_desc(&temp, "app", "0", extra);
+            std::fs::write(temp.path().join("app/files"), "%FILES%\n").unwrap();
+            assert!(check_local_db_consistency(temp.path()).is_err(), "{extra}");
+        }
     }
 
     /// A database that cannot be parsed must not be reported as a clean set of
