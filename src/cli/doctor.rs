@@ -1057,6 +1057,12 @@ fn path_status(
         let Some(found) = matches.next() else {
             continue;
         };
+        // `which` decides executability from mode bits alone, so a directory
+        // carrying any execute bit can be returned as a match. A directory is
+        // not a runnable `omg`; keep searching the remaining PATH entries.
+        if !found.is_file() {
+            continue;
+        }
         return match same_executable_file(&found, current_exe) {
             Some(true) => PathStatus::Current,
             Some(false) => PathStatus::Shadowed(found),
@@ -1578,6 +1584,47 @@ mod tests {
         std::fs::set_permissions(&omg, std::fs::Permissions::from_mode(0o700))
             .expect("executable permissions");
         assert_eq!(status(), PathStatus::Current, "runnable omg must be found");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_rejects_a_directory_named_omg_and_keeps_searching() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::TempDir::new().expect("isolated PATH fixture");
+        let decoy = fixture.path().join("decoy");
+        let real = fixture.path().join("real");
+        std::fs::create_dir_all(&decoy).expect("decoy bin fixture");
+        std::fs::create_dir_all(&real).expect("real bin fixture");
+        let path = std::env::join_paths([&decoy, &real]).expect("fixture PATH");
+
+        // `which` decides executability from mode bits alone, so a directory
+        // carrying the execute bit can be handed back as a match. A directory
+        // is not a runnable `omg` and must not satisfy the check.
+        let as_directory = decoy.join("omg");
+        std::fs::create_dir_all(&as_directory).expect("omg directory fixture");
+        std::fs::set_permissions(
+            &as_directory,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("executable directory permissions");
+
+        let status = || path_status(&path, fixture.path(), &real.join("omg"));
+        assert_eq!(
+            status(),
+            PathStatus::Missing,
+            "a directory named omg is not a runnable omg"
+        );
+
+        let omg = real.join("omg");
+        std::fs::write(&omg, b"#!/bin/sh\nexit 0\n").expect("omg fixture");
+        std::fs::set_permissions(&omg, std::fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+        assert_eq!(
+            status(),
+            PathStatus::Current,
+            "a runnable omg later on PATH must still be found"
+        );
     }
 
     #[cfg(unix)]
