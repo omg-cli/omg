@@ -27,8 +27,7 @@
         "arch",
         "debian",
         "debian-trixie",
-        "fedora",
-        "ubuntu-2604"
+        "fedora"
       ]
     },
     {

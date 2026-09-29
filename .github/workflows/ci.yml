@@ -202,11 +202,13 @@ jobs:
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
-      # The platform id is the matrix entry itself. Remapping ubuntu-2604 to
-      # `ubuntu` would collide with the separate host job below that already
-      # uses that id, and would drop the platform from the native-skip
-      # allowlist that admits root-only skips inside containers.
-      OMG_CONTRACT_PLATFORM: ${{ matrix.platform }}
+      # The contract platform is a separate id from the lane label, because
+      # the contracts model in tests/contracts/ has no entry for every matrix
+      # row. Ubuntu 26.04 builds the same APT 7 surface as Debian trixie and
+      # consumes the same release archive, so it reports the `debian-trixie`
+      # contract platform; `matrix.platform` stays `ubuntu-2604` for the job
+      # name, cache key, artifact names and the lane `if:` conditions.
+      OMG_CONTRACT_PLATFORM: ${{ matrix.contract_platform || matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
@@ -267,6 +269,7 @@ jobs:
           # APT 7 integration must also pass on Ubuntu itself. This lane does
           # not produce another release archive.
           - platform: ubuntu-2604
+            contract_platform: debian-trixie
             image: ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78
             features: debian,pgp,license
             setup: |
