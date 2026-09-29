@@ -1943,7 +1943,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         "License Compliance Scan",
                         "1 total packages",
                         "GPL-2.0-or-later: 1 assignments (100%)",
-                        "pacman - Copyleft license (GPL) requires legal review",
+                        "pacman - Copyleft license requires legal review",
                     ] {
                         if !result.stdout.contains(expected) {
                             issues.push(format!("enterprise license scan omitted {expected:?}"));
@@ -1965,7 +1965,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         "violations": [{
                             "package": "pacman",
                             "license": "GPL-2.0-or-later",
-                            "reason": "Copyleft license (GPL) requires legal review"
+                            "reason": "Copyleft license requires legal review"
                         }],
                         "unknown": []
                     });
