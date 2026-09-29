@@ -1321,6 +1321,66 @@ pub fn list_local_cached() -> Result<Vec<LocalDbPackage>> {
     Ok(cache.packages.values().cloned().collect())
 }
 
+/// A declared dependency that nothing installed satisfies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsatisfiedDependency {
+    /// The installed package that declares the dependency.
+    pub package: String,
+    /// The base dependency name, with any version constraint stripped.
+    pub dependency: String,
+}
+
+/// Report dependencies declared by the local database at `path` that nothing
+/// installed satisfies.
+pub fn unsatisfied_local_dependencies(path: &Path) -> Vec<UnsatisfiedDependency> {
+    match parse_local_db(path) {
+        Ok(packages) => unsatisfied_dependencies(&packages),
+        Err(error) => {
+            tracing::debug!(error = %error, "cannot resolve dependencies from an unreadable database");
+            Vec::new()
+        }
+    }
+}
+
+/// Report dependencies declared by an already-parsed database that nothing
+/// installed satisfies.
+///
+/// Virtual packages are resolved through `%PROVIDES%`, and a package depending on
+/// itself is ignored. `optdepends` are deliberately not checked: pacman treats
+/// them as optional.
+///
+/// This is a consistency check over the parsed database, not a version
+/// comparison: it answers "is anything installed that could satisfy this name".
+fn unsatisfied_dependencies(
+    packages: &HashMap<String, LocalDbPackage>,
+) -> Vec<UnsatisfiedDependency> {
+    let provided: std::collections::HashSet<&str> = packages
+        .values()
+        .flat_map(|package| package.provides.iter().map(String::as_str))
+        .collect();
+
+    let mut missing = Vec::new();
+    for package in packages.values() {
+        for depend in &package.depends {
+            let target = dependency_base_name(depend);
+            if target == package.name || packages.contains_key(target) || provided.contains(target)
+            {
+                continue;
+            }
+            missing.push(UnsatisfiedDependency {
+                package: package.name.clone(),
+                dependency: target.to_owned(),
+            });
+        }
+    }
+    missing.sort_by(|a, b| {
+        a.package
+            .cmp(&b.package)
+            .then_with(|| a.dependency.cmp(&b.dependency))
+    });
+    missing
+}
+
 /// Identify potential AUR packages (installed but not in any sync database).
 ///
 /// Uses pure Rust cache for extreme speed (<1ms).
@@ -2282,6 +2342,54 @@ mod tests {
         assert_eq!(dependency_base_name("curl"), "curl");
         assert_eq!(dependency_base_name("curl>=7.0"), "curl");
         assert_eq!(dependency_base_name("libfoo.so=1-64"), "libfoo.so");
+    }
+
+    /// #687: a local database that parses cleanly can still declare a
+    /// dependency nothing installed satisfies, which is what a half-removed
+    /// package looks like. Doctor previously accepted it.
+    #[test]
+    fn unsatisfied_dependencies_reports_only_genuinely_missing_names() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // Direct dependency, satisfied.
+        write_local_desc(&temp, "app-main", "0", "\n%DEPENDS%\nlib-used>=1.0\n");
+        write_local_desc(&temp, "lib-used", "1", "");
+        // Virtual dependency, satisfied only through %PROVIDES%.
+        write_local_desc(&temp, "app-virtual", "0", "\n%DEPENDS%\nvirtual-svc\n");
+        write_local_desc(&temp, "provider", "1", "\n%PROVIDES%\nvirtual-svc\n");
+        // Self-reference and an unmet dependency on the same package.
+        write_local_desc(
+            &temp,
+            "app-broken",
+            "0",
+            "\n%DEPENDS%\napp-broken\ngone-lib\n",
+        );
+        // optdepends are optional and must not be reported.
+        write_local_desc(
+            &temp,
+            "app-opt",
+            "0",
+            "\n%OPTDEPENDS%\nnever-installed: does things\n",
+        );
+
+        let packages = parse_local_db(temp.path()).unwrap();
+        let missing = unsatisfied_dependencies(&packages);
+
+        assert_eq!(
+            missing,
+            vec![UnsatisfiedDependency {
+                package: "app-broken".to_string(),
+                dependency: "gone-lib".to_string(),
+            }],
+            "expected only the unmet name, with constraints and self-references resolved"
+        );
+    }
+
+    /// A database that cannot be parsed must not be reported as a clean set of
+    /// satisfied dependencies; the structural check owns that failure.
+    #[test]
+    fn unsatisfied_local_dependencies_is_empty_for_an_unreadable_database() {
+        let temp = tempfile::TempDir::new().unwrap();
+        assert!(unsatisfied_local_dependencies(&temp.path().join("absent")).is_empty());
     }
 
     /// Regression (audit ARCH-R1): a dependency whose desc lacks the dead

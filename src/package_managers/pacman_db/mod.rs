@@ -6,6 +6,7 @@
 mod db;
 
 pub(crate) use db::check_local_db_consistency;
+pub use db::{UnsatisfiedDependency, unsatisfied_local_dependencies};
 
 pub use db::{
     AlpmCatalogEpoch, CachedUpdate, LocalDbEpoch, LocalDbPackage, SyncDbEpoch, SyncDbPackage,

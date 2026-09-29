@@ -665,11 +665,35 @@ fn check_arch_infra() -> usize {
     let local_dir = crate::core::paths::pacman_local_dir();
     if local_dir.is_dir() {
         match crate::package_managers::pacman_db::check_local_db_consistency(&local_dir) {
-            Ok(packages) => println!(
-                "  {} ALPM local package database ({}, {packages} packages verified)",
-                style::success("✓"),
-                local_dir.display()
-            ),
+            Ok(packages) => {
+                // Structure alone does not prove consistency: the database can
+                // parse cleanly and still declare a dependency nothing installed
+                // satisfies, which is what a half-removed package looks like.
+                let missing =
+                    crate::package_managers::pacman_db::unsatisfied_local_dependencies(&local_dir);
+                for entry in &missing {
+                    println!(
+                        "  {} ALPM dependency unsatisfied: {} requires {}",
+                        style::error("✗"),
+                        entry.package,
+                        entry.dependency
+                    );
+                }
+                if missing.is_empty() {
+                    println!(
+                        "  {} ALPM local package database ({packages} packages verified, dependencies satisfied)",
+                        style::success("✓")
+                    );
+                } else {
+                    println!(
+                        "  {} ALPM local package database inconsistent: {} of {packages} dependencies unmet ({})",
+                        style::error("✗"),
+                        missing.len(),
+                        local_dir.display()
+                    );
+                    issues += 1;
+                }
+            }
             Err(error) => {
                 println!(
                     "  {} ALPM local package database inconsistent ({}): {error}",
