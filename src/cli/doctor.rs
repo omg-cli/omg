@@ -1603,11 +1603,8 @@ mod tests {
         // is not a runnable `omg` and must not satisfy the check.
         let as_directory = decoy.join("omg");
         std::fs::create_dir_all(&as_directory).expect("omg directory fixture");
-        std::fs::set_permissions(
-            &as_directory,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .expect("executable directory permissions");
+        std::fs::set_permissions(&as_directory, std::fs::Permissions::from_mode(0o755))
+            .expect("executable directory permissions");
 
         let status = || path_status(&path, fixture.path(), &real.join("omg"));
         assert_eq!(
