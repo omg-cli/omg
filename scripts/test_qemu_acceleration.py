@@ -46,9 +46,17 @@ class QemuAccelerationTests(unittest.TestCase):
     def test_tcg_deadlines_are_explicit_and_leave_kvm_defaults_unchanged(self):
         runner = (ROOT / "scripts/benchmark-qemu.sh").read_text(encoding="utf-8")
         daemon = (ROOT / "scripts/qemu-daemon-check.sh").read_text(encoding="utf-8")
-        self.assertIn("boot_timeout=700", runner)
+        # The KVM boot deadline is derived from the guest-side readiness wait so
+        # it can never fall below it; TCG keeps an explicitly wider allowance.
+        # Guest and daemon deadlines are unchanged.
+        self.assertIn(
+            "SSH_WAIT_BUDGET=$(( SSH_WAIT_ATTEMPTS * (SSH_ATTEMPT_TIMEOUT + SSH_RETRY_DELAY) ))",
+            runner,
+        )
+        self.assertIn("BOOT_TIMEOUT=$(( SSH_WAIT_BUDGET + 180 ))", runner)
+        self.assertIn("boot_timeout=$BOOT_TIMEOUT", runner)
+        self.assertIn("boot_timeout=$(( BOOT_TIMEOUT * 2 ))", runner)
         self.assertIn("guest_timeout=600", runner)
-        self.assertIn("boot_timeout=1800", runner)
         self.assertIn("guest_timeout=2400", runner)
         self.assertIn("kvm) daemon_timeout=240 ;; tcg) daemon_timeout=900", runner)
         self.assertIn('OMG_QEMU_ACCEL="$accel" timeout', runner)

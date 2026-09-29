@@ -61,9 +61,12 @@ class BootTimeoutExceedsReadinessWait(unittest.TestCase):
 
     def test_driver_no_longer_hardcodes_a_short_boot_timeout(self):
         text = DRIVER.read_text(encoding="utf-8")
+        # re.MULTILINE is required: without it the ^ and $ anchors bind to the
+        # whole file, the pattern can never match, and this test passes no
+        # matter what the driver contains.
         self.assertNotRegex(
             text,
-            r"^\s*boot_timeout=\d+\s*$",
+            r"(?m)^\s*boot_timeout=\d+\s*$",
             "boot_timeout must not be a bare literal; derive it from the wait budget",
         )
 

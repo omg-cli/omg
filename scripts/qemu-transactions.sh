@@ -103,7 +103,7 @@ start_clone() {
   # QEMU-state / serial-banner / last-guest-lines diagnostics. The old hardcoded
   # 360 killed the clone first, so a slow boot produced an empty log and no
   # diagnostics at all. Keep in step with SSH_WAIT_BUDGET in benchmark-qemu.sh;
-  # scripts/test_qemu_output_contracts.py asserts the ordering.
+  # scripts/test_qemu_boot_timeout_budget.py asserts the ordering.
   timeout --kill-after=5s "$clone_boot_timeout" bash /work/boot.sh "${boot_args[@]}" "$disk" "$vars" "$serial" > "$log" 2>&1 || rc=$?
   # boot.sh reuses this controller log on every clone. Preserve each launch
   # before the next trial can overwrite the evidence for a failed boot.
