@@ -372,11 +372,18 @@ mod tests {
         let error = run("bash")
             .await
             .expect_err("blame with no backend must not look like not-installed");
-        assert!(
-            error
+        let expected = if cfg!(target_os = "macos") {
+            assert_eq!(
+                crate::package_managers::resolve_backend().unwrap(),
+                crate::package_managers::Backend::MacOS
+            );
+            "Package installation history is not implemented for Homebrew".to_string()
+        } else {
+            crate::package_managers::resolve_backend()
+                .expect_err("no matching live backend is compiled")
                 .to_string()
-                .contains("not available without an Arch or Debian package backend")
-        );
+        };
+        assert_eq!(error.to_string(), expected);
     }
 
     #[test]

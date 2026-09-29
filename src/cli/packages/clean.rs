@@ -605,11 +605,7 @@ mod tests {
         let error = clean(true, false, false, false, false, true)
             .await
             .expect_err("orphan removal with no backend must not look like success");
-        assert!(
-            error
-                .to_string()
-                .contains("not available without an Arch or Debian package backend")
-        );
+        assert_eq!(error.to_string(), unsupported_cleanup_error());
     }
 
     #[tokio::test]
@@ -623,11 +619,27 @@ mod tests {
         let error = clean(false, true, false, false, false, true)
             .await
             .expect_err("cache cleanup with no backend must not look like success");
-        assert!(
-            error
+        assert_eq!(error.to_string(), unsupported_cleanup_error());
+    }
+
+    #[cfg(not(any(
+        feature = "arch",
+        feature = "debian",
+        feature = "debian-pure",
+        feature = "fedora"
+    )))]
+    fn unsupported_cleanup_error() -> String {
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                crate::package_managers::resolve_backend().unwrap(),
+                crate::package_managers::Backend::MacOS
+            );
+            "Package cleanup is not implemented for the Homebrew backend".to_string()
+        } else {
+            crate::package_managers::resolve_backend()
+                .expect_err("no matching live backend is compiled")
                 .to_string()
-                .contains("not available without a package manager backend")
-        );
+        }
     }
 
     #[tokio::test]
@@ -636,12 +648,16 @@ mod tests {
         let error = clean(false, false, true, false, false, true)
             .await
             .expect_err("AUR cleanup without the Arch backend must not look like success");
-        // Debian-like hosts hit the earlier host-specific bail
-        // ("…on Debian-like systems"); others hit the backend bail.
-        // Both fail closed and share this prefix.
-        assert!(
-            error.to_string().contains("AUR cleanup is not available"),
-            "AUR cleanup without Arch must fail closed; got: {error}"
-        );
+        match crate::package_managers::resolve_backend() {
+            Err(selection_error) => assert_eq!(error.to_string(), selection_error.to_string()),
+            Ok(crate::package_managers::Backend::MacOS) => assert_eq!(
+                error.to_string(),
+                "Package cleanup is not implemented for the Homebrew backend"
+            ),
+            Ok(_) => assert!(
+                error.to_string().contains("AUR cleanup is not available"),
+                "AUR cleanup without Arch must fail closed; got: {error}"
+            ),
+        }
     }
 }

@@ -594,6 +594,64 @@ pub fn get_package_manager() -> anyhow::Result<Arc<dyn PackageManager>> {
     }
 }
 
+// apt exports are available with debian feature
+#[cfg(feature = "debian")]
+pub fn apt_search_sync(query: &str) -> anyhow::Result<Vec<SyncPackage>> {
+    if crate::core::paths::test_mode() {
+        let pm = get_package_manager()?;
+        let results = futures::executor::block_on(pm.search(query))?;
+        return Ok(results
+            .into_iter()
+            .map(|p| SyncPackage {
+                name: p.name,
+                version: p.version,
+                description: p.description,
+                repo: "main".to_string(),
+                download_size: 0,
+                installed: p.installed,
+            })
+            .collect());
+    }
+    apt::search_sync(query)
+}
+
+#[cfg(feature = "debian")]
+pub fn apt_list_explicit() -> anyhow::Result<Vec<String>> {
+    if crate::core::paths::test_mode() {
+        let pm = get_package_manager()?;
+        return futures::executor::block_on(pm.list_explicit());
+    }
+    apt::list_explicit()
+}
+
+#[cfg(feature = "debian")]
+pub use apt::{
+    AptPackageManager, get_sync_pkg_info as apt_get_sync_pkg_info,
+    get_system_status as apt_get_system_status,
+    list_all_package_names as apt_list_all_package_names,
+    list_installed_fast as apt_list_installed_fast, list_updates as apt_list_updates,
+    remove_orphans as apt_remove_orphans,
+};
+#[cfg(any(feature = "debian", feature = "debian-pure"))]
+pub use debian_db::{
+    get_counts_fast as apt_get_counts_fast, get_info_fast as apt_get_info_fast,
+    list_explicit_fast as apt_list_explicit_fast, search_fast as apt_search_fast,
+};
+
+#[cfg(all(
+    any(feature = "debian", feature = "debian-pure"),
+    not(feature = "debian")
+))]
+pub use debian_db::list_installed_fast as apt_list_installed_fast;
+
+// Homebrew exports are available on macOS
+#[cfg(any(feature = "macos", target_os = "macos"))]
+pub use homebrew::HomebrewPackageManager;
+
+// DNF/RPM exports are available with fedora feature
+#[cfg(feature = "fedora")]
+pub use dnf::DnfPackageManager;
+
 #[cfg(test)]
 mod backend_selection_tests {
     use super::{Backend, CompiledBackends, resolve_for};
@@ -681,6 +739,47 @@ mod backend_selection_tests {
     }
 
     #[test]
+    fn current_macos_availability_matches_automatic_target_support() {
+        assert_eq!(
+            CompiledBackends::current().macos,
+            cfg!(any(feature = "macos", target_os = "macos"))
+        );
+    }
+
+    #[test]
+    fn every_feature_combination_requires_the_matching_live_backend() {
+        for bits in 0u8..32 {
+            let compiled = CompiledBackends {
+                arch: bits & 1 != 0,
+                debian: bits & 2 != 0,
+                fedora: bits & 4 != 0,
+                macos: bits & 8 != 0,
+                debian_pure: bits & 16 != 0,
+            };
+            for (distro, expected, available) in [
+                (Distro::Arch, Backend::Arch, compiled.arch),
+                (Distro::Debian, Backend::Debian, compiled.debian),
+                (Distro::Ubuntu, Backend::Debian, compiled.debian),
+                (Distro::Fedora, Backend::Fedora, compiled.fedora),
+                (Distro::MacOS, Backend::MacOS, compiled.macos),
+            ] {
+                let resolved = resolve_for(distro, compiled, false);
+                if available {
+                    assert_eq!(resolved.unwrap(), expected, "feature bits {bits}");
+                } else {
+                    assert!(resolved.is_err(), "{distro:?}: feature bits {bits}");
+                }
+                assert_eq!(resolve_for(distro, compiled, true).unwrap(), Backend::Mock);
+            }
+            assert!(resolve_for(Distro::Unknown, compiled, false).is_err());
+            assert_eq!(
+                resolve_for(Distro::Unknown, compiled, true).unwrap(),
+                Backend::Mock
+            );
+        }
+    }
+
+    #[test]
     fn explicit_test_mode_selects_mock_without_a_live_backend() {
         assert_eq!(
             resolve_for(Distro::Unknown, ARCH, true).unwrap(),
@@ -688,61 +787,3 @@ mod backend_selection_tests {
         );
     }
 }
-
-// apt exports are available with debian feature
-#[cfg(feature = "debian")]
-pub fn apt_search_sync(query: &str) -> anyhow::Result<Vec<SyncPackage>> {
-    if crate::core::paths::test_mode() {
-        let pm = get_package_manager()?;
-        let results = futures::executor::block_on(pm.search(query))?;
-        return Ok(results
-            .into_iter()
-            .map(|p| SyncPackage {
-                name: p.name,
-                version: p.version,
-                description: p.description,
-                repo: "main".to_string(),
-                download_size: 0,
-                installed: p.installed,
-            })
-            .collect());
-    }
-    apt::search_sync(query)
-}
-
-#[cfg(feature = "debian")]
-pub fn apt_list_explicit() -> anyhow::Result<Vec<String>> {
-    if crate::core::paths::test_mode() {
-        let pm = get_package_manager()?;
-        return futures::executor::block_on(pm.list_explicit());
-    }
-    apt::list_explicit()
-}
-
-#[cfg(feature = "debian")]
-pub use apt::{
-    AptPackageManager, get_sync_pkg_info as apt_get_sync_pkg_info,
-    get_system_status as apt_get_system_status,
-    list_all_package_names as apt_list_all_package_names,
-    list_installed_fast as apt_list_installed_fast, list_updates as apt_list_updates,
-    remove_orphans as apt_remove_orphans,
-};
-#[cfg(any(feature = "debian", feature = "debian-pure"))]
-pub use debian_db::{
-    get_counts_fast as apt_get_counts_fast, get_info_fast as apt_get_info_fast,
-    list_explicit_fast as apt_list_explicit_fast, search_fast as apt_search_fast,
-};
-
-#[cfg(all(
-    any(feature = "debian", feature = "debian-pure"),
-    not(feature = "debian")
-))]
-pub use debian_db::list_installed_fast as apt_list_installed_fast;
-
-// Homebrew exports are available on macOS
-#[cfg(any(feature = "macos", target_os = "macos"))]
-pub use homebrew::HomebrewPackageManager;
-
-// DNF/RPM exports are available with fedora feature
-#[cfg(feature = "fedora")]
-pub use dnf::DnfPackageManager;

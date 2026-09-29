@@ -50,7 +50,8 @@ pub(crate) async fn enforce_install_policy(
 
 #[cfg(feature = "arch")]
 mod arch;
-#[cfg(any(feature = "debian", feature = "debian-pure"))]
+// debian-pure is indexing-only and cannot dispatch live APT installs.
+#[cfg(feature = "debian")]
 mod debian;
 mod generic;
 
@@ -132,7 +133,10 @@ async fn install_with_replacement_budget(
     validate_install_targets(packages)?;
 
     if dry_run {
+        #[cfg(feature = "arch")]
         return install_dry_run(packages).await;
+        #[cfg(not(feature = "arch"))]
+        return install_dry_run(packages);
     }
 
     #[cfg(unix)]
@@ -171,10 +175,22 @@ fn validate_install_targets(packages: &[String]) -> Result<()> {
     }
 }
 
+#[cfg(feature = "arch")]
 async fn install_dry_run(packages: &[String]) -> Result<()> {
     dispatch_backend! {
         debian: { debian::install_dry_run(packages) },
         arch: { arch::install_dry_run(packages).await },
+        generic: { generic::install_dry_run(packages) },
+    }
+}
+
+// Without Arch, every compiled preview is synchronous. Keep that contract
+// rather than manufacturing an await solely to satisfy an async signature.
+#[cfg(not(feature = "arch"))]
+fn install_dry_run(packages: &[String]) -> Result<()> {
+    dispatch_backend! {
+        debian: { debian::install_dry_run(packages) },
+        arch: { unreachable!("Arch is not compiled") },
         generic: { generic::install_dry_run(packages) },
     }
 }
@@ -184,10 +200,28 @@ mod tests {
     use super::{deduplicate_packages, validate_install_targets};
 
     #[test]
+    #[serial_test::serial]
     fn install_targets_are_validated_before_backend_dispatch() {
-        let error = validate_install_targets(&["invalid\nname".to_string()])
-            .expect_err("invalid target must fail at the command boundary");
-        assert!(error.to_string().contains("Invalid"));
+        // Select a backend explicitly, independent of the host/feature pair.
+        // A missing live backend must otherwise fail before target validation.
+        temp_env::with_var("OMG_TEST_MODE", Some("1"), || {
+            let error = validate_install_targets(&["invalid\nname".to_string()])
+                .expect_err("invalid target must fail at the command boundary");
+            assert!(error.to_string().contains("Invalid"));
+        });
+    }
+
+    #[cfg(not(feature = "arch"))]
+    #[test]
+    #[serial_test::serial]
+    fn non_arch_preview_is_synchronous_and_validates_mock_targets() {
+        temp_env::with_var("OMG_TEST_MODE", Some("1"), || {
+            super::install_dry_run(&["bash".to_string()])
+                .expect("explicit mock preview must succeed without a live backend");
+            let error = super::install_dry_run(&["invalid\nname".to_string()])
+                .expect_err("preview must reject invalid targets");
+            assert!(error.to_string().contains("Invalid"));
+        });
     }
 
     #[test]

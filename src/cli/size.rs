@@ -446,11 +446,18 @@ mod tests {
     #[tokio::test]
     async fn size_without_backend_is_an_error() {
         let error = run(None, 20).await.expect_err("size requires a backend");
-        assert!(
-            error
+        let expected = if cfg!(target_os = "macos") {
+            assert_eq!(
+                crate::package_managers::resolve_backend().unwrap(),
+                crate::package_managers::Backend::MacOS
+            );
+            "Package size analysis is not implemented for Homebrew".to_string()
+        } else {
+            crate::package_managers::resolve_backend()
+                .expect_err("no matching live backend is compiled")
                 .to_string()
-                .contains("requires a supported package backend")
-        );
+        };
+        assert_eq!(error.to_string(), expected);
     }
 
     #[cfg(any(
