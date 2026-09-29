@@ -49,6 +49,13 @@ const INSTALL_RECEIPT: &str = "INSTALL_RECEIPT.json";
 const FORMULA_API: &str = "https://formulae.brew.sh/api/formula.json";
 /// Homebrew cask API endpoint
 const CASK_API: &str = "https://formulae.brew.sh/api/cask.json";
+// Homebrew documents these as all-current-package endpoints:
+// https://formulae.brew.sh/docs/api/
+// These full indexes currently contain thousands of distinct entries.
+// Conservative floors reject a syntactically valid but severely incomplete
+// response before it can make Doctor green or overwrite a useful local cache.
+const MIN_EXPECTED_FORMULAS: usize = 4_000;
+const MIN_EXPECTED_CASKS: usize = 2_000;
 const FORMULA_CACHE_FILE: &str = "formula.jws.json";
 const CASK_CACHE_FILE: &str = "cask.jws.json";
 const HOMEBREW_CACHE_TTL_SECS: u64 = 604_800;
@@ -161,6 +168,57 @@ struct CaskInfo {
     version: Option<String>,
 }
 
+/// The two full-index responses consumed by the live Homebrew backend.
+#[derive(Clone, Copy)]
+pub(crate) enum HomebrewIndexKind {
+    Formula,
+    Cask,
+}
+
+/// Doctor uses the live backend's typed response shapes rather than treating
+/// an HTTP 200 with an HTML login page or partial JSON as a healthy API.
+pub(crate) fn validate_homebrew_index(kind: HomebrewIndexKind, body: &[u8]) -> Result<()> {
+    match kind {
+        HomebrewIndexKind::Formula => {
+            let formulas: Vec<FormulaInfo> =
+                serde_json::from_slice(body).context("Homebrew formula index is not parseable")?;
+            validate_formula_catalog(&formulas)?;
+        }
+        HomebrewIndexKind::Cask => {
+            let casks: Vec<CaskInfo> =
+                serde_json::from_slice(body).context("Homebrew cask index is not parseable")?;
+            validate_cask_catalog(&casks)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_formula_catalog(formulas: &[FormulaInfo]) -> Result<()> {
+    let distinct = formulas
+        .iter()
+        .map(|formula| formula.name.as_str())
+        .collect::<AHashSet<_>>()
+        .len();
+    anyhow::ensure!(
+        distinct >= MIN_EXPECTED_FORMULAS,
+        "Homebrew formula index has only {distinct} distinct entries; expected at least {MIN_EXPECTED_FORMULAS}"
+    );
+    Ok(())
+}
+
+fn validate_cask_catalog(casks: &[CaskInfo]) -> Result<()> {
+    let distinct = casks
+        .iter()
+        .map(|cask| cask.token.as_str())
+        .collect::<AHashSet<_>>()
+        .len();
+    anyhow::ensure!(
+        distinct >= MIN_EXPECTED_CASKS,
+        "Homebrew cask index has only {distinct} distinct entries; expected at least {MIN_EXPECTED_CASKS}"
+    );
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct HomebrewApiEnvelope {
     payload: String,
@@ -248,7 +306,7 @@ impl HomebrewPackageManager {
     #[must_use]
     pub fn new() -> Self {
         let prefix = Self::detect_prefix();
-        let cellar = prefix.join(CELLAR_DIR);
+        let cellar = Self::select_cellar(&prefix);
 
         Self {
             prefix,
@@ -262,29 +320,70 @@ impl HomebrewPackageManager {
         }
     }
 
+    /// Paths used by the live backend. Doctor probes these exact paths so a
+    /// second Homebrew installation cannot make the selected backend look
+    /// healthy while its own package inventory is empty.
+    pub(crate) fn prefix(&self) -> &Path {
+        &self.prefix
+    }
+
+    pub(crate) fn cellar(&self) -> &Path {
+        &self.cellar
+    }
+
+    pub(crate) fn caskroom(&self) -> PathBuf {
+        self.prefix.join(CASKROOM_DIR)
+    }
+
+    pub(crate) fn brew_executable(&self) -> PathBuf {
+        self.prefix.join("bin").join("brew")
+    }
+
+    /// Match Homebrew's Cellar selection: `brew --cellar` reports
+    /// `$HOMEBREW_PREFIX/Cellar` on every architecture, so the prefix Cellar
+    /// is the inventory location. On Intel the Homebrew git checkout lives at
+    /// `/usr/local/Homebrew`, which is a source checkout and not a bottle
+    /// location; preferring `<repository>/Cellar` there made the backend read
+    /// an inventory that `brew --cellar` never reports, which `omg doctor`
+    /// then reports as a Cellar mismatch on a healthy Intel machine.
+    /// A missing prefix Cellar remains selected before any formula is installed.
+    fn select_cellar(prefix: &Path) -> PathBuf {
+        prefix.join(CELLAR_DIR)
+    }
+
     /// Detect Homebrew installation prefix
     ///
     /// Homebrew uses different installation paths based on CPU architecture:
     /// - ARM (Apple Silicon): `/opt/homebrew`
     /// - Intel (`x86_64`): `/usr/local`
     ///
-    /// This method checks for the Cellar directory in each location and returns
-    /// the first valid prefix found, defaulting to ARM if neither exists.
+    /// The executable is the installation authority, including before the
+    /// first formula creates a Cellar. Prefer the current binary architecture
+    /// when both Homebrew installations exist (for example under Rosetta).
     fn detect_prefix() -> PathBuf {
-        // Check ARM prefix first (modern Macs)
         let arm_path = PathBuf::from(HOMEBREW_PREFIX_ARM);
-        if arm_path.join(CELLAR_DIR).exists() {
-            return arm_path;
-        }
-
-        // Fall back to Intel prefix
         let intel_path = PathBuf::from(HOMEBREW_PREFIX_INTEL);
-        if intel_path.join(CELLAR_DIR).exists() {
-            return intel_path;
+        if cfg!(target_arch = "aarch64") {
+            Self::select_prefix(&arm_path, &intel_path)
+        } else {
+            Self::select_prefix(&intel_path, &arm_path)
         }
+    }
 
-        // Default to ARM prefix (most common on modern Macs)
-        arm_path
+    fn select_prefix(preferred: &Path, alternate: &Path) -> PathBuf {
+        for path in [preferred, alternate] {
+            if path.join("bin").join("brew").is_file() {
+                return path.to_path_buf();
+            }
+        }
+        // Preserve access to a damaged installation's inventory for read
+        // operations; doctor reports its missing executable as an issue.
+        for path in [preferred, alternate] {
+            if path.join(CELLAR_DIR).is_dir() {
+                return path.to_path_buf();
+            }
+        }
+        preferred.to_path_buf()
     }
 
     /// Get the cache directory for storing formula index
@@ -390,6 +489,8 @@ impl HomebrewPackageManager {
             Self::read_homebrew_api_payload::<Vec<FormulaInfo>>(&formula_path),
             Self::read_homebrew_api_payload::<Vec<CaskInfo>>(&cask_path)
         )?;
+        validate_formula_catalog(&formulas)?;
+        validate_cask_catalog(&casks)?;
 
         tracing::debug!(
             "Loaded {} formulas and {} casks from Homebrew cache",
@@ -430,6 +531,8 @@ impl HomebrewPackageManager {
         let (formulas, casks): (Vec<FormulaInfo>, Vec<CaskInfo>) =
             rkyv::from_bytes::<(Vec<FormulaInfo>, Vec<CaskInfo>), rkyv::rancor::Error>(&data)
                 .map_err(|e| anyhow::anyhow!("Invalid rkyv cache: {e}"))?;
+        validate_formula_catalog(&formulas)?;
+        validate_cask_catalog(&casks)?;
 
         Ok(Some(Self::build_cache(formulas, casks)))
     }
@@ -473,6 +576,8 @@ impl HomebrewPackageManager {
             .json()
             .await
             .context("Failed to parse cask API response")?;
+        validate_formula_catalog(&formulas)?;
+        validate_cask_catalog(&casks)?;
 
         tracing::debug!(
             "Fetched {} formulas and {} casks",
@@ -560,7 +665,7 @@ impl HomebrewPackageManager {
             }
         }
 
-        let caskroom = self.prefix.join(CASKROOM_DIR);
+        let caskroom = self.caskroom();
         if caskroom.exists() {
             let mut entries = fs::read_dir(&caskroom).await?;
             while let Some(entry) = entries.next_entry().await? {
@@ -797,7 +902,7 @@ impl HomebrewPackageManager {
         }
 
         // Sort by score (descending) - highest relevance first
-        results.sort_by(|a, b| b.0.cmp(&a.0));
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         // Take top 50 results to avoid overwhelming the user
         results.truncate(50);
@@ -833,7 +938,7 @@ impl HomebrewPackageManager {
 
     fn list_installed_sync(&self) -> Result<Vec<String>> {
         let mut names = Vec::new();
-        for root in [&self.cellar, &self.prefix.join(CASKROOM_DIR)] {
+        for root in [&self.cellar, &self.caskroom()] {
             if !root.exists() {
                 continue;
             }
@@ -854,7 +959,7 @@ impl HomebrewPackageManager {
         let cellar_mtime = std::fs::metadata(&self.cellar)
             .ok()
             .and_then(|metadata| metadata.modified().ok());
-        let caskroom_mtime = std::fs::metadata(self.prefix.join(CASKROOM_DIR))
+        let caskroom_mtime = std::fs::metadata(self.caskroom())
             .ok()
             .and_then(|metadata| metadata.modified().ok());
         (cellar_mtime, caskroom_mtime)
@@ -919,7 +1024,7 @@ impl HomebrewPackageManager {
             .map(|argument| (*argument).to_owned())
             .collect::<Vec<_>>();
         crate::core::security::audit::record_operation("brew", &targets, "attempt")?;
-        let brew_path = self.prefix.join("bin").join("brew");
+        let brew_path = self.brew_executable();
 
         let mut cmd = tokio::process::Command::new(&brew_path);
         cmd.args(args);
@@ -1231,6 +1336,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prefix_selection_prefers_running_architecture_and_existing_brew() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let preferred = root.path().join("preferred");
+        let alternate = root.path().join("alternate");
+        std::fs::create_dir_all(preferred.join("bin"))?;
+        std::fs::create_dir_all(alternate.join("bin"))?;
+
+        // A fresh Homebrew install can have an executable before its first
+        // formula creates a Cellar.
+        std::fs::write(preferred.join("bin/brew"), b"brew")?;
+        assert_eq!(
+            HomebrewPackageManager::select_prefix(&preferred, &alternate),
+            preferred
+        );
+
+        // A second architecture's Cellar cannot override the executable for
+        // the architecture of the running OMG binary.
+        std::fs::create_dir_all(alternate.join(CELLAR_DIR))?;
+        std::fs::write(alternate.join("bin/brew"), b"brew")?;
+        assert_eq!(
+            HomebrewPackageManager::select_prefix(&preferred, &alternate),
+            preferred
+        );
+
+        std::fs::remove_file(preferred.join("bin/brew"))?;
+        assert_eq!(
+            HomebrewPackageManager::select_prefix(&preferred, &alternate),
+            alternate
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prefix_cellar_is_the_inventory_the_backend_reads() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let prefix = root.path().join("prefix");
+        let prefix_cellar = prefix.join(CELLAR_DIR);
+        assert_eq!(
+            HomebrewPackageManager::select_cellar(&prefix),
+            prefix_cellar,
+            "the prefix Cellar is selected before any formula is installed"
+        );
+        std::fs::create_dir_all(prefix_cellar.join("wget/1.0"))?;
+
+        let selected = HomebrewPackageManager::select_cellar(&prefix);
+        assert_eq!(selected, prefix_cellar);
+        let manager = HomebrewPackageManager {
+            prefix: prefix.clone(),
+            cellar: selected,
+            cache: Arc::new(RwLock::new(None)),
+            client: crate::core::http::download_client().clone(),
+        };
+        let installed = manager.read_installed_packages().await?;
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].name, "wget");
+        assert_eq!(installed[0].version, "1.0");
+
+        // An Intel-style Homebrew git checkout at `<prefix>/Homebrew` is a
+        // source tree, not a bottle location. `brew --cellar` still reports
+        // `$HOMEBREW_PREFIX/Cellar`, so the backend must keep reading the
+        // prefix even when a repository Cellar exists alongside it.
+        let repository_cellar = prefix.join("Homebrew").join(CELLAR_DIR);
+        std::fs::create_dir_all(repository_cellar.join("curl/2.0"))?;
+        assert_eq!(
+            HomebrewPackageManager::select_cellar(&prefix),
+            prefix_cellar,
+            "the prefix Cellar stays selected even when a repository Cellar exists"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_cache_paths() {
         let binary_cache = HomebrewPackageManager::binary_cache_path();
@@ -1261,18 +1438,26 @@ mod tests {
         let cache_root = tempfile::tempdir()?;
         let api_dir = cache_root.path().join("api");
         std::fs::create_dir_all(&api_dir)?;
-        let formula_payload = serde_json::json!([{
-            "name": "wget",
-            "desc": "Internet file retriever",
-            "homepage": "https://www.gnu.org/software/wget/",
-            "versions": {"stable": "1.0"}
-        }]);
-        let cask_payload = serde_json::json!([{
-            "token": "firefox",
-            "desc": null,
-            "homepage": "https://www.mozilla.org/firefox/",
-            "version": "146.0"
-        }]);
+        let formula_payload = serde_json::Value::Array(
+            (0..MIN_EXPECTED_FORMULAS)
+                .map(|index| {
+                    serde_json::json!({
+                        "name": if index == 0 { "wget".to_string() } else { format!("formula-{index}") },
+                        "versions": {"stable": "1.0"}
+                    })
+                })
+                .collect(),
+        );
+        let cask_payload = serde_json::Value::Array(
+            (0..MIN_EXPECTED_CASKS)
+                .map(|index| {
+                    serde_json::json!({
+                        "token": if index == 0 { "firefox".to_string() } else { format!("cask-{index}") },
+                        "version": "1.0"
+                    })
+                })
+                .collect(),
+        );
         for (name, payload) in [
             (FORMULA_CACHE_FILE, formula_payload),
             (CASK_CACHE_FILE, cask_payload),
@@ -1296,12 +1481,37 @@ mod tests {
                 .block_on(manager.load_from_homebrew_cache())?
                 .context("expected current Homebrew API cache")?;
 
-            assert_eq!(cache.formulas.len(), 1);
-            assert_eq!(cache.casks.len(), 1);
+            assert_eq!(cache.formulas.len(), MIN_EXPECTED_FORMULAS);
+            assert_eq!(cache.casks.len(), MIN_EXPECTED_CASKS);
             assert!(cache.formula_map.contains_key("wget"));
             assert!(cache.cask_map.contains_key("firefox"));
+
+            std::fs::write(
+                api_dir.join(FORMULA_CACHE_FILE),
+                serde_json::json!({
+                    "payload": "[{\"name\":\"wget\",\"versions\":{\"stable\":\"1.0\"}}]"
+                })
+                .to_string(),
+            )?;
+            assert!(
+                runtime
+                    .block_on(manager.load_from_homebrew_cache())
+                    .is_err(),
+                "a partial native cache must not become the OMG package index"
+            );
             Ok(())
         })
+    }
+
+    #[test]
+    fn repeated_catalog_entries_do_not_fake_completeness() {
+        let repeated = serde_json::json!({
+            "name": "wget",
+            "versions": {"stable": "1.0"}
+        });
+        let catalog = vec![repeated; MIN_EXPECTED_FORMULAS];
+        let body = serde_json::to_vec(&catalog).expect("catalog fixture");
+        assert!(validate_homebrew_index(HomebrewIndexKind::Formula, &body).is_err());
     }
 
     #[test]
