@@ -108,6 +108,92 @@ class LicenseOracleTests(unittest.TestCase):
              "Strong copyleft license (AGPL) requires legal review"),
         ])
 
+    def test_advisory_single_plus_and_compact_alias_categories(self):
+        # Independent literals for the parent's thirteen parity counterexamples.
+        # These are advisory family spellings, not canonical SPDX/legal claims.
+        for license_value, expected in (
+            ("GPL+", "Copyleft"), ("LGPL+", "Copyleft"),
+            ("AGPL+", "StrongCopyleft"), ("MPL+", "Copyleft"),
+            ("GPL2+", "Copyleft"), ("GPL3+", "Copyleft"),
+            ("LGPL2.1+", "Copyleft"), ("MPL-2.0+", "Copyleft"),
+            ("GPL1", "Copyleft"), ("LGPL2", "Copyleft"),
+            ("LGPL3", "Copyleft"), ("AGPL1", "StrongCopyleft"),
+            ("AGPL3", "StrongCopyleft"),
+        ):
+            with self.subTest(license_value=license_value):
+                self.assertEqual(ORACLE.known_category([license_value]), expected)
+                self.assertEqual(ORACLE.known_category([license_value.lower()]), expected)
+        self.assertEqual(ORACLE.known_category(["MIT OR GPL2+"]), "Copyleft")
+        self.assertEqual(ORACLE.known_category(["GPL+ AND AGPL+"]), "StrongCopyleft")
+        self.assertEqual(ORACLE.known_category(
+            ["LGPL2.1+ WITH AGPL+"]), "Copyleft")
+
+    def test_advisory_plus_does_not_accept_unknown_or_exception_atoms(self):
+        for license_value in (
+            "GPL++", "LGPL++", "AGPL++", "MPL++", "GPL2++", "GPL3++",
+            "LGPL2.1++", "MPL-2.0++", "GPL-2.0++", "AGPL-3.0-only++",
+            "GPL-extra+", "GPL2-extra+", "LGPL2.1-made-up+", "MPL-2.0-fake+",
+            "AGPL-99.0+", "LicenseRef-GPL+", "LicenseRef-AGPL3+",
+            "LicenseRef-MPL-2.0+", "DocumentRef-GPL:LicenseRef-LGPL2.1+",
+            "custom:GPL+", "NotGPL+", "GPLish+", "GPL+extra",
+            "MIT WITH GPL+", "MIT WITH AGPL+", "MIT WITH LGPL2.1+",
+            "MIT WITH MPL-2.0+",
+        ):
+            with self.subTest(license_value=license_value):
+                self.assertIsNone(ORACLE.known_category([license_value]))
+                self.assertEqual(ORACLE.expected_enterprise(
+                    {"negative": ("1", [license_value])})[2], [])
+        self.assertEqual(ORACLE.known_category(
+            ["LicenseRef-GPL+ OR MPL+"]), "Copyleft")
+
+    def test_parity_spellings_require_exact_enterprise_reviews(self):
+        packages = {
+            "a": ("1", ["GPL+"]), "b": ("1", ["LGPL+"]),
+            "c": ("1", ["AGPL+"]), "d": ("1", ["MPL+"]),
+            "e": ("1", ["GPL2+"]), "f": ("1", ["GPL3+"]),
+            "g": ("1", ["LGPL2.1+"]), "h": ("1", ["MPL-2.0+"]),
+            "i": ("1", ["GPL1"]), "j": ("1", ["LGPL2"]),
+            "k": ("1", ["LGPL3"]), "l": ("1", ["AGPL1"]),
+            "m": ("1", ["AGPL3"]), "negative": ("1", ["LicenseRef-GPL+"]),
+        }
+        expected = [
+            ("a", "GPL+", "Copyleft license requires legal review"),
+            ("b", "LGPL+", "Copyleft license requires legal review"),
+            ("c", "AGPL+", "Strong copyleft license (AGPL) requires legal review"),
+            ("d", "MPL+", "Copyleft license requires legal review"),
+            ("e", "GPL2+", "Copyleft license requires legal review"),
+            ("f", "GPL3+", "Copyleft license requires legal review"),
+            ("g", "LGPL2.1+", "Copyleft license requires legal review"),
+            ("h", "MPL-2.0+", "Copyleft license requires legal review"),
+            ("i", "GPL1", "Copyleft license requires legal review"),
+            ("j", "LGPL2", "Copyleft license requires legal review"),
+            ("k", "LGPL3", "Copyleft license requires legal review"),
+            ("l", "AGPL1", "Strong copyleft license (AGPL) requires legal review"),
+            ("m", "AGPL3", "Strong copyleft license (AGPL) requires legal review"),
+        ]
+        self.assertEqual(ORACLE.expected_enterprise(packages)[2], expected)
+        # Export expectations are literal, never taken from oracle output.
+        report = {"total": 14, "unknown": [], "by_license": {
+            "GPL+": 1, "LGPL+": 1, "AGPL+": 1, "MPL+": 1,
+            "GPL2+": 1, "GPL3+": 1, "LGPL2.1+": 1, "MPL-2.0+": 1,
+            "GPL1": 1, "LGPL2": 1, "LGPL3": 1, "AGPL1": 1, "AGPL3": 1,
+            "LicenseRef-GPL+": 1,
+        }, "violations": [dict(package=name, license=value, reason=reason)
+                          for name, value, reason in expected]}
+        self.output.write_text(json.dumps(report), encoding="utf-8")
+        self.output.chmod(0o600)
+        ORACLE.check("enterprise-json", self.output, packages)
+        for bad_rows in (
+            report["violations"][1:],  # missing specifically a new plus review
+            report["violations"] + [report["violations"][0]],
+            report["violations"] + [{"package": "negative", "license": "LicenseRef-GPL+",
+                                     "reason": "Copyleft license requires legal review"}],
+        ):
+            self.output.write_text(json.dumps(dict(report, violations=bad_rows)),
+                                   encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "enterprise violations differ"):
+                ORACLE.check("enterprise-json", self.output, packages)
+
     def test_retained_native_rows_have_an_exact_independent_violation_set(self):
         # Literal assignments transcribed from retained run 36605828415:
         # pr-702/qemu-arch/run-0KNsr4/inventory/rows/audit-licenses.stdout.log.

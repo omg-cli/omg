@@ -125,6 +125,8 @@ def known_category(licenses):
 
     This is a family-presence review policy, not a full SPDX expression evaluator
     or a determination that an OR alternative imposes copyleft obligations.
+    Exactly one trailing plus on a declared family identifier is an advisory
+    review spelling; this does not assert canonical SPDX or legal validity.
     """
     if not licenses:
         return "Unknown"
@@ -142,7 +144,13 @@ def known_category(licenses):
             if token == "WITH":
                 skip_exception = True
             elif token:
-                tokens.add(token)
+                # Normalize one advisory plus, never repeated pluses. Matching
+                # still requires an existing explicit family ID; custom atoms
+                # and arbitrary suffixes cannot acquire family membership.
+                if token.endswith("+"):
+                    token = token[:-1]
+                if not token.endswith("+"):
+                    tokens.add(token)
     if tokens & FAMILY_IDS["AGPL"]:
         return "StrongCopyleft"
     if any(tokens & FAMILY_IDS[family] for family in ("GPL", "LGPL", "MPL")):
