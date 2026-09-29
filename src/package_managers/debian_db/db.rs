@@ -1033,35 +1033,150 @@ fn parse_packages_paragraph(
 }
 
 fn read_packages_file_content(path: &Path) -> Result<String> {
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    decode_packages_content(
+        path,
+        BufReader::new(fs::File::open(path)?),
+        MAX_INDEX_SNAPSHOT_BYTES,
+    )
+}
 
-    let mut buf = String::new();
+fn decode_packages_content(path: &Path, mut reader: impl Read, limit: u64) -> Result<String> {
+    let mut output = BudgetedWriter::new(Vec::new(), limit);
     if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("lz4"))
     {
-        let mut decoder = lz4_flex::frame::FrameDecoder::new(reader);
-        decoder.read_to_string(&mut buf)?;
+        // FrameDecoder treats EOF while reading a block header as normal EOF.
+        // Convert that premature EOF to InvalidData (not UnexpectedEof, which
+        // it suppresses). A complete frame terminates at its native EndMark.
+        struct RequireFrameEnd<R>(R);
+        impl<R: Read> Read for RequireFrameEnd<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.0.read(buffer)?;
+                if count == 0 && !buffer.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Incomplete LZ4 frame",
+                    ));
+                }
+                Ok(count)
+            }
+        }
+        std::io::copy(
+            &mut lz4_flex::frame::FrameDecoder::new(RequireFrameEnd(&mut reader)),
+            &mut output,
+        )?;
+        let mut extra = [0];
+        anyhow::ensure!(
+            reader.read(&mut extra)? == 0,
+            "Trailing data after LZ4 frame"
+        );
     } else if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
     {
-        let mut decoder = flate2::read::GzDecoder::new(reader);
-        decoder.read_to_string(&mut buf)?;
+        // Drain all members, including their checksums; trailing garbage is not healthy.
+        std::io::copy(&mut flate2::read::MultiGzDecoder::new(reader), &mut output)?;
     } else if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("xz"))
     {
-        let mut decompressed = BudgetedWriter::new(Vec::new(), MAX_INDEX_SNAPSHOT_BYTES);
-        decode_xz_to(&mut reader, &mut decompressed)?;
-        buf = String::from_utf8(decompressed.into_inner())
-            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in xz-compressed Packages file: {e}"))?;
+        decode_xz_to(&mut reader, &mut output)?;
     } else {
-        reader.read_to_string(&mut buf)?;
+        std::io::copy(&mut reader, &mut output)?;
     }
+    String::from_utf8(output.into_inner()).context("Invalid UTF-8 in Packages file")
+}
 
-    Ok(buf)
+/// Counts from fully read and parsed native files, not from a cached index.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeIndexValidation {
+    pub installed_packages: usize,
+    pub apt_packages: usize,
+    pub apt_files: usize,
+}
+
+/// Validate a caller-selected dpkg status and APT Packages file set without writes.
+///
+/// Empty status/Packages content is valid; an absent APT file set is not.
+/// Only `_Packages`, `_Packages.lz4`, `_Packages.gz`, `_Packages.xz` are accepted.
+/// No symlinks or special files are followed. At most 256 files, 128 MiB per
+/// input/decoded file and 512 MiB aggregate input + decoded bytes are admitted.
+/// Budget exhaustion is an error, never partial success. This is parse health,
+/// not repository authentication, freshness, candidate selection or dpkg repair.
+pub fn validate_native_indexes(
+    status_path: &Path,
+    package_paths: &[PathBuf],
+) -> Result<NativeIndexValidation> {
+    validate_native_indexes_bounded(
+        status_path,
+        package_paths,
+        128 * 1024 * 1024,
+        512 * 1024 * 1024,
+    )
+}
+
+fn validate_native_indexes_bounded(
+    status_path: &Path,
+    package_paths: &[PathBuf],
+    file_limit: u64,
+    mut remaining: u64,
+) -> Result<NativeIndexValidation> {
+    anyhow::ensure!(!package_paths.is_empty(), "No APT Packages indexes found");
+    anyhow::ensure!(package_paths.len() <= 256, "Too many APT Packages indexes");
+    let mut read = |path: &Path, compressed: bool| -> Result<String> {
+        let bytes = read_index_snapshot(path, file_limit.min(remaining))?;
+        remaining = remaining
+            .checked_sub(bytes.len() as u64)
+            .context("Native index input budget exhausted")?;
+        let contents = if compressed {
+            if path.extension().is_some_and(|ext| ext == "lz4") {
+                anyhow::ensure!(
+                    bytes.starts_with(&[0x04, 0x22, 0x4d, 0x18]),
+                    "Missing LZ4 frame header"
+                );
+            }
+            decode_packages_content(path, bytes.as_slice(), file_limit.min(remaining))?
+        } else {
+            anyhow::ensure!(
+                bytes.len() as u64 <= remaining,
+                "Native index decoded budget exhausted"
+            );
+            String::from_utf8(bytes.to_vec()).context("Invalid UTF-8 in dpkg status")?
+        };
+        remaining = remaining
+            .checked_sub(contents.len() as u64)
+            .context("Native index decoded budget exhausted")?;
+        Ok(contents)
+    };
+    let status = read(status_path, false)
+        .with_context(|| format!("Invalid dpkg status {}", status_path.display()))?;
+    let installed_packages = parse_security_inventory(&status)?.len();
+    let mut apt_packages = 0;
+    for path in package_paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Invalid APT index filename")?;
+        anyhow::ensure!(
+            ["_Packages", "_Packages.lz4", "_Packages.gz", "_Packages.xz"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix)),
+            "Unsupported APT index filename: {name}"
+        );
+        let content =
+            read(path, true).with_context(|| format!("Invalid APT index {}", path.display()))?;
+        for paragraph in content.split("\n\n") {
+            if parse_packages_paragraph(paragraph, "", "", "")?.is_some() {
+                apt_packages += 1;
+            }
+        }
+    }
+    Ok(NativeIndexValidation {
+        installed_packages,
+        apt_packages,
+        apt_files: package_paths.len(),
+    })
 }
 
 fn parse_minimal_package_info(paragraph: &str, expected_name: &str) -> Option<(String, String)> {
@@ -4146,5 +4261,189 @@ mod tests {
         let flat = Path::new("/var/lib/apt/lists/some-repo_amd64_Packages");
         assert_eq!(extract_suite_from_path(flat), "");
         assert_eq!(extract_source_key_from_path(flat), "");
+    }
+}
+
+#[cfg(test)]
+mod native_index_validation_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn encoded(extension: &str, content: &[u8]) -> Vec<u8> {
+        match extension {
+            "gz" => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(content).unwrap();
+                encoder.finish().unwrap()
+            }
+            "lz4" => {
+                let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+                encoder.write_all(content).unwrap();
+                encoder.finish().unwrap()
+            }
+            // Fixed XZ streams generated with Python's lzma.compress (FORMAT_XZ).
+            "xz" if content.is_empty() => vec![
+                253, 55, 122, 88, 90, 0, 0, 4, 230, 214, 180, 70, 0, 0, 0, 0, 28, 223, 68, 33, 31,
+                182, 243, 125, 1, 0, 0, 0, 0, 4, 89, 90,
+            ],
+            "xz" => vec![
+                253, 55, 122, 88, 90, 0, 0, 4, 230, 214, 180, 70, 2, 0, 33, 1, 22, 0, 0, 0, 116,
+                47, 229, 163, 1, 0, 10, 86, 101, 114, 115, 105, 111, 110, 58, 32, 49, 10, 0, 0,
+                213, 79, 118, 93, 123, 171, 194, 225, 0, 1, 35, 11, 194, 27, 253, 9, 31, 182, 243,
+                125, 1, 0, 0, 0, 0, 4, 89, 90,
+            ],
+            _ => content.to_vec(),
+        }
+    }
+
+    #[test]
+    fn native_index_validation_empty_corrupt_and_valid_encodings() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let status = dir.path().join("status");
+        fs::write(&status, "")?;
+        for extension in ["", "gz", "lz4", "xz"] {
+            let path = dir.path().join(format!(
+                "fixture_Packages{}",
+                if extension.is_empty() {
+                    String::new()
+                } else {
+                    format!(".{extension}")
+                }
+            ));
+            let valid = if extension == "xz" {
+                include_bytes!("../../../tests/data/xz-subset/apt-packages-sha256.xz").to_vec()
+            } else {
+                encoded(
+                    extension,
+                    b"Package: fixture
+Version: 1
+",
+                )
+            };
+            fs::write(&path, &valid)?;
+            assert_eq!(
+                validate_native_indexes(&status, std::slice::from_ref(&path))?.apt_packages,
+                1,
+                "{extension}"
+            );
+            fs::write(&path, encoded(extension, b""))?;
+            assert_eq!(
+                validate_native_indexes(&status, std::slice::from_ref(&path))?.apt_packages,
+                0,
+                "empty {extension}"
+            );
+            fs::write(
+                &path,
+                encoded(
+                    extension,
+                    b"Version: 1
+",
+                ),
+            )?;
+            assert!(
+                validate_native_indexes(&status, std::slice::from_ref(&path)).is_err(),
+                "corrupt stanza {extension}"
+            );
+            fs::write(&path, b"garbage")?;
+            assert!(
+                validate_native_indexes(&status, std::slice::from_ref(&path)).is_err(),
+                "garbage {extension}"
+            );
+            if !extension.is_empty() {
+                fs::write(&path, &valid[..valid.len() - 1])?;
+                assert!(
+                    validate_native_indexes(&status, std::slice::from_ref(&path)).is_err(),
+                    "missing footer {extension}"
+                );
+                let mut trailing = valid.clone();
+                trailing.extend_from_slice(b"garbage");
+                fs::write(&path, trailing)?;
+                assert!(
+                    validate_native_indexes(&status, std::slice::from_ref(&path)).is_err(),
+                    "trailing garbage {extension}"
+                );
+                fs::write(&path, &valid[..valid.len() / 2])?;
+                assert!(
+                    validate_native_indexes(&status, std::slice::from_ref(&path)).is_err(),
+                    "truncated {extension}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_index_validation_status_and_bounds() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let status = dir.path().join("status");
+        let path = dir.path().join("fixture_Packages");
+        fs::write(
+            &status,
+            "Package: fixture
+Status: install ok installed
+Version: 1
+Architecture: all
+",
+        )?;
+        fs::write(&path, "")?;
+        assert_eq!(
+            validate_native_indexes(&status, std::slice::from_ref(&path))?.installed_packages,
+            1
+        );
+        fs::write(&status, "garbage")?;
+        assert!(validate_native_indexes(&status, std::slice::from_ref(&path)).is_err());
+        fs::write(&status, "")?;
+        fs::write(
+            &path,
+            "Package: fixture
+",
+        )?;
+        assert!(
+            validate_native_indexes_bounded(&status, std::slice::from_ref(&path), 4, 100).is_err()
+        );
+        assert!(
+            validate_native_indexes_bounded(&status, std::slice::from_ref(&path), 100, 20).is_err()
+        );
+        let gzip = dir.path().join("bomb_Packages.gz");
+        fs::write(&gzip, encoded("gz", &vec![b' '; 4096]))?;
+        assert!(validate_native_indexes_bounded(&status, &[gzip], 100, 1000).is_err());
+        assert!(validate_native_indexes(&status, &[]).is_err());
+        assert!(validate_native_indexes(&status, &vec![path.clone(); 257]).is_err());
+        assert!(validate_native_indexes(&status, &[dir.path().join("bad_Packages.zst")]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_index_validation_unreadable_and_unsafe_files() -> Result<()> {
+        anyhow::ensure!(
+            !crate::core::is_root(),
+            "Permission regression requires an unprivileged test runner"
+        );
+        let dir = tempfile::tempdir()?;
+        let status = dir.path().join("status");
+        let path = dir.path().join("fixture_Packages");
+        fs::write(&status, "")?;
+        fs::write(&path, "")?;
+        for protected in [&status, &path] {
+            fs::set_permissions(protected, fs::Permissions::from_mode(0))?;
+            let result = validate_native_indexes(&status, std::slice::from_ref(&path));
+            fs::set_permissions(protected, fs::Permissions::from_mode(0o600))?;
+            assert!(result.is_err(), "unreadable {}", protected.display());
+        }
+        let link = dir.path().join("link_Packages");
+        symlink(&path, &link)?;
+        assert!(validate_native_indexes(&status, &[link]).is_err());
+        let fifo = dir.path().join("fifo_Packages");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        assert!(validate_native_indexes(&status, &[fifo]).is_err());
+        assert!(validate_native_indexes(&status, &[dir.path().to_path_buf()]).is_err());
+        fs::remove_file(&path)?;
+        assert!(validate_native_indexes(&status, &[path]).is_err());
+        Ok(())
     }
 }
