@@ -369,5 +369,42 @@ class PolicyTests(unittest.TestCase):
         self.assertIn('--inventory-tiers "hermetic,container"', workflow)
 
 
+    def test_index_admits_the_inventory_that_is_actually_shipped(self):
+        """The current cli_behavior_inventory.tsv must be admissible.
+
+        Admission computes sha256 over the inventory file and looks the digest
+        up in the index, so a policy that does not contain that digest rejects
+        every run. That is a silent-coverage failure: the sharding change and
+        a content change to the reviewed inventory can land together, drop the
+        old digest, and leave the harness unable to admit anything.
+        """
+        import hashlib
+
+        inventory = (ROOT / "tests" / "cli_behavior_inventory.tsv").read_bytes()
+        digest = hashlib.sha256(inventory).hexdigest()
+        index = json.loads(
+            (ROOT / "tests" / "qemu-inventory-policy.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            digest,
+            index["inventories"],
+            "the shipped inventory is not admissible by the shipped policy",
+        )
+
+    def test_every_indexed_digest_has_a_shard(self):
+        """A digest with no shard file would KeyError at admission time."""
+        policy = ROOT / "tests" / "qemu-inventory-policy.json"
+        shard_dir = policy.with_name(policy.stem + ".d")
+        index = json.loads(policy.read_text(encoding="utf-8"))
+        missing = [d for d in index["inventories"] if not (shard_dir / f"{d}.json").is_file()]
+        self.assertEqual(missing, [], "indexed digests without a shard file")
+
+    def test_index_digests_are_unique_lowercase_hex(self):
+        policy = ROOT / "tests" / "qemu-inventory-policy.json"
+        index = json.loads(policy.read_text(encoding="utf-8"))
+        for digest in index["inventories"]:
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+
 if __name__ == "__main__":
     unittest.main()
