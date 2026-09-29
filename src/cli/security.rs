@@ -740,7 +740,7 @@ fn require_audit_integrity(is_valid: bool) -> Result<()> {
 
 /// License categories for compliance
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LicenseCategory {
+pub(crate) enum LicenseCategory {
     Permissive,     // MIT, BSD, Apache
     Copyleft,       // GPL, LGPL, MPL
     StrongCopyleft, // AGPL
@@ -749,30 +749,16 @@ enum LicenseCategory {
 }
 
 impl LicenseCategory {
-    fn from_license(license: &str) -> Self {
-        let tokens = crate::core::security::policy::spdx_license_tokens(license);
-        let mut category = Self::Unknown;
-        for token in &tokens {
-            if token.contains("agpl") {
-                return Self::StrongCopyleft;
-            }
-            if token.contains("gpl") || token.contains("lgpl") || token.contains("mpl") {
-                category = Self::Copyleft;
-                continue;
-            }
-            if token_is_permissive(token) {
-                if category == Self::Unknown {
-                    category = Self::Permissive;
-                }
-                continue;
-            }
-            if (token.contains("proprietary") || token.contains("commercial"))
-                && category == Self::Unknown
-            {
-                category = Self::Proprietary;
-            }
+    pub(crate) fn from_license(license: &str) -> Self {
+        use crate::core::security::policy::{LicenseClassification, classify_license_expression};
+
+        match classify_license_expression(license) {
+            LicenseClassification::Permissive => Self::Permissive,
+            LicenseClassification::Copyleft => Self::Copyleft,
+            LicenseClassification::StrongCopyleft => Self::StrongCopyleft,
+            LicenseClassification::Proprietary => Self::Proprietary,
+            LicenseClassification::Unknown => Self::Unknown,
         }
-        category
     }
 
     fn color(&self) -> String {
@@ -784,14 +770,6 @@ impl LicenseCategory {
             Self::Unknown => style::dim("Unknown"),
         }
     }
-}
-
-fn token_is_permissive(token: &str) -> bool {
-    matches!(
-        token,
-        "mit" | "isc" | "unlicense" | "cc0" | "cc0-1.0" | "0bsd" | "bsd" | "apache"
-    ) || token.starts_with("bsd-")
-        || token.starts_with("apache-")
 }
 
 type LicenseRow = (String, String, String, LicenseCategory);
@@ -1774,6 +1752,51 @@ mod tests {
         assert_eq!(spreadsheet_safe_cell("=cmd()"), "'=cmd()");
         assert_eq!(spreadsheet_safe_cell("+1"), "'+1");
         assert_eq!(spreadsheet_safe_cell("normal"), "normal");
+    }
+
+    #[test]
+    fn audit_categories_and_serialized_rows_use_explicit_identifiers() {
+        let cases = [
+            ("GPL2", LicenseCategory::Copyleft, "Copyleft"),
+            ("GPL3", LicenseCategory::Copyleft, "Copyleft"),
+            ("LGPL2.1", LicenseCategory::Copyleft, "Copyleft"),
+            (
+                "AGPL-3.0-only",
+                LicenseCategory::StrongCopyleft,
+                "StrongCopyleft",
+            ),
+            ("MPL-2.0", LicenseCategory::Copyleft, "Copyleft"),
+            ("LicenseRef-GPL", LicenseCategory::Unknown, "Unknown"),
+            (
+                "DocumentRef-x:LicenseRef-AGPL",
+                LicenseCategory::Unknown,
+                "Unknown",
+            ),
+            (
+                "MIT WITH AGPL-3.0",
+                LicenseCategory::Permissive,
+                "Permissive",
+            ),
+            ("MIT OR GPL2", LicenseCategory::Copyleft, "Copyleft"),
+            (
+                "MIT AND AGPL-3.0",
+                LicenseCategory::StrongCopyleft,
+                "StrongCopyleft",
+            ),
+            ("Apache-2.0", LicenseCategory::Permissive, "Permissive"),
+            ("Proprietary", LicenseCategory::Proprietary, "Proprietary"),
+            ("LIMITED", LicenseCategory::Unknown, "Unknown"),
+        ];
+        for (license, expected, label) in cases {
+            let category = LicenseCategory::from_license(license);
+            assert_eq!(category, expected, "{license}");
+            let rows = vec![("fixture".into(), license.into(), "1.0".into(), category)];
+            let encoded = serialize_license_rows("json", &rows).expect("audit JSON");
+            let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(value[0]["name"], "fixture");
+            assert_eq!(value[0]["license"], license);
+            assert_eq!(value[0]["category"], label);
+        }
     }
 
     #[test]

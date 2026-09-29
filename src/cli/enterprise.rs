@@ -433,6 +433,22 @@ struct LicenseViolation {
     reason: String,
 }
 
+/// Advisory review reasons shared with audit; this is not legal approval.
+#[cfg(feature = "arch")]
+fn enterprise_license_review_reason(license: &str) -> Option<&'static str> {
+    use crate::cli::security::LicenseCategory;
+
+    match LicenseCategory::from_license(license) {
+        LicenseCategory::StrongCopyleft => {
+            Some("Strong copyleft license (AGPL) requires legal review")
+        }
+        LicenseCategory::Copyleft => Some("Copyleft license requires legal review"),
+        LicenseCategory::Permissive | LicenseCategory::Proprietary | LicenseCategory::Unknown => {
+            None
+        }
+    }
+}
+
 fn perform_license_scan() -> Result<LicenseScan> {
     #[cfg(not(feature = "arch"))]
     anyhow::bail!("Enterprise license scan requires the Arch package backend");
@@ -451,11 +467,11 @@ fn perform_license_scan() -> Result<LicenseScan> {
             } else {
                 for lic in &pkg.licenses {
                     *by_license.entry(lic.clone()).or_insert(0) += 1;
-                    if lic.to_uppercase().contains("GPL") {
+                    if let Some(reason) = enterprise_license_review_reason(lic) {
                         violations.push(LicenseViolation {
                             package: pkg.name.clone(),
                             license: lic.clone(),
-                            reason: "Copyleft license (GPL) requires legal review".to_string(),
+                            reason: reason.to_string(),
                         });
                     }
                 }
@@ -544,6 +560,45 @@ mod tests {
         };
         let licenses = generate_license_csv(&scan).expect("license CSV");
         assert!(licenses.contains("\"'=HYPERLINK(\"\"https://example.com\"\")\",1"));
+    }
+
+    #[test]
+    #[cfg(feature = "arch")]
+    fn enterprise_review_reasons_and_serialized_violations_are_exact() {
+        let copyleft = Some("Copyleft license requires legal review");
+        let strong = Some("Strong copyleft license (AGPL) requires legal review");
+        let cases = [
+            ("GPL2", copyleft),
+            ("GPL3", copyleft),
+            ("LGPL2.1", copyleft),
+            ("AGPL-3.0-only", strong),
+            ("MPL-2.0", copyleft),
+            ("LicenseRef-GPL", None),
+            ("DocumentRef-x:LicenseRef-AGPL", None),
+            ("MIT WITH AGPL-3.0", None),
+            ("MIT OR GPL2", copyleft),
+            ("MIT AND AGPL-3.0", strong),
+            ("Apache-2.0", None),
+            ("Proprietary", None),
+            ("LIMITED", None),
+        ];
+        for (license, expected) in cases {
+            let reason = enterprise_license_review_reason(license);
+            assert_eq!(reason, expected, "{license}");
+            if let Some(reason) = reason {
+                let violation = LicenseViolation {
+                    package: "fixture".into(),
+                    license: license.into(),
+                    reason: reason.into(),
+                };
+                assert_eq!(
+                    serde_json::to_value(violation).unwrap(),
+                    serde_json::json!({
+                        "package": "fixture", "license": license, "reason": expected.unwrap()
+                    })
+                );
+            }
+        }
     }
 
     #[test]
