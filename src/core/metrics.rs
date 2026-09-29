@@ -3,25 +3,78 @@
 //! Provides atomic counters and gauges for monitoring system health and security.
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 /// Trailing window, in milliseconds, used by the health-oriented failure
 /// count. Failures older than this are forgotten, so a long-lived daemon is
 /// not latched unhealthy by its lifetime error history.
 pub const FAILURE_HEALTH_WINDOW_MS: u64 = 300_000;
 
-/// Sentinel meaning "no failure window has been opened yet". It is larger than
-/// any realistic epoch-millisecond value, and is checked explicitly rather
-/// than relying on wrapping arithmetic.
-const FAILURE_WINDOW_UNSET: u64 = u64::MAX;
-
-/// Wall-clock milliseconds since the Unix epoch, saturating at 0 if the system
-/// clock is set before 1970.
+/// Milliseconds elapsed on a process-local monotonic clock. Wall-clock
+/// corrections cannot prematurely clear a recent failure storm.
 fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// One entry per occupied millisecond, not per request. After pruning there
+/// are at most FAILURE_HEALTH_WINDOW_MS entries, regardless of request rate.
+/// The mutex serializes pruning, recording and reading as one operation.
+struct FailureWindow {
+    buckets: VecDeque<(u64, u64)>,
+    total: u128,
+    last_ms: u64,
+}
+
+impl FailureWindow {
+    const fn new() -> Self {
+        Self {
+            buckets: VecDeque::new(),
+            total: 0,
+            last_ms: 0,
+        }
+    }
+
+    fn advance(&mut self, now_ms: u64) -> u64 {
+        // Clamp backwards or out-of-order samples to the last observed time.
+        // Expired history is never resurrected; a late recorder is counted at
+        // its serialization time. Production samples use a monotonic clock.
+        let now_ms = now_ms.max(self.last_ms);
+        self.last_ms = now_ms;
+        while let Some(&(timestamp, count)) = self.buckets.front() {
+            if now_ms - timestamp < FAILURE_HEALTH_WINDOW_MS {
+                break;
+            }
+            self.buckets.pop_front();
+            self.total -= u128::from(count);
+        }
+        now_ms
+    }
+
+    fn record(&mut self, now_ms: u64) {
+        let now_ms = self.advance(now_ms);
+        if let Some((timestamp, count)) = self.buckets.back_mut()
+            && *timestamp == now_ms
+        {
+            // Saturate only this millisecond's bucket. Keep the wider total
+            // exact so expiry still subtracts the correct recorded count.
+            if *count < u64::MAX {
+                *count += 1;
+                self.total += 1;
+            }
+            return;
+        }
+        self.buckets.push_back((now_ms, 1));
+        self.total += 1;
+    }
+
+    fn count(&mut self, now_ms: u64) -> u64 {
+        self.advance(now_ms);
+        u64::try_from(self.total).unwrap_or(u64::MAX)
+    }
 }
 
 /// Snapshot of current metrics state
@@ -42,7 +95,7 @@ pub struct MetricsSnapshot {
     pub status_requests: u64,
 }
 
-/// Global metrics registry using atomics for high performance
+/// Global metrics registry with atomic lifetime counters and a locked health window
 pub struct Metrics {
     requests_total: AtomicU64,
     requests_failed: AtomicU64,
@@ -57,11 +110,7 @@ pub struct Metrics {
     search_requests: AtomicU64,
     info_requests: AtomicU64,
     status_requests: AtomicU64,
-    /// Start of the current trailing failure window; `FAILURE_WINDOW_UNSET`
-    /// until the first failure is recorded.
-    failures_window_start_ms: AtomicU64,
-    /// Failures recorded inside the current trailing window.
-    failures_in_window: AtomicU64,
+    failure_window: Mutex<FailureWindow>,
 }
 
 impl Default for Metrics {
@@ -86,8 +135,7 @@ impl Metrics {
             search_requests: AtomicU64::new(0),
             info_requests: AtomicU64::new(0),
             status_requests: AtomicU64::new(0),
-            failures_window_start_ms: AtomicU64::new(FAILURE_WINDOW_UNSET),
-            failures_in_window: AtomicU64::new(0),
+            failure_window: Mutex::new(FailureWindow::new()),
         }
     }
 
@@ -100,31 +148,23 @@ impl Metrics {
         self.record_request_failure_at(now_millis());
     }
 
-    /// Records a failed request at an explicit epoch-millisecond timestamp.
-    /// Split out from [`Metrics::inc_requests_failed`] so the trailing-window
-    /// behaviour can be exercised deterministically without sleeping.
+    /// Records a failed request at an explicit monotonic millisecond timestamp.
+    /// Split out for deterministic tests; backwards samples are clamped to the
+    /// last observed timestamp under the same lock as expiry and insertion.
     pub(crate) fn record_request_failure_at(&self, now_ms: u64) {
-        let start = self.failures_window_start_ms.load(Ordering::Relaxed);
-        if start != FAILURE_WINDOW_UNSET && now_ms.wrapping_sub(start) < FAILURE_HEALTH_WINDOW_MS {
-            self.failures_in_window.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        // Window unopened or expired: open a fresh one. Concurrent recorders
-        // can both land here; the resulting count is approximate, which is
-        // acceptable for a health heuristic and never latches permanently.
-        self.failures_window_start_ms
-            .store(now_ms, Ordering::Relaxed);
-        self.failures_in_window.store(1, Ordering::Relaxed);
+        self.failure_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(now_ms);
     }
 
-    /// Failed requests recorded within the trailing
-    /// [`FAILURE_HEALTH_WINDOW_MS`] window ending at `now_ms`.
+    /// Failed requests with age strictly less than
+    /// [`FAILURE_HEALTH_WINDOW_MS`]. Exactly-boundary failures have expired.
     pub(crate) fn request_failures_within_window(&self, now_ms: u64) -> u64 {
-        let start = self.failures_window_start_ms.load(Ordering::Relaxed);
-        if start == FAILURE_WINDOW_UNSET || now_ms.wrapping_sub(start) >= FAILURE_HEALTH_WINDOW_MS {
-            return 0;
-        }
-        self.failures_in_window.load(Ordering::Relaxed)
+        self.failure_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .count(now_ms)
     }
 
     /// Failed requests inside the trailing window as of now. Unlike the
@@ -305,5 +345,131 @@ mod tests {
         assert_eq!(metrics.request_failures_within_window(0), 0);
         metrics.record_request_failure_at(0);
         assert_eq!(metrics.request_failures_within_window(0), 1);
+    }
+    #[test]
+    fn recent_burst_survives_first_failure_boundary() {
+        let metrics = Metrics::new();
+        metrics.record_request_failure_at(1_000_000);
+        for _ in 0..1001 {
+            metrics.record_request_failure_at(1_299_999);
+        }
+        assert_eq!(metrics.request_failures_within_window(1_300_000), 1001);
+        assert_eq!(metrics.request_failures_within_window(1_599_998), 1001);
+        assert_eq!(metrics.request_failures_within_window(1_599_999), 0);
+    }
+
+    #[test]
+    fn exact_boundary_expires_only_the_oldest_millisecond() {
+        let metrics = Metrics::new();
+        metrics.record_request_failure_at(0);
+        metrics.record_request_failure_at(1);
+        assert_eq!(
+            metrics.request_failures_within_window(FAILURE_HEALTH_WINDOW_MS - 1),
+            2
+        );
+        assert_eq!(
+            metrics.request_failures_within_window(FAILURE_HEALTH_WINDOW_MS),
+            1
+        );
+        assert_eq!(
+            metrics.request_failures_within_window(FAILURE_HEALTH_WINDOW_MS + 1),
+            0
+        );
+    }
+
+    #[test]
+    fn backwards_timestamps_do_not_clear_or_resurrect_failures() {
+        let metrics = Metrics::new();
+        metrics.record_request_failure_at(100);
+        assert_eq!(metrics.request_failures_within_window(99), 1);
+        metrics.record_request_failure_at(98);
+        assert_eq!(metrics.request_failures_within_window(100), 2);
+        assert_eq!(
+            metrics.request_failures_within_window(100 + FAILURE_HEALTH_WINDOW_MS),
+            0
+        );
+        assert_eq!(metrics.request_failures_within_window(100), 0);
+        metrics.record_request_failure_at(100);
+        assert_eq!(
+            metrics.request_failures_within_window(100 + FAILURE_HEALTH_WINDOW_MS),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_recorders_and_readers_do_not_lose_boundary_updates() {
+        use std::sync::{Arc, Barrier};
+        let metrics = Metrics::new();
+        metrics.record_request_failure_at(0);
+        for timestamp in [1, FAILURE_HEALTH_WINDOW_MS, 2 * FAILURE_HEALTH_WINDOW_MS] {
+            let barrier = Arc::new(Barrier::new(9));
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let barrier = Arc::clone(&barrier);
+                    let metrics = &metrics;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..1000 {
+                            metrics.record_request_failure_at(timestamp);
+                            assert!(metrics.request_failures_within_window(timestamp) > 0);
+                        }
+                    });
+                }
+                barrier.wait();
+            });
+            let expected = if timestamp == 1 {
+                8001
+            } else if timestamp == FAILURE_HEALTH_WINDOW_MS {
+                16000
+            } else {
+                8000
+            };
+            assert_eq!(metrics.request_failures_within_window(timestamp), expected);
+        }
+    }
+
+    #[test]
+    fn storage_is_bounded_and_same_millisecond_bursts_are_coalesced() {
+        let metrics = Metrics::new();
+        for timestamp in 0..=FAILURE_HEALTH_WINDOW_MS {
+            metrics.record_request_failure_at(timestamp);
+        }
+        for _ in 0..10000 {
+            metrics.record_request_failure_at(FAILURE_HEALTH_WINDOW_MS);
+        }
+        assert_eq!(
+            metrics.request_failures_within_window(FAILURE_HEALTH_WINDOW_MS),
+            FAILURE_HEALTH_WINDOW_MS + 10000
+        );
+        {
+            let window = metrics.failure_window.lock().unwrap();
+            assert_eq!(window.buckets.len(), FAILURE_HEALTH_WINDOW_MS as usize);
+            assert_eq!(
+                window.buckets.back(),
+                Some(&(FAILURE_HEALTH_WINDOW_MS, 10001))
+            );
+        }
+        assert_eq!(
+            metrics.request_failures_within_window(2 * FAILURE_HEALTH_WINDOW_MS),
+            0
+        );
+        assert!(metrics.failure_window.lock().unwrap().buckets.is_empty());
+    }
+
+    #[test]
+    fn saturated_bucket_expires_without_corrupting_other_counts() {
+        let metrics = Metrics::new();
+        {
+            let mut window = metrics.failure_window.lock().unwrap();
+            window.buckets.push_back((0, u64::MAX));
+            window.total = u128::from(u64::MAX);
+        }
+        metrics.record_request_failure_at(0);
+        metrics.record_request_failure_at(1);
+        assert_eq!(metrics.request_failures_within_window(1), u64::MAX);
+        assert_eq!(
+            metrics.request_failures_within_window(FAILURE_HEALTH_WINDOW_MS),
+            1
+        );
     }
 }

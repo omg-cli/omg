@@ -1824,6 +1824,27 @@ mod tests {
     }
 
     #[test]
+    fn health_keeps_recent_burst_unhealthy_across_oldest_failure_expiry() {
+        use crate::core::metrics::{FAILURE_HEALTH_WINDOW_MS, Metrics};
+        let metrics = Metrics::new();
+        metrics.record_request_failure_at(1_000_000);
+        for _ in 0..=HEALTH_UNHEALTHY_FAILURES_THRESHOLD {
+            metrics.record_request_failure_at(1_299_999);
+        }
+        assert_eq!(
+            health_status(0, metrics.request_failures_within_window(1_300_000)),
+            "unhealthy"
+        );
+        assert_eq!(
+            health_status(
+                0,
+                metrics.request_failures_within_window(1_299_999 + FAILURE_HEALTH_WINDOW_MS)
+            ),
+            "healthy"
+        );
+    }
+
+    #[test]
     fn windowed_failures_decide_health_not_lifetime_totals() {
         use crate::core::metrics::{FAILURE_HEALTH_WINDOW_MS, Metrics};
 
