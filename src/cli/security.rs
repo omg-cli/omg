@@ -521,18 +521,28 @@ pub fn show_policy(_ctx: &CliContext) -> Result<()> {
         }
     }
 
-    if !policy.allowed_licenses.is_empty() {
-        println!(
-            "\n  {} Allowed Licenses:",
-            style::maybe_color("ℹ", |t| t.blue().to_string())
-        );
-        for lic in &policy.allowed_licenses {
+    match &policy.allowed_licenses {
+        Some(allowed) if !allowed.is_empty() => {
             println!(
-                "    {} {}",
-                style::maybe_color("•", |t| t.green().to_string()),
-                lic
+                "\n  {} Allowed Licenses:",
+                style::maybe_color("ℹ", |t| t.blue().to_string())
+            );
+            for lic in allowed {
+                println!(
+                    "    {} {}",
+                    style::maybe_color("•", |t| t.green().to_string()),
+                    lic
+                );
+            }
+        }
+        // An explicitly empty allowlist is a deny-all policy, not an absent one.
+        Some(_) => {
+            println!(
+                "\n  {} Allowed Licenses: none (every license is rejected)",
+                style::maybe_color("⚠", |t| t.yellow().to_string())
             );
         }
+        None => {}
     }
 
     println!(
@@ -1039,12 +1049,9 @@ fn license_policy_violations(
         let expression = crate::core::security::policy::combined_license_expression(
             license.split(',').map(str::trim),
         );
-        if !policy.allowed_licenses.is_empty()
+        if let Some(allowed) = &policy.allowed_licenses
             && !expression.as_deref().is_some_and(|expression| {
-                crate::core::security::policy::license_matches_allowlist(
-                    expression,
-                    &policy.allowed_licenses,
-                )
+                crate::core::security::policy::license_matches_allowlist(expression, allowed)
             })
         {
             violations.push((name.clone(), license.clone(), "Not in allowed list"));
@@ -1682,12 +1689,31 @@ mod tests {
             ),
         ];
         let policy = SecurityPolicy {
-            allowed_licenses: vec!["MIT".to_string()],
+            allowed_licenses: Some(vec!["MIT".to_string()]),
             ..SecurityPolicy::default()
         };
         let violations = license_policy_violations(&packages, &policy);
         assert!(violations.iter().any(|(name, _, _)| name == "hidden"));
         assert!(enforce_license_policy(&violations).is_err());
+    }
+
+    #[test]
+    fn empty_license_allowlist_is_a_deny_all_policy_but_an_absent_one_is_not() {
+        let packages = vec![("any".to_string(), "MIT".to_string(), "1.0".to_string())];
+        let denied = SecurityPolicy {
+            allowed_licenses: Some(Vec::new()),
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            license_policy_violations(&packages, &denied).len(),
+            1,
+            "an explicit empty allowlist must flag every package"
+        );
+        let unrestricted = SecurityPolicy::default();
+        assert!(
+            license_policy_violations(&packages, &unrestricted).is_empty(),
+            "a policy without an allowlist must not flag anything"
+        );
     }
 
     #[test]
@@ -1698,7 +1724,7 @@ mod tests {
             "1.0".to_string(),
         )];
         let policy = SecurityPolicy {
-            allowed_licenses: vec!["AGPL-3.0".to_string()],
+            allowed_licenses: Some(vec!["AGPL-3.0".to_string()]),
             ..SecurityPolicy::default()
         };
         assert!(license_policy_violations(&packages, &policy).is_empty());
@@ -1712,7 +1738,7 @@ mod tests {
             "1.0".to_string(),
         )];
         let policy = SecurityPolicy {
-            allowed_licenses: vec!["MIT".to_string()],
+            allowed_licenses: Some(vec!["MIT".to_string()]),
             ..SecurityPolicy::default()
         };
 

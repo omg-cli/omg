@@ -93,7 +93,8 @@ minimum_grade = "Community"
 # minimum_grade = "Verified"
 # allow_aur = true
 # require_pgp = false
-# allowed_licenses = []  # Allow all licenses
+# allowed_licenses = ["MIT", "Apache-2.0", "GPL-3.0"]  # Allow only these
+# (omit allowed_licenses entirely to allow all licenses; an empty list allows none)
 # banned_packages = ["cpuminer", "xmrig"]  # Block miners
 
 # --- Open Source Project (Permissive) ---
@@ -102,7 +103,7 @@ minimum_grade = "Community"
 # minimum_grade = "Community"
 # allow_aur = true
 # require_pgp = false
-# allowed_licenses = []
+# (omit allowed_licenses entirely to allow all licenses; an empty list allows none)
 # banned_packages = []
 
 # --- CI/CD Pipeline (Security-First) ---
@@ -151,7 +152,8 @@ minimum_grade = "Community"
 # 1. Before installation, OMG assigns a security grade to each package
 # 2. If grade < minimum_grade, installation is blocked
 # 3. If package is in banned_packages, installation is blocked
-# 4. If license not in allowed_licenses (and list is non-empty), blocked
+# 4. If allowed_licenses is present, a license not in the list is blocked
+#    (an empty list therefore blocks every license; omit the key to skip this check)
 # 5. If AUR package and allow_aur=false, installation is blocked
 # 6. If unsigned package and require_pgp=true, installation is blocked
 #

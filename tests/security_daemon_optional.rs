@@ -18,7 +18,7 @@ fn audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_i
         minimum_grade: SecurityGrade::Verified,
         allow_aur: false,
         require_pgp: true,
-        allowed_licenses: vec!["MIT".to_owned()],
+        allowed_licenses: Some(vec!["MIT".to_owned()]),
         banned_packages: vec!["fixture-banned-package".to_owned()],
     };
     let original = toml::to_string(&policy)?;

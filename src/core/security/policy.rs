@@ -109,8 +109,10 @@ pub struct SecurityPolicy {
     pub allow_aur: bool,
     #[serde(default)]
     pub require_pgp: bool,
-    #[serde(default)]
-    pub allowed_licenses: Vec<String>,
+    /// `None` (key absent) means no license policy: every license is allowed.
+    /// `Some(vec![])` (key present but empty) permits no license at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_licenses: Option<Vec<String>>,
     #[serde(default)]
     pub banned_packages: Vec<String>,
 }
@@ -129,7 +131,7 @@ impl Default for SecurityPolicy {
             minimum_grade: SecurityGrade::Community,
             allow_aur: true,
             require_pgp: false,
-            allowed_licenses: Vec::new(),
+            allowed_licenses: None,
             banned_packages: Vec::new(),
         }
     }
@@ -320,9 +322,9 @@ impl SecurityPolicy {
             });
         }
 
-        if !self.allowed_licenses.is_empty() {
+        if let Some(allowed) = &self.allowed_licenses {
             match license {
-                Some(lic) if license_matches_allowlist(lic, &self.allowed_licenses) => {}
+                Some(lic) if license_matches_allowlist(lic, allowed) => {}
                 Some(lic) => {
                     return Err(PolicyError::LicenseNotAllowed {
                         name: name.to_string(),
@@ -610,7 +612,7 @@ mod tests {
     #[test]
     fn separate_license_entries_preserve_all_obligations_and_group_alternatives() {
         let policy = SecurityPolicy {
-            allowed_licenses: vec!["MIT".into()],
+            allowed_licenses: Some(vec!["MIT".into()]),
             ..SecurityPolicy::default()
         };
         let licenses = combined_license_expression(["MIT", "GPL-3.0"]);
@@ -729,7 +731,7 @@ mod tests {
             minimum_grade: SecurityGrade::Verified,
             allow_aur: false,
             require_pgp: true,
-            allowed_licenses: vec!["MIT".to_string()],
+            allowed_licenses: Some(vec!["MIT".to_string()]),
             banned_packages: vec!["banned".to_string()],
         };
         fs::write(&path, toml::to_string(&policy).expect("serialize policy"))
@@ -744,6 +746,98 @@ mod tests {
             policy
         );
         assert!(serde_json::from_str::<SecurityPolicy>(r#"{"verify_slsa":true}"#).is_err());
+    }
+
+    #[test]
+    fn absent_license_key_keeps_licensing_unrestricted() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let path = temp.path().join("policy.toml");
+        fs::write(&path, "minimum_grade = \"Community\"\n").expect("write policy");
+        let policy = SecurityPolicy::load_optional(&path).expect("load policy");
+        assert_eq!(
+            policy.allowed_licenses, None,
+            "an absent allowed_licenses key must not become a deny-all allowlist"
+        );
+        assert!(
+            policy
+                .check_package("foo", false, Some("GPL-3.0"), SecurityGrade::Verified)
+                .is_ok(),
+            "an operator who wrote no license policy must not get license enforcement"
+        );
+        assert!(
+            policy
+                .check_package("foo", false, None, SecurityGrade::Verified)
+                .is_ok(),
+            "an unknown license must stay allowed when no allowlist is configured"
+        );
+    }
+
+    #[test]
+    fn explicitly_empty_license_allowlist_permits_no_license() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let path = temp.path().join("policy.toml");
+        fs::write(&path, "allowed_licenses = []\n").expect("write policy");
+        let policy = SecurityPolicy::load_optional(&path).expect("load policy");
+        assert_eq!(policy.allowed_licenses, Some(Vec::new()));
+        let err = policy
+            .check_package("foo", false, Some("MIT"), SecurityGrade::Verified)
+            .expect_err("an explicit empty allowlist must not be treated as unrestricted");
+        assert!(
+            matches!(err, PolicyError::LicenseNotAllowed { .. }),
+            "empty allowlist violations must be typed, got: {err}"
+        );
+        let err = policy
+            .check_package("foo", false, None, SecurityGrade::Verified)
+            .expect_err("an unknown license cannot satisfy an empty allowlist");
+        assert!(
+            matches!(err, PolicyError::LicenseUnknown { .. }),
+            "empty allowlist unknown-license failures must be typed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn populated_license_allowlist_still_allows_only_listed_licenses() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let path = temp.path().join("policy.toml");
+        fs::write(&path, "allowed_licenses = [\"MIT\"]\n").expect("write policy");
+        let policy = SecurityPolicy::load_optional(&path).expect("load policy");
+        assert_eq!(policy.allowed_licenses, Some(vec!["MIT".to_string()]));
+        assert!(
+            policy
+                .check_package("foo", false, Some("MIT"), SecurityGrade::Verified)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check_package("foo", false, Some("GPL-3.0"), SecurityGrade::Verified)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn policy_without_license_key_roundtrips_through_file_and_elevation_payload() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let path = temp.path().join("policy.toml");
+        let policy = SecurityPolicy {
+            minimum_grade: SecurityGrade::Verified,
+            allow_aur: false,
+            ..SecurityPolicy::default()
+        };
+        let serialized = toml::to_string(&policy).expect("serialize policy");
+        assert!(
+            !serialized.contains("allowed_licenses"),
+            "an unset allowlist must be omitted, not written as an empty one: {serialized}"
+        );
+        fs::write(&path, &serialized).expect("write policy");
+        assert_eq!(
+            SecurityPolicy::load_optional(&path).expect("load policy"),
+            policy
+        );
+        let payload = serde_json::to_vec(&policy).expect("serialize elevation policy");
+        assert_eq!(
+            serde_json::from_slice::<SecurityPolicy>(&payload).expect("read elevation policy"),
+            policy
+        );
     }
 
     #[test]
@@ -847,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn prepared_plan_checks_dependencies_and_actual_licenses() {
         let mut policy = SecurityPolicy {
-            allowed_licenses: vec!["MIT".to_owned()],
+            allowed_licenses: Some(vec!["MIT".to_owned()]),
             ..SecurityPolicy::default()
         };
         let package = |name: &str, license: &str| {
@@ -1012,7 +1106,7 @@ mod tests {
     #[test]
     fn allowed_license_matches_spdx_tokens_not_substrings() {
         let policy = SecurityPolicy {
-            allowed_licenses: vec!["MIT".to_string()],
+            allowed_licenses: Some(vec!["MIT".to_string()]),
             ..SecurityPolicy::default()
         };
         let err = policy
@@ -1037,7 +1131,7 @@ mod tests {
     #[test]
     fn compound_spdx_and_requires_all_operands_allowed() {
         let mit_only = SecurityPolicy {
-            allowed_licenses: vec!["MIT".to_string()],
+            allowed_licenses: Some(vec!["MIT".to_string()]),
             ..SecurityPolicy::default()
         };
         // One allowed token must not satisfy an AND expression.
@@ -1055,7 +1149,10 @@ mod tests {
         );
 
         let both = SecurityPolicy {
-            allowed_licenses: vec!["MIT".to_string(), "GPL-3.0".to_string()],
+            allowed_licenses: Some(vec![
+                "MIT".to_string(),
+                "GPL-3.0".to_string(),
+            ]),
             ..SecurityPolicy::default()
         };
         assert!(

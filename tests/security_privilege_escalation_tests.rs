@@ -1833,7 +1833,7 @@ mod attack_scenarios {
             minimum_grade: SecurityGrade::Verified,
             allow_aur: false,
             require_pgp: true,
-            allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
+            allowed_licenses: Some(vec!["MIT".to_string(), "Apache-2.0".to_string()]),
             banned_packages: vec!["telnet".to_string(), "ftp".to_string()],
         };
 

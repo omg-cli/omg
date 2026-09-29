@@ -273,7 +273,7 @@ impl PackageService {
             // UpdateInfo has no licenses. Enforce those using the actual
             // prepared packages in the privileged backend, including dependencies.
             let mut candidate_policy = self.policy.clone();
-            candidate_policy.allowed_licenses.clear();
+            candidate_policy.allowed_licenses = None;
             candidate_policy.check_package(&up.name, community, None, grade)?;
 
             changes.push(PackageChange {
