@@ -170,15 +170,36 @@ fn test_dry_run_missing_package_fails_with_reason() {
 
 #[test]
 fn test_install_missing_packages_fails_without_corrupting_state() {
-    let result = run_omg(&["install", "-y", "fake-package-xyz", "fake-pkg-2"]);
+    // Make the lookup deterministic instead of depending on live AUR RPC.
+    // Measured: with the network reachable the CLI reports "Package not found
+    // in official repos"; with a refused proxy it reports "AUR RPC transport
+    // failed". Both are correct behaviour for a package that does not exist,
+    // but only the first contains "not found", so this assertion passed or
+    // failed with the runner's network state. run_omg_with_home panics on
+    // release binaries precisely because these are meant to be hermetic, and
+    // nothing here was enforcing it.
+    const REFUSED: &str = "http://127.0.0.1:1";
+    let result = run_omg_with_env(
+        &["install", "-y", "fake-package-xyz", "fake-pkg-2"],
+        &[
+            ("HTTPS_PROXY", REFUSED),
+            ("HTTP_PROXY", REFUSED),
+            ("ALL_PROXY", REFUSED),
+        ],
+    );
     let combined = result.combined_output();
     assert!(
-        !result.success && combined.contains("not found"),
-        "installing missing packages must fail with an explicit error: {combined}"
+        !result.success,
+        "installing missing packages must fail: {combined}"
+    );
+    assert!(
+        combined.contains("transport failed") || combined.contains("not found"),
+        "the failure must say the lookup could not be satisfied, got: {combined}"
     );
 
     // The failed transaction must not poison subsequent operations: a dry run
-    // of an existing package still succeeds afterwards.
+    // of an existing package still succeeds afterwards. This needs no network,
+    // so it is left to run against whatever the runner has.
     let recovery = run_omg(&["install", "--dry-run", "firefox"]);
     assert!(
         recovery.success,
