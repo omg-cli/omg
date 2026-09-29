@@ -306,12 +306,7 @@ impl HomebrewPackageManager {
     #[must_use]
     pub fn new() -> Self {
         let prefix = Self::detect_prefix();
-        let repository = if prefix == Path::new(HOMEBREW_PREFIX_INTEL) {
-            prefix.join("Homebrew")
-        } else {
-            prefix.clone()
-        };
-        let cellar = Self::select_cellar(&prefix, &repository);
+        let cellar = Self::select_cellar(&prefix);
 
         Self {
             prefix,
@@ -344,16 +339,16 @@ impl HomebrewPackageManager {
         self.prefix.join("bin").join("brew")
     }
 
-    /// Match Homebrew's Cellar selection: an existing repository Cellar takes
-    /// precedence, otherwise the prefix Cellar is the inventory location.
+    /// Match Homebrew's Cellar selection: `brew --cellar` reports
+    /// `$HOMEBREW_PREFIX/Cellar` on every architecture, so the prefix Cellar
+    /// is the inventory location. On Intel the Homebrew git checkout lives at
+    /// `/usr/local/Homebrew`, which is a source checkout and not a bottle
+    /// location; preferring `<repository>/Cellar` there made the backend read
+    /// an inventory that `brew --cellar` never reports, which `omg doctor`
+    /// then reports as a Cellar mismatch on a healthy Intel machine.
     /// A missing prefix Cellar remains selected before any formula is installed.
-    fn select_cellar(prefix: &Path, repository: &Path) -> PathBuf {
-        let repository_cellar = repository.join(CELLAR_DIR);
-        if repository_cellar.is_dir() {
-            repository_cellar
-        } else {
-            prefix.join(CELLAR_DIR)
-        }
+    fn select_cellar(prefix: &Path) -> PathBuf {
+        prefix.join(CELLAR_DIR)
     }
 
     /// Detect Homebrew installation prefix
@@ -1375,21 +1370,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_cellar_is_the_inventory_the_backend_reads() -> Result<()> {
+    async fn prefix_cellar_is_the_inventory_the_backend_reads() -> Result<()> {
         let root = tempfile::tempdir()?;
         let prefix = root.path().join("prefix");
-        let repository = prefix.join("Homebrew");
-        let repository_cellar = repository.join(CELLAR_DIR);
         let prefix_cellar = prefix.join(CELLAR_DIR);
         assert_eq!(
-            HomebrewPackageManager::select_cellar(&prefix, &repository),
+            HomebrewPackageManager::select_cellar(&prefix),
             prefix_cellar,
-            "Homebrew selects the prefix even before either Cellar exists"
+            "the prefix Cellar is selected before any formula is installed"
         );
-        std::fs::create_dir_all(repository_cellar.join("wget/1.0"))?;
+        std::fs::create_dir_all(prefix_cellar.join("wget/1.0"))?;
 
-        let selected = HomebrewPackageManager::select_cellar(&prefix, &repository);
-        assert_eq!(selected, repository_cellar);
+        let selected = HomebrewPackageManager::select_cellar(&prefix);
+        assert_eq!(selected, prefix_cellar);
         let manager = HomebrewPackageManager {
             prefix: prefix.clone(),
             cellar: selected,
@@ -1401,17 +1394,16 @@ mod tests {
         assert_eq!(installed[0].name, "wget");
         assert_eq!(installed[0].version, "1.0");
 
-        std::fs::create_dir_all(prefix_cellar.join("curl/2.0"))?;
+        // An Intel-style Homebrew git checkout at `<prefix>/Homebrew` is a
+        // source tree, not a bottle location. `brew --cellar` still reports
+        // `$HOMEBREW_PREFIX/Cellar`, so the backend must keep reading the
+        // prefix even when a repository Cellar exists alongside it.
+        let repository_cellar = prefix.join("Homebrew").join(CELLAR_DIR);
+        std::fs::create_dir_all(repository_cellar.join("curl/2.0"))?;
         assert_eq!(
-            HomebrewPackageManager::select_cellar(&prefix, &repository),
-            repository_cellar,
-            "Homebrew prefers the repository Cellar even if the prefix Cellar exists"
-        );
-        std::fs::remove_dir_all(&repository_cellar)?;
-        assert_eq!(
-            HomebrewPackageManager::select_cellar(&prefix, &repository),
+            HomebrewPackageManager::select_cellar(&prefix),
             prefix_cellar,
-            "Homebrew falls back to the prefix when the repository Cellar is absent"
+            "the prefix Cellar stays selected even when a repository Cellar exists"
         );
         Ok(())
     }
