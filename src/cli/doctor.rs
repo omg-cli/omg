@@ -24,6 +24,21 @@ const GENERIC_MIRROR_ENDPOINTS: &[(&str, &str)] = &[
 const ARCH_DNS_HOSTS: &[&str] = &["archlinux.org", "aur.archlinux.org", "github.com"];
 const GENERIC_DNS_HOSTS: &[&str] = &["kernel.org", "github.com"];
 
+const HOMEBREW_MIRROR_ENDPOINTS: &[(&str, &str)] = &[
+    (
+        "Homebrew formula API",
+        "https://formulae.brew.sh/api/formula.json",
+    ),
+    (
+        "Homebrew cask API",
+        "https://formulae.brew.sh/api/cask.json",
+    ),
+    ("GitHub", "https://github.com"),
+];
+const HOMEBREW_DNS_HOSTS: &[&str] = &["formulae.brew.sh", "github.com"];
+#[cfg(any(feature = "macos", target_os = "macos"))]
+const HOMEBREW_API_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
 fn mirror_status_is_issue(status: reqwest::StatusCode) -> bool {
     !status.is_success() && !status.is_redirection()
 }
@@ -108,26 +123,34 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
             &mut warnings,
         );
     }
+    #[cfg(any(feature = "macos", target_os = "macos"))]
+    if matches!(distro, Distro::MacOS) {
+        issues += check_macos_infra().await;
+    }
 
     // 3b. Backend-specific infrastructure (what the compiled backend itself
     //     reads — no invented checks).
     add_native_infra_issues(distro, &mut issues, check_fedora_infra()).await;
 
-    // 4. Daemon Status. A down daemon only limits speed, never
-    // correctness, so it warns without failing the run.
-    match check_daemon().await {
-        DaemonStatus::Running => {
-            println!("  {}", style::success("Daemon is running"));
-        }
-        DaemonStatus::Down => {
-            println!(
-                "  {}",
-                style::warning("Daemon is not running (run 'omg daemon')")
-            );
-            warnings += 1;
-        }
-        DaemonStatus::SocketStale => {
-            warnings += 1;
+    // 4. Daemon Status. The daemon accelerates Linux reads; macOS uses its
+    // direct Homebrew backend and should not warn users to start one.
+    if matches!(distro, Distro::MacOS) {
+        println!("  {}", style::dim("Daemon is not used on macOS"));
+    } else {
+        match check_daemon().await {
+            DaemonStatus::Running => {
+                println!("  {}", style::success("Daemon is running"));
+            }
+            DaemonStatus::Down => {
+                println!(
+                    "  {}",
+                    style::warning("Daemon is not running (run 'omg daemon')")
+                );
+                warnings += 1;
+            }
+            DaemonStatus::SocketStale => {
+                warnings += 1;
+            }
         }
     }
 
@@ -173,7 +196,7 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     if network {
         println!();
         println!("{}", style::header("Network Diagnostics"));
-        issues += check_network(arch_backend).await;
+        issues += check_network(distro).await;
     }
 
     // 8. EOL runtime checks (if requested)
@@ -471,6 +494,117 @@ async fn check_fedora_package_db(command: std::process::Command, deadline: Durat
     }
 }
 
+/// Check the same Homebrew installation that the package backend reads and
+/// executes. A working `brew` elsewhere on PATH cannot validate that backend.
+#[cfg(any(feature = "macos", target_os = "macos"))]
+async fn check_macos_infra() -> usize {
+    if crate::core::paths::test_mode() {
+        return 0;
+    }
+
+    let manager = crate::package_managers::homebrew::HomebrewPackageManager::new();
+    let caskroom = manager.caskroom();
+    let brew = manager.brew_executable();
+    check_homebrew_paths(
+        &brew,
+        [
+            ("--prefix", manager.prefix()),
+            ("--cellar", manager.cellar()),
+            ("--caskroom", &caskroom),
+        ],
+    )
+    .await
+}
+
+#[cfg(any(feature = "macos", target_os = "macos"))]
+async fn check_homebrew_paths(
+    brew: &std::path::Path,
+    expected: [(&str, &std::path::Path); 3],
+) -> usize {
+    if !brew.is_file() {
+        println!(
+            "  {} Homebrew executable missing ({})",
+            style::error("✗"),
+            brew.display()
+        );
+        return 1;
+    }
+
+    let mut issues = 0;
+    for (option, path) in expected {
+        match query_homebrew_path(brew, option, Duration::from_secs(5)).await {
+            Ok(actual) if actual == path => {
+                if option != "--prefix" {
+                    match std::fs::read_dir(path) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            println!(
+                                "  {} Homebrew {option} inventory cannot be read: {error}",
+                                style::error("✗")
+                            );
+                            issues += 1;
+                            continue;
+                        }
+                    }
+                }
+                println!(
+                    "  {} Homebrew {option} matches backend ({})",
+                    style::success("✓"),
+                    path.display()
+                );
+            }
+            Ok(actual) => {
+                println!(
+                    "  {} Homebrew {option} differs from backend: brew={}, omg={}",
+                    style::error("✗"),
+                    style::sanitize_terminal_text(&actual.display().to_string())
+                        .chars()
+                        .take(160)
+                        .collect::<String>(),
+                    path.display()
+                );
+                issues += 1;
+            }
+            Err(error) => {
+                println!("  {} Homebrew {option} failed: {error}", style::error("✗"));
+                issues += 1;
+            }
+        }
+    }
+    issues
+}
+
+#[cfg(any(feature = "macos", target_os = "macos"))]
+async fn query_homebrew_path(
+    brew: &std::path::Path,
+    option: &str,
+    deadline: Duration,
+) -> Result<std::path::PathBuf> {
+    use anyhow::{bail, ensure};
+
+    let mut command = tokio::process::Command::new(brew);
+    command.arg(option).kill_on_drop(true);
+    let output = tokio::time::timeout(deadline, command.output())
+        .await
+        .with_context(|| format!("{option} timed out after {deadline:?}"))?
+        .with_context(|| format!("could not execute {option}"))?;
+    if !output.status.success() {
+        let detail = style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));
+        let detail: String = detail.chars().take(160).collect();
+        bail!("exit {}: {detail}", output.status);
+    }
+    let value = String::from_utf8(output.stdout).context("Homebrew path was not UTF-8")?;
+    let value = value.strip_suffix('\n').unwrap_or(&value);
+    ensure!(
+        !value.is_empty()
+            && !value.chars().any(|ch| matches!(ch, '\n' | '\r'))
+            && value.starts_with('/'),
+        "Homebrew returned an invalid path"
+    );
+    Ok(std::path::PathBuf::from(value))
+}
+
 /// Whether an APT lists entry carries a package index. Modern APT acquires
 /// compressed indexes (`_Packages.lz4`, `.gz`, `.xz` depending on
 /// server/config — see #299), so the compression suffix must be stripped
@@ -565,26 +699,103 @@ const fn check_arch_infra() -> usize {
     0
 }
 
-async fn check_network(arch_backend: bool) -> usize {
-    let client = shared_client();
-    let mut issues = 0;
+fn network_targets(
+    distro: Distro,
+) -> (
+    &'static [(&'static str, &'static str)],
+    &'static [&'static str],
+) {
+    match distro {
+        Distro::Arch => (ARCH_MIRROR_ENDPOINTS, ARCH_DNS_HOSTS),
+        Distro::MacOS => (HOMEBREW_MIRROR_ENDPOINTS, HOMEBREW_DNS_HOSTS),
+        _ => (GENERIC_MIRROR_ENDPOINTS, GENERIC_DNS_HOSTS),
+    }
+}
 
-    // Arch-only mirrors (archlinux.org, AUR) do not apply to other backends.
-    let endpoints: &[(&str, &str)] = if arch_backend {
-        ARCH_MIRROR_ENDPOINTS
+fn count_usable_dns_addresses<T>(addresses: impl Iterator<Item = T>) -> std::io::Result<usize> {
+    let count = addresses.count();
+    if count == 0 {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "resolver returned no addresses",
+        ))
     } else {
-        GENERIC_MIRROR_ENDPOINTS
-    };
+        Ok(count)
+    }
+}
+
+#[cfg(any(feature = "macos", target_os = "macos"))]
+async fn validate_homebrew_api_response(
+    mut response: reqwest::Response,
+    kind: crate::package_managers::homebrew::HomebrewIndexKind,
+    limit: usize,
+) -> Result<()> {
+    // The current official formula and cask indexes are about 31 and 19 MiB.
+    // Bound decoded bytes as well as the advertised length so compression or
+    // a misbehaving server cannot turn a Doctor probe into an unbounded read.
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length <= limit as u64),
+        "Homebrew API response exceeds {limit} bytes"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            chunk.len() <= limit - body.len(),
+            "Homebrew API response exceeds {limit} bytes"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    crate::package_managers::homebrew::validate_homebrew_index(kind, &body)
+}
+
+async fn check_network(distro: Distro) -> usize {
+    let mut issues = 0;
+    let (endpoints, dns_hosts) = network_targets(distro);
 
     for (name, url) in endpoints {
         let start = std::time::Instant::now();
-        let result = tokio::time::timeout(Duration::from_secs(5), client.get(*url).send()).await;
+        let is_homebrew_index = matches!(distro, Distro::MacOS)
+            && matches!(*name, "Homebrew formula API" | "Homebrew cask API");
+        // The shared client has a 15-second request timeout. Full indexes
+        // need the same read-stall-aware download client as the live backend.
+        let client = if is_homebrew_index {
+            crate::core::http::download_client()
+        } else {
+            shared_client()
+        };
+        // Full Homebrew indexes are tens of MiB. This longer bound applies
+        // only to the opt-in API validation, including its response body.
+        let deadline = if is_homebrew_index {
+            Duration::from_mins(3)
+        } else {
+            Duration::from_secs(5)
+        };
+        let result = tokio::time::timeout(deadline, async {
+            let response = client.get(*url).send().await?;
+            let status = response.status();
+            #[cfg(any(feature = "macos", target_os = "macos"))]
+            if is_homebrew_index && status.is_success() {
+                let kind = match *name {
+                    "Homebrew formula API" => {
+                        crate::package_managers::homebrew::HomebrewIndexKind::Formula
+                    }
+                    "Homebrew cask API" => {
+                        crate::package_managers::homebrew::HomebrewIndexKind::Cask
+                    }
+                    _ => unreachable!("Homebrew index name was checked above"),
+                };
+                validate_homebrew_api_response(response, kind, HOMEBREW_API_BODY_LIMIT).await?;
+            }
+            Ok::<_, anyhow::Error>(status)
+        })
+        .await;
 
         match result {
-            Ok(Ok(response)) => {
+            Ok(Ok(status)) => {
                 let latency = start.elapsed().as_millis();
-                let status = response.status();
-                if mirror_status_is_issue(status) {
+                if mirror_status_is_issue(status) || (is_homebrew_index && !status.is_success()) {
                     println!(
                         "  {} {} (HTTP {})",
                         style::warning("⚠"),
@@ -610,11 +821,6 @@ async fn check_network(arch_backend: bool) -> usize {
     // DNS resolution test
     println!();
     println!("  {}", style::dim("DNS Resolution:"));
-    let dns_hosts: &[&str] = if arch_backend {
-        ARCH_DNS_HOSTS
-    } else {
-        GENERIC_DNS_HOSTS
-    };
     for host in dns_hosts {
         // A dead resolver blocks ToSocketAddrs forever and would hang the
         // whole doctor run, so resolve off the executor with a hard timeout.
@@ -623,7 +829,7 @@ async fn check_network(arch_backend: bool) -> usize {
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
                 std::net::ToSocketAddrs::to_socket_addrs(lookup.as_str())
-                    .map(std::iter::Iterator::count)
+                    .and_then(count_usable_dns_addresses)
             }),
         )
         .await;
@@ -1214,10 +1420,180 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[test]
+    fn doctor_network_targets_match_selected_backend() {
+        let (mac_endpoints, mac_dns) = network_targets(Distro::MacOS);
+        assert_eq!(
+            mac_endpoints,
+            [
+                (
+                    "Homebrew formula API",
+                    "https://formulae.brew.sh/api/formula.json"
+                ),
+                (
+                    "Homebrew cask API",
+                    "https://formulae.brew.sh/api/cask.json"
+                ),
+                ("GitHub", "https://github.com"),
+            ]
+        );
+        assert_eq!(mac_dns, ["formulae.brew.sh", "github.com"]);
+        assert_eq!(network_targets(Distro::Arch).0, ARCH_MIRROR_ENDPOINTS);
+        assert_eq!(network_targets(Distro::Fedora).0, GENERIC_MIRROR_ENDPOINTS);
+    }
+
+    #[test]
+    fn dns_lookup_without_addresses_is_an_issue() {
+        let empty = count_usable_dns_addresses(std::iter::empty::<std::net::SocketAddr>());
+        assert_eq!(
+            empty
+                .expect_err("an empty successful lookup must fail")
+                .kind(),
+            std::io::ErrorKind::AddrNotAvailable
+        );
+        let one = std::net::SocketAddr::from(([127, 0, 0, 1], 443));
+        assert_eq!(count_usable_dns_addresses(std::iter::once(one)).unwrap(), 1);
+    }
+
+    #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
+    fn fake_brew(prefix: &std::path::Path, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = prefix.join("bin");
+        std::fs::create_dir_all(&bin).expect("fake brew bin");
+        let brew = bin.join("brew");
+        std::fs::write(&brew, script).expect("fake brew executable");
+        std::fs::set_permissions(&brew, std::fs::Permissions::from_mode(0o755))
+            .expect("executable mode");
+        brew
+    }
+
+    #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
+    #[tokio::test]
+    async fn homebrew_doctor_requires_real_matching_backend_paths() {
+        let root = tempfile::tempdir().expect("temporary prefix");
+        let cellar = root.path().join("Cellar");
+        let caskroom = root.path().join("Caskroom");
+        let expected = || {
+            [
+                ("--prefix", root.path()),
+                ("--cellar", cellar.as_path()),
+                ("--caskroom", caskroom.as_path()),
+            ]
+        };
+        let brew = root.path().join("bin/brew");
+        assert_eq!(check_homebrew_paths(&brew, expected()).await, 1);
+
+        let valid = "#!/bin/sh\nprefix=${0%/bin/brew}\ncase \"$1\" in\n  --prefix) printf '%s\\n' \"$prefix\";;\n  --cellar) printf '%s/Cellar\\n' \"$prefix\";;\n  --caskroom) printf '%s/Caskroom\\n' \"$prefix\";;\n  *) exit 64;;\nesac\n";
+        let brew = fake_brew(root.path(), valid);
+        assert_eq!(check_homebrew_paths(&brew, expected()).await, 0);
+
+        std::fs::write(&cellar, b"not a directory").expect("bad inventory path");
+        assert_eq!(check_homebrew_paths(&brew, expected()).await, 1);
+        std::fs::remove_file(&cellar).expect("remove bad inventory path");
+
+        let mismatch = valid.replace("'%s/Caskroom\\n' \"$prefix\"", "'/other/Caskroom\\n'");
+        fake_brew(root.path(), &mismatch);
+        let count = check_homebrew_paths(&brew, expected()).await;
+        assert_eq!(count, 1, "mismatched cask inventory must be an issue");
+        assert!(finish_doctor(count, 0).is_err());
+
+        let failed = valid.replace(
+            "--cellar) printf '%s/Cellar\\n' \"$prefix\";;",
+            "--cellar) printf 'broken' >&2; exit 23;;",
+        );
+        fake_brew(root.path(), &failed);
+        assert_eq!(check_homebrew_paths(&brew, expected()).await, 1);
+    }
+
+    #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
+    #[tokio::test]
+    async fn homebrew_doctor_matches_backend_selected_repository_cellar() {
+        let root = tempfile::tempdir().expect("temporary prefix");
+        let prefix = root.path();
+        let prefix_cellar = prefix.join("Cellar");
+        let repository_cellar = prefix.join("Homebrew/Cellar");
+        let caskroom = prefix.join("Caskroom");
+        let script = "#!/bin/sh\nprefix=${0%/bin/brew}\ncase \"$1\" in\n  --prefix) printf '%s\\n' \"$prefix\";;\n  --cellar) printf '%s/Homebrew/Cellar\\n' \"$prefix\";;\n  --caskroom) printf '%s/Caskroom\\n' \"$prefix\";;\n  *) exit 64;;\nesac\n";
+        let brew = fake_brew(prefix, script);
+        std::fs::create_dir_all(repository_cellar.join("wget/1.0"))
+            .expect("repository inventory contains a package");
+        assert_eq!(
+            check_homebrew_paths(
+                &brew,
+                [
+                    ("--prefix", prefix),
+                    ("--cellar", repository_cellar.as_path()),
+                    ("--caskroom", caskroom.as_path()),
+                ],
+            )
+            .await,
+            0,
+            "Doctor must validate the repository inventory selected by the backend"
+        );
+
+        std::fs::create_dir_all(prefix_cellar.join("curl/2.0"))
+            .expect("prefix inventory contains a package");
+        assert_eq!(
+            check_homebrew_paths(
+                &brew,
+                [
+                    ("--prefix", prefix),
+                    ("--cellar", repository_cellar.as_path()),
+                    ("--caskroom", caskroom.as_path()),
+                ],
+            )
+            .await,
+            0,
+            "a prefix Cellar must not override Homebrew's repository Cellar"
+        );
+        assert_eq!(
+            check_homebrew_paths(
+                &brew,
+                [
+                    ("--prefix", prefix),
+                    ("--cellar", prefix_cellar.as_path()),
+                    ("--caskroom", caskroom.as_path()),
+                ],
+            )
+            .await,
+            1,
+            "Doctor must reject a different Cellar from the selected backend"
+        );
+    }
+
+    #[cfg(all(unix, any(feature = "macos", target_os = "macos")))]
+    #[tokio::test]
+    async fn homebrew_doctor_bounds_hung_probe_and_rejects_bad_output() {
+        let root = tempfile::tempdir().expect("temporary prefix");
+        let brew = fake_brew(
+            root.path(),
+            "#!/bin/sh\nsleep 1\nprintf '/opt/homebrew\\n'\n",
+        );
+        let timeout = query_homebrew_path(&brew, "--prefix", Duration::from_millis(20)).await;
+        assert!(
+            timeout
+                .expect_err("hung brew must fail")
+                .to_string()
+                .contains("timed out")
+        );
+
+        fake_brew(
+            root.path(),
+            "#!/bin/sh\nprintf '/opt/homebrew\\n/other\\n'\n",
+        );
+        assert!(
+            query_homebrew_path(&brew, "--prefix", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
     async fn serve_probe_response(
-        response: &'static [u8],
+        response: &[u8],
         delay: Duration,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        let response = response.to_vec();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("local probe listener");
@@ -1238,12 +1614,12 @@ mod tests {
             tokio::time::sleep(delay).await;
             if delay.is_zero() {
                 socket
-                    .write_all(response)
+                    .write_all(&response)
                     .await
                     .expect("probe response write");
             } else {
                 // The timeout test intentionally drops the client request.
-                let _ = socket.write_all(response).await;
+                let _ = socket.write_all(&response).await;
             }
         });
         (url, server)
@@ -1255,6 +1631,69 @@ mod tests {
         } else {
             server.abort();
             panic!("local probe server did not finish");
+        }
+    }
+
+    #[cfg(any(feature = "macos", target_os = "macos"))]
+    #[tokio::test]
+    async fn homebrew_api_probe_requires_bounded_typed_plausible_catalogs() {
+        use crate::package_managers::homebrew::HomebrewIndexKind;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local Homebrew API client");
+        const FORMULA: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[{\"name\":\"wget\",\"versions\":{\"stable\":\"1.0\"}}]";
+        const CASK: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[{\"token\":\"firefox\",\"desc\":null,\"version\":\"1.0\"}]";
+        const HTML: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<html>proxy login</html>";
+        const TRUNCATED: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[{\"name\":\"wget\"";
+        const EMPTY: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[]";
+        const EXCESS_LENGTH: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n";
+        for (kind, count) in [
+            (HomebrewIndexKind::Formula, 4_000),
+            (HomebrewIndexKind::Cask, 2_000),
+        ] {
+            let entries: Vec<_> = (0..count)
+                .map(|index| match kind {
+                    HomebrewIndexKind::Formula => serde_json::json!({
+                        "name": format!("formula-{index}"),
+                        "versions": {"stable": "1.0"}
+                    }),
+                    HomebrewIndexKind::Cask => serde_json::json!({
+                        "token": format!("cask-{index}"),
+                        "version": "1.0"
+                    }),
+                })
+                .collect();
+            let mut wire = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+            wire.extend(serde_json::to_vec(&entries).expect("valid catalog fixture"));
+            let (url, server) = serve_probe_response(&wire, Duration::ZERO).await;
+            let response = client.get(&url).send().await.expect("local API response");
+            assert!(
+                validate_homebrew_api_response(response, kind, 2_000_000)
+                    .await
+                    .is_ok(),
+                "full-sized typed catalog must pass"
+            );
+            finish_probe_server(server).await;
+        }
+        for (wire, kind, limit, should_pass) in [
+            (FORMULA, HomebrewIndexKind::Formula, 1024, false),
+            (CASK, HomebrewIndexKind::Cask, 1024, false),
+            (FORMULA, HomebrewIndexKind::Cask, 1024, false),
+            (CASK, HomebrewIndexKind::Formula, 1024, false),
+            (HTML, HomebrewIndexKind::Formula, 1024, false),
+            (TRUNCATED, HomebrewIndexKind::Formula, 1024, false),
+            (EMPTY, HomebrewIndexKind::Cask, 1024, false),
+            (FORMULA, HomebrewIndexKind::Formula, 32, false),
+            (EXCESS_LENGTH, HomebrewIndexKind::Formula, 1024, false),
+        ] {
+            let (url, server) = serve_probe_response(wire, Duration::ZERO).await;
+            let response = client.get(&url).send().await.expect("local API response");
+            let result = validate_homebrew_api_response(response, kind, limit).await;
+            assert_eq!(result.is_ok(), should_pass, "fixture {wire:?}: {result:?}");
+            finish_probe_server(server).await;
         }
     }
 

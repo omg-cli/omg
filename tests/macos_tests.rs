@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use omg_lib::package_managers::{HomebrewPackageManager, PackageManager};
 
 pub mod platform_semantics;
@@ -50,14 +50,58 @@ mod homebrew_integration {
 
     #[tokio::test]
     async fn test_list_installed_formulae() -> Result<()> {
-        let pm = HomebrewPackageManager::new();
+        // CI installs wget before this test. Homebrew's own inventory is the
+        // oracle, so an empty OMG inventory cannot make this test pass.
+        let brew = std::process::Command::new("brew")
+            .args(["list", "--formula", "--versions", "wget"])
+            .output()
+            .context("run brew list --formula --versions wget")?;
+        assert!(
+            brew.status.success(),
+            "brew could not list installed wget: {}",
+            String::from_utf8_lossy(&brew.stderr)
+        );
+        let output = String::from_utf8(brew.stdout).context("brew inventory is not UTF-8")?;
+        let lines: Vec<_> = output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected one wget inventory row: {output:?}"
+        );
+        let mut fields = lines[0].split_whitespace();
+        assert_eq!(
+            fields.next(),
+            Some("wget"),
+            "unexpected brew inventory: {output:?}"
+        );
+        let brew_versions: Vec<_> = fields.collect();
+        assert!(
+            !brew_versions.is_empty(),
+            "brew reported wget without an installed version: {output:?}"
+        );
 
-        // The operation must succeed, and every returned entry must carry a
-        // usable identity — not just "run without error".
+        let pm = HomebrewPackageManager::new();
         let installed = pm.list_installed().await?;
+        assert!(
+            !installed.is_empty(),
+            "OMG missed Homebrew's installed wget"
+        );
         for pkg in &installed {
             assert!(!pkg.name.is_empty(), "installed entries must have a name");
         }
+        let wget = installed
+            .iter()
+            .find(|pkg| pkg.name == "wget")
+            .expect("OMG inventory must include Homebrew's installed wget");
+        assert!(wget.installed, "OMG must mark wget as installed");
+        let omg_version = wget.version.to_string();
+        assert!(
+            brew_versions.contains(&omg_version.as_str()),
+            "OMG wget version {omg_version:?} differs from Homebrew versions {brew_versions:?}"
+        );
 
         Ok(())
     }
