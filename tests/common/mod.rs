@@ -211,6 +211,93 @@ impl CommandResult {
     }
 }
 
+/// Loopback proxy: reject before TLS, never contact upstream, count attempts.
+/// Child-local policy controls all proxy spellings and both bypass variables.
+pub struct RejectedProxy {
+    url: String,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Default for RejectedProxy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RejectedProxy {
+    pub fn new() -> Self {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind isolated proxy");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let count = std::sync::Arc::clone(&requests);
+        let stopped = std::sync::Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let mut request = [0; 4096];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("isolated proxy accept failed: {error}"),
+                }
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    pub fn env(&self) -> Vec<(&str, &str)> {
+        [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ]
+        .into_iter()
+        .map(|key| (key, self.url.as_str()))
+        .chain([("NO_PROXY", ""), ("no_proxy", "")])
+        .collect()
+    }
+
+    pub fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for RejectedProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.worker
+            .take()
+            .unwrap()
+            .join()
+            .expect("isolated proxy worker panicked");
+    }
+}
+
 /// Run an OMG command
 pub fn run_omg(args: &[&str]) -> CommandResult {
     run_omg_with_options(args, None, &[])
@@ -513,6 +600,61 @@ impl TestProject {
         run_omg_with_home(args, Some(self.path()), &vars, self.home_dir.path())
     }
 
+    /// Mirror the private AUR index schema to seed offline non-exact search results.
+    /// The real CLI must validate and consume this fixture without RPC fallback.
+    #[cfg(feature = "arch")]
+    pub fn seed_missing_aur_index(&self, query: &str) {
+        use std::io::Write as _;
+        #[derive(rkyv::Archive, rkyv::Serialize)]
+        struct Entry {
+            name: String,
+            version: String,
+            maintainer: Option<String>,
+            last_modified: Option<i64>,
+            description: Option<String>,
+            num_votes: i32,
+            popularity: f64,
+            out_of_date: Option<i64>,
+        }
+        #[derive(rkyv::Archive, rkyv::Serialize)]
+        struct Archive {
+            entries: Vec<Entry>,
+        }
+        let directory = self.data_dir.path().join("cache/aur/_meta");
+        fs::create_dir_all(&directory).unwrap();
+        let archive = fs::File::create(directory.join("packages-meta-ext-v1.json.gz")).unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(archive, flate2::Compression::default());
+        let metadata = serde_json::json!([{
+            "Name": "fixture-neighbor", "Version": "1.0", "Description": query
+        }]);
+        gzip.write_all(metadata.to_string().as_bytes()).unwrap();
+        gzip.finish().unwrap();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&Archive {
+            entries: vec![Entry {
+                name: "fixture-neighbor".into(),
+                version: "1.0".into(),
+                maintainer: None,
+                last_modified: None,
+                description: Some(query.into()),
+                num_votes: 0,
+                popularity: 0.0,
+                out_of_date: None,
+            }],
+        })
+        .expect("serialize non-exact AUR fixture");
+        fs::write(directory.join("packages-meta-ext-v1.rkyv"), bytes).unwrap();
+        // Suggestions also consult AUR name completion; keep that source offline.
+        let completion = serde_json::json!({
+            "format_version": 1,
+            "entries": { "aur_last_refresh": jiff::Timestamp::now().to_string(), "aur_packages": "" }
+        });
+        fs::write(
+            self.data_dir.path().join("completion-cache.json"),
+            completion.to_string(),
+        )
+        .unwrap();
+    }
+
     pub fn mock_install(&self, package: &str, version: &str) -> Result<()> {
         update_mock_state(self.data_dir.path(), self.distro(), package, version, true)
     }
@@ -797,8 +939,28 @@ impl DaemonTestFixture {
 
 #[cfg(test)]
 mod tests {
-    use super::command_timeout;
+    use super::{RejectedProxy, command_timeout};
     use std::time::Duration;
+
+    #[test]
+    fn proxy_policy_controls_every_spelling_and_disables_bypasses() {
+        let proxy = RejectedProxy::new();
+        let policy: std::collections::BTreeMap<_, _> = proxy.env().into_iter().collect();
+        assert_eq!(policy.len(), 8);
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert_eq!(policy.get(key), Some(&proxy.url.as_str()));
+        }
+        assert_eq!(policy.get("NO_PROXY"), Some(&""));
+        assert_eq!(policy.get("no_proxy"), Some(&""));
+        assert_eq!(proxy.requests(), 0);
+    }
 
     #[test]
     fn explicit_timeout_overrides_inherited_timeout() {
