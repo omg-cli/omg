@@ -72,6 +72,9 @@ jobs:
       - name: Validate change classification
         run: python3 -m unittest discover -s scripts -p test_ci_change_scope.py
 
+      - name: QEMU boot deadline regressions
+        run: python3 -m unittest discover -s scripts -p test_qemu_boot_timeout_budget.py
+
       - name: Debt ratchet (gating)
         run: python3 scripts/debt-ratchet.py
 

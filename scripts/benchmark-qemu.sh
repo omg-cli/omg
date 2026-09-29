@@ -433,6 +433,10 @@ if [[ $# == 11 ]]; then
   [[ "$vm_serial" == /work/transactions/* && "$vm_serial" != *'/../'* ]] || exit 2
 elif [[ $# != 8 ]]; then exit 2; fi
 [[ ! -e qemu.pid ]] || exit 2
+# Setup runs in its own bounded process; QEMU remains owned by the controller.
+if [[ ${OMG_QEMU_SETUP_ONLY:-0} != 1 ]]; then
+  OMG_QEMU_SETUP_ONLY=1 timeout --kill-after=2s 180s bash "$0" "$@"
+else
 if [[ "$initial" == true ]]; then
 ssh-keygen -q -t ed25519 -N '' -f client-key
 ssh-keygen -q -t ed25519 -N '' -f guest-host-key
@@ -528,62 +532,83 @@ awk '
   END { exit !(uid && gid && caps && nnp && seccomp) }
 ' "/proc/$qemu_pid/status" || { printf 'QEMU isolation verification failed\n' >&2; exit 1; }
 printf 'QEMU isolation verified: uid=65534 gid=65534 capabilities=none no_new_privs=1 seccomp=2\n'
+exit 0
+fi
+# Absolute phase deadlines include timeout kill grace and retry sleeps.
+SSH_WAIT_BUDGET=1680
+SSH_ATTEMPT_TIMEOUT=12
+SSH_KILL_GRACE=2
+SSH_RETRY_DELAY=2
+boot_diagnostics() {
+  local pid serial_bytes kernel_banner=no qemu_state
+  pid=$(<qemu.pid)
+  serial_bytes=$(wc -c < "$vm_serial")
+  if grep -aqm1 'Linux version ' "$vm_serial"; then kernel_banner=yes; fi
+  qemu_state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf 'unknown')
+  printf '%s deadline expired: qemu_state=%s serial_bytes=%s kernel_banner_seen=%s\n' \
+    "$1" "$qemu_state" "$serial_bytes" "$kernel_banner" >&2
+  printf 'Last guest serial lines:\n' >&2
+  tail -n 6 "$vm_serial" >&2
+}
 opts=(-i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=2 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
+# Reserve kill grace inside the phase, not outside each attempt's budget.
+phase_ssh() {
+  local remaining=$(( phase_deadline - SECONDS - SSH_KILL_GRACE ))
+  (( remaining > 0 )) || return 124
+  (( remaining <= SSH_ATTEMPT_TIMEOUT )) || remaining=$SSH_ATTEMPT_TIMEOUT
+  timeout --kill-after="${SSH_KILL_GRACE}s" "${remaining}s" ssh "${opts[@]}" bench@127.0.0.1 "$@"
+}
+phase_pause() {
+  local remaining=$(( phase_deadline - SECONDS ))
+  (( remaining > 0 )) || return 0
+  (( remaining <= SSH_RETRY_DELAY )) || remaining=$SSH_RETRY_DELAY
+  sleep "$remaining"
+}
 wait_ssh() {
-  local pid serial_bytes kernel_banner qemu_state
-  for attempt in {1..120}; do
+  local pid phase_deadline=$(( SECONDS + SSH_WAIT_BUDGET ))
+  while (( SECONDS + SSH_KILL_GRACE < phase_deadline )); do
     pid=$(<qemu.pid)
     if ! kill -0 "$pid" 2>/dev/null; then
-      printf 'QEMU exited before SSH became ready (attempt %s)\n' "$attempt" >&2
+      printf 'QEMU exited before SSH became ready\n' >&2
       cat qemu-startup.log >&2
       return 1
     fi
-    if timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 true 2>/dev/null; then return 0; fi
-    sleep 2
+    if phase_ssh true 2>/dev/null; then return 0; fi
+    phase_pause
   done
-  serial_bytes=$(wc -c < "$vm_serial")
-  kernel_banner=no
-  if grep -aqm1 'Linux version ' "$vm_serial"; then kernel_banner=yes; fi
-  qemu_state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf 'unknown')
-  printf 'SSH readiness timed out after 120 attempts: qemu_state=%s serial_bytes=%s kernel_banner_seen=%s\n' \
-    "$qemu_state" "$serial_bytes" "$kernel_banner" >&2
-  printf 'Last guest serial lines:\n' >&2
-  tail -n 6 "$vm_serial" >&2
+  boot_diagnostics 'initial SSH readiness'
   return 1
 }
 wait_ssh
 # The controller checks cloud-init's authoritative runtime records and
 # systemd target without starting a second Python process inside the guest.
-bash /work/check-qemu-cloud-init.sh bench@127.0.0.1 "${opts[@]}"
-timeout 15 ssh "${opts[@]}" bench@127.0.0.1 'cat /etc/os-release && uname -r && sudo -n true'
+timeout --kill-after=2s 250s bash /work/check-qemu-cloud-init.sh bench@127.0.0.1 "${opts[@]}"
+timeout --kill-after=2s 15s ssh "${opts[@]}" bench@127.0.0.1 'cat /etc/os-release && uname -r && sudo -n true'
 if [[ "$initial" == false ]]; then exit 0; fi
 # Arm diagnostics before the first reboot and every subsequent disk clone.
 # The timer has no network-online dependency, so failed DHCP/SSH cannot hide it.
-ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl daemon-reload && sudo -n systemctl enable omg-boot-network.timer'
-ssh "${opts[@]}" bench@127.0.0.1 "sudo -n systemctl enable '$2'"
+timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl daemon-reload && sudo -n systemctl enable omg-boot-network.timer'
+timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 "sudo -n systemctl enable '$2'"
 before=$(timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id)
 timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl reboot' || true
-for attempt in {1..120}; do
-  if after=$(timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id 2>/dev/null) && [[ "$after" != "$before" ]]; then
+phase_deadline=$(( SECONDS + SSH_WAIT_BUDGET ))
+while (( SECONDS + SSH_KILL_GRACE < phase_deadline )); do
+  if after=$(phase_ssh cat /proc/sys/kernel/random/boot_id 2>/dev/null) && [[ "$after" != "$before" ]]; then
     printf 'reboot verified: %s -> %s\n' "$before" "$after"
-    ssh "${opts[@]}" bench@127.0.0.1 "sudo -n true; systemctl is-active '$2'"
+    timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 "sudo -n true; systemctl is-active '$2'"
     exit 0
   fi
-  sleep 2
+  phase_pause
 done
+boot_diagnostics 'post-reboot SSH readiness'
 exit 1
 BOOT
-# The guest-side readiness waits below can each spin for
-# SSH_WAIT_ATTEMPTS * (SSH_ATTEMPT_TIMEOUT + SSH_RETRY_DELAY) seconds before
-# they give up and print diagnostics. Any host-side `timeout` wrapped around
-# boot.sh MUST exceed that, or the kernel/serial/QEMU-state diagnostics in
-# wait_ssh are unreachable precisely when they are needed.
-SSH_WAIT_ATTEMPTS=120
-SSH_ATTEMPT_TIMEOUT=12
-SSH_RETRY_DELAY=2
-SSH_WAIT_BUDGET=$(( SSH_WAIT_ATTEMPTS * (SSH_ATTEMPT_TIMEOUT + SSH_RETRY_DELAY) ))
-# Margin for image I/O and the pre-SSH setup steps in boot.sh.
-BOOT_TIMEOUT=$(( SSH_WAIT_BUDGET + 180 ))
+# Both readiness phases are sequential. Their absolute deadlines already
+# include attempt kill grace. Other phases include their own kill allowances:
+# setup 180+2, cloud-init 250+2, identity 15+2, five SSH calls 12+2.
+# Reserve 30 seconds for local diagnostics and controller dispatch.
+SSH_WAIT_BUDGET=1680
+BOOT_TIMEOUT=$(( 2 * SSH_WAIT_BUDGET + 182 + 252 + 17 + 5 * 14 + 30 ))
 boot_timeout=$BOOT_TIMEOUT
 guest_timeout=600
 printf 'ssh_wait_budget=%s boot_timeout=%s guest_timeout=%s\n' \
@@ -595,7 +620,7 @@ if [[ "$qemu_accel" == tcg ]]; then
   guest_timeout=2400
 fi
 printf 'boot_timeout=%s guest_timeout=%s\n' "$boot_timeout" "$guest_timeout" >> "$work/metadata.txt"
-timeout "$boot_timeout" docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1
+timeout --kill-after=5s "$boot_timeout" docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1
 if [[ -n "$inventory_tiers" ]]; then
   # The inventory executor runs inside the controller (same netns as the
   # guest); /work is bind-mounted there.
