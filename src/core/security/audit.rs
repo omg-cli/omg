@@ -370,6 +370,12 @@ impl AuditLogger {
             message: "computed hash disappeared before publication",
         })?;
 
+        // The human-readable message is the only tracing output a plaintext
+        // subscriber cannot escape, so render the sanitized description
+        // instead of the raw parameter: a caller-supplied newline, carriage
+        // return, or ANSI escape would otherwise forge extra log records.
+        let message = tracing_safe_audit_text(&entry.description);
+
         // Structured fields keep the tracing output queryable (event_type,
         // severity, hash-chain linkage) without touching the on-disk JSONL
         // format. Per-level macro calls are required because `event!` needs a
@@ -381,7 +387,7 @@ impl AuditLogger {
                     event_type = %entry.event_type,
                     severity = ?severity,
                     chain_hash = %self.last_hash,
-                    "{description}"
+                    "{message}"
                 );
             }
             AuditSeverity::Info => {
@@ -390,7 +396,7 @@ impl AuditLogger {
                     event_type = %entry.event_type,
                     severity = ?severity,
                     chain_hash = %self.last_hash,
-                    "{description}"
+                    "{message}"
                 );
             }
             AuditSeverity::Warning => {
@@ -399,7 +405,7 @@ impl AuditLogger {
                     event_type = %entry.event_type,
                     severity = ?severity,
                     chain_hash = %self.last_hash,
-                    "{description}"
+                    "{message}"
                 );
             }
             AuditSeverity::Error => {
@@ -408,7 +414,7 @@ impl AuditLogger {
                     event_type = %entry.event_type,
                     severity = ?severity,
                     chain_hash = %self.last_hash,
-                    "{description}"
+                    "{message}"
                 );
             }
             AuditSeverity::Critical => {
@@ -418,7 +424,7 @@ impl AuditLogger {
                     severity = ?severity,
                     chain_hash = %self.last_hash,
                     critical = true,
-                    "{description}"
+                    "{message}"
                 );
             }
         }
@@ -567,6 +573,29 @@ impl AuditLogger {
             .filter(|e| e.severity >= min_severity)
             .collect())
     }
+}
+
+/// Escape caller-controlled text before it is rendered as a human-readable
+/// tracing message.
+///
+/// The on-disk JSONL path is escaped by `serde_json`, but a plaintext tracing
+/// subscriber writes the message verbatim, so a newline, carriage return, or
+/// ANSI escape in a caller-supplied description would let that caller forge
+/// additional log records or repaint the operator's terminal.
+fn tracing_safe_audit_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => {
+                escaped.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 fn bounded_audit_field(value: &str) -> String {
@@ -2109,6 +2138,95 @@ mod completeness_tests {
         assert!(super::ensure_complete_collection(&log_path.with_file_name("incomplete")).is_err());
         *super::AUDIT_LOGGER.lock().unwrap() = None;
         *super::AUDIT_INCOMPLETE_MARKER.write().unwrap() = None;
+        Ok(())
+    }
+
+    /// Minimal `tracing::Subscriber` that captures the rendered `message` field
+    /// so the test can inspect exactly what a plaintext subscriber would print.
+    #[derive(Default, Clone)]
+    struct MessageCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct MessageVisitor(std::sync::Arc<std::sync::Mutex<Vec<String>>>, String);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(
+            &mut self,
+            _field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            self.1.push_str(&format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
+            self.1.push_str(value);
+        }
+    }
+
+    impl tracing::Subscriber for MessageCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MessageVisitor(self.0.clone(), String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.1);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn tracing_message_escapes_newlines_from_caller_description() -> anyhow::Result<()> {
+        assert_eq!(
+            super::tracing_safe_audit_text("ok\nInjected: fake success"),
+            "ok\\nInjected: fake success"
+        );
+        assert_eq!(super::tracing_safe_audit_text("a\r\nb"), "a\\r\\nb");
+        assert_eq!(
+            super::tracing_safe_audit_text("paint \u{1b}[31mred"),
+            "paint \\u{1b}[31mred"
+        );
+
+        let directory = tempfile::tempdir()?;
+        let log_path = directory.path().join("audit.jsonl");
+        let mut logger = super::AuditLogger::new_in(&log_path)?;
+        let capture = MessageCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            logger
+                .log(
+                    super::AuditEventType::PackageInstall,
+                    super::AuditSeverity::Info,
+                    "pkg",
+                    "Installed pkg\nInjected: fake success",
+                )
+                .expect("audit entry must be written");
+        });
+
+        let messages = capture.0.lock().unwrap().clone();
+        assert_eq!(messages.len(), 1, "one audit event must emit one record");
+        assert!(
+            !messages[0].contains('\n') && !messages[0].contains('\r'),
+            "tracing message must stay on one line: {:?}",
+            messages[0],
+        );
+        assert!(messages[0].contains("\\nInjected: fake success"));
+
+        // The on-disk JSONL record keeps the full description (JSON-escaped),
+        // so nothing is lost by sanitizing the human-readable field.
+        let disk = std::fs::read_to_string(&log_path)?;
+        assert_eq!(disk.lines().count(), 1, "disk record must be one line");
+        assert!(disk.contains("Installed pkg\\nInjected: fake success"));
         Ok(())
     }
 
