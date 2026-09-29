@@ -2149,11 +2149,7 @@ mod completeness_tests {
     struct MessageVisitor(std::sync::Arc<std::sync::Mutex<Vec<String>>>, String);
 
     impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(
-            &mut self,
-            _field: &tracing::field::Field,
-            value: &dyn std::fmt::Debug,
-        ) {
+        fn record_debug(&mut self, _field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             self.1.push_str(&format!("{value:?}"));
         }
 
