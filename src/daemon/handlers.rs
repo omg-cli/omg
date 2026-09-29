@@ -1832,6 +1832,8 @@ mod tests {
 
         // 2000 lifetime failures spread over two hours: one every ~3.6s, so
         // far below the threshold inside any single trailing window.
+        // record_request_failure_at maintains the window only; the lifetime
+        // counter is covered by inc_requests_failed_counts_lifetime_and_opens_the_window.
         let spread = Metrics::new();
         let step_ms = (2 * 3_600_000) / 2000;
         let mut now = EPOCH_MS;
@@ -1839,7 +1841,6 @@ mod tests {
             spread.record_request_failure_at(now);
             now += step_ms;
         }
-        assert_eq!(spread.snapshot().requests_failed, 2000);
         assert_eq!(
             health_status(SMALL_CACHE, spread.request_failures_within_window(now)),
             "healthy",

@@ -218,6 +218,9 @@ mod tests {
     fn long_lifetime_failures_do_not_latch_unhealthy() {
         let metrics = Metrics::new();
         // 2000 failures spread across two hours, one every ~3.6 seconds.
+        // record_request_failure_at only maintains the trailing window, so the
+        // lifetime counter is asserted separately by
+        // inc_requests_failed_counts_lifetime_and_opens_the_window.
         let step_ms = (2 * 3_600_000) / 2000;
         let mut now = EPOCH_MS;
         for _ in 0..2000 {
@@ -225,15 +228,36 @@ mod tests {
             now += step_ms;
         }
 
-        assert_eq!(
-            metrics.snapshot().requests_failed,
-            2000,
-            "lifetime counter must keep counting every failure"
-        );
         assert!(
             metrics.request_failures_within_window(now) <= UNHEALTHY_THRESHOLD,
             "lifetime failures must not latch the health window, got {}",
             metrics.request_failures_within_window(now)
+        );
+    }
+
+    #[test]
+    fn inc_requests_failed_counts_lifetime_and_opens_the_window() {
+        // Production has eleven inc_requests_failed call sites and reaches the
+        // window only through this method, so the two must stay hooked
+        // together. If they are ever unhooked, health silently reports a
+        // failure storm as healthy.
+        let metrics = Metrics::new();
+        assert_eq!(metrics.snapshot().requests_failed, 0);
+        assert_eq!(metrics.request_failures_within_window(now_millis()), 0);
+
+        for _ in 0..5 {
+            metrics.inc_requests_failed();
+        }
+
+        assert_eq!(
+            metrics.snapshot().requests_failed,
+            5,
+            "lifetime counter must keep counting every failure"
+        );
+        assert_eq!(
+            metrics.recent_request_failures(),
+            5,
+            "the health window must be fed by the same call"
         );
     }
 
