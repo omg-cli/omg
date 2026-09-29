@@ -172,9 +172,17 @@ def expected_enterprise(packages):
             unknown.append(name)
         for license_value in licenses:
             counts[license_value] += 1
-            if "GPL" in license_value.upper():
+            # Mirror the product's classifier (src/cli/enterprise.rs), which
+            # uses the same SPDX-aware categories as `omg audit`. A bare
+            # "GPL" substring test understated AGPL, missed MPL entirely, and
+            # only caught LGPL by accident.
+            category = known_category([license_value])
+            if category == "StrongCopyleft":
                 violations.append((name, license_value,
-                                   "Copyleft license (GPL) requires legal review"))
+                                   "Strong copyleft license (AGPL) requires legal review"))
+            elif category == "Copyleft":
+                violations.append((name, license_value,
+                                   "Copyleft license requires legal review"))
     return counts, sorted(unknown), sorted(violations)
 
 

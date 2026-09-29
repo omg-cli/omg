@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use crate::cli::security::spreadsheet_safe_cell;
+use crate::cli::security::{LicenseCategory, spreadsheet_safe_cell};
 use crate::core::license;
 
 fn artifact_stamp() -> String {
@@ -433,6 +433,27 @@ struct LicenseViolation {
     reason: String,
 }
 
+/// Reason text for a license that needs legal review, or `None` when the
+/// license does not require review.
+///
+/// This deliberately shares `LicenseCategory::from_license` with `omg audit`
+/// (src/cli/security.rs) so both commands agree on what counts as copyleft.
+/// A previous `"GPL" in <uppercase>` substring test misreported three ways: it
+/// understated AGPL as plain copyleft, missed MPL-2.0 entirely because "MPL"
+/// has no "GPL" substring, and only caught LGPL by accident because "GPL" is a
+/// substring of "LGPL-2.1" while still naming GPL in the reason.
+///
+/// `scripts/qemu-license-oracle.py` mirrors this mapping.
+fn enterprise_license_review_reason(license: &str) -> Option<&'static str> {
+    match LicenseCategory::from_license(license) {
+        LicenseCategory::StrongCopyleft => {
+            Some("Strong copyleft license (AGPL) requires legal review")
+        }
+        LicenseCategory::Copyleft => Some("Copyleft license requires legal review"),
+        _ => None,
+    }
+}
+
 fn perform_license_scan() -> Result<LicenseScan> {
     #[cfg(not(feature = "arch"))]
     anyhow::bail!("Enterprise license scan requires the Arch package backend");
@@ -451,11 +472,11 @@ fn perform_license_scan() -> Result<LicenseScan> {
             } else {
                 for lic in &pkg.licenses {
                     *by_license.entry(lic.clone()).or_insert(0) += 1;
-                    if lic.to_uppercase().contains("GPL") {
+                    if let Some(reason) = enterprise_license_review_reason(lic) {
                         violations.push(LicenseViolation {
                             package: pkg.name.clone(),
                             license: lic.clone(),
-                            reason: "Copyleft license (GPL) requires legal review".to_string(),
+                            reason: reason.to_string(),
                         });
                     }
                 }
@@ -544,6 +565,59 @@ mod tests {
         };
         let licenses = generate_license_csv(&scan).expect("license CSV");
         assert!(licenses.contains("\"'=HYPERLINK(\"\"https://example.com\"\")\",1"));
+    }
+
+    #[test]
+    fn enterprise_review_reason_classifies_the_copyleft_family() {
+        // The three cases a "GPL" substring test got wrong.
+        assert_eq!(
+            enterprise_license_review_reason("MPL-2.0"),
+            Some("Copyleft license requires legal review"),
+            "MPL-2.0 is copyleft but contains no GPL substring"
+        );
+        assert_eq!(
+            enterprise_license_review_reason("AGPL-3.0"),
+            Some("Strong copyleft license (AGPL) requires legal review"),
+            "AGPL must not be reported as plain copyleft"
+        );
+        assert_eq!(
+            enterprise_license_review_reason("LGPL-2.1"),
+            Some("Copyleft license requires legal review"),
+            "LGPL is copyleft and must not be named GPL"
+        );
+    }
+
+    #[test]
+    fn enterprise_review_reason_matches_the_audit_classifier() {
+        // AGPL and ordinary copyleft must agree with `omg audit`, and
+        // permissive or unknown licenses must not be flagged for review.
+        for license in ["GPL-2.0", "GPL-3.0", "LGPL-2.1", "MPL-2.0", "AGPL-3.0"] {
+            let audit_says_copyleft = matches!(
+                LicenseCategory::from_license(license),
+                LicenseCategory::Copyleft | LicenseCategory::StrongCopyleft
+            );
+            assert_eq!(
+                enterprise_license_review_reason(license).is_some(),
+                audit_says_copyleft,
+                "enterprise and audit disagree for {license}"
+            );
+        }
+        for license in [
+            "MIT",
+            "Apache-2.0",
+            "BSD-3-Clause",
+            "Unlicense",
+            "SSPL-1.0",
+            "BUSL-1.1",
+            "LicenseRef-Proprietary",
+            "LIMITED",
+        ] {
+            assert_eq!(
+                enterprise_license_review_reason(license),
+                None,
+                "{license} should not require copyleft review"
+            );
+        }
     }
 
     #[test]

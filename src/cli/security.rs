@@ -740,7 +740,7 @@ fn require_audit_integrity(is_valid: bool) -> Result<()> {
 
 /// License categories for compliance
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LicenseCategory {
+pub(crate) enum LicenseCategory {
     Permissive,     // MIT, BSD, Apache
     Copyleft,       // GPL, LGPL, MPL
     StrongCopyleft, // AGPL
@@ -749,7 +749,11 @@ enum LicenseCategory {
 }
 
 impl LicenseCategory {
-    fn from_license(license: &str) -> Self {
+    /// Classify a license expression into a compliance category.
+    ///
+    /// Shared with the enterprise license scan so `omg audit` and
+    /// `omg enterprise audit` agree on what counts as copyleft.
+    pub(crate) fn from_license(license: &str) -> Self {
         let tokens = crate::core::security::policy::spdx_license_tokens(license);
         let mut category = Self::Unknown;
         for token in &tokens {
