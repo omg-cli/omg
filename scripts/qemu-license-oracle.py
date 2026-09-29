@@ -94,17 +94,58 @@ def spreadsheet_safe(value):
     return "'" + value if value.startswith(("=", "+", "-", "@")) else value
 
 
+# Independently enumerated review families, not imported from the Rust classifier.
+# SPDX identifiers and expression syntax:
+# https://spdx.org/licenses/ (including deprecated GPL/LGPL/AGPL version IDs)
+# https://spdx.github.io/spdx-spec/v2.3/SPDX-license-expressions/
+# Arch native aliases (GPL2, GPL3, LGPL2.1, etc.) denote families only;
+# they do not establish SPDX's distinct "only" versus "or later" terms.
+# Retained native metadata: run 36605828415, audit-licenses.stdout.log.
+VERSIONED_FAMILIES = {
+    "GPL": ("1.0", "2.0", "3.0"),
+    "LGPL": ("2.0", "2.1", "3.0"),
+    "AGPL": ("1.0", "3.0"),
+}
+FAMILY_IDS = {
+    family: {family} | {
+        f"{family}-{version}{suffix}".upper()
+        for version in versions for suffix in ("", "+", "-only", "-or-later")
+    }
+    for family, versions in VERSIONED_FAMILIES.items()
+}
+FAMILY_IDS["GPL"].update({"GPL1", "GPL2", "GPL3"})
+FAMILY_IDS["LGPL"].update({"LGPL2", "LGPL2.1", "LGPL3"})
+FAMILY_IDS["AGPL"].update({"AGPL1", "AGPL3"})
+FAMILY_IDS["MPL"] = {"MPL", "MPL-1.0", "MPL-1.1", "MPL-2.0",
+                     "MPL-2.0-NO-COPYLEFT-EXCEPTION"}
+
+
 def known_category(licenses):
-    """Assert only categories whose native license entries are unambiguous."""
+    """Review recognized families; leave other audit categories unconstrained.
+
+    This is a family-presence review policy, not a full SPDX expression evaluator
+    or a determination that an OR alternative imposes copyleft obligations.
+    """
     if not licenses:
         return "Unknown"
     upper = [value.upper() for value in licenses]
-    tokens = [token for value in upper for token in
-              re.split(r"[^A-Z0-9.+-]+", value) if token]
-    if any(re.fullmatch(r"AGPL(?:[.+-][A-Z0-9.+-]+)?", token) for token in tokens):
+    tokens = set()
+    for value in upper:
+        # Preserve LicenseRef/DocumentRef identifiers as whole atoms, including
+        # the colon in DocumentRef-x:LicenseRef-y. A WITH operand is an
+        # exception identifier, not a license family.
+        skip_exception = False
+        for token in re.split(r"[\s(),]+", value):
+            if skip_exception:
+                skip_exception = False
+                continue
+            if token == "WITH":
+                skip_exception = True
+            elif token:
+                tokens.add(token)
+    if tokens & FAMILY_IDS["AGPL"]:
         return "StrongCopyleft"
-    if any(re.fullmatch(r"(?:LGPL|GPL|MPL)(?:[.+-][A-Z0-9.+-]+)?", token)
-           for token in tokens):
+    if any(tokens & FAMILY_IDS[family] for family in ("GPL", "LGPL", "MPL")):
         return "Copyleft"
     if all(re.fullmatch(r"MIT|ISC|0BSD|UNLICENSE|CC0(?:-1\.0)?|BSD(?:-[A-Z0-9.+-]+)?|"
                         r"APACHE(?:-[A-Z0-9.+-]+)?", value) for value in upper):
@@ -172,9 +213,16 @@ def expected_enterprise(packages):
             unknown.append(name)
         for license_value in licenses:
             counts[license_value] += 1
-            if "GPL" in license_value.upper():
+            # Independent family-presence expectations for the exact review
+            # set. Custom references and unrecognized IDs are not evidence of
+            # membership, even when their names contain GPL/LGPL/AGPL/MPL.
+            category = known_category([license_value])
+            if category == "StrongCopyleft":
                 violations.append((name, license_value,
-                                   "Copyleft license (GPL) requires legal review"))
+                                   "Strong copyleft license (AGPL) requires legal review"))
+            elif category == "Copyleft":
+                violations.append((name, license_value,
+                                   "Copyleft license requires legal review"))
     return counts, sorted(unknown), sorted(violations)
 
 
