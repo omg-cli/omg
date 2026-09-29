@@ -590,7 +590,9 @@ fn tracing_safe_audit_text(value: &str) -> String {
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
             c if c.is_control() => {
-                escaped.push_str(&format!("\\u{{{:x}}}", c as u32));
+                // Fully qualified so this stays unambiguous next to `std::io::Write`.
+                let _ =
+                    std::fmt::Write::write_fmt(&mut escaped, format_args!("\\u{{{:x}}}", c as u32));
             }
             c => escaped.push(c),
         }
@@ -2146,15 +2148,17 @@ mod completeness_tests {
     #[derive(Default, Clone)]
     struct MessageCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
-    struct MessageVisitor(std::sync::Arc<std::sync::Mutex<Vec<String>>>, String);
+    /// Only accumulates the rendered message; the capture buffer is owned by the
+    /// subscriber, so the visitor deliberately holds no reference to it.
+    struct MessageVisitor(String);
 
     impl tracing::field::Visit for MessageVisitor {
         fn record_debug(&mut self, _field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.1.push_str(&format!("{value:?}"));
+            let _ = std::fmt::Write::write_fmt(&mut self.0, format_args!("{value:?}"));
         }
 
         fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
-            self.1.push_str(value);
+            self.0.push_str(value);
         }
     }
 
@@ -2172,9 +2176,9 @@ mod completeness_tests {
         fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
 
         fn event(&self, event: &tracing::Event<'_>) {
-            let mut visitor = MessageVisitor(self.0.clone(), String::new());
+            let mut visitor = MessageVisitor(String::new());
             event.record(&mut visitor);
-            self.0.lock().unwrap().push(visitor.1);
+            self.0.lock().unwrap().push(visitor.0);
         }
 
         fn enter(&self, _span: &tracing::span::Id) {}
