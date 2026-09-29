@@ -123,7 +123,7 @@ class LicenseOracleTests(unittest.TestCase):
                   "by_license": {"MIT": 1, "GPL-3.0-only": 1, "Apache-2.0": 1},
                   "unknown": ["gamma"],
                   "violations": [{"package": "beta", "license": "GPL-3.0-only",
-                                  "reason": "Copyleft license (GPL) requires legal review"}]}
+                                  "reason": "Copyleft license requires legal review"}]}
         self.output.write_text(json.dumps(report), encoding="utf-8")
         self.output.chmod(0o600)
         ORACLE.check("enterprise-json", self.output, native)
