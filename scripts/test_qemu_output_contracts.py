@@ -807,37 +807,82 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
             healthy += '  Found dependency: sudo\n'
         if distro in ('debian', 'ubuntu'):
             healthy += '  Found dependency: apt-get\n'
-        healthy_product = ('printf %s ' + shlex.quote(healthy) + '\n'
-                   'if command -v git >/dev/null; then echo "  Optional tool available: git"; '
-                   'else echo "  Optional tool unavailable: git (project and Git integration)"; fi\n'
-                   'if [[ "$1" == doctor ]] && [[ "' + distro + '" == arch ]]; then '
-                   'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
-                   'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
+        git_probe = ('if command -v git >/dev/null; then echo "  Optional tool available: git"; '
+                     'else echo "  Optional tool unavailable: git (project and Git integration)"; fi\n')
+        healthy_prefix = ('printf %s ' + shlex.quote(healthy) + '\n' + git_probe +
+                          'if [[ "$1" == doctor ]] && [[ "' + distro + '" == arch ]]; then '
+                          'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
+                          'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
+        healthy_product = healthy_prefix + 'printf "  PATH configured correctly\\nSystem is healthy with warnings.\\n"\n'
         fault_guard = ('if [[ -n "${OMG_PACMAN_DB_DIR:-}" ]]; then '
                        'printf "  ALPM local package database inconsistent (fixture): missing files\\n"; exit 1; fi\n')
-        product = fault_guard + healthy_product
+        proxy_logic = ('if [[ "${HTTPS_PROXY:-}" == http://127.0.0.1:1 ]]; then\n'
+                   '  printf "  Connectivity probes failed (controlled proxy refusal)\\n"\n'
+                   '  resolved=$(command -v omg || true)\n'
+                   '  if [[ -z "$resolved" ]]; then\n'
+                   '    printf "  omg executable not found on PATH\\n→ Found 2 issue(s). Please review.\\n"\n'
+                   '    printf "Error: doctor found 2 health issue(s)\\n" >&2\n'
+                   '  elif [[ $(readlink -f "$resolved") != $(readlink -f "$0") ]]; then\n'
+                   '    printf "  PATH resolves a different omg executable first: \\"%s\\"\\n→ Found 2 issue(s). Please review.\\n" "$resolved"\n'
+                   '    printf "Error: doctor found 2 health issue(s)\\n" >&2\n'
+                   '  else\n'
+                   '    printf "  PATH configured correctly\\n→ Found 1 issue(s). Please review.\\n"\n'
+                   '    printf "Error: doctor found 1 health issue(s)\\n" >&2\n'
+                   '  fi\n'
+                   '  exit 1\n'
+                   'fi\n')
+        product = fault_guard + healthy_prefix + proxy_logic + 'printf "  PATH configured correctly\\nSystem is healthy with warnings.\\n"\n'
         native = {'pacman': 'case "$1" in -Dk) exit 0 ;; -Qq) printf "one\\ntwo\\n" ;; *) exit 17 ;; esac\n'}
-        result, evidence, logs = self.run_inventory(product, rows, native_commands=native, distro=distro)
+        result, evidence, logs = self.run_inventory(product, rows, native_commands=native,
+                                                    distro=distro, binary_name='omg')
         if distro == 'fedora':
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertEqual(evidence[0]['result'], 'FAIL')
             self.assertIn('did not execute the trusted offline DNF5', logs['doctor.log'])
         else:
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 0, f'{result.stderr}\n{logs}')
             self.assertEqual(evidence[0]['result'], 'PASS')
+            for false_green in (
+                product.replace('  omg executable not found on PATH',
+                                '  PATH configured correctly'),
+                product.replace('  PATH resolves a different omg executable first:',
+                                '  PATH configured correctly:'),
+                product.replace('Found 2 issue(s)', 'Found 1 issue(s)')
+                       .replace('doctor found 2 health issue(s)',
+                                'doctor found 1 health issue(s)'),
+            ):
+                result, evidence, logs = self.run_inventory(
+                    false_green, rows, native_commands=native, distro=distro, binary_name='omg')
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                self.assertIn('controlled Doctor PATH probe', logs['doctor.log'])
         if distro == 'arch':
+            stalled = product.replace(
+                'if [[ "${HTTPS_PROXY:-}" == http://127.0.0.1:1 ]]; then\n',
+                'if [[ "${HTTPS_PROXY:-}" == http://127.0.0.1:1 ]]; then sleep 3; fi\n'
+                'if [[ "${HTTPS_PROXY:-}" == http://127.0.0.1:1 ]]; then\n', 1)
+            result, evidence, logs = self.run_inventory(
+                stalled, rows, native_commands=native, distro=distro, row_timeout=1,
+                binary_name='omg')
+            self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+            self.assertEqual(evidence[0]['exit_code'], 124,
+                             'a timed-out probe must retain its executor identity')
+            self.assertIn('did not execute as a product run', logs['doctor.log'])
             silent_fault = healthy_product
             result, evidence, logs = self.run_inventory(silent_fault, rows,
-                                                        native_commands=native, distro=distro)
+                                                        native_commands=native, distro=distro,
+                                                        binary_name='omg')
             self.assertEqual(evidence[0]['result'], 'FAIL', logs)
             self.assertIn('doctor accepted a corrupt Arch local package entry', logs['doctor.log'])
-            spoofed = fault_guard + 'printf %s ' + shlex.quote(healthy + '  Optional tool available: git\n') + '\n'
-            result, evidence, logs = self.run_inventory(spoofed, rows, native_commands=native, distro=distro)
+            spoofed = product.replace(git_probe, 'echo "  Optional tool available: git"\n')
+            result, evidence, logs = self.run_inventory(spoofed, rows, native_commands=native,
+                                                        distro=distro, binary_name='omg')
             self.assertEqual(evidence[0]['result'], 'FAIL',
                              'a fixed Git verdict must fail under the restricted PATH')
             self.assertIn('did not report absent Git/AUR tools', logs['doctor.log'])
         result, evidence, logs = self.run_inventory('printf "Doctor is healthy\\n"\n', rows,
-                                                    native_commands=native, distro=distro)
+                                                    native_commands=native, distro=distro,
+                                                    binary_name='omg')
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(evidence[0]['result'], 'FAIL')
         self.assertIn('doctor did not identify', logs['doctor.log'])
@@ -1733,7 +1778,7 @@ esac
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
-    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False):
+    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, binary_name='product'):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -1748,7 +1793,7 @@ esac
                 tool = root / 'bin' / name
                 tool.write_text('#!/usr/bin/env bash\n' + content, encoding='utf-8', newline='\n')
                 tool.chmod(0o755)
-            binary = root / 'product'
+            binary = root / binary_name
             # The real submitted product is an ELF executable and remains
             # launchable when its PATH is restricted. Use an absolute shell
             # interpreter for the fixture so it has that same property.

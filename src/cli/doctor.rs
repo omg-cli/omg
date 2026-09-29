@@ -132,11 +132,29 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     }
 
     // 5. PATH Configuration
-    if check_path() {
-        println!("  {}", style::success("PATH configured correctly"));
-    } else {
-        println!("  {}", style::error("OMG bin directory not in PATH"));
-        issues += 1;
+    match check_path() {
+        PathStatus::Current => println!("  {}", style::success("PATH configured correctly")),
+        PathStatus::Missing => {
+            println!("  {}", style::error("omg executable not found on PATH"));
+            issues += 1;
+        }
+        PathStatus::Shadowed(found) => {
+            let found = style::sanitize_terminal_text(&found.display().to_string());
+            println!(
+                "  {}",
+                style::error(&format!(
+                    "PATH resolves a different omg executable first: \"{found}\""
+                ))
+            );
+            issues += 1;
+        }
+        PathStatus::Unverifiable => {
+            println!(
+                "  {}",
+                style::error("Could not verify the omg executable on PATH")
+            );
+            issues += 1;
+        }
     }
 
     // 6. Shell Hook. A missing hook only costs shell integration,
@@ -998,28 +1016,74 @@ async fn check_daemon() -> DaemonStatus {
     }
 }
 
-fn check_path() -> bool {
+#[derive(Debug, PartialEq, Eq)]
+enum PathStatus {
+    Current,
+    Missing,
+    Shadowed(std::path::PathBuf),
+    Unverifiable,
+}
+
+fn check_path() -> PathStatus {
     if crate::core::paths::test_mode() {
-        return true;
+        return PathStatus::Current;
     }
     let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
+        return PathStatus::Missing;
     };
-    let paths: Vec<std::path::PathBuf> = std::env::split_paths(&path_var).collect();
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
-    let data_bin = crate::core::paths::data_dir().join("bin");
-    let home_bin = dirs::home_dir().map(|h| h.join(".local/bin"));
+    let (Ok(cwd), Ok(current_exe)) = (std::env::current_dir(), std::env::current_exe()) else {
+        return PathStatus::Unverifiable;
+    };
+    path_status(&path_var, &cwd, &current_exe)
+}
 
-    // Compare PATH entries as whole components via split_paths; a substring
-    // check falsely matched lookalike directories (e.g. /usr/local/bin-backup)
-    // and vacuously passed when the exe dir was non-UTF-8.
-    // Accept if either the running executable directory, OMG's managed data
-    // bin directory (~/.local/share/omg/bin), or user bin (~/.local/bin) is in PATH.
-    paths.iter().any(|dir| {
-        exe_dir.as_ref() == Some(dir) || dir == &data_bin || home_bin.as_ref() == Some(dir)
-    })
+fn path_status(
+    path_var: &std::ffi::OsStr,
+    cwd: &std::path::Path,
+    current_exe: &std::path::Path,
+) -> PathStatus {
+    // Shell lookup uses the first runnable match, including relative PATH
+    // entries. Resolve each entry against the caller's cwd before probing so
+    // this stays testable without changing the process-wide working directory.
+    for entry in std::env::split_paths(path_var) {
+        let directory = if entry.is_absolute() {
+            entry
+        } else {
+            cwd.join(entry)
+        };
+        let Ok(mut matches) = which::which_in_global("omg", Some(directory.as_os_str())) else {
+            continue;
+        };
+        let Some(found) = matches.next() else {
+            continue;
+        };
+        // `which` decides executability from mode bits alone, so a directory
+        // carrying any execute bit can be returned as a match. A directory is
+        // not a runnable `omg`; keep searching the remaining PATH entries.
+        if !found.is_file() {
+            continue;
+        }
+        return match same_executable_file(&found, current_exe) {
+            Some(true) => PathStatus::Current,
+            Some(false) => PathStatus::Shadowed(found),
+            None => PathStatus::Unverifiable,
+        };
+    }
+    PathStatus::Missing
+}
+
+#[cfg(unix)]
+fn same_executable_file(found: &std::path::Path, running: &std::path::Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let found = found.metadata().ok()?;
+    let running = running.metadata().ok()?;
+    Some(found.dev() == running.dev() && found.ino() == running.ino())
+}
+
+#[cfg(not(unix))]
+fn same_executable_file(found: &std::path::Path, running: &std::path::Path) -> Option<bool> {
+    Some(found.canonicalize().ok()? == running.canonicalize().ok()?)
 }
 
 fn check_shell_hook() -> bool {
@@ -1488,6 +1552,154 @@ mod tests {
         assert!(finish_doctor(0, 2).is_ok());
         let err = finish_doctor(3, 0).expect_err("issues must produce Err");
         assert!(err.to_string().contains('3'), "err: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_requires_an_executable_omg_not_just_a_listed_bin_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::TempDir::new().expect("isolated PATH fixture");
+        let bin = fixture.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("user bin fixture");
+        let path = std::env::join_paths([&bin]).expect("fixture PATH");
+
+        let status = || path_status(&path, fixture.path(), &bin.join("omg"));
+        assert_eq!(status(), PathStatus::Missing, "empty bin is not proof");
+        let other = bin.join("omgd");
+        std::fs::write(&other, b"#!/bin/sh\nexit 0\n").expect("other executable");
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+        assert_eq!(status(), PathStatus::Missing, "omgd does not satisfy omg");
+
+        let omg = bin.join("omg");
+        std::fs::write(&omg, b"#!/bin/sh\nexit 0\n").expect("omg fixture");
+        std::fs::set_permissions(&omg, std::fs::Permissions::from_mode(0o600))
+            .expect("non-executable permissions");
+        assert_eq!(
+            status(),
+            PathStatus::Missing,
+            "non-executable omg is not runnable"
+        );
+        std::fs::set_permissions(&omg, std::fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+        assert_eq!(status(), PathStatus::Current, "runnable omg must be found");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_rejects_a_directory_named_omg_and_keeps_searching() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::TempDir::new().expect("isolated PATH fixture");
+        let decoy = fixture.path().join("decoy");
+        let real = fixture.path().join("real");
+        std::fs::create_dir_all(&decoy).expect("decoy bin fixture");
+        std::fs::create_dir_all(&real).expect("real bin fixture");
+        let path = std::env::join_paths([&decoy, &real]).expect("fixture PATH");
+
+        // `which` decides executability from mode bits alone, so a directory
+        // carrying the execute bit can be handed back as a match. A directory
+        // is not a runnable `omg` and must not satisfy the check.
+        let as_directory = decoy.join("omg");
+        std::fs::create_dir_all(&as_directory).expect("omg directory fixture");
+        std::fs::set_permissions(&as_directory, std::fs::Permissions::from_mode(0o755))
+            .expect("executable directory permissions");
+
+        let status = || path_status(&path, fixture.path(), &real.join("omg"));
+        assert_eq!(
+            status(),
+            PathStatus::Missing,
+            "a directory named omg is not a runnable omg"
+        );
+
+        let omg = real.join("omg");
+        std::fs::write(&omg, b"#!/bin/sh\nexit 0\n").expect("omg fixture");
+        std::fs::set_permissions(&omg, std::fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+        assert_eq!(
+            status(),
+            PathStatus::Current,
+            "a runnable omg later on PATH must still be found"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_follows_a_runnable_symlink_and_rejects_a_broken_one() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let fixture = tempfile::TempDir::new().expect("isolated PATH fixture");
+        let bin = fixture.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin fixture");
+        let target = fixture.path().join("real-omg");
+        symlink(&target, bin.join("omg")).expect("omg symlink");
+        let path = std::env::join_paths([&bin]).expect("fixture PATH");
+        assert_eq!(
+            path_status(&path, fixture.path(), &target),
+            PathStatus::Missing,
+            "broken symlink is not runnable"
+        );
+
+        std::fs::write(&target, b"#!/bin/sh\nexit 0\n").expect("symlink target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+        assert_eq!(
+            path_status(&path, fixture.path(), &target),
+            PathStatus::Current,
+            "runnable symlink must be found"
+        );
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("non-executable permissions");
+        assert_eq!(
+            path_status(&path, fixture.path(), &target),
+            PathStatus::Missing,
+            "symlink target must be runnable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_uses_relative_entries_and_rejects_an_earlier_shadowing_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::TempDir::new().expect("isolated PATH fixture");
+        let bin = fixture.path().join("bin");
+        let stale = fixture.path().join("stale");
+        std::fs::create_dir(&bin).expect("current bin");
+        std::fs::create_dir(&stale).expect("stale bin");
+        let current = bin.join("omg");
+        let shadow = stale.join("omg");
+        for executable in [&current, &shadow] {
+            std::fs::write(executable, b"#!/bin/sh\nexit 0\n").expect("executable fixture");
+            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700))
+                .expect("executable permissions");
+        }
+
+        let relative = std::env::join_paths(["./bin"]).expect("relative PATH");
+        assert_eq!(
+            path_status(&relative, fixture.path(), &current),
+            PathStatus::Current,
+            "a relative PATH entry launches the current OMG from this directory"
+        );
+
+        let hardlink_bin = fixture.path().join("hardlink-bin");
+        std::fs::create_dir(&hardlink_bin).expect("hardlink bin");
+        std::fs::hard_link(&current, hardlink_bin.join("omg")).expect("same executable hardlink");
+        let hardlinked = std::env::join_paths([&hardlink_bin, &bin]).expect("hardlink PATH");
+        assert_eq!(
+            path_status(&hardlinked, fixture.path(), &current),
+            PathStatus::Current,
+            "an earlier hardlink to the running binary is not a shadow"
+        );
+
+        let shadowed = std::env::join_paths([&stale, &bin]).expect("shadowed PATH");
+        assert_eq!(
+            path_status(&shadowed, fixture.path(), &current),
+            PathStatus::Shadowed(shadow),
+            "the first executable on PATH controls the next plain omg command"
+        );
     }
 
     #[cfg(target_os = "linux")]
