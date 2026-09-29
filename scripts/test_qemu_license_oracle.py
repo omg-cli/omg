@@ -54,6 +54,101 @@ class LicenseOracleTests(unittest.TestCase):
             {"name": "gamma", "version": "3.0-1", "license": "Unknown", "category": "Unknown"},
         ]
 
+    def test_independent_spdx_families_and_native_aliases(self):
+        # SPDX IDs are not arbitrary strings containing a family name.
+        # Legacy native spellings are family aliases, not claims about
+        # whether a package's license is "only" or "or later".
+        families = {
+            "Copyleft": {
+                "GPL", "GPL1", "GPL2", "GPL3", "LGPL", "LGPL2", "LGPL2.1",
+                "LGPL3", "MPL", "MPL-1.0", "MPL-1.1", "MPL-2.0",
+                "MPL-2.0-no-copyleft-exception",
+                "GPL-1.0", "GPL-2.0", "GPL-3.0", "LGPL-2.0", "LGPL-2.1", "LGPL-3.0",
+            },
+            "StrongCopyleft": {"AGPL", "AGPL1", "AGPL3", "AGPL-1.0", "AGPL-3.0"},
+        }
+        for category, identifiers in families.items():
+            for identifier in identifiers:
+                with self.subTest(identifier=identifier):
+                    self.assertEqual(ORACLE.known_category([identifier]), category)
+                    self.assertEqual(ORACLE.known_category([identifier.lower()]), category)
+        for base in ("GPL-1.0", "GPL-2.0", "GPL-3.0", "LGPL-2.0", "LGPL-2.1",
+                     "LGPL-3.0", "AGPL-1.0", "AGPL-3.0"):
+            category = "StrongCopyleft" if base.startswith("AGPL") else "Copyleft"
+            for suffix in ("-only", "-or-later", "+"):
+                with self.subTest(identifier=base + suffix):
+                    self.assertEqual(ORACLE.known_category([base + suffix]), category)
+        self.assertEqual(ORACLE.known_category(
+            ["MIT OR (LGPL2.1 AND AGPL-3.0-only)"]), "StrongCopyleft")
+        self.assertEqual(ORACLE.known_category(
+            ["GPL-2.0-only WITH Linux-syscall-note OR MIT"]), "Copyleft")
+
+    def test_custom_references_and_substrings_are_not_family_identifiers(self):
+        for value in ("LicenseRef-Example", "LicenseRef-GPL-2.0-only",
+                      "DocumentRef-GPL:LicenseRef-MPL-2.0", "custom:GPL",
+                      "NotGPL", "GPLish", "example", "AGPL-99.0", "GPL-2.0-fake",
+                      "MPL-2.0-made-up", "MIT WITH GPL-2.0-only"):
+            with self.subTest(value=value):
+                self.assertIsNone(ORACLE.known_category([value]))
+                self.assertEqual(ORACLE.expected_enterprise(
+                    {"custom": ("1", [value])})[2], [])
+        self.assertEqual(ORACLE.known_category(
+            ["LicenseRef-GPL OR AGPL-3.0-only"]), "StrongCopyleft")
+
+    def test_enterprise_family_presence_is_not_substring_matching(self):
+        packages = {
+            "network": ("1", ["MIT OR AGPL-3.0-only"]),
+            "library": ("1", ["LGPL2.1"]),
+            "custom": ("1", ["LicenseRef-Example", "DocumentRef-GPL:LicenseRef-MPL"]),
+            "source-available": ("1", ["SSPL-1.0", "BUSL-1.1"]),
+        }
+        self.assertEqual(ORACLE.expected_enterprise(packages)[2], [
+            ("library", "LGPL2.1", "Copyleft license requires legal review"),
+            ("network", "MIT OR AGPL-3.0-only",
+             "Strong copyleft license (AGPL) requires legal review"),
+        ])
+
+    def test_retained_native_rows_have_an_exact_independent_violation_set(self):
+        # Literal assignments transcribed from retained run 36605828415:
+        # pr-702/qemu-arch/run-0KNsr4/inventory/rows/audit-licenses.stdout.log.
+        # Categories from that product report are deliberately NOT used.
+        packages = {
+            "gptfdisk": ("1.0.10-2", ["GPL2"]),
+            "grep": ("3.12-2", ["GPL3"]),
+            "make": ("4.4.1-3", ["GPL3"]),
+            "libmnl": ("1.0.5-2", ["LGPL2.1"]),
+            "libidn2": ("2.3.8-1", ["GPL2", "LGPL3"]),
+            "ca-certificates-mozilla": ("3.130-1", ["MPL-2.0"]),
+            "libpsl": ("0.21.5-2", ["MIT"]),
+        }
+        reason = "Copyleft license requires legal review"
+        expected = sorted([
+            ("gptfdisk", "GPL2", reason), ("grep", "GPL3", reason),
+            ("make", "GPL3", reason), ("libmnl", "LGPL2.1", reason),
+            ("libidn2", "GPL2", reason), ("libidn2", "LGPL3", reason),
+            ("ca-certificates-mozilla", "MPL-2.0", reason),
+        ])
+        counts, unknown, violations = ORACLE.expected_enterprise(packages)
+        self.assertEqual(dict(counts),
+                         {"GPL2": 2, "GPL3": 2, "LGPL2.1": 1, "LGPL3": 1,
+                          "MPL-2.0": 1, "MIT": 1})
+        self.assertEqual(unknown, [])
+        self.assertEqual(violations, expected)
+        report = {"total": 7, "by_license": dict(counts), "unknown": [],
+                  "violations": [dict(package=name, license=license_value, reason=why)
+                                 for name, license_value, why in expected]}
+        self.output.write_text(json.dumps(report), encoding="utf-8")
+        self.output.chmod(0o600)
+        ORACLE.check("enterprise-json", self.output, packages)
+        for bad_rows in (report["violations"][:-1],
+                         report["violations"] + [report["violations"][0]],
+                         report["violations"] + [dict(package="libpsl", license="MIT",
+                                                       reason=reason)]):
+            self.output.write_text(json.dumps(dict(report, violations=bad_rows)),
+                                   encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "enterprise violations differ"):
+                ORACLE.check("enterprise-json", self.output, packages)
+
     def test_wrong_or_incomplete_audit_json_is_rejected(self):
         native = self.native()
         self.output.write_text(json.dumps(self.audit_rows()), encoding="utf-8")
