@@ -21,6 +21,8 @@ set -eu
 printf '%s\n' "$*" >> "$FIXTURE/ssh.log"
 cmd=${*: -1}
 if [[ "$cmd" == true ]]; then
+  # Deliberately consume launch/command time as well as retry sleep time.
+  if [[ "$SCENARIO" == sequential ]]; then sleep 0.6; fi
   n=$(cat "$FIXTURE/initial-count"); echo $((n+1)) > "$FIXTURE/initial-count"
   if [[ "$SCENARIO" == initial-expiry ]]; then
     trap '' TERM
@@ -29,6 +31,7 @@ if [[ "$cmd" == true ]]; then
   if [[ "$SCENARIO" == sequential && $n -lt 2 ]]; then exit 1; fi
 fi
 if [[ "$*" == *'cat /proc/sys/kernel/random/boot_id'* ]]; then
+  if [[ "$SCENARIO" == sequential ]]; then sleep 0.6; fi
   n=$(cat "$FIXTURE/reboot-count"); echo $((n+1)) > "$FIXTURE/reboot-count"
   if [[ $n == 0 ]]; then echo before
   elif [[ "$SCENARIO" == reboot-expiry || ( "$SCENARIO" == sequential && $n -lt 3 ) ]]; then echo before
@@ -48,7 +51,12 @@ class BootDeadlineExecution(unittest.TestCase):
         # Run the actual readiness/SSH/reboot code, not QEMU setup.
         start_marker = "# Absolute phase deadlines" if "# Absolute phase deadlines" in boot else "opts=(-i client-key -p 2222"
         phases = boot[boot.index(start_marker):]
-        phases = phases.replace("SSH_WAIT_BUDGET=1680", "SSH_WAIT_BUDGET=4")
+        # Successful phase: two (0.6s probe + 1s retry) failures then a
+        # 0.6s success = 3.8s. Reserve another whole second for SECONDS
+        # quantization and 1s for kill grace: 5.8s requires a 6s deadline.
+        # The old 4s fixture could stop before probe three even though neither
+        # guest nor production deadline was faulty. Keep real clocks/timeout.
+        phases = phases.replace("SSH_WAIT_BUDGET=1680", "SSH_WAIT_BUDGET=6")
         phases = phases.replace("SSH_ATTEMPT_TIMEOUT=12", "SSH_ATTEMPT_TIMEOUT=1")
         phases = phases.replace("SSH_KILL_GRACE=2", "SSH_KILL_GRACE=1")
         phases = phases.replace("SSH_RETRY_DELAY=2", "SSH_RETRY_DELAY=1")
@@ -91,6 +99,8 @@ class BootDeadlineExecution(unittest.TestCase):
         self.assertIn("reboot verified: before -> after", result.stdout)
         self.assertGreaterEqual(calls.count("bench@127.0.0.1 true"), 3)
         self.assertGreaterEqual(calls.count("cat /proc/sys/kernel/random/boot_id"), 4)
+        self.assertEqual(calls.count("bench@127.0.0.1 true"), 3)
+        self.assertEqual(calls.count("cat /proc/sys/kernel/random/boot_id"), 4)
         self.assertGreater(elapsed, 3)
         self.assertLess(elapsed, 12)
 
