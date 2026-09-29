@@ -1806,7 +1806,9 @@ pub(crate) fn list_installed_versions(versions_dir: &Path) -> Result<Vec<String>
 /// Compare version strings in ascending order.
 ///
 /// Semantic versions use SemVer precedence, including pre-release ordering.
-/// Other vendor formats fall back to unbounded numeric component comparison.
+/// Other vendor formats fall back to unbounded numeric component comparison,
+/// and fall back further still to SemVer-style pre-release precedence once a
+/// pre-release marker is recognised in the trailing suffix.
 #[must_use]
 pub(crate) fn version_cmp(a: &str, b: &str) -> Ordering {
     if let (Ok(a), Ok(b)) = (
@@ -1831,19 +1833,82 @@ pub(crate) fn version_cmp(a: &str, b: &str) -> Ordering {
         left.len().cmp(&right.len()).then_with(|| left.cmp(right))
     }
 
-    let a_parts = numeric_parts(a);
-    let b_parts = numeric_parts(b);
-    let max_len = a_parts.len().max(b_parts.len());
+    /// Compare two numeric component lists position by position, padding the
+    /// shorter list with zeroes. Components stay as digit strings, so absurdly
+    /// long vendor components never overflow an integer.
+    fn compare_part_lists(left: &[&str], right: &[&str]) -> Ordering {
+        let max_len = left.len().max(right.len());
+        (0..max_len)
+            .map(|index| {
+                compare_numeric_parts(
+                    left.get(index).copied().unwrap_or("0"),
+                    right.get(index).copied().unwrap_or("0"),
+                )
+            })
+            .find(|&ordering| ordering != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    }
 
-    (0..max_len)
-        .map(|index| {
-            compare_numeric_parts(
-                a_parts.get(index).copied().unwrap_or("0"),
-                b_parts.get(index).copied().unwrap_or("0"),
-            )
-        })
-        .find(|&ordering| ordering != Ordering::Equal)
-        .unwrap_or(Ordering::Equal)
+    /// Split a version at its first character that is neither a digit nor a dot,
+    /// yielding the numeric core and the trailing pre-release/build suffix.
+    ///
+    /// `3.12.0` -> (`3.12.0`, `""`), `3.12.0rc1` -> (`3.12.0`, `rc1`),
+    /// `3.12.0-1ubuntu1` -> (`3.12.0`, `-1ubuntu1`).
+    fn core_and_suffix(version: &str) -> (&str, &str) {
+        match version.find(|character: char| !character.is_ascii_digit() && character != '.') {
+            Some(index) => version.split_at(index),
+            None => (version, ""),
+        }
+    }
+
+    /// Return whether a trailing suffix names a pre-release rather than a
+    /// build, distro or packaging suffix.
+    ///
+    /// Only a whole leading alphabetic run is matched, so `-1ubuntu` and
+    /// `-amd64` keep their numeric ordering while `-rc1`, `-beta.2` and `rc1`
+    /// are recognised as pre-releases.
+    fn is_pre_release(suffix: &str) -> bool {
+        const MARKERS: [&str; 9] = [
+            "alpha", "beta", "rc", "pre", "dev", "nightly", "snapshot", "a", "b",
+        ];
+        let marker: String = suffix
+            .trim_start_matches(|character: char| !character.is_ascii_alphanumeric())
+            .chars()
+            .take_while(char::is_ascii_alphabetic)
+            .collect();
+        MARKERS.contains(&marker.as_str())
+    }
+
+    let (a_core, a_suffix) = core_and_suffix(a);
+    let (b_core, b_suffix) = core_and_suffix(b);
+    let a_pre_release = is_pre_release(a_suffix);
+    let b_pre_release = is_pre_release(b_suffix);
+
+    if a_pre_release || b_pre_release {
+        // The numeric core decides first, so a pre-release marker never
+        // reorders two distinct release lines: `3.15.0rc1` still beats
+        // `3.14.0`, and `3.12.0-beta1` still trails `3.13.0`.
+        match compare_part_lists(&numeric_parts(a_core), &numeric_parts(b_core)) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+        // Equal cores: SemVer precedence puts a pre-release below its final
+        // release. Without this the trailing pre-release digits survive the
+        // numeric split and `3.12.0-rc1` would outrank `3.12.0`.
+        return match (a_pre_release, b_pre_release) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (true, true) => compare_part_lists(&numeric_parts(a_suffix), &numeric_parts(b_suffix))
+                .then_with(|| a_suffix.cmp(b_suffix)),
+            // Unreachable: the enclosing `if a_pre_release || b_pre_release`
+            // guard means at least one side was recognised as a pre-release.
+            (false, false) => Ordering::Equal,
+        };
+    }
+
+    // No pre-release marker: keep the unbounded numeric comparison that
+    // vendor formats such as `1.0.0-1ubuntu1` and `1.9.9` rely on.
+    compare_part_lists(&numeric_parts(a), &numeric_parts(b))
 }
 
 /// Normalize version string (remove leading 'v' if present)
@@ -1901,7 +1966,11 @@ pub(crate) fn resolve_partial_version(available: &[String], requested: &str) -> 
     available
         .iter()
         .filter(|candidate| extends_request(candidate))
-        .max_by(|a, b| version_cmp(a, b))
+        // `max_by` yields the LAST maximum, so a bare version comparison lets
+        // the vendor's list order pick the winner among equal candidates.
+        // Tie-break on the raw string to make the choice deterministic; a
+        // final release already outranks a pre-release via `version_cmp`.
+        .max_by(|a, b| version_cmp(a, b).then_with(|| a.cmp(b)))
         .map(|newest| newest.trim_start_matches(['v', 'V']).to_owned())
 }
 
@@ -2831,6 +2900,60 @@ mod tests {
             version_cmp("1.00000000000000000010", "1.9"),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn version_cmp_orders_a_non_semver_prerelease_below_its_release() {
+        // These fall through to the vendor-format comparison because the
+        // four-component / two-component forms do not parse as semver. Before
+        // the fix, `numeric_parts` kept the digits trailing the separator, so
+        // `1.2.3.4-rc1` reduced to ["1","2","3","4","1"] and outranked
+        // `1.2.3.4`.
+        assert_eq!(version_cmp("1.2.3.4-rc1", "1.2.3.4"), Ordering::Less);
+        assert_eq!(version_cmp("1.2.3.4", "1.2.3.4-rc1"), Ordering::Greater);
+        assert_eq!(version_cmp("2024.01-beta", "2024.01"), Ordering::Less);
+        assert_eq!(version_cmp("3.12.0-beta.2", "3.12.0"), Ordering::Less);
+    }
+
+    #[test]
+    fn version_cmp_keeps_distinct_release_lines_ordered_across_pre_release_markers() {
+        // The numeric core must decide first: a pre-release marker on a newer
+        // line still outranks an older final release.
+        assert_eq!(version_cmp("3.15.0rc1", "3.14.0"), Ordering::Greater);
+        assert_eq!(version_cmp("3.12.0-beta1", "3.13.0"), Ordering::Less);
+        assert_eq!(version_cmp("1.0.0-rc.10", "1.0.0-rc.2"), Ordering::Greater);
+    }
+
+    #[test]
+    fn version_cmp_ignores_distro_and_build_suffixes_when_ordering() {
+        // A packaging suffix is not a pre-release, so numeric ordering decides.
+        assert_eq!(
+            version_cmp("1.0.0-1ubuntu1", "1.0.0-1ubuntu2"),
+            Ordering::Less
+        );
+        assert_eq!(
+            version_cmp("1.0.0-1.fc39", "1.0.0-1.fc38"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            version_cmp("1.0.0-1ubuntu1", "1.0.0-2ubuntu1"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn resolve_partial_version_breaks_ties_independently_of_input_order() {
+        // `3.12` and `3.12.0` compare Equal, so the winner used to be decided
+        // by the position in the vendor's remote list. It must not be.
+        let forward = ["3.12".to_string(), "3.12.0".to_string()];
+        let reversed = ["3.12.0".to_string(), "3.12".to_string()];
+        let from_forward = resolve_partial_version(&forward, "3.12").expect("match");
+        let from_reversed = resolve_partial_version(&reversed, "3.12").expect("match");
+        assert_eq!(
+            from_forward, from_reversed,
+            "candidate order from a remote index must not change the resolution"
+        );
+        assert_eq!(from_forward, "3.12.0");
     }
 
     #[test]
