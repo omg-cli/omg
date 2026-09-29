@@ -195,9 +195,40 @@ pub struct AuditEntry {
     pub metadata: Option<serde_json::Value>,
     /// Hash of previous entry (for chain integrity)
     pub prev_hash: String,
+    /// Chain-hash preimage encoding used for this entry.
+    ///
+    /// Older logs predate this marker, so it defaults to
+    /// [`HASH_VERSION_LEGACY`] and their concatenated preimage keeps verifying.
+    /// New entries use [`HASH_VERSION_LENGTH_PREFIXED`], which length-prefixes
+    /// every field so no two distinct entries share a preimage.
+    #[serde(default)]
+    pub hash_version: u8,
     /// Hash of this entry (computed from all fields except this one)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+}
+
+/// Preimage encoding used by logs written before length prefixes existed: the
+/// field values were concatenated with no separator, so `resource="ab",
+/// description=""` and `resource="a", description="b"` hashed identically.
+/// Retained only so retained logs still verify; never written again.
+const HASH_VERSION_LEGACY: u8 = 0;
+/// Current preimage encoding.
+///
+/// Each field is hashed as a big-endian `u64` byte length followed by its
+/// bytes, and the version byte is bound into the preimage so an entry cannot
+/// be replayed under a different encoding.
+pub const HASH_VERSION_LENGTH_PREFIXED: u8 = 1;
+
+/// Feed one field into the chain hash as a fixed-width length followed by its
+/// bytes. This keeps the encoding injective: no separator byte is needed, so
+/// field content that looks like a delimiter cannot shift a later field.
+fn update_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    // Saturated rather than truncating: a field that long cannot exist on a
+    // 64-bit target, and saturating keeps the prefix unique either way.
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    hasher.update(len.to_be_bytes());
+    hasher.update(bytes);
 }
 
 impl AuditEntry {
@@ -205,23 +236,47 @@ impl AuditEntry {
     #[must_use]
     pub fn compute_hash(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(self.id.as_bytes());
-        hasher.update(self.timestamp.as_bytes());
-        hasher.update(format!("{:?}", self.event_type).as_bytes());
-        hasher.update(format!("{:?}", self.severity).as_bytes());
-        hasher.update(self.user.as_bytes());
-        hasher.update(self.resource.as_bytes());
-        hasher.update(self.description.as_bytes());
-        if let Some(meta) = &self.metadata {
-            hasher.update(meta.to_string().as_bytes());
+        if self.hash_version == HASH_VERSION_LEGACY {
+            hasher.update(self.id.as_bytes());
+            hasher.update(self.timestamp.as_bytes());
+            hasher.update(format!("{:?}", self.event_type).as_bytes());
+            hasher.update(format!("{:?}", self.severity).as_bytes());
+            hasher.update(self.user.as_bytes());
+            hasher.update(self.resource.as_bytes());
+            hasher.update(self.description.as_bytes());
+            if let Some(meta) = &self.metadata {
+                hasher.update(meta.to_string().as_bytes());
+            }
+            hasher.update(self.prev_hash.as_bytes());
+        } else {
+            hasher.update([self.hash_version]);
+            update_length_prefixed(&mut hasher, self.id.as_bytes());
+            update_length_prefixed(&mut hasher, self.timestamp.as_bytes());
+            update_length_prefixed(&mut hasher, format!("{:?}", self.event_type).as_bytes());
+            update_length_prefixed(&mut hasher, format!("{:?}", self.severity).as_bytes());
+            update_length_prefixed(&mut hasher, self.user.as_bytes());
+            update_length_prefixed(&mut hasher, self.resource.as_bytes());
+            update_length_prefixed(&mut hasher, self.description.as_bytes());
+            // Absent metadata is an empty field, not an omitted one, so it
+            // cannot collide with `Some(empty)`.
+            let metadata = self
+                .metadata
+                .as_ref()
+                .map_or_else(String::new, ToString::to_string);
+            update_length_prefixed(&mut hasher, metadata.as_bytes());
+            update_length_prefixed(&mut hasher, self.prev_hash.as_bytes());
         }
-        hasher.update(self.prev_hash.as_bytes());
         hex::encode(hasher.finalize())
     }
 
     /// Verify the integrity of this entry
     #[must_use]
     pub fn verify(&self) -> bool {
+        // Fail closed on encodings this build does not implement rather than
+        // hashing them with the nearest known preimage.
+        if self.hash_version > HASH_VERSION_LENGTH_PREFIXED {
+            return false;
+        }
         if let Some(hash) = &self.hash {
             &self.compute_hash() == hash
         } else {
@@ -340,6 +395,7 @@ impl AuditLogger {
             description: bounded_audit_field(description),
             metadata: None,
             prev_hash,
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
 
@@ -1538,6 +1594,7 @@ mod tests {
             description: "Installed firefox".to_string(),
             metadata: None,
             prev_hash: "genesis".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
 
@@ -1558,6 +1615,7 @@ mod tests {
             description: "Installed firefox".to_string(),
             metadata: None,
             prev_hash: "genesis".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
 
@@ -1567,6 +1625,118 @@ mod tests {
         // Tamper with the entry
         entry.description = "Tampered".to_string();
         assert!(!entry.verify());
+    }
+
+    fn collision_test_entry(resource: &str, description: &str) -> AuditEntry {
+        AuditEntry {
+            id: "test-id".to_string(),
+            timestamp: "2026-01-16T00:00:00Z".to_string(),
+            event_type: AuditEventType::PackageInstall,
+            severity: AuditSeverity::Info,
+            user: "test".to_string(),
+            resource: resource.to_string(),
+            description: description.to_string(),
+            metadata: None,
+            prev_hash: "genesis".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
+            hash: None,
+        }
+    }
+
+    #[test]
+    fn length_prefixed_hash_separates_shifted_field_boundaries() {
+        // The pre-fix concatenation hashed `resource` and `description` back to
+        // back, so these two attacker-influenced entries collided.
+        let first = collision_test_entry("ab", "");
+        let second = collision_test_entry("a", "b");
+        assert_ne!(
+            first.compute_hash(),
+            second.compute_hash(),
+            "length-prefixed encoding must keep field boundaries injective"
+        );
+
+        // The same collision also existed between user and resource, and between
+        // absent metadata and empty metadata.
+        let third = collision_test_entry("bc", "");
+        let mut fourth = collision_test_entry("c", "");
+        fourth.user = "b".to_string();
+        assert_ne!(third.compute_hash(), fourth.compute_hash());
+
+        let mut with_empty_metadata = collision_test_entry("pkg", "d");
+        with_empty_metadata.metadata = Some(serde_json::json!(""));
+        let without_metadata = collision_test_entry("pkg", "d");
+        assert_ne!(
+            with_empty_metadata.compute_hash(),
+            without_metadata.compute_hash()
+        );
+    }
+
+    #[test]
+    fn legacy_entries_without_a_version_marker_keep_verifying() {
+        // A log written before the version marker existed deserializes the
+        // missing field as 0 and must verify with the old concatenated preimage
+        // instead of being reported corrupt.
+        let temp = tempfile::TempDir::new().unwrap();
+        let log_path = temp.path().join("audit.jsonl");
+
+        let legacy = collision_test_entry("ab", "");
+        let mut legacy_line = legacy;
+        legacy_line.hash_version = HASH_VERSION_LEGACY;
+        legacy_line.hash = Some(legacy_line.compute_hash());
+        std::fs::write(
+            &log_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&legacy_line).expect("serialize legacy entry")
+            ),
+        )
+        .unwrap();
+
+        let report = AuditLogger::new_in(&log_path)
+            .expect("open legacy log")
+            .verify_integrity()
+            .expect("verify legacy log");
+        assert!(
+            report.is_valid(),
+            "legacy chain must stay valid: {report:?}"
+        );
+        assert_eq!(report.total_entries, 1);
+        assert_eq!(report.valid_entries, 1);
+
+        // Appending to a retained legacy log keeps the chain intact: the new
+        // entry links to the legacy tail hash and uses the current encoding.
+        let mut logger = AuditLogger::new_in(&log_path).expect("append to legacy log");
+        logger
+            .log(
+                AuditEventType::PackageInstall,
+                AuditSeverity::Info,
+                "firefox",
+                "Installed firefox",
+            )
+            .expect("append to legacy log");
+        let report = logger.verify_integrity().expect("verify mixed log");
+        assert!(
+            report.is_valid(),
+            "mixed legacy/new chain must stay valid: {report:?}"
+        );
+        assert_eq!(report.total_entries, 2);
+        assert_eq!(report.valid_entries, 2);
+        assert_eq!(report.first_invalid_entry, None);
+
+        let entries = read_all_entries(&log_path).expect("read mixed log");
+        assert_eq!(entries[0].hash_version, HASH_VERSION_LEGACY);
+        assert_eq!(entries[1].hash_version, HASH_VERSION_LENGTH_PREFIXED);
+    }
+
+    #[test]
+    fn unknown_hash_versions_fail_closed() {
+        let mut entry = collision_test_entry("pkg", "d");
+        entry.hash_version = HASH_VERSION_LENGTH_PREFIXED + 1;
+        entry.hash = Some(entry.compute_hash());
+        assert!(
+            !entry.verify(),
+            "unknown preimage encodings must not be accepted as valid"
+        );
     }
 
     #[test]

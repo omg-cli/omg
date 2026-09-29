@@ -1521,7 +1521,7 @@ mod sbom_audit {
 
     #[test]
     fn test_audit_entry_hash_computation() {
-        use omg_lib::core::security::audit::AuditEntry;
+        use omg_lib::core::security::audit::{AuditEntry, HASH_VERSION_LENGTH_PREFIXED};
 
         let entry = AuditEntry {
             id: "test-123".to_string(),
@@ -1533,6 +1533,7 @@ mod sbom_audit {
             description: "Installed firefox".to_string(),
             metadata: None,
             prev_hash: "genesis".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
 
@@ -1546,7 +1547,7 @@ mod sbom_audit {
 
     #[test]
     fn test_audit_entry_verification() {
-        use omg_lib::core::security::audit::AuditEntry;
+        use omg_lib::core::security::audit::{AuditEntry, HASH_VERSION_LENGTH_PREFIXED};
 
         let mut entry = AuditEntry {
             id: "test-456".to_string(),
@@ -1558,6 +1559,7 @@ mod sbom_audit {
             description: "Removed curl".to_string(),
             metadata: None,
             prev_hash: "abc123".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
 
@@ -1613,7 +1615,7 @@ mod sbom_audit {
 
     #[test]
     fn test_audit_tamper_detection() {
-        use omg_lib::core::security::audit::AuditEntry;
+        use omg_lib::core::security::audit::{AuditEntry, HASH_VERSION_LENGTH_PREFIXED};
         use std::io::Write;
 
         let temp_dir = TempDir::new().unwrap();
@@ -1633,6 +1635,7 @@ mod sbom_audit {
             description: "Install pkg1".to_string(),
             metadata: None,
             prev_hash: "genesis".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
         entry1.hash = Some(entry1.compute_hash());
@@ -1651,6 +1654,7 @@ mod sbom_audit {
             description: "Remove pkg2".to_string(),
             metadata: None,
             prev_hash: entry1.hash.as_ref().unwrap().clone(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: Some("invalid_hash".to_string()),
         };
 

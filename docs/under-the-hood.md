@@ -228,6 +228,11 @@ their own chain hash:
 entry N: { …, "prev_hash": hash(entry N-1), "hash": sha256(canonical fields + prev_hash) }
 ```
 
+Entries carry a `hash_version` marker. Version 1 length-prefixes every field (an 8-byte
+length followed by the bytes) so shifting content across a field boundary cannot produce the
+same hash. Version 0 is the original concatenation; it is never written again, but retained
+logs still verify under it.
+
 Writers read the last hash under a lock, so two concurrent processes cannot fork the
 chain. `omg audit verify` recomputes the linkage and reports the first entry that does not
 match.
