@@ -355,6 +355,94 @@ pub(crate) fn spdx_license_tokens(license: &str) -> Vec<String> {
         .collect()
 }
 
+/// Advisory categories for recognized license identifiers, not legal conclusions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LicenseClassification {
+    Unknown,
+    Proprietary,
+    Permissive,
+    Copyleft,
+    StrongCopyleft,
+}
+
+/// Classify recognized SPDX families and native aliases without substring guesses.
+///
+/// Both AND and OR retain the historical conservative strongest-recognized
+/// category: an OR alternative does not erase a copyleft option. WITH evaluates
+/// the base identifier only; exception effects require legal review. Unknown
+/// identifiers are not inferred from their spelling, and an Unknown result (or
+/// an unknown operand alongside a recognized one) still requires review. This
+/// intentionally limited classification is neither SPDX validation nor a legal
+/// compliance determination. The allowlist evaluator has separate AND/OR rules.
+pub fn classify_license_expression(license: &str) -> LicenseClassification {
+    // Reject punctuation the legacy parser would otherwise silently discard,
+    // including ':' in document-scoped LicenseRef identifiers.
+    if license.chars().any(|c| {
+        !(c.is_ascii_alphanumeric()
+            || c.is_ascii_whitespace()
+            || matches!(c, '.' | '-' | '+' | '(' | ')'))
+    }) {
+        return LicenseClassification::Unknown;
+    }
+    let Some(expr) = SpdxParser::parse_expression(license) else {
+        return LicenseClassification::Unknown;
+    };
+    classify_license_expr(&expr)
+}
+
+fn classify_license_expr(expr: &SpdxExpr) -> LicenseClassification {
+    match expr {
+        SpdxExpr::Id(id) | SpdxExpr::With { id } => classify_license_id(id),
+        SpdxExpr::And(left, right) | SpdxExpr::Or(left, right) => {
+            classify_license_expr(left).max(classify_license_expr(right))
+        }
+    }
+}
+
+fn classify_license_id(id: &str) -> LicenseClassification {
+    use LicenseClassification::{Copyleft, Permissive, Proprietary, StrongCopyleft, Unknown};
+
+    // SPDX permits a single '+' suffix on a recognized license identifier.
+    // Arbitrary suffixes and custom LicenseRef names never inherit a category.
+    match id.strip_suffix('+').unwrap_or(id) {
+        "agpl" | "agpl-1.0" | "agpl-1.0-only" | "agpl-1.0-or-later" | "agpl-3.0"
+        | "agpl-3.0-only" | "agpl-3.0-or-later" => StrongCopyleft,
+        "gpl"
+        | "gpl2"
+        | "gpl3"
+        | "lgpl"
+        | "lgpl2.1"
+        | "gpl-1.0"
+        | "gpl-1.0-only"
+        | "gpl-1.0-or-later"
+        | "gpl-2.0"
+        | "gpl-2.0-only"
+        | "gpl-2.0-or-later"
+        | "gpl-3.0"
+        | "gpl-3.0-only"
+        | "gpl-3.0-or-later"
+        | "lgpl-2.0"
+        | "lgpl-2.0-only"
+        | "lgpl-2.0-or-later"
+        | "lgpl-2.1"
+        | "lgpl-2.1-only"
+        | "lgpl-2.1-or-later"
+        | "lgpl-3.0"
+        | "lgpl-3.0-only"
+        | "lgpl-3.0-or-later"
+        | "mpl"
+        | "mpl-1.0"
+        | "mpl-1.1"
+        | "mpl-2.0"
+        | "mpl-2.0-no-copyleft-exception" => Copyleft,
+        "mit" | "mit-0" | "isc" | "unlicense" | "cc0" | "cc0-1.0" | "0bsd" | "bsd"
+        | "bsd-2-clause" | "bsd-3-clause" | "bsd-4-clause" | "apache" | "apache-1.0"
+        | "apache-1.1" | "apache-2.0" => Permissive,
+        "proprietary" | "commercial" => Proprietary,
+        _ => Unknown,
+    }
+}
+
 /// True when `license` satisfies the allowlist under SPDX expression
 /// semantics: `AND` requires every operand to be allowed, `OR` requires any
 /// one operand to be allowed, and parentheses group sub-expressions. A
@@ -632,6 +720,125 @@ mod tests {
                 .is_ok()
         );
         assert!(combined_license_expression(std::iter::empty()).is_none());
+    }
+
+    #[test]
+    fn license_classification_recognizes_explicit_families_and_native_aliases() {
+        use LicenseClassification::{Copyleft, Permissive, Proprietary, StrongCopyleft};
+        // Independently enumerated fixtures; do not generate from implementation lists.
+        for (license, expected) in [
+            ("GPL2", Copyleft),
+            ("GPL3", Copyleft),
+            ("LGPL2.1", Copyleft),
+            ("gPl2", Copyleft),
+            ("GPL", Copyleft),
+            ("LGPL", Copyleft),
+            ("MPL", Copyleft),
+            ("AGPL", StrongCopyleft),
+            ("GPL-1.0-only", Copyleft),
+            ("GPL-2.0-or-later", Copyleft),
+            ("GPL-3.0-only", Copyleft),
+            ("GPL-2.0+", Copyleft),
+            ("LGPL-2.0-only", Copyleft),
+            ("LGPL-2.1-or-later", Copyleft),
+            ("LGPL-3.0+", Copyleft),
+            ("AGPL-1.0-only", StrongCopyleft),
+            ("AGPL-3.0-or-later", StrongCopyleft),
+            ("AGPL-3.0+", StrongCopyleft),
+            ("MPL-1.0", Copyleft),
+            ("MPL-1.1", Copyleft),
+            ("MPL-2.0-no-copyleft-exception", Copyleft),
+            ("MIT", Permissive),
+            ("MIT-0", Permissive),
+            ("MIT+", Permissive),
+            ("Apache-2.0+", Permissive),
+            ("GPL-2.0-only+", Copyleft),
+            ("ISC", Permissive),
+            ("Unlicense", Permissive),
+            ("CC0-1.0", Permissive),
+            ("0BSD", Permissive),
+            ("BSD-2-Clause", Permissive),
+            ("BSD-3-Clause", Permissive),
+            ("BSD-4-Clause", Permissive),
+            ("Apache-1.0", Permissive),
+            ("Apache-1.1", Permissive),
+            ("Apache-2.0", Permissive),
+            ("proprietary", Proprietary),
+            ("commercial", Proprietary),
+        ] {
+            assert_eq!(classify_license_expression(license), expected, "{license}");
+        }
+    }
+
+    #[test]
+    fn license_classification_does_not_guess_custom_or_near_miss_identifiers() {
+        for license in [
+            "LicenseRef-Example",
+            "LicenseRef-GPL-3.0",
+            "LicenseRef-MIT",
+            "LicenseRef-commercial",
+            "DocumentRef-MIT:LicenseRef-Example",
+            "DocumentRef-Example:LicenseRef-GPL-3.0",
+            "Example",
+            "not-gpl",
+            "AGPLish",
+            "MPLify",
+            "LIMITED",
+            "BSD-custom",
+            "Apache-custom",
+            "GPL20",
+            "LGPL2.10",
+            "GPL-4.0-only",
+            "AGPL-2.0-only",
+            "GPL-2.0-only-extra",
+            "GPL-2.0-or-later-extra",
+            "GPL-2.0++",
+            "MPL-2.0-only",
+            "MIT++",
+            "MITish",
+            "noncommercial",
+            "proprietaryish",
+            "",
+            "MIT AND",
+            "(MIT",
+            "MIT)",
+            "MIT WITH",
+            "MIT OR OR GPL2",
+        ] {
+            assert_eq!(
+                classify_license_expression(license),
+                LicenseClassification::Unknown,
+                "{license}"
+            );
+        }
+    }
+
+    #[test]
+    fn license_classification_preserves_conservative_expression_behavior() {
+        use LicenseClassification::{Copyleft, Permissive, StrongCopyleft, Unknown};
+        for (license, expected) in [
+            ("MIT AND GPL2", Copyleft),
+            ("MIT OR GPL3", Copyleft),
+            ("GPL3 OR MIT", Copyleft),
+            ("MIT LGPL2.1", Copyleft),
+            ("(MIT OR Apache-2.0) AND AGPL-3.0-only", StrongCopyleft),
+            ("GPL-2.0-only WITH Classpath-exception-2.0", Copyleft),
+            ("MIT WITH LicenseRef-GPL-3.0", Permissive),
+            ("LicenseRef-Example WITH Classpath-exception-2.0", Unknown),
+            ("LicenseRef-Example OR MIT", Permissive),
+            ("LicenseRef-Example AND GPL2", Copyleft),
+        ] {
+            assert_eq!(classify_license_expression(license), expected, "{license}");
+        }
+        // Classification is advisory and must not weaken allowlist obligations.
+        assert!(!license_matches_allowlist(
+            "MIT AND LicenseRef-Example",
+            &["MIT".into()]
+        ));
+        assert!(license_matches_allowlist(
+            "MIT OR LicenseRef-Example",
+            &["MIT".into()]
+        ));
     }
 
     #[test]
