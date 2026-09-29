@@ -1891,7 +1891,15 @@ fn behavior_inventory_runs_in_hermetic_state() {
                     let private_files = files.as_ref().is_some_and(|entries| {
                         entries.len() == expected.len() && entries.iter().all(|entry| {
                             entry.metadata().is_ok_and(|metadata| {
-                                metadata.is_file() && metadata.permissions().mode() & 0o077 == 0
+                                // `& 0o077` is the readable way to say "no group or
+                                // other permission bits"; clippy suggests a
+                                // trailing_zeros comparison that reads worse. The same
+                                // form is used in src/cli/config.rs and src/core/paths.rs.
+                                #[allow(clippy::verbose_bit_mask)]
+                                {
+                                    metadata.is_file()
+                                        && metadata.permissions().mode() & 0o077 == 0
+                                }
                             }) && entry.file_type().is_ok_and(|kind| kind.is_file())
                         })
                     });
@@ -1903,8 +1911,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         value["unavailable_evidence"].as_array().is_some_and(|items| {
                             items.iter().any(|item| item["artifact"] == "access-control-matrix")
                         })
-                    }) && json("change-log.json").is_some_and(serde_json::Value::is_array)
-                        && json("policy-enforcement.json").is_some_and(serde_json::Value::is_object)
+                    }) && json("change-log.json").is_some_and(|value| value.is_array())
+                        && json("policy-enforcement.json").is_some_and(|value| value.is_object())
                         && json("sbom-inventory.json").is_some_and(|value| {
                             value["bomFormat"] == "CycloneDX"
                                 && value["components"].as_array().is_some_and(|items| !items.is_empty())
@@ -1914,7 +1922,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                                 reader.headers().is_ok_and(|headers| {
                                     headers.iter().collect::<Vec<_>>()
                                         == ["package", "version", "description"]
-                                }) && reader.records().next().is_some_and(Result::is_ok)
+                                }) && reader.records().next().is_some_and(|record| record.is_ok())
                             });
                     if actual.as_ref().map(|files| files.iter().map(String::as_str).collect::<BTreeSet<_>>())
                         != Some(expected) || !private_files || !contents
