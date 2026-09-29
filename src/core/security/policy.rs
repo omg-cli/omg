@@ -402,15 +402,19 @@ fn classify_license_expr(expr: &SpdxExpr) -> LicenseClassification {
 fn classify_license_id(id: &str) -> LicenseClassification {
     use LicenseClassification::{Copyleft, Permissive, Proprietary, StrongCopyleft, Unknown};
 
-    // SPDX permits a single '+' suffix on a recognized license identifier.
+    // Preserve single-'+' family review for recognized identifiers and native
+    // aliases; this does not make legacy aliases canonical SPDX spellings.
     // Arbitrary suffixes and custom LicenseRef names never inherit a category.
     match id.strip_suffix('+').unwrap_or(id) {
-        "agpl" | "agpl-1.0" | "agpl-1.0-only" | "agpl-1.0-or-later" | "agpl-3.0"
-        | "agpl-3.0-only" | "agpl-3.0-or-later" => StrongCopyleft,
+        "agpl" | "agpl1" | "agpl3" | "agpl-1.0" | "agpl-1.0-only" | "agpl-1.0-or-later"
+        | "agpl-3.0" | "agpl-3.0-only" | "agpl-3.0-or-later" => StrongCopyleft,
         "gpl"
+        | "gpl1"
         | "gpl2"
         | "gpl3"
         | "lgpl"
+        | "lgpl2"
+        | "lgpl3"
         | "lgpl2.1"
         | "gpl-1.0"
         | "gpl-1.0-only"
@@ -810,6 +814,76 @@ mod tests {
                 LicenseClassification::Unknown,
                 "{license}"
             );
+        }
+    }
+
+    #[test]
+    fn license_classification_supports_explicit_native_alias_parity() {
+        use LicenseClassification::{Copyleft, StrongCopyleft};
+        // Native compatibility aliases, not claims of canonical SPDX spelling.
+        for (license, expected) in [
+            ("GPL1", Copyleft),
+            ("gpl1", Copyleft),
+            ("GPL1+", Copyleft),
+            ("gpl1+", Copyleft),
+            ("LGPL2", Copyleft),
+            ("lgpl2", Copyleft),
+            ("LGPL2+", Copyleft),
+            ("lgpl2+", Copyleft),
+            ("LGPL3", Copyleft),
+            ("lgpl3", Copyleft),
+            ("LGPL3+", Copyleft),
+            ("lgpl3+", Copyleft),
+            ("AGPL1", StrongCopyleft),
+            ("agpl1", StrongCopyleft),
+            ("AGPL1+", StrongCopyleft),
+            ("agpl1+", StrongCopyleft),
+            ("AGPL3", StrongCopyleft),
+            ("agpl3", StrongCopyleft),
+            ("AGPL3+", StrongCopyleft),
+            ("agpl3+", StrongCopyleft),
+        ] {
+            assert_eq!(classify_license_expression(license), expected, "{license}");
+        }
+    }
+
+    #[test]
+    fn license_classification_native_alias_boundaries_and_expressions() {
+        use LicenseClassification::{Copyleft, Permissive, StrongCopyleft, Unknown};
+        for (license, expected) in [
+            ("MIT AND GPL1", Copyleft),
+            ("LGPL2 OR MIT", Copyleft),
+            ("MIT OR LGPL3+", Copyleft),
+            ("(MIT OR GPL1) AND AGPL1", StrongCopyleft),
+            ("MIT AGPL3+", StrongCopyleft),
+            ("GPL1 WITH Classpath-exception-2.0", Copyleft),
+            ("LGPL2+ WITH Classpath-exception-2.0", Copyleft),
+            ("LGPL3 WITH Classpath-exception-2.0", Copyleft),
+            ("AGPL1 WITH Classpath-exception-2.0", StrongCopyleft),
+            ("AGPL3+ WITH Classpath-exception-2.0", StrongCopyleft),
+            ("MIT WITH AGPL3", Permissive),
+            ("LicenseRef-Example WITH GPL1", Unknown),
+            ("LicenseRef-GPL1", Unknown),
+            ("LicenseRef-LGPL2", Unknown),
+            ("LicenseRef-LGPL3", Unknown),
+            ("LicenseRef-AGPL1", Unknown),
+            ("LicenseRef-AGPL3+", Unknown),
+            ("DocumentRef-GPL1:LicenseRef-AGPL3", Unknown),
+            ("GPL1++", Unknown),
+            ("LGPL2++", Unknown),
+            ("LGPL3++", Unknown),
+            ("AGPL1++", Unknown),
+            ("AGPL3++", Unknown),
+            ("GPL1-only", Unknown),
+            ("LGPL2-or-later", Unknown),
+            ("LGPL3-extra", Unknown),
+            ("AGPL1ish", Unknown),
+            ("AGPL30", Unknown),
+            ("GPL1 AND", Unknown),
+            ("LGPL2 OR", Unknown),
+            ("AGPL3 WITH", Unknown),
+        ] {
+            assert_eq!(classify_license_expression(license), expected, "{license}");
         }
     }
 
