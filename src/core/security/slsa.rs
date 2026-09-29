@@ -323,7 +323,15 @@ fn parse_rekor_entry(
                 uuid: requested_uuid.to_string(),
             })?
     };
-    let canonical = canonical_set_payload(&log_id, log_index, integrated_time, &body);
+    // Reconstructing the signed bytes interpolates `log_id` and `body` raw
+    // into the JSON template, so a value containing `"` or `\` would splice
+    // attacker-chosen JSON into the payload the SET is checked against. The
+    // canonicalizer refuses such values; treat that as a malformed entry
+    // rather than verifying over reconstructed bytes.
+    let canonical = canonical_set_payload(&log_id, log_index, integrated_time, &body)
+        .ok_or_else(|| RekorError::EntrySetMalformed {
+            uuid: requested_uuid.to_string(),
+        })?;
     let key = rekor_verifying_key()?;
     if !verify_set_signature(canonical.as_bytes(), &set_bytes, &key) {
         return Err(RekorError::EntrySetVerificationFailed {
@@ -347,21 +355,36 @@ fn parse_rekor_entry(
 /// `VerifySET`) reconstruct exactly these four fields, hash them with
 /// SHA-256, and verify an ECDSA P-256 signature. For this fixed field set
 /// (base64 body, hex log ID, decimal integers) the RFC 8785 form is the
-/// key-sorted, whitespace-free JSON built here; all values are ASCII so no
-/// string escaping can occur.
-fn canonical_set_payload(log_id: &str, log_index: u64, integrated_time: u64, body: &str) -> String {
-    debug_assert!(
-        log_id.bytes().all(|b| b.is_ascii_hexdigit()),
-        "logID must be hex"
-    );
-    debug_assert!(
-        body.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
-        "body must be standard base64"
-    );
-    format!(
+/// key-sorted, whitespace-free JSON built here; for a hex `log_id` and a
+/// standard-base64 `body` all values are ASCII and need no string escaping.
+///
+/// The two values are interpolated raw into the template, so they are
+/// validated at runtime rather than by `debug_assert!` (which release builds
+/// strip): a `body` such as `a\"b` would otherwise splice extra JSON keys into
+/// the bytes the SET is verified over, letting a genuine signature validate a
+/// reconstructed payload with an attacker-chosen `integratedTime`. Values that
+/// are not hex / not standard base64 are refused here (`None`) and the caller
+/// rejects the entry. The template is deliberately left as raw interpolation:
+/// for the accepted inputs the produced bytes are unchanged, which the SET
+/// signature depends on.
+fn canonical_set_payload(
+    log_id: &str,
+    log_index: u64,
+    integrated_time: u64,
+    body: &str,
+) -> Option<String> {
+    if !log_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !body
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    {
+        return None;
+    }
+    Some(format!(
         "{{\"body\":\"{body}\",\"integratedTime\":{integrated_time},\"logID\":\"{log_id}\",\"logIndex\":{log_index}}}"
-    )
+    ))
 }
 
 /// Verify the ECDSA P-256 (ASN.1 DER) SET signature over the SHA-256 digest
@@ -1728,7 +1751,7 @@ mod tests {
 
         let log_id = "c0d23d6ad406973f9559f3ba2d1ca01f";
         let body = "aGVsbG8="; // base64
-        let canonical = canonical_set_payload(log_id, 12, 1_700_000_000, body);
+        let canonical = canonical_set_payload(log_id, 12, 1_700_000_000, body).unwrap();
         // RFC 8785 form: keys sorted, no whitespace.
         assert_eq!(
             canonical,
@@ -1745,19 +1768,19 @@ mod tests {
             "a valid ECDSA P-256 DER signature over the canonical form must verify"
         );
         // Tampered canonical bytes (one body character) must not verify.
-        let tampered_body = canonical_set_payload(log_id, 12, 1_700_000_000, "aGVsbG9f");
+        let tampered_body = canonical_set_payload(log_id, 12, 1_700_000_000, "aGVsbG9f").unwrap();
         assert!(
             !verify_set_signature(tampered_body.as_bytes(), sig_der.as_bytes(), key),
             "a tampered body must fail SET verification"
         );
         // Tampered integratedTime must not verify.
-        let tampered_time = canonical_set_payload(log_id, 12, 1_700_000_001, body);
+        let tampered_time = canonical_set_payload(log_id, 12, 1_700_000_001, body).unwrap();
         assert!(
             !verify_set_signature(tampered_time.as_bytes(), sig_der.as_bytes(), key),
             "a tampered integratedTime must fail SET verification"
         );
         // Tampered logID must not verify.
-        let tampered_log = canonical_set_payload("deadbeef", 12, 1_700_000_000, body);
+        let tampered_log = canonical_set_payload("deadbeef", 12, 1_700_000_000, body).unwrap();
         assert!(
             !verify_set_signature(tampered_log.as_bytes(), sig_der.as_bytes(), key),
             "a tampered logID must fail SET verification"
@@ -1795,7 +1818,7 @@ mod tests {
     ) -> HashMap<String, serde_json::Value> {
         use base64::Engine as _;
         use p256::ecdsa::signature::Signer as _;
-        let canonical = canonical_set_payload(log_id, log_index, integrated_time, body);
+        let canonical = canonical_set_payload(log_id, log_index, integrated_time, body).unwrap();
         let set: p256::ecdsa::Signature = signing.sign(canonical.as_bytes());
         HashMap::from([(
             uuid.to_string(),
@@ -1917,13 +1940,15 @@ mod tests {
             12,
             1_700_000_000,
             "aGVsbG8=",
-        );
+        )
+        .unwrap();
         let tampered = canonical_set_payload(
             "c0d23d6ad406973f9559f3ba2d1ca01f",
             12,
             1_700_000_000,
             "YWx0ZXJlZA==",
-        );
+        )
+        .unwrap();
         use p256::ecdsa::signature::Signer as _;
         let sig_over_tampered: p256::ecdsa::Signature = signing.sign(tampered.as_bytes());
         assert!(
@@ -1950,6 +1975,75 @@ mod tests {
             }),
         );
         let err = parse_rekor_entry("abc", bad).expect_err("malformed SET base64 must be refused");
+        assert!(
+            matches!(err, RekorError::EntrySetMalformed { .. }),
+            "got: {err}"
+        );
+    }
+
+    /// The canonical bytes are built by raw `format!` interpolation, so a
+    /// value that is not hex (logID) / not standard base64 (body) must be
+    /// refused at runtime, not only under `debug_assert!` (stripped in
+    /// release). Otherwise a body containing `"` splices extra JSON keys into
+    /// the payload the SET is checked against.
+    #[test]
+    fn canonical_set_payload_rejects_non_base64_body_and_non_hex_log_id() {
+        let log_id = "c0d23d6ad406973f9559f3ba2d1ca01f";
+        // Quote-injecting body: would splice `,"integratedTime":0` into the
+        // template and let the signature cover an attacker-chosen time.
+        assert!(
+            canonical_set_payload(log_id, 12, 1_700_000_000, "aGVsbG8=\",\"integratedTime\":0,\"x")
+                .is_none(),
+            "a body containing a double quote must be rejected"
+        );
+        assert!(
+            canonical_set_payload(log_id, 12, 1_700_000_000, "aG\\s=\"b").is_none(),
+            "a body containing a backslash must be rejected"
+        );
+        assert!(
+            canonical_set_payload(log_id, 12, 1_700_000_000, "aGVsbG8=?").is_none(),
+            "a body containing a non-base64 character must be rejected"
+        );
+        // Same for the logID slot.
+        assert!(
+            canonical_set_payload("deadbeef\", \"x\": 1", 12, 1_700_000_000, "aGVsbG8=").is_none(),
+            "a non-hex logID must be rejected"
+        );
+        // Valid inputs are byte-identical to the pre-fix template output.
+        let body = "aGVsbG8=";
+        assert_eq!(
+            canonical_set_payload(log_id, 12, 1_700_000_000, body),
+            Some("{\"body\":\"aGVsbG8=\",\"integratedTime\":1700000000,\"logID\":\"c0d23d6ad406973f9559f3ba2d1ca01f\",\"logIndex\":12}".to_string())
+        );
+        // A padded base64 body with `+`/`/` and an empty body are still accepted.
+        assert_eq!(
+            canonical_set_payload(log_id, 1, 2, "a+b/c=="),
+            Some("{\"body\":\"a+b/c==\",\"integratedTime\":2,\"logID\":\"c0d23d6ad406973f9559f3ba2d1ca01f\",\"logIndex\":1}".to_string())
+        );
+        assert_eq!(
+            canonical_set_payload(log_id, 1, 2, ""),
+            Some("{\"body\":\"\",\"integratedTime\":2,\"logID\":\"c0d23d6ad406973f9559f3ba2d1ca01f\",\"logIndex\":1}".to_string())
+        );
+    }
+
+    /// End-to-end: a quote-injecting body must be refused before any SET
+    /// verification, even when the signature is genuine over the entry's
+    /// declared fields.
+    #[test]
+    fn rekor_entry_with_quote_injecting_body_is_refused() {
+        let mut bad = HashMap::new();
+        bad.insert(
+            "abc".to_string(),
+            serde_json::json!({
+                "logIndex": 1,
+                "integratedTime": 2,
+                "logID": "c0d23d6ad406973f9559f3ba2d1ca01f",
+                "body": "aGVsbG8=\",\"integratedTime\":1700000000,\"x",
+                "verification": {"signedEntryTimestamp": "AAAA"}
+            }),
+        );
+        let err = parse_rekor_entry("abc", bad)
+            .expect_err("a body that splices JSON into the canonical form must be refused");
         assert!(
             matches!(err, RekorError::EntrySetMalformed { .. }),
             "got: {err}"
