@@ -328,9 +328,11 @@ fn parse_rekor_entry(
     // attacker-chosen JSON into the payload the SET is checked against. The
     // canonicalizer refuses such values; treat that as a malformed entry
     // rather than verifying over reconstructed bytes.
-    let canonical = canonical_set_payload(&log_id, log_index, integrated_time, &body)
-        .ok_or_else(|| RekorError::EntrySetMalformed {
-            uuid: requested_uuid.to_string(),
+    let canonical =
+        canonical_set_payload(&log_id, log_index, integrated_time, &body).ok_or_else(|| {
+            RekorError::EntrySetMalformed {
+                uuid: requested_uuid.to_string(),
+            }
         })?;
     let key = rekor_verifying_key()?;
     if !verify_set_signature(canonical.as_bytes(), &set_bytes, &key) {
@@ -1992,8 +1994,13 @@ mod tests {
         // Quote-injecting body: would splice `,"integratedTime":0` into the
         // template and let the signature cover an attacker-chosen time.
         assert!(
-            canonical_set_payload(log_id, 12, 1_700_000_000, "aGVsbG8=\",\"integratedTime\":0,\"x")
-                .is_none(),
+            canonical_set_payload(
+                log_id,
+                12,
+                1_700_000_000,
+                "aGVsbG8=\",\"integratedTime\":0,\"x"
+            )
+            .is_none(),
             "a body containing a double quote must be rejected"
         );
         assert!(
