@@ -1149,10 +1149,7 @@ mod tests {
         );
 
         let both = SecurityPolicy {
-            allowed_licenses: Some(vec![
-                "MIT".to_string(),
-                "GPL-3.0".to_string(),
-            ]),
+            allowed_licenses: Some(vec!["MIT".to_string(), "GPL-3.0".to_string()]),
             ..SecurityPolicy::default()
         };
         assert!(
