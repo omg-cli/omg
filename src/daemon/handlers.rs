@@ -649,8 +649,24 @@ const MAX_SUGGEST_LIMIT: usize = 50;
 const HEALTH_DEGRADED_CACHE_THRESHOLD: usize = 50_000;
 /// Cache size threshold for "unhealthy" health status
 const HEALTH_UNHEALTHY_CACHE_THRESHOLD: usize = 100_000;
-/// Failed request threshold for "unhealthy" health status
+/// Failed request threshold for "unhealthy" health status. Compared against
+/// failures in the trailing `FAILURE_HEALTH_WINDOW_MS` window, not the
+/// lifetime total, so a long-lived daemon recovers once failures stop.
 const HEALTH_UNHEALTHY_FAILURES_THRESHOLD: u64 = 1000;
+
+/// Pure health-status decision, split out from [`handle_health`] so the
+/// thresholds are testable without a live daemon.
+fn health_status(cache_size: usize, recent_failures: u64) -> &'static str {
+    if cache_size > HEALTH_UNHEALTHY_CACHE_THRESHOLD
+        || recent_failures > HEALTH_UNHEALTHY_FAILURES_THRESHOLD
+    {
+        "unhealthy"
+    } else if cache_size > HEALTH_DEGRADED_CACHE_THRESHOLD {
+        "degraded"
+    } else {
+        "healthy"
+    }
+}
 
 /// Handle metrics request
 fn handle_metrics(id: RequestId) -> Response {
@@ -1133,18 +1149,11 @@ fn handle_health(state: &Arc<DaemonState>, id: RequestId) -> Response {
     let cache_size = state.cache.stats().size;
     let metrics = GLOBAL_METRICS.snapshot();
     let active_connections = metrics.active_connections;
+    let recent_failures = GLOBAL_METRICS.recent_request_failures();
 
     let memory_usage_mb = process_rss_mb().unwrap_or(0);
 
-    let status = if cache_size > HEALTH_UNHEALTHY_CACHE_THRESHOLD
-        || metrics.requests_failed > HEALTH_UNHEALTHY_FAILURES_THRESHOLD
-    {
-        "unhealthy".to_string()
-    } else if cache_size > HEALTH_DEGRADED_CACHE_THRESHOLD {
-        "degraded".to_string()
-    } else {
-        "healthy".to_string()
-    };
+    let status = health_status(cache_size, recent_failures).to_string();
 
     Response::Success {
         id,
@@ -1812,6 +1821,50 @@ mod tests {
     fn health_reports_resident_memory_from_procfs() {
         let rss_mb = process_rss_mb().expect("VmRSS must be readable on Linux");
         assert!(rss_mb > 0, "a running test process has non-zero RSS");
+    }
+
+    #[test]
+    fn windowed_failures_decide_health_not_lifetime_totals() {
+        use crate::core::metrics::{FAILURE_HEALTH_WINDOW_MS, Metrics};
+
+        const EPOCH_MS: u64 = 1_700_000_000_000;
+        const SMALL_CACHE: usize = 0;
+
+        // 2000 lifetime failures spread over two hours: one every ~3.6s, so
+        // far below the threshold inside any single trailing window.
+        // record_request_failure_at maintains the window only; the lifetime
+        // counter is covered by inc_requests_failed_counts_lifetime_and_opens_the_window.
+        let spread = Metrics::new();
+        let step_ms = (2 * 3_600_000) / 2000;
+        let mut now = EPOCH_MS;
+        for _ in 0..2000 {
+            spread.record_request_failure_at(now);
+            now += step_ms;
+        }
+        assert_eq!(
+            health_status(SMALL_CACHE, spread.request_failures_within_window(now)),
+            "healthy",
+            "lifetime failures must not latch health unhealthy"
+        );
+
+        // 1001 failures inside one window is a genuine burst and stays red.
+        let burst = Metrics::new();
+        for _ in 0..=HEALTH_UNHEALTHY_FAILURES_THRESHOLD {
+            burst.record_request_failure_at(EPOCH_MS);
+        }
+        assert_eq!(
+            health_status(SMALL_CACHE, burst.request_failures_within_window(EPOCH_MS)),
+            "unhealthy"
+        );
+
+        // Once the burst leaves the trailing window health recovers.
+        assert_eq!(
+            health_status(
+                SMALL_CACHE,
+                burst.request_failures_within_window(EPOCH_MS + FAILURE_HEALTH_WINDOW_MS)
+            ),
+            "healthy"
+        );
     }
 }
 
