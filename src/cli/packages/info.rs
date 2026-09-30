@@ -23,10 +23,19 @@ const AUR_INFO_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Show package information (Synchronous fast-path)
 pub fn info_sync(package: &str) -> Result<bool> {
-    crate::package_managers::resolve_backend()?;
+    let backend = crate::package_managers::resolve_backend()?;
     // SECURITY: Validate package name
     if let Err(e) = crate::core::security::validate_package_name(package) {
         anyhow::bail!("Invalid package name: {e}");
+    }
+
+    if backend == crate::package_managers::Backend::Mock {
+        let pm = get_package_manager()?;
+        if let Some(info) = futures::executor::block_on(manager_info(pm.as_ref(), package))? {
+            display_manager_info(&info, pm.name());
+            return Ok(true);
+        }
+        return Ok(false);
     }
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
@@ -170,6 +179,19 @@ pub async fn info_with_json(package: &str, json: bool) -> Result<()> {
 }
 
 async fn info_json(package: &str) -> Result<()> {
+    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Mock {
+        let pm = get_package_manager()?;
+        let info = manager_info(pm.as_ref(), package)
+            .await?
+            .with_context(|| format!("Package '{package}' not found"))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&info)
+                .context("Failed to serialize package info as JSON")?
+        );
+        return Ok(());
+    }
+
     #[cfg(unix)]
     if let Ok(Ok(info)) = tokio::time::timeout(DAEMON_INFO_TIMEOUT, async {
         let mut client = crate::core::client::DaemonClient::connect().await?;
@@ -263,6 +285,15 @@ async fn info_json(package: &str) -> Result<()> {
 }
 
 async fn info_fallback(package: &str) -> Result<()> {
+    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Mock {
+        let pm = get_package_manager()?;
+        let info = manager_info(pm.as_ref(), package)
+            .await?
+            .with_context(|| format!("Package '{package}' not found. Try: omg search {package}"))?;
+        display_manager_info(&info, pm.name());
+        return Ok(());
+    }
+
     // Try sync path first
     if info_sync(package)? {
         return Ok(());
@@ -347,6 +378,31 @@ async fn info_fallback(package: &str) -> Result<()> {
     anyhow::bail!("Package '{package}' not found. Try: omg search {package}");
 }
 
+async fn manager_info(
+    manager: &dyn crate::package_managers::PackageManager,
+    package: &str,
+) -> Result<Option<crate::core::Package>> {
+    manager
+        .info(package)
+        .await
+        .with_context(|| format!("Failed to query package '{package}'"))
+}
+
+fn display_manager_info(info: &crate::core::Package, manager_name: &str) {
+    let version = info.version.to_string();
+    let source = format!("{} ({manager_name})", info.source);
+    ui::print_package_info(
+        &ui::InfoCore {
+            name: &info.name,
+            version: &version,
+            source: &source,
+            installed: info.installed,
+            description: &info.description,
+        },
+        &ui::InfoExtras::none(),
+    );
+}
+
 /// Display package info (debian only)
 #[cfg(feature = "debian")]
 fn display_package_info(info: &crate::package_managers::types::PackageInfo) {
@@ -401,6 +457,50 @@ mod tests {
             assert_eq!(value["name"], "bash");
             assert_eq!(value["installed"], installed);
         }
+    }
+
+    #[tokio::test]
+    async fn selected_manager_info_preserves_catalog_and_missing_results() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manager =
+            crate::package_managers::mock::MockPackageManager::new_in("arch", directory.path());
+        assert_eq!(
+            crate::package_managers::PackageManager::name(&manager),
+            "pacman"
+        );
+        let info = super::manager_info(&manager, "git")
+            .await?
+            .expect("catalog package");
+        assert_eq!(info.name, "git");
+        assert_eq!(info.version.to_string(), "2.43.0");
+        assert!(!info.installed);
+        assert!(
+            super::manager_info(&manager, "missing-fixture-package")
+                .await?
+                .is_none()
+        );
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selected_manager_info_preserves_query_errors() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("mock_state_pacman.json");
+        std::fs::write(&path, b"not json")?;
+        let manager =
+            crate::package_managers::mock::MockPackageManager::new_in("arch", directory.path());
+        let error = super::manager_info(&manager, "git")
+            .await
+            .expect_err("corrupt fixture must fail");
+        assert!(error.to_string().contains("git"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+        );
+        assert_eq!(std::fs::read(path)?, b"not json");
+        Ok(())
     }
 
     #[tokio::test]

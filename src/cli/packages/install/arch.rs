@@ -38,7 +38,11 @@ pub async fn install(packages: &[String], yes: bool, replacement_hops: u32) -> R
     let pb = modern_ui::modern_spinner("Resolving", "package sources");
 
     #[cfg(unix)]
-    let mut daemon_client = DaemonClient::connect().await.ok();
+    let mut daemon_client = if permits_live_lookup(crate::package_managers::resolve_backend()?) {
+        DaemonClient::connect().await.ok()
+    } else {
+        None
+    };
 
     let mut missing_packages = Vec::new();
     for pkg in packages {
@@ -249,7 +253,11 @@ pub async fn install_dry_run(packages: &[String]) -> Result<()> {
 
     let mut total_size: u64 = 0;
     #[cfg(unix)]
-    let mut daemon_client = SyncDaemonClient::acquire().ok();
+    let mut daemon_client = if permits_live_lookup(crate::package_managers::resolve_backend()?) {
+        SyncDaemonClient::acquire().ok()
+    } else {
+        None
+    };
 
     for pkg_name in packages {
         if let Some(info) = local_archive_preview(pkg_name)? {
@@ -313,6 +321,9 @@ pub async fn install_dry_run(packages: &[String]) -> Result<()> {
                 ]);
             }
             Ok(None) => {
+                if !permits_live_lookup(crate::package_managers::resolve_backend()?) {
+                    anyhow::bail!("Package '{pkg_name}' was not found");
+                }
                 let (info, _) = resolve_aur_package(pkg_name)
                     .await
                     .with_context(|| format!("Package '{pkg_name}' was not found"))?;
@@ -418,6 +429,9 @@ fn handle_missing_package(
     replacement_hops: u32,
 ) -> BoxFuture<'static, Result<()>> {
     Box::pin(async move {
+        if !permits_live_lookup(crate::package_managers::resolve_backend()?) {
+            return Err(mock_missing_error(&pkg_name, original_error));
+        }
         match try_aur_package(&pkg_name).await {
             Ok(aur_pkg) => return handle_aur_package(aur_pkg, yes).await,
             Err(error) if is_aur_not_found(&error) => {}
@@ -485,6 +499,14 @@ fn handle_missing_package(
 
         Err(original_error)
     })
+}
+
+fn permits_live_lookup(backend: crate::package_managers::Backend) -> bool {
+    backend != crate::package_managers::Backend::Mock
+}
+
+fn mock_missing_error(package: &str, original_error: anyhow::Error) -> anyhow::Error {
+    original_error.context(format!("Package '{package}' not found"))
 }
 
 fn consume_replacement_hop(remaining_hops: u32, replacement: &str) -> Result<u32> {
@@ -666,6 +688,37 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::pin::Pin;
+
+    #[test]
+    fn selected_mock_cannot_enter_live_lookup() {
+        use crate::package_managers::Backend;
+        assert!(!permits_live_lookup(Backend::Mock));
+        for backend in [
+            Backend::Arch,
+            Backend::Debian,
+            Backend::Fedora,
+            Backend::MacOS,
+        ] {
+            assert!(permits_live_lookup(backend));
+        }
+    }
+
+    #[test]
+    fn mock_missing_keeps_original_operation_error() {
+        let original =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "official fixture missing");
+        let error = mock_missing_error("missing-fixture-package", original.into());
+        assert_eq!(
+            error.to_string(),
+            "Package 'missing-fixture-package' not found"
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        );
+        assert!(format!("{error:#}").contains("official fixture missing"));
+    }
 
     struct VulnerableSource;
 
