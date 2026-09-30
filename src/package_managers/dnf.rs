@@ -233,11 +233,11 @@ enum NativeOutcome {
     NoTransaction,
     Committed(Vec<crate::core::history::PackageChange>),
     Failed,
-    /// libdnf5 left a journal row in a non-terminal state, which
-    /// `dnf history redo` can finish. Carries the recorded identity so the
-    /// caller can attempt recovery and still report the full detail.
+    /// libdnf5 left a journal row in a non-terminal state. This is not proof
+    /// of committed package changes; retain its identity for diagnosis only.
     Interrupted {
         id: u64,
+        comment: String,
         status: String,
         actions: usize,
         command: String,
@@ -937,7 +937,14 @@ impl DnfPackageManager {
         Ok(args)
     }
 
-    async fn query_output(mut command: tokio::process::Command) -> Result<Vec<u8>> {
+    async fn query_output(command: tokio::process::Command) -> Result<Vec<u8>> {
+        Self::query_output_with_deadline(command, std::time::Duration::from_mins(1)).await
+    }
+
+    async fn query_output_with_deadline(
+        mut command: tokio::process::Command,
+        deadline: std::time::Duration,
+    ) -> Result<Vec<u8>> {
         use tokio::io::AsyncReadExt;
         const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
         let operation = async {
@@ -962,9 +969,9 @@ impl DnfPackageManager {
             anyhow::ensure!(status.success(), "DNF query failed: {status}");
             Ok(bytes)
         };
-        tokio::time::timeout(std::time::Duration::from_mins(1), operation)
+        tokio::time::timeout(deadline, operation)
             .await
-            .context("DNF query timed out after 60 seconds")?
+            .with_context(|| format!("DNF query timed out after {} seconds", deadline.as_secs()))?
     }
 
     fn advisory_command() -> Result<tokio::process::Command> {
@@ -1081,10 +1088,9 @@ impl DnfPackageManager {
                 // (libdnf5/transaction/transaction.hpp: TransactionState
                 // { STARTED = 1, OK = 2, ERROR = 3 }, start(), finish()).
                 // A row still marked STARTED was interrupted before it could
-                // finish. dnf5 history(8) documents the same shape and calls
-                // redo "useful to finish interrupted transactions", so hand the
-                // id back and let the caller attempt recovery once before
-                // giving up on it.
+                // finish. Redo creates a separate transaction, not a terminal
+                // state on this row, and can change packages/reasons again.
+                // Do not infer success or initiate repair from this row.
                 let command = if transaction.description.is_empty() {
                     "not recorded".to_owned()
                 } else {
@@ -1098,36 +1104,13 @@ impl DnfPackageManager {
                 );
                 Ok(NativeOutcome::Interrupted {
                     id: transaction.id,
+                    comment: transaction.comment.clone(),
                     status: status.to_owned(),
                     actions: transaction.packages.len(),
                     command,
                 })
             }
         }
-    }
-
-    /// Ask dnf to finish a transaction libdnf5 left non-terminal.
-    ///
-    /// Runs as a single privileged subprocess, exactly like the transaction
-    /// command itself, and is only ever called with the id of a transaction
-    /// carrying our own `--comment`, so it cannot touch an unrelated row.
-    async fn finish_interrupted_transaction(id: u64) -> Result<()> {
-        // The subprocess blocks, so keep it off the async runtime the same way
-        // `run_dnf` does.
-        tokio::task::spawn_blocking(move || {
-            let mut command = crate::core::privilege::system_command("dnf")?;
-            let status = command
-                .args(["history", "redo", &id.to_string()])
-                .status()
-                .with_context(|| format!("Failed to run `dnf history redo {id}`"))?;
-            anyhow::ensure!(
-                status.success(),
-                "`dnf history redo {id}` did not finish the interrupted transaction"
-            );
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("`dnf history redo {id}` task failed: {error}"))?
     }
 
     fn native_changes(
@@ -1250,23 +1233,18 @@ impl DnfPackageManager {
             Ok(transactions) => Self::native_outcome(&transactions, &comment),
             Err(error) => Err(error),
         };
-        // libdnf5 can leave a journal row non-terminal when the process is
-        // interrupted. `dnf history redo` is the documented way to finish one,
-        // so try exactly once and re-classify from a fresh read. Bounded on
-        // purpose: never retry in a loop, and never redo more than our own
-        // transaction.
-        let observed = match observed {
-            Ok(NativeOutcome::Interrupted { id, .. }) => {
-                match Self::finish_interrupted_transaction(id).await {
-                    Ok(()) => match Self::native_history(Some(before)).await {
-                        Ok(transactions) => Self::native_outcome(&transactions, &comment),
-                        Err(error) => Err(error),
-                    },
-                    Err(error) => Err(error),
-                }
-            }
-            other => other,
-        };
+        // Observing a non-terminal journal row must not initiate another
+        // package mutation. A redo would need its own correlation and native
+        // state proof, plus explicit confirmation/elevation/deadline policy.
+        Self::record_native_result(kind, history, operation, observed)
+    }
+
+    fn record_native_result(
+        kind: crate::core::history::TransactionType,
+        history: &crate::core::history::HistoryManager,
+        operation: Result<()>,
+        observed: Result<NativeOutcome>,
+    ) -> Result<()> {
         let persistence = match observed {
             Ok(NativeOutcome::NoTransaction) if operation.is_ok() => Ok(()),
             Ok(NativeOutcome::NoTransaction | NativeOutcome::Failed) => history
@@ -1281,13 +1259,14 @@ impl DnfPackageManager {
             Ok(NativeOutcome::Committed(changes)) => history.add_transaction(kind, changes, true),
             Ok(NativeOutcome::Interrupted {
                 id,
+                comment,
                 status,
                 actions,
                 command,
             }) => Err(anyhow::anyhow!(
-                "DNF transaction {id} has unresolved status '{status}' for {actions} \
-                 package action(s); recorded command: {command}. One automatic \
-                 `dnf history redo {id}` did not finish it; retry manually"
+                "DNF transaction {id} with comment '{comment}' has unresolved status '{status}' for {actions} \
+                 package action(s); recorded command: {command}. Automatic recovery was not attempted; \
+                 inspect native DNF history and package state before deciding on recovery"
             )),
             Err(error) => Err(error),
         };
@@ -1298,7 +1277,7 @@ impl DnfPackageManager {
                 Err(error.context("DNF operation succeeded but its history could not be recorded"))
             }
             (Err(operation), Err(history)) => anyhow::bail!(
-                "DNF operation failed: {operation}; history recording also failed: {history}"
+                "DNF operation failed: {operation:#}; history recording also failed: {history:#}"
             ),
         }
     }
@@ -2369,17 +2348,19 @@ mod tests {
         // such a row behind (run 36204199869). The error must carry the
         // recorded identity instead of only the status word.
         let transactions: Vec<NativeTransaction> = serde_json::from_str(r#"[{"id":41,"comment":"omg-fixture","status":"Started","description":"/usr/bin/dnf5 --comment=omg-fixture remove --yes tree-2.2.1-4.fc44","packages":[{"nevra":"tree-0:2.2.1-4.fc44.x86_64","action":"Remove"}]}]"#).expect("native history fixture");
-        // The recorded identity is carried, not raised: the caller uses it to
-        // attempt one `dnf history redo` before reporting an error.
+        // The recorded identity is carried to the final diagnostic without
+        // replaying the interrupted transaction.
         match DnfPackageManager::native_outcome(&transactions, "omg-fixture")
             .expect("an unfinished transaction is reported as Interrupted")
         {
             NativeOutcome::Interrupted {
                 id,
+                comment,
                 status,
                 actions,
                 command,
             } => {
+                assert_eq!(comment, "omg-fixture");
                 assert_eq!(id, 41, "{status} {actions} {command}");
                 assert_eq!(status, "Started");
                 assert_eq!(actions, 1, "package action count must be preserved");
@@ -2409,12 +2390,219 @@ mod tests {
     }
 
     #[test]
+    fn native_interruption_is_diagnostic_only_and_preserves_operation_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let history =
+            crate::core::history::HistoryManager::new_in(directory.path().join("history.json"))
+                .unwrap();
+        let transactions: Vec<NativeTransaction> = serde_json::from_str(
+            r#"[{"id":41,"comment":"ours","status":"Started","description":"dnf remove tree","packages":[]},
+                {"id":42,"comment":"","status":"Ok","description":"dnf history redo 41","packages":[]}]"#,
+        ).unwrap();
+        let result = DnfPackageManager::record_native_result(
+            crate::core::history::TransactionType::Remove,
+            &history,
+            Err(anyhow::anyhow!("original exit 1").context("DNF child failed")),
+            DnfPackageManager::native_outcome(&transactions, "ours"),
+        )
+        .unwrap_err()
+        .to_string();
+        for expected in [
+            "original exit 1",
+            "41",
+            "comment 'ours'",
+            "Started",
+            "0 package action(s)",
+            "dnf remove tree",
+            "Automatic recovery was not attempted",
+        ] {
+            assert!(result.contains(expected), "missing {expected}: {result}");
+        }
+        assert!(
+            !result.contains("retry manually"),
+            "must not advise blind replay: {result}"
+        );
+        assert!(
+            history.load().unwrap().is_empty(),
+            "Started is not committed history"
+        );
+        let result = DnfPackageManager::record_native_result(
+            crate::core::history::TransactionType::Remove,
+            &history,
+            Ok(()),
+            DnfPackageManager::native_outcome(&transactions, "ours"),
+        )
+        .unwrap_err();
+        assert!(format!("{result:#}").contains("Automatic recovery was not attempted"));
+        assert!(history.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_result_selection_keeps_journal_and_command_outcomes_separate() {
+        use crate::core::history::{HistoryManager, TransactionType};
+        let directory = tempfile::tempdir().unwrap();
+        let history = HistoryManager::new_in(directory.path().join("history.json")).unwrap();
+        let result = DnfPackageManager::record_native_result;
+        result(
+            TransactionType::Remove,
+            &history,
+            Ok(()),
+            Ok(NativeOutcome::NoTransaction),
+        )
+        .unwrap();
+        assert!(
+            history.load().unwrap().is_empty(),
+            "no-op must not invent history"
+        );
+        let error = result(
+            TransactionType::Remove,
+            &history,
+            Ok(()),
+            Ok(NativeOutcome::Failed),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("failed journal transaction after command success"));
+        assert!(!history.load().unwrap()[0].success);
+        let error = result(
+            TransactionType::Remove,
+            &history,
+            Err(anyhow::anyhow!("original error")),
+            Ok(NativeOutcome::Committed(Vec::new())),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "original error",
+            "a committed journal row is not recovery of a command error"
+        );
+        let entries = history.load().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries[1].success,
+            "record native commitment honestly despite command error"
+        );
+        for operation in [Ok(()), Err(anyhow::anyhow!("original error"))] {
+            let error = result(
+                TransactionType::Remove,
+                &history,
+                operation,
+                Err(anyhow::anyhow!("invalid journal")),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("invalid journal"));
+        }
+        assert_eq!(
+            history.load().unwrap().len(),
+            2,
+            "invalid journal must not invent changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_history_query_is_noninteractive_and_bounded() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "if read line; then exit 9; fi; printf '[]'"]);
+        assert_eq!(
+            DnfPackageManager::query_output(command).await.unwrap(),
+            b"[]"
+        );
+        let mut command = tokio::process::Command::new("/bin/sh");
+        // exec avoids a surviving shell descendant; no native DNF or sudo runs.
+        command.args(["-c", "exec sleep 30"]);
+        let started = std::time::Instant::now();
+        let error = DnfPackageManager::query_output_with_deadline(
+            command,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("DNF query timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf '[]'; exit 7"]);
+        assert!(
+            DnfPackageManager::query_output(command)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("DNF query failed")
+        );
+    }
+
+    #[test]
     fn native_failure_does_not_turn_planned_versions_into_committed_changes() {
         let transactions: Vec<NativeTransaction> = serde_json::from_str(r#"[{"id":1,"comment":"ours","status":"Error","packages":[{"nevra":"a-0:1-1.noarch","action":"Install"}]}]"#).unwrap();
         assert!(matches!(
             DnfPackageManager::native_outcome(&transactions, "ours").unwrap(),
             NativeOutcome::Failed
         ));
+    }
+
+    #[test]
+    fn native_interruption_keeps_uuid_without_description_and_rejects_ambiguous_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let history =
+            crate::core::history::HistoryManager::new_in(directory.path().join("history.json"))
+                .unwrap();
+        let comment = "omg-550e8400-e29b-41d4-a716-446655440000";
+        let transactions: Vec<NativeTransaction> = serde_json::from_str(
+            r#"[{"id":73,"comment":"omg-550e8400-e29b-41d4-a716-446655440000","status":"Started","packages":[]},
+                {"id":74,"comment":"omg-550e8400-e29b-41d4-a716-446655440001","status":"Ok","packages":[]}]"#,
+        ).unwrap();
+        let outcome = DnfPackageManager::native_outcome(&transactions, comment).unwrap();
+        match &outcome {
+            NativeOutcome::Interrupted {
+                id,
+                comment: observed,
+                status,
+                actions,
+                command,
+            } => {
+                assert_eq!(*id, 73);
+                assert_eq!(observed, comment);
+                assert_eq!(status, "Started");
+                assert_eq!(*actions, 0);
+                assert_eq!(command, "not recorded");
+            }
+            other => panic!("expected Interrupted, got {other:?}"),
+        }
+        let error = DnfPackageManager::record_native_result(
+            crate::core::history::TransactionType::Remove,
+            &history,
+            Err(anyhow::anyhow!("original exit 1")),
+            Ok(outcome),
+        )
+        .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        for expected in [
+            comment,
+            "73",
+            "Started",
+            "0 package action(s)",
+            "not recorded",
+            "original exit 1",
+        ] {
+            assert!(
+                diagnostic.contains(expected),
+                "missing {expected}: {diagnostic}"
+            );
+        }
+        assert!(history.load().unwrap().is_empty());
+        assert!(matches!(
+            DnfPackageManager::native_outcome(&transactions[1..], comment).unwrap(),
+            NativeOutcome::NoTransaction
+        ));
+        let duplicates: Vec<NativeTransaction> = serde_json::from_str(
+            r#"[{"id":73,"comment":"omg-550e8400-e29b-41d4-a716-446655440000","status":"Started","packages":[]},
+                {"id":75,"comment":"omg-550e8400-e29b-41d4-a716-446655440000","status":"Ok","packages":[]}]"#,
+        ).unwrap();
+        let error = DnfPackageManager::native_outcome(&duplicates, comment).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Duplicate DNF transaction correlation")
+        );
+        assert!(history.load().unwrap().is_empty());
     }
 
     #[test]
