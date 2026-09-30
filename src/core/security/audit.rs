@@ -199,8 +199,8 @@ pub struct AuditEntry {
     ///
     /// Older logs predate this marker, so it defaults to
     /// [`HASH_VERSION_LEGACY`] and their concatenated preimage keeps verifying.
-    /// New entries use [`HASH_VERSION_LENGTH_PREFIXED`], which length-prefixes
-    /// every field so no two distinct entries share a preimage.
+    /// New entries use [`HASH_VERSION_LENGTH_PREFIXED`], which binds field
+    /// boundaries and separates the preimage from all legacy UTF-8 bytes.
     #[serde(default)]
     pub hash_version: u8,
     /// Hash of this entry (computed from all fields except this one)
@@ -215,9 +215,9 @@ pub struct AuditEntry {
 const HASH_VERSION_LEGACY: u8 = 0;
 /// Current preimage encoding.
 ///
-/// Each field is hashed as a big-endian `u64` byte length followed by its
-/// bytes, and the version byte is bound into the preimage so an entry cannot
-/// be replayed under a different encoding.
+/// The preimage starts with `0xff` and the version byte. Legacy preimages
+/// contain only valid UTF-8, so they cannot start with this prefix. Each field
+/// follows as a big-endian `u64` byte length and its UTF-8 bytes.
 pub const HASH_VERSION_LENGTH_PREFIXED: u8 = 1;
 
 /// Feed one field into the chain hash as a fixed-width length followed by its
@@ -249,7 +249,9 @@ impl AuditEntry {
             }
             hasher.update(self.prev_hash.as_bytes());
         } else {
-            hasher.update([self.hash_version]);
+            // A version byte alone is valid UTF-8 and can collide with legacy
+            // concatenation. The invalid UTF-8 prefix separates both domains.
+            hasher.update([0xff, self.hash_version]);
             update_length_prefixed(&mut hasher, self.id.as_bytes());
             update_length_prefixed(&mut hasher, self.timestamp.as_bytes());
             update_length_prefixed(&mut hasher, format!("{:?}", self.event_type).as_bytes());
@@ -1627,6 +1629,92 @@ mod tests {
         assert!(!entry.verify());
     }
 
+    // Independent baseline concatenation and UTF-8 fixtures, checked with Python hashlib.
+    const HISTORICAL: &str = concat!(
+        r#"{"id":"legacy-1","timestamp":"2026-01-16T00:00:00Z","event_type":"package_install","severity":"info","user":"test","resource":"ab","description":"","prev_hash":"genesis","hash":"0c1d6273c4d0c09be7a190c6bf7f76e62ce3ebe4c16f08f11fa9b6d5cd57113b"}"#,
+        "\n",
+        r#"{"id":"legacy-2","timestamp":"2026-01-16T00:00:00Z","event_type":"package_install","severity":"info","user":"test","resource":"café","description":"line\nx","prev_hash":"0c1d6273c4d0c09be7a190c6bf7f76e62ce3ebe4c16f08f11fa9b6d5cd57113b","hash":"c2c9a3b5fad8ec6f962ceae36d69be6f375d3b9b1d6eeeebdc0edc585920023d","metadata":{"ok":true}}"#,
+        "\n",
+    );
+
+    fn historical_entry() -> AuditEntry {
+        serde_json::from_str(HISTORICAL.lines().next().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn hash_domain_rejects_cross_version_substitution_and_unknown_versions() {
+        let mut modern = historical_entry();
+        modern.hash_version = HASH_VERSION_LENGTH_PREFIXED;
+        modern.id = "12345678-1234-1234-1234-123456789abc".into();
+        modern.resource = "PackageInstallInfo".into();
+        modern.hash = Some(modern.compute_hash());
+        assert!(modern.verify());
+
+        // AH-2's previous version-only prefix is valid UTF-8, including controls.
+        let mut prefix = vec![1u8];
+        for field in [
+            &modern.id,
+            &modern.timestamp,
+            &"PackageInstall".into(),
+            &"Info".into(),
+            &modern.user,
+        ] {
+            prefix.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            prefix.extend_from_slice(field.as_bytes());
+        }
+        prefix.extend_from_slice(&(modern.resource.len() as u64).to_be_bytes());
+        let mut suffix = Vec::new();
+        for n in [0u64, 0, modern.prev_hash.len() as u64] {
+            suffix.extend_from_slice(&n.to_be_bytes());
+        }
+        let mut legacy = modern.clone();
+        legacy.hash_version = HASH_VERSION_LEGACY;
+        legacy.id = String::from_utf8(prefix).unwrap();
+        legacy.timestamp.clear();
+        legacy.user = String::from_utf8(suffix).unwrap();
+        legacy.resource.clear();
+        legacy.description.clear();
+        // Literal digest of the old v1 bytes, independently checked with hashlib.
+        assert_eq!(
+            legacy.compute_hash(),
+            "8990f1ee97380347c877d3141ed63f1bceab7d3e6e5ca0177f600b0dc58b5805"
+        );
+        assert_ne!(legacy.compute_hash(), modern.compute_hash());
+        // Keep the modern digest and previous hash instead of rehashing the substitution.
+        assert_eq!(legacy.prev_hash, modern.prev_hash);
+        assert!(!legacy.verify());
+        let serialized = serde_json::to_string(&legacy).unwrap();
+        let substituted: AuditEntry = serde_json::from_str(&serialized).unwrap();
+        assert!(
+            !substituted.verify(),
+            "escaped controls must not bypass domain separation"
+        );
+        let mut swapped = modern.clone();
+        swapped.hash_version = HASH_VERSION_LEGACY;
+        assert!(!swapped.verify());
+        for version in [2, 255] {
+            let mut unknown = modern.clone();
+            unknown.hash_version = version;
+            assert!(!unknown.verify());
+            unknown.hash = Some(unknown.compute_hash());
+            assert!(
+                !unknown.verify(),
+                "recomputed unknown encodings must also be refused"
+            );
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("audit.jsonl");
+            std::fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string(&unknown).unwrap()),
+            )
+            .unwrap();
+            let logger = AuditLogger::new_in(&path).unwrap();
+            let report = logger.verify_integrity().unwrap();
+            assert_eq!(report.total_entries, 1);
+            assert!(!report.is_valid());
+        }
+    }
+
     fn collision_test_entry(resource: &str, description: &str) -> AuditEntry {
         AuditEntry {
             id: "test-id".to_string(),
@@ -1655,12 +1743,16 @@ mod tests {
             "length-prefixed encoding must keep field boundaries injective"
         );
 
-        // The same collision also existed between user and resource, and between
-        // absent metadata and empty metadata.
+        assert_legacy_collision_modern_distinction(first, second);
+
+        // Both legacy user/resource pairs concatenate to "testbc".
         let third = collision_test_entry("bc", "");
         let mut fourth = collision_test_entry("c", "");
-        fourth.user = "b".to_string();
-        assert_ne!(third.compute_hash(), fourth.compute_hash());
+        fourth.user = "testb".to_string();
+        assert_legacy_collision_modern_distinction(third, fourth);
+
+        // A JSON empty string contributes two quote bytes, not zero bytes.
+        // This checks distinct metadata values, not a claimed legacy collision.
 
         let mut with_empty_metadata = collision_test_entry("pkg", "d");
         with_empty_metadata.metadata = Some(serde_json::json!(""));
@@ -1673,39 +1765,33 @@ mod tests {
 
     #[test]
     fn legacy_entries_without_a_version_marker_keep_verifying() {
-        // A log written before the version marker existed deserializes the
-        // missing field as 0 and must verify with the old concatenated preimage
-        // instead of being reported corrupt.
+        assert!(!HISTORICAL.contains("hash_version"));
+        for line in HISTORICAL.lines() {
+            let entry: AuditEntry = serde_json::from_str(line).unwrap();
+            assert_eq!(entry.hash_version, HASH_VERSION_LEGACY);
+            assert_eq!(entry.compute_hash(), entry.hash.as_ref().unwrap().as_str());
+            assert!(entry.verify());
+            let mut relabeled = entry.clone();
+            relabeled.hash_version = HASH_VERSION_LENGTH_PREFIXED;
+            assert!(!relabeled.verify());
+            let mut explicit_zero: serde_json::Value = serde_json::from_str(line).unwrap();
+            explicit_zero["hash_version"] = serde_json::json!(0);
+            let explicit_zero: AuditEntry = serde_json::from_value(explicit_zero).unwrap();
+            assert_eq!(explicit_zero.hash_version, HASH_VERSION_LEGACY);
+            assert!(explicit_zero.verify());
+            assert_eq!(entry.compute_hash(), explicit_zero.compute_hash());
+        }
         let temp = tempfile::TempDir::new().unwrap();
         let log_path = temp.path().join("audit.jsonl");
-
-        let legacy = collision_test_entry("ab", "");
-        let mut legacy_line = legacy;
-        legacy_line.hash_version = HASH_VERSION_LEGACY;
-        legacy_line.hash = Some(legacy_line.compute_hash());
-        std::fs::write(
-            &log_path,
-            format!(
-                "{}\n",
-                serde_json::to_string(&legacy_line).expect("serialize legacy entry")
-            ),
-        )
-        .unwrap();
-
-        let report = AuditLogger::new_in(&log_path)
-            .expect("open legacy log")
-            .verify_integrity()
-            .expect("verify legacy log");
+        std::fs::write(&log_path, HISTORICAL).unwrap();
+        let mut logger = AuditLogger::new_in(&log_path).expect("open legacy log");
+        let report = logger.verify_integrity().expect("verify legacy log");
         assert!(
             report.is_valid(),
             "legacy chain must stay valid: {report:?}"
         );
-        assert_eq!(report.total_entries, 1);
-        assert_eq!(report.valid_entries, 1);
-
-        // Appending to a retained legacy log keeps the chain intact: the new
-        // entry links to the legacy tail hash and uses the current encoding.
-        let mut logger = AuditLogger::new_in(&log_path).expect("append to legacy log");
+        assert_eq!(report.total_entries, 2);
+        assert_eq!(report.valid_entries, 2);
         logger
             .log(
                 AuditEventType::PackageInstall,
@@ -1714,18 +1800,108 @@ mod tests {
                 "Installed firefox",
             )
             .expect("append to legacy log");
+        let bytes = std::fs::read(&log_path).unwrap();
+        assert!(
+            bytes.starts_with(HISTORICAL.as_bytes()),
+            "append must not rewrite retained bytes"
+        );
+        let appended: AuditEntry = serde_json::from_slice(&bytes[HISTORICAL.len()..]).unwrap();
+        assert_eq!(appended.hash_version, HASH_VERSION_LENGTH_PREFIXED);
+        assert_eq!(
+            appended.prev_hash,
+            "c2c9a3b5fad8ec6f962ceae36d69be6f375d3b9b1d6eeeebdc0edc585920023d"
+        );
+        assert!(appended.verify());
         let report = logger.verify_integrity().expect("verify mixed log");
         assert!(
             report.is_valid(),
             "mixed legacy/new chain must stay valid: {report:?}"
         );
-        assert_eq!(report.total_entries, 2);
-        assert_eq!(report.valid_entries, 2);
+        assert_eq!(report.total_entries, 3);
+        assert_eq!(report.valid_entries, 3);
         assert_eq!(report.first_invalid_entry, None);
-
         let entries = read_all_entries(&log_path).expect("read mixed log");
         assert_eq!(entries[0].hash_version, HASH_VERSION_LEGACY);
-        assert_eq!(entries[1].hash_version, HASH_VERSION_LENGTH_PREFIXED);
+        assert_eq!(entries[1].hash_version, HASH_VERSION_LEGACY);
+        assert_eq!(entries[2].hash_version, HASH_VERSION_LENGTH_PREFIXED);
+    }
+
+    fn assert_legacy_collision_modern_distinction(mut a: AuditEntry, mut b: AuditEntry) {
+        a.hash_version = HASH_VERSION_LEGACY;
+        b.hash_version = HASH_VERSION_LEGACY;
+        assert_eq!(
+            a.compute_hash(),
+            b.compute_hash(),
+            "must be a genuine legacy collision"
+        );
+        a.hash_version = HASH_VERSION_LENGTH_PREFIXED;
+        b.hash_version = HASH_VERSION_LENGTH_PREFIXED;
+        assert_ne!(a.compute_hash(), b.compute_hash());
+        b.hash = Some(a.compute_hash());
+        assert!(!b.verify());
+    }
+
+    #[test]
+    fn hash_delimits_utf8_controls_empty_fields_and_metadata() {
+        let mut reference: AuditEntry =
+            serde_json::from_str(HISTORICAL.lines().nth(1).unwrap()).unwrap();
+        reference.hash_version = HASH_VERSION_LENGTH_PREFIXED;
+        assert_eq!(
+            reference.compute_hash(),
+            "8ab74d0af48d5e68df48933fff842f9d15b01c94bed662079d7b68a402092705"
+        );
+        for (left, shifted, right) in [("ab", "a", "b"), ("éx", "é", "x"), ("\0\n", "\0", "\n")] {
+            let mut a = historical_entry();
+            a.resource = left.into();
+            let mut b = a.clone();
+            b.resource = shifted.into();
+            b.description = right.into();
+            assert_legacy_collision_modern_distinction(a, b);
+        }
+        let mut a = historical_entry();
+        a.id = "i".into();
+        a.timestamp = "ts".into();
+        let mut b = a.clone();
+        b.id = "it".into();
+        b.timestamp = "s".into();
+        assert_legacy_collision_modern_distinction(a, b);
+        // Shift actual serialized JSON bytes across description/metadata.
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!({"text":"é\n"}),
+        ] {
+            let mut a = historical_entry();
+            a.description = value.to_string();
+            let mut b = a.clone();
+            b.description.clear();
+            b.metadata = Some(value);
+            assert_legacy_collision_modern_distinction(a, b);
+        }
+        let mut entry = historical_entry();
+        entry.hash_version = HASH_VERSION_LENGTH_PREFIXED;
+        let mut hashes = std::collections::HashSet::new();
+        for meta in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!({})),
+        ] {
+            entry.metadata = meta;
+            assert!(hashes.insert(entry.compute_hash()));
+        }
+    }
+
+    #[test]
+    fn hash_rejects_shifted_field_boundaries() {
+        let mut entry = collision_test_entry("ab", "");
+        entry.hash = Some(entry.compute_hash());
+        entry.resource = "a".into();
+        entry.description = "b".into();
+        assert!(
+            !entry.verify(),
+            "shifting fields must invalidate the retained hash"
+        );
     }
 
     #[test]
@@ -2356,8 +2532,69 @@ mod completeness_tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
-    #[test]
-    fn tracing_message_escapes_newlines_from_caller_description() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn tracing_message_escapes_newlines_from_caller_description() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        const CHILD_MARKER: &str = "OMG_AUDIT_CAPTURE_ISOLATED_CHILD";
+        const TEST_NAME: &str = "core::security::audit::completeness_tests::tracing_message_escapes_newlines_from_caller_description";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            // A temporary subscriber shares callsite registration with parallel
+            // tests. Run this same real logging oracle in a fresh test process.
+            use tokio::io::AsyncReadExt;
+            const MAX_CAPTURE: u64 = 256 * 1024;
+            let mut child = tokio::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", TEST_NAME, "--nocapture", "--color", "never"])
+                .env(CHILD_MARKER, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let stdout = child.stdout.take().context("child stdout must be piped")?;
+            let stderr = child.stderr.take().context("child stderr must be piped")?;
+            let capture = async {
+                let (status, stdout, stderr) = tokio::try_join!(
+                    child.wait(),
+                    async {
+                        let mut bytes = Vec::new();
+                        stdout.take(MAX_CAPTURE + 1).read_to_end(&mut bytes).await?;
+                        Ok::<_, std::io::Error>(bytes)
+                    },
+                    async {
+                        let mut bytes = Vec::new();
+                        stderr.take(MAX_CAPTURE + 1).read_to_end(&mut bytes).await?;
+                        Ok::<_, std::io::Error>(bytes)
+                    },
+                )?;
+                Ok::<_, std::io::Error>((status, stdout, stderr))
+            };
+            let (status, stdout, stderr) =
+                match tokio::time::timeout(std::time::Duration::from_secs(20), capture).await {
+                    Ok(Ok(output)) => output,
+                    result => {
+                        // Kill only this owned child, then reap it before returning.
+                        if child.try_wait()?.is_none() {
+                            child.kill().await?;
+                        }
+                        child.wait().await?;
+                        anyhow::bail!("isolated audit capture did not complete: {result:?}");
+                    }
+                };
+            anyhow::ensure!(
+                stdout.len() <= MAX_CAPTURE as usize && stderr.len() <= MAX_CAPTURE as usize,
+                "isolated audit capture output exceeded its bound"
+            );
+            let stdout = String::from_utf8(stdout)?;
+            let stderr = String::from_utf8(stderr)?;
+            anyhow::ensure!(
+                status.success(),
+                "isolated audit capture failed: {status}\n{stdout}\n{stderr}"
+            );
+            anyhow::ensure!(stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")), "isolated audit capture must execute exactly one passing test: {stdout}");
+            println!("AUDIT_CAPTURE_CHILD_BEGIN\n{stdout}\n{stderr}\nAUDIT_CAPTURE_CHILD_END");
+            return Ok(());
+        }
         assert_eq!(
             super::tracing_safe_audit_text("ok\nInjected: fake success"),
             "ok\\nInjected: fake success"

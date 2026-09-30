@@ -1541,6 +1541,11 @@ mod sbom_audit {
         assert!(!hash.is_empty());
         assert_eq!(hash.len(), 64); // SHA-256
 
+        // Independently checked ff01/BE64 encoding from Python hashlib.
+        assert_eq!(
+            hash,
+            "a152b601c0db36599e6487b43768e244196e4b553ffc84007c1e5c0cf1ca3d70"
+        );
         // Hash should be deterministic
         assert_eq!(hash, entry.compute_hash());
     }
