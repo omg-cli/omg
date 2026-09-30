@@ -489,39 +489,176 @@ fn parse_desc_manual(content: &str, repo: &str) -> Result<SyncDbPackage> {
     Ok(pkg)
 }
 
-/// Doctor deliberately uses the same parser as package queries. The parser
-/// tolerates damaged entries so ordinary queries remain available; doctor
-/// checks that none of those entries were silently omitted.
-pub(crate) fn check_local_db_consistency(path: &Path) -> Result<usize> {
-    let mut directories = 0;
-    for entry in fs::read_dir(path)
-        .with_context(|| format!("Failed to read local package database {}", path.display()))?
-    {
-        let entry = entry.context("Failed to enumerate local package database")?;
-        if !entry.metadata()?.is_dir() {
-            continue;
-        }
-        directories += 1;
+/// Doctor resolves dependencies from one validated package snapshot.
+pub(crate) fn check_local_db_health(path: &Path) -> Result<(usize, Vec<UnsatisfiedDependency>)> {
+    let snapshot = LocalHealthSnapshot::capture(path)?;
+    validate_health_relations(&snapshot.packages)?;
+    let missing = unsatisfied_dependencies(&snapshot.packages);
+    snapshot.revalidate(path)?;
+    Ok((snapshot.packages.len(), missing))
+}
+
+struct LocalHealthSnapshot {
+    packages: HashMap<String, LocalDbPackage>,
+    fingerprints: std::collections::BTreeMap<PathBuf, Vec<u8>>,
+}
+
+fn health_identity(metadata: &fs::Metadata) -> Vec<u8> {
+    let mut result = Vec::new();
+    for value in [
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        u64::from(metadata.mode()),
+    ] {
+        result.extend_from_slice(&value.to_be_bytes());
+    }
+    for value in [
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ] {
+        result.extend_from_slice(&value.to_be_bytes());
+    }
+    result
+}
+
+fn health_file(path: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
+    let before = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        before.is_file(),
+        "Local package file must be regular: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        before.len() <= MAX_DESC_BYTES,
+        "Local package file exceeds size limit: {}",
+        path.display()
+    );
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("Failed to open local package file {}", path.display()))?;
+    let identity = health_identity(&before);
+    anyhow::ensure!(
+        identity == health_identity(&file.metadata()?),
+        "Local package file changed: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    (&file).take(MAX_DESC_BYTES + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_DESC_BYTES,
+        "Local package file exceeds size limit: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        identity == health_identity(&file.metadata()?)
+            && identity == health_identity(&fs::symlink_metadata(path)?),
+        "Local package file changed: {}",
+        path.display()
+    );
+    let mut fingerprint = identity;
+    fingerprint.extend_from_slice(&Sha256::digest(&bytes));
+    Ok((bytes, fingerprint))
+}
+
+impl LocalHealthSnapshot {
+    fn capture(path: &Path) -> Result<Self> {
+        let mut packages = HashMap::new();
+        let fingerprints = Self::observe(path, Some(&mut packages))?;
+        Ok(Self {
+            packages,
+            fingerprints,
+        })
+    }
+
+    fn revalidate(&self, path: &Path) -> Result<()> {
         anyhow::ensure!(
-            directories <= 20_000,
-            "local package database has too many entries"
+            self.fingerprints == Self::observe(path, None)?,
+            "Local package database changed during health inspection"
         );
-        for required in ["desc", "files"] {
+        Ok(())
+    }
+
+    /// Revalidation checks identities and bytes, without another tolerant parse.
+    fn observe(
+        path: &Path,
+        mut packages: Option<&mut HashMap<String, LocalDbPackage>>,
+    ) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+        let root = fs::symlink_metadata(path).with_context(|| {
+            format!(
+                "Failed to observe local package database {}",
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            root.is_dir(),
+            "Local package database must be a nonsymlink directory"
+        );
+        let root_identity = health_identity(&root);
+        let mut fingerprints = std::collections::BTreeMap::new();
+        fingerprints.insert(PathBuf::new(), root_identity.clone());
+        let mut directories = 0;
+        let mut entries = 0;
+        for entry in fs::read_dir(path)
+            .with_context(|| format!("Failed to read local package database {}", path.display()))?
+        {
+            let entry = entry.context("Failed to enumerate local package database")?;
+            entries += 1;
             anyhow::ensure!(
-                entry.path().join(required).is_file(),
-                "local package entry {} lacks {required}",
-                entry.file_name().to_string_lossy()
+                entries <= 20_000,
+                "Local package database has too many entries"
+            );
+            let relative = PathBuf::from(entry.file_name());
+            let metadata = fs::symlink_metadata(entry.path())?;
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "Local package entry must not be a symlink"
+            );
+            let identity = health_identity(&metadata);
+            fingerprints.insert(relative.clone(), identity.clone());
+            if !metadata.is_dir() {
+                continue;
+            }
+            directories += 1;
+            for required in ["desc", "files"] {
+                let file_path = entry.path().join(required);
+                let (bytes, fingerprint) = health_file(&file_path).with_context(|| {
+                    format!(
+                        "Invalid local package entry {} {required}",
+                        entry.path().display()
+                    )
+                })?;
+                if required == "desc"
+                    && let Some(ref mut packages) = packages
+                {
+                    let content =
+                        std::str::from_utf8(&bytes).context("Local package desc is not UTF-8")?;
+                    let package = parse_local_desc_content(content)?;
+                    anyhow::ensure!(!package.name.is_empty(), "Local package entry has no name");
+                    let name = package.name.clone();
+                    anyhow::ensure!(
+                        packages.insert(name.clone(), package).is_none(),
+                        "Duplicate local package name {name}"
+                    );
+                }
+                fingerprints.insert(relative.join(required), fingerprint);
+            }
+            anyhow::ensure!(
+                identity == health_identity(&fs::symlink_metadata(entry.path())?),
+                "Local package directory changed during health inspection"
             );
         }
+        anyhow::ensure!(directories > 0, "Local package database is empty");
+        anyhow::ensure!(
+            root_identity == health_identity(&fs::symlink_metadata(path)?),
+            "Local package database changed during health inspection"
+        );
+        Ok(fingerprints)
     }
-    anyhow::ensure!(directories > 0, "local package database is empty");
-    let parsed = parse_local_db(path)?;
-    anyhow::ensure!(
-        parsed.len() == directories,
-        "local package database parsed {} of {directories} entries",
-        parsed.len()
-    );
-    Ok(directories)
 }
 
 /// Parse the local package database (/var/lib/pacman/local/)
@@ -627,12 +764,16 @@ fn parse_local_desc(path: &Path) -> Result<LocalDbPackage> {
         "Local package desc exceeds the {MAX_DESC_BYTES}-byte limit"
     );
 
+    parse_local_desc_content(&content)
+}
+
+fn parse_local_desc_content(content: &str) -> Result<LocalDbPackage> {
     // Modern pacman never writes `%REQUIREDBY%`/`%OPTFOR%` sections into local
     // desc files, so reverse dependencies cannot be read from disk. They are
     // derived from `%DEPENDS%`/`%PROVIDES%` at query time (see
     // `compute_required_names`) under the canonical orphan rule
     // (`types::is_orphan_package`, `pacman -Qdt` semantics).
-    if let Ok(desc) = alpm_db::desc::DbDescFileV1::from_str(&content) {
+    if let Ok(desc) = alpm_db::desc::DbDescFileV1::from_str(content) {
         Ok(LocalDbPackage {
             name: desc.name.to_string(),
             version: desc.version.into(),
@@ -644,7 +785,7 @@ fn parse_local_desc(path: &Path) -> Result<LocalDbPackage> {
             optdepends: desc.optdepends.iter().map(ToString::to_string).collect(),
             provides: desc.provides.iter().map(ToString::to_string).collect(),
         })
-    } else if let Ok(desc) = alpm_db::desc::DbDescFileV2::from_str(&content) {
+    } else if let Ok(desc) = alpm_db::desc::DbDescFileV2::from_str(content) {
         // V2 (has XDATA support)
         Ok(LocalDbPackage {
             name: desc.name.to_string(),
@@ -659,7 +800,7 @@ fn parse_local_desc(path: &Path) -> Result<LocalDbPackage> {
         })
     } else {
         // Fallback: manual parsing for edge cases
-        parse_local_desc_manual(&content)
+        parse_local_desc_manual(content)
     }
 }
 
@@ -1326,7 +1467,7 @@ pub fn list_local_cached() -> Result<Vec<LocalDbPackage>> {
 pub struct UnsatisfiedDependency {
     /// The installed package that declares the dependency.
     pub package: String,
-    /// The base dependency name, with any version constraint stripped.
+    /// The complete declared dependency, including its version constraint.
     pub dependency: String,
 }
 
@@ -1342,35 +1483,40 @@ pub fn unsatisfied_local_dependencies(path: &Path) -> Vec<UnsatisfiedDependency>
     }
 }
 
-/// Report dependencies declared by an already-parsed database that nothing
-/// installed satisfies.
-///
-/// Virtual packages are resolved through `%PROVIDES%`, and a package depending on
-/// itself is ignored. `optdepends` are deliberately not checked: pacman treats
-/// them as optional.
-///
-/// This is a consistency check over the parsed database, not a version
-/// comparison: it answers "is anything installed that could satisfy this name".
+/// Required relations use the installed or explicitly provided version.
+/// Optional dependencies are excluded. Diagnostics retain the original relation.
 fn unsatisfied_dependencies(
     packages: &HashMap<String, LocalDbPackage>,
 ) -> Vec<UnsatisfiedDependency> {
-    let provided: std::collections::HashSet<&str> = packages
-        .values()
-        .flat_map(|package| package.provides.iter().map(String::as_str))
-        .collect();
-
+    let mut provided: HashMap<&str, Vec<HealthRelation<'_>>> = HashMap::new();
+    for package in packages.values() {
+        for raw in &package.provides {
+            if let Ok(relation) = health_relation(raw)
+                && matches!(relation.operator, "" | "=")
+            {
+                provided.entry(relation.name).or_default().push(relation);
+            }
+        }
+    }
     let mut missing = Vec::new();
     for package in packages.values() {
-        for depend in &package.depends {
-            let target = dependency_base_name(depend);
-            if target == package.name || packages.contains_key(target) || provided.contains(target)
-            {
-                continue;
-            }
-            missing.push(UnsatisfiedDependency {
-                package: package.name.clone(),
-                dependency: target.to_owned(),
+        for raw in &package.depends {
+            let satisfied = health_relation(raw).is_ok_and(|required| {
+                packages
+                    .get(required.name)
+                    .is_some_and(|installed| required.accepts(Some(&installed.version.to_string())))
+                    || provided.get(required.name).is_some_and(|providers| {
+                        providers
+                            .iter()
+                            .any(|provider| required.accepts(provider.version))
+                    })
             });
+            if !satisfied {
+                missing.push(UnsatisfiedDependency {
+                    package: package.name.clone(),
+                    dependency: raw.clone(),
+                });
+            }
         }
     }
     missing.sort_by(|a, b| {
@@ -1379,6 +1525,76 @@ fn unsatisfied_dependencies(
             .then_with(|| a.dependency.cmp(&b.dependency))
     });
     missing
+}
+
+struct HealthRelation<'a> {
+    name: &'a str,
+    operator: &'a str,
+    version: Option<&'a str>,
+}
+
+fn health_relation(raw: &str) -> Result<HealthRelation<'_>> {
+    alpm_types::RelationOrSoname::from_str(raw)
+        .with_context(|| format!("Invalid required dependency or provision {raw}"))?;
+    if let Some(index) = raw.find(['<', '>', '=']) {
+        let tail = &raw[index..];
+        let width = if tail.starts_with("<=") || tail.starts_with(">=") {
+            2
+        } else {
+            1
+        };
+        Ok(HealthRelation {
+            name: &raw[..index],
+            operator: &tail[..width],
+            version: Some(&tail[width..]),
+        })
+    } else {
+        Ok(HealthRelation {
+            name: raw,
+            operator: "",
+            version: None,
+        })
+    }
+}
+
+impl HealthRelation<'_> {
+    fn accepts(&self, candidate: Option<&str>) -> bool {
+        let Some(required) = self.version else {
+            return true;
+        };
+        let Some(candidate) = candidate else {
+            return false;
+        };
+        let comparison = alpm::vercmp(candidate, required);
+        match self.operator {
+            "=" => comparison.is_eq(),
+            ">" => comparison.is_gt(),
+            ">=" => !comparison.is_lt(),
+            "<" => comparison.is_lt(),
+            "<=" => !comparison.is_gt(),
+            _ => false,
+        }
+    }
+}
+
+fn validate_health_relations(packages: &HashMap<String, LocalDbPackage>) -> Result<()> {
+    for package in packages.values() {
+        alpm_types::Name::from_str(&package.name).context("Invalid local package name")?;
+        for dependency in &package.depends {
+            health_relation(dependency)
+                .with_context(|| format!("Invalid dependency declared by {}", package.name))?;
+        }
+        for provision in &package.provides {
+            let relation = health_relation(provision)
+                .with_context(|| format!("Invalid provision declared by {}", package.name))?;
+            anyhow::ensure!(
+                matches!(relation.operator, "" | "="),
+                "Unsupported provision {provision} declared by {}",
+                package.name
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Identify potential AUR packages (installed but not in any sync database).
@@ -2316,6 +2532,285 @@ mod tests {
         std::fs::write(corrupt.join("desc"), "%VERSION%\n1.0-1\n").unwrap();
         std::fs::write(corrupt.join("files"), "%FILES%\nusr/bin/corrupt\n").unwrap();
         assert!(check_local_db_consistency(temp.path()).is_err());
+    }
+
+    fn health_fixture() -> tempfile::TempDir {
+        let temp = tempfile::TempDir::new().unwrap();
+        write_local_desc(&temp, "app", "0", "");
+        fs::write(temp.path().join("app/files"), "%FILES%\nusr/bin/app\n").unwrap();
+        temp
+    }
+
+    #[test]
+    fn health_observation_healthy_snapshot_and_missing_dependency() {
+        let temp = health_fixture();
+        assert_eq!(check_local_db_health(temp.path()).unwrap(), (1, Vec::new()));
+        write_local_desc(&temp, "app", "0", "\n%DEPENDS%\nabsent\n");
+        assert_eq!(
+            check_local_db_health(temp.path()).unwrap(),
+            (
+                1,
+                vec![UnsatisfiedDependency {
+                    package: "app".into(),
+                    dependency: "absent".into()
+                }]
+            )
+        );
+    }
+
+    #[test]
+    fn health_observation_rejects_missing_empty_and_not_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        assert!(check_local_db_health(temp.path()).is_err());
+        assert!(check_local_db_health(&temp.path().join("absent")).is_err());
+        let file = temp.path().join("not-directory");
+        fs::write(&file, "file").unwrap();
+        assert!(check_local_db_health(&file).is_err());
+    }
+
+    #[test]
+    fn health_observation_rejects_required_file_and_malformed_declaration() {
+        let temp = health_fixture();
+        fs::remove_file(temp.path().join("app/files")).unwrap();
+        assert!(check_local_db_health(temp.path()).is_err());
+        fs::write(temp.path().join("app/files"), "").unwrap();
+        fs::write(temp.path().join("app/desc"), "%VERSION%\n1.0-1\n").unwrap();
+        assert!(check_local_db_health(temp.path()).is_err());
+    }
+
+    #[test]
+    fn health_observation_rejects_duplicate_package_names() {
+        let temp = health_fixture();
+        fs::create_dir(temp.path().join("duplicate")).unwrap();
+        fs::copy(
+            temp.path().join("app/desc"),
+            temp.path().join("duplicate/desc"),
+        )
+        .unwrap();
+        fs::write(temp.path().join("duplicate/files"), "").unwrap();
+        assert!(
+            check_local_db_health(temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate local package name")
+        );
+    }
+
+    #[test]
+    fn health_observation_rejects_symlinks() {
+        let temp = health_fixture();
+        let link = temp.path().join("alias");
+        std::os::unix::fs::symlink(temp.path().join("app"), &link).unwrap();
+        assert!(check_local_db_health(temp.path()).is_err());
+        fs::remove_file(link).unwrap();
+        fs::remove_file(temp.path().join("app/files")).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("app/desc"), temp.path().join("app/files"))
+            .unwrap();
+        assert!(check_local_db_health(temp.path()).is_err());
+    }
+
+    #[test]
+    fn health_observation_rejects_unreadable_declaring_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = health_fixture();
+        assert_eq!(fs::metadata(temp.path()).unwrap().uid(), 1000);
+        let path = temp.path().join("app/desc");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+        assert!(check_local_db_health(temp.path()).is_err());
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn health_observation_rejects_changed_desc_files_and_entry_set() {
+        for relative in ["app/desc", "app/files"] {
+            let temp = health_fixture();
+            let snapshot = LocalHealthSnapshot::capture(temp.path()).unwrap();
+            fs::write(temp.path().join(relative), "changed").unwrap();
+            assert!(snapshot.revalidate(temp.path()).is_err());
+        }
+        let temp = health_fixture();
+        let snapshot = LocalHealthSnapshot::capture(temp.path()).unwrap();
+        fs::write(temp.path().join("new-entry"), "").unwrap();
+        assert!(snapshot.revalidate(temp.path()).is_err());
+    }
+
+    #[test]
+    fn health_observation_rejects_vanished_or_replaced_root() {
+        let temp = health_fixture();
+        let snapshot = LocalHealthSnapshot::capture(temp.path()).unwrap();
+        let moved = temp.path().with_extension("moved");
+        fs::rename(temp.path(), &moved).unwrap();
+        assert!(snapshot.revalidate(temp.path()).is_err());
+        fs::create_dir(temp.path()).unwrap();
+        assert!(snapshot.revalidate(temp.path()).is_err());
+        fs::remove_dir(temp.path()).unwrap();
+        fs::rename(moved, temp.path()).unwrap();
+    }
+
+    fn health_relation_missing(required: &str, provision: &str) -> Vec<UnsatisfiedDependency> {
+        let temp = health_fixture();
+        write_local_desc(&temp, "app", "0", &format!("\n%DEPENDS%\n{required}\n"));
+        write_local_desc(
+            &temp,
+            "provider",
+            "1",
+            &format!("\n%PROVIDES%\n{provision}\n"),
+        );
+        fs::write(temp.path().join("provider/files"), "").unwrap();
+        check_local_db_health(temp.path()).unwrap().1
+    }
+
+    #[test]
+    fn health_matching_literal_and_self_versions_preserve_raw_diagnostics() {
+        let temp = health_fixture();
+        write_local_desc(&temp, "app", "0", "\n%DEPENDS%\napp>=9\nliteral>=9\n");
+        write_local_desc(&temp, "literal", "1", "");
+        fs::write(temp.path().join("literal/files"), "").unwrap();
+        assert_eq!(
+            check_local_db_health(temp.path()).unwrap().1,
+            vec![
+                UnsatisfiedDependency {
+                    package: "app".into(),
+                    dependency: "app>=9".into()
+                },
+                UnsatisfiedDependency {
+                    package: "app".into(),
+                    dependency: "literal>=9".into()
+                },
+            ]
+        );
+        write_local_desc(&temp, "app", "0", "\n%DEPENDS%\napp>=1\nliteral=1.0\n");
+        assert!(check_local_db_health(temp.path()).unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn health_matching_versioned_provisions_and_alternate_providers() {
+        assert!(health_relation_missing("virtual>=9", "virtual").len() == 1);
+        assert!(health_relation_missing("virtual>=9", "virtual=1").len() == 1);
+        assert!(health_relation_missing("virtual>=9", "virtual=9").is_empty());
+        let temp = health_fixture();
+        write_local_desc(&temp, "app", "0", "\n%DEPENDS%\nvirtual>=9\n");
+        for (name, version) in [("old", "1"), ("new", "9")] {
+            write_local_desc(
+                &temp,
+                name,
+                "1",
+                &format!("\n%PROVIDES%\nvirtual={version}\n"),
+            );
+            fs::write(temp.path().join(name).join("files"), "").unwrap();
+        }
+        assert!(check_local_db_health(temp.path()).unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn health_matching_soname_v1_basic_explicit_and_cross_relation() {
+        assert!(health_relation_missing("libfoo.so", "libfoo.so=1-64").is_empty());
+        assert_eq!(alpm::vercmp("1-64", "1"), std::cmp::Ordering::Equal);
+        assert!(health_relation_missing("libfoo.so=1", "libfoo.so=1-64").is_empty());
+        assert!(health_relation_missing("libfoo.so=1-64", "libfoo.so=1").is_empty());
+        assert!(health_relation_missing("libfoo.so=1-64", "libfoo.so=1-64").is_empty());
+        for provided in ["libfoo.so=2-64", "libfoo.so=1-32", "libfoo.so"] {
+            assert_eq!(
+                health_relation_missing("libfoo.so=1-64", provided).len(),
+                1,
+                "{provided}"
+            );
+        }
+        assert!(
+            health_relation_missing("libfoo.so=libfoo.so-64", "libfoo.so=libfoo.so-64").is_empty()
+        );
+        assert_eq!(
+            health_relation_missing("libfoo.so=libfoo.so-64", "libfoo.so=libfoo.so-32").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn health_matching_soname_v2_preserves_prefix_and_name() {
+        assert!(health_relation_missing("lib:libfoo.so.1", "lib:libfoo.so.1").is_empty());
+        for provided in ["lib64:libfoo.so.1", "lib:libbar.so.1", "lib:libfoo.so.2"] {
+            assert_eq!(
+                health_relation_missing("lib:libfoo.so.1", provided).len(),
+                1,
+                "{provided}"
+            );
+        }
+    }
+
+    #[test]
+    fn health_matching_all_operators_epochs_releases_and_equivalent_versions() {
+        for (required, provision, satisfied) in [
+            ("virtual<2", "virtual=1", true),
+            ("virtual<1", "virtual=1", false),
+            ("virtual<=1", "virtual=1", true),
+            ("virtual<=1", "virtual=2", false),
+            ("virtual>1", "virtual=2", true),
+            ("virtual>1", "virtual=1", false),
+            ("virtual>=1", "virtual=1", true),
+            ("virtual>=2", "virtual=1", false),
+            ("virtual=1", "virtual=01", true),
+            ("virtual=1", "virtual=2", false),
+            ("virtual>1:9-9", "virtual=2:1-1", true),
+            ("virtual>1.0-1", "virtual=1.0-2", true),
+            ("virtual=1.0-2", "virtual=1.0-1", false),
+        ] {
+            assert_eq!(
+                health_relation_missing(required, provision).is_empty(),
+                satisfied,
+                "{required} / {provision}"
+            );
+        }
+    }
+
+    #[test]
+    fn health_matching_optional_dependencies_remain_optional() {
+        let temp = health_fixture();
+        write_local_desc(&temp, "app", "0", "\n%OPTDEPENDS%\nabsent>=9: optional\n");
+        assert!(check_local_db_health(temp.path()).unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn health_matching_rejects_malformed_or_unsupported_relations() {
+        for extra in [
+            "\n%DEPENDS%\nvirtual>=\n",
+            "\n%DEPENDS%\nvirtual==1\n",
+            "\n%PROVIDES%\nvirtual>=9\n",
+            "\n%PROVIDES%\nvirtual=\n",
+        ] {
+            let temp = health_fixture();
+            write_local_desc(&temp, "app", "0", extra);
+            assert!(check_local_db_health(temp.path()).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn health_matching_cpu_comparator_controls_relation_decisions() {
+        for (candidate, required) in [
+            ("1-64", "1"),
+            ("01", "1"),
+            ("2:1-1", "1:9-9"),
+            ("1.0-2", "1.0-1"),
+        ] {
+            let comparison = alpm::vercmp(candidate, required);
+            for (operator, expected) in [
+                ("=", comparison.is_eq()),
+                ("<", comparison.is_lt()),
+                ("<=", !comparison.is_gt()),
+                (">", comparison.is_gt()),
+                (">=", !comparison.is_lt()),
+            ] {
+                let raw = format!("virtual{operator}{required}");
+                assert_eq!(
+                    health_relation(&raw).unwrap().accepts(Some(candidate)),
+                    expected,
+                    "{raw} / {candidate}"
+                );
+            }
+        }
+    }
+
+    fn check_local_db_consistency(path: &Path) -> Result<usize> {
+        check_local_db_health(path).map(|(count, _)| count)
     }
 
     /// Parse the fixture db and apply the canonical orphan rule with

@@ -664,13 +664,10 @@ fn check_arch_infra() -> usize {
 
     let local_dir = crate::core::paths::pacman_local_dir();
     if local_dir.is_dir() {
-        match crate::package_managers::pacman_db::check_local_db_consistency(&local_dir) {
-            Ok(packages) => {
-                // Structure alone does not prove consistency: the database can
-                // parse cleanly and still declare a dependency nothing installed
-                // satisfies, which is what a half-removed package looks like.
-                let missing =
-                    crate::package_managers::pacman_db::unsatisfied_local_dependencies(&local_dir);
+        let health = crate::package_managers::pacman_db::check_local_db_health(&local_dir);
+        issues += alpm_health_issue_count(&health);
+        match health {
+            Ok((packages, missing)) => {
                 for entry in &missing {
                     println!(
                         "  {} ALPM dependency unsatisfied: {} requires {}",
@@ -691,7 +688,6 @@ fn check_arch_infra() -> usize {
                         missing.len(),
                         local_dir.display()
                     );
-                    issues += 1;
                 }
             }
             Err(error) => {
@@ -700,7 +696,6 @@ fn check_arch_infra() -> usize {
                     style::error("✗"),
                     local_dir.display()
                 );
-                issues += 1;
             }
         }
     } else {
@@ -715,6 +710,16 @@ fn check_arch_infra() -> usize {
     issues += check_pacman_lock(db_path.as_deref());
 
     issues
+}
+
+#[cfg(feature = "arch")]
+fn alpm_health_issue_count(
+    health: &Result<(
+        usize,
+        Vec<crate::package_managers::pacman_db::UnsatisfiedDependency>,
+    )>,
+) -> usize {
+    usize::from(!matches!(health, Ok((_, missing)) if missing.is_empty()))
 }
 
 /// Check network connectivity to backend-appropriate mirrors
@@ -1922,6 +1927,61 @@ mod tests {
         assert_eq!(check_pacman_lock(Some(&dir_str)), 0);
         std::fs::write(dir.path().join("db.lck"), b"").expect("stale lock");
         assert_eq!(check_pacman_lock(Some(&dir_str)), 1);
+    }
+
+    #[cfg(feature = "arch")]
+    fn alpm_doctor_fixture(dependencies: &str) -> tempfile::TempDir {
+        let temp = tempfile::TempDir::new().unwrap();
+        let package = temp.path().join("app");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("desc"),
+            format!("%NAME%\napp\n\n%VERSION%\n1.0-1\n\n%DEPENDS%\n{dependencies}\n"),
+        )
+        .unwrap();
+        std::fs::write(package.join("files"), "").unwrap();
+        temp
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_doctor_healthy_snapshot_has_no_issue() {
+        let temp = alpm_doctor_fixture("app>=1");
+        let health = crate::package_managers::pacman_db::check_local_db_health(temp.path());
+        assert_eq!(alpm_health_issue_count(&health), 0);
+        assert_eq!(health.unwrap(), (1, Vec::new()));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_doctor_wrong_version_is_an_issue_with_raw_relation() {
+        let temp = alpm_doctor_fixture("app>=9");
+        let health = crate::package_managers::pacman_db::check_local_db_health(temp.path());
+        assert_eq!(alpm_health_issue_count(&health), 1);
+        let (count, missing) = health.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            missing,
+            vec![crate::package_managers::pacman_db::UnsatisfiedDependency {
+                package: "app".into(),
+                dependency: "app>=9".into()
+            }]
+        );
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_doctor_failed_or_skipped_observation_is_an_issue() {
+        let temp = alpm_doctor_fixture("absent>=9");
+        for path in [temp.path().join("absent"), temp.path().join("app/desc")] {
+            let health = crate::package_managers::pacman_db::check_local_db_health(&path);
+            assert!(health.is_err());
+            assert_eq!(alpm_health_issue_count(&health), 1);
+        }
+        std::fs::write(temp.path().join("app/desc"), "%VERSION%\n1.0-1\n").unwrap();
+        let health = crate::package_managers::pacman_db::check_local_db_health(temp.path());
+        assert!(health.is_err());
+        assert_eq!(alpm_health_issue_count(&health), 1);
     }
 
     // W3-A-02: every supported backend distro must get a healthy OS verdict;
