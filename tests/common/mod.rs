@@ -211,6 +211,55 @@ impl CommandResult {
     }
 }
 
+/// Remove inherited Git selectors before applying child-local fixture overrides.
+pub fn clear_git_environment(command: &mut Command) {
+    for (key, _) in env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
+/// Build a direct Git command for a disposable repository.
+pub fn fixture_git_command(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    clear_git_environment(&mut command);
+    command
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    command
+}
+
+/// Check discovery after private initialization, before further Git writes.
+pub fn assert_fixture_git_identity(dir: &Path) {
+    for (flag, expected) in [
+        ("--show-toplevel", dir.to_path_buf()),
+        ("--absolute-git-dir", dir.join(".git")),
+    ] {
+        let output = fixture_git_command(dir)
+            .args(["rev-parse", flag])
+            .output()
+            .expect("discover fixture repository");
+        assert!(
+            output.status.success(),
+            "fixture discovery failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let discovered = String::from_utf8(output.stdout).expect("UTF-8 fixture path");
+        assert_eq!(
+            Path::new(discovered.trim()).canonicalize().unwrap(),
+            expected.canonicalize().unwrap(),
+            "Git must discover the intended private fixture for {flag}"
+        );
+    }
+}
+
+
 /// Run an OMG command
 pub fn run_omg(args: &[&str]) -> CommandResult {
     run_omg_with_options(args, None, &[])
@@ -269,6 +318,7 @@ fn run_omg_with_home(
         );
     }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_omg"));
+    clear_git_environment(&mut cmd);
     cmd.args(args)
         .env("OMG_TEST_MODE", "1")
         .env("OMG_DISABLE_DAEMON", "1")
