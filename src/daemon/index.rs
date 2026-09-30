@@ -326,7 +326,7 @@ impl PackageIndex {
         }
     }
 
-    #[cfg(any(feature = "debian", feature = "debian-pure"))]
+    #[cfg(feature = "debian")]
     fn new_apt() -> Result<Self> {
         #[cfg(feature = "debian")]
         if !crate::core::paths::test_mode() {

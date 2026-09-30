@@ -6,7 +6,7 @@ use super::dispatch_backend;
 
 #[cfg(feature = "arch")]
 mod arch;
-#[cfg(any(feature = "debian", feature = "debian-pure"))]
+#[cfg(feature = "debian")]
 mod debian;
 mod generic;
 

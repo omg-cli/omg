@@ -50,7 +50,7 @@ pub(crate) async fn enforce_install_policy(
 
 #[cfg(feature = "arch")]
 mod arch;
-#[cfg(any(feature = "debian", feature = "debian-pure"))]
+#[cfg(feature = "debian")]
 mod debian;
 mod generic;
 
@@ -175,7 +175,7 @@ async fn install_dry_run(packages: &[String]) -> Result<()> {
     dispatch_backend! {
         debian: { debian::install_dry_run(packages) },
         arch: { arch::install_dry_run(packages).await },
-        generic: { generic::install_dry_run(packages) },
+        generic: { generic::install_dry_run(packages).await },
     }
 }
 

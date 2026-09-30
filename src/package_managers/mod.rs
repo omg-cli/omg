@@ -594,6 +594,64 @@ pub fn get_package_manager() -> anyhow::Result<Arc<dyn PackageManager>> {
     }
 }
 
+// apt exports are available with debian feature
+#[cfg(feature = "debian")]
+pub fn apt_search_sync(query: &str) -> anyhow::Result<Vec<SyncPackage>> {
+    if crate::core::paths::test_mode() {
+        let pm = get_package_manager()?;
+        let results = futures::executor::block_on(pm.search(query))?;
+        return Ok(results
+            .into_iter()
+            .map(|p| SyncPackage {
+                name: p.name,
+                version: p.version,
+                description: p.description,
+                repo: "main".to_string(),
+                download_size: 0,
+                installed: p.installed,
+            })
+            .collect());
+    }
+    apt::search_sync(query)
+}
+
+#[cfg(feature = "debian")]
+pub fn apt_list_explicit() -> anyhow::Result<Vec<String>> {
+    if crate::core::paths::test_mode() {
+        let pm = get_package_manager()?;
+        return futures::executor::block_on(pm.list_explicit());
+    }
+    apt::list_explicit()
+}
+
+#[cfg(feature = "debian")]
+pub use apt::{
+    AptPackageManager, get_sync_pkg_info as apt_get_sync_pkg_info,
+    get_system_status as apt_get_system_status,
+    list_all_package_names as apt_list_all_package_names,
+    list_installed_fast as apt_list_installed_fast, list_updates as apt_list_updates,
+    remove_orphans as apt_remove_orphans,
+};
+#[cfg(any(feature = "debian", feature = "debian-pure"))]
+pub use debian_db::{
+    get_counts_fast as apt_get_counts_fast, get_info_fast as apt_get_info_fast,
+    list_explicit_fast as apt_list_explicit_fast, search_fast as apt_search_fast,
+};
+
+#[cfg(all(
+    any(feature = "debian", feature = "debian-pure"),
+    not(feature = "debian")
+))]
+pub use debian_db::list_installed_fast as apt_list_installed_fast;
+
+// Homebrew exports are available on macOS
+#[cfg(any(feature = "macos", target_os = "macos"))]
+pub use homebrew::HomebrewPackageManager;
+
+// DNF/RPM exports are available with fedora feature
+#[cfg(feature = "fedora")]
+pub use dnf::DnfPackageManager;
+
 #[cfg(test)]
 mod backend_selection_tests {
     use super::{Backend, CompiledBackends, resolve_for};
@@ -688,61 +746,3 @@ mod backend_selection_tests {
         );
     }
 }
-
-// apt exports are available with debian feature
-#[cfg(feature = "debian")]
-pub fn apt_search_sync(query: &str) -> anyhow::Result<Vec<SyncPackage>> {
-    if crate::core::paths::test_mode() {
-        let pm = get_package_manager()?;
-        let results = futures::executor::block_on(pm.search(query))?;
-        return Ok(results
-            .into_iter()
-            .map(|p| SyncPackage {
-                name: p.name,
-                version: p.version,
-                description: p.description,
-                repo: "main".to_string(),
-                download_size: 0,
-                installed: p.installed,
-            })
-            .collect());
-    }
-    apt::search_sync(query)
-}
-
-#[cfg(feature = "debian")]
-pub fn apt_list_explicit() -> anyhow::Result<Vec<String>> {
-    if crate::core::paths::test_mode() {
-        let pm = get_package_manager()?;
-        return futures::executor::block_on(pm.list_explicit());
-    }
-    apt::list_explicit()
-}
-
-#[cfg(feature = "debian")]
-pub use apt::{
-    AptPackageManager, get_sync_pkg_info as apt_get_sync_pkg_info,
-    get_system_status as apt_get_system_status,
-    list_all_package_names as apt_list_all_package_names,
-    list_installed_fast as apt_list_installed_fast, list_updates as apt_list_updates,
-    remove_orphans as apt_remove_orphans,
-};
-#[cfg(any(feature = "debian", feature = "debian-pure"))]
-pub use debian_db::{
-    get_counts_fast as apt_get_counts_fast, get_info_fast as apt_get_info_fast,
-    list_explicit_fast as apt_list_explicit_fast, search_fast as apt_search_fast,
-};
-
-#[cfg(all(
-    any(feature = "debian", feature = "debian-pure"),
-    not(feature = "debian")
-))]
-pub use debian_db::list_installed_fast as apt_list_installed_fast;
-
-// Homebrew exports are available on macOS
-#[cfg(any(feature = "macos", target_os = "macos"))]
-pub use homebrew::HomebrewPackageManager;
-
-// DNF/RPM exports are available with fedora feature
-#[cfg(feature = "fedora")]
-pub use dnf::DnfPackageManager;
