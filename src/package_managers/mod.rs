@@ -745,4 +745,91 @@ mod backend_selection_tests {
             Backend::Mock
         );
     }
+
+    #[test]
+    fn empty_feature_set_refuses_every_live_host_but_allows_explicit_mock() {
+        let none = CompiledBackends {
+            arch: false,
+            debian: false,
+            fedora: false,
+            macos: false,
+            debian_pure: false,
+        };
+        for (host, feature) in [
+            (Distro::Arch, "arch"),
+            (Distro::Debian, "debian"),
+            (Distro::Ubuntu, "debian"),
+            (Distro::Fedora, "fedora"),
+            (Distro::MacOS, "macos"),
+        ] {
+            let message = resolve_for(host, none, false).unwrap_err().to_string();
+            assert!(
+                message.contains(&format!("lacks the {feature} package backend")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!(
+                    "--no-default-features --features {feature},pgp,license"
+                )),
+                "{message}"
+            );
+            assert_eq!(resolve_for(host, none, true).unwrap(), Backend::Mock);
+        }
+        assert!(resolve_for(Distro::Unknown, none, false).is_err());
+        assert_eq!(
+            resolve_for(Distro::Unknown, none, true).unwrap(),
+            Backend::Mock
+        );
+    }
+
+    #[test]
+    fn mixed_features_keep_host_selection_and_macos_refusal_precise() {
+        let mixed = CompiledBackends {
+            arch: true,
+            debian: true,
+            fedora: true,
+            macos: true,
+            debian_pure: true,
+        };
+        for (host, expected) in [
+            (Distro::Arch, Backend::Arch),
+            (Distro::Debian, Backend::Debian),
+            (Distro::Ubuntu, Backend::Debian),
+            (Distro::Fedora, Backend::Fedora),
+            (Distro::MacOS, Backend::MacOS),
+        ] {
+            assert_eq!(resolve_for(host, mixed, false).unwrap(), expected);
+            assert_eq!(resolve_for(host, mixed, true).unwrap(), Backend::Mock);
+        }
+        let unavailable = CompiledBackends {
+            macos: false,
+            ..mixed
+        };
+        let message = resolve_for(Distro::MacOS, unavailable, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("lacks the macos package backend required by MacOS"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn pure_indexer_refuses_both_debian_hosts_even_with_other_live_features() {
+        let indexer = CompiledBackends {
+            debian: false,
+            debian_pure: true,
+            fedora: true,
+            macos: true,
+            ..ARCH
+        };
+        for host in [Distro::Debian, Distro::Ubuntu] {
+            let message = resolve_for(host, indexer, false).unwrap_err().to_string();
+            assert_eq!(
+                message,
+                "The Debian indexing feature is not a live APT backend. Install the Debian/Ubuntu omg build, or rebuild with --no-default-features --features debian,pgp,license"
+            );
+            assert_eq!(resolve_for(host, indexer, true).unwrap(), Backend::Mock);
+        }
+    }
 }
