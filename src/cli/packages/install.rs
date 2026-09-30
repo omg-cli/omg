@@ -147,6 +147,11 @@ async fn install_with_replacement_budget(
         return Ok(());
     }
 
+    #[cfg(feature = "arch")]
+    if super::mock_arch_backend()? {
+        return arch::install(packages, yes, replacement_hops).await;
+    }
+
     dispatch_backend! {
         debian: { let _ = (yes, replacement_hops); debian::install(packages).await },
         arch: { arch::install(packages, yes, replacement_hops).await },
@@ -155,6 +160,12 @@ async fn install_with_replacement_budget(
 }
 
 fn validate_install_targets(packages: &[String]) -> Result<()> {
+    #[cfg(feature = "arch")]
+    if super::mock_arch_backend()? {
+        crate::core::security::validate_package_names_or_files(packages)?;
+        return Ok(());
+    }
+
     dispatch_backend! {
         debian: {
             crate::core::security::validate_debian_package_names_or_files(packages)?;
@@ -172,6 +183,11 @@ fn validate_install_targets(packages: &[String]) -> Result<()> {
 }
 
 async fn install_dry_run(packages: &[String]) -> Result<()> {
+    #[cfg(feature = "arch")]
+    if super::mock_arch_backend()? {
+        return arch::install_dry_run(packages).await;
+    }
+
     dispatch_backend! {
         debian: { debian::install_dry_run(packages) },
         arch: { arch::install_dry_run(packages).await },
