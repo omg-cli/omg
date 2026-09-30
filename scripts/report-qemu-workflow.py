@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Report QEMU evidence from a trusted workflow_run job without executing it."""
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -192,6 +193,15 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                         "guest/evidence/index-update.txt",
                         "guest/evidence/daemon-direct.log",
                         "guest/evidence/daemon-advisory-shutdown.log")]
+                    doctor_candidates = [parent / f"guest/evidence/doctor-connectivity-{name}"
+                                         for name in ("fallback.log", "primary.preflight.log",
+                                                      "alternate.preflight.log")]
+                    doctor_candidates = [candidate for candidate in doctor_candidates
+                                         if (member := members_by_name.get(str(candidate))) is not None
+                                         and member.file_size <= 8 * 1024 * 1024
+                                         and archive.read(member).strip()]
+                    if doctor_candidates:
+                        candidates = doctor_candidates + [parent / "guest-check.log"]
                 else:
                     candidates = []
                 excerpts = []
@@ -372,18 +382,39 @@ def projection(rows, verified_published):
             selected[key] = dict(row, result="HARNESS_ERROR" if row["result"] == "BLOCKED" else row["result"])
         elif verified_published and row["result"] == "PASS" and key not in selected:
             selected[key] = row
-    # The matrix job emits an aggregate receipt whenever a lane fails. Once
-    # detailed evidence identifies that failure, filing both adds no diagnosis.
-    # Keep the aggregate when it is the only failure (and keep PASS closures).
+    # Replace an aggregate only when detail covers every guest it names.
+    # Independent guests and unknown matrix scope remain reportable.
     def aggregate(case_id):
         return case_id == "qemu-matrix-workflow" or (
             case_id.startswith("qemu-matrix-") and case_id.endswith("-workflow")
         )
 
-    if any(not aggregate(row["case_id"]) and row["result"] in FAILURES
-           for row in selected.values()):
-        selected = {key: row for key, row in selected.items()
-                    if not aggregate(row["case_id"]) or row["result"] not in FAILURES}
+    detailed = {(row["distro"], row.get("arch", "x86_64"))
+                for row in selected.values()
+                if not aggregate(row["case_id"])
+                and row["case_id"] != "qemu-arm-runner-kvm-health"
+                and row["result"] in FAILURES}
+
+    def covered(row):
+        if row["distro"] not in DISTROS:
+            # A matrix-wide receipt does not identify which guests failed.
+            return False
+        case_id = row["case_id"]
+        if case_id == "qemu-matrix-all-workflow":
+            arches = {"x86_64", "aarch64"}
+        elif case_id == "qemu-matrix-arm-workflow":
+            arches = {"aarch64"}
+        elif case_id == "qemu-matrix-x86-workflow":
+            arches = {"x86_64"}
+        elif case_id == "qemu-matrix-workflow" and "arch" in row:
+            arches = {row["arch"]}
+        else:
+            return False
+        return all((row["distro"], arch) in detailed for arch in arches)
+
+    selected = {key: row for key, row in selected.items()
+                if not aggregate(row["case_id"]) or row["result"] not in FAILURES
+                or not covered(row)}
     return list(selected.values())
 
 
@@ -409,6 +440,93 @@ def published_provenance(content, distro, revision):
             or not re.fullmatch(r"[0-9a-f]{40}", provenance["inventory_revision"])):
         raise ValueError("published evidence provenance mismatch")
     return provenance["artifact_tag"], provenance["inventory_revision"]
+
+
+def published_inventory_admission(content, distro, policy):
+    """Recheck the complete published profile against the trusted shard catalog."""
+    # Reuse archive validation before consuming any selected input. No archive
+    # path is extracted or executed; only fixed private filenames are written.
+    _, snapshots = all_snapshots(policy)
+    archive_rows(content, canonical_case_ids({"inventories": snapshots}))
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        members = archive.infolist()
+        roots = {PurePosixPath(member.filename).parts[0] for member in members
+                 if PurePosixPath(member.filename).parts
+                 and PurePosixPath(member.filename).parts[0].startswith("run-")}
+        if len(roots) != 1:
+            raise ValueError("published guest lacks one run root")
+        root = next(iter(roots))
+        if not re.fullmatch(r"run-[A-Za-z0-9-]+", root):
+            raise ValueError("invalid published run root")
+        names = {"inventory": f"{root}/cases.tsv",
+                 "results": f"{root}/inventory/results.json",
+                 "summary": f"{root}/inventory/summary.json",
+                 "admission": f"{root}/inventory-admission.json"}
+        inputs = {}
+        for key, name in names.items():
+            matches = [member for member in members if member.filename == name]
+            if len(matches) != 1 or matches[0].file_size > 1024 * 1024:
+                raise ValueError("published guest lacks bounded CLI evidence")
+            inputs[key] = archive.read(matches[0])
+        if any(PurePosixPath(member.filename).name == "results.json"
+               and PurePosixPath(member.filename).parent.name != "transactions"
+               and member.filename not in (names["results"], f"{root}/results.json")
+               for member in members):
+            raise ValueError("published guest has foreign result evidence")
+        lifecycle = next((member for member in members if member.filename == f"{root}/results.json"), None)
+        if lifecycle is not None:
+            if lifecycle.file_size > 1024 * 1024:
+                raise ValueError("published lifecycle exceeds limit")
+            lifecycle_rows = json.loads(archive.read(lifecycle), object_pairs_hook=unique_object)
+            if any(row["case_id"] != f"qemu-{distro}-lifecycle" for row in lifecycle_rows):
+                raise ValueError("published lifecycle contains inventory cases")
+    spec = importlib.util.spec_from_file_location(
+        "qemu_inventory_admission", Path(__file__).with_name("check-qemu-inventory.py"))
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    with tempfile.TemporaryDirectory() as directory:
+        paths = {}
+        for key in ("inventory", "results", "summary"):
+            paths[key] = Path(directory) / key
+            paths[key].write_bytes(inputs[key])
+        admitted = checker.admit(policy, paths["inventory"], paths["results"],
+                                 paths["summary"], distro, "hermetic,qemu,container,network,pty")
+    receipt = json.loads(inputs["admission"], object_pairs_hook=unique_object)
+    # JSON type identity matters: Python otherwise considers True equal to 1.
+    if json.dumps(receipt, sort_keys=True, allow_nan=False) != json.dumps(admitted, sort_keys=True, allow_nan=False):
+        raise ValueError("published CLI inventory receipt mismatch")
+    return admitted["passed"]
+
+
+def complete_listing(payload, key):
+    if (not isinstance(payload, dict) or type(payload.get("total_count")) is not int
+            or not 0 <= payload["total_count"] <= 100
+            or not isinstance(payload.get(key), list)
+            or len(payload[key]) != payload["total_count"]
+            or any(not isinstance(row, dict) for row in payload[key])):
+        raise ValueError("incomplete GitHub listing")
+    return payload[key]
+
+
+def failed_lane_guests(jobs):
+    guests = set()
+    for job in jobs:
+        if job.get("conclusion") not in ("failure", "timed_out", "cancelled", "action_required"):
+            continue
+        name = job["name"]
+        arm = re.search(r"QEMU guest arm64 \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
+        x86 = re.search(r"(?:QEMU guest|Distro lane) \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
+        if arm:
+            guests.add((arm.group(1), "aarch64"))
+        elif x86:
+            guests.add((x86.group(1), "x86_64"))
+    return guests
+
+
+def failed_guest_receipts(jobs):
+    return [dict(case_id=f"qemu-matrix-{'arm' if arch == 'aarch64' else 'x86'}-workflow",
+                 distro=distro, arch=arch, result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
+            for distro, arch in sorted(failed_lane_guests(jobs))]
 
 
 def workflow_receipt(jobs, conclusion):
@@ -448,6 +566,9 @@ def workflow_receipt(jobs, conclusion):
                     result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
     scope = "all" if arm_selected and x86_selected else "arm" if arm_selected else "x86"
     passed = conclusion == "success"
+    if passed and not (x86_selected or arm_selected):
+        return dict(case_id="qemu-matrix-workflow", distro="matrix",
+                    result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
     distro = next(iter(failed_lane_distros)) if len(failed_lane_distros) == 1 else "matrix"
     return dict(case_id=f"qemu-matrix-{scope}-workflow", distro=distro,
                 result="PASS" if passed else "HARNESS_ERROR",
@@ -544,8 +665,25 @@ def main():
     except (OSError, ValueError, KeyError, TypeError):
         allowed_cases = None
         evidence_error = True
-    jobs = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100"))
-    job_rows = jobs.get("jobs")
+    jobs_valid = False
+    job_rows = []
+    try:
+        jobs = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100"),
+                          object_pairs_hook=unique_object)
+        job_rows = complete_listing(jobs, "jobs")
+        if len({job.get("id") for job in job_rows if type(job.get("id")) is int}) != len(job_rows):
+            raise ValueError("duplicate or invalid workflow job identity")
+        if any(not isinstance(job.get("name"), str)
+               or type(job.get("id")) is not int or job["id"] <= 0
+               or job.get("conclusion") not in ("success", "failure", "timed_out", "cancelled",
+                                                 "action_required", "skipped", "neutral", "stale")
+               or not isinstance(job.get("steps", []), list)
+               for job in job_rows):
+            raise ValueError("invalid workflow job identity")
+        jobs_valid = True
+    except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError):
+        job_rows = []
+        evidence_error = True
     published_candidate = (run["conclusion"] == "success"
                            and run["path"] == ".github/workflows/qemu-matrix.yml"
                            and run["event"] in ("schedule", "workflow_dispatch")
@@ -556,14 +694,14 @@ def main():
     rows = []
     diagnostics = {}
     try:
-        if allowed_cases is None:
-            raise ValueError("unvalidated inventory policy catalog")
-        listing = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100"))
-        if listing["total_count"] > 100:
-            raise ValueError("too many artifacts")
+        if allowed_cases is None or not jobs_valid:
+            raise ValueError("unvalidated policy catalog or job listing")
+        listing = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100"),
+                             object_pairs_hook=unique_object)
+        artifacts = complete_listing(listing, "artifacts")
         guest_artifacts = set()
         published_artifacts = {}
-        for artifact in listing["artifacts"]:
+        for artifact in artifacts:
             if not re.fullmatch(r"qemu-(?:arm-)?evidence-(?:arch|debian|ubuntu|fedora)|qemu-workflow-report", artifact["name"]):
                 continue
             # Re-run failed jobs retains successful jobs and their artifacts.
@@ -600,8 +738,7 @@ def main():
                 raise ValueError("successful CI is missing required Linux guest evidence")
         if published_candidate:
             required = {f"qemu-evidence-{distro}" for distro in DISTROS}
-            if (set(published_artifacts) == required
-                    and set(DISTROS) <= {row["distro"] for row in rows}):
+            if set(published_artifacts) == required:
                 sources = {published_provenance(published_artifacts[f"qemu-evidence-{distro}"],
                                                 distro, run["head_sha"]) for distro in DISTROS}
                 if None in sources and len(sources) > 1:
@@ -614,20 +751,40 @@ def main():
                     if release_commit.get("sha") != source_revision:
                         raise ValueError("published inventory revision does not match release tag")
                     latest = json.loads(api(f"repos/{repository}/releases/latest"))
-                    verified_published = latest.get("tag_name") == source_tag
+                    admissions = [published_inventory_admission(
+                        published_artifacts[f"qemu-evidence-{distro}"], distro,
+                        Path("tests/qemu-inventory-policy.json")) for distro in DISTROS]
+                    verified_published = latest.get("tag_name") == source_tag and all(admissions)
                     published_tag = source_tag if verified_published else None
                     published_revision = source_revision if verified_published else None
         selected = projection(rows, verified_published)
-    except (ValueError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError):
+    except (ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile, subprocess.SubprocessError):
         selected = []
         evidence_error = True
     ci_failed = ci_non_qemu_failure(run, job_rows)
     qemu_failed = qemu_job_failed(run, job_rows)
-    receipt = workflow_receipt(job_rows, run["conclusion"])
+    receipt = workflow_receipt(job_rows, run["conclusion"]) if jobs_valid else dict(
+        case_id="qemu-matrix-workflow", distro="matrix", result="HARNESS_ERROR",
+        exit_code=1, elapsed_seconds=0)
+    if run["conclusion"] == "success" and receipt["result"] in FAILURES:
+        selected = []
+        verified_published = False
+        evidence_error = True
     selected = [receipt if row["case_id"] == "qemu-matrix-workflow" else row for row in selected]
     if evidence_error:
         if qemu_failed or not ci_failed:
-            selected.append(workflow_receipt(job_rows, "failure"))
+            guests = failed_guest_receipts(job_rows) if jobs_valid else []
+            if len(guests) > 1:
+                selected.extend(guests)
+                if receipt["case_id"] == "qemu-arm-runner-kvm-health":
+                    selected.append(receipt)
+            else:
+                selected.append(workflow_receipt(job_rows, "failure")
+                                if jobs_valid and receipt["case_id"] != "qemu-matrix-workflow" else receipt)
+    elif qemu_failed and (failed_lane_guests(job_rows)
+                          or receipt["case_id"] == "qemu-arm-runner-kvm-health"):
+        health = [receipt] if receipt["case_id"] == "qemu-arm-runner-kvm-health" else []
+        selected = projection([*selected, *health, *failed_guest_receipts(job_rows)], verified_published)
     elif run["conclusion"] != "success" and not any(row["result"] in FAILURES for row in selected):
         if qemu_failed or not ci_failed:
             selected.append(receipt)
@@ -654,7 +811,7 @@ def main():
         print("No authoritative case updates to report")
         return 0
     details = {"ci": [], "qemu-matrix": []}
-    for job in jobs["jobs"][:100]:
+    for job in job_rows:
         if job["conclusion"] not in ("success", "skipped"):
             source = ("qemu-matrix" if run["path"] == ".github/workflows/qemu-matrix.yml"
                       or job["name"].startswith("QEMU behavioral verification") else "ci")

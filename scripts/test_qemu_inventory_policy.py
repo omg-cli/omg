@@ -2,9 +2,11 @@ import hashlib
 import csv
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 import sys
 
@@ -182,6 +184,32 @@ class PolicyTests(unittest.TestCase):
         self.policy_dir.symlink_to(self.root, target_is_directory=True)
         with self.assertRaisesRegex(ValueError, "snapshot directory"):
             self.admit()
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "mkfifo"), "requires POSIX FIFOs")
+    def test_fifo_inputs_and_digest_shards_are_rejected_before_blocking_open(self):
+        for kind in ("policy", "inventory", "results", "summary", "snapshot"):
+            with self.subTest(kind=kind):
+                self.write_policy()
+                self.results.write_text(json.dumps(self.rows))
+                self.summary.write_text('{"complete":true,"pass":1,"fail":0,"skipped":1}')
+                target = next(self.policy_dir.iterdir()) if kind == "snapshot" else getattr(self, kind)
+                content = target.read_bytes()
+                target.unlink()
+                os.mkfifo(target, 0o600)
+                try:
+                    started = time.monotonic()
+                    result = subprocess.run([sys.executable, str(ROOT / "scripts/check-qemu-inventory.py"),
+                        "--policy", str(self.policy), "--inventory", str(self.inventory),
+                        "--results", str(self.results), "--summary", str(self.summary),
+                        "--distro", "arch", "--tiers", "hermetic"],
+                        capture_output=True, text=True, timeout=3)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {
+                        "schema_version": 1, "passed": False, "error": "inventory policy admission failed"})
+                    self.assertLess(time.monotonic() - started, 3)
+                finally:
+                    target.unlink()
+                    target.write_bytes(content)
 
     def test_add_command_appends_only_one_reviewed_digest(self):
         prior = self.policy.read_bytes()
