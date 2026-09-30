@@ -1806,18 +1806,11 @@ pub(crate) fn list_installed_versions(versions_dir: &Path) -> Result<Vec<String>
 /// Compare version strings in ascending order.
 ///
 /// Semantic versions use SemVer precedence, including pre-release ordering.
-/// Other vendor formats fall back to unbounded numeric component comparison,
-/// and fall back further still to SemVer-style pre-release precedence once a
-/// pre-release marker is recognised in the trailing suffix.
+/// Vendor formats use unbounded numeric cores and recognized stage/sequence
+/// tokens. Leading v/V and build metadata do not affect precedence. Unknown
+/// vendor suffixes retain natural numeric packaging-revision ordering.
 #[must_use]
 pub(crate) fn version_cmp(a: &str, b: &str) -> Ordering {
-    if let (Ok(a), Ok(b)) = (
-        semver::Version::parse(a.trim_start_matches(['v', 'V'])),
-        semver::Version::parse(b.trim_start_matches(['v', 'V'])),
-    ) {
-        return a.cmp(&b);
-    }
-
     fn numeric_parts(version: &str) -> Vec<&str> {
         version
             .split(|character: char| !character.is_ascii_digit())
@@ -1861,54 +1854,74 @@ pub(crate) fn version_cmp(a: &str, b: &str) -> Ordering {
         }
     }
 
-    /// Return whether a trailing suffix names a pre-release rather than a
-    /// build, distro or packaging suffix.
-    ///
-    /// Only a whole leading alphabetic run is matched, so `-1ubuntu` and
-    /// `-amd64` keep their numeric ordering while `-rc1`, `-beta.2` and `rc1`
-    /// are recognised as pre-releases.
-    fn is_pre_release(suffix: &str) -> bool {
-        const MARKERS: [&str; 9] = [
-            "alpha", "beta", "rc", "pre", "dev", "nightly", "snapshot", "a", "b",
-        ];
-        let marker: String = suffix
-            .trim_start_matches(|character: char| !character.is_ascii_alphanumeric())
-            .chars()
-            .take_while(char::is_ascii_alphabetic)
-            .collect();
-        MARKERS.contains(&marker.as_str())
-    }
-
-    let (a_core, a_suffix) = core_and_suffix(a);
-    let (b_core, b_suffix) = core_and_suffix(b);
-    let a_pre_release = is_pre_release(a_suffix);
-    let b_pre_release = is_pre_release(b_suffix);
-
-    if a_pre_release || b_pre_release {
-        // The numeric core decides first, so a pre-release marker never
-        // reorders two distinct release lines: `3.15.0rc1` still beats
-        // `3.14.0`, and `3.12.0-beta1` still trails `3.13.0`.
-        match compare_part_lists(&numeric_parts(a_core), &numeric_parts(b_core)) {
-            Ordering::Equal => {}
-            ordering => return ordering,
-        }
-        // Equal cores: SemVer precedence puts a pre-release below its final
-        // release. Without this the trailing pre-release digits survive the
-        // numeric split and `3.12.0-rc1` would outrank `3.12.0`.
-        return match (a_pre_release, b_pre_release) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            (true, true) => compare_part_lists(&numeric_parts(a_suffix), &numeric_parts(b_suffix))
-                .then_with(|| a_suffix.cmp(b_suffix)),
-            // Unreachable: the enclosing `if a_pre_release || b_pre_release`
-            // guard means at least one side was recognised as a pre-release.
-            (false, false) => Ordering::Equal,
+    // Each operand gets its own key: parsing must not depend on its partner.
+    // Valid SemVer keeps dot-delimited identifiers (alpha10 is lexical).
+    // Vendor grammar: numeric dot core, optional '-' then a recognized ASCII
+    // stage, followed by digits or dot-separated numeric identifiers. Compact
+    // rc10 becomes [rc, 10]; stage is compared before its natural sequence.
+    // These keys deliberately do not equate SemVer rc10 with vendor rc10.
+    // Other suffixes retain numeric packaging-revision ordering, not stage rules.
+    fn key(version: &str) -> (Vec<&str>, Option<Vec<&str>>, Vec<&str>) {
+        let version = version.trim_start_matches(['v', 'V']);
+        let version = version.split_once('+').map_or(version, |(core, _)| core);
+        let (core, suffix) = core_and_suffix(version);
+        let suffix = suffix.strip_prefix('-').unwrap_or(suffix);
+        let prerelease = if semver::Version::parse(version).is_ok() {
+            (!suffix.is_empty()).then(|| suffix.split('.').collect())
+        } else {
+            let stage_end = suffix
+                .find(|character: char| !character.is_ascii_alphabetic())
+                .unwrap_or(suffix.len());
+            let (stage, sequence) = suffix.split_at(stage_end);
+            let stage_only = sequence.is_empty();
+            let sequence = sequence.strip_prefix('.').unwrap_or(sequence);
+            let recognized = [
+                "alpha", "beta", "rc", "pre", "dev", "nightly", "snapshot", "a", "b",
+            ]
+            .contains(&stage);
+            if recognized
+                && (stage_only
+                    || sequence.split('.').all(|part| {
+                        !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                    }))
+            {
+                let mut identifiers = vec![stage];
+                if !sequence.is_empty() {
+                    identifiers.extend(sequence.split('.'));
+                }
+                Some(identifiers)
+            } else {
+                None
+            }
         };
+        (numeric_parts(core), prerelease, numeric_parts(suffix))
     }
 
-    // No pre-release marker: keep the unbounded numeric comparison that
-    // vendor formats such as `1.0.0-1ubuntu1` and `1.9.9` rely on.
-    compare_part_lists(&numeric_parts(a), &numeric_parts(b))
+    fn compare_identifiers(left: &[&str], right: &[&str]) -> Ordering {
+        for (left, right) in left.iter().zip(right) {
+            let left_numeric = left.bytes().all(|byte| byte.is_ascii_digit());
+            let right_numeric = right.bytes().all(|byte| byte.is_ascii_digit());
+            let ordering = match (left_numeric, right_numeric) {
+                (true, true) => compare_numeric_parts(left, right),
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => left.cmp(right),
+            };
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        left.len().cmp(&right.len())
+    }
+
+    let (a_core, a_pre, a_revision) = key(a);
+    let (b_core, b_pre, b_revision) = key(b);
+    compare_part_lists(&a_core, &b_core).then_with(|| match (a_pre, b_pre) {
+        (Some(a), Some(b)) => compare_identifiers(&a, &b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => compare_part_lists(&a_revision, &b_revision),
+    })
 }
 
 /// Normalize version string (remove leading 'v' if present)
@@ -2954,6 +2967,109 @@ mod tests {
             "candidate order from a remote index must not change the resolution"
         );
         assert_eq!(from_forward, "3.12.0");
+    }
+
+    #[test]
+    fn ordering_mixed_counterexample_has_no_cycle() {
+        let a = "1.2.3-alpha10";
+        let b = "1.2.3-alpha2";
+        let c = "1.2.3alpha3";
+        assert_eq!(version_cmp(a, b), Ordering::Less);
+        assert_eq!(version_cmp(c, a), Ordering::Less);
+        assert_eq!(version_cmp(c, b), Ordering::Less);
+    }
+
+    #[test]
+    fn ordering_stage_sequence_prefix_and_metadata_contracts() {
+        for (a, b) in [
+            ("1.2.3.4-rc1", "1.2.3.4-alpha2"),
+            ("1.2.3.4-beta1", "1.2.3.4-alpha99"),
+            ("1.2.3.4-rc10", "1.2.3.4-rc2"),
+            ("1.2.3alpha10", "1.2.3alpha2"),
+            ("v1.2.3.4", "1.2.3.4rc1"),
+            ("V1.2.3.4", "1.2.3.4rc1"),
+            ("1.2.3.4-rc99999999999999999999", "1.2.3.4-rc10"),
+        ] {
+            assert_eq!(version_cmp(a, b), Ordering::Greater, "{a}, {b}");
+            assert_eq!(version_cmp(b, a), Ordering::Less, "{b}, {a}");
+        }
+        assert_eq!(version_cmp("1.2.3-alpha10", "1.2.3-alpha2"), Ordering::Less);
+        for (a, b) in [
+            ("v1.0.0+99", "V1.0.0+2"),
+            ("v1.2.3.4-rc1+build99", "1.2.3.4-rc1+build2"),
+            ("v1.2.3.4", "V1.2.3.4+build999"),
+        ] {
+            assert_eq!(version_cmp(a, b), Ordering::Equal, "{a}, {b}");
+        }
+    }
+
+    #[test]
+    fn ordering_mixed_catalog_obeys_comparison_laws() {
+        let versions = [
+            "1.2.3-alpha10",
+            "1.2.3-alpha2",
+            "1.2.3alpha3",
+            "1.2.3alpha2",
+            "1.2.3-alpha.2",
+            "1.2.3-alpha.10",
+            "1.2.3-beta1",
+            "1.2.3-1",
+            "1.2.3-rc.2",
+            "1.2.3rc10",
+            "1.2.3",
+            "v1.2.3+build99",
+            "V1.2.3+build2",
+            "1.2.3.0",
+            "1.2.3.0-alpha2",
+            "1.2.3.0-rc1",
+            "1.2.3.0-rc10",
+            "1.2.3.4-rc2",
+            "1.2.3.4-rc10",
+            "v1.2.3.4-rc10+build2",
+            "1.2.3.4",
+            "V1.2.3.4+build999",
+            "1.2.3.4-1ubuntu1",
+            "1.2.3.4-1ubuntu2",
+            "1.2.3.4-1.fc39",
+            "1.2.3.4-2ubuntu1",
+            "1.2.4",
+            "1.42949672960.0",
+            "1.00000000000000000010",
+        ];
+        for a in versions {
+            assert_eq!(version_cmp(a, a), Ordering::Equal);
+            for b in versions {
+                let ab = version_cmp(a, b);
+                assert_eq!(ab, version_cmp(b, a).reverse(), "{a}, {b}");
+                for c in versions {
+                    if ab != Ordering::Greater && version_cmp(b, c) != Ordering::Greater {
+                        assert_ne!(version_cmp(a, c), Ordering::Greater, "{a} <= {b} <= {c}");
+                    }
+                    if ab == Ordering::Equal {
+                        assert_eq!(version_cmp(a, c), version_cmp(b, c), "{a} == {b}, {c}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordering_partial_resolution_is_permutation_independent() {
+        let candidates = ["3.12", "3.12.0", "v3.12.0"];
+        for a in 0..3 {
+            for b in 0..3 {
+                for c in 0..3 {
+                    if a != b && a != c && b != c {
+                        let versions =
+                            [candidates[a], candidates[b], candidates[c]].map(str::to_owned);
+                        assert_eq!(
+                            resolve_partial_version(&versions, "3.12").as_deref(),
+                            Some("3.12.0")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
