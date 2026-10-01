@@ -155,6 +155,18 @@ AUR packages are community-maintained and not officially verified.
    allow_aur = false  # Disable AUR if not needed
    ```
 
+   Grades describe source and vulnerability policy, not cryptographic receipts.
+   `Locked` is not assigned by ordinary install grading and can reject official packages.
+   On Arch, `require_pgp` makes ALPM package signatures mandatory for registered
+   repositories and default, local-file, and remote-file transaction settings
+   (`src/package_managers/alpm_ops.rs`, `enforce_required_package_signature`).
+   Grade prechecks conservatively reject AUR and local archives under this setting;
+   they do not themselves verify a signature. Explicit policies also require
+   vulnerability grading and prepared-dependency checks; scan errors propagate.
+   Native APT, DNF, and Homebrew refuse explicit OMG policies because they lack
+   final-transaction policy enforcement. These source contracts are not proof of
+   native signed/unsigned package behavior.
+
 3. **Review Audit Logs:**
 
    ```bash

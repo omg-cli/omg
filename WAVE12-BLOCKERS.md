@@ -1,5 +1,7 @@
 # Wave-12 BLOCKER Remediation Plan (citation: /tmp/omg-fleet12/aud-*.md)
 
+> Historical fleet audit plan. Its temporary report paths, implementation decisions, and status marks describe that review; they are not current completion evidence. See the [current documentation index](docs/index.md) for supported behavior and the [open issue backlog](https://github.com/omg-cli/omg/issues) for active work. The original plan remains below for provenance.
+
 Status legend: [x] fixed+pushed, [ ] open. Each item cites its auditor evidence.
 
 - [x] B01 AUR success printed before outcome check — fixed 5a843ac
