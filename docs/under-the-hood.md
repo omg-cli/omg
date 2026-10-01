@@ -225,8 +225,20 @@ Security-relevant events are appended to a JSONL log whose entries carry `prev_h
 their own chain hash:
 
 ```text
-entry N: { …, "prev_hash": hash(entry N-1), "hash": sha256(canonical fields + prev_hash) }
+entry N: { …, "hash_version": 1, "prev_hash": hash(entry N-1), "hash": sha256(versioned fields) }
 ```
+
+Version 1 starts its preimage with bytes `0xff, 0x01`. Nine fields follow in order:
+ID, timestamp, event type, severity, user, resource, description, metadata, and previous
+hash. Each field has an eight-byte big-endian UTF-8 byte length followed by its bytes.
+Event type and severity use their Rust Debug names. Metadata is compact JSON, or an
+empty field when absent. This binds field boundaries. The invalid UTF-8 prefix also
+separates the encoding from every legacy preimage, which contains only valid UTF-8.
+
+An absent `hash_version` or explicit zero uses the unchanged historical concatenation.
+Appending writes version 1 and preserves retained legacy bytes and tail linkage. Unknown
+versions fail verification. The faulty version-only prefix from the unpublished PR is
+not accepted as version 1; private deployments of that draft need separate migration.
 
 Writers read the last hash under a lock, so two concurrent processes cannot fork the
 chain. `omg audit verify` recomputes the linkage and reports the first entry that does not

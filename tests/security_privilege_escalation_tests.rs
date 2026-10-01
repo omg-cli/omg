@@ -1604,7 +1604,7 @@ mod sbom_audit {
 
     #[test]
     fn test_audit_entry_hash_computation() {
-        use omg_lib::core::security::audit::AuditEntry;
+        use omg_lib::core::security::audit::{AuditEntry, HASH_VERSION_LENGTH_PREFIXED};
 
         let entry = AuditEntry {
             id: "test-123".to_string(),
@@ -1616,6 +1616,7 @@ mod sbom_audit {
             description: "Installed firefox".to_string(),
             metadata: None,
             prev_hash: "genesis".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
 
@@ -1623,13 +1624,18 @@ mod sbom_audit {
         assert!(!hash.is_empty());
         assert_eq!(hash.len(), 64); // SHA-256
 
+        // Independently checked ff01/BE64 encoding from Python hashlib.
+        assert_eq!(
+            hash,
+            "a152b601c0db36599e6487b43768e244196e4b553ffc84007c1e5c0cf1ca3d70"
+        );
         // Hash should be deterministic
         assert_eq!(hash, entry.compute_hash());
     }
 
     #[test]
     fn test_audit_entry_verification() {
-        use omg_lib::core::security::audit::AuditEntry;
+        use omg_lib::core::security::audit::{AuditEntry, HASH_VERSION_LENGTH_PREFIXED};
 
         let mut entry = AuditEntry {
             id: "test-456".to_string(),
@@ -1641,6 +1647,7 @@ mod sbom_audit {
             description: "Removed curl".to_string(),
             metadata: None,
             prev_hash: "abc123".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
 
@@ -1696,7 +1703,7 @@ mod sbom_audit {
 
     #[test]
     fn test_audit_tamper_detection() {
-        use omg_lib::core::security::audit::AuditEntry;
+        use omg_lib::core::security::audit::{AuditEntry, HASH_VERSION_LENGTH_PREFIXED};
         use std::io::Write;
 
         let temp_dir = TempDir::new().unwrap();
@@ -1716,6 +1723,7 @@ mod sbom_audit {
             description: "Install pkg1".to_string(),
             metadata: None,
             prev_hash: "genesis".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
         entry1.hash = Some(entry1.compute_hash());
@@ -1734,6 +1742,7 @@ mod sbom_audit {
             description: "Remove pkg2".to_string(),
             metadata: None,
             prev_hash: entry1.hash.as_ref().unwrap().clone(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: Some("invalid_hash".to_string()),
         };
 
