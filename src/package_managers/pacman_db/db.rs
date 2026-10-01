@@ -2797,7 +2797,7 @@ mod tests {
                 .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
             "production health read must preserve PermissionDenied: {error:#}"
         );
-        println!("[omg-alpm-permission] uid={uid} fixture_owner={uid} cause={error:#}");
+        println!("[omg-alpm-permission] cause={error:#}");
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
