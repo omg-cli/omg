@@ -34,9 +34,9 @@ collect_failed_guest_state() {
       if test -f "$record"; then head -c 4096 "$record"; else echo unavailable; fi
       printf "\n"
     done
-    systemctl show cloud-init-local.service cloud-init-network.service cloud-init-main.service cloud-config.service cloud-final.service ssh.service sshd.service \
+    systemctl show cloud-init-local.service cloud-init.service cloud-init-network.service cloud-init-main.service cloud-config.service cloud-final.service ssh.service sshd.service \
       --property=Id,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,ActiveEnterTimestamp,InactiveEnterTimestamp --no-pager
-    sudo -n journalctl --boot --unit=cloud-init-local.service --unit=cloud-init-network.service --unit=cloud-init-main.service \
+    sudo -n journalctl --boot --unit=cloud-init-local.service --unit=cloud-init.service --unit=cloud-init-network.service --unit=cloud-init-main.service \
       --unit=cloud-config.service --unit=cloud-final.service --unit=ssh.service --unit=sshd.service \
       --lines=80 --no-pager --output=short-iso --quiet
   ' 2>&1 | head -c 16384 >&2; then

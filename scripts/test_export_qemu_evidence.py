@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -325,9 +327,32 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(report["bytes"], 0)
         self.assertTrue(any("budget" in item["error"] for item in report["errors"]))
 
-    @unittest.skipUnless(os.name == "posix" and os.environ.get("SUDO_UID"), "requires sudo fixture run")
     def test_root_owned_diagnostics_export_for_runner_without_changing_source(self):
-        uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+        if os.geteuid() != 0:
+            uid, gid = os.getuid(), os.getgid()
+            result = subprocess.run([
+                "sudo", "-n", "env", f"SUDO_UID={uid}", f"SUDO_GID={gid}",
+                sys.executable, "-Werror", str(Path(__file__).resolve()),
+                "DescriptorTests.test_root_owned_diagnostics_export_for_runner_without_changing_source",
+            ], capture_output=True, text=True, timeout=30, check=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Ran 1 test", result.stderr)
+            self.assertIn("\nOK\n", result.stderr)
+            self.assertNotIn("skipped", result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "Exported 1 files (10 bytes); skipped 0 paths; 0 errors",
+                f"root_fixture_actor_uid=0 destination_uid={uid} destination_gid={gid}"
+            ])
+            return
+        self.assertEqual(os.getuid(), 0, "fixture must run at its actual privileged UID")
+        if os.environ.get("SUDO_UID"):
+            uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+        else:
+            import pwd
+
+            account = pwd.getpwnam("nobody")
+            uid, gid = account.pw_uid, account.pw_gid
+        self.assertNotEqual(uid, 0, "export destination must belong to an ordinary user")
         log = self.fixture("run-test/guest/evidence/audit-directory-after.txt")
         log.chmod(0o600)
         self.assertEqual(log.stat().st_uid, 0)
@@ -339,6 +364,7 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(copied.read_bytes(), b"diagnostic")
         self.assertEqual(log.stat().st_uid, 0)
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+        print(f"root_fixture_actor_uid={os.getuid()} destination_uid={copied.stat().st_uid} destination_gid={copied.stat().st_gid}")
 
 
 if __name__ == "__main__":
