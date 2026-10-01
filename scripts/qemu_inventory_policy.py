@@ -39,7 +39,9 @@ def read_bounded(path):
     path = Path(path)
     if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
         raise ValueError("symlinked inventory evidence file")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    # A FIFO can block in open before fstat gets a chance to reject it.
+    flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
     return read_descriptor(os.open(path, flags))
 
 
@@ -70,7 +72,8 @@ def read_snapshot_file(directory, digest):
         # swapped directory or final component from redirecting the read.
         directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=directory_fd)
             return read_descriptor(descriptor)
         finally:
             os.close(directory_fd)
