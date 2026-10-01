@@ -65,7 +65,10 @@ def main():
         if private_file(store) != source_bytes():
             raise ValueError('source audit log changed')
         actual = json.loads(private_file(export), object_pairs_hook=unique_object)
-        if actual != [entries()[index] for index in (5, 4, 2)]:
+        # Legacy input omits the marker; AuditEntry defaults it to zero on
+        # deserialization and includes that explicit version in JSON exports.
+        expected = [dict(entries()[index], hash_version=0) for index in (5, 4, 2)]
+        if actual != expected:
             raise ValueError('export is not newest three error-or-critical records')
     else:
         raise ValueError('unknown oracle mode')
