@@ -7,7 +7,6 @@ import tempfile
 import unittest
 
 
-@unittest.skipIf(os.name == 'nt', 'Guest POSIX command lookup runs in hosted Linux CI')
 class CargoFixtureTests(unittest.TestCase):
     def test_present_cargo_is_setup_failure_and_absent_cargo_is_valid(self):
         source = (Path(__file__).resolve().parent / 'benchmark-qemu.sh').read_text()
@@ -48,10 +47,19 @@ boot_args=()
 SSH_WAIT_BUDGET=$(( 120 * (12 + 2) ))
 clone_boot_timeout=$(( SSH_WAIT_BUDGET + 180 ))
 timeout() {
-  if [[ "$5" == first-disk ]]; then
-    printf 'first clone QEMU failure\\n' > qemu-startup.log
-  fi
-  return 124
+  case "$4" in
+    /work/boot.sh)
+      if [[ "$5" == first-disk ]]; then
+        printf 'first clone QEMU failure\\n' > qemu-startup.log
+      fi
+      return 124
+      ;;
+    /work/qemu-boot-diagnostics.sh)
+      printf 'controlled observer receipt\\n'
+      return 0
+      ;;
+    *) return 90 ;;
+  esac
 }
 ''' + function + '''
 first=0
@@ -67,6 +75,9 @@ printf '%s %s\\n' "$first" "$second"
             self.assertEqual((root / 'first/boot.qemu-startup.log').read_text(),
                              'first clone QEMU failure\n')
             self.assertFalse((root / 'second/boot.qemu-startup.log').exists())
+            for launch in ('first', 'second'):
+                self.assertEqual((root / launch / 'boot.diagnostics.log').read_text(),
+                                 'controlled observer receipt\n')
 
     def test_timeout_or_killed_guest_is_not_reported_as_product_failure(self):
         source = (Path(__file__).resolve().parent / 'benchmark-qemu.sh').read_text()
