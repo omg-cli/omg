@@ -41,11 +41,11 @@ class QemuProcessIsolationTests(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'SSH timeout regression needs POSIX timeout and process signals')
     def test_guest_readiness_probe_cannot_hang_on_an_ssh_banner(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
-        self.assertIn('after=$(timeout --kill-after=2s 12s ssh', source)
+        self.assertIn('probe_timeout=$(( remaining - SSH_KILL_GRACE ))', source)
+        self.assertIn('after=$(timeout --kill-after="${SSH_KILL_GRACE}s" "${probe_timeout}s" ssh', source)
         start = source.index('wait_ssh() {')
         end = source.index('\nwait_ssh\n', start)
-        function = source[start:end].replace('{1..120}', '{1..2}').replace('sleep 2', 'sleep 0')
-        function = function.replace('12s ssh', '1s ssh')
+        function = source[start:end]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             ssh = root / 'ssh'
@@ -54,11 +54,13 @@ class QemuProcessIsolationTests(unittest.TestCase):
             (root / 'qemu.pid').write_text(str(os.getpid()))
             (root / 'serial.log').write_text('Booting Fedora Linux\n', encoding='utf-8')
             result = subprocess.run(
-                [BASH, '-c', 'opts=(); vm_serial=serial.log; ' + function + '\nwait_ssh'],
+                [BASH, '-c', 'opts=(); vm_serial=serial.log; SSH_WAIT_BUDGET=3; '
+                 'SSH_ATTEMPT_TIMEOUT=1; SSH_KILL_GRACE=1; SSH_RETRY_DELAY=1; '
+                 + function + '\nwait_ssh'],
                 cwd=root, env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH']),
                 capture_output=True, text=True, timeout=4)
             self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertIn('SSH readiness timed out after 120 attempts', result.stderr)
+            self.assertIn('SSH readiness timed out after 3 seconds', result.stderr)
             self.assertIn('kernel_banner_seen=no', result.stderr)
             self.assertIn('Booting Fedora Linux', result.stderr)
 
