@@ -229,8 +229,10 @@ pub fn fixture_git_command(dir: &Path) -> Command {
     let mut command = Command::new("git");
     clear_git_environment(&mut command);
     command
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1");
     command
 }
@@ -258,7 +260,6 @@ pub fn assert_fixture_git_identity(dir: &Path) {
         );
     }
 }
-
 
 /// Run an OMG command
 pub fn run_omg(args: &[&str]) -> CommandResult {
