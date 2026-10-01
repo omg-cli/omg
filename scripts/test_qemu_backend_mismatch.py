@@ -69,6 +69,50 @@ class BackendMismatchReceiptTests(unittest.TestCase):
                 self.assertFalse(PROBE.native_db_access(
                     'openat(AT_FDCWD, "/etc/os-release", O_RDONLY) = 3', distro))
 
+    def test_repository_and_config_reads_reject_otherwise_passing_receipts(self):
+        paths = {
+            "arch": ("/var/lib/pacman/sync/core.db", "/etc/pacman.conf"),
+            "debian": ("/var/lib/apt/lists/mirror_Packages", "/etc/apt/sources.list"),
+            "ubuntu": ("/var/lib/apt/lists/mirror_Packages.lz4", "/etc/apt/apt.conf.d/fixture"),
+            "fedora": ("/var/lib/dnf/history.sqlite", "/etc/yum.repos.d/fixture.repo"),
+        }
+        for distro, roots in paths.items():
+            for path in roots:
+                with self.subTest(distro=distro, path=path):
+                    access = PROBE.native_db_access(
+                        f'openat(AT_FDCWD, "{path}", O_RDONLY) = 3', distro)
+                    self.assertTrue(access)
+                    receipt = dict(self.receipt(), distro=distro,
+                                   fixture_distro=PROBE.FAKE_ID[distro],
+                                   update_check_native_db_access=access)
+                    with self.assertRaises(ValueError):
+                        PROBE.validate_receipt(receipt, distro)
+
+    def test_relative_repository_reads_include_directory_descriptor_identity(self):
+        self.assertTrue(PROBE.native_db_access(
+            'openat(3</var/lib/pacman/sync>, "core.db", O_RDONLY) = 4', "arch"))
+        self.assertTrue(PROBE.native_db_access(
+            'openat(3</var/lib/apt/lists>, "mirror_Packages", O_RDONLY) = 4', "debian"))
+
+    def test_fingerprints_include_repository_and_configuration_roots(self):
+        for distro in ("debian", "ubuntu"):
+            self.assertIn("/var/lib/apt", PROBE.DATABASE_PATHS[distro])
+            self.assertIn("/etc/apt", PROBE.DATABASE_PATHS[distro])
+        self.assertIn("/var/lib/pacman", PROBE.DATABASE_PATHS["arch"])
+        self.assertIn("/etc/pacman.conf", PROBE.DATABASE_PATHS["arch"])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "sync"
+            repository.mkdir()
+            config = Path(directory) / "pacman.conf"
+            config.write_text("original")
+            with patch.dict(PROBE.DATABASE_PATHS, {"arch": (str(repository), str(config))}):
+                before = PROBE.database_snapshot("arch")
+                (repository / "core.db").write_text("new index")
+                self.assertNotEqual(before, PROBE.database_snapshot("arch"))
+                before = PROBE.database_snapshot("arch")
+                config.write_text("changed configuration")
+                self.assertNotEqual(before, PROBE.database_snapshot("arch"))
+
     def test_package_database_snapshot_detects_content_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "local"

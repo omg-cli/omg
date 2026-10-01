@@ -23,10 +23,20 @@ class ProductFailure(Exception):
 
 
 DATABASE_PATHS = {
-    "arch": ("/var/lib/pacman/local",),
-    "debian": ("/var/lib/dpkg/status", "/var/lib/apt/extended_states"),
-    "ubuntu": ("/var/lib/dpkg/status", "/var/lib/apt/extended_states"),
-    "fedora": ("/usr/lib/sysimage/rpm", "/var/lib/rpm"),
+    "arch": ("/var/lib/pacman", "/etc/pacman.conf", "/etc/pacman.d", "/var/cache/pacman"),
+    "debian": ("/var/lib/dpkg", "/var/lib/apt", "/etc/apt", "/var/cache/apt"),
+    "ubuntu": ("/var/lib/dpkg", "/var/lib/apt", "/etc/apt", "/var/cache/apt"),
+    "fedora": ("/usr/lib/sysimage/rpm", "/var/lib/rpm", "/var/lib/dnf",
+               "/var/cache/dnf", "/etc/dnf", "/etc/yum.repos.d", "/etc/rpm"),
+}
+# Trace read access independently of mutation fingerprints. -yy also annotates
+# directory descriptors, so relative openat calls retain their native root.
+TRACE_PATHS = {
+    "arch": ("/var/lib/pacman", "/etc/pacman.conf", "/etc/pacman.d", "/var/cache/pacman"),
+    "debian": ("/var/lib/dpkg", "/var/lib/apt", "/etc/apt", "/var/cache/apt"),
+    "ubuntu": ("/var/lib/dpkg", "/var/lib/apt", "/etc/apt", "/var/cache/apt"),
+    "fedora": ("/usr/lib/sysimage/rpm", "/var/lib/rpm", "/var/lib/dnf",
+               "/var/cache/dnf", "/etc/dnf", "/etc/yum.repos.d", "/etc/rpm"),
 }
 FAKE_ID = {"arch": "fedora", "debian": "fedora", "ubuntu": "fedora", "fedora": "debian"}
 NATIVE_EXECUTABLES = {
@@ -66,7 +76,7 @@ def database_snapshot(distro):
                           f"{metadata.st_mtime_ns}".encode())
             if path.is_symlink():
                 digest.update(os.readlink(path).encode())
-            if path.is_file():
+            elif path.is_file():
                 with path.open("rb") as source:
                     for chunk in iter(lambda: source.read(1024 * 1024), b""):
                         digest.update(chunk)
@@ -76,7 +86,8 @@ def database_snapshot(distro):
 
 
 def native_db_access(trace_text, distro):
-    return (any(f'"{path}' in trace_text for path in DATABASE_PATHS[distro])
+    return (any(f'"{path}' in trace_text or f'<{path}' in trace_text
+                for path in TRACE_PATHS[distro])
             or any(re.search(rf'execve\("[^"]*/{tool}"', trace_text)
                    for tool in NATIVE_EXECUTABLES[distro]))
 
@@ -148,7 +159,7 @@ def run(binary_name, distro):
                   "--clear-groups", "--no-new-privs", "--bounding-set=-all",
                   "--inh-caps=-all", "--ambient-caps=-all"]
         trace_probe = subprocess.run(
-            ["strace", "--kill-on-exit", "-f", "-qq", "-e", "trace=execve,%file", "-o", str(trace_probe_path)]
+            ["strace", "--kill-on-exit", "-f", "-qq", "-yy", "-e", "trace=execve,%file", "-o", str(trace_probe_path)]
             + prefix + ["/usr/bin/true"], env=env, cwd=root, capture_output=True,
             text=True, timeout=10, check=False)
         if (trace_probe.returncode != 0 or not trace_probe_path.is_file()
@@ -158,7 +169,7 @@ def run(binary_name, distro):
         for name, args in PROBES:
             command = [str(daemon if name == "omgd" else binary), *args]
             trace = root / f"{name}.trace"
-            argv = ["strace", "--kill-on-exit", "-f", "-qq", "-e", "trace=execve,%file", "-o", str(trace)]
+            argv = ["strace", "--kill-on-exit", "-f", "-qq", "-yy", "-e", "trace=execve,%file", "-o", str(trace)]
             argv += prefix + command
             command_env = env.copy()
             if name == "omgd":
