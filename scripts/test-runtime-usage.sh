@@ -27,7 +27,7 @@ assert usage['commands']['runtime_switch'] == count, usage
 assert usage['total_commands'] == count, usage
 PY
     done
-    "$OMG_DATA_DIR/versions/node/current/bin/node" -e 'if (process.version !== "v24.21.0" || 6*7 !== 42) process.exit(1)'
+    timeout --kill-after=5s 10 "$OMG_DATA_DIR/versions/node/current/bin/node" -e 'if (process.version !== "v24.21.0" || 6*7 !== 42) process.exit(1)'
     printf 'PASS: fresh runtime usage with telemetry=%s\n' "$telemetry"
   )
 done
