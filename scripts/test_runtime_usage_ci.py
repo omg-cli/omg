@@ -1,6 +1,7 @@
 """Admission and workflow negatives; fixtures do not prove runtime installs."""
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -13,12 +14,96 @@ USAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(USAGE)
 from test_native_build_artifact import fixture, bundle
 
-EXPECTED = dict(repository='omg-cli/omg', source='a' * 40, run=123, attempt=1)
+EXPECTED = dict(repository='omg-cli/omg', source='a' * 40, api_head='a' * 40, event='push', run=123, attempt=1)
 RUN = dict(id=123, run_attempt=1, repository={'full_name': 'omg-cli/omg'},
-           path='.github/workflows/ci.yml', head_sha='a' * 40, status='in_progress', conclusion=None)
-JOB = dict(name='Linux (ubuntu)', status='completed', conclusion='success', head_sha='a' * 40)
+           path='.github/workflows/ci.yml', event='push', head_sha='a' * 40, status='in_progress', conclusion=None)
+JOB = dict(name='Linux (ubuntu)', status='completed', conclusion='success', head_sha='a' * 40,
+           run_id=123, run_attempt=1)
 ARTIFACT = dict(id=456, name='native-release-ubuntu-1', expired=False, size_in_bytes=1024,
                 workflow_run=dict(id=123, head_sha='a' * 40))
+
+
+class EventIdentityTests(unittest.TestCase):
+    # Actual PR 691 run 36891723110 reports this head, while its native
+    # provenance records the distinct tested merge and Git commit tree.
+    HEAD = 'b7c50f884af5a3f4e3a3d963f9a8de5037a06c47'
+    BASE = '624bd8a1294a0b8cbcec1bc8a14f25aa2ff56638'
+    MERGE = '886c5674d514e0862a90fb7b210a69d5a5ee22cf'
+    TREE = '67b2400c52c16a2b883fec3ed79bed539f75447a'
+
+    def pr_fixture(self):
+        side = lambda sha, ref: dict(sha=sha, ref=ref, repo=dict(id=1133413326, full_name='omg-cli/omg'))
+        event = dict(repository={'full_name': 'omg-cli/omg'}, number=691,
+                     pull_request=dict(head=side(self.HEAD, 'fix/qemu-semantic-combined'),
+                                       base=side(self.BASE, 'main')))
+        context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA=self.MERGE,
+                       GITHUB_RUN_ID='36891723110', GITHUB_RUN_ATTEMPT='1',
+                       GITHUB_EVENT_NAME='pull_request', GITHUB_REF='refs/pull/691/merge')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'event.json'
+            path.write_text(json.dumps(event))
+            expected = USAGE.identity(dict(context, GITHUB_EVENT_PATH=str(path)))
+        api_pr = dict(number=691, head=event['pull_request']['head'], base=event['pull_request']['base'])
+        run = dict(RUN, id=36891723110, event='pull_request', head_sha=self.HEAD, pull_requests=[api_pr])
+        commit = dict(sha=self.MERGE, tree=dict(sha=self.TREE),
+                      parents=[dict(sha=self.BASE), dict(sha=self.HEAD)])
+        return expected, run, commit
+
+    def test_pr_api_head_differs_from_tested_merge_without_weakening_recipe(self):
+        expected, run, commit = self.pr_fixture()
+        self.assertEqual(expected['source'], self.MERGE)
+        self.assertEqual(expected['api_head'], self.HEAD)
+        USAGE.validate_run(run, expected)
+        USAGE.validate_commit(commit, expected, self.TREE)
+        job = dict(JOB, run_id=36891723110, head_sha=self.HEAD)
+        artifact = dict(ARTIFACT, workflow_run=dict(id=36891723110, head_sha=self.HEAD))
+        self.assertEqual(USAGE.select_artifact([artifact], [job], expected), artifact)
+        recipe, provenance, payload = fixture('ubuntu')
+        recipe.update(source_sha=self.MERGE, run_id='36891723110', image='ubuntu-24.04')
+        provenance.update(source_sha=self.MERGE, run_id='36891723110', image='ubuntu-24.04')
+        data = bundle(provenance, payload)
+        digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+        USAGE.native.validate_bundle(data, digest, recipe)
+        with self.assertRaisesRegex(ValueError, 'source_sha'):
+            USAGE.native.validate_bundle(data, digest, dict(recipe, source_sha=self.HEAD))
+
+    def test_wrong_pr_head_base_number_event_and_refs_fail(self):
+        expected, run, _ = self.pr_fixture()
+        for field, value in [('head_sha', self.MERGE), ('event', 'push'), ('run_attempt', 2)]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                USAGE.validate_run(dict(run, **{field: value}), expected)
+        for side, field, value in [('head', 'sha', 'a' * 40), ('base', 'sha', 'a' * 40),
+                                   ('base', 'ref', 'foreign'), ('head', 'ref', 'foreign')]:
+            wrong = json.loads(json.dumps(run))
+            wrong['pull_requests'][0][side][field] = value
+            with self.subTest(side=side, field=field), self.assertRaises(ValueError):
+                USAGE.validate_run(wrong, expected)
+        wrong = json.loads(json.dumps(run))
+        wrong['pull_requests'][0]['number'] = 692
+        with self.assertRaisesRegex(ValueError, 'another PR'):
+            USAGE.validate_run(wrong, expected)
+
+    def test_wrong_tree_source_or_merge_parent_link_fails(self):
+        expected, _, commit = self.pr_fixture()
+        for wrong, tree in [(commit, 'a' * 40), (dict(commit, sha=self.HEAD), self.TREE),
+                            (dict(commit, parents=[dict(sha=self.HEAD), dict(sha=self.BASE)]), self.TREE),
+                            (dict(commit, parents=[dict(sha=self.BASE), dict(sha='a' * 40)]), self.TREE)]:
+            with self.subTest(wrong=wrong, tree=tree), self.assertRaises(ValueError):
+                USAGE.validate_commit(wrong, expected, tree)
+
+    def test_main_manual_and_merge_group_keep_exact_source_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'event.json'
+            for name, event in [('push', dict(after='a' * 40)), ('workflow_dispatch', {}),
+                                ('merge_group', dict(merge_group=dict(head_sha='a' * 40, head_ref='refs/heads/queue')))]:
+                event['repository'] = {'full_name': 'omg-cli/omg'}
+                path.write_text(json.dumps(event))
+                context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a' * 40,
+                               GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1', GITHUB_EVENT_NAME=name,
+                               GITHUB_REF='refs/heads/queue', GITHUB_EVENT_PATH=str(path))
+                expected = USAGE.identity(context)
+                self.assertEqual(expected['api_head'], expected['source'])
+                USAGE.validate_run(dict(RUN, event=name), expected)
 
 
 class AdmissionTests(unittest.TestCase):
@@ -68,7 +153,8 @@ class AdmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             (state / 'bin').mkdir()
-            responses = [RUN, dict(jobs=[JOB]), dict(artifacts=[ARTIFACT]), dict(RUN, run_attempt=2)]
+            responses = [RUN, dict(sha='a' * 40, tree=dict(sha='a' * 40)),
+                         dict(jobs=[JOB]), dict(artifacts=[ARTIFACT]), dict(RUN, run_attempt=2)]
             provenance = dict(archive='subject.tar.gz')
             with patch.object(USAGE, 'checked_state', return_value=EXPECTED), \
                     patch.object(USAGE.native, 'command_output', return_value='a' * 40), \
@@ -102,7 +188,9 @@ class AdmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory).resolve()
             context = dict(RUNNER_TEMP=str(parent), GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1',
-                           GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a' * 40)
+                           GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a' * 40,
+                           GITHUB_EVENT_NAME='push', GITHUB_EVENT_PATH=str(parent / 'event.json'))
+            (parent / 'event.json').write_text(json.dumps(dict(repository={'full_name': 'omg-cli/omg'}, after='a' * 40)))
             state = parent / 'runtime-usage-123-1'
             self.assertNotEqual(os.getuid(), 0, 'run lifecycle checks as an actual ordinary user')
             USAGE.initialize(state, context)

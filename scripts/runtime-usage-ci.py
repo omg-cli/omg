@@ -38,8 +38,39 @@ def identity(context):
     require(re.fullmatch(r'[a-f0-9]{40}', context['GITHUB_SHA']), 'invalid source identity')
     for key in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'):
         require(re.fullmatch(r'[1-9][0-9]*', context[key]), 'invalid run identity')
-    return dict(repository=repository, source=context['GITHUB_SHA'],
-                run=int(context['GITHUB_RUN_ID']), attempt=int(context['GITHUB_RUN_ATTEMPT']))
+    event_name = context['GITHUB_EVENT_NAME']
+    require(event_name in ('push', 'pull_request', 'workflow_dispatch', 'merge_group'),
+            'unsupported CI event')
+    event_path = Path(context['GITHUB_EVENT_PATH'])
+    require(event_path.is_file() and event_path.stat().st_size <= 8 * 1024 * 1024,
+            'missing or excessive trusted event payload')
+    event = json.loads(event_path.read_text())
+    require(event.get('repository', {}).get('full_name') == repository, 'foreign event repository')
+    result = dict(repository=repository, source=context['GITHUB_SHA'], event=event_name,
+                  api_head=context['GITHUB_SHA'], run=int(context['GITHUB_RUN_ID']),
+                  attempt=int(context['GITHUB_RUN_ATTEMPT']))
+    if event_name == 'pull_request':
+        number = event.get('number')
+        require(type(number) is int and number > 0
+                and context['GITHUB_REF'] == f'refs/pull/{number}/merge', 'foreign PR merge ref')
+        pr = event['pull_request']
+        head, base = pr['head'], pr['base']
+        require(base['repo']['full_name'] == repository, 'foreign PR base repository')
+        for side in (head, base):
+            require(re.fullmatch('[a-f0-9]{40}', side['sha'])
+                    and isinstance(side['ref'], str) and 0 < len(side['ref']) <= 256
+                    and type(side['repo']['id']) is int and side['repo']['id'] > 0,
+                    'invalid PR source identity')
+        result.update(api_head=head['sha'], pr=dict(number=number, head_sha=head['sha'],
+                      base_sha=base['sha'], head_ref=head['ref'], base_ref=base['ref'],
+                      head_repository_id=head['repo']['id'], base_repository_id=base['repo']['id']))
+    elif event_name == 'push':
+        require(event.get('after') == result['source'], 'push event source mismatch')
+    elif event_name == 'merge_group':
+        require(event.get('merge_group', {}).get('head_sha') == result['source']
+                and event['merge_group'].get('head_ref') == context['GITHUB_REF'],
+                'merge-group source mismatch')
+    return result
 
 
 def initialize(state, context):
@@ -85,16 +116,39 @@ def validate_run(run, expected):
             'foreign or superseded run attempt')
     require(run.get('repository', {}).get('full_name') == expected['repository']
             and run.get('path') == '.github/workflows/ci.yml'
-            and run.get('head_sha') == expected['source'], 'foreign producer source or workflow')
+            and run.get('head_sha') == expected['api_head']
+            and run.get('event') == expected['event'], 'foreign producer source, event or workflow')
     require(run.get('status') in ('queued', 'in_progress', 'completed')
             and run.get('conclusion') in (None, 'success'), 'producer run did not complete normally')
+    if expected['event'] == 'pull_request':
+        pr = expected['pr']
+        rows = [row for row in run.get('pull_requests', []) if row.get('number') == pr['number']]
+        require(len(rows) == 1, 'producer belongs to another PR')
+        for side in ('head', 'base'):
+            actual = rows[0].get(side, {})
+            require(actual.get('sha') == pr[side + '_sha']
+                    and actual.get('ref') == pr[side + '_ref']
+                    and actual.get('repo', {}).get('id') == pr[side + '_repository_id'],
+                    'producer PR ' + side + ' identity changed')
+
+
+def validate_commit(commit, expected, checkout_tree):
+    require(commit.get('sha') == expected['source']
+            and re.fullmatch('[a-f0-9]{40}', checkout_tree)
+            and commit.get('tree', {}).get('sha') == checkout_tree, 'consumer commit tree mismatch')
+    if expected['event'] == 'pull_request':
+        require([parent.get('sha') for parent in commit.get('parents', [])]
+                == [expected['pr']['base_sha'], expected['pr']['head_sha']],
+                'tested merge does not link the exact PR base and head')
 
 
 def select_artifact(artifacts, jobs, expected):
     owners = [job for job in jobs if job.get('name') == 'Linux (ubuntu)']
     require(len(owners) == 1 and owners[0].get('status') == 'completed'
             and owners[0].get('conclusion') == 'success'
-            and owners[0].get('head_sha') == expected['source'], 'Ubuntu producer did not succeed')
+            and owners[0].get('head_sha') == expected['api_head']
+            and owners[0].get('run_id') == expected['run']
+            and owners[0].get('run_attempt') == expected['attempt'], 'Ubuntu producer did not succeed')
     name = 'native-release-ubuntu-' + str(expected['attempt'])
     selected = [artifact for artifact in artifacts if artifact.get('name') == name]
     require(len(selected) == 1, 'missing or ambiguous current-attempt Ubuntu artifact')
@@ -104,7 +158,7 @@ def select_artifact(artifacts, jobs, expected):
     require(type(artifact.get('size_in_bytes')) is int
             and 0 < artifact['size_in_bytes'] <= native.MAX_DOWNLOAD, 'artifact size outside bound')
     owner = artifact.get('workflow_run', {})
-    require(owner.get('id') == expected['run'] and owner.get('head_sha') == expected['source'],
+    require(owner.get('id') == expected['run'] and owner.get('head_sha') == expected['api_head'],
             'artifact belongs to another run or source')
     return artifact
 
@@ -128,6 +182,9 @@ def admit(state, context):
     path = 'repos/' + expected['repository'] + '/actions/runs/' + str(expected['run'])
     run = native.api_json(path)
     validate_run(run, expected)
+    commit = native.api_json('repos/' + expected['repository'] + '/git/commits/' + expected['source'])
+    checkout_tree = native.command_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD^{tree}'])
+    validate_commit(commit, expected, checkout_tree)
     jobs = fetch_pages(path + '/attempts/' + str(expected['attempt']) + '/jobs', 'jobs')
     artifacts = fetch_pages(path + '/artifacts', 'artifacts')
     artifact = select_artifact(artifacts, jobs, expected)
@@ -159,7 +216,7 @@ def admit(state, context):
             destination.chmod(0o700)
     write_json(state / 'evidence/admission.json', dict(artifact=artifact, producer=run,
                refreshedProducer=refreshed, expected=recipe, provenance=provenance,
-               apiZIP_SHA256=native.sha256(content)))
+               apiZIP_SHA256=native.sha256(content), sourceCommit=commit, checkoutTree=checkout_tree))
 
 
 def product_environment(state):
