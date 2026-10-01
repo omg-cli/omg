@@ -900,7 +900,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn opt_out_verdict_tracks_config_file_and_env() {
-        if crate::config::Settings::rerun_config_test_unprivileged(
+        if crate::config::Settings::rerun_test_unprivileged(
             "core::telemetry::tests::opt_out_verdict_tracks_config_file_and_env",
         ) {
             return;
