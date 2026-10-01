@@ -5,8 +5,8 @@
 
 mod db;
 
-pub(crate) use db::check_local_db_health;
 pub use db::{UnsatisfiedDependency, unsatisfied_local_dependencies};
+pub(crate) use db::{check_local_db_health, check_native_local_db_health};
 
 pub use db::{
     AlpmCatalogEpoch, CachedUpdate, LocalDbEpoch, LocalDbPackage, SyncDbEpoch, SyncDbPackage,

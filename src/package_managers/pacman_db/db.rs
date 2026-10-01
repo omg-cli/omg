@@ -498,6 +498,157 @@ pub(crate) fn check_local_db_health(path: &Path) -> Result<(usize, Vec<Unsatisfi
     Ok((snapshot.packages.len(), missing))
 }
 
+/// Use pacman's documented offline -Dk operation for dependency, conflict and
+/// duplicate file ownership semantics. An explicit empty config and dbpath
+/// prevent an unrelated configured database or repository from being checked.
+pub(crate) async fn check_native_local_db_health(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "ALPM local database path must be absolute"
+    );
+    anyhow::ensure!(
+        path.file_name() == Some(std::ffi::OsStr::new("local")),
+        "Native ALPM check requires a local directory under its database path"
+    );
+    let snapshot = LocalHealthSnapshot::capture(path)?;
+    let mut command = crate::core::privilege::system_command("pacman")?;
+    command
+        .env_clear()
+        .env("PATH", crate::core::privilege::SYSTEM_PATH)
+        .env("LC_ALL", "C")
+        .args([
+            "--config",
+            "/dev/null",
+            "--color",
+            "never",
+            "-Dk",
+            "--dbpath",
+        ])
+        .arg(path.parent().context("ALPM local database has no parent")?);
+    let result =
+        bounded_native_check(command, std::time::Duration::from_secs(15), 1024 * 1024).await;
+    snapshot.revalidate(path)?;
+    result
+}
+
+async fn bounded_native_check(
+    command: std::process::Command,
+    deadline: std::time::Duration,
+    max_output: u64,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut command = tokio::process::Command::from(command);
+    let operation = async {
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Could not start pacman -Dk")?;
+        let stdout = child.stdout.take().context("pacman stdout not captured")?;
+        let stderr = child.stderr.take().context("pacman stderr not captured")?;
+        async fn read_limited(
+            reader: impl tokio::io::AsyncRead + Unpin,
+            limit: u64,
+        ) -> Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            reader.take(limit + 1).read_to_end(&mut bytes).await?;
+            anyhow::ensure!(
+                bytes.len() as u64 <= limit,
+                "pacman -Dk output exceeds limit"
+            );
+            Ok(bytes)
+        }
+        let (stdout, stderr) = tokio::try_join!(
+            read_limited(stdout, max_output),
+            read_limited(stderr, max_output)
+        )?;
+        let status = child
+            .wait()
+            .await
+            .context("Could not wait for pacman -Dk")?;
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        let detail = String::from_utf8_lossy(&detail);
+        let detail = detail
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .take(8)
+            .map(|line| {
+                crate::cli::style::sanitize_terminal_text(line)
+                    .chars()
+                    .take(160)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::ensure!(
+            status.success(),
+            "pacman -Dk rejected local database ({status}): {detail}"
+        );
+        Ok(())
+    };
+    tokio::time::timeout(deadline, operation)
+        .await
+        .context("pacman -Dk timed out")?
+}
+
+#[cfg(test)]
+mod native_health_tests {
+    use super::bounded_native_check;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn native_check_propagates_failure_and_sanitizes_diagnostic() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'missing dependency\\033[31m\\n' >&2; exit 1"]);
+        let error = bounded_native_check(command, Duration::from_secs(2), 1024)
+            .await
+            .unwrap_err();
+        let detail = error.to_string();
+        assert!(detail.contains("rejected local database"));
+        assert!(detail.contains("missing dependency"));
+        assert!(!detail.contains('\x1b'));
+    }
+
+    #[tokio::test]
+    async fn native_check_requires_success_and_bounds_elapsed_and_both_streams() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        bounded_native_check(command, Duration::from_secs(2), 16)
+            .await
+            .unwrap();
+        for target in ["", " >&2"] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", &format!("printf '01234567890123456789'{target}")]);
+            let error = bounded_native_check(command, Duration::from_secs(2), 16)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("output exceeds limit"));
+        }
+        let fixture = tempfile::TempDir::new().unwrap();
+        let pid_file = fixture.path().join("pid");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf '%s' \"$$\" > \"$1\"; exec sleep 5", "_"]);
+        command.arg(&pid_file);
+        let started = std::time::Instant::now();
+        let error = bounded_native_check(command, Duration::from_millis(250), 16)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        let pid = nix::unistd::Pid::from_raw(pid);
+        for _ in 0..20 {
+            if nix::sys::signal::kill(pid, None) == Err(nix::errno::Errno::ESRCH) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("Timed-out native check child was not killed and reaped");
+    }
+}
+
 struct LocalHealthSnapshot {
     packages: HashMap<String, LocalDbPackage>,
     fingerprints: std::collections::BTreeMap<PathBuf, Vec<u8>>,
