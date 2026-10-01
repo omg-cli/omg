@@ -323,7 +323,17 @@ fn parse_rekor_entry(
                 uuid: requested_uuid.to_string(),
             })?
     };
-    let canonical = canonical_set_payload(&log_id, log_index, integrated_time, &body);
+    // Reconstructing the signed bytes interpolates `log_id` and `body` raw
+    // into the JSON template, so a value containing `"` or `\` would splice
+    // attacker-chosen JSON into the payload the SET is checked against. The
+    // canonicalizer refuses such values; treat that as a malformed entry
+    // rather than verifying over reconstructed bytes.
+    let canonical =
+        canonical_set_payload(&log_id, log_index, integrated_time, &body).ok_or_else(|| {
+            RekorError::EntrySetMalformed {
+                uuid: requested_uuid.to_string(),
+            }
+        })?;
     let key = rekor_verifying_key()?;
     if !verify_set_signature(canonical.as_bytes(), &set_bytes, &key) {
         return Err(RekorError::EntrySetVerificationFailed {
@@ -346,22 +356,37 @@ fn parse_rekor_entry(
 /// logIndex}`; clients such as sigstore-go (`pkg/tlog/entry.go`,
 /// `VerifySET`) reconstruct exactly these four fields, hash them with
 /// SHA-256, and verify an ECDSA P-256 signature. For this fixed field set
-/// (base64 body, hex log ID, decimal integers) the RFC 8785 form is the
-/// key-sorted, whitespace-free JSON built here; all values are ASCII so no
-/// string escaping can occur.
-fn canonical_set_payload(log_id: &str, log_index: u64, integrated_time: u64, body: &str) -> String {
-    debug_assert!(
-        log_id.bytes().all(|b| b.is_ascii_hexdigit()),
-        "logID must be hex"
-    );
-    debug_assert!(
-        body.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
-        "body must be standard base64"
-    );
-    format!(
+/// (base64 body, hex log ID, integers in 0..=2^53-1) the RFC 8785 form is
+/// the key-sorted, whitespace-free JSON built here. This safe-integer subset
+/// avoids rounding signed fields through IEEE-754; larger integers are refused,
+/// not silently rounded. This is not a general JCS implementation.
+///
+/// The strings are interpolated raw, so their alphabets are checked at runtime.
+/// Accepted ASCII strings need no JSON escaping, and their signed bytes remain
+/// unchanged. These guards refuse malformed reconstruction inputs; they do not
+/// establish a bypass of the pinned-key signature check.
+fn canonical_set_payload(
+    log_id: &str,
+    log_index: u64,
+    integrated_time: u64,
+    body: &str,
+) -> Option<String> {
+    const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+    if log_index > MAX_SAFE_INTEGER || integrated_time > MAX_SAFE_INTEGER {
+        return None;
+    }
+    if !log_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !body
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    {
+        return None;
+    }
+    Some(format!(
         "{{\"body\":\"{body}\",\"integratedTime\":{integrated_time},\"logID\":\"{log_id}\",\"logIndex\":{log_index}}}"
-    )
+    ))
 }
 
 /// Verify the ECDSA P-256 (ASN.1 DER) SET signature over the SHA-256 digest
@@ -511,6 +536,69 @@ fn decode_pem_body(pem: &str, label: &str) -> Result<Vec<u8>, base64::DecodeErro
     base64::engine::general_purpose::STANDARD.decode(body)
 }
 
+/// Check the extension policy for the existing direct-root or one-intermediate
+/// topology. `ca_below` is None for a leaf, Some(0) for an intermediate/direct
+/// root, or Some(1) for a root above an intermediate. Absent KeyUsage retains
+/// existing behavior; present KeyUsage must permit the certificate's role.
+///
+/// Critical support is deliberately narrow: BC/KU for issuers, plus codeSigning
+/// EKU and identity SAN for leaves. Parser recognition alone is not support.
+/// This does not implement general RFC 5280 path construction, revocation,
+/// name constraints, policy processing, or self-issued rollover exceptions.
+fn fulcio_extensions_permit_role(
+    certificate: &x509_parser::certificate::X509Certificate<'_>,
+    ca_below: Option<u32>,
+) -> bool {
+    use x509_parser::extensions::ParsedExtension;
+
+    let mut seen = std::collections::HashSet::new();
+    for extension in certificate.extensions() {
+        if !seen.insert(&extension.oid) {
+            return false;
+        }
+        let supported = match extension.parsed_extension() {
+            ParsedExtension::BasicConstraints(constraints) => {
+                if let Some(count) = ca_below {
+                    if !constraints.ca
+                        || constraints
+                            .path_len_constraint
+                            .is_some_and(|limit| count > limit)
+                    {
+                        return false;
+                    }
+                } else if constraints.ca || constraints.path_len_constraint.is_some() {
+                    return false;
+                }
+                true
+            }
+            ParsedExtension::KeyUsage(usage) => {
+                let permitted = if ca_below.is_some() {
+                    usage.key_cert_sign()
+                } else {
+                    usage.digital_signature()
+                };
+                if !permitted {
+                    return false;
+                }
+                true
+            }
+            ParsedExtension::ExtendedKeyUsage(usage) if ca_below.is_none() => {
+                if !usage.code_signing {
+                    return false;
+                }
+                true
+            }
+            ParsedExtension::SubjectAlternativeName(_) if ca_below.is_none() => true,
+            ParsedExtension::ParseError { .. } | ParsedExtension::Unparsed => return false,
+            _ => false,
+        };
+        if extension.critical && !supported {
+            return false;
+        }
+    }
+    true
+}
+
 /// Bind a Fulcio leaf certificate to a signer identity by validating its
 /// chain against the embedded Sigstore trust roots.
 ///
@@ -518,6 +606,8 @@ fn decode_pem_body(pem: &str, label: &str) -> Result<Vec<u8>, base64::DecodeErro
 /// (directly or through the embedded intermediate), every link's signature
 /// verifies, every validity window covers `integrated_time`, and the leaf
 /// carries an RFC822/URI Subject Alternative Name identifying the signer.
+/// The selected chain must also pass the narrow role/critical-extension policy
+/// in `fulcio_extensions_permit_role`; this is not full PKI validation.
 fn verify_fulcio_chain(
     leaf_der: &[u8],
     integrated_time: u64,
@@ -529,6 +619,9 @@ fn verify_fulcio_chain(
     let decode_pem_der = |pem: &str| decode_pem_body(pem, "CERTIFICATE").ok();
 
     let (_, leaf) = X509Certificate::from_der(leaf_der).ok()?;
+    if !fulcio_extensions_permit_role(&leaf, None) {
+        return None;
+    }
 
     // An absent intermediate may be passed as an empty string; only a
     // successfully decoded, non-empty DER counts.
@@ -566,6 +659,7 @@ fn verify_fulcio_chain(
             leaf.issuer() == root.subject()
                 && certificate_valid_at(&root, at)
                 && certificate_is_ca(&root)
+                && fulcio_extensions_permit_role(&root, Some(0))
                 && verify_x509_signature(
                     root.public_key().raw,
                     leaf.tbs_certificate.as_ref(),
@@ -584,6 +678,7 @@ fn verify_fulcio_chain(
         if leaf.issuer() != intermediate.subject()
             || !certificate_valid_at(&intermediate, at)
             || !certificate_is_ca(&intermediate)
+            || !fulcio_extensions_permit_role(&intermediate, Some(0))
         {
             return None;
         }
@@ -600,6 +695,7 @@ fn verify_fulcio_chain(
                 intermediate.issuer() == root.subject()
                     && certificate_valid_at(&root, at)
                     && certificate_is_ca(&root)
+                    && fulcio_extensions_permit_role(&root, Some(1))
                     && verify_x509_signature(
                         root.public_key().raw,
                         intermediate.tbs_certificate.as_ref(),
@@ -1722,13 +1818,386 @@ mod tests {
         );
     }
 
+    // Immutable upstream fixture, copied byte-for-byte from sigstore/sigstore-go
+    // 5845298281875c153f40da081466ca716ff1abc6, pkg/testing/data/sigstoreBundle.json.
+    // Blob 314f907ce302717882d21faefa5ed4de55018d0b; raw SHA-256
+    // b3f8ae41764e44961cc795d585122560dbd77ef8e5652f202f8adeddcb57d132.
+    // This proves captured SET acceptance only, not Merkle inclusion/provenance.
+    fn captured_rekor_response() -> HashMap<String, Value> {
+        use base64::Engine as _;
+        let bundle: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/rekor-sigstore-bundle.json"
+        ))
+        .unwrap();
+        let entry = &bundle["verificationMaterial"]["tlogEntries"][0];
+        let log_id = hex::encode(
+            base64::engine::general_purpose::STANDARD
+                .decode(entry["logId"]["keyId"].as_str().unwrap())
+                .unwrap(),
+        );
+        HashMap::from([(
+            "captured".to_string(),
+            serde_json::json!({
+                "body": entry["canonicalizedBody"],
+                "integratedTime": entry["integratedTime"].as_str().unwrap().parse::<u64>().unwrap(),
+                "logIndex": entry["logIndex"].as_str().unwrap().parse::<u64>().unwrap(),
+                "logID": log_id,
+                "verification": {"signedEntryTimestamp": entry["inclusionPromise"]["signedEntryTimestamp"]}
+            }),
+        )])
+    }
+
+    #[test]
+    fn captured_rekor_set_verifies_with_production_pin_and_rejects_tampering() {
+        let response = captured_rekor_response();
+        let verified = parse_rekor_entry("captured", response.clone()).unwrap();
+        assert_eq!(verified.log_index, 6_800_908);
+        assert_eq!(verified.integrated_time, 1_668_034_836);
+        assert_eq!(
+            verified.body,
+            response["captured"]["body"].as_str().unwrap()
+        );
+        for (field, replacement) in [
+            ("integratedTime", serde_json::json!(1_668_034_837_u64)),
+            ("logIndex", serde_json::json!(6_800_909_u64)),
+            ("body", serde_json::json!("YWx0ZXJlZA==")),
+            (
+                "logID",
+                serde_json::json!(
+                    "d0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d"
+                ),
+            ),
+        ] {
+            let mut tampered = response.clone();
+            tampered.get_mut("captured").unwrap()[field] = replacement;
+            assert!(
+                matches!(
+                    parse_rekor_entry("captured", tampered),
+                    Err(RekorError::EntrySetVerificationFailed { .. })
+                ),
+                "unchanged pinned SET must refuse tampered {field}"
+            );
+        }
+        for field in ["body", "logID"] {
+            for malformed in ["quote\"", "back\\slash", "non-ASCII-é"] {
+                let mut response = captured_rekor_response();
+                response.get_mut("captured").unwrap()[field] = serde_json::json!(malformed);
+                assert!(
+                    matches!(
+                        parse_rekor_entry("captured", response),
+                        Err(RekorError::EntrySetMalformed { .. })
+                    ),
+                    "malformed {field} must be refused before signature verification"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rekor_safe_integer_boundaries_preserve_bytes_and_refuse_out_of_domain_fields() {
+        const MAX: u64 = 9_007_199_254_740_991;
+        for (index, time) in [(0, 0), (MAX, 0), (0, MAX), (MAX, MAX)] {
+            assert_eq!(
+                canonical_set_payload("ab", index, time, "YQ=="),
+                Some(format!(
+                    "{{\"body\":\"YQ==\",\"integratedTime\":{time},\"logID\":\"ab\",\"logIndex\":{index}}}"
+                ))
+            );
+        }
+        for field in ["logIndex", "integratedTime"] {
+            for value in [MAX + 1, MAX + 2, u64::MAX] {
+                let (index, time) = if field == "logIndex" {
+                    (value, 0)
+                } else {
+                    (0, value)
+                };
+                assert!(canonical_set_payload("ab", index, time, "YQ==").is_none());
+                let mut response = captured_rekor_response();
+                response.get_mut("captured").unwrap()[field] = serde_json::json!(value);
+                assert!(
+                    matches!(
+                        parse_rekor_entry("captured", response),
+                        Err(RekorError::EntrySetMalformed { .. })
+                    ),
+                    "out-of-domain {field}={value} must be a typed refusal"
+                );
+            }
+        }
+    }
+
+    fn policy_certificate_params(role: &str) -> rcgen::CertificateParams {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+            KeyUsagePurpose, SanType,
+        };
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params.distinguished_name.push(DnType::CommonName, role);
+        if role == "leaf" {
+            params.subject_alt_names = vec![SanType::Rfc822Name(
+                "signer@example.com".try_into().unwrap(),
+            )];
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        } else {
+            params.is_ca = IsCa::Ca(BasicConstraints::Constrained(u8::from(role == "root")));
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        }
+        params
+    }
+
+    fn signed_policy_chain(
+        root_params: rcgen::CertificateParams,
+        intermediate_params: Option<rcgen::CertificateParams>,
+        leaf_params: rcgen::CertificateParams,
+    ) -> (rcgen::Certificate, String, String) {
+        let root_key = rcgen::KeyPair::generate().unwrap();
+        let root = root_params.self_signed(&root_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        if let Some(params) = intermediate_params {
+            let intermediate_key = rcgen::KeyPair::generate().unwrap();
+            let intermediate = params
+                .signed_by(&intermediate_key, &root, &root_key)
+                .unwrap();
+            let leaf = leaf_params
+                .signed_by(&leaf_key, &intermediate, &intermediate_key)
+                .unwrap();
+            (leaf, root.pem(), intermediate.pem())
+        } else {
+            let leaf = leaf_params.signed_by(&leaf_key, &root, &root_key).unwrap();
+            (leaf, root.pem(), String::new())
+        }
+    }
+
+    fn assert_policy_chain(chain: &(rcgen::Certificate, String, String), expected: bool) {
+        let identity =
+            verify_fulcio_chain(chain.0.der(), 1_700_000_000, &[chain.1.as_str()], &chain.2);
+        assert_eq!(
+            identity.as_deref(),
+            expected.then_some("signer@example.com")
+        );
+    }
+
+    fn policy_extension(oid: &[u64], content: Vec<u8>, critical: bool) -> rcgen::CustomExtension {
+        let mut extension = rcgen::CustomExtension::from_oid_content(oid, content);
+        extension.set_criticality(critical);
+        extension
+    }
+
+    #[test]
+    fn fulcio_signed_chains_enforce_present_role_key_usage() {
+        for role in ["leaf", "intermediate", "root"] {
+            for usage in [None, Some(true), Some(false)] {
+                let mut root = policy_certificate_params("root");
+                let mut intermediate = policy_certificate_params("intermediate");
+                let mut leaf = policy_certificate_params("leaf");
+                let selected = match role {
+                    "root" => &mut root,
+                    "intermediate" => &mut intermediate,
+                    _ => &mut leaf,
+                };
+                selected.key_usages = match usage {
+                    None => Vec::new(),
+                    Some(true) if role == "leaf" => vec![rcgen::KeyUsagePurpose::DigitalSignature],
+                    Some(true) => vec![rcgen::KeyUsagePurpose::KeyCertSign],
+                    Some(false) => vec![rcgen::KeyUsagePurpose::KeyEncipherment],
+                };
+                assert_policy_chain(
+                    &signed_policy_chain(root, Some(intermediate), leaf),
+                    usage != Some(false),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fulcio_signed_chains_refuse_unhandled_critical_extensions_by_selected_role() {
+        for role in ["leaf", "intermediate", "root"] {
+            for critical in [false, true] {
+                for (oid, content) in [
+                    (vec![1, 2, 3, 4], vec![0x05, 0x00]),
+                    // Valid CertificatePolicies, recognized but not enforced.
+                    (
+                        vec![2, 5, 29, 32],
+                        vec![0x30, 0x07, 0x30, 0x05, 0x06, 0x03, 0x2a, 0x03, 0x04],
+                    ),
+                ] {
+                    let mut root = policy_certificate_params("root");
+                    let mut intermediate = policy_certificate_params("intermediate");
+                    let mut leaf = policy_certificate_params("leaf");
+                    let selected = match role {
+                        "root" => &mut root,
+                        "intermediate" => &mut intermediate,
+                        _ => &mut leaf,
+                    };
+                    selected
+                        .custom_extensions
+                        .push(policy_extension(&oid, content, critical));
+                    assert_policy_chain(
+                        &signed_policy_chain(root, Some(intermediate), leaf),
+                        !critical,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fulcio_signed_chains_refuse_malformed_and_duplicate_extensions() {
+        for role in ["leaf", "intermediate", "root"] {
+            for duplicate in [false, true] {
+                let mut root = policy_certificate_params("root");
+                let mut intermediate = policy_certificate_params("intermediate");
+                let mut leaf = policy_certificate_params("leaf");
+                let selected = match role {
+                    "root" => &mut root,
+                    "intermediate" => &mut intermediate,
+                    _ => &mut leaf,
+                };
+                let content = if duplicate {
+                    vec![0x03, 0x02, 0x00, 0x84]
+                } else {
+                    vec![0xff]
+                };
+                if !duplicate {
+                    selected.key_usages.clear();
+                }
+                selected
+                    .custom_extensions
+                    .push(policy_extension(&[2, 5, 29, 15], content, true));
+                assert_policy_chain(&signed_policy_chain(root, Some(intermediate), leaf), false);
+            }
+        }
+    }
+
+    #[test]
+    fn fulcio_supported_critical_leaf_extensions_and_unsupported_issuer_eku() {
+        let mut leaf = policy_certificate_params("leaf");
+        leaf.subject_alt_names.clear();
+        leaf.extended_key_usages.clear();
+        let email = b"signer@example.com";
+        let mut san = vec![
+            0x30,
+            u8::try_from(email.len() + 2).unwrap(),
+            0x81,
+            u8::try_from(email.len()).unwrap(),
+        ];
+        san.extend_from_slice(email);
+        let eku = vec![
+            0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03,
+        ];
+        leaf.custom_extensions
+            .push(policy_extension(&[2, 5, 29, 17], san, true));
+        leaf.custom_extensions
+            .push(policy_extension(&[2, 5, 29, 37], eku.clone(), true));
+        assert_policy_chain(
+            &signed_policy_chain(
+                policy_certificate_params("root"),
+                Some(policy_certificate_params("intermediate")),
+                leaf,
+            ),
+            true,
+        );
+        for role in ["root", "intermediate"] {
+            for critical in [false, true] {
+                let mut root = policy_certificate_params("root");
+                let mut intermediate = policy_certificate_params("intermediate");
+                let selected = if role == "root" {
+                    &mut root
+                } else {
+                    &mut intermediate
+                };
+                selected.custom_extensions.push(policy_extension(
+                    &[2, 5, 29, 37],
+                    eku.clone(),
+                    critical,
+                ));
+                assert_policy_chain(
+                    &signed_policy_chain(
+                        root,
+                        Some(intermediate),
+                        policy_certificate_params("leaf"),
+                    ),
+                    !critical,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fulcio_fixed_topology_path_lengths_roles_and_unselected_roots() {
+        let mut root_zero = policy_certificate_params("root");
+        root_zero.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        let direct =
+            signed_policy_chain(root_zero.clone(), None, policy_certificate_params("leaf"));
+        assert_policy_chain(&direct, true);
+        assert_policy_chain(
+            &signed_policy_chain(
+                root_zero,
+                Some(policy_certificate_params("intermediate")),
+                policy_certificate_params("leaf"),
+            ),
+            false,
+        );
+        let valid = signed_policy_chain(
+            policy_certificate_params("root"),
+            Some(policy_certificate_params("intermediate")),
+            policy_certificate_params("leaf"),
+        );
+        assert_policy_chain(&valid, true);
+        for role in ["leaf", "intermediate", "root"] {
+            let mut root = policy_certificate_params("root");
+            let mut intermediate = policy_certificate_params("intermediate");
+            let mut leaf = policy_certificate_params("leaf");
+            let selected = match role {
+                "root" => &mut root,
+                "intermediate" => &mut intermediate,
+                _ => &mut leaf,
+            };
+            selected.is_ca = if role == "leaf" {
+                rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained)
+            } else {
+                rcgen::IsCa::ExplicitNoCa
+            };
+            assert_policy_chain(&signed_policy_chain(root, Some(intermediate), leaf), false);
+        }
+        let mut invalid_root = policy_certificate_params("root");
+        invalid_root.custom_extensions.push(policy_extension(
+            &[1, 2, 3, 4],
+            vec![0x05, 0x00],
+            true,
+        ));
+        let invalid_pem = invalid_root
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem();
+        for roots in [
+            [invalid_pem.as_str(), valid.1.as_str()],
+            [valid.1.as_str(), invalid_pem.as_str()],
+        ] {
+            assert_eq!(
+                verify_fulcio_chain(valid.0.der(), 1_700_000_000, &roots, &valid.2).as_deref(),
+                Some("signer@example.com")
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_fulcio_issuer_extensions_fit_the_fixed_topology_policy() {
+        use x509_parser::prelude::*;
+        for (pem, count) in [(FULCIO_ROOT_PEM, 1), (FULCIO_INTERMEDIATE_PEM, 0)] {
+            let der = decode_pem_body(pem, "CERTIFICATE").unwrap();
+            let (_, certificate) = X509Certificate::from_der(&der).unwrap();
+            assert!(fulcio_extensions_permit_role(&certificate, Some(count)));
+        }
+    }
+
     #[test]
     fn rekor_set_signature_over_canonical_form_roundtrips() {
         use p256::ecdsa::signature::Signer as _;
 
         let log_id = "c0d23d6ad406973f9559f3ba2d1ca01f";
         let body = "aGVsbG8="; // base64
-        let canonical = canonical_set_payload(log_id, 12, 1_700_000_000, body);
+        let canonical = canonical_set_payload(log_id, 12, 1_700_000_000, body).unwrap();
         // RFC 8785 form: keys sorted, no whitespace.
         assert_eq!(
             canonical,
@@ -1745,19 +2214,19 @@ mod tests {
             "a valid ECDSA P-256 DER signature over the canonical form must verify"
         );
         // Tampered canonical bytes (one body character) must not verify.
-        let tampered_body = canonical_set_payload(log_id, 12, 1_700_000_000, "aGVsbG9f");
+        let tampered_body = canonical_set_payload(log_id, 12, 1_700_000_000, "aGVsbG9f").unwrap();
         assert!(
             !verify_set_signature(tampered_body.as_bytes(), sig_der.as_bytes(), key),
             "a tampered body must fail SET verification"
         );
         // Tampered integratedTime must not verify.
-        let tampered_time = canonical_set_payload(log_id, 12, 1_700_000_001, body);
+        let tampered_time = canonical_set_payload(log_id, 12, 1_700_000_001, body).unwrap();
         assert!(
             !verify_set_signature(tampered_time.as_bytes(), sig_der.as_bytes(), key),
             "a tampered integratedTime must fail SET verification"
         );
         // Tampered logID must not verify.
-        let tampered_log = canonical_set_payload("deadbeef", 12, 1_700_000_000, body);
+        let tampered_log = canonical_set_payload("deadbeef", 12, 1_700_000_000, body).unwrap();
         assert!(
             !verify_set_signature(tampered_log.as_bytes(), sig_der.as_bytes(), key),
             "a tampered logID must fail SET verification"
@@ -1795,7 +2264,7 @@ mod tests {
     ) -> HashMap<String, serde_json::Value> {
         use base64::Engine as _;
         use p256::ecdsa::signature::Signer as _;
-        let canonical = canonical_set_payload(log_id, log_index, integrated_time, body);
+        let canonical = canonical_set_payload(log_id, log_index, integrated_time, body).unwrap();
         let set: p256::ecdsa::Signature = signing.sign(canonical.as_bytes());
         HashMap::from([(
             uuid.to_string(),
@@ -1917,13 +2386,15 @@ mod tests {
             12,
             1_700_000_000,
             "aGVsbG8=",
-        );
+        )
+        .unwrap();
         let tampered = canonical_set_payload(
             "c0d23d6ad406973f9559f3ba2d1ca01f",
             12,
             1_700_000_000,
             "YWx0ZXJlZA==",
-        );
+        )
+        .unwrap();
         use p256::ecdsa::signature::Signer as _;
         let sig_over_tampered: p256::ecdsa::Signature = signing.sign(tampered.as_bytes());
         assert!(
@@ -1950,6 +2421,80 @@ mod tests {
             }),
         );
         let err = parse_rekor_entry("abc", bad).expect_err("malformed SET base64 must be refused");
+        assert!(
+            matches!(err, RekorError::EntrySetMalformed { .. }),
+            "got: {err}"
+        );
+    }
+
+    /// The canonical bytes are built by raw `format!` interpolation, so a
+    /// value that is not hex (logID) / not standard base64 (body) must be
+    /// refused at runtime, not only under `debug_assert!` (stripped in
+    /// release). Otherwise a body containing `"` splices extra JSON keys into
+    /// the payload the SET is checked against.
+    #[test]
+    fn canonical_set_payload_rejects_non_base64_body_and_non_hex_log_id() {
+        let log_id = "c0d23d6ad406973f9559f3ba2d1ca01f";
+        // Quote-injecting body would splice duplicate keys into the template.
+        // This tests input refusal, not acceptance of a pinned-key signature.
+        assert!(
+            canonical_set_payload(
+                log_id,
+                12,
+                1_700_000_000,
+                "aGVsbG8=\",\"integratedTime\":0,\"x"
+            )
+            .is_none(),
+            "a body containing a double quote must be rejected"
+        );
+        assert!(
+            canonical_set_payload(log_id, 12, 1_700_000_000, "aG\\s=\"b").is_none(),
+            "a body containing a backslash must be rejected"
+        );
+        assert!(
+            canonical_set_payload(log_id, 12, 1_700_000_000, "aGVsbG8=?").is_none(),
+            "a body containing a non-base64 character must be rejected"
+        );
+        // Same for the logID slot.
+        assert!(
+            canonical_set_payload("deadbeef\", \"x\": 1", 12, 1_700_000_000, "aGVsbG8=").is_none(),
+            "a non-hex logID must be rejected"
+        );
+        // Valid inputs are byte-identical to the pre-fix template output.
+        let body = "aGVsbG8=";
+        assert_eq!(
+            canonical_set_payload(log_id, 12, 1_700_000_000, body),
+            Some("{\"body\":\"aGVsbG8=\",\"integratedTime\":1700000000,\"logID\":\"c0d23d6ad406973f9559f3ba2d1ca01f\",\"logIndex\":12}".to_string())
+        );
+        // A padded base64 body with `+`/`/` and an empty body are still accepted.
+        assert_eq!(
+            canonical_set_payload(log_id, 1, 2, "a+b/c=="),
+            Some("{\"body\":\"a+b/c==\",\"integratedTime\":2,\"logID\":\"c0d23d6ad406973f9559f3ba2d1ca01f\",\"logIndex\":1}".to_string())
+        );
+        assert_eq!(
+            canonical_set_payload(log_id, 1, 2, ""),
+            Some("{\"body\":\"\",\"integratedTime\":2,\"logID\":\"c0d23d6ad406973f9559f3ba2d1ca01f\",\"logIndex\":1}".to_string())
+        );
+    }
+
+    /// A quote-injecting body must be refused before signature verification.
+    /// AAAA is three zero bytes, not a genuine DER SET signature; this test
+    /// checks validation order only.
+    #[test]
+    fn rekor_entry_with_quote_injecting_body_is_refused() {
+        let mut bad = HashMap::new();
+        bad.insert(
+            "abc".to_string(),
+            serde_json::json!({
+                "logIndex": 1,
+                "integratedTime": 2,
+                "logID": "c0d23d6ad406973f9559f3ba2d1ca01f",
+                "body": "aGVsbG8=\",\"integratedTime\":1700000000,\"x",
+                "verification": {"signedEntryTimestamp": "AAAA"}
+            }),
+        );
+        let err = parse_rekor_entry("abc", bad)
+            .expect_err("a body that splices JSON into the canonical form must be refused");
         assert!(
             matches!(err, RekorError::EntrySetMalformed { .. }),
             "got: {err}"
