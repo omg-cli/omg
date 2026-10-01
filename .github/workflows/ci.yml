@@ -752,9 +752,21 @@ jobs:
         run: cargo build --release --no-default-features --features macos,pgp,license --locked
 
       - name: Install nextest
-        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        id: install-nextest
+        run: |
+          python3 scripts/install-nextest-macos.py \
+            --destination "$RUNNER_TEMP/omg-nextest-0.9.143" \
+            --receipts "$RUNNER_TEMP/nextest-installer-receipts"
+
+      - name: Preserve nextest installer receipts
+        if: always() && steps.install-nextest.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          tool: nextest
+          name: nextest-installer-macos
+          path: ${{ runner.temp }}/nextest-installer-receipts/
+          retention-days: 14
+          if-no-files-found: error
+
       - name: Verify nextest
         run: cargo nextest --version
 
@@ -790,6 +802,81 @@ jobs:
         with:
           name: cli-surfaces-macos
           path: target/contract-surfaces/
+          retention-days: 14
+          if-no-files-found: error
+
+  macos-nextest-source:
+    name: "macOS nextest source contract"
+    needs: quick-gate
+    if: (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act
+    runs-on: macos-14
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.95.0"
+
+      - name: Build the admitted nextest registry source
+        run: |
+          python3 scripts/install-nextest-macos.py --source-only \
+            --destination "$RUNNER_TEMP/nextest-source-contract" \
+            --receipts "$RUNNER_TEMP/nextest-source-receipts"
+
+      - name: Execute a genuine Rust contract with the source-built nextest
+        run: |
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import importlib.util, json, os, pathlib, sys, xml.etree.ElementTree as ET
+          root = pathlib.Path(sys.argv[1])
+          spec = importlib.util.spec_from_file_location('installer', 'scripts/install-nextest-macos.py')
+          installer = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(installer)
+          receipt = json.loads((root / 'nextest-source-receipts/admission.json').read_text())
+          assert receipt['source_only_requested'] and receipt['route'] == 'official-locked-registry-source'
+          assert receipt['source_contract']['archive_sha256'] == installer.REGISTRY_SHA
+          assert receipt['source_contract']['packaged_lock_sha256'] == installer.LOCK_SHA
+          assert receipt['source_contract']['packaged_source_commit'] == installer.SOURCE_COMMIT
+          assert receipt['installer_sha256'] == installer.digest(pathlib.Path(spec.origin))
+          assert receipt['workflow_source_sha'] == os.environ['GITHUB_SHA']
+          binary = root / 'nextest-source-contract/bin/cargo-nextest'
+          assert installer.digest(binary) == receipt['binary_sha256']
+          project = root / 'nextest-rust-contract'
+          project.mkdir(mode=0o700)
+          (project / 'src').mkdir()
+          (project / '.config').mkdir()
+          (project / 'Cargo.toml').write_text('[package]\nname="nextest-installer-contract"\nversion="0.0.0"\nedition="2024"\n')
+          (project / 'Cargo.lock').write_text('version=4\n[[package]]\nname="nextest-installer-contract"\nversion="0.0.0"\n')
+          (project / 'src/lib.rs').write_text('#[test]\nfn genuine_nextest_rust_execution() { assert_eq!(19u32.checked_add(23), Some(42)); }\n')
+          (project / '.config/nextest.toml').write_text('[profile.default]\nretries=0\n[profile.default.junit]\npath="junit.xml"\n')
+          commands = installer.Commands(root / 'nextest-rust-receipts')
+          environment = dict(os.environ, CARGO_TARGET_DIR=str(project / 'target'), CARGO_NET_OFFLINE='true', CARGO_TERM_COLOR='never')
+          code, _, _ = commands.run('genuine-rust-contract', [str(binary), 'nextest', 'run', '--manifest-path', str(project / 'Cargo.toml'), '--locked'], 90, project, environment)
+          assert code == 0
+          report = project / 'target/nextest/default/junit.xml'
+          document = ET.parse(report).getroot()
+          cases = document.findall('.//testcase')
+          assert len(cases) == 1 and cases[0].get('name') == 'genuine_nextest_rust_execution'
+          assert not document.findall('.//skipped') and not document.findall('.//failure') and not document.findall('.//error')
+          assert installer.digest(binary) == receipt['binary_sha256']
+          (root / 'nextest-rust-receipts/junit.xml').write_bytes(report.read_bytes())
+          result = dict(source_sha=os.environ['GITHUB_SHA'], installer_sha256=receipt['installer_sha256'], nextest_sha256=receipt['binary_sha256'], actual_rust_contract_positives=1, failed=0, ignored=0, commands=commands.rows)
+          (root / 'nextest-rust-receipts/result.json').write_text(json.dumps(result, indent=2) + '\n')
+          PY
+
+      - name: Preserve native nextest source proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-source-contract-macos
+          path: |
+            ${{ runner.temp }}/nextest-source-receipts/
+            ${{ runner.temp }}/nextest-rust-receipts/
           retention-days: 14
           if-no-files-found: error
 
@@ -977,7 +1064,7 @@ jobs:
 
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu, qemu, docs-audit, runtime-usage]
+    needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -993,6 +1080,7 @@ jobs:
           SANDBOX_CANCELLATION: ${{ needs.sandbox-cancellation.result }}
           FEATURE_INTERSECTIONS: ${{ needs.feature-intersections.result }}
           MACOS: ${{ needs.macos.result }}
+          MACOS_NEXTEST_SOURCE: ${{ needs.macos-nextest-source.result }}
           UBUNTU: ${{ needs.ubuntu.result }}
           RUNTIME_USAGE: ${{ needs.runtime-usage.result }}
           QEMU: ${{ needs.qemu.result }}
@@ -1009,6 +1097,7 @@ jobs:
           echo "| AUR Sandbox Cancellation | $SANDBOX_CANCELLATION |" >> $GITHUB_STEP_SUMMARY
           echo "| Feature Intersections | $FEATURE_INTERSECTIONS |" >> $GITHUB_STEP_SUMMARY
           echo "| macOS | $MACOS |" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS nextest source contract | $MACOS_NEXTEST_SOURCE |" >> $GITHUB_STEP_SUMMARY
           echo "| Ubuntu | $UBUNTU |" >> $GITHUB_STEP_SUMMARY
           echo "| Runtime usage accounting | $RUNTIME_USAGE |" >> $GITHUB_STEP_SUMMARY
           echo "| QEMU | $QEMU |" >> $GITHUB_STEP_SUMMARY
@@ -1035,6 +1124,7 @@ jobs:
             ["AUR Sandbox Cancellation"]="$SANDBOX_CANCELLATION"
             ["Feature Intersections"]="$FEATURE_INTERSECTIONS"
             ["macOS"]="$MACOS"
+            ["macOS nextest source contract"]="$MACOS_NEXTEST_SOURCE"
             ["Ubuntu"]="$UBUNTU"
             ["Runtime usage accounting"]="$RUNTIME_USAGE"
           )
