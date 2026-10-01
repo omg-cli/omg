@@ -15,7 +15,7 @@ class ScopeTests(unittest.TestCase):
     def test_coverage_aggregate_rejects_missing_failed_or_cancelled_work(self):
         workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/coverage.yml').read_text(encoding='utf-8')
         block = workflow.split('      - name: Require selected coverage\n')[1]
-        script = textwrap.dedent(block.split('        run: |\n')[1])
+        script = textwrap.dedent(block.split('        run: |\n')[1].split('\n      - ', 1)[0])
         bash = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
         with tempfile.TemporaryDirectory() as directory:
             for classification, required, coverage, passes in [
