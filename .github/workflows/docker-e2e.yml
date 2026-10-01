@@ -81,7 +81,9 @@ jobs:
           labels: org.opencontainers.image.revision=${{ github.sha }}
           build-args: NATIVE_REFRESH=${{ steps.evidence.outputs.native-refresh }}
           cache-from: type=gha,version=2,scope=docker-e2e-arch
-          cache-to: type=gha,version=2,scope=docker-e2e-arch,mode=max,ignore-error=true
+          # PR merge-ref caches cannot warm main. Preserve all intermediate
+          # dependency layers on main without duplicating them for every PR.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,version=2,scope=docker-e2e-arch,mode=max' || '' }}
           no-cache: ${{ github.event_name == 'schedule' || inputs.cold_cache == true }}
 
       - name: Verify image provenance
