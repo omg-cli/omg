@@ -251,12 +251,12 @@ fn rerun_transport_as_ordinary_user() -> bool {
         .expect("ordinary receipt read with root-only write");
     let (executable, copied_hash) = copy_fixture_program(directory.path(), &original, "aur-test");
     let output = std::process::Command::new(
-        omg_lib::core::privilege::trusted_program("timeout")
+        omg_lib::core::privilege::root_controlled_program_path("timeout")
             .expect("root-controlled fixture timeout"),
     )
     .args(["--kill-after=2s", "60s"])
     .arg(
-        omg_lib::core::privilege::trusted_program("setpriv")
+        omg_lib::core::privilege::root_controlled_program_path("setpriv")
             .expect("root-controlled privilege drop"),
     )
     .args(["--clear-groups", "--no-new-privs"])

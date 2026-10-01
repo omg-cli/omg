@@ -267,7 +267,7 @@ class WorkflowTests(unittest.TestCase):
         script = body.split('        run: |\n', 1)[1].split('\n  #', 1)[0]
         script = '\n'.join(line[10:] for line in script.splitlines())
         keys = ['QUICK_GATE', 'PORTABLE', 'LINUX_MATRIX', 'SANDBOX_CANCELLATION',
-                'FEATURE_INTERSECTIONS', 'MACOS', 'UBUNTU', 'QEMU', 'DOCS_AUDIT']
+                'FEATURE_INTERSECTIONS', 'MACOS', 'MACOS_NEXTEST_SOURCE', 'UBUNTU', 'QEMU', 'DOCS_AUDIT']
         for required, status, accepted in [('true', 'success', True), ('true', 'failure', False),
                                             ('true', 'cancelled', False), ('true', 'skipped', False),
                                             ('false', 'skipped', True), ('false', 'failure', False)]:
