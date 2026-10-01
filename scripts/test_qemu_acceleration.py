@@ -6,6 +6,8 @@ import subprocess
 import tempfile
 import unittest
 
+from test_qemu_boot_timeout_budget import budget_values
+
 
 ROOT = Path(__file__).resolve().parent.parent
 BASH = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
@@ -46,14 +48,13 @@ class QemuAccelerationTests(unittest.TestCase):
     def test_tcg_deadlines_are_explicit_and_leave_kvm_defaults_unchanged(self):
         runner = (ROOT / "scripts/benchmark-qemu.sh").read_text(encoding="utf-8")
         daemon = (ROOT / "scripts/qemu-daemon-check.sh").read_text(encoding="utf-8")
-        # The KVM boot deadline is derived from the guest-side readiness wait so
-        # it can never fall below it; TCG keeps an explicitly wider allowance.
-        # Guest and daemon deadlines are unchanged.
-        self.assertIn(
-            "SSH_WAIT_BUDGET=$(( SSH_WAIT_ATTEMPTS * (SSH_ATTEMPT_TIMEOUT + SSH_RETRY_DELAY) ))",
-            runner,
-        )
-        self.assertIn("BOOT_TIMEOUT=$(( SSH_WAIT_BUDGET + 180 ))", runner)
+        # Evaluate the shared aggregate. TCG doubles the complete initial
+        # budget, not just one readiness phase. Guest/daemon bounds stay fixed.
+        wait, clone, initial = budget_values()
+        self.assertEqual(wait, 1680)
+        self.assertEqual(clone, 2161)
+        self.assertEqual(initial, 3911)
+        self.assertEqual(initial * 2, 7822)
         self.assertIn("boot_timeout=$BOOT_TIMEOUT", runner)
         self.assertIn("boot_timeout=$(( BOOT_TIMEOUT * 2 ))", runner)
         self.assertIn("guest_timeout=600", runner)
