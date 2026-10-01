@@ -529,6 +529,30 @@ def failed_guest_receipts(jobs):
             for distro, arch in sorted(failed_lane_guests(jobs))]
 
 
+def case_job_details(run, jobs, row):
+    source = "ci" if row["case_id"] == "ci-non-qemu-workflow" else "qemu-matrix"
+    guest = ((row["distro"], row.get("arch", "x86_64"))
+             if row["distro"] in DISTROS
+             and row["case_id"].startswith((f"qemu-{row['distro']}-", "qemu-matrix-")) else None)
+    details = []
+    for job in jobs:
+        if job["conclusion"] in ("success", "skipped"):
+            continue
+        job_source = ("qemu-matrix" if run["path"] == ".github/workflows/qemu-matrix.yml"
+                      or job["name"].startswith("QEMU behavioral verification") else "ci")
+        if job_source != source or (guest is not None and guest not in failed_lane_guests([job])):
+            continue
+        if row["case_id"] == "qemu-arm-runner-kvm-health" and job["name"] != "ARM guest runner KVM health":
+            continue
+        name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", job["name"])[:120]
+        details.append(f"Job {job['id']}: {name} ({job['conclusion']})")
+        for step in job.get("steps", [])[:100]:
+            if step["conclusion"] not in ("success", "skipped"):
+                name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", step["name"])[:120]
+                details.append(f"  Step {step['number']}: {name} ({step['conclusion']})")
+    return details[:6]
+
+
 def workflow_receipt(jobs, conclusion):
     """Return an aggregate identity scoped to the architecture actually run.
 
@@ -810,17 +834,6 @@ def main():
     if not selected:
         print("No authoritative case updates to report")
         return 0
-    details = {"ci": [], "qemu-matrix": []}
-    for job in job_rows:
-        if job["conclusion"] not in ("success", "skipped"):
-            source = ("qemu-matrix" if run["path"] == ".github/workflows/qemu-matrix.yml"
-                      or job["name"].startswith("QEMU behavioral verification") else "ci")
-            name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", job["name"])[:120]
-            details[source].append(f"Job {job['id']}: {name} ({job['conclusion']})")
-            for step in job.get("steps", [])[:100]:
-                if step["conclusion"] not in ("success", "skipped"):
-                    name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", step["name"])[:120]
-                    details[source].append(f"  Step {step['number']}: {name} ({step['conclusion']})")
     selected, failure_catalog = bound_issue_updates(selected)
     report_directory = Path(os.environ["RUNNER_TEMP"]) / "qemu-issue-report"
     write_failure_catalog(report_directory, run, repository, failure_catalog, evidence_error)
@@ -849,8 +862,7 @@ def main():
                     f"Observed: {row['result']}, exit {row['exit_code']}, elapsed {row['elapsed_seconds']}s\n"
                     f"Evidence invalid/unavailable: {evidence_error}\n"
                     "Exit status alone does not establish the root cause. Inspect the linked run's logs and artifacts.\n"
-                     + "\n".join(details["ci" if row["case_id"] == "ci-non-qemu-workflow"
-                                         else "qemu-matrix"][:6]) + "\n"
+                    + "\n".join(case_job_details(run, job_rows, row)) + "\n"
                     + "Case diagnostic (untrusted log excerpt, redacted by issue helper):\n"
                     + diagnostics.get((row["case_id"], row["distro"], arch),
                                       "No case log available; inspect linked artifacts.")

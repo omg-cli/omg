@@ -1234,6 +1234,57 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(calls[0][1][0]["distro"], "fedora")
         self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-x86-workflow")
 
+    def test_debian_case_uses_its_failed_job_when_fedora_failed_first(self):
+        failure = dict(self.row(), case_id="qemu-debian-lifecycle", distro="debian",
+                       result="HARNESS_ERROR", elapsed_seconds=45)
+        jobs = [
+            dict(id=110323348538, name="Distro lane (fedora) / QEMU guest (fedora)",
+                 conclusion="failure", steps=[dict(number=11, name="Fedora inventory", conclusion="failure")]),
+            dict(id=110323636555, name="Distro lane (debian) / QEMU guest (debian)",
+                 conclusion="failure", steps=[dict(number=11, name="Debian guest boot", conclusion="failure")]),
+            dict(id=110352017241, name="QEMU matrix result", conclusion="failure"),
+        ]
+        calls, catalog = self.run_report_fixture(
+            [failure], all_distros=True, jobs=jobs, log_case="lifecycle",
+            case_log="cloud-init did not publish complete status within 180 seconds")
+        transcript = calls[0][2]["debian-qemu-debian-lifecycle"]
+        self.assertIn("Job 110323636555:", transcript)
+        self.assertIn("Debian guest boot", transcript)
+        self.assertNotIn("110323348538", transcript)
+        self.assertNotIn("Fedora inventory", transcript)
+        self.assertNotIn("110352017241", transcript)
+        self.assertIn("cloud-init did not publish complete status", transcript)
+        fedora = calls[0][2]["fedora-qemu-matrix-x86-workflow"]
+        self.assertIn("Job 110323348538:", fedora)
+        self.assertNotIn("110323636555", fedora)
+        self.assertEqual(catalog["failures"], [
+            dict(failure, arch="x86_64"),
+            dict(case_id="qemu-matrix-x86-workflow", distro="fedora", arch="x86_64",
+                 result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)])
+
+    def test_case_job_context_keeps_arm_and_x86_failures_separate(self):
+        failure = dict(self.row(), case_id="qemu-debian-search", distro="debian")
+        jobs = [dict(id=11, name="QEMU guest arm64 (debian)", conclusion="failure"),
+                dict(id=12, name="Distro lane (debian) / QEMU guest (debian)", conclusion="failure")]
+        calls, _ = self.run_report_fixture(
+            [failure], all_distros=True, jobs=jobs, arm_rows=[failure])
+        x86 = calls[0][2]["debian-qemu-debian-search"]
+        arm = calls[0][2]["debian-aarch64-qemu-debian-search"]
+        self.assertIn("Job 12:", x86)
+        self.assertNotIn("Job 11:", x86)
+        self.assertIn("Job 11:", arm)
+        self.assertNotIn("Job 12:", arm)
+
+    def test_case_without_matching_failed_job_keeps_diagnostic_without_wrong_lane(self):
+        failure = dict(self.row(), case_id="qemu-debian-search", distro="debian")
+        calls, _ = self.run_report_fixture(
+            [failure], all_distros=True,
+            jobs=[dict(id=11, name="QEMU guest (fedora)", conclusion="failure")],
+            case_log="Debian package is missing")
+        transcript = calls[0][2]["debian-qemu-debian-search"]
+        self.assertNotIn("Job 11:", transcript)
+        self.assertIn("Debian package is missing", transcript)
+
     def test_failed_native_ci_before_qemu_uses_ci_prerequisite_identity(self):
         jobs = [
             {"name": "Linux (debian-trixie)", "conclusion": "failure", "id": 11,
