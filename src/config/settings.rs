@@ -378,7 +378,7 @@ impl Settings {
                 .expect("allow fixture account to execute tests");
             let mut file = std::fs::File::open(&executable).expect("open copied test executable");
             let mut digest = Sha256::new();
-            let mut buffer = [0u8; 65536];
+            let mut buffer = [0u8; 8192];
             loop {
                 let count = file.read(&mut buffer).expect("hash copied test executable");
                 if count == 0 {

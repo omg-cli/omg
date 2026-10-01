@@ -2785,6 +2785,11 @@ mod recovery_diagnostic_tests {
     #[test]
     #[serial_test::serial]
     fn lazy_recovery_preserves_quarantine_and_persistent_gap() -> anyhow::Result<()> {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "core::security::audit::recovery_diagnostic_tests::lazy_recovery_preserves_quarantine_and_persistent_gap",
+        ) {
+            return Ok(());
+        }
         assert!(
             !crate::core::is_root(),
             "this fixture requires an unprivileged process"
@@ -2817,6 +2822,11 @@ mod recovery_diagnostic_tests {
     #[test]
     #[cfg(unix)]
     fn recovery_marker_failure_keeps_original_history() -> anyhow::Result<()> {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "core::security::audit::recovery_diagnostic_tests::recovery_marker_failure_keeps_original_history",
+        ) {
+            return Ok(());
+        }
         use std::os::unix::fs::PermissionsExt;
         assert!(
             !crate::core::is_root(),
@@ -2996,6 +3006,11 @@ mod recovery_diagnostic_tests {
 
     #[tokio::test]
     async fn failure_plaintext_escapes_paths_resources_and_keeps_raw_disk() -> anyhow::Result<()> {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "core::security::audit::recovery_diagnostic_tests::failure_plaintext_escapes_paths_resources_and_keeps_raw_disk",
+        ) {
+            return Ok(());
+        }
         const NAME: &str = "core::security::audit::recovery_diagnostic_tests::failure_plaintext_escapes_paths_resources_and_keeps_raw_disk";
         const MARKER: &str = "OMG_AUDIT_FAILURE_PLAINTEXT_CHILD";
         if std::env::var_os(MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
