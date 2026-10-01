@@ -266,6 +266,10 @@ impl Settings {
     /// config from misspelled settings.
     fn validate_known_keys(content: &str) -> Result<()> {
         let table: toml::Table = toml::from_str(content).context("Config is not valid TOML")?;
+        crate::core::security::policy::validate_legacy_security_config(
+            &table,
+            std::path::Path::new("config.toml"),
+        )?;
 
         const ROOT_KEYS: [&str; 2] = ["telemetry_enabled", "aur"];
         const AUR_KEYS: [&str; 16] = [
@@ -289,7 +293,8 @@ impl Settings {
 
         // Legacy sections written by older omg releases. They carry no
         // settings the current schema consumes; recognize them so existing
-        // installs keep working, but tell the user they are ignored.
+        // installs keep working, but tell the user they are ignored. Populated
+        // security controls were rejected above and never reach this fallback.
         const LEGACY_KEYS: [&str; 8] = [
             "cache",
             "general",
@@ -874,6 +879,40 @@ mod tests {
 
         assert_eq!(parsed.data_dir, paths::data_dir());
         assert_eq!(parsed.socket_path, paths::socket_path());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn legacy_security_settings_fail_closed_and_preserve_existing_configuration() {
+        if Settings::rerun_config_test_unprivileged(
+            "config::settings::tests::legacy_security_settings_fail_closed_and_preserve_existing_configuration",
+        ) {
+            return;
+        }
+        let dir = tempfile::TempDir::new().expect("isolated config dir");
+        temp_env::with_var("OMG_CONFIG_DIR", Some(dir.path()), || {
+            let config_path = Settings::config_path().unwrap();
+            let policy_path = dir.path().join("policy.toml");
+            let policy = "allow_aur = true\n";
+            std::fs::write(&policy_path, policy).unwrap();
+            for content in [
+                "[security]\nallow_aur = false\n",
+                "[security]\nminimum_grade = 'community'\n",
+                "security = true\n",
+            ] {
+                std::fs::write(&config_path, content).unwrap();
+                let error = Settings::load().expect_err("populated legacy security must fail");
+                assert!(
+                    format!("{error:#}").contains("Manually migrate"),
+                    "{error:#}"
+                );
+                assert!(crate::core::security::SecurityPolicy::load_default().is_err());
+                assert_eq!(std::fs::read_to_string(&config_path).unwrap(), content);
+                assert_eq!(std::fs::read_to_string(&policy_path).unwrap(), policy);
+            }
+            std::fs::write(&config_path, "[security]\n[aur]\nreview_pkgbuild = true\n").unwrap();
+            assert!(Settings::load().unwrap().aur.review_pkgbuild);
+        });
     }
 
     /// A missing env-pointed config dir falls back to defaults (with a warn

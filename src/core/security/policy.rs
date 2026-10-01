@@ -51,6 +51,10 @@ fn read_policy_file(path: &Path) -> io::Result<String> {
 /// Failures from loading a security policy or checking a package against it.
 #[derive(Debug, Error)]
 pub enum PolicyError {
+    #[error(
+        "Legacy [security] settings in {path} cannot be enforced from config.toml. Manually migrate them to the sibling policy.toml as top-level keys, validate its supported values (minimum_grade uses Risk, Community, Verified or Locked), then remove [security] from config.toml. Neither file was changed; an existing policy.toml does not resolve conflicting legacy settings."
+    )]
+    LegacySecurityConfig { path: String },
     #[error("Failed to read security policy: {path}")]
     Read {
         path: String,
@@ -216,7 +220,10 @@ impl SecurityPolicy {
     }
 
     /// Load a policy file, using the built-in default only when the file is absent.
+    /// Populated legacy security controls in its sibling config.toml fail closed
+    /// even when the policy exists, because their migration/conflicts are unresolved.
     pub fn load_optional(path: impl AsRef<Path>) -> Result<Self, PolicyError> {
+        reject_legacy_security_file(&path.as_ref().with_file_name("config.toml"))?;
         match Self::load(&path) {
             Ok(policy) => Ok(policy),
             Err(PolicyError::Read { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
@@ -341,6 +348,37 @@ impl SecurityPolicy {
     }
 }
 
+fn reject_legacy_security_file(path: &Path) -> Result<(), PolicyError> {
+    match read_policy_file(path) {
+        Ok(content) => {
+            let table = toml::from_str(&content).map_err(|source| PolicyError::Parse {
+                path: path.display().to_string(),
+                source,
+            })?;
+            validate_legacy_security_config(&table, path)
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(PolicyError::Read {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
+pub(crate) fn validate_legacy_security_config(
+    table: &toml::Table,
+    path: &Path,
+) -> Result<(), PolicyError> {
+    if let Some(security) = table.get("security")
+        && !security.as_table().is_some_and(toml::Table::is_empty)
+    {
+        return Err(PolicyError::LegacySecurityConfig {
+            path: path.display().to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Lowercase SPDX-ish tokens from a license expression.
 pub(crate) fn spdx_license_tokens(license: &str) -> Vec<String> {
     license
@@ -365,21 +403,50 @@ pub(crate) enum LicenseClassification {
     StrongCopyleft,
 }
 
-/// AND and OR preserve the strongest recognized family; WITH uses its base.
-/// Unknown operands do not erase known families. This category alone does not
-/// report unresolved operands or establish the legal effect of an exception.
-pub(crate) fn classify_license_expression(license: &str) -> LicenseClassification {
-    fn classify(expr: &SpdxExpr) -> LicenseClassification {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LicenseAssessment {
+    pub category: LicenseClassification,
+    pub unresolved_review: bool,
+}
+
+/// AND and OR preserve the strongest recognized family and any unresolved
+/// operand. WITH keeps its base family but always requires exception review:
+/// this bounded classifier does not resolve exception terms or custom references.
+pub(crate) fn assess_license_expression(license: &str) -> LicenseAssessment {
+    fn assess(expr: &SpdxExpr) -> LicenseAssessment {
         match expr {
-            SpdxExpr::Id(id) | SpdxExpr::With { id } => classify_license_id(id),
+            SpdxExpr::Id(id) => {
+                let category = classify_license_id(id);
+                LicenseAssessment {
+                    category,
+                    unresolved_review: category == LicenseClassification::Unknown,
+                }
+            }
+            SpdxExpr::With { id } => LicenseAssessment {
+                category: classify_license_id(id),
+                unresolved_review: true,
+            },
             SpdxExpr::And(left, right) | SpdxExpr::Or(left, right) => {
-                classify(left).max(classify(right))
+                let left = assess(left);
+                let right = assess(right);
+                LicenseAssessment {
+                    category: left.category.max(right.category),
+                    unresolved_review: left.unresolved_review || right.unresolved_review,
+                }
             }
         }
     }
-    SpdxParser::parse_expression(license)
-        .as_ref()
-        .map_or(LicenseClassification::Unknown, classify)
+    SpdxParser::parse_expression(license).as_ref().map_or(
+        LicenseAssessment {
+            category: LicenseClassification::Unknown,
+            unresolved_review: true,
+        },
+        assess,
+    )
+}
+
+pub(crate) fn classify_license_expression(license: &str) -> LicenseClassification {
+    assess_license_expression(license).category
 }
 
 fn classify_license_id(id: &str) -> LicenseClassification {
@@ -751,6 +818,111 @@ async fn check_prepared_with_source(
 mod tests {
     use super::*;
     use crate::core::security::vulnerability::VulnerabilityError;
+
+    #[test]
+    fn license_assessment_preserves_unknown_operands_and_exception_review() {
+        use LicenseClassification::{Copyleft, Permissive, StrongCopyleft, Unknown};
+        for (expression, category, unresolved_review) in [
+            ("MIT", Permissive, false),
+            ("MIT OR Apache-2.0", Permissive, false),
+            ("MIT AND LicenseRef-private", Permissive, true),
+            ("LicenseRef-private OR MIT", Permissive, true),
+            ("GPL2 AND LicenseRef-private", Copyleft, true),
+            (
+                "AGPL3 OR DocumentRef-x:LicenseRef-private",
+                StrongCopyleft,
+                true,
+            ),
+            ("MIT WITH Classpath-exception-2.0", Permissive, true),
+            ("MIT WITH AGPL-3.0", Permissive, true),
+            ("LicenseRef-private", Unknown, true),
+            ("MIT AND", Unknown, true),
+            ("", Unknown, true),
+        ] {
+            assert_eq!(
+                assess_license_expression(expression),
+                LicenseAssessment {
+                    category,
+                    unresolved_review
+                },
+                "{expression}"
+            );
+        }
+        for expression in [
+            "MIT ".repeat(1025),
+            format!("{}MIT{}", "(".repeat(33), ")".repeat(33)),
+        ] {
+            assert_eq!(
+                assess_license_expression(&expression),
+                LicenseAssessment {
+                    category: Unknown,
+                    unresolved_review: true
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_security_rejects_optional_policy_defaults_and_conflicts_without_rewrites() {
+        let dir = tempfile::TempDir::new().expect("isolated configuration");
+        let config_path = dir.path().join("config.toml");
+        let policy_path = dir.path().join("policy.toml");
+        for config in [
+            "[security]\nallow_aur = false\n",
+            "[security]\nrequire_pgp = true\n",
+            "[security]\nminimum_grade = 'verified'\n",
+            "[security]\nallowed_licenses = ['MIT']\n",
+            "[security]\nbanned_packages = ['curl']\n",
+            "[security]\nminimum_grade = 'community'\n",
+            "security = false\n",
+            "[security]\nmisspelled_control = true\n",
+        ] {
+            fs::write(&config_path, config).expect("legacy configuration");
+            for policy in [None, Some("allow_aur = true\n")] {
+                if let Some(policy) = policy {
+                    fs::write(&policy_path, policy).expect("conflicting policy");
+                }
+                let error = SecurityPolicy::load_optional(&policy_path)
+                    .expect_err("legacy controls must fail closed");
+                assert!(matches!(error, PolicyError::LegacySecurityConfig { .. }));
+                let message = error.to_string();
+                assert!(message.contains("Manually migrate"), "{message}");
+                assert!(message.contains("policy.toml"), "{message}");
+                assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+                if let Some(policy) = policy {
+                    assert_eq!(fs::read_to_string(&policy_path).unwrap(), policy);
+                    fs::remove_file(&policy_path).expect("remove owned fixture policy");
+                } else {
+                    assert!(!policy_path.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_legacy_security_accepts_current_policy_and_absent_policy_defaults() {
+        let dir = tempfile::TempDir::new().expect("isolated configuration");
+        let path = dir.path().join("policy.toml");
+        fs::write(dir.path().join("config.toml"), "[security]\n").unwrap();
+        assert_eq!(
+            SecurityPolicy::load_optional(&path).unwrap(),
+            SecurityPolicy::default()
+        );
+        fs::write(&path, "minimum_grade = 'Verified'\nallow_aur = false\n").unwrap();
+        let policy = SecurityPolicy::load_optional(&path).unwrap();
+        assert_eq!(policy.minimum_grade, SecurityGrade::Verified);
+        assert!(!policy.allow_aur);
+    }
+
+    #[test]
+    fn invalid_legacy_config_cannot_select_optional_policy_defaults() {
+        let dir = tempfile::TempDir::new().expect("isolated configuration");
+        fs::write(dir.path().join("config.toml"), "[security\n").unwrap();
+        assert!(matches!(
+            SecurityPolicy::load_optional(dir.path().join("policy.toml")),
+            Err(PolicyError::Parse { .. })
+        ));
+    }
 
     #[test]
     fn separate_license_entries_preserve_all_obligations_and_group_alternatives() {

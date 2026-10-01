@@ -48,10 +48,10 @@ class LicenseOracleTests(unittest.TestCase):
 
     def audit_rows(self):
         return [
-            {"name": "alpha", "version": "1.0-1", "license": "MIT", "category": "Permissive"},
+            {"name": "alpha", "version": "1.0-1", "license": "MIT", "category": "Permissive", "unresolved_review": False},
             {"name": "beta", "version": "2.0-2", "license": "GPL-3.0-only, Apache-2.0",
-             "category": "Copyleft"},
-            {"name": "gamma", "version": "3.0-1", "license": "Unknown", "category": "Unknown"},
+             "category": "Copyleft", "unresolved_review": False},
+            {"name": "gamma", "version": "3.0-1", "license": "Unknown", "category": "Unknown", "unresolved_review": True},
         ]
 
     def test_wrong_or_incomplete_audit_json_is_rejected(self):
@@ -96,9 +96,9 @@ class LicenseOracleTests(unittest.TestCase):
 
         with self.output.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.writer(stream)
-            writer.writerow(["Package", "Version", "License", "Category"])
+            writer.writerow(["Package", "Version", "License", "Category", "UnresolvedReview"])
             for row in self.audit_rows():
-                writer.writerow([row[k] for k in ("name", "version", "license", "category")])
+                writer.writerow([row[k] for k in ("name", "version", "license", "category")] + [str(row["unresolved_review"]).lower()])
         self.output.chmod(0o600)
         ORACLE.check("audit-csv", self.output, native)
         self.output.write_text("Package,Version,License,Category\nalpha,1.0-1,MIT,Permissive\n",
@@ -109,11 +109,11 @@ class LicenseOracleTests(unittest.TestCase):
         native = dict(native, delta=("1.0-1", ["=HYPERLINK(\"https://example.invalid\")"]))
         with self.output.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.writer(stream)
-            writer.writerow(["Package", "Version", "License", "Category"])
+            writer.writerow(["Package", "Version", "License", "Category", "UnresolvedReview"])
             for row in self.audit_rows():
-                writer.writerow([row[k] for k in ("name", "version", "license", "category")])
+                writer.writerow([row[k] for k in ("name", "version", "license", "category")] + [str(row["unresolved_review"]).lower()])
             writer.writerow(["delta", "1.0-1", "'=HYPERLINK(\"https://example.invalid\")",
-                             "Unknown"])
+                             "Unknown", "true"])
         self.output.chmod(0o600)
         ORACLE.check("audit-csv", self.output, native)
 
@@ -121,7 +121,7 @@ class LicenseOracleTests(unittest.TestCase):
         native = self.native()
         report = {"total": 3,
                   "by_license": {"MIT": 1, "GPL-3.0-only": 1, "Apache-2.0": 1},
-                  "unknown": ["gamma"],
+                  "unknown": ["gamma"], "unresolved_review": [],
                   "violations": [{"package": "beta", "license": "GPL-3.0-only",
                                   "reason": "Copyleft license requires legal review"}]}
         self.output.write_text(json.dumps(report), encoding="utf-8")
@@ -162,6 +162,7 @@ class LicenseOracleTests(unittest.TestCase):
                                "License Inventory\n│ Apache-2.0: 1 assignments (33%)\n"
                                "│ GPL-3.0-only: 1 assignments (33%)\n"
                                "│ MIT: 1 assignments (33%)\n"
+                               "Unresolved License Review\n│ 0 unresolved assignments; 1 packages without license metadata\n"
                                "Policy Violations\n│ beta - Copyleft license requires legal review\n"
                                "Unknown Licenses\n│ gamma\n",
                                encoding="utf-8")
@@ -191,6 +192,7 @@ class LicenseOracleTests(unittest.TestCase):
                                "│ Apache-2.0: 1 assignments (25%)\n"
                                "│ GPL-3.0-only: 1 assignments (25%)\n"
                                "│ MIT: 1 assignments (25%)\n"
+                               "Unresolved License Review\n│ 0 unresolved assignments; 1 packages without license metadata\n"
                                "Policy Violations\n│ beta - Copyleft license requires legal review\n"
                                "Unknown Licenses\n│ gamma\n", encoding="utf-8")
         ORACLE.check("enterprise-text", self.output, native)
@@ -235,7 +237,7 @@ class LicenseOracleTests(unittest.TestCase):
         self.assertEqual(ORACLE.advisory_category("GPL2, LGPL3"), "Unknown")
         packages = {"libidn2": ("2.3.8-1", ["GPL2", "LGPL3"])}
         ORACLE.compare_audit_rows([{"name": "libidn2", "version": "2.3.8-1",
-                                    "license": "GPL2, LGPL3", "category": "Copyleft"}],
+                                    "license": "GPL2, LGPL3", "category": "Copyleft", "unresolved_review": False}],
                                   ORACLE.expected_audit(packages))
         counts, unknown, violations = ORACLE.expected_enterprise(packages)
         self.assertEqual(dict(counts), {"GPL2": 1, "LGPL3": 1})
@@ -258,7 +260,7 @@ class LicenseOracleTests(unittest.TestCase):
         packages = self.native()
         correct = ("[License Compliance Scan] 3 total packages\nLicense Inventory\n"
                    "│ Apache-2.0: 1 assignments (33%)\n│ GPL-3.0-only: 1 assignments (33%)\n"
-                   "│ MIT: 1 assignments (33%)\nPolicy Violations\n"
+                   "│ MIT: 1 assignments (33%)\nUnresolved License Review\n│ 0 unresolved assignments; 1 packages without license metadata\nPolicy Violations\n"
                    "│ beta - Copyleft license requires legal review\nUnknown Licenses\n│ gamma\n")
         ORACLE.check_enterprise_text(correct, packages)
         bad_reports = [
@@ -286,6 +288,7 @@ class LicenseOracleTests(unittest.TestCase):
         packages.update({f"unknown{i}": ("1", []) for i in range(7)})
         correct = ("[License Compliance Scan] 30 total packages\nLicense Inventory\n"
                    "│ GPL2: 11 assignments (48%)\n│ GPL3: 12 assignments (52%)\n"
+                   "Unresolved License Review\n│ 0 unresolved assignments; 7 packages without license metadata\n"
                    "Policy Violations\n" + "".join(f"│ p{i:02} - Copyleft license requires legal review\n" for i in range(20))
                    + "│ ... and 3 more\nUnknown Licenses\n"
                    + "".join(f"│ unknown{i}\n" for i in range(5)) + "│ ... and 2 more\n")
@@ -299,8 +302,8 @@ class LicenseOracleTests(unittest.TestCase):
                 ORACLE.check_enterprise_text(bad, packages)
         many = {f"p{i:02}": ("1", [f"LicenseRef-{i:02}"]) for i in range(23)}
         inventory = ("[License Compliance Scan] 23 total packages\nLicense Inventory\n"
-                     + "".join(f"│ LicenseRef-{i:02}: 1 assignments (4%)\n" for i in range(20))
-                     + "│ ... and 3 more\n")
+                     + "".join(f"│ LicenseRef-{i:02}: 1 assignments (4%) [unresolved license review]\n" for i in range(20))
+                     + "│ ... and 3 more\nUnresolved License Review\n│ 23 unresolved assignments; 0 packages without license metadata\n")
         ORACLE.check_enterprise_text(inventory, many)
         with self.assertRaises(AssertionError):
             ORACLE.check_enterprise_text(inventory.replace("... and 3 more", "... and 2 more"), many)
@@ -308,6 +311,34 @@ class LicenseOracleTests(unittest.TestCase):
         self.assertEqual(ORACLE.assignment_percentage(3, 8), "38")
         self.assertEqual(ORACLE.assignment_percentage(1, 3), "33")
         self.assertEqual(ORACLE.assignment_percentage(2, 3), "67")
+
+    def test_unresolved_review_is_required_for_mixed_operands_exceptions_and_exports(self):
+        for expression, category in (
+            ("MIT AND LicenseRef-private", "Permissive"),
+            ("LicenseRef-private OR MIT", "Permissive"),
+            ("GPL2 WITH Classpath-exception-2.0", "Copyleft"),
+            ("MIT WITH AGPL-3.0", "Permissive"),
+            ("MIT AND", "Unknown"),
+        ):
+            self.assertEqual(ORACLE.advisory_assessment(expression), (category, True))
+        self.assertEqual(ORACLE.advisory_assessment("MIT OR Apache-2.0"), ("Permissive", False))
+        packages = {"mixed": ("1", ["MIT AND LicenseRef-private"])}
+        row = {"name": "mixed", "version": "1", "license": "MIT AND LicenseRef-private",
+               "category": "Permissive", "unresolved_review": True}
+        ORACLE.compare_audit_rows([row], ORACLE.expected_audit(packages))
+        for bad in (dict(row, unresolved_review=False), dict(row, unresolved_review="true"),
+                    {key: value for key, value in row.items() if key != "unresolved_review"}):
+            with self.assertRaises(AssertionError):
+                ORACLE.compare_audit_rows([bad], ORACLE.expected_audit(packages))
+        report = {"total": 1, "by_license": {row["license"]: 1}, "unknown": [],
+                  "violations": [], "unresolved_review": [{"package": "mixed", "license": row["license"]}]}
+        self.output.write_text(json.dumps(report), encoding="utf-8")
+        self.output.chmod(0o600)
+        ORACLE.check("enterprise-json", self.output, packages)
+        report["unresolved_review"] = []
+        self.output.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            ORACLE.check("enterprise-json", self.output, packages)
 
     def test_symlink_and_world_readable_exports_are_rejected(self):
         native = self.native()

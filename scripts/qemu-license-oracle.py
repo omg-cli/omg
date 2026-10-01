@@ -19,7 +19,7 @@ from collections import Counter
 
 LOCAL_DB = Path("/var/lib/pacman/local")
 CATEGORIES = {"Permissive", "Copyleft", "StrongCopyleft", "Proprietary", "Unknown"}
-CSV_HEADER = ["Package", "Version", "License", "Category"]
+CSV_HEADER = ["Package", "Version", "License", "Category", "UnresolvedReview"]
 MAX_FILE_BYTES = 8 * 1024 * 1024
 REJECT_POLICY = "LicenseRef-QemuNoInstalledLicense"
 
@@ -116,30 +116,30 @@ FAMILY_IDS = {
 CATEGORY_ORDER = ["Unknown", "Proprietary", "Permissive", "Copyleft", "StrongCopyleft"]
 
 
-def advisory_category(expression):
+def advisory_assessment(expression):
     """Bounded syntax with explicit family IDs; AND/OR keep the strongest family."""
     if len(expression.encode("utf-8")) > 4096 or re.search(r"[^A-Za-z0-9.\-+:() \t\r\n\v\f]", expression):
-        return "Unknown"
+        return "Unknown", True
     tokens = re.findall(r"[A-Za-z0-9.\-+:]+|[()]", expression.upper())
     if not tokens or len(tokens) > 256:
-        return "Unknown"
+        return "Unknown", True
     depth = 0
     for token in tokens:
         if token == "(":
             depth += 1
             if depth > 32:
-                return "Unknown"
+                return "Unknown", True
         elif token == ")":
             depth -= 1
             if depth < 0:
-                return "Unknown"
+                return "Unknown", True
         elif token not in ("AND", "OR", "WITH"):
             pattern = (r"DOCUMENTREF-[A-Z0-9.\-]+:LICENSEREF-[A-Z0-9.\-]+" if ":" in token
                        else r"[A-Z0-9.\-]+\+?")
             if re.fullmatch(pattern, token) is None:
-                return "Unknown"
+                return "Unknown", True
     if depth:
-        return "Unknown"
+        return "Unknown", True
     position = 0
 
     def atom():
@@ -153,31 +153,38 @@ def advisory_category(expression):
             position += 1
             return category
         require(token not in ("AND", "OR", "WITH", ")"), "invalid expression operand")
-        if position < len(tokens) and tokens[position] == "WITH":
+        has_exception = position < len(tokens) and tokens[position] == "WITH"
+        if has_exception:
             position += 1
             require(position < len(tokens) and tokens[position] not in
                     ("AND", "OR", "WITH", "(", ")"), "missing exception")
             position += 1  # Exception text is not a base license family.
         identifier = token.removesuffix("+")
-        return next((category for category, ids in FAMILY_IDS.items() if identifier in ids),
-                    "Unknown")
+        category = next((category for category, ids in FAMILY_IDS.items() if identifier in ids),
+                        "Unknown")
+        return category, has_exception or category == "Unknown"
 
     def chain():
         nonlocal position
-        category = atom()
+        category, unresolved = atom()
         while position < len(tokens) and tokens[position] != ")":
             if tokens[position] in ("AND", "OR"):
                 position += 1
-            right = atom()  # Whitespace juxtaposition preserves legacy alternatives.
+            right, right_unresolved = atom()  # Whitespace juxtaposition preserves legacy alternatives.
             category = max((category, right), key=CATEGORY_ORDER.index)
-        return category
+            unresolved = unresolved or right_unresolved
+        return category, unresolved
 
     try:
         category = chain()
         require(position == len(tokens), "trailing expression token")
         return category
     except AssertionError:
-        return "Unknown"
+        return "Unknown", True
+
+
+def advisory_category(expression):
+    return advisory_assessment(expression)[0]
 
 
 def known_category(licenses):
@@ -185,6 +192,10 @@ def known_category(licenses):
         return "Unknown"
     # Native assignments are cumulative. Commas are display-only separators.
     return advisory_category(" AND ".join(f"({value})" for value in licenses))
+
+
+def unresolved_review(licenses):
+    return advisory_assessment(" AND ".join(f"({value})" for value in licenses))[1]
 
 
 def expected_audit(packages, mit_only=False, csv_safe=False):
@@ -199,9 +210,9 @@ def expected_audit(packages, mit_only=False, csv_safe=False):
         if csv_safe:
             rows[spreadsheet_safe(name)] = (spreadsheet_safe(version),
                                             spreadsheet_safe(license_value),
-                                            known_category(licenses))
+                                            known_category(licenses), unresolved_review(licenses))
         else:
-            rows[name] = (version, license_value, known_category(licenses))
+            rows[name] = (version, license_value, known_category(licenses), unresolved_review(licenses))
     return rows
 
 
@@ -209,7 +220,7 @@ def compare_audit_rows(rows, expected):
     require(isinstance(rows, list), "license report must be an array")
     observed = {}
     for row in rows:
-        require(isinstance(row, dict) and set(row) == {"name", "version", "license", "category"},
+        require(isinstance(row, dict) and set(row) == {"name", "version", "license", "category", "unresolved_review"},
                 "license report row schema is wrong")
         name, version, license_value, category = (
             row[key] for key in ("name", "version", "license", "category"))
@@ -221,6 +232,8 @@ def compare_audit_rows(rows, expected):
         require(expected_row is not None, f"unexpected license report package: {name}")
         if expected_row[2] is not None:
             require(category == expected_row[2], f"wrong license category for {name}")
+        require(type(row["unresolved_review"]) is bool and row["unresolved_review"] == expected_row[3],
+                f"wrong unresolved review marker for {name}")
         observed[name] = (version, license_value)
     require(observed == {name: row[:2] for name, row in expected.items()},
             "license report differs from native installed inventory")
@@ -258,6 +271,11 @@ def expected_enterprise(packages):
     return counts, sorted(unknown), sorted(violations)
 
 
+def expected_unresolved_assignments(packages):
+    return sorted((name, license_value) for name, (_, licenses) in packages.items()
+                  for license_value in licenses if advisory_assessment(license_value)[1])
+
+
 def assignment_percentage(count, assignments):
     # The renderer calculates in f32 and formats with zero decimal places.
     # Reproduce only those arithmetic/rounding rules, never rendered output.
@@ -273,7 +291,7 @@ def check_enterprise_text(report, packages):
     require(lines.count(summary) == 1, "enterprise license summary lacks native package total")
     sections = {}
     current = None
-    titles = {"License Inventory", "Policy Violations", "Unknown Licenses"}
+    titles = {"License Inventory", "Policy Violations", "Unknown Licenses", "Unresolved License Review"}
     for line in lines:
         if not line.strip() or line == summary:
             continue
@@ -291,6 +309,7 @@ def check_enterprise_text(report, packages):
     require("License Inventory" in sections, "missing enterprise license inventory")
     assignments = sum(counts.values())
     inventory = [f"{value}: {count} assignments ({assignment_percentage(count, assignments)}%)"
+                 + (" [unresolved license review]" if advisory_assessment(value)[1] else "")
                  for value, count in counts.items()]
     inventory.sort()
     expected_inventory = inventory[:20]
@@ -298,6 +317,9 @@ def check_enterprise_text(report, packages):
         expected_inventory.append(f"... and {len(inventory) - 20} more")
     require(sections["License Inventory"] == expected_inventory,
             "enterprise displayed license counts or percentages differ from native data")
+    require(sections.get("Unresolved License Review") == [
+        f"{len(expected_unresolved_assignments(packages))} unresolved assignments; {len(unknown)} packages without license metadata"
+    ], "enterprise unresolved review count differs from native data")
 
     def limited_members(title, expected, limit):
         if not expected:
@@ -343,13 +365,15 @@ def check(mode, path, packages, stderr=None):
             rows = []
             for item in reader:
                 require(None not in item and None not in item.values(), "malformed license CSV row")
+                require(item["UnresolvedReview"] in ("true", "false"), "invalid unresolved CSV marker")
                 rows.append(dict(name=item["Package"], version=item["Version"],
-                                 license=item["License"], category=item["Category"]))
+                                 license=item["License"], category=item["Category"],
+                                 unresolved_review=item["UnresolvedReview"] == "true"))
         compare_audit_rows(rows, expected_audit(packages, csv_safe=True))
     elif mode == "enterprise-json":
         report = read_json(path)
         require(isinstance(report, dict) and
-                set(report) == {"total", "by_license", "violations", "unknown"},
+                set(report) == {"total", "by_license", "violations", "unknown", "unresolved_review"},
                 "enterprise license export schema differs")
         counts, unknown, violations = expected_enterprise(packages)
         require(type(report["total"]) is int and report["total"] == len(packages),
@@ -367,6 +391,12 @@ def check(mode, path, packages, stderr=None):
         observed = sorted((row["package"], row["license"], row["reason"])
                           for row in observed_violations)
         require(observed == violations, "enterprise violations differ from native inventory")
+        review = report["unresolved_review"]
+        require(isinstance(review, list) and all(isinstance(row, dict) and
+                set(row) == {"package", "license"} and all(isinstance(value, str) for value in row.values())
+                for row in review), "enterprise unresolved review schema differs")
+        require(sorted((row["package"], row["license"]) for row in review) == expected_unresolved_assignments(packages),
+                "enterprise unresolved review differs from native inventory")
     elif mode == "enterprise-text":
         report = path.read_text(encoding="utf-8")
         check_enterprise_text(report, packages)

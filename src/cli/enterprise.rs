@@ -184,6 +184,14 @@ pub fn license_scan(export: Option<&str>, _ctx: &CliContext) -> Result<()> {
         ),
         Cmd::spacer(),
         Components::limited_card("License Inventory", license_inventory, 20),
+        Cmd::card(
+            "Unresolved License Review",
+            vec![format!(
+                "{} unresolved assignments; {} packages without license metadata",
+                scan.unresolved_review.len(),
+                scan.unknown.len()
+            )],
+        ),
         if violations.is_empty() {
             Cmd::none()
         } else {
@@ -426,6 +434,13 @@ struct LicenseScan {
     by_license: HashMap<String, usize>,
     violations: Vec<LicenseViolation>,
     unknown: Vec<String>,
+    unresolved_review: Vec<LicenseReview>,
+}
+
+#[derive(Debug, Serialize)]
+struct LicenseReview {
+    package: String,
+    license: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -472,6 +487,7 @@ fn perform_license_scan() -> Result<LicenseScan> {
         let mut by_license: HashMap<String, usize> = HashMap::new();
         let mut violations: Vec<LicenseViolation> = Vec::new();
         let mut unknown: Vec<String> = Vec::new();
+        let mut unresolved_review = Vec::new();
         let total = packages.len();
         for pkg in packages {
             if pkg.licenses.is_empty() {
@@ -479,6 +495,14 @@ fn perform_license_scan() -> Result<LicenseScan> {
             } else {
                 for lic in &pkg.licenses {
                     *by_license.entry(lic.clone()).or_insert(0) += 1;
+                    if crate::core::security::policy::assess_license_expression(lic)
+                        .unresolved_review
+                    {
+                        unresolved_review.push(LicenseReview {
+                            package: pkg.name.clone(),
+                            license: lic.clone(),
+                        });
+                    }
                     if let Some(reason) = enterprise_license_review_reason(lic) {
                         violations.push(LicenseViolation {
                             package: pkg.name.clone(),
@@ -494,6 +518,7 @@ fn perform_license_scan() -> Result<LicenseScan> {
             by_license,
             violations,
             unknown,
+            unresolved_review,
         })
     }
 }
@@ -509,7 +534,14 @@ fn license_inventory_rows(scan: &LicenseScan) -> Vec<String> {
             } else {
                 (*count as f32 / assignments as f32) * 100.0
             };
-            format!("{license}: {count} assignments ({percentage:.0}%)")
+            let review = if crate::core::security::policy::assess_license_expression(license)
+                .unresolved_review
+            {
+                " [unresolved license review]"
+            } else {
+                ""
+            };
+            format!("{license}: {count} assignments ({percentage:.0}%){review}")
         })
         .collect::<Vec<_>>();
     rows.sort_unstable();
@@ -518,12 +550,18 @@ fn license_inventory_rows(scan: &LicenseScan) -> Vec<String> {
 
 fn generate_license_csv(scan: &LicenseScan) -> Result<String> {
     let mut writer = csv::Writer::from_writer(Vec::new());
-    writer.write_record(["license", "count"])?;
+    writer.write_record(["license", "count", "unresolved_review"])?;
     let mut licenses: Vec<_> = scan.by_license.iter().collect();
     licenses.sort_unstable_by_key(|(left, _)| *left);
     for (license, count) in licenses {
+        let unresolved_review =
+            crate::core::security::policy::assess_license_expression(license).unresolved_review;
         let license = spreadsheet_safe_cell(license);
-        writer.write_record([&*license, count.to_string().as_str()])?;
+        writer.write_record([
+            &*license,
+            count.to_string().as_str(),
+            if unresolved_review { "true" } else { "false" },
+        ])?;
     }
     let bytes = writer
         .into_inner()
@@ -569,6 +607,7 @@ mod tests {
             by_license: HashMap::from([("=HYPERLINK(\"https://example.com\")".to_string(), 1)]),
             violations: Vec::new(),
             unknown: Vec::new(),
+            unresolved_review: Vec::new(),
         };
         let licenses = generate_license_csv(&scan).expect("license CSV");
         assert!(licenses.contains("\"'=HYPERLINK(\"\"https://example.com\"\")\",1"));
@@ -630,12 +669,46 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_license_assignments_survive_enterprise_inventory_and_exports() {
+        let expression = "MIT AND LicenseRef-private";
+        let scan = LicenseScan {
+            total: 1,
+            by_license: HashMap::from([(expression.into(), 2)]),
+            violations: Vec::new(),
+            unknown: Vec::new(),
+            unresolved_review: vec![
+                LicenseReview {
+                    package: "mixed".into(),
+                    license: expression.into(),
+                },
+                LicenseReview {
+                    package: "mixed".into(),
+                    license: expression.into(),
+                },
+            ],
+        };
+        assert_eq!(scan.unresolved_review.len(), 2);
+        assert_eq!(
+            license_inventory_rows(&scan),
+            ["MIT AND LicenseRef-private: 2 assignments (100%) [unresolved license review]"]
+        );
+        let json = serde_json::to_value(&scan).unwrap();
+        assert_eq!(json["unresolved_review"][0]["package"], "mixed");
+        assert_eq!(json["unresolved_review"][0]["license"], expression);
+        assert_eq!(json["by_license"][expression], 2);
+        let csv = generate_license_csv(&scan).unwrap();
+        assert!(csv.contains("license,count,unresolved_review"));
+        assert!(csv.contains("MIT AND LicenseRef-private,2,true"));
+    }
+
+    #[test]
     fn license_inventory_handles_empty_and_multi_license_scans() {
         let empty = LicenseScan {
             total: 0,
             by_license: HashMap::new(),
             violations: Vec::new(),
             unknown: Vec::new(),
+            unresolved_review: Vec::new(),
         };
         assert!(license_inventory_rows(&empty).is_empty());
 
@@ -644,6 +717,7 @@ mod tests {
             by_license: HashMap::from([("MIT".to_string(), 2), ("Apache-2.0".to_string(), 1)]),
             violations: Vec::new(),
             unknown: Vec::new(),
+            unresolved_review: Vec::new(),
         };
         let rows = license_inventory_rows(&scan);
         assert!(

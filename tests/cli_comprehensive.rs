@@ -1301,6 +1301,97 @@ fn has_ansi(text: &str) -> bool {
 
 #[test]
 #[serial]
+#[cfg(feature = "arch")]
+fn license_reports_preserve_unresolved_native_operands() {
+    let project = TestProject::for_distro("arch");
+    prepare_behavior_fixture(&project);
+    let metadata = project
+        .pacman_root
+        .path()
+        .join("var/lib/pacman/local/pacman-7.0.0-1/desc");
+    let original = std::fs::read_to_string(&metadata).unwrap();
+    let expression = "MIT AND LicenseRef-private";
+    std::fs::write(&metadata, original.replace("GPL-2.0-or-later", expression)).unwrap();
+    let result = project.run(&["audit", "licenses", "--format", "json"]);
+    result.assert_success();
+    let rows: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(
+        rows,
+        serde_json::json!([{
+            "name": "pacman", "version": "7.0.0-1", "license": expression,
+            "category": "Permissive", "unresolved_review": true
+        }])
+    );
+    let table = project.run(&["audit", "licenses"]);
+    table.assert_success();
+    table.assert_stdout_contains("Unresolved license review: 1");
+    table.assert_stdout_contains("[unresolved license review]");
+    let csv = project.run(&["audit", "licenses", "--format", "csv"]);
+    csv.assert_success();
+    csv.assert_stdout_contains("pacman,7.0.0-1,MIT AND LicenseRef-private,Permissive,true");
+    let enterprise = project.run(&["enterprise", "license-scan", "--export", "json"]);
+    enterprise.assert_success();
+    enterprise
+        .assert_stdout_contains("1 unresolved assignments; 0 packages without license metadata");
+    enterprise.assert_stdout_contains(
+        "MIT AND LicenseRef-private: 1 assignments (100%) [unresolved license review]",
+    );
+    let exports = std::fs::read_dir(project.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("license-scan-")
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exports.len(), 1);
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&exports[0]).unwrap()).unwrap();
+    assert_eq!(
+        report["unresolved_review"],
+        serde_json::json!([{"package": "pacman", "license": expression}])
+    );
+    assert_eq!(report["by_license"][expression], 1);
+}
+
+#[test]
+#[serial]
+fn legacy_security_configuration_refuses_cli_reads_and_writes_without_rewrites() {
+    let project = TestProject::new();
+    let config_path = project.config_dir.path().join("config.toml");
+    let policy_path = project.config_dir.path().join("policy.toml");
+    let config = "[security]\nallow_aur = false\n";
+    std::fs::write(&config_path, config).unwrap();
+    for policy in [None, Some("allow_aur = true\n")] {
+        if let Some(policy) = policy {
+            std::fs::write(&policy_path, policy).unwrap();
+        }
+        for args in [
+            vec!["config", "validate"],
+            vec!["config", "set", "telemetry.enabled", "false"],
+            vec!["audit", "policy"],
+        ] {
+            let result = project.run(&args);
+            result.assert_failure();
+            result.assert_stderr_contains("Manually migrate");
+            result.assert_stderr_contains("policy.toml");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), config);
+            if let Some(policy) = policy {
+                assert_eq!(std::fs::read_to_string(&policy_path).unwrap(), policy);
+            } else {
+                assert!(!policy_path.exists());
+            }
+        }
+    }
+}
+
+#[test]
+#[serial]
 #[cfg(feature = "arch")] // This inventory fixture explicitly seeds a pacman database.
 fn behavior_inventory_runs_in_hermetic_state() {
     use std::fmt::Write as _;
@@ -1909,7 +2000,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         "name": "pacman",
                         "version": "7.0.0-1",
                         "license": "GPL-2.0-or-later",
-                        "category": "Copyleft"
+                        "category": "Copyleft",
+                        "unresolved_review": false
                     }]);
                     if serde_json::from_str::<serde_json::Value>(&result.stdout).ok()
                         != Some(expected)
@@ -1927,7 +2019,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 }
                 Assertion::LicenseAuditCsv => {
                     let path = project.path().join("licenses-export.csv");
-                    let expected = "Package,Version,License,Category\npacman,7.0.0-1,GPL-2.0-or-later,Copyleft\n";
+                    let expected = "Package,Version,License,Category,UnresolvedReview\npacman,7.0.0-1,GPL-2.0-or-later,Copyleft,false\n";
                     let actual = std::fs::read_to_string(path)
                         .ok()
                         .map(|content| content.replace("\r\n", "\n"));
@@ -1941,6 +2033,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         "1 total packages",
                         "GPL-2.0-or-later: 1 assignments (100%)",
                         "pacman - Copyleft license requires legal review",
+                        "0 unresolved assignments; 0 packages without license metadata",
                     ] {
                         if !result.stdout.contains(expected) {
                             issues.push(format!("enterprise license scan omitted {expected:?}"));
@@ -1964,7 +2057,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
                             "license": "GPL-2.0-or-later",
                             "reason": "Copyleft license requires legal review"
                         }],
-                        "unknown": []
+                        "unknown": [],
+                        "unresolved_review": []
                     });
                     let actual = exports.first().and_then(|entry| {
                         std::fs::read_to_string(entry.path()).ok()

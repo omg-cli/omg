@@ -995,14 +995,8 @@ setup_config() {
 
   if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
     cat >"$CONFIG_DIR/config.toml" <<'EOF'
-[general]
-use_shims = false
-
-[security]
-minimum_grade = "community"
-
-[cache]
-ttl_hours = 24
+# OMG application settings. Security controls belong in policy.toml.
+# Edit supported settings with: omg config set <key> <value>
 EOF
     success "Default config created"
   else
