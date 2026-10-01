@@ -190,7 +190,10 @@ jobs:
     needs: [changes, coverage]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Require selected coverage
         env:
@@ -209,3 +212,24 @@ jobs:
             echo '::error::Missing or invalid coverage selection'
             exit 1
           fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.coverage_required == 'true'
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Require coverage to meet the exact base commit
+        if: needs.changes.outputs.coverage_required == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/require-base-coverage.py
+
+      - name: Preserve coverage comparison evidence
+        if: ${{ always() && needs.changes.outputs.coverage_required == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-comparison
+          path: coverage-comparison/
+          if-no-files-found: error
+          retention-days: 30
