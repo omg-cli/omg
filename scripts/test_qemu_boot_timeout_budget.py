@@ -86,7 +86,6 @@ class BootTimeoutExceedsReadinessWait(unittest.TestCase):
         self.assertNotRegex(source, r"(?m)^ssh ")
 
 
-@unittest.skipUnless(os.name == "posix", "real GNU timeout fixtures require Linux")
 class BootShellDeadlineTests(unittest.TestCase):
     def run_shell(self, root, script, args=(), limit=35):
         env = clean_env()
