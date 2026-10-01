@@ -839,6 +839,9 @@ if [[ "$distro" == arch ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-aur-check.sh /work/qemu-aur-fixture.py bench@127.0.0.1:
 fi
 if [[ -n "$inventory_tiers" ]]; then
+  if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+    timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-doctor-index-oracle.py bench@127.0.0.1:qemu-doctor-index-oracle.py
+  fi
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-arch-update-fixture.sh bench@127.0.0.1:qemu-arch-update-fixture.sh
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fedora-update-fixture.sh bench@127.0.0.1:qemu-fedora-update-fixture.sh
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fingerprint-oracle.py bench@127.0.0.1:qemu-fingerprint-oracle.py

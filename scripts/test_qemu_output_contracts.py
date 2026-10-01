@@ -923,6 +923,9 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
             pacman.write_text('#!/usr/bin/env bash\ncase "$1" in -Dk) exit 0 ;; -Qq) printf "one\\ntwo\\n" ;; *) exit 17 ;; esac\n', encoding='utf-8')
             pacman.chmod(0o755)
             env = dict(os.environ, PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
+            env['HOME'] = str(root)
+            (root / 'qemu-doctor-index-oracle.py').write_bytes(
+                (ROOT / 'scripts/qemu-doctor-index-oracle.py').read_bytes())
             for distro, (identity, health) in expected.items():
                 with self.subTest(distro=distro):
                     release.write_text(f'ID={distro}\n', encoding='utf-8')
@@ -947,6 +950,15 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
                             cwd=root, env=env, capture_output=True, text=True, timeout=10)
                     passed = probe()
                     self.assertEqual(passed.returncode, 0, passed.stderr)
+                    if distro in ('debian', 'ubuntu'):
+                        negative = subprocess.run(
+                            [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                             command.replace('"$4"\n', '"$4" false "$5"\n'), '_',
+                             distro, str(output), str(release), '',
+                             str(root / 'missing-index-proof.json')],
+                            cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                        self.assertEqual(negative.returncode, 1,
+                                         'healthy output without the required corrupt-index proof must fail')
                     if distro == 'arch':
                         pacman.write_text('#!/usr/bin/env bash\nexit 17\n', encoding='utf-8')
                         self.assertEqual(probe().returncode, 2)
@@ -1060,6 +1072,21 @@ esac
                    'fi\n')
         product = fault_guard + healthy_prefix + proxy_logic + 'printf "  PATH configured correctly\\nSystem is healthy with warnings.\\n"\n'
         native = {'pacman': 'case "$1" in -Dk) exit 0 ;; -Qq) printf "one\\ntwo\\n" ;; *) exit 17 ;; esac\n'}
+        if distro in ('debian', 'ubuntu'):
+            # This test isolates the PATH oracle. Root QEMU mounts are an
+            # external prerequisite; receipt validation remains real.
+            receipt = {'schema_version': 1, 'distro': distro, 'complete': True,
+                       'db_before': 'a' * 64, 'db_after': 'a' * 64,
+                       'baseline_issues': 1, 'cases': {
+                           name: {'exit': 1, 'issues': 1 if name == 'empty' else 2,
+                                  'diagnostic': True}
+                           for name in ('empty', 'corrupt-gzip', 'unreadable', 'corrupt-status')}}
+            native['sudo'] = ('[[ "$1" == -n ]] || exit 120\nshift\n'
+                              '[[ "$1" == unshare && "$2" == --mount && "$3" == --propagation '
+                              '&& "$4" == private && "$5" == python3 '
+                              '&& "$6" == "$HOME/qemu-doctor-index-oracle.py" '
+                              '&& "$7" == --binary && "$9" == --distro ]] || exit 120\n'
+                              'printf %s ' + shlex.quote(json.dumps(receipt)) + '\n')
         result, evidence, logs = self.run_inventory(product, rows, native_commands=native,
                                                     distro=distro, binary_name='omg')
         if distro == 'fedora':
@@ -2204,6 +2231,8 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
                     (ROOT / 'scripts/qemu-enterprise-export-oracle.py').read_bytes(),
                 'qemu-audit-log-oracle.py':
                     (ROOT / 'scripts/qemu-audit-log-oracle.py').read_bytes(),
+                'qemu-doctor-index-oracle.py':
+                    (ROOT / 'scripts/qemu-doctor-index-oracle.py').read_bytes(),
             }
             guest_files.update(home_files or {})
             for name, content in guest_files.items():
