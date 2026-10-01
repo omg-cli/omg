@@ -3931,6 +3931,12 @@ mod tests {
         std::fs::set_permissions(dir.path(), original).expect("restore parent");
         let error = result.expect_err("unreadable existing extended_states must not look missing");
         assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
+        );
+        assert!(
             error.to_string().contains("Failed to read mtime"),
             "got: {error}"
         );

@@ -1761,9 +1761,12 @@ path = "hostile"
         );
         let result = resolve_installed_version_req(&versions_dir, "^20");
         fs::set_permissions(&versions_dir, original).expect("restore fixture permissions");
+        let error = result.expect_err("unreadable versions directory must fail closed");
         assert!(
-            result.is_err(),
-            "unreadable versions directory must fail closed, got {result:?}"
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
         );
     }
 
@@ -1839,9 +1842,12 @@ path = "hostile"
         );
         let result = detect_versions(dir.path());
         fs::set_permissions(&pin, original).expect("restore fixture permissions");
+        let error = result.expect_err("unreadable pin file must fail closed");
         assert!(
-            result.is_err(),
-            "unreadable pin file must fail closed, got {result:?}"
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
         );
     }
 
@@ -2031,9 +2037,12 @@ path = "hostile"
         );
         let result = resolve_nvm_alias(dir.path(), "lts");
         fs::set_permissions(&alias, original).expect("restore fixture permissions");
+        let error = result.expect_err("unreadable nvm alias must fail closed");
         assert!(
-            result.is_err(),
-            "unreadable nvm alias must fail closed, got {result:?}"
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
         );
     }
     #[cfg(test)]

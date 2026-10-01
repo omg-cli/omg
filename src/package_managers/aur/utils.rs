@@ -370,6 +370,12 @@ mod tests {
         std::fs::set_permissions(&build_root, original).expect("restore chmod");
 
         let error = result.expect_err("uninspectable directory must fail closed");
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
+        );
         assert!(error.to_string().contains("fail"), "got: {error}");
     }
 }

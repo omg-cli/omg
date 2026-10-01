@@ -432,9 +432,12 @@ mod tests {
         );
         let result = CompletionEngine::probe_context_from(temp_dir.path(), "python");
         std::fs::set_permissions(&pin, original).expect("restore fixture permissions");
+        let error = result.expect_err("unreadable pin must fail closed");
         assert!(
-            result.is_err(),
-            "unreadable pin must fail closed, got {result:?}"
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
         );
     }
 

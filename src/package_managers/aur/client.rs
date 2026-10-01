@@ -6402,7 +6402,13 @@ mod tests {
 
         std::fs::set_permissions(&srcinfo, original).expect("restore chmod");
 
-        result.expect_err("unreadable .SRCINFO must fail closed");
+        let error = result.expect_err("unreadable .SRCINFO must fail closed");
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
+        );
     }
 
     #[test]

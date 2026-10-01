@@ -547,9 +547,12 @@ mod tests {
         );
         let result = read_hook_file(&path);
         fs::set_permissions(&path, original).expect("restore fixture permissions");
+        let error = result.expect_err("unreadable hook file must fail closed");
         assert!(
-            result.is_err(),
-            "unreadable hook file must fail closed, got {result:?}"
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
         );
     }
 }

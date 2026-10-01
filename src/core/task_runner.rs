@@ -1853,9 +1853,12 @@ build = "node"
         let detector = TaskDetector::new(temp.path().to_path_buf()).unwrap();
         let result = detector.detect();
         fs::set_permissions(&path, original).expect("restore fixture permissions");
+        let error = result.expect_err("unreadable package.json must fail closed");
         assert!(
-            result.is_err(),
-            "unreadable package.json must fail closed, got {result:?}"
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
         );
     }
 
@@ -2000,9 +2003,12 @@ build = "node"
         );
         let result = resolve_nvm_alias(temp.path(), "lts");
         fs::set_permissions(&alias, original).expect("restore fixture permissions");
+        let error = result.expect_err("unreadable nvm alias must fail closed");
         assert!(
-            result.is_err(),
-            "unreadable nvm alias must fail closed, got {result:?}"
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
         );
     }
 }

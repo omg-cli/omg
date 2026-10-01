@@ -1781,6 +1781,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn test_collect_sync_db_paths_unreadable_dir_errors() {
         if crate::config::Settings::rerun_test_unprivileged(
             "package_managers::pacman_db::db::tests::test_collect_sync_db_paths_unreadable_dir_errors",
@@ -1791,6 +1792,13 @@ mod tests {
             !crate::core::is_root(),
             "permission fixture must not run as root"
         );
+        let config_dir = tempfile::TempDir::new().unwrap();
+        let config = config_dir.path().join("pacman.conf");
+        std::fs::write(
+            &config,
+            "[options]\n[core]\nServer = https://core.example/$repo/$arch\n",
+        )
+        .unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let original = std::fs::metadata(temp_dir.path()).unwrap().permissions();
         use std::os::unix::fs::PermissionsExt;
@@ -1802,11 +1810,16 @@ mod tests {
             "[omg-permission-fixture] test=package_managers::pacman_db::db::tests::test_collect_sync_db_paths_unreadable_dir_errors uid={} errno=PermissionDenied",
             nix::unistd::geteuid()
         );
-        let result = collect_sync_db_paths(temp_dir.path());
+        let result = temp_env::with_var("OMG_PACMAN_CONF", Some(config.as_os_str()), || {
+            collect_sync_db_paths(temp_dir.path())
+        });
         std::fs::set_permissions(temp_dir.path(), original).expect("restore fixture permissions");
+        let error = result.expect_err("unreadable sync dir must fail closed");
         assert!(
-            result.is_err(),
-            "unreadable sync dir must fail closed, got {result:?}"
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
         );
     }
 
@@ -2189,9 +2202,12 @@ mod tests {
         );
         let result = SyncDbEpoch::from_sync_dir(temp_dir.path());
         std::fs::set_permissions(temp_dir.path(), original).expect("restore fixture permissions");
+        let error = result.expect_err("unreadable sync dir must fail closed");
         assert!(
-            result.is_err(),
-            "unreadable sync dir must fail closed, got {result:?}"
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production must retain the permission denial: {error:#}"
         );
     }
 
