@@ -4,7 +4,7 @@
 # Key Features:
 # - PR path filtering: Avoid redundant platform builds for documentation
 # - Quick gate: Fast checks run first, gate expensive builds
-# - Matrix strategy: 6 platforms tested in parallel
+# - Matrix strategy: native Linux distro and ABI checks in parallel
 # - cargo-nextest: 10-35% faster test execution
 # - Artifact caching: Shared caches across jobs
 # - Timeout protection: Prevents runaway jobs
@@ -191,7 +191,7 @@ jobs:
 
   #############################################################################
   # STAGE 2: Platform Matrix (Linux containers)
-  # Parallel builds across Arch, Debian, Fedora
+  # Parallel builds across Arch, Debian, Ubuntu 26.04, Fedora
   #############################################################################
   linux-matrix:
     name: "Linux (${{ matrix.platform }})"
@@ -202,7 +202,13 @@ jobs:
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
-      OMG_CONTRACT_PLATFORM: ${{ matrix.platform }}
+      # The contract platform is a separate id from the lane label, because
+      # the contracts model in tests/contracts/ has no entry for every matrix
+      # row. Ubuntu 26.04 builds the same APT 7 surface as Debian trixie and
+      # consumes the same release archive, so it reports the `debian-trixie`
+      # contract platform; `matrix.platform` stays `ubuntu-2604` for the job
+      # name, cache key, artifact names and the lane `if:` conditions.
+      OMG_CONTRACT_PLATFORM: ${{ matrix.contract_platform || matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
@@ -249,6 +255,32 @@ jobs:
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                 ca-certificates curl git build-essential pkg-config sudo python3 \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
+              curl --proto '=https' --tlsv1.2 -fsSL \
+                https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
+                -o /tmp/rustup-init
+              echo "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init" | sha256sum --check
+              chmod +x /tmp/rustup-init
+              /tmp/rustup-init -y --profile minimal --default-toolchain 1.95.0
+              rm -f /tmp/rustup-init
+              echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+              "$HOME/.cargo/bin/rustup" component add clippy
+
+          # The Trixie archive is shipped for Ubuntu 26.04, but its native
+          # APT 7 integration must also pass on Ubuntu itself. This lane does
+          # not produce another release archive.
+          - platform: ubuntu-2604
+            contract_platform: ubuntu
+            image: ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78
+            features: debian,pgp,license
+            setup: |
+              . /etc/os-release
+              test "$ID" = ubuntu && test "$VERSION_ID" = 26.04
+              test "$(uname -m)" = x86_64
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                ca-certificates curl git build-essential pkg-config sudo python3 \
+                libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
+              ldconfig -p | grep -F 'libapt-pkg.so.7'
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
                 -o /tmp/rustup-init
@@ -328,6 +360,7 @@ jobs:
           cache-workspace-crates: false
 
       - name: Build release
+        if: matrix.platform != 'ubuntu-2604'
         shell: bash
         env:
           DISTRO: ${{ matrix.platform }}
@@ -337,7 +370,12 @@ jobs:
           python3 scripts/native-build-artifact.py build --distro "$DISTRO" \
             --image "$BUILD_IMAGE" --features "$BUILD_FEATURES" --destination "$RUNNER_TEMP/native-release"
 
+      - name: Build Ubuntu 26.04 validation binary
+        if: matrix.platform == 'ubuntu-2604'
+        run: cargo build --release --no-default-features --features debian,pgp,license --locked
+
       - name: Upload native release pair
+        if: matrix.platform != 'ubuntu-2604'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-release-${{ matrix.platform }}-${{ github.run_attempt }}
@@ -362,7 +400,7 @@ jobs:
         run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
 
       - name: Run serial library and binary contracts
-        if: matrix.platform != 'debian-trixie'
+        if: matrix.platform != 'debian-trixie' && matrix.platform != 'ubuntu-2604'
         # Preserve the former staged-QEMU libtest owner alongside nextest.
         run: cargo test --lib --bins --no-default-features --features ${{ matrix.features }} --locked --no-fail-fast -- --test-threads=1
 

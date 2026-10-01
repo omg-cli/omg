@@ -20,6 +20,30 @@ SPEC.loader.exec_module(NATIVE)
 
 
 class WholeSuiteAdmission(unittest.TestCase):
+    def test_ubuntu_2604_requires_native_apt_candidate_execution(self):
+        workflow = (Path(__file__).resolve().parents[1]
+                    / '.github/workflows/ci.yml').read_text()
+        lane = workflow.split('- platform: ubuntu-2604\n', 1)[1]
+        platform_id = lane.split('contract_platform:', 1)[1].splitlines()[0].strip()
+        self.assertEqual(platform_id, 'ubuntu')
+        identity = 'omg::debian_tests::debian_specific::test_debian_stable_packages'
+        execution = {'counts': {'selected': 2, 'passed': 1, 'failed': 0, 'retried': 0},
+                     'tests': {identity: {'selection_state': 'selected', 'runtime_skip': True,
+                                          'runtime_skip_reason': 'requires Debian',
+                                          'attempts': [{'result': 'SKIPPED'}]}}}
+        with patch.dict(os.environ, {'OMG_CONTRACT_PLATFORM': platform_id}):
+            with self.assertRaisesRegex(ValueError, 'unexplained native runtime skip'):
+                NATIVE.admission_exit_code(0, execution, True)
+            executed = copy.deepcopy(execution)
+            executed['counts']['passed'] = 2
+            executed['tests'][identity].update(
+                runtime_skip=False, runtime_skip_reason=None,
+                attempts=[{'result': 'PASS'}])
+            self.assertEqual(NATIVE.admission_exit_code(0, executed, True), 0)
+        with patch.dict(os.environ, {'OMG_CONTRACT_PLATFORM': 'debian-trixie'}):
+            with self.assertRaisesRegex(ValueError, 'unexplained native runtime skip'):
+                NATIVE.admission_exit_code(0, execution, True)
+
     def test_unmapped_first_failure_survives_a_successful_retry(self):
         binary = 'omg::unmapped'
         listing = {'test-count': 1, 'rust-suites': {binary: {
@@ -57,25 +81,34 @@ class WholeSuiteAdmission(unittest.TestCase):
                      'tests': {known: {'selection_state': 'selected', 'runtime_skip': True,
                                        'runtime_skip_reason': reason,
                                        'attempts': [{'result': 'SKIPPED'}]}}}
-        with patch.dict(os.environ, {'OMG_CONTRACT_PLATFORM': 'portable'}):
-            if os.name == 'posix' and os.geteuid() != 0:
-                self.assertEqual(NATIVE.admission_exit_code(0, execution, True), 0)
-                self.assertEqual(NATIVE.explained_runtime_skips(execution),
-                                 [{'test_id': known, 'reason': reason}])
-            for mutation in ('unknown-id', 'wrong-reason', 'unexpected-pass'):
-                invalid = copy.deepcopy(execution)
-                if mutation == 'unknown-id':
-                    invalid['tests']['omg::unknown'] = invalid['tests'].pop(known)
-                elif mutation == 'wrong-reason':
-                    invalid['tests'][known]['runtime_skip_reason'] = 'unexpected environment failure'
+        for uid in (0, 1000):
+            with self.subTest(uid=uid), \
+                    patch.dict(os.environ, {'OMG_CONTRACT_PLATFORM': 'portable'}), \
+                    patch.object(NATIVE.os, 'geteuid', return_value=uid, create=True):
+                if uid == 0:
+                    with self.assertRaisesRegex(ValueError, 'root-only test skipped on root runner'):
+                        NATIVE.admission_exit_code(0, execution, True)
                 else:
-                    invalid['counts']['passed'] = 2
-                with self.subTest(mutation=mutation):
-                    if mutation == 'unexpected-pass':
-                        self.assertEqual(NATIVE.admission_exit_code(0, invalid, True), 1)
+                    self.assertEqual(NATIVE.admission_exit_code(0, execution, True), 0)
+                    self.assertEqual(NATIVE.explained_runtime_skips(execution),
+                                     [{'test_id': known, 'reason': reason}])
+                for mutation in ('unknown-id', 'wrong-reason', 'unexpected-pass'):
+                    invalid = copy.deepcopy(execution)
+                    if mutation == 'unknown-id':
+                        invalid['tests']['omg::unknown'] = invalid['tests'].pop(known)
+                    elif mutation == 'wrong-reason':
+                        invalid['tests'][known]['runtime_skip_reason'] = 'unexpected environment failure'
                     else:
-                        with self.assertRaisesRegex(ValueError, 'unexplained native runtime skip'):
-                            NATIVE.admission_exit_code(0, invalid, True)
+                        invalid['counts']['passed'] = 2
+                    with self.subTest(mutation=mutation):
+                        if mutation == 'unexpected-pass' and uid != 0:
+                            self.assertEqual(NATIVE.admission_exit_code(0, invalid, True), 1)
+                        else:
+                            message = ('root-only test skipped on root runner'
+                                       if mutation == 'unexpected-pass'
+                                       else 'unexplained native runtime skip')
+                            with self.assertRaisesRegex(ValueError, message):
+                                NATIVE.admission_exit_code(0, invalid, True)
 
     def test_ignored_known_skip_cannot_offset_unexplained_selected_skip(self):
         known = 'omg::e2e_runtime_management::test_use_node_lts'
