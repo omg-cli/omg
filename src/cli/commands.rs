@@ -763,7 +763,7 @@ pub fn daemon(foreground: bool) -> Result<()> {
 #[cfg(unix)]
 fn resolve_omgd_path() -> Result<std::path::PathBuf> {
     resolve_omgd_path_from(crate::core::paths::sibling_binary("omgd"), || {
-        crate::core::privilege::trusted_program("omgd")
+        crate::core::privilege::root_controlled_program_path("omgd")
             .context("omgd is not installed beside omg or in a root-controlled system path")
     })
 }

@@ -258,7 +258,7 @@ async fn add_native_infra_issues(
 ) {
     *issues += match distro {
         Distro::Debian | Distro::Ubuntu => check_debian_infra(),
-        Distro::Arch => check_arch_infra(),
+        Distro::Arch => check_arch_infra().await,
         Distro::Fedora => fedora_check.await,
         Distro::MacOS | Distro::Unknown => 0,
     };
@@ -649,7 +649,7 @@ fn apt_lists_entry_has_index(file_name: &str) -> bool {
 /// the pacman configuration file (`/etc/pacman.conf`) and the ALPM local
 /// package database directory (`/var/lib/pacman/local`).
 #[cfg(feature = "arch")]
-fn check_arch_infra() -> usize {
+async fn check_arch_infra() -> usize {
     if crate::core::paths::test_mode() {
         return 0;
     }
@@ -687,22 +687,58 @@ fn check_arch_infra() -> usize {
         issues += 1;
     }
 
-    let local_dir = crate::core::paths::pacman_local_dir();
+    let local_dir = match crate::core::paths::pacman_local_dir_result() {
+        Ok(path) => path,
+        Err(error) => {
+            println!(
+                "  {} ALPM local package database path unavailable: {error}",
+                style::error("✗")
+            );
+            return issues + 1 + check_pacman_lock(db_path.as_deref());
+        }
+    };
     if local_dir.is_dir() {
-        match crate::package_managers::pacman_db::check_local_db_consistency(&local_dir) {
-            Ok(packages) => println!(
-                "  {} ALPM local package database ({}, {packages} packages verified)",
-                style::success("✓"),
+        let health =
+            crate::package_managers::pacman_db::check_native_local_db_health(&local_dir).await;
+        issues += alpm_health_issue_count(&health);
+        match health {
+            Ok(observed) => {
+                let packages = observed.packages;
+                if let Err(error) = &observed.native {
+                    println!(
+                        "  {} ALPM native database check failed ({}): {error}",
+                        style::error("✗"),
+                        local_dir.display()
+                    );
+                    for entry in &observed.missing {
+                        println!(
+                            "  {} ALPM dependency unsatisfied: {} requires {}",
+                            style::error("✗"),
+                            entry.package,
+                            entry.dependency
+                        );
+                    }
+                }
+                if observed.native.is_ok() {
+                    println!(
+                        "  {} ALPM local package database ({}, {packages} packages verified), dependencies/conflicts/ownership verified",
+                        style::success("✓"),
+                        local_dir.display()
+                    );
+                } else if !observed.missing.is_empty() {
+                    println!(
+                        "  {} ALPM local package database inconsistent: {} of {packages} dependencies unmet ({})",
+                        style::error("✗"),
+                        observed.missing.len(),
+                        local_dir.display()
+                    );
+                }
+            }
+            Err(error) => println!(
+                "  {} ALPM local package database inconsistent ({}): {error}",
+                style::error("✗"),
                 local_dir.display()
             ),
-            Err(error) => {
-                println!(
-                    "  {} ALPM local package database inconsistent ({}): {error}",
-                    style::error("✗"),
-                    local_dir.display()
-                );
-                issues += 1;
-            }
         }
     } else {
         println!(
@@ -718,10 +754,18 @@ fn check_arch_infra() -> usize {
     issues
 }
 
+#[cfg(feature = "arch")]
+fn alpm_health_issue_count(
+    health: &Result<crate::package_managers::pacman_db::NativeLocalDbHealth>,
+) -> usize {
+    // Parser errors stay fatal. Pacman's -Dk is the graph health authority.
+    usize::from(!matches!(health, Ok(observed) if observed.native.is_ok()))
+}
+
 /// Check network connectivity to backend-appropriate mirrors
 #[cfg(not(feature = "arch"))]
-const fn check_arch_infra() -> usize {
-    0
+fn check_arch_infra() -> std::future::Ready<usize> {
+    std::future::ready(0)
 }
 
 fn network_targets(
@@ -1163,7 +1207,7 @@ fn check_required_system_command(cmd: &str, issues: &mut usize) {
         println!("  {}", style::success(&format!("Found dependency: {cmd}")));
         return;
     }
-    if crate::core::privilege::trusted_program(cmd).is_ok() {
+    if crate::core::privilege::root_controlled_program_path(cmd).is_ok() {
         println!("  {}", style::success(&format!("Found dependency: {cmd}")));
     } else {
         println!("  {}", style::error(&format!("Missing dependency: {cmd}")));
@@ -1371,7 +1415,7 @@ pub fn enable_turbo_mode() -> Result<()> {
         true
     };
     if cleanup_done {
-        let setcap = crate::core::privilege::trusted_program("setcap")?;
+        let setcap = crate::core::privilege::root_controlled_program_path("setcap")?;
         let remove = crate::core::privilege::system_command("sudo")?
             .arg("--")
             .arg(setcap)
@@ -1923,6 +1967,99 @@ mod tests {
         assert_eq!(check_pacman_lock(Some(&dir_str)), 0);
         std::fs::write(dir.path().join("db.lck"), b"").expect("stale lock");
         assert_eq!(check_pacman_lock(Some(&dir_str)), 1);
+    }
+
+    #[cfg(feature = "arch")]
+    fn alpm_doctor_fixture(dependencies: &str) -> tempfile::TempDir {
+        let temp = tempfile::TempDir::new().unwrap();
+        let package = temp.path().join("app");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("desc"),
+            format!("%NAME%\napp\n\n%VERSION%\n1.0-1\n\n%DEPENDS%\n{dependencies}\n"),
+        )
+        .unwrap();
+        std::fs::write(package.join("files"), "").unwrap();
+        temp
+    }
+
+    #[cfg(feature = "arch")]
+    fn alpm_fixture_health(
+        path: &std::path::Path,
+        native: Result<()>,
+    ) -> Result<crate::package_managers::pacman_db::NativeLocalDbHealth> {
+        crate::package_managers::pacman_db::check_local_db_health(path).map(
+            |(packages, missing)| crate::package_managers::pacman_db::NativeLocalDbHealth {
+                packages,
+                missing,
+                native,
+            },
+        )
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_doctor_healthy_snapshot_has_no_issue() {
+        let temp = alpm_doctor_fixture("app>=1");
+        let health = alpm_fixture_health(temp.path(), Ok(()));
+        assert_eq!(alpm_health_issue_count(&health), 0);
+        let observed = health.unwrap();
+        assert_eq!((observed.packages, observed.missing), (1, Vec::new()));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_doctor_wrong_version_is_an_issue_with_raw_relation() {
+        let temp = alpm_doctor_fixture("app>=9");
+        let health = alpm_fixture_health(
+            temp.path(),
+            Err(anyhow::anyhow!("native rejected dependency")),
+        );
+        assert_eq!(alpm_health_issue_count(&health), 1);
+        let observed = health.unwrap();
+        assert_eq!(observed.packages, 1);
+        assert_eq!(
+            observed.missing,
+            vec![crate::package_managers::pacman_db::UnsatisfiedDependency {
+                package: "app".into(),
+                dependency: "app>=9".into()
+            }]
+        );
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_doctor_failed_or_skipped_observation_is_an_issue() {
+        let temp = alpm_doctor_fixture("absent>=9");
+        for path in [temp.path().join("absent"), temp.path().join("app/desc")] {
+            let health = alpm_fixture_health(&path, Ok(()));
+            assert!(health.is_err());
+            assert_eq!(alpm_health_issue_count(&health), 1);
+        }
+        std::fs::write(temp.path().join("app/desc"), "%VERSION%\n1.0-1\n").unwrap();
+        let health = alpm_fixture_health(temp.path(), Ok(()));
+        assert!(health.is_err());
+        assert_eq!(alpm_health_issue_count(&health), 1);
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_native_graph_verdict_and_parser_errors_are_counted_once() {
+        let temp = alpm_doctor_fixture("app>=9");
+        let health = alpm_fixture_health(temp.path(), Ok(()));
+        assert_eq!(alpm_health_issue_count(&health), 0);
+        let rejected = Ok(crate::package_managers::pacman_db::NativeLocalDbHealth {
+            packages: 1,
+            missing: Vec::new(),
+            native: Err(anyhow::anyhow!(
+                "native rejected conflict or file ownership"
+            )),
+        });
+        assert_eq!(alpm_health_issue_count(&rejected), 1);
+        assert_eq!(
+            alpm_health_issue_count(&Err(anyhow::anyhow!("malformed entry"))),
+            1
+        );
     }
 
     // W3-A-02: every supported backend distro must get a healthy OS verdict;

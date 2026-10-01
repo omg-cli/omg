@@ -236,6 +236,94 @@ check_doctor_native_backend() {
       fi ;;
   esac
 }
+
+# Disposable metadata only. Neither pacman -Dk nor Doctor writes the live DB.
+check_arch_doctor_graph() {
+  local binary=$1 base=$2 deadline=$3 kind native_rc doctor_rc baseline_count count before_hash after_hash
+  [[ -x /usr/bin/pacman ]] || return 2
+  command -v sha256sum >/dev/null || return 2
+  mkdir -p "$base/healthy/local/first-1.0-1"
+  timeout --kill-after=2s 15 /usr/bin/pacman -Q > "$base/live-before.tsv" || return 2
+  # Pacman 7.1 requires the local DB version marker. Preserve the native
+  # schema identifier rather than guessing a version or upgrading any DB.
+  if [[ -f /var/lib/pacman/local/ALPM_DB_VERSION ]]; then
+    cp /var/lib/pacman/local/ALPM_DB_VERSION "$base/healthy/local/ALPM_DB_VERSION"
+  fi
+  printf '%%NAME%%\nfirst\n\n%%VERSION%%\n1.0-1\n\n' > "$base/healthy/local/first-1.0-1/desc"
+  printf '%%FILES%%\nusr/\nusr/bin/\nusr/bin/omg-graph-fixture\n\n' > "$base/healthy/local/first-1.0-1/files"
+  timeout --kill-after=2s 15 /usr/bin/pacman --config /dev/null -Dk --dbpath "$base/healthy" > "$base/healthy/native.stdout" 2> "$base/healthy/native.stderr" || return 2
+  doctor_rc=0
+  OMG_PACMAN_DB_DIR="$base/healthy" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0 timeout --kill-after=5s "$deadline" "$binary" doctor > "$base/healthy/doctor.stdout" 2> "$base/healthy/doctor.stderr" || doctor_rc=$?
+  [[ "$doctor_rc" == 0 || "$doctor_rc" == 1 ]] || return 2
+  grep -Fq "ALPM local package database ($base/healthy/local, 1 packages verified" "$base/healthy/doctor.stdout" || return 1
+  baseline_count=$(sed -n 's/.*doctor found \([0-9][0-9]*\) health issue(s).*/\1/p' "$base/healthy/doctor.stderr")
+  if [[ "$doctor_rc" == 0 ]]; then baseline_count=0; fi
+  [[ "$baseline_count" =~ ^[0-9]+$ ]] || return 1
+  for kind in dependency conflict ownership malformed; do
+    cp -a "$base/healthy" "$base/$kind"
+    case "$kind" in
+      dependency) printf '%%DEPENDS%%\nomg-fixture-unavailable>=99\n\n' >> "$base/$kind/local/first-1.0-1/desc" ;;
+      conflict|ownership)
+        mkdir "$base/$kind/local/second-1.0-1"
+        printf '%%NAME%%\nsecond\n\n%%VERSION%%\n1.0-1\n\n' > "$base/$kind/local/second-1.0-1/desc"
+        printf '%%FILES%%\nusr/\nusr/bin/\n\n' > "$base/$kind/local/second-1.0-1/files"
+        if [[ "$kind" == conflict ]]; then
+          printf '%%CONFLICTS%%\nsecond>=1\n\n' >> "$base/$kind/local/first-1.0-1/desc"
+        else
+          cp "$base/$kind/local/first-1.0-1/files" "$base/$kind/local/second-1.0-1/files"
+        fi ;;
+      malformed) rm "$base/$kind/local/first-1.0-1/files" ;;
+    esac
+    native_rc=0
+    timeout --kill-after=2s 15 /usr/bin/pacman --config /dev/null -Dk --dbpath "$base/$kind" > "$base/$kind/native.stdout" 2> "$base/$kind/native.stderr" || native_rc=$?
+    printf "Arch Doctor %s native diagnostic\n" "$kind" >&2
+    cat "$base/$kind/native.stdout" "$base/$kind/native.stderr" >&2
+    [[ "$native_rc" == 1 ]] || return 1
+    doctor_rc=0
+    OMG_PACMAN_DB_DIR="$base/$kind" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0 timeout --kill-after=5s "$deadline" "$binary" doctor > "$base/$kind/doctor.stdout" 2> "$base/$kind/doctor.stderr" || doctor_rc=$?
+    printf "Arch Doctor %s Doctor diagnostic\n" "$kind" >&2
+    cat "$base/$kind/doctor.stdout" "$base/$kind/doctor.stderr" >&2
+    [[ "$doctor_rc" == 1 ]] || return 1
+    count=$(sed -n 's/.*doctor found \([0-9][0-9]*\) health issue(s).*/\1/p' "$base/$kind/doctor.stderr")
+    [[ "$count" =~ ^[0-9]+$ && "$count" -eq "$((baseline_count + 1))" ]] || return 1
+    grep -Fq 'ALPM local package database (' "$base/$kind/doctor.stdout" && return 1
+    if [[ "$kind" == dependency ]]; then
+      grep -Fq 'omg-fixture-unavailable' "$base/$kind/native.stderr" || return 1
+      grep -Fq 'ALPM dependency unsatisfied: first requires omg-fixture-unavailable>=99' "$base/$kind/doctor.stdout" || return 1
+    elif [[ "$kind" == malformed ]]; then
+      grep -Fq 'ALPM local package database inconsistent (' "$base/$kind/doctor.stdout" || return 1
+    else
+      grep -Fq 'ALPM native database check failed (' "$base/$kind/doctor.stdout" || return 1
+    fi
+    printf 'Arch Doctor %s native_exit=%s doctor_exit=%s counted_issues=%s baseline=%s\n' "$kind" "$native_rc" "$doctor_rc" "$count" "$baseline_count"
+  done
+  # A config-only DBPath must select the same database as the live backend.
+  for kind in healthy dependency; do
+    printf '[options]\nDBPath = %s/%s\n' "$base" "$kind" > "$base/custom.conf"
+    doctor_rc=0
+    env -u OMG_PACMAN_DB_DIR -u OMG_PACMAN_LOCAL_DIR -u OMG_PACMAN_ROOT OMG_PACMAN_CONF="$base/custom.conf" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0 timeout --kill-after=5s "$deadline" "$binary" doctor > "$base/$kind/custom-doctor.stdout" 2> "$base/$kind/custom-doctor.stderr" || doctor_rc=$?
+    cat "$base/$kind/custom-doctor.stdout" "$base/$kind/custom-doctor.stderr" >&2
+    if [[ "$kind" == healthy ]]; then
+      grep -Fq "ALPM local package database ($base/healthy/local, 1 packages verified)" "$base/healthy/custom-doctor.stdout" || return 1
+      [[ "$doctor_rc" == 0 || "$doctor_rc" == 1 ]] || return 2
+      count=$(sed -n 's/.*doctor found \([0-9][0-9]*\) health issue(s).*/\1/p' "$base/healthy/custom-doctor.stderr")
+      if [[ "$doctor_rc" == 0 ]]; then count=0; fi
+      [[ "$count" == "$baseline_count" ]] || return 1
+    else
+      [[ "$doctor_rc" == 1 ]] || return 1
+      grep -Fq "ALPM native database check failed ($base/dependency/local)" "$base/dependency/custom-doctor.stdout" || return 1
+      grep -Fq 'ALPM dependency unsatisfied: first requires omg-fixture-unavailable>=99' "$base/dependency/custom-doctor.stdout" || return 1
+      count=$(sed -n 's/.*doctor found \([0-9][0-9]*\) health issue(s).*/\1/p' "$base/dependency/custom-doctor.stderr")
+      [[ "$count" =~ ^[0-9]+$ && "$count" -eq "$((baseline_count + 1))" ]] || return 1
+    fi
+    printf 'Arch Doctor configured DBPath %s doctor_exit=%s counted_issues=%s baseline=%s\n' "$kind" "$doctor_rc" "$count" "$baseline_count"
+  done
+  timeout --kill-after=2s 15 /usr/bin/pacman -Q > "$base/live-after.tsv" || return 2
+  before_hash=$(sha256sum "$base/live-before.tsv") || return 2
+  after_hash=$(sha256sum "$base/live-after.tsv") || return 2
+  [[ "${before_hash%% *}" == "${after_hash%% *}" ]] || return 1
+  printf 'Arch Doctor live inventory unchanged sha256=%s\n' "${after_hash%% *}"
+}
 # END DOCTOR BACKEND ORACLE
 
 # BEGIN INFO NATIVE PACKAGE ORACLE
@@ -1968,7 +2056,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ -n "$counter" ]]; then
     remote+="; $(declare -f check_native_counter)"
   elif [[ "$assertions" == doctor-native-backend ]]; then
-    remote+="; $(declare -f check_doctor_native_backend); $(declare -f check_doctor_issue_delta)"
+    remote+="; $(declare -f check_doctor_native_backend); $(declare -f check_doctor_issue_delta); $(declare -f check_arch_doctor_graph)"
   elif [[ "$assertions" == info-native-package ]]; then
     remote+="; $(declare -f check_info_native_package)"
   elif [[ "$assertions" == status-native-fast || "$assertions" == status-native-full ]]; then
@@ -2081,6 +2169,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     fi
     if [[ "$distro" == arch ]]; then
+      remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_arch_doctor_graph $quoted_binary \"\$rowdir/graph-db\" '$row_timeout' || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
       remote+="; mkdir -p fault-db/local/broken-1.0-1; printf '%%NAME%%\\nbroken\\n\\n%%VERSION%%\\n1.0-1\\n' > fault-db/local/broken-1.0-1/desc"
       remote+="; fault_rc=0; OMG_PACMAN_DB_DIR=\"\$rowdir/fault-db\" OMG_DISABLE_DAEMON=1 timeout --kill-after=5s '$row_timeout' $quoted_binary doctor > doctor-fault.stdout.log 2> doctor-fault.stderr.log || fault_rc=\$?"
       remote+="; if [ \"\$fault_rc\" != 1 ] || ! grep -Fq 'ALPM local package database inconsistent (' doctor-fault.stdout.log; then printf 'assertion failed: doctor accepted a corrupt Arch local package entry\\n' >&2; assertion=1; fi"
@@ -2175,10 +2264,14 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
   if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ "$assertions" == doctor-native-backend ]]; then
-    # Four PATH variants plus the minimal-PATH run; Arch also exercises a
-    # corrupt local database. Each run owns a separate row_timeout deadline.
+    # Four PATH variants plus the minimal-PATH run. Arch adds the existing
+    # corrupt-entry probe, five graph states and two configured DBPath states, each with its own
+    # row_timeout. Seven native read-only queries each have a 15s + 2s ceiling.
     doctor_extra_runs=5
-    if [[ "$distro" == arch ]]; then doctor_extra_runs=6; fi
+    if [[ "$distro" == arch ]]; then
+      doctor_extra_runs=13
+      budget=$((budget + 7 * 17))
+    fi
     budget=$((budget + doctor_extra_runs * (row_timeout + 5)))
   fi
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
