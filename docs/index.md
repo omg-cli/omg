@@ -75,7 +75,7 @@ Performance depends on the operation, backend, query, and cache state. Read [ben
 Historical changelogs, dated investigations, and audit reports describe their recorded state, not current feature guarantees. Dated research is kept for provenance and is linked here so it is not mistaken for current guidance:
 
 - [Extreme Technical Review, 2026-08-31](./TECH-DEBT-REVIEW-2026-08-31.md)
-- [Security and quality audit plan, 2026-09-03](../TODO.md)
+- [Repository root](../), including the historical security and quality audit plan from 2026-09-03.
 - [Wave-12 fleet audit plan](../WAVE12-BLOCKERS.md)
 - [Rust CI/CD best practices, 2025-2026](./ci-cd-best-practices-2025.md)
 - [CI/CD deep research, 2026-09-19](./ci-cd-deep-research-2026-09-19.md) with its raw job and source data ([jobs.csv](./ci-cd-research-2026-09-19-jobs.csv), [sources.json](./ci-cd-research-2026-09-19-sources.json))
