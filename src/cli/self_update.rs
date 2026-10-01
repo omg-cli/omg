@@ -1145,8 +1145,30 @@ mod tests {
 
     #[cfg(unix)]
     fn write_version_probe(path: &std::path::Path, body: &str) {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::process::Stdio;
+
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/cat > \"$1\"", "write-version-probe"])
+            .arg(path)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = writer.stdin.take().unwrap();
+        input
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .unwrap();
+        drop(input);
+        let output = writer.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "probe fixture writer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 

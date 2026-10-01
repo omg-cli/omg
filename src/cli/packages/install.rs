@@ -50,12 +50,8 @@ pub(crate) async fn enforce_install_policy(
 
 #[cfg(feature = "arch")]
 mod arch;
-#[cfg(any(feature = "debian", feature = "debian-pure"))]
+#[cfg(feature = "debian")]
 mod debian;
-#[cfg(all(
-    not(feature = "arch"),
-    not(any(feature = "debian", feature = "debian-pure"))
-))]
 mod generic;
 
 /// Install packages from repositories or AUR
@@ -151,6 +147,11 @@ async fn install_with_replacement_budget(
         return Ok(());
     }
 
+    #[cfg(feature = "arch")]
+    if super::mock_arch_backend()? {
+        return arch::install(packages, yes, replacement_hops).await;
+    }
+
     dispatch_backend! {
         debian: { let _ = (yes, replacement_hops); debian::install(packages).await },
         arch: { arch::install(packages, yes, replacement_hops).await },
@@ -159,42 +160,32 @@ async fn install_with_replacement_budget(
 }
 
 fn validate_install_targets(packages: &[String]) -> Result<()> {
-    dispatch_backend! {
-        debian: {
+    match crate::core::env::distro::detect_distro() {
+        crate::core::env::distro::Distro::Debian | crate::core::env::distro::Distro::Ubuntu => {
             crate::core::security::validate_debian_package_names_or_files(packages)?;
-            Ok(())
-        },
-        arch: {
+        }
+        crate::core::env::distro::Distro::Arch => {
             crate::core::security::validate_package_names_or_files(packages)?;
-            Ok(())
-        },
-        generic: {
+        }
+        _ => {
             crate::core::security::validate_package_names(packages)?;
-            Ok(())
-        },
+        }
     }
+    crate::package_managers::resolve_backend()?;
+    Ok(())
 }
 
-#[cfg(feature = "arch")]
 async fn install_dry_run(packages: &[String]) -> Result<()> {
+    #[cfg(feature = "arch")]
+    if super::mock_arch_backend()? {
+        return arch::install_dry_run(packages).await;
+    }
+
     dispatch_backend! {
         debian: { debian::install_dry_run(packages) },
         arch: { arch::install_dry_run(packages).await },
-        generic: { generic::install_dry_run(packages) },
+        generic: { generic::install_dry_run(packages).await },
     }
-}
-
-#[cfg(all(
-    not(feature = "arch"),
-    any(feature = "debian", feature = "debian-pure")
-))]
-fn install_dry_run(packages: &[String]) -> impl std::future::Future<Output = Result<()>> + use<'_> {
-    std::future::ready(debian::install_dry_run(packages))
-}
-
-#[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
-fn install_dry_run(packages: &[String]) -> impl std::future::Future<Output = Result<()>> + use<'_> {
-    std::future::ready(generic::install_dry_run(packages))
 }
 
 #[cfg(test)]

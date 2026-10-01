@@ -176,6 +176,15 @@ fn try_fast_elevated(
     // separator, and every token after it must be a package name; anything else
     // falls through to clap via split_elevated_invocation.
     let (command, package_tokens) = split_elevated_invocation(args, parent_records)?;
+    let selected = match omg_lib::package_managers::resolve_backend() {
+        Ok(backend) => backend,
+        Err(error) => return Some(Err(error)),
+    };
+    if selected != omg_lib::package_managers::Backend::Arch {
+        return Some(Err(anyhow::anyhow!(
+            "Privileged ALPM transactions require an Arch host"
+        )));
+    }
     let packages: Vec<String> = package_tokens.to_vec();
 
     // Handle commands that may have packages
@@ -380,6 +389,7 @@ async fn run_counter(counter: FastCounter, json: bool) -> Result<()> {
 }
 
 fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
+    let selected_backend = omg_lib::package_managers::resolve_backend()?;
     if counter == FastCounter::Explicit {
         packages::explicit_sync_with_json(true, json)?;
         return Ok(true);
@@ -417,7 +427,9 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
     }
 
     #[cfg(feature = "arch")]
-    if let Ok((total, explicit, orphans)) = omg_lib::package_managers::pacman_db::get_counts_fast()
+    if selected_backend == omg_lib::package_managers::Backend::Arch
+        && let Ok((total, explicit, orphans)) =
+            omg_lib::package_managers::pacman_db::get_counts_fast()
     {
         let updates = if counter == FastCounter::Updates {
             omg_lib::package_managers::pacman_db::check_updates_cached()?
@@ -437,6 +449,9 @@ fn try_print_counter(counter: FastCounter, json: bool) -> Result<bool> {
         return Ok(true);
     }
 
+    #[cfg(not(feature = "arch"))]
+    let _ = selected_backend;
+
     // A cache/daemon miss must reach the selected backend through the normal
     // async dispatcher, including Debian and Fedora. Do not invent zero counts.
     Ok(false)
@@ -449,6 +464,9 @@ fn try_fast_explicit_count(args: &[String]) -> bool {
     }
 
     if args.len() == 3 && args[1] == "explicit" && matches!(args[2].as_str(), "--count" | "-c") {
+        if omg_lib::package_managers::resolve_backend().is_err() {
+            return false;
+        }
         if omg_lib::core::paths::test_mode() {
             return packages::explicit_sync(true).is_ok();
         }
@@ -906,6 +924,21 @@ async fn async_main(args: Vec<String>) -> Result<()> {
     );
     set_yes_flag(yes_flag);
 
+    if let Commands::Install {
+        packages,
+        allow_local_file,
+        ..
+    } = &cli.command
+    {
+        omg_lib::core::security::ensure_local_archive_consent(packages, *allow_local_file)?;
+    }
+
+    // Reject a binary built for another distro before package commands can
+    // connect to a daemon, request elevation, or touch a package database.
+    if command_uses_package_backend(&cli.command) {
+        omg_lib::package_managers::resolve_backend()?;
+    }
+
     // SECURITY: Validate package names
     validate_package_security(&cli.command)?;
 
@@ -974,6 +1007,31 @@ fn command_requires_root(command: &Commands) -> bool {
         }
         _ => false,
     }
+}
+
+const fn command_uses_package_backend(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Search { .. }
+            | Commands::Install { .. }
+            | Commands::Remove { .. }
+            | Commands::Update { .. }
+            | Commands::Info { .. }
+            | Commands::Why { .. }
+            | Commands::Blame { .. }
+            | Commands::Outdated
+            | Commands::Size { .. }
+            | Commands::Clean { .. }
+            | Commands::Explicit { .. }
+            | Commands::ExplicitCount
+            | Commands::TotalCount
+            | Commands::OrphanCount
+            | Commands::UpdateCount
+            | Commands::Sync
+            | Commands::Status { .. }
+            | Commands::Rollback { .. }
+            | Commands::Dash
+    )
 }
 
 fn validate_package_security(command: &Commands) -> Result<()> {

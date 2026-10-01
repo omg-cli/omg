@@ -224,6 +224,80 @@ pub fn clear_git_environment(command: &mut Command) {
     }
 }
 
+pub fn fixture_program_hash(path: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut file = fs::File::open(path).expect("admitted fixture program");
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .expect("admitted fixture program bytes");
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn fixture_cli_path() -> PathBuf {
+    let original = PathBuf::from(env!("CARGO_BIN_EXE_omg"));
+    let Some(receipt) = env::var_os("OMG_CONTRACT_CLI_ROOT_FIXTURE") else {
+        return original;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let receipt = PathBuf::from(receipt);
+        assert!(receipt.is_absolute());
+        let directory = receipt.parent().expect("protected CLI receipt directory");
+        assert_eq!(
+            directory
+                .canonicalize()
+                .expect("canonical receipt directory"),
+            directory
+        );
+        let parent = fs::symlink_metadata(directory).expect("CLI receipt directory metadata");
+        assert!(parent.is_dir() && parent.uid() == 0 && parent.mode() & 0o022 == 0);
+        let metadata = fs::symlink_metadata(&receipt).expect("CLI receipt metadata");
+        assert!(
+            metadata.is_file()
+                && metadata.uid() == 0
+                && metadata.mode() & 0o022 == 0
+                && metadata.len() <= 4096
+        );
+        #[derive(serde::Deserialize)]
+        struct Receipt {
+            original: PathBuf,
+            copy: PathBuf,
+            sha256: String,
+        }
+        let receipt: Receipt =
+            serde_json::from_slice(&fs::read(&receipt).expect("CLI receipt bytes"))
+                .expect("typed CLI receipt");
+        assert_eq!(
+            receipt.original, original,
+            "receipt must bind the compiled CLI source"
+        );
+        assert_eq!(
+            receipt.copy.parent(),
+            Some(directory),
+            "CLI copy must stay in the protected receipt directory"
+        );
+        let metadata = fs::symlink_metadata(&receipt.copy).expect("CLI copy metadata");
+        assert!(metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0);
+        assert_eq!(
+            fixture_program_hash(&receipt.copy),
+            receipt.sha256,
+            "CLI copy must match the admitted original bytes"
+        );
+        receipt.copy
+    }
+    #[cfg(not(unix))]
+    panic!("root CLI fixture receipts require Unix ownership checks: {receipt:?}");
+}
+
 /// Build a direct Git command for a disposable repository.
 pub fn fixture_git_command(dir: &Path) -> Command {
     let mut command = Command::new("git");
@@ -311,14 +385,26 @@ fn run_omg_with_home(
     let start = Instant::now();
     let command_timeout = command_timeout(env_vars);
 
+    let cli = fixture_cli_path();
     if let Some(expected) = std::env::var_os("OMG_CONTRACT_EXPECTED_CLI") {
-        assert_eq!(
-            std::fs::canonicalize(env!("CARGO_BIN_EXE_omg")).expect("CLI executable exists"),
-            std::fs::canonicalize(expected).expect("Receipt subject exists"),
-            "CLI fixture executable differs from the admitted receipt subject"
-        );
+        let original = Path::new(env!("CARGO_BIN_EXE_omg"));
+        if cli == original {
+            assert_eq!(
+                original.canonicalize().expect("CLI executable exists"),
+                Path::new(&expected)
+                    .canonicalize()
+                    .expect("Receipt subject exists"),
+                "CLI fixture executable differs from the admitted receipt subject"
+            );
+        } else {
+            assert_eq!(
+                Path::new(&expected),
+                original,
+                "protected CLI receipt must bind the admitted original path"
+            );
+        }
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_omg"));
+    let mut cmd = Command::new(cli);
     clear_git_environment(&mut cmd);
     cmd.args(args)
         .env("OMG_TEST_MODE", "1")

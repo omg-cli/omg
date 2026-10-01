@@ -1065,6 +1065,13 @@ fn enforce_license_policy(violations: &[LicenseViolation]) -> Result<()> {
 fn installed_packages_with_licenses() -> Result<Vec<(String, String, String)>> {
     #[cfg(feature = "arch")]
     {
+        anyhow::ensure!(
+            matches!(
+                crate::package_managers::resolve_backend()?,
+                crate::package_managers::Backend::Arch | crate::package_managers::Backend::Mock
+            ),
+            "Native license scanning through ALPM requires an Arch host"
+        );
         crate::package_managers::alpm_direct::list_installed_with_licenses()
     }
     #[cfg(not(feature = "arch"))]
@@ -1088,6 +1095,13 @@ fn fix_requires_arch() -> Result<()> {
 fn package_has_available_update(package: &str) -> Result<bool> {
     #[cfg(feature = "arch")]
     {
+        anyhow::ensure!(
+            matches!(
+                crate::package_managers::resolve_backend()?,
+                crate::package_managers::Backend::Arch | crate::package_managers::Backend::Mock
+            ),
+            "Native update checks through ALPM require an Arch host"
+        );
         crate::package_managers::alpm_direct::has_update(package)
             .with_context(|| format!("Failed to check whether {package} has an available update"))
     }
@@ -1108,6 +1122,14 @@ pub async fn fix_vulnerabilities(
 ) -> Result<()> {
     #[cfg(not(feature = "arch"))]
     fix_requires_arch()?;
+    #[cfg(feature = "arch")]
+    anyhow::ensure!(
+        matches!(
+            crate::package_managers::resolve_backend()?,
+            crate::package_managers::Backend::Arch | crate::package_managers::Backend::Mock
+        ),
+        "Vulnerability auto-fix through ALPM requires an Arch host"
+    );
 
     println!(
         "{} Scanning for fixable vulnerabilities...\n",

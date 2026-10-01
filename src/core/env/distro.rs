@@ -152,12 +152,47 @@ fn parse_os_release(contents: &str) -> HashMap<String, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
-            let cleaned = value.trim().trim_matches('"');
-            map.insert(key.to_string(), cleaned.to_string());
+        if let Some((key, value)) = line.split_once('=')
+            && let Some(value) = parse_os_release_value(value.trim())
+        {
+            map.insert(key.to_string(), value);
         }
     }
     map
+}
+
+/// Decode an assignment value, never execute shell syntax or expand variables.
+fn parse_os_release_value(value: &str) -> Option<String> {
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    if let Some(inner) = value.strip_prefix('\'') {
+        let inner = inner.strip_suffix('\'')?;
+        return (!inner.contains('\'')).then(|| inner.to_string());
+    }
+    let (inner, quoted) = if let Some(inner) = value.strip_prefix('"') {
+        (inner.strip_suffix('"')?, true)
+    } else {
+        (value, false)
+    };
+    let mut decoded = String::new();
+    let mut chars = inner.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => {
+                let escaped = chars.next()?;
+                if quoted && !matches!(escaped, '$' | '`' | '"' | '\\') {
+                    decoded.push('\\');
+                }
+                decoded.push(escaped);
+            }
+            '"' => return None,
+            '\'' | ';' | '$' | '`' if !quoted => return None,
+            character if !quoted && character.is_whitespace() => return None,
+            character => decoded.push(character),
+        }
+    }
+    Some(decoded)
 }
 
 #[cfg(test)]
@@ -203,6 +238,81 @@ mod tests {
         // backend, so Debian classification is acceptable there.
         assert_eq!(classify("linuxmint", "debian"), Distro::Debian);
         assert_eq!(classify("kali", "debian"), Distro::Debian);
+    }
+
+    #[test]
+    fn quoted_identifiers_and_id_like_classify_without_quote_artifacts() {
+        for input in ["ID=fedora", "ID='fedora'", "ID=\"fedora\""] {
+            let fields = parse_os_release(input);
+            assert_eq!(fields["ID"], "fedora");
+            assert_eq!(classify(&fields["ID"], ""), Distro::Fedora);
+        }
+        for value in ["'ubuntu debian'", "\"ubuntu debian\"", "ubuntu\\ debian"] {
+            let fields = parse_os_release(&format!("ID=pop\nID_LIKE={value}"));
+            assert_eq!(fields["ID_LIKE"], "ubuntu debian");
+            assert_eq!(classify(&fields["ID"], &fields["ID_LIKE"]), Distro::Ubuntu);
+        }
+    }
+
+    #[test]
+    fn comments_blank_lines_and_later_valid_keys_are_preserved() {
+        let fields =
+            parse_os_release(" # comment\n\nID=arch\nID='fedora'\nNAME=\"Fédora Linux\"\nEMPTY=\n");
+        assert_eq!(fields["ID"], "fedora");
+        assert_eq!(fields["NAME"], "Fédora Linux");
+        assert_eq!(fields["EMPTY"], "");
+        assert_eq!(fields.len(), 3);
+    }
+
+    #[test]
+    fn escapes_follow_quote_context_without_variable_expansion() {
+        assert_eq!(
+            parse_os_release_value(r#""a\"b\\c\$HOME\`command\`\q""#).as_deref(),
+            Some("a\"b\\c$HOME`command`\\q")
+        );
+        assert_eq!(
+            parse_os_release_value(r"'\$HOME `command`'").as_deref(),
+            Some(r"\$HOME `command`")
+        );
+        assert_eq!(
+            parse_os_release_value(r"ubuntu\ debian").as_deref(),
+            Some("ubuntu debian")
+        );
+        assert_eq!(parse_os_release_value("\"$ID\"").as_deref(), Some("$ID"));
+        assert_eq!(classify("$ID", ""), Distro::Unknown);
+    }
+
+    #[test]
+    fn malformed_quotes_concatenation_and_dangling_escapes_are_rejected() {
+        for value in [
+            "'fedora",
+            "fedora'",
+            "\"fedora",
+            "fedora\"",
+            "'fedora''arch'",
+            "\"fedora\"\"arch\"",
+            "fedora\\",
+            "\"fedora\\\"",
+            "ubuntu debian",
+            "$(command)",
+            "`command`",
+            "fedora;arch",
+        ] {
+            assert_eq!(parse_os_release_value(value), None, "{value:?}");
+            assert!(parse_os_release(&format!("ID={value}")).is_empty());
+        }
+    }
+
+    #[test]
+    fn literal_quoted_special_characters_and_empty_values_are_retained() {
+        for (input, expected) in [
+            ("''", ""),
+            ("\"\"", ""),
+            ("'a;b=$HOME'", "a;b=$HOME"),
+            ("\"it's Linux\"", "it's Linux"),
+        ] {
+            assert_eq!(parse_os_release_value(input).as_deref(), Some(expected));
+        }
     }
 
     #[test]

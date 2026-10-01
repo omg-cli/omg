@@ -66,6 +66,7 @@ def canonical_case_ids(policy):
             identifiers.update(f"qemu-{distro}-{case_id}" for distro in DISTROS)
     identifiers.update(f"qemu-{distro}-lifecycle" for distro in DISTROS)
     identifiers.update(f"qemu-{distro}-aarch64-lifecycle" for distro in DISTROS)
+    identifiers.update(f"qemu-{distro}-backend-mismatch" for distro in DISTROS)
     identifiers.add("qemu-matrix-workflow")
     identifiers.update(("qemu-matrix-x86-workflow", "qemu-matrix-arm-workflow",
                         "qemu-matrix-all-workflow", "qemu-arm-runner-kvm-health"))
@@ -119,14 +120,24 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
             # Transaction trials use their own `results.json` schema (`id`,
             # `operation`, ...). They are checked by the guest verifier; this
             # reporter only consumes lifecycle and inventory case rows.
-            if path.name != "results.json" or path.parent.name == "transactions":
+            if path.name not in ("results.json", "backend-mismatch-results.json") or path.parent.name == "transactions":
                 continue
+            if path.name == "backend-mismatch-results.json" and (
+                    len(path.parts) != 2 or not re.fullmatch(
+                        r"run-[a-zA-Z0-9-]+", path.parent.name)):
+                raise ValueError("backend mismatch result is outside its run root")
             if member.file_size > 1024 * 1024:
                 raise ValueError("result exceeds limit")
             payload = json.loads(archive.read(member), object_pairs_hook=unique_object)
             if not isinstance(payload, list) or len(payload) > 1000:
                 raise ValueError("invalid result collection")
             for row in payload:
+                if not isinstance(row, dict):
+                    raise ValueError("invalid result row")
+                if path.name == "backend-mismatch-results.json" and (
+                        row.get("case_id") != f"qemu-{row.get('distro')}-backend-mismatch"
+                        or row.get("artifact_source") != "backend-mismatch"):
+                    raise ValueError("backend mismatch result has the wrong identity")
                 if (not isinstance(row, dict)
                         or not isinstance(row.get("case_id"), str)
                         or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", row["case_id"])
@@ -186,6 +197,9 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                 if parent.name == "inventory":
                     candidates = [parent / "rows" / f"{case}{suffix}.log"
                                   for suffix in (".stderr", ".stdout")]
+                elif case == "backend-mismatch":
+                    candidates = [parent / "backend-mismatch.json",
+                                  parent / "backend-mismatch.log"]
                 elif case in ("lifecycle", "aarch64-lifecycle"):
                     candidates = [parent / name for name in (
                         "kvm-probe.log", "health-validation.log", "transactions.log",

@@ -60,7 +60,7 @@ enum SystemBackendAccess {
     Isolated,
     Production {
         #[cfg(feature = "arch")]
-        alpm_worker: std::sync::Arc<AlpmWorker>,
+        alpm_worker: Option<std::sync::Arc<AlpmWorker>>,
     },
 }
 
@@ -72,12 +72,28 @@ impl SystemBackendAccess {
     fn production() -> anyhow::Result<Self> {
         Ok(Self::Production {
             #[cfg(feature = "arch")]
-            alpm_worker: std::sync::Arc::new(AlpmWorker::new()?),
+            alpm_worker: if crate::package_managers::resolve_backend()?
+                == crate::package_managers::Backend::Arch
+            {
+                Some(std::sync::Arc::new(AlpmWorker::new()?))
+            } else {
+                None
+            },
         })
     }
 
     fn is_production(&self) -> bool {
         matches!(self, Self::Production { .. })
+    }
+
+    #[cfg(feature = "arch")]
+    fn has_alpm_worker(&self) -> bool {
+        matches!(
+            self,
+            Self::Production {
+                alpm_worker: Some(_)
+            }
+        )
     }
 }
 
@@ -196,15 +212,27 @@ impl DaemonState {
     /// `refresh_lock`.
     async fn rebuild_production_index(&self) -> anyhow::Result<usize> {
         #[cfg(feature = "arch")]
-        let epoch = crate::package_managers::pacman_db::AlpmCatalogEpoch::observe()
-            .context("Failed to observe ALPM catalog before index rebuild")?;
+        let arch_backend = self
+            .system_backends
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_alpm_worker();
+        #[cfg(feature = "arch")]
+        let epoch = if arch_backend {
+            crate::package_managers::pacman_db::AlpmCatalogEpoch::observe()
+                .context("Failed to observe ALPM catalog before index rebuild")?
+        } else {
+            crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH
+        };
         let index = PackageIndex::for_package_manager(Arc::clone(&self.package_manager)).await?;
         self.refresh_system_backends()?;
         #[cfg(feature = "arch")]
-        epoch.ensure_unchanged(
-            crate::package_managers::pacman_db::AlpmCatalogEpoch::observe()
-                .context("Failed to observe ALPM catalog after index and backend rebuild")?,
-        )?;
+        if arch_backend {
+            epoch.ensure_unchanged(
+                crate::package_managers::pacman_db::AlpmCatalogEpoch::observe()
+                    .context("Failed to observe ALPM catalog after index and backend rebuild")?,
+            )?;
+        }
         let packages = self.replace_index(
             index,
             #[cfg(feature = "arch")]
@@ -234,6 +262,14 @@ impl DaemonState {
 
     #[cfg(feature = "arch")]
     fn catalog_needs_heal(&self) -> bool {
+        if !self
+            .system_backends
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_alpm_worker()
+        {
+            return false;
+        }
         match crate::package_managers::pacman_db::AlpmCatalogEpoch::observe() {
             Err(_) => true,
             Ok(disk) => {
@@ -256,6 +292,7 @@ impl DaemonState {
     }
 
     pub fn new() -> anyhow::Result<Self> {
+        let selected_backend = crate::package_managers::resolve_backend()?;
         let data_dir = crate::core::paths::daemon_data_dir();
         let persistent = Self::open_persistent_cache(&data_dir)?;
         let package_manager = get_package_manager()?;
@@ -266,10 +303,19 @@ impl DaemonState {
         };
         #[cfg(feature = "arch")]
         let ((index, system_backends), index_epoch) =
-            crate::package_managers::pacman_db::AlpmCatalogEpoch::load_stable(
-                crate::package_managers::pacman_db::AlpmCatalogEpoch::observe,
-                load_catalog,
-            )?;
+            if selected_backend == crate::package_managers::Backend::Arch {
+                crate::package_managers::pacman_db::AlpmCatalogEpoch::load_stable(
+                    crate::package_managers::pacman_db::AlpmCatalogEpoch::observe,
+                    load_catalog,
+                )?
+            } else {
+                (
+                    load_catalog()?,
+                    crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+                )
+            };
+        #[cfg(not(feature = "arch"))]
+        let _ = selected_backend;
         #[cfg(not(feature = "arch"))]
         let (index, system_backends) = load_catalog()?;
 
@@ -361,7 +407,10 @@ impl DaemonState {
 
         // Pre-warm Debian package cache if on Debian/Ubuntu
         #[cfg(any(feature = "debian", feature = "debian-pure"))]
-        if system_backends.is_production() {
+        if system_backends.is_production()
+            && !crate::core::paths::test_mode()
+            && package_manager.name() == "apt"
+        {
             tracing::info!("Pre-warming Debian package cache...");
             let start = std::time::Instant::now();
 
@@ -896,8 +945,7 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
         .system_backends
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_production()
-        && state.package_manager.name() == "pacman"
+        .has_alpm_worker()
     {
         match tokio::time::timeout(DAEMON_INFO_AUR_TIMEOUT, search_detailed(&package)).await {
             Ok(Ok(details)) => {
@@ -1207,7 +1255,7 @@ async fn handle_list_updates(state: Arc<DaemonState>, id: RequestId) -> Response
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match &*backends {
                 SystemBackendAccess::Production { alpm_worker } => {
-                    Some(std::sync::Arc::clone(alpm_worker))
+                    alpm_worker.as_ref().map(std::sync::Arc::clone)
                 }
                 SystemBackendAccess::Isolated => None,
             }
@@ -1233,8 +1281,7 @@ async fn handle_list_updates(state: Arc<DaemonState>, id: RequestId) -> Response
                 .system_backends
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_production()
-                && state.package_manager.name() == "pacman"
+                .has_alpm_worker()
             {
                 match crate::core::pacman_conf::PacmanConfig::parse(
                     crate::core::paths::pacman_conf_path(),

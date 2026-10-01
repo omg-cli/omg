@@ -105,6 +105,8 @@ class AllowlistTests(unittest.TestCase):
 
     def test_known_diagnostics_preserve_report_hierarchy(self):
         for path in ("provenance.json", "run-fixture/results.json", "run-fixture/guest-check.log",
+                     "run-fixture/backend-mismatch-results.json", "run-fixture/backend-mismatch.json",
+                     "run-fixture/backend-mismatch.log",
                      "run-fixture/reporting-status.json",
                      "run-fixture/controller-security.log",
                      "run-fixture/controller-pull.log",

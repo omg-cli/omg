@@ -54,8 +54,58 @@ pub mod types;
 pub(crate) use types::VersionDisplay;
 pub use types::{parse_version, parse_version_or_zero, zero_version};
 
+/// Synchronous CLI readers still need Tokio when a selected backend performs
+/// async subprocess or blocking-worker work. Run it on a separate thread so
+/// callers inside an existing runtime cannot nest a second runtime.
+fn block_on_live<T: Send>(
+    future: impl std::future::Future<Output = anyhow::Result<T>> + Send,
+) -> anyhow::Result<T> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(future)
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("Package backend worker panicked"))?
+    })
+}
+
 #[cfg(feature = "arch")]
 pub fn search_sync(query: &str) -> anyhow::Result<Vec<SyncPackage>> {
+    let backend = resolve_backend()?;
+    if backend == Backend::Mock {
+        let pm = get_package_manager()?;
+        let results = futures::executor::block_on(pm.search(query))?;
+        return Ok(results
+            .into_iter()
+            .map(|p| SyncPackage {
+                name: p.name,
+                version: p.version,
+                description: p.description,
+                repo: "official".to_string(),
+                download_size: 0,
+                installed: p.installed,
+            })
+            .collect());
+    }
+    if matches!(backend, Backend::Fedora | Backend::MacOS) {
+        let manager = get_package_manager()?;
+        let results = block_on_live(manager.search(query))?;
+        return Ok(results
+            .into_iter()
+            .map(|pkg| SyncPackage {
+                name: pkg.name,
+                version: pkg.version,
+                description: pkg.description,
+                repo: "official".to_string(),
+                download_size: 0,
+                installed: pkg.installed,
+            })
+            .collect());
+    }
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {
         #[cfg(feature = "debian")]
@@ -75,28 +125,19 @@ pub fn search_sync(query: &str) -> anyhow::Result<Vec<SyncPackage>> {
             .collect());
     }
 
-    if crate::core::paths::test_mode() {
-        let pm = get_package_manager()?;
-        let results = futures::executor::block_on(pm.search(query))?;
-        return Ok(results
-            .into_iter()
-            .map(|p| SyncPackage {
-                name: p.name,
-                version: p.version,
-                description: p.description,
-                repo: "official".to_string(),
-                download_size: 0,
-                installed: p.installed,
-            })
-            .collect());
-    }
     alpm_direct::search_sync(query)
 }
 
 pub fn list_explicit_fast() -> anyhow::Result<Vec<String>> {
+    let backend = resolve_backend()?;
     if crate::core::paths::test_mode() {
         let pm = get_package_manager()?;
         return futures::executor::block_on(pm.list_explicit());
+    }
+
+    if matches!(backend, Backend::Fedora | Backend::MacOS) {
+        let manager = get_package_manager()?;
+        return block_on_live(manager.list_explicit());
     }
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
@@ -139,6 +180,7 @@ fn local_packages_from_debian_db() -> anyhow::Result<Vec<LocalPackage>> {
 }
 
 pub fn list_installed_fast() -> anyhow::Result<Vec<LocalPackage>> {
+    let backend = resolve_backend()?;
     if crate::core::paths::test_mode() {
         let manager = get_package_manager()?;
         return futures::executor::block_on(manager.list_installed()).map(|packages| {
@@ -150,6 +192,23 @@ pub fn list_installed_fast() -> anyhow::Result<Vec<LocalPackage>> {
                     description: package.description,
                     install_size: 0,
                     reason: "explicit",
+                    licenses: Vec::new(),
+                })
+                .collect()
+        });
+    }
+
+    if matches!(backend, Backend::Fedora | Backend::MacOS) {
+        let manager = get_package_manager()?;
+        return block_on_live(manager.list_installed()).map(|packages| {
+            packages
+                .into_iter()
+                .map(|package| LocalPackage {
+                    name: package.name,
+                    version: package.version,
+                    description: package.description,
+                    install_size: 0,
+                    reason: "unknown",
                     licenses: Vec::new(),
                 })
                 .collect()
@@ -175,9 +234,15 @@ pub fn list_installed_fast() -> anyhow::Result<Vec<LocalPackage>> {
 }
 
 pub fn is_installed_fast(name: &str) -> anyhow::Result<bool> {
+    let backend = resolve_backend()?;
     if crate::core::paths::test_mode() {
         let manager = get_package_manager()?;
         return futures::executor::block_on(manager.is_installed(name));
+    }
+
+    if matches!(backend, Backend::MacOS) {
+        let manager = get_package_manager()?;
+        return block_on_live(manager.is_installed(name));
     }
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
@@ -230,6 +295,7 @@ fn package_info_from_debian_db(name: &str) -> anyhow::Result<Option<types::Packa
 }
 
 pub fn get_package_info(name: &str) -> anyhow::Result<Option<types::PackageInfo>> {
+    let backend = resolve_backend()?;
     if crate::core::paths::test_mode() {
         let manager = get_package_manager()?;
         let package = futures::executor::block_on(manager.info(name))?;
@@ -250,6 +316,25 @@ pub fn get_package_info(name: &str) -> anyhow::Result<Option<types::PackageInfo>
             licenses: Vec::new(),
             installed: package.installed,
         }));
+    }
+
+    if matches!(backend, Backend::Fedora | Backend::MacOS) {
+        let manager = get_package_manager()?;
+        return block_on_live(manager.info(name)).map(|package| {
+            package.map(|package| types::PackageInfo {
+                name: package.name,
+                version: package.version,
+                description: package.description,
+                url: None,
+                size: 0,
+                install_size: None,
+                download_size: None,
+                repo: "official".to_string(),
+                depends: Vec::new(),
+                licenses: Vec::new(),
+                installed: package.installed,
+            })
+        });
     }
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
@@ -280,8 +365,17 @@ pub fn get_package_info(name: &str) -> anyhow::Result<Option<types::PackageInfo>
 }
 
 pub fn list_orphans_fast() -> anyhow::Result<Vec<String>> {
+    let backend = resolve_backend()?;
     if crate::core::paths::test_mode() {
         return Ok(Vec::new());
+    }
+
+    if backend == Backend::Fedora {
+        #[cfg(feature = "fedora")]
+        return block_on_live(dnf::DnfPackageManager::orphan_packages());
+    }
+    if backend == Backend::MacOS {
+        anyhow::bail!("Homebrew does not expose an orphan package listing");
     }
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
@@ -315,9 +409,16 @@ fn counts_from_debian_db() -> anyhow::Result<(usize, usize, usize)> {
 }
 
 pub fn get_counts() -> anyhow::Result<(usize, usize, usize)> {
+    let backend = resolve_backend()?;
     if crate::core::paths::test_mode() {
         let manager = get_package_manager()?;
         let (total, explicit, orphans, _) = futures::executor::block_on(manager.get_status(false))?;
+        return Ok((total, explicit, orphans));
+    }
+
+    if matches!(backend, Backend::Fedora | Backend::MacOS) {
+        let manager = get_package_manager()?;
+        let (total, explicit, orphans, _) = block_on_live(manager.get_status(false))?;
         return Ok((total, explicit, orphans));
     }
 
@@ -340,9 +441,15 @@ pub fn get_counts() -> anyhow::Result<(usize, usize, usize)> {
 }
 
 pub fn get_system_status() -> anyhow::Result<(usize, usize, usize, usize)> {
+    let backend = resolve_backend()?;
     if crate::core::paths::test_mode() {
         let manager = get_package_manager()?;
         return futures::executor::block_on(manager.get_status(false));
+    }
+
+    if matches!(backend, Backend::Fedora | Backend::MacOS) {
+        let manager = get_package_manager()?;
+        return block_on_live(manager.get_status(false));
     }
 
     #[cfg(feature = "debian")]
@@ -392,97 +499,98 @@ pub use parallel_sync::sync_databases_parallel;
 pub use traits::PackageManager;
 pub use types::{LocalPackage, SyncPackage};
 
-/// Get the appropriate package manager for the current distribution
-pub fn get_package_manager() -> anyhow::Result<Arc<dyn PackageManager>> {
-    #[allow(
-        unused_imports,
-        reason = "the selected package-backend features use different subsets"
-    )]
-    use crate::core::env::distro::{Distro, detect_distro};
+/// Selected live package backend. Mock is available only under explicit test mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Arch,
+    Debian,
+    Fedora,
+    MacOS,
+    Mock,
+}
 
-    // Test mode is an explicit runtime adapter and must behave consistently in
-    // debug and release builds; otherwise fast-path helpers can recurse into
-    // the real backend when release binaries are exercised in isolation.
-    if crate::core::paths::test_mode() {
-        let distro = std::env::var("OMG_TEST_DISTRO").unwrap_or_else(|_| "arch".to_string());
-        return Ok(Arc::new(mock::MockPackageManager::new(&distro)));
-    }
+#[derive(Clone, Copy)]
+struct CompiledBackends {
+    arch: bool,
+    debian: bool,
+    fedora: bool,
+    macos: bool,
+    debian_pure: bool,
+}
 
-    match detect_distro() {
-        #[cfg(feature = "arch")]
-        Distro::Arch => Ok(Arc::new(ArchPackageManager::new())),
-        // debian provides AptPackageManager
-        #[cfg(feature = "debian")]
-        Distro::Debian | Distro::Ubuntu => Ok(Arc::new(AptPackageManager::new())),
-        // debian-pure is a TEST/INDEXING ENGINE, not a live-system backend:
-        // it cannot elevate, overwrites conffiles without dpkg semantics,
-        // and its rollback cannot restore overwritten files. Builds without
-        // the apt backend must fail explicitly rather than let it mutate a
-        // real machine.
-        #[cfg(all(not(feature = "debian"), feature = "debian-pure"))]
-        Distro::Debian | Distro::Ubuntu => Err(anyhow::anyhow!(
-            "This build uses the pure-Rust Debian indexing engine, which must not \
-             modify a live system (no privilege boundary or dpkg conffile semantics). \
-             Install an apt-backed build of omg for Debian/Ubuntu."
-        )),
-        // Fedora/RHEL provides DnfPackageManager (pure Rust)
-        #[cfg(feature = "fedora")]
-        Distro::Fedora => Ok(Arc::new(dnf::DnfPackageManager::new())),
-        // macOS provides HomebrewPackageManager
-        #[cfg(any(feature = "macos", target_os = "macos"))]
-        Distro::MacOS => Ok(Arc::new(homebrew::HomebrewPackageManager::new())),
-        _ => {
-            // Fallback or default
-            #[cfg(feature = "arch")]
-            return Ok(Arc::new(ArchPackageManager::new()));
-
-            #[cfg(all(not(feature = "arch"), feature = "debian"))]
-            return Ok(Arc::new(AptPackageManager::new()));
-
-            #[cfg(all(
-                not(feature = "arch"),
-                not(feature = "debian"),
-                feature = "debian-pure"
-            ))]
-            return Err(anyhow::anyhow!(
-                "This build only provides the pure-Rust Debian indexing engine; \
-                 no live package-manager backend is available for the detected platform."
-            ));
-
-            #[cfg(all(
-                not(feature = "arch"),
-                not(feature = "debian"),
-                not(feature = "debian-pure"),
-                any(feature = "macos", target_os = "macos")
-            ))]
-            return Ok(Arc::new(homebrew::HomebrewPackageManager::new()));
-
-            #[cfg(all(
-                not(feature = "arch"),
-                not(feature = "debian"),
-                not(feature = "debian-pure"),
-                not(any(feature = "macos", target_os = "macos")),
-                feature = "fedora"
-            ))]
-            return Ok(Arc::new(dnf::DnfPackageManager::new()));
-
-            #[cfg(not(any(
-                feature = "arch",
-                feature = "debian",
-                feature = "debian-pure",
-                feature = "fedora"
-            )))]
-            #[cfg(not(target_os = "macos"))]
-            #[allow(
-                unreachable_code,
-                reason = "additive backend feature returns above make this fallback unreachable"
-            )]
-            {
-                anyhow::bail!(
-                    "No package manager backend enabled! Build with --features arch, debian, fedora, or macos"
-                );
-            }
+impl CompiledBackends {
+    const fn current() -> Self {
+        Self {
+            arch: cfg!(feature = "arch"),
+            debian: cfg!(feature = "debian"),
+            fedora: cfg!(feature = "fedora"),
+            macos: cfg!(any(feature = "macos", target_os = "macos")),
+            debian_pure: cfg!(feature = "debian-pure"),
         }
+    }
+}
+
+/// Pure selection policy: compiled features never substitute for the host's
+/// actual package database. In particular `debian-pure` is an indexer, not a
+/// backend that may operate on a live machine.
+fn resolve_for(
+    distro: crate::core::env::distro::Distro,
+    compiled: CompiledBackends,
+    test_mode: bool,
+) -> anyhow::Result<Backend> {
+    use crate::core::env::distro::Distro;
+    if test_mode {
+        return Ok(Backend::Mock);
+    }
+    let (backend, available, feature) = match distro {
+        Distro::Arch => (Backend::Arch, compiled.arch, "arch"),
+        Distro::Debian | Distro::Ubuntu => (Backend::Debian, compiled.debian, "debian"),
+        Distro::Fedora => (Backend::Fedora, compiled.fedora, "fedora"),
+        Distro::MacOS => (Backend::MacOS, compiled.macos, "macos"),
+        Distro::Unknown => {
+            anyhow::bail!("Unsupported Linux distribution: no live package backend can be selected")
+        }
+    };
+    if available {
+        return Ok(backend);
+    }
+    if matches!(distro, Distro::Debian | Distro::Ubuntu) && compiled.debian_pure {
+        anyhow::bail!(
+            "The Debian indexing feature is not a live APT backend. Install the Debian/Ubuntu omg build, or rebuild with --no-default-features --features debian,pgp,license"
+        );
+    }
+    anyhow::bail!(
+        "This omg binary lacks the {feature} package backend required by {distro:?}. Install the matching distro build, or rebuild with --no-default-features --features {feature},pgp,license"
+    )
+}
+
+/// Select the host's compiled live package backend without touching package
+/// databases or starting a daemon.
+pub fn resolve_backend() -> anyhow::Result<Backend> {
+    let test_mode = crate::core::paths::test_mode();
+    resolve_for(
+        crate::core::env::distro::detect_distro(),
+        CompiledBackends::current(),
+        test_mode,
+    )
+}
+
+/// Get the appropriate package manager for the current distribution.
+pub fn get_package_manager() -> anyhow::Result<Arc<dyn PackageManager>> {
+    match resolve_backend()? {
+        Backend::Mock => {
+            let distro = std::env::var("OMG_TEST_DISTRO").unwrap_or_else(|_| "arch".to_string());
+            Ok(Arc::new(mock::MockPackageManager::new(&distro)))
+        }
+        #[cfg(feature = "arch")]
+        Backend::Arch => Ok(Arc::new(ArchPackageManager::new())),
+        #[cfg(feature = "debian")]
+        Backend::Debian => Ok(Arc::new(AptPackageManager::new())),
+        #[cfg(feature = "fedora")]
+        Backend::Fedora => Ok(Arc::new(dnf::DnfPackageManager::new())),
+        #[cfg(any(feature = "macos", target_os = "macos"))]
+        Backend::MacOS => Ok(Arc::new(homebrew::HomebrewPackageManager::new())),
+        other => anyhow::bail!("The selected {other:?} package backend is not compiled in"),
     }
 }
 
@@ -543,3 +651,185 @@ pub use homebrew::HomebrewPackageManager;
 // DNF/RPM exports are available with fedora feature
 #[cfg(feature = "fedora")]
 pub use dnf::DnfPackageManager;
+
+#[cfg(test)]
+mod backend_selection_tests {
+    use super::{Backend, CompiledBackends, resolve_for};
+    use crate::core::env::distro::Distro;
+
+    const ARCH: CompiledBackends = CompiledBackends {
+        arch: true,
+        debian: false,
+        fedora: false,
+        macos: false,
+        debian_pure: false,
+    };
+    const DEBIAN: CompiledBackends = CompiledBackends {
+        arch: false,
+        debian: true,
+        ..ARCH
+    };
+    const FEDORA: CompiledBackends = CompiledBackends {
+        arch: false,
+        fedora: true,
+        ..ARCH
+    };
+
+    #[test]
+    fn only_the_matching_live_backend_is_selected() {
+        for (distro, compiled, expected) in [
+            (Distro::Arch, ARCH, Backend::Arch),
+            (Distro::Debian, DEBIAN, Backend::Debian),
+            (Distro::Ubuntu, DEBIAN, Backend::Debian),
+            (Distro::Fedora, FEDORA, Backend::Fedora),
+            (
+                Distro::MacOS,
+                CompiledBackends {
+                    macos: true,
+                    ..ARCH
+                },
+                Backend::MacOS,
+            ),
+            (
+                Distro::Fedora,
+                CompiledBackends {
+                    fedora: true,
+                    ..ARCH
+                },
+                Backend::Fedora,
+            ),
+            (
+                Distro::Debian,
+                CompiledBackends {
+                    debian: true,
+                    ..ARCH
+                },
+                Backend::Debian,
+            ),
+        ] {
+            assert_eq!(resolve_for(distro, compiled, false).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn wrong_or_index_only_features_fail_with_build_guidance() {
+        for (distro, compiled, required) in [
+            (Distro::Debian, ARCH, "debian"),
+            (Distro::Ubuntu, ARCH, "debian"),
+            (Distro::Fedora, ARCH, "fedora"),
+            (Distro::Arch, DEBIAN, "arch"),
+            (Distro::Debian, FEDORA, "debian"),
+            (
+                Distro::Debian,
+                CompiledBackends {
+                    arch: false,
+                    debian_pure: true,
+                    ..ARCH
+                },
+                "debian",
+            ),
+        ] {
+            let message = resolve_for(distro, compiled, false)
+                .expect_err("wrong backend must fail")
+                .to_string();
+            assert!(message.contains(required), "{message}");
+            assert!(message.contains("--no-default-features"), "{message}");
+        }
+        assert!(resolve_for(Distro::Unknown, ARCH, false).is_err());
+    }
+
+    #[test]
+    fn explicit_test_mode_selects_mock_without_a_live_backend() {
+        assert_eq!(
+            resolve_for(Distro::Unknown, ARCH, true).unwrap(),
+            Backend::Mock
+        );
+    }
+
+    #[test]
+    fn empty_feature_set_refuses_every_live_host_but_allows_explicit_mock() {
+        let none = CompiledBackends {
+            arch: false,
+            debian: false,
+            fedora: false,
+            macos: false,
+            debian_pure: false,
+        };
+        for (host, feature) in [
+            (Distro::Arch, "arch"),
+            (Distro::Debian, "debian"),
+            (Distro::Ubuntu, "debian"),
+            (Distro::Fedora, "fedora"),
+            (Distro::MacOS, "macos"),
+        ] {
+            let message = resolve_for(host, none, false).unwrap_err().to_string();
+            assert!(
+                message.contains(&format!("lacks the {feature} package backend")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!(
+                    "--no-default-features --features {feature},pgp,license"
+                )),
+                "{message}"
+            );
+            assert_eq!(resolve_for(host, none, true).unwrap(), Backend::Mock);
+        }
+        assert!(resolve_for(Distro::Unknown, none, false).is_err());
+        assert_eq!(
+            resolve_for(Distro::Unknown, none, true).unwrap(),
+            Backend::Mock
+        );
+    }
+
+    #[test]
+    fn mixed_features_keep_host_selection_and_macos_refusal_precise() {
+        let mixed = CompiledBackends {
+            arch: true,
+            debian: true,
+            fedora: true,
+            macos: true,
+            debian_pure: true,
+        };
+        for (host, expected) in [
+            (Distro::Arch, Backend::Arch),
+            (Distro::Debian, Backend::Debian),
+            (Distro::Ubuntu, Backend::Debian),
+            (Distro::Fedora, Backend::Fedora),
+            (Distro::MacOS, Backend::MacOS),
+        ] {
+            assert_eq!(resolve_for(host, mixed, false).unwrap(), expected);
+            assert_eq!(resolve_for(host, mixed, true).unwrap(), Backend::Mock);
+        }
+        let unavailable = CompiledBackends {
+            macos: false,
+            ..mixed
+        };
+        let message = resolve_for(Distro::MacOS, unavailable, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("lacks the macos package backend required by MacOS"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn pure_indexer_refuses_both_debian_hosts_even_with_other_live_features() {
+        let indexer = CompiledBackends {
+            debian: false,
+            debian_pure: true,
+            fedora: true,
+            macos: true,
+            ..ARCH
+        };
+        for host in [Distro::Debian, Distro::Ubuntu] {
+            let message = resolve_for(host, indexer, false).unwrap_err().to_string();
+            assert_eq!(
+                message,
+                "The Debian indexing feature is not a live APT backend. Install the Debian/Ubuntu omg build, or rebuild with --no-default-features --features debian,pgp,license"
+            );
+            assert_eq!(resolve_for(host, indexer, true).unwrap(), Backend::Mock);
+        }
+    }
+}

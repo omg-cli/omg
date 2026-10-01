@@ -285,7 +285,8 @@ impl PackageIndex {
     }
 
     fn uses_manager_inventory(package_manager: &dyn PackageManager) -> bool {
-        matches!(package_manager.name(), "dnf" | "brew" | "homebrew")
+        crate::core::paths::test_mode()
+            || matches!(package_manager.name(), "dnf" | "brew" | "homebrew")
     }
 
     pub fn for_package_manager_blocking(package_manager: Arc<dyn PackageManager>) -> Result<Self> {
@@ -314,36 +315,18 @@ impl PackageIndex {
     }
 
     pub fn new() -> Result<Self> {
-        #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
-        use crate::core::env::distro::{Distro, detect_distro};
-        #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
-        let distro = detect_distro();
-
-        #[cfg(any(feature = "debian", feature = "debian-pure"))]
-        if distro == Distro::Debian || distro == Distro::Ubuntu {
-            return Self::new_apt();
+        match crate::package_managers::resolve_backend()? {
+            #[cfg(feature = "arch")]
+            crate::package_managers::Backend::Arch => Self::new_alpm(),
+            #[cfg(feature = "debian")]
+            crate::package_managers::Backend::Debian => Self::new_apt(),
+            backend => anyhow::bail!(
+                "The selected {backend:?} backend needs its package manager inventory"
+            ),
         }
-
-        #[cfg(feature = "arch")]
-        if distro == Distro::Arch {
-            return Self::new_alpm();
-        }
-
-        // Fallbacks if detection fails but features are enabled
-        #[cfg(feature = "arch")]
-        return Self::new_alpm();
-
-        #[cfg(all(
-            not(feature = "arch"),
-            any(feature = "debian", feature = "debian-pure")
-        ))]
-        return Self::new_apt();
-
-        #[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
-        anyhow::bail!("No package backend enabled")
     }
 
-    #[cfg(any(feature = "debian", feature = "debian-pure"))]
+    #[cfg(feature = "debian")]
     fn new_apt() -> Result<Self> {
         #[cfg(feature = "debian")]
         if !crate::core::paths::test_mode() {

@@ -102,6 +102,29 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertNotIn("private environment", excerpt)
         self.assertLessEqual(len(excerpt.encode("utf-8")), 1400)
 
+    def test_backend_mismatch_failure_files_its_own_case_with_probe_evidence(self):
+        case = dict(self.row(), case_id="qemu-arch-backend-mismatch",
+                    artifact_source="backend-mismatch")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("run-a/backend-mismatch-results.json", json.dumps([case]))
+            archive.writestr("run-a/backend-mismatch.json",
+                             '{"failure_kind":"product","error":"info accessed native database"}')
+            archive.writestr("run-b/backend-mismatch.log", "unrelated run")
+        diagnostics = {}
+        rows = REPORT.archive_rows(output.getvalue(), {case["case_id"]}, diagnostics)
+        self.assertEqual(rows, [{key: case[key] for key in
+                                 ("case_id", "distro", "result", "exit_code", "elapsed_seconds")}])
+        self.assertIn("info accessed native database", diagnostics[(case["case_id"], "arch")])
+        self.assertNotIn("unrelated run", diagnostics[(case["case_id"], "arch")])
+
+    def test_backend_mismatch_result_cannot_claim_an_inventory_case(self):
+        case = dict(self.row(), artifact_source="backend-mismatch")
+        with self.assertRaisesRegex(ValueError, "wrong identity"):
+            REPORT.archive_rows(
+                self.archive("run-a/backend-mismatch-results.json", json.dumps([case])),
+                {case["case_id"]})
+
     def test_inventory_combined_log_is_used_when_stream_logs_are_empty(self):
         output = io.BytesIO()
         with zipfile.ZipFile(output, "w") as archive:

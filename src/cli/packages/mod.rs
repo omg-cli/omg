@@ -34,13 +34,8 @@ pub use update::{update, update_fast, update_turbo};
 
 /// Dispatch to the compiled package-manager backend.
 ///
-/// Shared backend-selection policy for the install/remove/update commands:
-///
-/// 1. Debian-like distros use the Debian backend when Debian support is
-///    compiled in.
-/// 2. Otherwise the Arch backend is preferred when compiled in.
-/// 3. With Debian support but no Arch support, Debian is the fallback.
-/// 4. Otherwise the generic backend is used.
+/// The resolver rejects a binary built without the host distro's backend.
+/// Fedora, Homebrew, and explicit test mode use the shared manager path.
 ///
 /// Each body is a block expression. Only the arms enabled by the active
 /// feature flags are type-checked, so call sites may reference the backend
@@ -51,28 +46,24 @@ macro_rules! dispatch_backend {
         arch: $arch_body:block,
         generic: $generic_body:block $(,)?
     ) => {
-        #[cfg(any(feature = "debian", feature = "debian-pure"))]
-        if crate::core::env::distro::is_debian_like() {
-            return $debian_body;
+        match crate::package_managers::resolve_backend()? {
+            #[cfg(feature = "debian")]
+            crate::package_managers::Backend::Debian => $debian_body,
+            #[cfg(feature = "arch")]
+            crate::package_managers::Backend::Arch => $arch_body,
+            _ => $generic_body,
         }
-
-        #[cfg(feature = "arch")]
-        $arch_body
-
-        #[cfg(all(
-            not(feature = "arch"),
-            any(feature = "debian", feature = "debian-pure")
-        ))]
-        $debian_body
-
-        #[cfg(all(
-            not(feature = "arch"),
-            not(any(feature = "debian", feature = "debian-pure"))
-        ))]
-        $generic_body
     };
 }
 pub(crate) use dispatch_backend;
+
+#[cfg(feature = "arch")]
+fn mock_arch_backend() -> anyhow::Result<bool> {
+    Ok(
+        crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Mock
+            && crate::core::env::distro::detect_distro() == crate::core::env::distro::Distro::Arch,
+    )
+}
 
 /// Execute a `Cmd<()>` in fallback context (non-Elm mode).
 ///

@@ -216,6 +216,125 @@ fn explicit_shortcut_uses_the_same_isolated_state_as_explicit_count() {
     }
 }
 
+#[cfg(feature = "arch")]
+#[test]
+fn mock_fedora_sync_does_not_start_aur_metadata_io() {
+    let project = TestProject::for_distro("fedora");
+    let aur_metadata = project.data_dir.path().join("cache/aur/_meta");
+    assert!(!aur_metadata.exists());
+
+    let result = project.run_with_env(&["sync"], &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "8")]);
+    result.assert_success();
+    assert!(
+        !aur_metadata.exists(),
+        "non-Arch sync created AUR metadata state at {}",
+        aur_metadata.display()
+    );
+    project.close_checked();
+}
+
+#[cfg(feature = "arch")]
+#[test]
+fn mock_arch_read_only_flags_keep_arch_semantics_without_native_access() {
+    let project = TestProject::for_distro("arch");
+    project.mock_install("bash", "5.2.0").unwrap();
+    let state = project.data_dir.path().join("mock_state_pacman.json");
+    let before = std::fs::read(&state).unwrap();
+
+    let removal = project.run(&["remove", "--recursive", "--yes", "--dry-run", "bash"]);
+    removal.assert_success();
+    assert!(removal.stdout.contains("bash"));
+    assert!(
+        removal
+            .stdout
+            .contains("Additional unneeded dependencies would also be removed"),
+        "recursive dry run omitted the dependency scope: {}",
+        removal.combined_output()
+    );
+
+    let update = project.run(&["update", "--check", "--aur-only"]);
+    update.assert_success();
+    assert!(
+        update.stdout.contains("AUR only"),
+        "AUR-only check did not retain its selected scope: {}",
+        update.combined_output()
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), before);
+    assert!(!project.data_dir.path().join("cache/aur/_meta").exists());
+    project.close_checked();
+}
+
+#[test]
+fn mock_clean_refuses_mutation_before_native_package_helpers() {
+    for distro in ["arch", "debian", "fedora"] {
+        let project = TestProject::for_distro(distro);
+        project.mock_install("fixture-package", "1.0.0").unwrap();
+        let backend = match distro {
+            "arch" => "pacman",
+            "fedora" => "dnf",
+            _ => "apt",
+        };
+        let state = project
+            .data_dir
+            .path()
+            .join(format!("mock_state_{backend}.json"));
+        let before = std::fs::read(&state).unwrap();
+
+        let cache = project.pacman_root.path().join("var/cache/pacman/pkg");
+        std::fs::create_dir_all(&cache).unwrap();
+        let older = cache.join("fixture-package-1.0-1-x86_64.pkg.tar.zst");
+        let newer = cache.join("fixture-package-2.0-1-x86_64.pkg.tar.zst");
+        std::fs::write(&older, b"older native cache archive").unwrap();
+        std::fs::write(&newer, b"newer native cache archive").unwrap();
+
+        for args in [
+            &["clean", "--cache", "--yes"][..],
+            &["clean", "--orphans", "--yes"][..],
+        ] {
+            let result = project.run(args);
+            result.assert_failure();
+            assert!(
+                result.stderr.contains("Mock cleanup cannot mutate native"),
+                "{distro}: wrong cleanup refusal: {}",
+                result.combined_output()
+            );
+            assert_eq!(std::fs::read(&state).unwrap(), before);
+            assert_eq!(
+                std::fs::read(&older).unwrap(),
+                b"older native cache archive"
+            );
+            assert_eq!(
+                std::fs::read(&newer).unwrap(),
+                b"newer native cache archive"
+            );
+        }
+
+        let preview = project.run(&["clean", "--all", "--dry-run"]);
+        if distro == "debian" {
+            preview.assert_failure();
+            assert!(
+                preview.stderr.contains("not supported on the APT backend"),
+                "{distro}: unsupported cleanup reported the wrong result: {}",
+                preview.combined_output()
+            );
+        } else {
+            preview.assert_success();
+            assert!(preview.stdout.contains("No changes made (dry run)"));
+            assert!(preview.stdout.contains("mock has no native archives"));
+        }
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        assert_eq!(
+            std::fs::read(&older).unwrap(),
+            b"older native cache archive"
+        );
+        assert_eq!(
+            std::fs::read(&newer).unwrap(),
+            b"newer native cache archive"
+        );
+        project.close_checked();
+    }
+}
+
 #[test]
 fn prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments() {
     let project = TestProject::new();
@@ -2423,11 +2542,6 @@ mod install_tests {
         #[cfg(feature = "arch")]
         let proxy = crate::recovery_fixture::RejectedProxy::new();
         #[cfg(feature = "arch")]
-        crate::recovery_fixture::seed_missing_aur_index(
-            &project,
-            "package-that-definitely-does-not-exist-12345",
-        );
-        #[cfg(feature = "arch")]
         let environment = proxy.env();
         #[cfg(not(feature = "arch"))]
         let environment = Vec::new();
@@ -2442,6 +2556,8 @@ mod install_tests {
         #[cfg(feature = "arch")]
         assert_eq!(proxy.requests(), 0, "offline missing lookup contacted RPC");
         assert_eq!(result.exit_code, 1, "{}", result.combined_output());
+        #[cfg(feature = "arch")]
+        result.assert_stderr_contains("Package 'package-that-definitely-does-not-exist-12345' not found. Suggestion: use 'omg search' to check available package names");
         assert!(!result.combined_output().contains("transport failed"));
         project.close_checked();
         result.assert_failure();

@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -850,13 +850,28 @@ pub fn ensure_index_loaded() -> Result<()> {
 }
 
 fn rebuild_package_index(files: &[PathBuf]) -> Result<DebianPackageIndex> {
-    let packages = files
-        .par_iter()
-        .map(|path| parse_packages_file_sync(path))
-        .collect::<Result<Vec<Vec<DebianPackage>>>>()?;
+    let mut remaining = MAX_INDEX_SNAPSHOT_BYTES;
+    let mut encoded_remaining = MAX_INDEX_SNAPSHOT_BYTES;
     let mut index = DebianPackageIndex::new();
-    for package in packages.into_iter().flatten() {
-        index.add_package(package);
+    for path in files {
+        let (content, encoded_bytes) =
+            read_packages_file_snapshot(path, encoded_remaining, remaining)?;
+        encoded_remaining = encoded_remaining
+            .checked_sub(encoded_bytes)
+            .context("Encoded APT index set exceeds native byte budget")?;
+        remaining = remaining
+            .checked_sub(content.len() as u64)
+            .context("APT index set exceeds native byte budget")?;
+        let component = extract_component_from_path(path);
+        let suite = extract_suite_from_path(path);
+        let source_key = extract_source_key_from_path(path);
+        for paragraph in status_paragraphs(&content) {
+            if let Some(package) =
+                parse_packages_paragraph(paragraph, &component, &suite, &source_key)?
+            {
+                index.add_package(package);
+            }
+        }
     }
     index.updated_at = jiff::Timestamp::now().as_second();
     Ok(index)
@@ -976,6 +991,7 @@ pub fn ensure_mmap_loaded() -> bool {
     }
 }
 
+#[cfg(test)]
 fn parse_packages_file_sync(path: &Path) -> Result<Vec<DebianPackage>> {
     let component = extract_component_from_path(path);
     let suite = extract_suite_from_path(path);
@@ -1032,36 +1048,237 @@ fn parse_packages_paragraph(
     }
 }
 
-fn read_packages_file_content(path: &Path) -> Result<String> {
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
+// Native files are snapshots, not streams. O_NONBLOCK prevents a FIFO open
+// from blocking before the regular-file check; O_NOFOLLOW rejects symlinks.
+fn read_native_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("Failed to open native index {}", path.display()))?;
+    let before = file.metadata()?;
+    anyhow::ensure!(
+        before.is_file(),
+        "Native index must be a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        before.len() <= limit,
+        "Native index exceeds {limit} bytes: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= limit,
+        "Native index exceeds {limit} bytes"
+    );
+    let after = file.metadata()?;
+    anyhow::ensure!(
+        before.len() == after.len() && before.modified()? == after.modified()?,
+        "Native index changed while reading: {}",
+        path.display()
+    );
+    Ok(bytes)
+}
 
-    let mut buf = String::new();
-    if path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("lz4"))
-    {
-        let mut decoder = lz4_flex::frame::FrameDecoder::new(reader);
-        decoder.read_to_string(&mut buf)?;
-    } else if path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
-    {
-        let mut decoder = flate2::read::GzDecoder::new(reader);
-        decoder.read_to_string(&mut buf)?;
-    } else if path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("xz"))
-    {
-        let mut decompressed = BudgetedWriter::new(Vec::new(), MAX_INDEX_SNAPSHOT_BYTES);
-        decode_xz_to(&mut reader, &mut decompressed)?;
-        buf = String::from_utf8(decompressed.into_inner())
-            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in xz-compressed Packages file: {e}"))?;
-    } else {
-        reader.read_to_string(&mut buf)?;
+fn read_native_text(path: &Path) -> Result<String> {
+    String::from_utf8(read_native_bytes(path, MAX_INDEX_SNAPSHOT_BYTES)?)
+        .with_context(|| format!("Invalid UTF-8 in native index {}", path.display()))
+}
+
+fn read_decoded_bytes(reader: impl Read, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= limit,
+        "Decoded native index exceeds {limit} bytes"
+    );
+    Ok(bytes)
+}
+
+// lz4_flex 0.14 treats EOF before the end mark as successful completion and
+// stops Read at each end mark. Check frame boundaries, then let the pinned
+// decoder validate header/block/content checksums for every complete frame.
+fn decode_complete_lz4(bytes: &[u8], limit: u64) -> Result<Vec<u8>> {
+    let mut offset = 0;
+    let mut output = Vec::new();
+    anyhow::ensure!(!bytes.is_empty(), "Missing LZ4 frame");
+    while offset < bytes.len() {
+        let start = offset;
+        let header = bytes
+            .get(offset..offset + 7)
+            .context("Truncated LZ4 header")?;
+        anyhow::ensure!(header[..4] == [4, 34, 77, 24], "Invalid LZ4 frame magic");
+        let flags = header[4];
+        offset += 7 + usize::from(flags & 8 != 0) * 8 + usize::from(flags & 1 != 0) * 4;
+        anyhow::ensure!(offset <= bytes.len(), "Truncated LZ4 header");
+        loop {
+            let block = bytes
+                .get(offset..offset + 4)
+                .context("Missing LZ4 end mark")?;
+            let size = u32::from_le_bytes(block.try_into()?) as usize;
+            offset += 4;
+            if size == 0 {
+                offset += usize::from(flags & 4 != 0) * 4;
+                anyhow::ensure!(offset <= bytes.len(), "Truncated LZ4 content checksum");
+                break;
+            }
+            offset = offset
+                .checked_add(size & 0x7fff_ffff)
+                .and_then(|value| value.checked_add(usize::from(flags & 16 != 0) * 4))
+                .context("LZ4 block length overflow")?;
+            anyhow::ensure!(offset <= bytes.len(), "Truncated LZ4 block");
+        }
+        let remaining = limit
+            .checked_sub(output.len() as u64)
+            .context("LZ4 output exceeds budget")?;
+        let decoded = read_decoded_bytes(
+            lz4_flex::frame::FrameDecoder::new(&bytes[start..offset]),
+            remaining,
+        )?;
+        output.extend_from_slice(&decoded);
     }
+    Ok(output)
+}
 
-    Ok(buf)
+fn read_packages_file_content(path: &Path) -> Result<String> {
+    read_packages_file_content_with_limit(path, MAX_INDEX_SNAPSHOT_BYTES)
+}
+
+fn read_packages_file_content_with_limit(path: &Path, limit: u64) -> Result<String> {
+    read_packages_file_snapshot(path, limit, limit).map(|(content, _)| content)
+}
+
+fn read_packages_file_snapshot(path: &Path, input_limit: u64, limit: u64) -> Result<(String, u64)> {
+    let bytes = read_native_bytes(path, input_limit)?;
+    let encoded_bytes = bytes.len() as u64;
+    let decoded = match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("lz4") => decode_complete_lz4(&bytes, limit)?,
+        Some("gz") => {
+            anyhow::ensure!(!bytes.is_empty(), "Missing gzip stream");
+            read_decoded_bytes(flate2::read::MultiGzDecoder::new(bytes.as_slice()), limit)?
+        }
+        Some("xz") => {
+            let mut output = BudgetedWriter::new(Vec::new(), limit);
+            decode_xz_to(&mut bytes.as_slice(), &mut output)?;
+            output.into_inner()
+        }
+        _ => bytes,
+    };
+    let contents = String::from_utf8(decoded)
+        .with_context(|| format!("Invalid UTF-8 in Packages file {}", path.display()))?;
+    Ok((contents, encoded_bytes))
+}
+
+fn control_field<'a>(paragraph: &'a str, field: &str) -> Option<&'a str> {
+    paragraph
+        .lines()
+        .filter(|line| !line.starts_with([' ', '\t']))
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(name, value)| name.eq_ignore_ascii_case(field).then(|| value.trim()))
+}
+
+fn required_control_field<'a>(paragraph: &'a str, field: &str) -> Result<&'a str> {
+    control_field(paragraph, field)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("Invalid package entry: missing '{field}' field"))
+}
+
+fn validate_deb822_fields(paragraph: &str) -> Result<()> {
+    let mut seen = AHashSet::new();
+    let mut has_field = false;
+    let mut scalar_identity = false;
+    for line in paragraph.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with([' ', '\t']) {
+            anyhow::ensure!(has_field, "Orphan deb822 continuation");
+            anyhow::ensure!(!scalar_identity, "Continued deb822 identity field");
+            continue;
+        }
+        let (name, _) = line
+            .split_once(':')
+            .context("Invalid deb822 field without a colon")?;
+        anyhow::ensure!(
+            !name.is_empty()
+                && !name.starts_with(['#', '-'])
+                && name
+                    .bytes()
+                    .all(|byte| (0x21..=0x7e).contains(&byte) && byte != b':'),
+            "Invalid deb822 field name: {name}"
+        );
+        anyhow::ensure!(
+            seen.insert(name.to_ascii_lowercase()),
+            "Duplicate deb822 field: {name}"
+        );
+        has_field = true;
+        scalar_identity = ["Package", "Version", "Architecture", "Status"]
+            .iter()
+            .any(|field| name.eq_ignore_ascii_case(field));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_native_status(path: &Path) -> Result<()> {
+    let contents = read_native_text(path)?;
+    anyhow::ensure!(!contents.trim().is_empty(), "dpkg status database is empty");
+    parse_security_inventory(&contents)?;
+    Ok(())
+}
+
+fn is_packages_index_name(name: &str) -> bool {
+    name.ends_with("_Packages")
+        || name.rsplit_once('.').is_some_and(|(stem, encoding)| {
+            stem.ends_with("_Packages")
+                && ["lz4", "gz", "xz"]
+                    .iter()
+                    .any(|supported| encoding.eq_ignore_ascii_case(supported))
+        })
+}
+
+pub(crate) fn validate_native_packages(lists: &Path) -> Result<()> {
+    validate_native_packages_with_limit(lists, MAX_INDEX_SNAPSHOT_BYTES)
+}
+
+fn validate_native_packages_with_limit(lists: &Path, limit: u64) -> Result<()> {
+    let mut remaining = limit;
+    let mut encoded_remaining = limit;
+    let mut found = false;
+    for entry in fs::read_dir(lists)
+        .with_context(|| format!("Failed to read APT lists {}", lists.display()))?
+    {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_packages_index_name(name) {
+            continue;
+        }
+        found = true;
+        let (contents, encoded_bytes) =
+            read_packages_file_snapshot(&path, encoded_remaining, remaining)?;
+        encoded_remaining = encoded_remaining
+            .checked_sub(encoded_bytes)
+            .context("Encoded APT indexes exceed byte budget")?;
+        remaining = remaining
+            .checked_sub(contents.len() as u64)
+            .context("APT indexes exceed byte budget")?;
+        for paragraph in status_paragraphs(&contents) {
+            parse_packages_paragraph(paragraph, "", "", "")?;
+        }
+    }
+    anyhow::ensure!(found, "APT package indexes missing");
+    Ok(())
 }
 
 fn parse_minimal_package_info(paragraph: &str, expected_name: &str) -> Option<(String, String)> {
@@ -1254,14 +1471,15 @@ fn parse_paragraph_str(
     suite: &str,
     source_key: &str,
 ) -> Result<DebianPackage> {
-    let mut name = String::new();
-    let mut version = String::new();
+    validate_deb822_fields(paragraph)?;
+    let mut name = required_control_field(paragraph, "Package")?.to_owned();
+    let mut version = required_control_field(paragraph, "Version")?.to_owned();
     let mut description = String::with_capacity(128); // Pre-allocate for description
     let mut section = String::new();
     let mut priority = String::new();
     let mut installed_size = 0u64;
     let mut maintainer = String::new();
-    let mut architecture = String::new();
+    let mut architecture = required_control_field(paragraph, "Architecture")?.to_owned();
     let mut depends = Vec::new();
     let mut filename = String::new();
     let mut size = 0u64;
@@ -1717,10 +1935,15 @@ pub struct DpkgPackageEntry {
 /// Parse a dpkg status paragraph into `DpkgPackageEntry` fields
 #[inline]
 fn parse_status_paragraph(paragraph: &str) -> Option<(String, String, String, String)> {
-    let mut name = String::new();
-    let mut version = String::new();
+    validate_deb822_fields(paragraph).ok()?;
+    let mut name = required_control_field(paragraph, "Package")
+        .ok()?
+        .to_owned();
+    let mut version = control_field(paragraph, "Version").unwrap_or("").to_owned();
     let mut description = String::new();
-    let mut arch = String::new();
+    let mut arch = control_field(paragraph, "Architecture")
+        .unwrap_or("")
+        .to_owned();
     let mut current_field = None;
 
     for line in paragraph.lines() {
@@ -1761,7 +1984,7 @@ fn parse_status_paragraph(paragraph: &str) -> Option<(String, String, String, St
 /// Security exports read every installed stanza without a name-only cache or
 /// silently dropping incomplete identities.
 pub fn security_inventory() -> Result<Vec<crate::package_managers::types::SecurityPackage>> {
-    parse_security_inventory(&fs::read_to_string("/var/lib/dpkg/status")?)
+    parse_security_inventory(&read_native_text(Path::new("/var/lib/dpkg/status"))?)
 }
 
 fn parse_security_inventory(
@@ -1773,14 +1996,24 @@ fn parse_security_inventory(
         if paragraph.trim().is_empty() {
             continue;
         }
-        let mut statuses = paragraph
-            .lines()
-            .filter_map(|line| line.strip_prefix("Status:"));
-        let status = statuses.next().context("dpkg entry lacks Status")?;
-        anyhow::ensure!(
-            statuses.next().is_none(),
-            "dpkg entry has duplicate Status fields"
-        );
+        validate_deb822_fields(paragraph)?;
+        required_control_field(paragraph, "Package")?;
+        for field in ["Version", "Architecture"] {
+            if let Some(value) = control_field(paragraph, field) {
+                anyhow::ensure!(
+                    !value.is_empty() && !value.bytes().any(|byte| byte.is_ascii_whitespace()),
+                    "Invalid dpkg {field} value"
+                );
+            }
+        }
+        if control_field(paragraph, "Multi-Arch") == Some("same") {
+            anyhow::ensure!(
+                control_field(paragraph, "Architecture")
+                    .is_some_and(|value| !value.is_empty() && value != "all"),
+                "Multi-Arch: same requires a concrete architecture"
+            );
+        }
+        let status = required_control_field(paragraph, "Status")?;
         let fields: Vec<_> = status.split_whitespace().collect();
         anyhow::ensure!(
             fields.len() == 3
@@ -1791,13 +2024,18 @@ fn parse_security_inventory(
                 && fields[1] == "ok",
             "Invalid or broken dpkg package status: {status}"
         );
-        if matches!(fields[2], "not-installed" | "config-files") {
+        if fields[2] == "not-installed" {
+            continue;
+        }
+        required_control_field(paragraph, "Version")?;
+        if fields[2] == "config-files" {
             continue;
         }
         anyhow::ensure!(
             fields[2] == "installed",
             "Incomplete dpkg package state: {status}"
         );
+        required_control_field(paragraph, "Architecture")?;
         for field in ["Package", "Version", "Architecture"] {
             let count = paragraph
                 .lines()
@@ -2082,7 +2320,7 @@ pub fn list_installed_fast() -> Result<Vec<DpkgPackageEntry>> {
     }
 
     // Cache miss - parse from disk
-    let status_content = fs::read_to_string(status_path)?;
+    let status_content = read_native_text(status_path)?;
 
     // Fast parse of extended_states using memchr for line iteration
     let auto_installed = read_auto_installed_names(extended_states_path)?;
@@ -2091,22 +2329,18 @@ pub fn list_installed_fast() -> Result<Vec<DpkgPackageEntry>> {
     let mut packages = Vec::with_capacity(status_content.len() / 300);
     let mut installed_set = AHashSet::new();
 
-    for paragraph in status_paragraphs(&status_content) {
-        if !status_paragraph_is_installed(paragraph) {
-            continue;
-        }
-
-        if let Some((name, version, description, arch)) = parse_status_paragraph(paragraph) {
-            let is_explicit = !auto_installed.contains(&name);
-            installed_set.insert(name.clone());
-            packages.push(DpkgPackageEntry {
-                name,
-                version,
-                description,
-                architecture: arch,
-                is_explicit,
-            });
-        }
+    for package in parse_security_inventory(&status_content)? {
+        let is_explicit = !auto_installed.contains(&package.name);
+        installed_set.insert(package.name.clone());
+        packages.push(DpkgPackageEntry {
+            name: package.name,
+            version: package.version,
+            description: package.description,
+            architecture: package
+                .architecture
+                .context("Validated dpkg entry lacks architecture")?,
+            is_explicit,
+        });
     }
 
     // Update cache
@@ -2326,8 +2560,32 @@ pub(crate) fn installed_version_for_arch<'a>(
 
 /// Split a dpkg-style control file into paragraphs separated by blank lines.
 /// The final paragraph needs no trailing blank line.
-fn status_paragraphs(content: &str) -> impl Iterator<Item = &str> {
-    content.split("\n\n")
+fn status_paragraphs(mut content: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        if content.is_empty() {
+            return None;
+        }
+        let bytes = content.as_bytes();
+        let separator = memchr::memchr_iter(b'\n', bytes).find_map(|position| {
+            if bytes.get(position + 1) == Some(&b'\n') {
+                Some((position, 2))
+            } else if position > 0
+                && bytes[position - 1] == b'\r'
+                && bytes.get(position + 1..position + 3) == Some(b"\r\n")
+            {
+                Some((position - 1, 4))
+            } else {
+                None
+            }
+        });
+        if let Some((position, length)) = separator {
+            let paragraph = &content[..position];
+            content = &content[position + length..];
+            Some(paragraph)
+        } else {
+            Some(std::mem::take(&mut content))
+        }
+    })
 }
 
 fn dependencies_from_status(content: &str, package_name: &str) -> (Vec<String>, Vec<String>) {
@@ -2393,7 +2651,7 @@ pub fn get_package_dependencies(package_name: &str) -> Result<(Vec<String>, Vec<
         anyhow::bail!("dpkg status file not found: {}", status_path.display());
     }
 
-    let content = fs::read_to_string(status_path)?;
+    let content = read_native_text(status_path)?;
     Ok(dependencies_from_status(&content, package_name))
 }
 
@@ -2463,7 +2721,7 @@ pub fn get_package_size(package_name: &str) -> Result<Option<i64>> {
         anyhow::bail!("dpkg status file not found: {}", status_path.display());
     }
 
-    let content = fs::read_to_string(status_path)?;
+    let content = read_native_text(status_path)?;
     package_size_from_status(&content, package_name)
 }
 
@@ -2482,7 +2740,7 @@ pub fn get_all_packages_with_sizes() -> Result<Vec<(String, i64)>> {
         anyhow::bail!("dpkg status file not found: {}", status_path.display());
     }
 
-    let content = fs::read_to_string(status_path)?;
+    let content = read_native_text(status_path)?;
     packages_with_sizes_from_status(&content)
 }
 
@@ -2498,7 +2756,7 @@ pub fn get_package_version(package_name: &str) -> Result<Option<String>> {
         anyhow::bail!("dpkg status file not found: {}", status_path.display());
     }
 
-    let content = fs::read_to_string(status_path)?;
+    let content = read_native_text(status_path)?;
     Ok(installed_version_from_status(&content, package_name))
 }
 
@@ -2525,9 +2783,15 @@ fn installed_version_from_status(content: &str, package_name: &str) -> Option<St
 /// A missing file is an empty set (no auto-install tracking), matching APT.
 /// An unreadable existing file is an error so auto-installed packages are not hidden.
 fn read_auto_installed_names(path: &Path) -> Result<AHashSet<String>> {
-    match fs::read_to_string(path) {
+    match read_native_text(path) {
         Ok(content) => Ok(auto_installed_names_from_extended_states(&content)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AHashSet::new()),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(AHashSet::new())
+        }
         Err(error) => Err(error)
             .with_context(|| format!("Failed to read APT extended_states {}", path.display())),
     }
@@ -2628,7 +2892,7 @@ fn build_dependency_map() -> Result<HashMap<String, Vec<String>>> {
         anyhow::bail!("dpkg status file not found: {}", status_path.display());
     }
 
-    let content = fs::read_to_string(status_path)?;
+    let content = read_native_text(status_path)?;
     Ok(dependency_map_from_status(&content))
 }
 
@@ -2917,7 +3181,6 @@ mod tests {
     /// Application-cold readers, warm OS page cache; not a disk-cold benchmark.
     /// Uses owned buffers; earlier mmap measurements do not describe this reader.
     #[test]
-    #[ignore = "bounded synthetic benchmark; run optimized with --ignored --nocapture"]
     fn snapshot_load_benchmark() -> Result<()> {
         for count in [10_000, 50_000] {
             let directory = tempfile::tempdir()?;
@@ -3199,7 +3462,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let good = directory.path().join("good_Packages");
         let bad = directory.path().join("bad_Packages");
-        fs::write(&good, b"Package: kept\nVersion: 1\n\n")?;
+        fs::write(&good, b"Package: kept\nVersion: 1\nArchitecture: amd64\n\n")?;
         fs::write(&bad, b"Version: 2\n\n")?;
         assert!(rebuild_package_index(&[good.clone(), bad.clone()]).is_err());
         fs::remove_file(&bad)?;
@@ -3285,7 +3548,7 @@ mod tests {
 
     #[test]
     fn parse_paragraph_reads_required_and_numeric_fields() -> Result<()> {
-        let paragraph = "Package: vim\nVersion: 2:9.1.0-1\nDescription: Vi IMproved - enhanced vi editor\nSection: editors\nPriority: optional\nInstalled-Size: 3500\n";
+        let paragraph = "Package: vim\nVersion: 2:9.1.0-1\nArchitecture: amd64\nDescription: Vi IMproved - enhanced vi editor\nSection: editors\nPriority: optional\nInstalled-Size: 3500\n";
 
         let package = parse_paragraph_str(paragraph, "main", "bookworm", "deb.example_debian")?;
 
@@ -3299,7 +3562,7 @@ mod tests {
 
     #[test]
     fn parse_paragraph_preserves_description_continuations() -> Result<()> {
-        let paragraph = "Package: curl\nVersion: 8.5.0-1\nDescription: command line tool for transferring data\n curl is a tool to transfer data from or to a server\n .\n using one of the supported protocols.\nSection: net\n";
+        let paragraph = "Package: curl\nVersion: 8.5.0-1\nArchitecture: amd64\nDescription: command line tool for transferring data\n curl is a tool to transfer data from or to a server\n .\n using one of the supported protocols.\nSection: net\n";
 
         let package = parse_paragraph_str(paragraph, "main", "bookworm", "deb.example_debian")?;
 
@@ -3331,7 +3594,7 @@ mod tests {
     #[test]
     fn parse_paragraph_rejects_invalid_numeric_fields() {
         let error = parse_paragraph_str(
-            "Package: curl\nSize: many\n",
+            "Package: curl\nVersion: 1\nArchitecture: amd64\nSize: many\n",
             "main",
             "bookworm",
             "deb.example_debian",
@@ -3343,7 +3606,7 @@ mod tests {
 
     #[test]
     fn parse_paragraph_reads_multiline_dependencies() -> Result<()> {
-        let paragraph = "Package: bash\nDepends: libc6 (>= 2.38),\n libreadline8 (>= 8.1), libtinfo6 | ncurses-term\n";
+        let paragraph = "Package: bash\nVersion: 1\nArchitecture: amd64\nDepends: libc6 (>= 2.38),\n libreadline8 (>= 8.1), libtinfo6 | ncurses-term\n";
 
         let package = parse_paragraph_str(paragraph, "main", "bookworm", "deb.example_debian")?;
 
@@ -3356,7 +3619,7 @@ mod tests {
             ]
         );
         let pre_depends = parse_paragraph_str(
-            "Package: init-system\nPre-Depends: libc6 (>= 2.36)\n",
+            "Package: init-system\nVersion: 1\nArchitecture: amd64\nPre-Depends: libc6 (>= 2.36)\n",
             "main",
             "bookworm",
             "deb.example_debian",
@@ -3447,6 +3710,19 @@ mod tests {
         unsafe {
             std::env::remove_var("OMG_TEST_MODE");
         }
+    }
+
+    #[test]
+    fn status_sizes_accept_mixed_line_endings_and_unicode_descriptions() {
+        let content = "Package: apt\r\nStatus: install ok installed\r\nDescription: café\r\nInstalled-Size: 4\r\n\r\nPackage: vim\nStatus: install ok installed\nDescription: 编辑器\nInstalled-Size: 3\n\nPackage: curl\r\nStatus: install ok installed\r\nInstalled-Size: 2";
+        assert_eq!(
+            packages_with_sizes_from_status(content).expect("valid mixed control file"),
+            vec![
+                ("apt".to_string(), 4 * 1024),
+                ("vim".to_string(), 3 * 1024),
+                ("curl".to_string(), 2 * 1024),
+            ]
+        );
     }
 
     #[test]
@@ -3948,7 +4224,7 @@ mod tests {
         let path = dir.path().join("test_Packages");
         std::fs::write(
             &path,
-            "Package: vim\nVersion: 1.0\n\nVersion: 2.0\n\nPackage: bash\nVersion: 1.0\n",
+            "Package: vim\nVersion: 1.0\nArchitecture: amd64\n\nVersion: 2.0\n\nPackage: bash\nVersion: 1.0\nArchitecture: amd64\n",
         )
         .expect("packages file");
         let error = parse_packages_file_sync(&path)
@@ -3965,7 +4241,7 @@ mod tests {
         let path = dir.path().join("test_Packages");
         std::fs::write(
             &path,
-            "Package: vim\nVersion: 1.0\n\nPackage: bash\nVersion: 1.0\n",
+            "Package: vim\nVersion: 1.0\nArchitecture: amd64\n\nPackage: bash\nVersion: 1.0\nArchitecture: amd64\n",
         )
         .expect("packages file");
         let packages = parse_packages_file_sync(&path).expect("valid Packages file");
@@ -3983,7 +4259,43 @@ mod tests {
             include_bytes!("../../../tests/data/xz-subset/apt-packages-sha256.xz"),
         )
         .expect("write APT Packages index");
-        let packages = parse_packages_file_sync(&path).expect("decode SHA-256 checked index");
+        let original =
+            read_packages_file_content(&path).expect("decode original SHA-256 checked index");
+        assert_eq!(original, "Package: fixture\nVersion: 1.0\n\n");
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(
+                    "../../../tests/data/xz-subset/apt-packages-sha256.xz"
+                ))
+            ),
+            "29b0e2a1d69f434d4c78d078ee339da6f001141550b5328329f7b16d20b7f5da"
+        );
+        // The historical decoder fixture omits Architecture. A separate complete
+        // SHA256-XZ fixture exercises strict record parsing without changing it.
+        let complete = dir.path().join("complete_Packages.xz");
+        let complete_bytes: &[u8] = &[
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x0a, 0xe1, 0xfb, 0x0c, 0xa1, 0x02, 0x00,
+            0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x74, 0x2f, 0xe5, 0xa3, 0x01, 0x00, 0x32, 0x50,
+            0x61, 0x63, 0x6b, 0x61, 0x67, 0x65, 0x3a, 0x20, 0x66, 0x69, 0x78, 0x74, 0x75, 0x72,
+            0x65, 0x0a, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x3a, 0x20, 0x31, 0x2e, 0x30,
+            0x0a, 0x41, 0x72, 0x63, 0x68, 0x69, 0x74, 0x65, 0x63, 0x74, 0x75, 0x72, 0x65, 0x3a,
+            0x20, 0x61, 0x6d, 0x64, 0x36, 0x34, 0x0a, 0x0a, 0x00, 0x00, 0xce, 0x0c, 0x99, 0x26,
+            0xfa, 0x61, 0x72, 0xf5, 0x1a, 0x0c, 0xd7, 0x55, 0xec, 0xcf, 0xc9, 0x77, 0x3a, 0xe9,
+            0x30, 0xfc, 0x95, 0x7b, 0x57, 0xe5, 0xd8, 0xe2, 0x8c, 0x55, 0xb8, 0x31, 0xb7, 0x94,
+            0x00, 0x01, 0x63, 0x33, 0x59, 0xec, 0x86, 0xd1, 0x18, 0x9b, 0x4b, 0x9a, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x0a, 0x59, 0x5a,
+        ];
+        assert_eq!(
+            format!("{:x}", Sha256::digest(complete_bytes)),
+            "31a8db8fe67dc3747594c1f7e2ed54d4e891bab408427b9c29facd9f6a404823"
+        );
+        std::fs::write(&complete, complete_bytes).expect("write complete SHA-256 index");
+        assert_eq!(
+            read_packages_file_content(&complete).expect("decode complete index"),
+            original.replace("Version: 1.0\n", "Version: 1.0\nArchitecture: amd64\n")
+        );
+        let packages = parse_packages_file_sync(&complete).expect("decode SHA-256 checked index");
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "fixture");
     }
@@ -4161,5 +4473,261 @@ mod tests {
         let flat = Path::new("/var/lib/apt/lists/some-repo_amd64_Packages");
         assert_eq!(extract_suite_from_path(flat), "");
         assert_eq!(extract_source_key_from_path(flat), "");
+    }
+}
+
+#[cfg(test)]
+mod native_validation_tests {
+    use super::*;
+    use std::io::Write;
+
+    const PACKAGE: &str =
+        "Package: fixture\nVersion: 1\nArchitecture: amd64\nDescription: fixture\n";
+    const STATUS: &str =
+        "Package: fixture\nVersion: 1\nArchitecture: amd64\nStatus: hold ok installed\n";
+
+    #[test]
+    fn packages_require_complete_unique_case_insensitive_identities() -> Result<()> {
+        for field in [
+            "Package: fixture\n",
+            "Version: 1\n",
+            "Architecture: amd64\n",
+        ] {
+            assert!(parse_packages_paragraph(&PACKAGE.replace(field, ""), "", "", "").is_err());
+            assert!(
+                parse_packages_paragraph(
+                    &format!("{PACKAGE}{}", field.to_ascii_lowercase()),
+                    "",
+                    "",
+                    ""
+                )
+                .is_err()
+            );
+            let (name, _) = field.split_once(':').context("fixture field")?;
+            assert!(
+                parse_packages_paragraph(
+                    &PACKAGE.replace(field, &format!("{name}:\n")),
+                    "",
+                    "",
+                    ""
+                )
+                .is_err()
+            );
+        }
+        let package = parse_packages_paragraph(&PACKAGE.to_ascii_lowercase(), "", "", "")?
+            .context("case-insensitive record")?;
+        assert_eq!(
+            (
+                package.name.as_str(),
+                package.version.as_str(),
+                package.architecture.as_str()
+            ),
+            ("fixture", "1", "amd64")
+        );
+        assert!(parse_packages_paragraph("\n", "", "", "")?.is_none());
+        assert!(parse_packages_paragraph("Package: fixture\n", "", "", "").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_syntax_is_rejected_before_status_filtering() {
+        for status in [
+            "hold ok installed",
+            "deinstall ok config-files",
+            "purge ok not-installed",
+        ] {
+            let record = STATUS.replace("hold ok installed", status);
+            for corrupt in [
+                format!("{record}garbage\n"),
+                format!(" continuation\n{record}"),
+                format!("{record}status: purge ok not-installed\n"),
+                record.replace("Package: fixture\n", ""),
+                record.replace("Architecture: amd64\n", "Architecture:\n"),
+                record.replace("Package: fixture\n", "Package: fixture\n continued\n"),
+            ] {
+                assert!(
+                    parse_security_inventory(&corrupt).is_err(),
+                    "accepted {corrupt:?}"
+                );
+            }
+        }
+        assert!(parse_security_inventory(&STATUS.replace("Version: 1\n", "")).is_err());
+    }
+
+    #[test]
+    fn extension_fields_follow_policy_name_grammar() -> Result<()> {
+        validate_deb822_fields("X.Custom!: value\nX_Alternate: value\n")?;
+        for field in ["#Comment", "-Leading", "With Space", "With\u{7f}Control"] {
+            assert!(validate_deb822_fields(&format!("{field}: value\n")).is_err());
+        }
+        assert!(validate_deb822_fields("X.Custom: value\nx.custom: duplicate\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn status_tombstones_and_legacy_config_files_keep_state_specific_fields() -> Result<()> {
+        let tombstone = "Package: fixture\nStatus: purge ok not-installed\n";
+        assert!(parse_security_inventory(tombstone)?.is_empty());
+        let config = "Package: fixture\nStatus: deinstall ok config-files\nVersion: 1\n";
+        assert!(parse_security_inventory(config)?.is_empty());
+        assert!(parse_security_inventory(&config.replace("Version: 1\n", "")).is_err());
+        for record in [tombstone, config] {
+            for invalid in [
+                "Architecture:\n",
+                "Version:\n",
+                "Architecture: amd64 i386\n",
+                "Multi-Arch: same\n",
+            ] {
+                assert!(parse_security_inventory(&format!("{record}{invalid}")).is_err());
+            }
+        }
+        assert!(parse_security_inventory(&STATUS.replace("Architecture: amd64\n", "")).is_err());
+        assert!(
+            parse_security_inventory(&format!(
+                "{}Multi-Arch: same\n",
+                STATUS.replace("amd64", "all")
+            ))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validated_status_preserves_filtered_and_held_semantics() -> Result<()> {
+        let removed = "Package: removed\nArchitecture: amd64\nStatus: purge ok not-installed\n";
+        let config = STATUS.replace("hold ok installed", "deinstall ok config-files");
+        let contents = format!("{STATUS}\n{removed}\n{config}");
+        let rows = parse_security_inventory(&contents)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "fixture");
+        assert_eq!(rows[0].version, "1");
+        assert_eq!(
+            parse_security_inventory(&contents.replace('\n', "\r\n"))?.len(),
+            1
+        );
+        assert!(parse_security_inventory(&format!("{STATUS}\n{STATUS}")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_snapshots_enforce_exact_input_and_output_limits() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("fixture_Packages");
+        fs::write(&path, b"12345")?;
+        assert_eq!(read_native_bytes(&path, 5)?, b"12345");
+        assert!(read_native_bytes(&path, 4).is_err());
+        assert_eq!(read_decoded_bytes(b"12345".as_slice(), 5)?, b"12345");
+        assert!(read_decoded_bytes(b"12345".as_slice(), 4).is_err());
+        fs::write(&path, [0xff])?;
+        assert!(read_native_text(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_snapshots_refuse_symlinks_directories_and_fifos() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("status");
+        fs::write(&path, STATUS)?;
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&path, &link)?;
+        assert!(validate_native_status(&link).is_err());
+        assert!(validate_native_status(root.path()).is_err());
+        let fifo = root.path().join("fifo");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        assert!(validate_native_status(&fifo).is_err());
+        Ok(())
+    }
+
+    fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes)?;
+        Ok(encoder.finish()?)
+    }
+
+    #[test]
+    fn gzip_validates_every_member_and_rejects_truncation_and_tails() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("fixture_Packages.gz");
+        let first = gzip(format!("{PACKAGE}\n").as_bytes())?;
+        let second = gzip(format!("{}\n", PACKAGE.replace("fixture", "second")).as_bytes())?;
+        let mut both = first.clone();
+        both.extend_from_slice(&second);
+        fs::write(&path, &both)?;
+        assert_eq!(parse_packages_file_sync(&path)?.len(), 1 + 1);
+        for size in 0..first.len() {
+            fs::write(&path, &first[..size])?;
+            assert!(
+                read_packages_file_content(&path).is_err(),
+                "accepted gzip prefix {size}"
+            );
+        }
+        both.extend_from_slice(b"garbage");
+        fs::write(&path, &both)?;
+        assert!(read_packages_file_content(&path).is_err());
+        let expanded = gzip(&vec![b'a'; 256])?;
+        assert!(expanded.len() < 64);
+        fs::write(&path, &expanded)?;
+        assert!(read_packages_file_content_with_limit(&path, 64).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lz4_requires_complete_frames_and_validates_every_frame() -> Result<()> {
+        let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+        encoder.write_all(PACKAGE.as_bytes())?;
+        let frame = encoder.finish()?;
+        assert_eq!(decode_complete_lz4(&frame, 4096)?, PACKAGE.as_bytes());
+        for size in 0..frame.len() {
+            assert!(
+                decode_complete_lz4(&frame[..size], 4096).is_err(),
+                "accepted LZ4 prefix {size}"
+            );
+        }
+        let mut both = frame.clone();
+        both.extend_from_slice(&frame);
+        assert_eq!(decode_complete_lz4(&both, 4096)?.len(), PACKAGE.len() * 2);
+        both.push(0);
+        assert!(decode_complete_lz4(&both, 4096).is_err());
+        assert!(decode_complete_lz4(&frame, PACKAGE.len() as u64 - 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_index_set_enforces_an_aggregate_budget() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("a_Packages"), PACKAGE)?;
+        fs::write(root.path().join("b_Packages"), PACKAGE)?;
+        validate_native_packages_with_limit(root.path(), PACKAGE.len() as u64 * 2)?;
+        assert!(
+            validate_native_packages_with_limit(root.path(), PACKAGE.len() as u64 * 2 - 1).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_validation_reads_every_index_and_never_builds_cache() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let status = root.path().join("status");
+        let lists = root.path().join("lists");
+        fs::create_dir(&lists)?;
+        fs::write(&status, STATUS)?;
+        validate_native_status(&status)?;
+        assert!(validate_native_packages(&lists).is_err());
+        let first = lists.join("a_Packages");
+        let second = lists.join("b_Packages.gz");
+        fs::write(&first, "")?;
+        validate_native_packages(&lists)?;
+        fs::write(&second, gzip(PACKAGE.as_bytes())?)?;
+        validate_native_packages(&lists)?;
+        fs::write(&second, b"corrupt")?;
+        assert!(validate_native_packages(&lists).is_err());
+        fs::write(&status, "")?;
+        assert!(validate_native_status(&status).is_err());
+        assert_eq!(fs::read_dir(root.path())?.count(), 2);
+        assert_eq!(fs::read_dir(&lists)?.count(), 2);
+        Ok(())
     }
 }

@@ -38,6 +38,14 @@ pub async fn clean(
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
+    let backend = crate::package_managers::resolve_backend()?;
+    if backend == crate::package_managers::Backend::Mock {
+        return clean_mock(orphans, cache, aur, all, dry_run);
+    }
+    anyhow::ensure!(
+        backend != crate::package_managers::Backend::MacOS,
+        "Package cleanup is not implemented for the Homebrew backend"
+    );
     if dry_run {
         crate::cli::modern_ui::print_phase_header("🧹", "Clean Preview", "dry run");
     } else {
@@ -51,7 +59,7 @@ pub async fn clean(
     }
 
     #[cfg(feature = "fedora")]
-    if crate::package_managers::get_package_manager()?.name() == "dnf" {
+    if backend == crate::package_managers::Backend::Fedora {
         if aur {
             anyhow::bail!("AUR cleanup is not available on Fedora");
         }
@@ -69,12 +77,12 @@ pub async fn clean(
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if is_debian_like() {
-        #[cfg(feature = "debian-pure")]
+        #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
         {
             return handle_debian_pure_clean(orphans, cache, all, dry_run, yes).await;
         }
 
-        #[cfg(all(feature = "debian", not(feature = "debian-pure")))]
+        #[cfg(feature = "debian")]
         {
             if apt_cleanup_requests_unsupported_work(cache, aur, all) {
                 anyhow::bail!("Cache and AUR cleanup are not supported on the APT backend");
@@ -129,7 +137,11 @@ pub async fn clean(
     // not Debian-like: there is no Debian package database here to clean.
     // (With the Arch backend also compiled in, execution continues into the
     // Arch-capable block below instead.)
-    #[cfg(all(feature = "debian-pure", not(feature = "arch")))]
+    #[cfg(all(
+        feature = "debian-pure",
+        not(feature = "arch"),
+        not(feature = "debian")
+    ))]
     {
         anyhow::bail!(
             "Clean requires a Debian-like system (or an Arch-enabled build); \
@@ -137,7 +149,7 @@ pub async fn clean(
         );
     }
 
-    #[cfg(any(feature = "arch", not(feature = "debian-pure")))]
+    #[cfg(any(feature = "arch", feature = "debian", not(feature = "debian-pure")))]
     {
         let do_orphans = orphans || all;
         let do_cache = cache || all;
@@ -328,6 +340,60 @@ pub async fn clean(
         }
         Ok(())
     }
+}
+
+fn clean_mock(orphans: bool, cache: bool, aur: bool, all: bool, dry_run: bool) -> Result<()> {
+    use crate::core::env::distro::{Distro, detect_distro};
+
+    let distro = detect_distro();
+    let requested = orphans || cache || aur || all;
+    if requested {
+        anyhow::ensure!(
+            dry_run,
+            "Mock cleanup cannot mutate native package databases or caches; use --dry-run"
+        );
+    }
+    match distro {
+        Distro::Arch => {}
+        Distro::Debian | Distro::Ubuntu => {
+            anyhow::ensure!(
+                !(cache || aur || all),
+                "Cache and AUR cleanup are not supported on the APT backend"
+            );
+        }
+        Distro::Fedora => {
+            anyhow::ensure!(!aur, "AUR cleanup is not available on Fedora");
+        }
+        Distro::MacOS => anyhow::bail!("Package cleanup is not implemented for Homebrew"),
+        Distro::Unknown => anyhow::bail!("Package cleanup requires a supported distribution"),
+    }
+
+    if !requested {
+        println!("Mock cleanup preview; use --orphans, --cache, or --all with --dry-run");
+        return Ok(());
+    }
+    crate::cli::modern_ui::print_phase_header("🧹", "Clean Preview", "dry run");
+    println!();
+    if orphans || all {
+        println!(
+            "  {} Would remove orphan packages (mock has no dependency graph)",
+            style::accent("→")
+        );
+    }
+    if cache || all {
+        println!(
+            "  {} Would clear package cache (mock has no native archives)",
+            style::accent("→")
+        );
+    }
+    if aur || (all && distro == Distro::Arch) {
+        println!(
+            "  {} Would clean AUR build directories (mock has no AUR cache)",
+            style::accent("→")
+        );
+    }
+    println!("  {} No changes made (dry run)", style::info("ℹ"));
+    Ok(())
 }
 
 #[cfg(feature = "fedora")]
@@ -539,10 +605,16 @@ mod tests {
         let error = clean(true, false, false, false, false, true)
             .await
             .expect_err("orphan removal with no backend must not look like success");
+        let expected = match crate::package_managers::resolve_backend() {
+            Ok(crate::package_managers::Backend::MacOS) => {
+                "Package cleanup is not implemented for the Homebrew backend".to_string()
+            }
+            Err(error) => error.to_string(),
+            Ok(_) => "not available without an Arch or Debian package backend".to_string(),
+        };
         assert!(
-            error
-                .to_string()
-                .contains("not available without an Arch or Debian package backend")
+            error.to_string().contains(&expected),
+            "selected backend must fail with its own unsupported-operation cause: {error}"
         );
     }
 
@@ -557,10 +629,16 @@ mod tests {
         let error = clean(false, true, false, false, false, true)
             .await
             .expect_err("cache cleanup with no backend must not look like success");
+        let expected = match crate::package_managers::resolve_backend() {
+            Ok(crate::package_managers::Backend::MacOS) => {
+                "Package cleanup is not implemented for the Homebrew backend".to_string()
+            }
+            Err(error) => error.to_string(),
+            Ok(_) => "not available without a package manager backend".to_string(),
+        };
         assert!(
-            error
-                .to_string()
-                .contains("not available without a package manager backend")
+            error.to_string().contains(&expected),
+            "selected backend must fail with its own unsupported-operation cause: {error}"
         );
     }
 
@@ -570,11 +648,15 @@ mod tests {
         let error = clean(false, false, true, false, false, true)
             .await
             .expect_err("AUR cleanup without the Arch backend must not look like success");
-        // Debian-like hosts hit the earlier host-specific bail
-        // ("…on Debian-like systems"); others hit the backend bail.
-        // Both fail closed and share this prefix.
+        let expected = match crate::package_managers::resolve_backend() {
+            Ok(crate::package_managers::Backend::MacOS) => {
+                "Package cleanup is not implemented for the Homebrew backend".to_string()
+            }
+            Err(error) => error.to_string(),
+            Ok(_) => "AUR cleanup is not available".to_string(),
+        };
         assert!(
-            error.to_string().contains("AUR cleanup is not available"),
+            error.to_string().contains(&expected),
             "AUR cleanup without Arch must fail closed; got: {error}"
         );
     }

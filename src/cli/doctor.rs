@@ -61,17 +61,30 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     let distro = detected_distro();
     let arch_backend = matches!(distro, Distro::Arch);
 
-    // 1. OS Check — every supported backend distro is healthy; only an
-    //    unsupported system is an issue (W3-A-02: a supported Debian system
-    //    must not be reported as permanently unhealthy).
-    if let Some(label) = supported_distro_label(distro) {
-        println!("  {}", style::success(label));
-    } else {
-        println!(
-            "  {}",
-            style::warning("Unsupported system detected (no package-manager backend)")
-        );
-        issues += 1;
+    // 1. OS and compiled backend must agree. A copied binary with the wrong
+    //    feature set must not advertise a healthy package manager.
+    match crate::package_managers::resolve_backend() {
+        Ok(_) => {
+            if let Some(label) = supported_distro_label(distro) {
+                println!("  {}", style::success(label));
+            } else {
+                println!(
+                    "  {}",
+                    style::warning("Unsupported system detected (no package-manager backend)")
+                );
+                issues += 1;
+            }
+        }
+        Err(error) => {
+            println!(
+                "  {} Package backend unavailable: {error}",
+                style::error("✗")
+            );
+            issues += 1;
+            // Native infrastructure checks are meaningful only when this
+            // binary can actually operate the detected host backend.
+            return finish_doctor(issues, warnings);
+        }
     }
 
     // 2. Internet Connectivity (basic check)
@@ -293,6 +306,7 @@ fn supported_distro_label(distro: Distro) -> Option<&'static str> {
 /// the name carries `_Packages` and the encoding is one
 /// `package_managers::debian_db` reads (uncompressed, lz4, gz, xz).
 /// InRelease metadata, lock files, and pdiff fragments do not count.
+#[cfg(test)]
 fn is_apt_packages_index(path: &std::path::Path) -> bool {
     let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -301,6 +315,7 @@ fn is_apt_packages_index(path: &std::path::Path) -> bool {
 }
 
 /// Whether a lists directory holds at least one parseable package index.
+#[cfg(test)]
 fn apt_lists_have_packages(lists: &std::path::Path) -> bool {
     lists.is_dir()
         && std::fs::read_dir(lists).is_ok_and(|entries| {
@@ -310,48 +325,57 @@ fn apt_lists_have_packages(lists: &std::path::Path) -> bool {
         })
 }
 
-/// Check the Debian/Ubuntu infrastructure the apt backend actually depends
-/// on (W3-A-02): the dpkg status database and the APT package indexes that
-/// `package_managers::debian_db` parses directly. No other infrastructure is
-/// invented; repo reachability for apt is exactly these on-disk indexes.
+/// Check content from one bounded, read-only snapshot per native input.
 fn check_debian_infra() -> usize {
     if crate::core::paths::test_mode() {
-        // Hermetic like the other checks: report healthy under test mode.
         return 0;
     }
-
-    let mut issues = 0;
-
-    let status = std::path::Path::new("/var/lib/dpkg/status");
-    if status.exists() {
-        println!(
-            "  {}",
-            style::success("dpkg package database (/var/lib/dpkg/status)")
-        );
-    } else {
-        println!(
-            "  {}",
-            style::error("dpkg package database missing (/var/lib/dpkg/status)")
-        );
-        issues += 1;
+    #[cfg(any(feature = "debian", feature = "debian-pure"))]
+    {
+        check_debian_infra_at(
+            std::path::Path::new("/var/lib/dpkg/status"),
+            std::path::Path::new("/var/lib/apt/lists"),
+        )
     }
-
-    let lists = std::path::Path::new("/var/lib/apt/lists");
-    let has_indexes = apt_lists_have_packages(lists);
-    if has_indexes {
+    #[cfg(not(any(feature = "debian", feature = "debian-pure")))]
+    {
         println!(
-            "  {}",
-            style::success("APT package indexes (/var/lib/apt/lists)")
-        );
-    } else {
-        println!(
-            "  {} APT package indexes missing or empty (/var/lib/apt/lists) — run 'sudo apt-get update'",
+            "  {} Debian index validation is unavailable in this binary",
             style::error("✗")
         );
-        issues += 1;
+        1
     }
+}
 
+#[cfg(any(feature = "debian", feature = "debian-pure"))]
+fn check_debian_infra_at(status: &std::path::Path, lists: &std::path::Path) -> usize {
+    let mut issues = 0;
+    for (label, path, result) in [
+        (
+            "dpkg package database",
+            status,
+            crate::package_managers::debian_db::db::validate_native_status(status),
+        ),
+        (
+            "APT package indexes",
+            lists,
+            crate::package_managers::debian_db::db::validate_native_packages(lists),
+        ),
+    ] {
+        match result {
+            Ok(()) => println!("  {}", style::success(&debian_health_label(label, path))),
+            Err(error) => {
+                println!("  {} {label}: {error:#}", style::error("✗"));
+                issues += 1;
+            }
+        }
+    }
     issues
+}
+
+#[cfg(any(feature = "debian", feature = "debian-pure"))]
+fn debian_health_label(label: &str, path: &std::path::Path) -> String {
+    format!("{label} ({})", path.display())
 }
 
 /// Check the tools and local package database used by the Fedora backend.
@@ -610,6 +634,7 @@ async fn query_homebrew_path(
 /// server/config — see #299), so the compression suffix must be stripped
 /// before testing the `_Packages` stem. `InRelease`/`Release` files alone
 /// are not indexes.
+#[cfg(test)]
 fn apt_lists_entry_has_index(file_name: &str) -> bool {
     file_name.ends_with("_Packages")
         || file_name.rsplit_once('.').is_some_and(|(name, encoding)| {
@@ -2213,5 +2238,86 @@ mod tests {
         let doctor_issues = probe().await;
         assert_eq!(doctor_issues, 1);
         assert!(finish_doctor(doctor_issues, 0).is_err());
+    }
+}
+
+#[cfg(all(test, any(feature = "debian", feature = "debian-pure")))]
+mod debian_native_health_tests {
+    use super::check_debian_infra_at;
+
+    #[test]
+    fn debian_health_labels_satisfy_the_guest_output_oracle() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let output_path = root.path().join("doctor.out");
+        let release_path = root.path().join("os-release");
+        let source = include_str!("../../scripts/qemu-inventory.sh");
+        let (_, oracle) = source.split_once("# BEGIN DOCTOR BACKEND ORACLE").unwrap();
+        let (oracle, _) = oracle.split_once("# END DOCTOR BACKEND ORACLE").unwrap();
+        let command = format!("{oracle}\ncheck_doctor_native_backend \"$1\" \"$2\" \"$3\"\n");
+        for distro in ["debian", "ubuntu"] {
+            std::fs::write(&release_path, format!("ID={distro}\n"))?;
+            let prefix = "  Debian/Ubuntu detected (apt backend)\n  Found dependency: sudo\n  Found dependency: apt-get\n";
+            let healthy = format!(
+                "{prefix}  {}\n  {}\n",
+                super::debian_health_label(
+                    "dpkg package database",
+                    std::path::Path::new("/var/lib/dpkg/status")
+                ),
+                super::debian_health_label(
+                    "APT package indexes",
+                    std::path::Path::new("/var/lib/apt/lists")
+                ),
+            );
+            for (text, expected_success) in [
+                (healthy, true),
+                (
+                    format!("{prefix}  dpkg package database\n  APT package indexes\n"),
+                    false,
+                ),
+            ] {
+                std::fs::write(&output_path, text)?;
+                let result = std::process::Command::new("bash")
+                    .args(["-c", &command, "_", distro])
+                    .arg(&output_path)
+                    .arg(&release_path)
+                    .current_dir(root.path())
+                    .output()?;
+                assert_eq!(
+                    result.status.success(),
+                    expected_success,
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+        assert_eq!(
+            super::debian_health_label("APT package indexes", root.path()),
+            format!("APT package indexes ({})", root.path().display())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn debian_health_counts_content_errors_not_just_paths() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let status = root.path().join("status");
+        let lists = root.path().join("lists");
+        std::fs::create_dir(&lists)?;
+        let index = lists.join("mirror_Packages");
+        std::fs::write(
+            &status,
+            "Package: fixture\nVersion: 1\nArchitecture: amd64\nStatus: hold ok installed\n",
+        )?;
+        std::fs::write(&index, "")?;
+        assert_eq!(check_debian_infra_at(&status, &lists), 0);
+        std::fs::write(&status, "garbage")?;
+        assert_eq!(check_debian_infra_at(&status, &lists), 1);
+        std::fs::write(&index, "Package: fixture\n")?;
+        assert_eq!(check_debian_infra_at(&status, &lists), 2);
+        std::fs::remove_file(&index)?;
+        std::fs::create_dir(&index)?;
+        assert_eq!(check_debian_infra_at(&status, &lists), 2);
+        assert!(super::finish_doctor(2, 0).is_err());
+        Ok(())
     }
 }

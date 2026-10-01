@@ -6,12 +6,8 @@ use super::dispatch_backend;
 
 #[cfg(feature = "arch")]
 mod arch;
-#[cfg(any(feature = "debian", feature = "debian-pure"))]
+#[cfg(feature = "debian")]
 mod debian;
-#[cfg(all(
-    not(feature = "arch"),
-    not(any(feature = "debian", feature = "debian-pure"))
-))]
 mod generic;
 
 /// Remove packages.
@@ -50,6 +46,10 @@ pub async fn remove(packages: &[String], recursive: bool, yes: bool, dry_run: bo
 // reject unsupported recursion. Keep one cross-feature contract at the call site.
 #[cfg_attr(feature = "arch", allow(clippy::unnecessary_wraps))]
 fn validate_removal_mode(recursive: bool) -> Result<()> {
+    #[cfg(feature = "arch")]
+    if super::mock_arch_backend()? {
+        return Ok(());
+    }
     dispatch_backend! {
         debian: {
             anyhow::ensure!(!recursive, "Recursive removal is not supported by the Debian backend");
@@ -106,6 +106,10 @@ async fn remove_packages(packages: &[String], recursive: bool) -> Result<()> {
     )
 )]
 async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> {
+    #[cfg(feature = "arch")]
+    if super::mock_arch_backend()? {
+        return arch::remove_dry_run(packages, recursive);
+    }
     dispatch_backend! {
         debian: { debian::remove_dry_run(packages); Ok(()) },
         arch: { arch::remove_dry_run(packages, recursive) },
@@ -115,7 +119,17 @@ async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_removal_mode;
+    use super::{remove, validate_removal_mode};
+
+    #[tokio::test]
+    async fn removal_targets_are_validated_before_backend_dispatch() {
+        for recursive in [false, true] {
+            let error = remove(&["invalid\nname".to_string()], recursive, true, true)
+                .await
+                .expect_err("invalid removal target must fail before backend selection");
+            assert!(error.to_string().contains("Invalid package name"));
+        }
+    }
 
     #[cfg(feature = "arch")]
     #[test]
@@ -127,6 +141,14 @@ mod tests {
     #[cfg(not(feature = "arch"))]
     #[test]
     fn unsupported_backends_reject_recursive_removal() {
+        if let Err(selection_error) = crate::package_managers::resolve_backend() {
+            for recursive in [false, true] {
+                let error = validate_removal_mode(recursive)
+                    .expect_err("a missing live backend must refuse every removal mode");
+                assert_eq!(error.to_string(), selection_error.to_string());
+            }
+            return;
+        }
         validate_removal_mode(false).unwrap();
         let error = validate_removal_mode(true).unwrap_err();
         assert!(
