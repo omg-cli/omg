@@ -346,6 +346,7 @@ fn test_dry_run_missing_package_fails_with_reason() {
 }
 
 /// Package/config bytes must survive; unresolved lookups create no transaction.
+#[derive(Clone, Copy)]
 enum FailureFixture {
     MockMissing,
     AurTransport,
