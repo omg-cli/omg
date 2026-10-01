@@ -36,10 +36,15 @@ permissions:
 
 jobs:
   docker-e2e:
+    if: github.ref != 'refs/heads/main'
+    permissions:
+      contents: read
+    env:
+      CACHE_EXPORT: ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
-    steps:
+    steps: &docker_e2e_steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -66,6 +71,16 @@ jobs:
           printf 'revision=%s\nnative-refresh=%s\n' "$GITHUB_SHA" "$native_refresh" \
             > "$RUNNER_TEMP/docker-e2e-evidence/build.txt"
 
+      - name: Authenticate cache registry
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$REGISTRY_USER" --password-stdin
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -81,9 +96,7 @@ jobs:
           labels: org.opencontainers.image.revision=${{ github.sha }}
           build-args: NATIVE_REFRESH=${{ steps.evidence.outputs.native-refresh }}
           cache-from: type=gha,version=2,scope=docker-e2e-arch
-          # PR merge-ref caches cannot warm main. Preserve all intermediate
-          # dependency layers on main without duplicating them for every PR.
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,version=2,scope=docker-e2e-arch,mode=max' || '' }}
+          cache-to: ${{ env.CACHE_EXPORT }}
           no-cache: ${{ github.event_name == 'schedule' || inputs.cold_cache == true }}
 
       - name: Verify image provenance
@@ -109,6 +122,11 @@ jobs:
           OMG_RUN_DOCKER_TESTS: "1"
           OMG_DOCKER_IMAGE: ${{ steps.image.outputs.imageid }}
 
+      - name: Clear registry credentials
+        if: always() && github.ref == 'refs/heads/main'
+        shell: bash
+        run: docker logout ghcr.io
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -117,3 +135,16 @@ jobs:
           path: ${{ runner.temp }}/docker-e2e-evidence/
           retention-days: 14
           if-no-files-found: warn
+
+  docker-e2e-main:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CACHE_EXPORT: |
+        type=gha,version=2,scope=docker-e2e-arch,mode=max
+        type=registry,ref=ghcr.io/omg-cli/omg-buildcache:arch-e2e,mode=max
+    steps: *docker_e2e_steps
