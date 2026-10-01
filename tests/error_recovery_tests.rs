@@ -150,11 +150,51 @@ fn test_parallel_builder_self_dependency_is_rejected_as_circular() {
 
 pub mod common;
 
-use common::{run_omg, run_omg_with_env};
+use common::{TestProject, run_omg, run_omg_with_env};
+
+#[path = "support/recovery_fixture.rs"]
+mod recovery_fixture;
+use recovery_fixture::{RejectedProxy, seed_missing_aur_index};
+
+fn missing_dry_run(name: &str) -> common::CommandResult {
+    let project = TestProject::for_distro("arch");
+    let proxy = RejectedProxy::new();
+    seed_missing_aur_index(&project, name);
+    let result = project.run_with_env(&["install", "--dry-run", name], &proxy.env());
+    assert_eq!(result.exit_code, 1, "{}", result.combined_output());
+    result.assert_stderr_contains("Package not found in AUR");
+    assert!(!result.combined_output().contains("transport failed"));
+    assert_eq!(
+        proxy.requests(),
+        0,
+        "missing rejection consulted a live index"
+    );
+    project.close_checked();
+    result
+}
+
+struct PersistentBytes {
+    packages: Vec<u8>,
+    config: Vec<u8>,
+}
+
+impl PersistentBytes {
+    fn capture(packages: &std::path::Path, config: &std::path::Path) -> Self {
+        Self {
+            packages: std::fs::read(packages).unwrap(),
+            config: std::fs::read(config).unwrap(),
+        }
+    }
+
+    fn matches(&self, packages: &std::path::Path, config: &std::path::Path) -> bool {
+        std::fs::read(packages).is_ok_and(|bytes| bytes == self.packages)
+            && std::fs::read(config).is_ok_and(|bytes| bytes == self.config)
+    }
+}
 
 #[test]
 fn test_dry_run_missing_package_fails_with_reason() {
-    let result = run_omg(&["install", "--dry-run", "nonexistent-pkg-xyz-12345"]);
+    let result = missing_dry_run("nonexistent-pkg-xyz-12345");
     let combined = result.combined_output();
 
     assert!(
@@ -168,23 +208,66 @@ fn test_dry_run_missing_package_fails_with_reason() {
     );
 }
 
+/// Package/config bytes must survive; unresolved lookups create no transaction.
+fn assert_failed_install_recovers(seed_index: bool) {
+    let project = TestProject::for_distro("arch");
+    let proxy = RejectedProxy::new();
+    let env = proxy.env();
+    project.mock_install("sentinel-package", "1.2.3").unwrap();
+    project.mock_available("recovery-package", "4.5.6").unwrap();
+    project
+        .run_with_env(&["config", "set", "aur.build_concurrency", "2"], &env)
+        .assert_success();
+    if seed_index {
+        seed_missing_aur_index(&project, "fake-package-xyz");
+    }
+    let package_state = project.data_dir.path().join("mock_state_pacman.json");
+    let config = project.config_dir.path().join("config.toml");
+    let before = PersistentBytes::capture(&package_state, &config);
+    assert!(!project.data_dir.path().join("history.json").exists());
+    let result = project.run_with_env(&["install", "-y", "fake-package-xyz", "fake-pkg-2"], &env);
+    assert_eq!(result.exit_code, 1, "{}", result.combined_output());
+    if seed_index {
+        result.assert_stderr_contains("Package not found in official repos");
+        assert!(!result.combined_output().contains("transport failed"));
+        assert_eq!(proxy.requests(), 0, "cached missing lookup reached network");
+    } else {
+        result.assert_stderr_contains("AUR RPC transport failed");
+        result.assert_stderr_contains("fake-package-xyz");
+        assert!(!result.combined_output().contains("not found"));
+        assert!(proxy.requests() > 0, "transport fault was not exercised");
+    }
+    assert!(before.matches(&package_state, &config));
+    let history = omg_lib::core::history::HistoryManager::new_in(
+        project.data_dir.path().join("history.json"),
+    )
+    .unwrap()
+    .load()
+    .unwrap();
+    assert!(
+        history.is_empty(),
+        "lookup-only failure must not invent a transaction"
+    );
+    assert!(!project.data_dir.path().join("history.json").exists());
+    // This package exists ONLY in the persisted state, not in the stock mock.
+    let recovery = project.run_with_env(&["install", "--dry-run", "recovery-package"], &env);
+    recovery.assert_success();
+    recovery.assert_stdout_contains("recovery-package");
+    recovery.assert_stdout_contains("4.5.6");
+    recovery.assert_stdout_contains("No changes will be made (dry run)");
+    assert!(before.matches(&package_state, &config));
+    assert!(!project.data_dir.path().join("history.json").exists());
+    project.close_checked();
+}
+
 #[test]
 fn test_install_missing_packages_fails_without_corrupting_state() {
-    let result = run_omg(&["install", "-y", "fake-package-xyz", "fake-pkg-2"]);
-    let combined = result.combined_output();
-    assert!(
-        !result.success && combined.contains("not found"),
-        "installing missing packages must fail with an explicit error: {combined}"
-    );
+    assert_failed_install_recovers(true);
+}
 
-    // The failed transaction must not poison subsequent operations: a dry run
-    // of an existing package still succeeds afterwards.
-    let recovery = run_omg(&["install", "--dry-run", "firefox"]);
-    assert!(
-        recovery.success,
-        "state after a failed install must stay usable: {}{}",
-        recovery.stdout, recovery.stderr
-    );
+#[test]
+fn test_install_transport_failure_preserves_state_and_recovers() {
+    assert_failed_install_recovers(false);
 }
 
 #[test]
@@ -221,11 +304,7 @@ fn test_malicious_package_names_are_rejected_with_reason() {
 
 #[test]
 fn test_cli_error_message_names_the_package() {
-    let result = run_omg(&[
-        "install",
-        "--dry-run",
-        "definitely-nonexistent-package-xyz123",
-    ]);
+    let result = missing_dry_run("definitely-nonexistent-package-xyz123");
     let combined = result.combined_output();
     assert!(
         !result.success,
@@ -245,9 +324,7 @@ fn test_concurrent_dry_runs_are_isolated_and_deterministic() {
     // With per-invocation data dirs, concurrent invocations cannot observe
     // each other's mock state; every missing package must fail identically.
     let handles: [_; 3] = std::array::from_fn(|i| {
-        thread::spawn(move || {
-            run_omg(&["install", "--dry-run", &format!("isolated-missing-pkg-{i}")])
-        })
+        thread::spawn(move || missing_dry_run(&format!("isolated-missing-pkg-{i}")))
     });
 
     for (i, handle) in handles.into_iter().enumerate() {
@@ -301,4 +378,57 @@ fn test_dry_run_never_prompts_for_password() {
         !combined.contains("[sudo]") && !combined.contains("Password:"),
         "Dry run should never prompt for password: {combined}"
     );
+}
+
+#[test]
+fn test_persistent_bytes_oracle_detects_corruption_and_disappearance() {
+    let directory = tempfile::tempdir().unwrap();
+    let packages = directory.path().join("packages.json");
+    let config = directory.path().join("config.toml");
+    std::fs::write(&packages, b"package-state").unwrap();
+    std::fs::write(&config, b"config-state").unwrap();
+    let before = PersistentBytes::capture(&packages, &config);
+    assert!(before.matches(&packages, &config));
+    std::fs::write(&packages, b"corrupt").unwrap();
+    assert!(!before.matches(&packages, &config));
+    std::fs::write(&packages, &before.packages).unwrap();
+    std::fs::write(&config, b"corrupt").unwrap();
+    assert!(!before.matches(&packages, &config));
+    std::fs::remove_file(&config).unwrap();
+    assert!(!before.matches(&packages, &config));
+    directory.close().unwrap();
+}
+
+#[test]
+fn test_proxy_policy_overrides_every_inherited_spelling_and_bypass() {
+    // Each subprocess inherits a conflicting setting; its real CLI child must
+    // still hit the allocated rejecting proxy and recover in the same state.
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        let value = if key.eq_ignore_ascii_case("no_proxy") {
+            "*"
+        } else {
+            "http://127.0.0.1:1"
+        };
+        let mut command = assert_cmd::Command::new(std::env::current_exe().unwrap());
+        command
+            .timeout(std::time::Duration::from_mins(1))
+            .args([
+                "--exact",
+                "test_install_transport_failure_preserves_state_and_recovers",
+                "--nocapture",
+            ])
+            .env(key, value);
+        let assertion = command.assert().success();
+        let output = String::from_utf8_lossy(&assertion.get_output().stdout);
+        assert!(output.contains("1 passed; 0 failed"), "{key}: {output}");
+    }
 }
