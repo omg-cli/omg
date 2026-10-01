@@ -21,7 +21,7 @@ RUN = r"run-[a-zA-Z0-9-]+"
 HOST_FILES = {
     "results.json", "sentry-results.json", "metadata.txt", "host-metadata.txt",
     "cleanup.log", "reporting.log", "reporting-status.json", "kvm-probe.log", "engine-preflight.log",
-    "controller-setup.log", "controller-security.log", "controller-pull.log", "image-setup.log", "boot.log", "guest-check.log",
+    "controller-setup.log", "controller-security.log", "controller-pull.log", "image-setup.log", "boot.log", "boot.diagnostics.log", "guest-check.log",
     "evidence-copy.log", "benchmark-validation.log", "transactions.log",
     "transaction-validation.log", "inventory.log",
     "guest-health.json", "controller-health.json", "controller-final-state.json", "health-validation.log",
@@ -150,13 +150,14 @@ def allowed_file(parts):
                         "expected-version.txt", "automatic-updates.log", "resume-disk.log",
                         "resume-serial.log", "resume-boot.log",
                         "resume-boot.qemu-startup.log",
+                        "resume-boot.diagnostics.log", "prepare-install-boot.diagnostics.log",
                         "prepare-install-boot.qemu-startup.log"} or re.fullmatch(
             r"(?:install|remove)-(?:base-check\.log|base-unchanged\.log|firmware\.sha256|"
             r"repository-state\.(?:log|sha256)|before\.tsv|manual-before\.names)"
             r"|(?:prepare|stop-prepared)-(?:install|remove)(?:-serial|-boot)?\.log", name
         ) is not None
     if len(parent) == 3 and parent[:2] == ("transactions", "trials"):
-        return name in {"disk-create.log", "serial.log", "boot.log", "boot.qemu-startup.log",
+        return name in {"disk-create.log", "serial.log", "boot.log", "boot.qemu-startup.log", "boot.diagnostics.log",
                         "guest.log", "copy.log",
                         "validation.log", "stop.log", "health.json", "health.log"}
     return benchmark_file(name) or (

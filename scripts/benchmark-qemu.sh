@@ -420,6 +420,7 @@ if [[ -n "$image_policy" ]]; then
 fi
 timeout 30 docker exec -w /work/guest "$controller" bash -c '"$1" --version; qemu-img info base.qcow2' _ "$qemu_bin" >> "$work/image-setup.log" 2>&1
 cp "$here/qemu-boot-budget.sh" "$work/qemu-boot-budget.sh"
+cp "$here/qemu-boot-diagnostics.sh" "$work/qemu-boot-diagnostics.sh"
 source "$work/qemu-boot-budget.sh"
 cat > "$work/boot.sh" <<'BOOT'
 #!/usr/bin/env bash
@@ -613,7 +614,10 @@ if [[ "$qemu_accel" == tcg ]]; then
   guest_timeout=2400
 fi
 printf 'boot_timeout=%s guest_timeout=%s\n' "$boot_timeout" "$guest_timeout" >> "$work/metadata.txt"
-timeout --kill-after=5s "$boot_timeout" docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1
+boot_rc=0
+timeout --kill-after=5s "$boot_timeout" docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1 || boot_rc=$?
+timeout --kill-after=2s 3s docker exec "$controller" bash /work/qemu-boot-diagnostics.sh > "$work/boot.diagnostics.log" 2>&1 || printf 'Boot diagnostics unavailable\n' >> "$work/boot.diagnostics.log"
+[[ "$boot_rc" == 0 ]] || exit "$boot_rc"
 if [[ -n "$inventory_tiers" ]]; then
   # The inventory executor runs inside the controller (same netns as the
   # guest); /work is bind-mounted there.

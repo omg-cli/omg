@@ -98,6 +98,7 @@ start_clone() {
   rm -f -- qemu-startup.log
   # The aggregate includes every sequential clone phase and diagnostics.
   timeout --kill-after=5s "$clone_boot_timeout" bash /work/boot.sh "${boot_args[@]}" "$disk" "$vars" "$serial" > "$log" 2>&1 || rc=$?
+  timeout --kill-after=2s 3s bash /work/qemu-boot-diagnostics.sh > "${log%.log}.diagnostics.log" 2>&1 || printf 'Boot diagnostics unavailable\n' >> "${log%.log}.diagnostics.log"
   # boot.sh reuses this controller log on every clone. Preserve each launch
   # before the next trial can overwrite the evidence for a failed boot.
   if [[ -f qemu-startup.log && ! -L qemu-startup.log ]]; then

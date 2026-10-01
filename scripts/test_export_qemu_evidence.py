@@ -30,6 +30,18 @@ TRANSACTION_PRIVATE = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_boot_process_diagnostics_stay_at_explicit_controller_paths(self):
+        paths = (("run-test", "boot.diagnostics.log"),
+                 ("run-test", "transactions", "prepare-install-boot.diagnostics.log"),
+                 ("run-test", "transactions", "resume-boot.diagnostics.log"),
+                 ("run-test", "transactions", "trials", "remove-native-001", "boot.diagnostics.log"))
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertTrue(exporter.allowed_file(path))
+                self.assertFalse(exporter.allowed_file((*path[:-1], path[-1] + ".bak")))
+        self.assertFalse(exporter.allowed_file(("run-test", "guest", "boot.diagnostics.log")))
+        self.assertFalse(exporter.allowed_file(("run-test", "transactions", "trials", "remove-native-001", "transaction-trial", "boot.diagnostics.log")))
+
     def test_doctor_connectivity_evidence_is_bounded_to_guest_diagnostics(self):
         names = ("doctor-connectivity-fallback.json", "doctor-connectivity-fallback.log",
                  "doctor-connectivity-cert.log")
@@ -187,6 +199,23 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(status, 0, report)
         self.assertEqual(report["copied"], [name])
         self.assertEqual((self.destination / name).read_bytes(), b"QEMU network backend failed")
+
+    def test_boot_observations_survive_export_without_private_neighbors(self):
+        names = ("run-test/boot.diagnostics.log",
+                 "run-test/transactions/prepare-install-boot.diagnostics.log",
+                 "run-test/transactions/resume-boot.diagnostics.log",
+                 "run-test/transactions/trials/remove-native-001/boot.diagnostics.log")
+        for name in names:
+            self.fixture(name, b"qemu_process_status=unavailable\nlistener=absent\n")
+        private = "run-test/transactions/trials/remove-native-001/transaction-trial/boot.diagnostics.log"
+        self.fixture(private, b"private-neighbor")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(set(report["copied"]), set(names))
+        for name in names:
+            self.assertEqual((self.destination / name).read_bytes(),
+                             b"qemu_process_status=unavailable\nlistener=absent\n")
+        self.assertFalse((self.destination / private).exists())
 
     def test_daemon_ipc_snapshots_survive_export(self):
         prefix = "run-test/guest/evidence/"
