@@ -2,10 +2,11 @@
 #![expect(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
 //! Debian/Ubuntu CLI integration tests with mixed evidence boundaries.
 //!
-//! `TestProject` fixtures keep mock package operations in isolated state, but
-//! some CLI read paths query the host Debian database. Opt-in system cases are
-//! not hermetic and belong only in disposable environments. Enable them with:
-//! `OMG_RUN_SYSTEM_TESTS=1 OMG_TEST_DISTRO=debian cargo test --locked --no-default-features --features debian-pure --test debian_tests`.
+//! `TestProject` fixtures keep mock package operations in isolated state.
+//! Live APT oracles require `debian`; indexing-only variants execute the real
+//! CLI on Debian/Ubuntu and verify refusal with unchanged package state.
+//! Opt-in system cases belong only in disposable environments. Enable them with:
+//! `OMG_RUN_SYSTEM_TESTS=1 OMG_TEST_DISTRO=debian cargo test --locked --no-default-features --features debian --test debian_tests`.
 //!
 //! Real package-system mutations run in disposable Docker/QEMU owners; see
 //! `scripts/debian-smoke-test.sh` and the QEMU inventory.
@@ -16,6 +17,99 @@ pub mod platform_semantics;
 use common::fixtures::*;
 use common::*;
 use platform_semantics::{assert_no_arch_terms, assert_no_fedora_terms, assert_no_macos_terms};
+
+#[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+const INDEXING_ONLY_REFUSAL: &str = "The Debian indexing feature is not a live APT backend. Install the Debian/Ubuntu omg build, or rebuild with --no-default-features --features debian,pgp,license";
+
+#[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+fn assert_indexing_only_refusal(args: &[&str]) {
+    assert!(
+        omg_lib::core::env::distro::is_debian_like(),
+        "indexing-only refusal must execute on an actual Debian/Ubuntu host"
+    );
+    let native_state = || {
+        ["/var/lib/dpkg/status", "/var/lib/apt/extended_states"].map(|path| {
+            let path = std::path::Path::new(path);
+            match std::fs::metadata(path) {
+                Ok(metadata) => {
+                    assert!(metadata.is_file() && metadata.len() <= 64 * 1024 * 1024);
+                    Some(fixture_program_hash(path))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("cannot inspect native package state: {error}"),
+            }
+        })
+    };
+    let before = native_state();
+    assert!(before[0].is_some(), "native dpkg status is required");
+    let fixture = tempfile::tempdir().expect("indexing-only private state");
+    for directory in ["config", "data", "cache"] {
+        std::fs::create_dir(fixture.path().join(directory))
+            .expect("create private state directory");
+        std::fs::write(
+            fixture.path().join(directory).join("sentinel"),
+            b"retained user state",
+        )
+        .expect("write state sentinel");
+    }
+    let executable = assert_cmd::cargo::cargo_bin!("omg");
+    if let Some(expected) = std::env::var_os("OMG_CONTRACT_EXPECTED_CLI") {
+        assert_eq!(
+            std::fs::canonicalize(executable).expect("CLI executable exists"),
+            std::fs::canonicalize(expected).expect("receipt subject exists"),
+            "indexing-only executable differs from admitted receipt subject"
+        );
+    }
+    let output = std::process::Command::new(executable)
+        .args(args)
+        .env("OMG_TEST_MODE", "0")
+        .env_remove("OMG_TEST_DISTRO")
+        .env("OMG_DISABLE_DAEMON", "1")
+        .env("OMG_NO_TELEMETRY", "1")
+        .env("NO_COLOR", "1")
+        .env("HOME", fixture.path())
+        .env("OMG_CONFIG_DIR", fixture.path().join("config"))
+        .env("OMG_DATA_DIR", fixture.path().join("data"))
+        .env("OMG_CACHE_DIR", fixture.path().join("cache"))
+        .output()
+        .expect("execute actual indexing-only CLI");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stdout.is_empty(),
+        "refusal must not emit a success result"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr)
+            .expect("refusal is UTF-8")
+            .trim(),
+        format!("Error: {INDEXING_ONLY_REFUSAL}")
+    );
+    assert_eq!(
+        before,
+        native_state(),
+        "refusal changed native package state"
+    );
+    assert_eq!(
+        std::fs::read_dir(fixture.path())
+            .expect("private state entries")
+            .count(),
+        3
+    );
+    for directory in ["config", "data", "cache"] {
+        let path = fixture.path().join(directory);
+        assert_eq!(
+            std::fs::read_dir(&path)
+                .expect("private directory entries")
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(path.join("sentinel")).expect("read sentinel"),
+            b"retained user state"
+        );
+    }
+    fixture.close().expect("remove indexing-only fixture");
+}
 
 fn assert_debian_platform_purity(result: &CommandResult, context: &str) {
     let output = result.combined_output();
@@ -86,6 +180,7 @@ mod docker_integration {
 mod apt_integration {
     use super::*;
 
+    #[cfg(feature = "debian")]
     fn native_candidate(package: &str) -> String {
         let installed = std::process::Command::new("dpkg-query")
             .args(["-W", package])
@@ -114,6 +209,7 @@ mod apt_integration {
             .expect("installed package has an APT candidate")
     }
 
+    #[cfg(feature = "debian")]
     pub(super) fn native_info(args: &[&str]) -> std::process::Output {
         let executable = assert_cmd::cargo::cargo_bin!("omg");
         if let Some(expected) = std::env::var_os("OMG_CONTRACT_EXPECTED_CLI") {
@@ -141,6 +237,7 @@ mod apt_integration {
         output
     }
 
+    #[cfg(feature = "debian")]
     fn native_status(package: &str) -> String {
         let output = std::process::Command::new("dpkg-query")
             .args(["-s", package])
@@ -155,6 +252,7 @@ mod apt_integration {
         String::from_utf8(output.stdout).expect("dpkg status is UTF-8")
     }
 
+    #[cfg(feature = "debian")]
     pub(super) fn native_depends_on(package: &str, dependency: &str) -> bool {
         native_status(package)
             .lines()
@@ -226,6 +324,7 @@ mod apt_integration {
         assert_search_has_package(&project, "libc6", "libc6:amd64");
     }
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_info_installed_package() {
         let candidate = native_candidate("apt");
@@ -243,6 +342,13 @@ mod apt_integration {
         );
     }
 
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_info_installed_package() {
+        assert_indexing_only_refusal(&["--json", "info", "apt"]);
+    }
+
+    #[cfg(feature = "debian")]
     #[test]
     fn test_info_package_details() {
         let candidate = native_candidate("dpkg");
@@ -260,6 +366,12 @@ mod apt_integration {
                 .is_some_and(|description| !description.is_empty()),
             "{stdout}"
         );
+    }
+
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_info_package_details() {
+        assert_indexing_only_refusal(&["info", "dpkg"]);
     }
 
     #[cfg(feature = "debian")]
@@ -437,6 +549,7 @@ mod apt_integration {
         assert_debian_platform_purity(&result, "Debian mock up-to-date check");
     }
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_clean_orphans() {
         require_debian_like!();
@@ -518,6 +631,12 @@ mod apt_integration {
         );
     }
 
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_clean_orphans() {
+        assert_indexing_only_refusal(&["clean", "--orphans", "--dry-run"]);
+    }
+
     #[test]
     fn test_install_remove_cycle() {
         let project = TestProject::for_distro("debian");
@@ -561,6 +680,7 @@ mod apt_integration {
         project.close_checked();
     }
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_why_integration() {
         assert!(
@@ -578,6 +698,13 @@ mod apt_integration {
         );
     }
 
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_why_integration() {
+        assert_indexing_only_refusal(&["why", "apt"]);
+    }
+
+    #[cfg(feature = "debian")]
     #[test]
     fn test_size_integration() {
         let status = native_status("apt");
@@ -598,6 +725,12 @@ mod apt_integration {
                 .any(|line| line.contains(&format!("apt: {expected}"))),
             "size --tree apt differs from native Installed-Size ({kib} KiB): {stdout}"
         );
+    }
+
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_size_integration() {
+        assert_indexing_only_refusal(&["size", "--tree", "apt"]);
     }
 }
 
@@ -699,13 +832,13 @@ mod ubuntu_specific {
     #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
     #[test]
     fn test_ubuntu_main_repo() {
-        report_skip("native Ubuntu APT search requires Ubuntu with libapt");
+        assert_indexing_only_refusal(&["search", "ubuntu-desktop", "--json"]);
     }
 
     #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
     #[test]
     fn test_ubuntu_universe_repo() {
-        report_skip("native Ubuntu APT search requires Ubuntu with libapt");
+        assert_indexing_only_refusal(&["search", "cowsay", "--json"]);
     }
 }
 
@@ -769,6 +902,7 @@ mod debian_specific {
 mod new_features {
     use super::*;
 
+    #[cfg(feature = "debian")]
     fn native_sized_package_count() -> usize {
         let output = std::process::Command::new("dpkg-query")
             .args(["-W", "-f=${Status}\t${Installed-Size}\n"])
@@ -790,6 +924,7 @@ mod new_features {
             .count()
     }
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_why_command() {
         assert!(apt_integration::native_depends_on("bash", "libc6"));
@@ -804,6 +939,13 @@ mod new_features {
         );
     }
 
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_why_command() {
+        assert_indexing_only_refusal(&["why", "bash"]);
+    }
+
+    #[cfg(feature = "debian")]
     #[test]
     fn test_why_reverse_dependencies() {
         assert!(apt_integration::native_depends_on("apt", "libc6"));
@@ -816,6 +958,12 @@ mod new_features {
                 .any(|line| line.split_whitespace().any(|part| part == "apt:")),
             "reverse dependencies of libc6 omitted native dependent apt: {stdout}"
         );
+    }
+
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_why_reverse_dependencies() {
+        assert_indexing_only_refusal(&["why", "libc6", "--reverse"]);
     }
 
     #[test]
@@ -859,6 +1007,7 @@ mod new_features {
         project.close_checked();
     }
 
+    #[cfg(feature = "debian")]
     #[test]
     fn test_size_command() {
         let count = native_sized_package_count();
@@ -875,6 +1024,13 @@ mod new_features {
         );
     }
 
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_size_command() {
+        assert_indexing_only_refusal(&["size"]);
+    }
+
+    #[cfg(feature = "debian")]
     #[test]
     fn test_size_with_limit() {
         assert!(native_sized_package_count() > 10);
@@ -892,6 +1048,13 @@ mod new_features {
         assert_eq!(ranks, (1..=10).collect::<Vec<_>>(), "{stdout}");
     }
 
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_size_with_limit() {
+        assert_indexing_only_refusal(&["size", "--limit", "10"]);
+    }
+
+    #[cfg(feature = "debian")]
     #[test]
     fn test_blame_command() {
         let native = std::process::Command::new("dpkg-query")
@@ -922,6 +1085,12 @@ mod new_features {
             stdout.contains(&format!("Install Reason: {reason}")),
             "{stdout}"
         );
+    }
+
+    #[cfg(all(feature = "debian-pure", not(feature = "debian")))]
+    #[test]
+    fn test_blame_command() {
+        assert_indexing_only_refusal(&["blame", "apt"]);
     }
 
     #[test]
@@ -1064,12 +1233,13 @@ mod security {
             .env("OMG_DISABLE_DAEMON", "1")
             .output()
             .expect("run pure Debian SBOM command");
-        assert!(
-            !output.status.success(),
+        assert_eq!(
+            output.status.code(),
+            Some(1),
             "pure indexing build generated a live SBOM"
         );
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("pure-Rust Debian indexing engine"),
+            String::from_utf8_lossy(&output.stderr).contains(INDEXING_ONLY_REFUSAL),
             "wrong pure-backend refusal: {}",
             String::from_utf8_lossy(&output.stderr)
         );
