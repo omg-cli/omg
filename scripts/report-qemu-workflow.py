@@ -774,7 +774,7 @@ def main():
     if evidence_error:
         if qemu_failed or not ci_failed:
             guests = failed_guest_receipts(job_rows) if jobs_valid else []
-            if len(guests) > 1:
+            if len(guests) > 1 or (guests and receipt["case_id"] == "qemu-arm-runner-kvm-health"):
                 selected.extend(guests)
                 if receipt["case_id"] == "qemu-arm-runner-kvm-health":
                     selected.append(receipt)

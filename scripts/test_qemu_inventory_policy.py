@@ -185,7 +185,6 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "snapshot directory"):
             self.admit()
 
-    @unittest.skipUnless(os.name == "posix" and hasattr(os, "mkfifo"), "requires POSIX FIFOs")
     def test_fifo_inputs_and_digest_shards_are_rejected_before_blocking_open(self):
         for kind in ("policy", "inventory", "results", "summary", "snapshot"):
             with self.subTest(kind=kind):

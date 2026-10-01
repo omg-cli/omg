@@ -620,6 +620,16 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual({row["case_id"] for row in catalog["failures"]},
                          {"qemu-arch-search", "qemu-arm-runner-kvm-health", "qemu-matrix-x86-workflow"})
 
+    def test_unavailable_artifacts_keep_arm_health_and_one_failed_x86_guest(self):
+        jobs = [dict(name="ARM guest runner KVM health", conclusion="failure"),
+                dict(name="QEMU guest (fedora)", conclusion="failure")]
+        _, catalog = self.run_report_fixture([], jobs=jobs, artifact_listing_error=True)
+        self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+        self.assertEqual({(row["case_id"], row["distro"], row.get("arch", "x86_64"))
+                          for row in catalog["failures"]}, {
+            ("qemu-arm-runner-kvm-health", "ubuntu", "x86_64"),
+            ("qemu-matrix-x86-workflow", "fedora", "x86_64")})
+
     def test_listing_completeness_and_job_unavailability_fail_closed(self):
         invalid = ({}, {"total_count": True, "jobs": []}, {"total_count": -1, "jobs": []},
                    {"total_count": 101, "jobs": []}, {"total_count": 1, "jobs": []},
