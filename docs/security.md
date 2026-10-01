@@ -75,7 +75,11 @@ omg audit policy
 
 The policy supports minimum grades, AUR restrictions, package bans, PGP requirements, and license allowlists. See [configuration](./configuration.md).
 
+A populated legacy `[security]` section in `config.toml` fails both settings and default policy loading, including when `policy.toml` already exists. Manually reconcile its controls into top-level `policy.toml` keys and then remove the legacy section. Validate supported values instead of blindly copying them: `minimum_grade` accepts `Risk`, `Community`, `Verified`, and `Locked`. OMG leaves both files unchanged. An empty legacy section is accepted. Fresh installer configs use the current settings schema.
+
 `omg audit licenses --check-policy` is available with the Arch backend. It evaluates the full installed-package license inventory against a configured allowlist and exits nonzero on violations, even when `--filter` limits displayed rows. Native Debian, Ubuntu, and Fedora inventories do not yet provide reliable license metadata for this command.
+
+License reports preserve the original metadata and the strongest recognized advisory family. They also mark `unresolved_review` for unknown operands, malformed or bounded-out expressions, and every `WITH` exception because OMG does not resolve exception terms. `MIT AND LicenseRef-private` therefore keeps its permissive family and requires unresolved review. Audit JSON, CSV, table output, and enterprise inventories and exports retain that marker; summaries count unresolved packages or assignments separately from recognized categories. This is a bounded advisory classifier, not SPDX validation or a legal determination. SPDX distinguishes custom references and exception terms from license identifiers in [license expressions](https://spdx.github.io/spdx-spec/v2.3/SPDX-license-expressions/).
 
 Explicit package policies are checked against ALPM's prepared transaction, including dependencies. Native APT, DNF, and Homebrew install and upgrade paths refuse explicit policies because a separate precheck cannot guarantee the final native transaction. Do not assume that a policy enforced on Arch is enforced identically elsewhere. A build with only the `debian-pure` indexing feature refuses live Debian package mutations; use an APT-backed build for those operations.
 

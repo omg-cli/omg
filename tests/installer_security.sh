@@ -341,4 +341,22 @@ if [[ "$EUID" == 0 ]]; then
     ! gh_candidate_is_trusted "$task_dir/untrusted-gh/link"
   )
 fi
+(
+  set --
+  source "$task_dir/functions.sh"
+  trap - EXIT
+  CONFIG_DIR="$task_dir/config-fixture"
+  DATA_DIR="$task_dir/config-data-fixture"
+  setup_config
+  [[ -f "$CONFIG_DIR/config.toml" ]]
+  ! grep -Eq '^\[(security|general|cache)\]' "$CONFIG_DIR/config.toml"
+  [[ ! -e "$CONFIG_DIR/policy.toml" ]]
+  printf '[security]\nallow_aur = false\n' > "$CONFIG_DIR/config.toml"
+  printf 'allow_aur = false\n' > "$CONFIG_DIR/policy.toml"
+  cp "$CONFIG_DIR/config.toml" "$task_dir/config-before"
+  cp "$CONFIG_DIR/policy.toml" "$task_dir/policy-before"
+  setup_config
+  cmp "$CONFIG_DIR/config.toml" "$task_dir/config-before"
+  cmp "$CONFIG_DIR/policy.toml" "$task_dir/policy-before"
+)
 printf 'Installer security scenarios passed\n'

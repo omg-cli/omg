@@ -740,7 +740,7 @@ fn require_audit_integrity(is_valid: bool) -> Result<()> {
 
 /// License categories for compliance
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LicenseCategory {
+pub(crate) enum LicenseCategory {
     Permissive,     // MIT, BSD, Apache
     Copyleft,       // GPL, LGPL, MPL
     StrongCopyleft, // AGPL
@@ -749,30 +749,19 @@ enum LicenseCategory {
 }
 
 impl LicenseCategory {
-    fn from_license(license: &str) -> Self {
-        let tokens = crate::core::security::policy::spdx_license_tokens(license);
-        let mut category = Self::Unknown;
-        for token in &tokens {
-            if token.contains("agpl") {
-                return Self::StrongCopyleft;
-            }
-            if token.contains("gpl") || token.contains("lgpl") || token.contains("mpl") {
-                category = Self::Copyleft;
-                continue;
-            }
-            if token_is_permissive(token) {
-                if category == Self::Unknown {
-                    category = Self::Permissive;
-                }
-                continue;
-            }
-            if (token.contains("proprietary") || token.contains("commercial"))
-                && category == Self::Unknown
-            {
-                category = Self::Proprietary;
-            }
+    /// Classify a license expression into a compliance category.
+    ///
+    /// Shared with the enterprise license scan so `omg audit` and
+    /// `omg enterprise audit` agree on what counts as copyleft.
+    pub(crate) fn from_license(license: &str) -> Self {
+        use crate::core::security::policy::{LicenseClassification, classify_license_expression};
+        match classify_license_expression(license) {
+            LicenseClassification::Unknown => Self::Unknown,
+            LicenseClassification::Proprietary => Self::Proprietary,
+            LicenseClassification::Permissive => Self::Permissive,
+            LicenseClassification::Copyleft => Self::Copyleft,
+            LicenseClassification::StrongCopyleft => Self::StrongCopyleft,
         }
-        category
     }
 
     fn color(&self) -> String {
@@ -786,15 +775,23 @@ impl LicenseCategory {
     }
 }
 
-fn token_is_permissive(token: &str) -> bool {
-    matches!(
-        token,
-        "mit" | "isc" | "unlicense" | "cc0" | "cc0-1.0" | "0bsd" | "bsd" | "apache"
-    ) || token.starts_with("bsd-")
-        || token.starts_with("apache-")
+/// ALPM's display join is not expression syntax. Normalize only at this
+/// installed-inventory caller, keeping the original metadata for serialization.
+fn installed_license_category(license: &str) -> LicenseCategory {
+    crate::core::security::policy::combined_license_expression(license.split(',').map(str::trim))
+        .as_deref()
+        .map_or(LicenseCategory::Unknown, LicenseCategory::from_license)
 }
 
-type LicenseRow = (String, String, String, LicenseCategory);
+fn installed_license_requires_review(license: &str) -> bool {
+    crate::core::security::policy::combined_license_expression(license.split(',').map(str::trim))
+        .as_deref()
+        .is_none_or(|expression| {
+            crate::core::security::policy::assess_license_expression(expression).unresolved_review
+        })
+}
+
+type LicenseRow = (String, String, String, LicenseCategory, bool);
 
 pub(crate) fn spreadsheet_safe_cell(value: &str) -> std::borrow::Cow<'_, str> {
     if value.starts_with(['=', '+', '-', '@']) {
@@ -809,12 +806,13 @@ fn serialize_license_rows(format: &str, rows: &[LicenseRow]) -> Result<Vec<u8>> 
         "json" => {
             let data: Vec<_> = rows
                 .iter()
-                .map(|(name, license, version, category)| {
+                .map(|(name, license, version, category, unresolved_review)| {
                     serde_json::json!({
                         "name": name,
                         "version": version,
                         "license": license,
-                        "category": format!("{category:?}")
+                        "category": format!("{category:?}"),
+                        "unresolved_review": unresolved_review
                     })
                 })
                 .collect();
@@ -822,8 +820,14 @@ fn serialize_license_rows(format: &str, rows: &[LicenseRow]) -> Result<Vec<u8>> 
         }
         "csv" => {
             let mut writer = csv::Writer::from_writer(Vec::new());
-            writer.write_record(["Package", "Version", "License", "Category"])?;
-            for (name, license, version, category) in rows {
+            writer.write_record([
+                "Package",
+                "Version",
+                "License",
+                "Category",
+                "UnresolvedReview",
+            ])?;
+            for (name, license, version, category, unresolved_review) in rows {
                 let name = spreadsheet_safe_cell(name);
                 let version = spreadsheet_safe_cell(version);
                 let license = spreadsheet_safe_cell(license);
@@ -833,6 +837,7 @@ fn serialize_license_rows(format: &str, rows: &[LicenseRow]) -> Result<Vec<u8>> 
                     version.as_ref(),
                     license.as_ref(),
                     category.as_str(),
+                    if *unresolved_review { "true" } else { "false" },
                 ])?;
             }
             writer
@@ -841,9 +846,13 @@ fn serialize_license_rows(format: &str, rows: &[LicenseRow]) -> Result<Vec<u8>> 
         }
         "table" => {
             use std::fmt::Write as _;
-            let mut content = String::from("Package\tVersion\tLicense\tCategory\n");
-            for (name, license, version, category) in rows {
-                let _ = writeln!(content, "{name}\t{version}\t{license}\t{category:?}");
+            let mut content =
+                String::from("Package\tVersion\tLicense\tCategory\tUnresolvedReview\n");
+            for (name, license, version, category, unresolved_review) in rows {
+                let _ = writeln!(
+                    content,
+                    "{name}\t{version}\t{license}\t{category:?}\t{unresolved_review}"
+                );
             }
             Ok(content.into_bytes())
         }
@@ -884,7 +893,8 @@ pub fn scan_licenses(
     let installed_count = packages.len();
 
     // Filter by license if specified, categorizing each package once.
-    // `from_license` tokenizes the expression, so it must not be recomputed
+    // Native assignments are combined at this caller, not in the parser.
+    // Classification must not be recomputed
     // separately for the summary, policy check, AND export.
     let filter_terms: Vec<String> = filter
         .map(|f| f.split(',').map(|s| s.trim().to_lowercase()).collect())
@@ -907,8 +917,9 @@ pub fn scan_licenses(
             }
         })
         .map(|(name, license, version)| {
-            let category = LicenseCategory::from_license(&license);
-            (name, license, version, category)
+            let category = installed_license_category(&license);
+            let unresolved_review = installed_license_requires_review(&license);
+            (name, license, version, category, unresolved_review)
         })
         .collect();
 
@@ -929,7 +940,7 @@ pub fn scan_licenses(
         style::success("Permissive:"),
         filtered_packages
             .iter()
-            .filter(|(_, _, _, c)| *c == LicenseCategory::Permissive)
+            .filter(|(_, _, _, c, _)| *c == LicenseCategory::Permissive)
             .count()
     );
     println!(
@@ -937,12 +948,12 @@ pub fn scan_licenses(
         style::warning("Copyleft:"),
         filtered_packages
             .iter()
-            .filter(|(_, _, _, c)| *c == LicenseCategory::Copyleft)
+            .filter(|(_, _, _, c, _)| *c == LicenseCategory::Copyleft)
             .count()
     );
     let strong_copyleft = filtered_packages
         .iter()
-        .filter(|(_, _, _, c)| *c == LicenseCategory::StrongCopyleft)
+        .filter(|(_, _, _, c, _)| *c == LicenseCategory::StrongCopyleft)
         .count();
     if strong_copyleft > 0 {
         println!(
@@ -953,18 +964,23 @@ pub fn scan_licenses(
     }
     let proprietary = filtered_packages
         .iter()
-        .filter(|(_, _, _, c)| *c == LicenseCategory::Proprietary)
+        .filter(|(_, _, _, c, _)| *c == LicenseCategory::Proprietary)
         .count();
     if proprietary > 0 {
         println!("    {} {}", style::error("Proprietary:"), proprietary);
     }
     let unknown = filtered_packages
         .iter()
-        .filter(|(_, _, _, c)| *c == LicenseCategory::Unknown)
+        .filter(|(_, _, _, c, _)| *c == LicenseCategory::Unknown)
         .count();
     if unknown > 0 {
         println!("    {} {}", style::dim("Unknown:"), unknown);
     }
+    println!(
+        "    {} {}",
+        style::warning("Unresolved license review:"),
+        filtered_packages.iter().filter(|row| row.4).count()
+    );
     println!();
 
     // Check against policy if requested
@@ -1006,12 +1022,17 @@ pub fn scan_licenses(
     } else if format == "table" {
         // Show first 20 packages in table format
         println!("  {}", style::header("Packages"));
-        for (name, license, _, category) in filtered_packages.iter().take(20) {
+        for (name, license, _, category, unresolved_review) in filtered_packages.iter().take(20) {
             println!(
-                "    {} {} ({})",
+                "    {} {} ({}){}",
                 style::package(name),
                 style::dim(license),
-                category.color()
+                category.color(),
+                if *unresolved_review {
+                    " [unresolved license review]"
+                } else {
+                    ""
+                }
             );
         }
         if filtered_packages.len() > 20 {
@@ -1680,6 +1701,7 @@ mod tests {
             "MIT".to_string(),
             "1.2.3".to_string(),
             LicenseCategory::Permissive,
+            false,
         )];
 
         let json = serialize_license_rows("json", &rows).expect("JSON report");
@@ -1691,6 +1713,47 @@ mod tests {
         let csv = String::from_utf8(csv).expect("UTF-8 CSV");
         assert!(csv.contains("Package,Version,License,Category"));
         assert!(csv.contains("demo,1.2.3,MIT,Permissive"));
+    }
+
+    #[test]
+    fn unresolved_license_review_survives_inventory_and_all_exports() {
+        let mut rows = Vec::new();
+        for (name, license) in [
+            ("mixed", "MIT AND LicenseRef-private"),
+            ("native", "GPL2, LicenseRef-private"),
+            ("exception", "MIT WITH AGPL-3.0"),
+            ("known", "MIT OR Apache-2.0"),
+        ] {
+            rows.push((
+                name.into(),
+                license.into(),
+                "1.0".into(),
+                installed_license_category(license),
+                installed_license_requires_review(license),
+            ));
+        }
+        assert_eq!(rows.iter().filter(|row| row.4).count(), 3);
+        let json: serde_json::Value =
+            serde_json::from_slice(&serialize_license_rows("json", &rows).unwrap()).unwrap();
+        assert_eq!(json[0]["license"], "MIT AND LicenseRef-private");
+        assert_eq!(json[0]["category"], "Permissive");
+        assert_eq!(json[0]["unresolved_review"], true);
+        assert_eq!(json[1]["category"], "Copyleft");
+        assert_eq!(json[1]["unresolved_review"], true);
+        assert_eq!(json[3]["unresolved_review"], false);
+        let csv_bytes = serialize_license_rows("csv", &rows).unwrap();
+        let mut reader = csv::Reader::from_reader(csv_bytes.as_slice());
+        assert_eq!(reader.headers().unwrap().get(4), Some("UnresolvedReview"));
+        let csv_rows = reader
+            .records()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(csv_rows[0].get(2), Some("MIT AND LicenseRef-private"));
+        assert_eq!(csv_rows[0].get(4), Some("true"));
+        assert_eq!(csv_rows[3].get(4), Some("false"));
+        let table = String::from_utf8(serialize_license_rows("table", &rows).unwrap()).unwrap();
+        assert!(table.contains("mixed\t1.0\tMIT AND LicenseRef-private\tPermissive\ttrue"));
+        assert!(table.contains("known\t1.0\tMIT OR Apache-2.0\tPermissive\tfalse"));
     }
 
     #[test]
@@ -1796,6 +1859,70 @@ mod tests {
         assert_eq!(spreadsheet_safe_cell("=cmd()"), "'=cmd()");
         assert_eq!(spreadsheet_safe_cell("+1"), "'+1");
         assert_eq!(spreadsheet_safe_cell("normal"), "normal");
+    }
+
+    #[test]
+    fn native_license_assignment_join_keeps_category_and_export_metadata() {
+        // Actual ALPM libidn2 assignment spellings, joined by the inventory caller.
+        let display = ["GPL2", "LGPL3"].join(", ");
+        assert_eq!(
+            LicenseCategory::from_license(&display),
+            LicenseCategory::Unknown
+        );
+        assert_eq!(
+            installed_license_category(&display),
+            LicenseCategory::Copyleft
+        );
+        let rows = vec![(
+            "libidn2".into(),
+            display.clone(),
+            "2.3.8-1".into(),
+            installed_license_category(&display),
+            installed_license_requires_review(&display),
+        )];
+        let json: serde_json::Value =
+            serde_json::from_slice(&serialize_license_rows("json", &rows).unwrap()).unwrap();
+        assert_eq!(json[0]["license"], "GPL2, LGPL3");
+        assert_eq!(json[0]["category"], "Copyleft");
+        let csv = String::from_utf8(serialize_license_rows("csv", &rows).unwrap()).unwrap();
+        assert!(csv.contains("libidn2,2.3.8-1,\"GPL2, LGPL3\",Copyleft"));
+        assert_eq!(
+            installed_license_category("MIT, AGPL3+"),
+            LicenseCategory::StrongCopyleft
+        );
+        assert_eq!(
+            installed_license_category("MIT, "),
+            LicenseCategory::Unknown
+        );
+    }
+
+    #[test]
+    fn advisory_identifier_boundaries_and_with_base_are_preserved() {
+        for license in [
+            "LicenseRef-GPL",
+            "Apache-custom",
+            "BSD-custom",
+            "MIT++",
+            "GPL2++",
+            "MIT & GPL2",
+        ] {
+            assert_eq!(
+                LicenseCategory::from_license(license),
+                LicenseCategory::Unknown,
+                "{license}"
+            );
+        }
+        assert_eq!(
+            LicenseCategory::from_license("MIT WITH AGPL-3.0"),
+            LicenseCategory::Permissive
+        );
+        for operator in ["AND", "OR"] {
+            let expression = format!("DocumentRef-x:LicenseRef-private {operator} GPL2");
+            assert_eq!(
+                LicenseCategory::from_license(&expression),
+                LicenseCategory::Copyleft
+            );
+        }
     }
 
     #[test]
