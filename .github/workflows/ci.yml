@@ -935,14 +935,16 @@ jobs:
     permissions:
       contents: read
       actions: read
-    env:
-      RUNTIME_USAGE_STATE: ${{ runner.temp }}/runtime-usage-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Create private accounting state
-        run: python3 scripts/runtime-usage-ci.py init --state "$RUNTIME_USAGE_STATE"
+        env:
+          RUNTIME_USAGE_STATE: ${{ runner.temp }}/runtime-usage-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          printf 'RUNTIME_USAGE_STATE=%s\n' "$RUNTIME_USAGE_STATE" >> "$GITHUB_ENV"
+          python3 scripts/runtime-usage-ci.py init --state "$RUNTIME_USAGE_STATE"
       - name: Admit this attempt's Ubuntu release
         env:
           GH_TOKEN: ${{ github.token }}
