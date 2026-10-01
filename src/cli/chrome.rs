@@ -500,6 +500,34 @@ mod tests {
 
     #[test]
     #[serial]
+    fn preview_chrome_is_plain_when_colors_are_off() {
+        temp_env::with_var("NO_COLOR", Some("1"), || {
+            assert_eq!(
+                osc8_file(Path::new("/tmp/preview file"), "PKGBUILD"),
+                "PKGBUILD"
+            );
+            assert_eq!(
+                snippet_line(12, "source=('archive.tar.gz')"),
+                "  |   12 | source=('archive.tar.gz')"
+            );
+            assert_eq!(kv("package", "example"), "  |  package   example");
+            assert_eq!(
+                rail_line("review before building"),
+                "  |  review before building"
+            );
+        });
+    }
+
+    #[test]
+    fn preview_truncation_preserves_unicode_and_character_limit() {
+        assert_eq!(truncate_chars("αβγ", 3), "αβγ");
+        assert_eq!(truncate_chars("αβγδ", 3), "αβ…");
+        assert_eq!(truncate_chars("αβ", 1), "…");
+        assert_eq!(truncate_chars("", 0), "");
+    }
+
+    #[test]
+    #[serial]
     fn highlight_marks_source_and_comments() {
         temp_env::with_vars(
             [("NO_COLOR", None::<&str>), ("OMG_COLORS", Some("always"))],
