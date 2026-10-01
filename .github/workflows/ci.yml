@@ -888,9 +888,46 @@ jobs:
         run: make audit-docs
 
 
+  runtime-usage:
+    name: "Runtime usage accounting (Ubuntu)"
+    needs: [quick-gate, ubuntu]
+    if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RUNTIME_USAGE_STATE: ${{ runner.temp }}/runtime-usage-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create private accounting state
+        run: python3 scripts/runtime-usage-ci.py init --state "$RUNTIME_USAGE_STATE"
+      - name: Admit this attempt's Ubuntu release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          timeout --kill-after=5s 60s python3 scripts/runtime-usage-ci.py admit --state "$RUNTIME_USAGE_STATE" > "$RUNTIME_USAGE_STATE/evidence/admission.stdout" 2> "$RUNTIME_USAGE_STATE/evidence/admission.stderr"
+      - name: Verify real runtime accounting in both telemetry modes
+        run: timeout --kill-after=5s 800s python3 scripts/runtime-usage-ci.py run --state "$RUNTIME_USAGE_STATE"
+      - name: Upload accounting evidence
+        id: upload-runtime-evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-usage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RUNTIME_USAGE_STATE }}/evidence/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove verified private accounting state
+        if: always() && steps.upload-runtime-evidence.outcome == 'success'
+        run: timeout --kill-after=5s 10s python3 scripts/runtime-usage-ci.py cleanup --state "$RUNTIME_USAGE_STATE"
+
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu, qemu, docs-audit]
+    needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu, qemu, docs-audit, runtime-usage]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -907,6 +944,7 @@ jobs:
           FEATURE_INTERSECTIONS: ${{ needs.feature-intersections.result }}
           MACOS: ${{ needs.macos.result }}
           UBUNTU: ${{ needs.ubuntu.result }}
+          RUNTIME_USAGE: ${{ needs.runtime-usage.result }}
           QEMU: ${{ needs.qemu.result }}
           QEMU_REQUIRED: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true' }}
           DOCS_AUDIT: ${{ needs.docs-audit.result }}
@@ -922,6 +960,7 @@ jobs:
           echo "| Feature Intersections | $FEATURE_INTERSECTIONS |" >> $GITHUB_STEP_SUMMARY
           echo "| macOS | $MACOS |" >> $GITHUB_STEP_SUMMARY
           echo "| Ubuntu | $UBUNTU |" >> $GITHUB_STEP_SUMMARY
+          echo "| Runtime usage accounting | $RUNTIME_USAGE |" >> $GITHUB_STEP_SUMMARY
           echo "| QEMU | $QEMU |" >> $GITHUB_STEP_SUMMARY
           echo "| Docs audit | $DOCS_AUDIT |" >> $GITHUB_STEP_SUMMARY
 
@@ -947,6 +986,7 @@ jobs:
             ["Feature Intersections"]="$FEATURE_INTERSECTIONS"
             ["macOS"]="$MACOS"
             ["Ubuntu"]="$UBUNTU"
+            ["Runtime usage accounting"]="$RUNTIME_USAGE"
           )
           for job in "${!required_results[@]}"; do
             if [[ "${required_results[$job]}" == "skipped" && "$BUILD_REQUIRED" == "false" ]]; then
