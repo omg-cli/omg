@@ -2,7 +2,8 @@
 # Default location: ~/.config/omg/policy.toml
 #
 # This file defines security policies for package installations.
-# OMG will enforce these policies before allowing installations.
+# ALPM enforces explicit policies on the prepared dependency transaction.
+# Native APT, DNF and Homebrew refuse explicit OMG package policies.
 
 # ============================================================================
 # SECURITY GRADING
@@ -10,12 +11,12 @@
 
 # Minimum security grade required for installations (default: "Community")
 # Options (from most to least restrictive):
-# - "Locked": SLSA provenance + PGP signatures (enterprise-grade)
-# - "Verified": PGP signatures or checksums (recommended)
-# - "Community": AUR/unsigned packages allowed (default)
+# - "Locked": enum value not assigned by ordinary install grading; rejects it
+# - "Verified": official source with no matched vulnerability, not a signature receipt
+# - "Community": community/local source with no matched vulnerability (default)
 # - "Risk": Allow packages with known vulnerabilities (NOT recommended)
 #
-# Example: Enforce PGP verification for all packages
+# Example: Require the official-source grade, separate from signature enforcement
 #minimum_grade = "Verified"
 
 # Example: Block installations with known vulnerabilities
@@ -26,11 +27,12 @@ minimum_grade = "Community"
 # ============================================================================
 
 # Allow installing AUR packages (default: true)
-# Set to false to restrict installations to official repositories only
+# Set to false to reject community sources, including AUR and local archives
 #allow_aur = true
 
-# Require PGP signatures on all packages (default: false)
-# When true, blocks unsigned packages (including AUR)
+# Require ALPM package signatures (default: false)
+# Sets mandatory signature flags on repositories and default/local/remote transactions.
+# Source-grade prechecks also reject community/local inputs; grades are not receipts.
 #require_pgp = false
 
 # ============================================================================
@@ -78,8 +80,8 @@ minimum_grade = "Community"
 # EXAMPLE POLICIES
 # ============================================================================
 
-# --- Enterprise Security Policy ---
-# Uncomment for strict enterprise environments:
+# --- Locked Grade Rejection Example ---
+# Not an install-approval preset: Locked is not assigned by ordinary grading.
 #
 # minimum_grade = "Locked"
 # allow_aur = false
@@ -105,8 +107,8 @@ minimum_grade = "Community"
 # allowed_licenses = []
 # banned_packages = []
 
-# --- CI/CD Pipeline (Security-First) ---
-# Uncomment for reproducible, auditable builds:
+# --- Locked Grade Rejection Example for CI ---
+# Not a provenance or reproducibility guarantee; this grade rejects ordinary installs.
 #
 # minimum_grade = "Locked"
 # allow_aur = false
@@ -127,19 +129,19 @@ minimum_grade = "Community"
 
 # Security Grading Explained:
 #
-# 1. LOCKED (SLSA + PGP):
-#    - Supply chain security with build provenance
-#    - PGP signature verification
-#    - Recommended for: Production systems, CI/CD
+# 1. LOCKED:
+#    - Retained enum value, not produced by ordinary grading
+#    - No SLSA or PGP receipt is an input to grade assignment
+#    - Requiring it rejects ordinary official and community packages
 #
-# 2. VERIFIED (PGP/Checksum):
-#    - PGP signatures or SHA checksums verified
-#    - Recommended for: Developer workstations
+# 2. VERIFIED:
+#    - Official source with no matched vulnerability
+#    - Source-only prechecks cannot establish cryptographic evidence
 #
-# 3. COMMUNITY (AUR/Unsigned):
-#    - Allows community packages (AUR)
-#    - Basic checksum verification only
-#    - Recommended for: Personal machines, testing
+# 3. COMMUNITY:
+#    - Community sources, including AUR and local archives
+#    - No matched vulnerability when grading uses the scanner
+#    - Does not itself certify signatures or checksums
 #
 # 4. RISK (Vulnerabilities):
 #    - Allows packages with known CVEs
@@ -153,8 +155,9 @@ minimum_grade = "Community"
 # 3. If package is in banned_packages, installation is blocked
 # 4. If license not in allowed_licenses (and list is non-empty), blocked
 # 5. If AUR package and allow_aur=false, installation is blocked
-# 6. If unsigned package and require_pgp=true, installation is blocked
+# 6. require_pgp rejects community sources and forces ALPM mandatory signatures
+# Explicit-policy scan failures propagate rather than receiving a source-grade fallback.
 #
-# Override policies:
-# - Use `omg install --force` to bypass policy (not recommended)
-# - Use `omg policy check <package>` to preview without installing
+# Inspect policies:
+# - Use `omg audit policy` to show the local policy
+# - There is no install --force policy bypass or policy check <package> command
