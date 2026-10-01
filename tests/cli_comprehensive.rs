@@ -14,6 +14,10 @@
 
 pub mod common;
 
+#[cfg(feature = "arch")]
+#[path = "support/recovery_fixture.rs"]
+mod recovery_fixture;
+
 use clap::{CommandFactory, Parser};
 use common::*;
 use omg_lib::cli::Cli;
@@ -2282,11 +2286,31 @@ mod install_tests {
     // `!success || ...` disjunction also passed when install wrongly succeeded.
     #[test]
     fn test_install_nonexistent() {
-        let result = run_omg(&[
-            "install",
-            "--yes",
+        let project = TestProject::for_distro("arch");
+        #[cfg(feature = "arch")]
+        let proxy = crate::recovery_fixture::RejectedProxy::new();
+        #[cfg(feature = "arch")]
+        crate::recovery_fixture::seed_missing_aur_index(
+            &project,
             "package-that-definitely-does-not-exist-12345",
-        ]);
+        );
+        #[cfg(feature = "arch")]
+        let environment = proxy.env();
+        #[cfg(not(feature = "arch"))]
+        let environment = Vec::new();
+        let result = project.run_with_env(
+            &[
+                "install",
+                "--yes",
+                "package-that-definitely-does-not-exist-12345",
+            ],
+            &environment,
+        );
+        #[cfg(feature = "arch")]
+        assert_eq!(proxy.requests(), 0, "offline missing lookup contacted RPC");
+        assert_eq!(result.exit_code, 1, "{}", result.combined_output());
+        assert!(!result.combined_output().contains("transport failed"));
+        project.close_checked();
         result.assert_failure();
         let combined = result.combined_output();
         assert!(
