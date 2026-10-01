@@ -741,9 +741,9 @@ esac
 # never acceptable product refusals. Keep this after the lifecycle probe.
 if [[ -n "$inventory_tiers" ]]; then
   case "$distro" in
-    arch) sudo -n pacman -S --noconfirm --needed git make curl python strace ;;
-    debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace ;;
-    fedora) sudo -n dnf install -y git make curl python3 strace podman rpm-build createrepo_c ;;
+    arch) sudo -n pacman -S --noconfirm --needed git make curl python strace gcc ;;
+    debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace gcc libc6-dev ;;
+    fedora) sudo -n dnf install -y git make curl python3 strace podman rpm-build createrepo_c gcc glibc-devel ;;
   esac > evidence/inventory-setup.txt 2>&1 || exit 120
   # The hermetic `new` row exercises the missing-toolchain refusal. A guest
   # with Cargo installed is a different fixture, not a product failure.

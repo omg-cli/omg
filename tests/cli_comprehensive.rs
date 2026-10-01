@@ -488,6 +488,21 @@ fn behavior_inventory_keeps_offline_refusal_assertions() {
     }
 }
 
+#[test]
+fn behavior_inventory_requires_native_rust_installation_proof() {
+    let cases = behavior_cases();
+    let case = cases
+        .iter()
+        .find(|case| case.id == "runtime-rust-install")
+        .expect("required native Rust installation case");
+    assert_eq!(case.args, ["use", "rust", "1.85.0"]);
+    assert_eq!(case.safety, Safety::IsolatedWrite);
+    assert_eq!(case.tiers, [Tier::Container]);
+    assert_eq!(case.assertions, [Assertion::RuntimeRustInstalled]);
+    assert_eq!(case.cleanup, Cleanup::TempdirDrop);
+    assert!(!case.runs_hermetically());
+}
+
 /// Rows that need their own empty project directory.
 ///
 /// The shared fixture captures an `omg.lock` (env-capture) and other state

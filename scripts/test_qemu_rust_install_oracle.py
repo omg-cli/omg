@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import shlex
 from pathlib import Path
 import pwd
 import subprocess
@@ -180,6 +181,45 @@ class RustOracleBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(evidence, [])
         self.assertNotIn("PRODUCT_MUST_NOT_RUN", result.stdout)
+
+
+class RustGuestPrerequisiteTests(unittest.TestCase):
+    def run_setup(self, distro, installer_exit=0):
+        driver = (HERE / "benchmark-qemu.sh").read_text()
+        marker = '# Inventory fixtures need these tools; missing tools are setup failures,'
+        setup = driver.split(marker, 1)[1].split('  # The hermetic `new` row', 1)[0]
+        setup = setup[setup.index('  case "$distro" in'):]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "evidence").mkdir()
+            recorder = root / "sudo"
+            recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$SETUP_ARGUMENTS"\nexit "$SETUP_EXIT"\n')
+            recorder.chmod(0o700)
+            environment = dict(os.environ, PATH=f"{root}:/usr/bin:/bin",
+                               SETUP_ARGUMENTS=str(root / "arguments"), SETUP_EXIT=str(installer_exit))
+            result = subprocess.run(['bash', '-c', 'set -euo pipefail\ndistro='
+                                     + shlex.quote(distro) + '\n' + setup], cwd=root, env=environment,
+                                    capture_output=True, text=True, timeout=5)
+            return result, (root / "arguments").read_text().splitlines()
+
+    def test_guest_setup_supplies_linker_and_native_headers_for_each_distro(self):
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            with self.subTest(distro=distro):
+                result, arguments = self.run_setup(distro)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('gcc', arguments)
+                if distro in ('debian', 'ubuntu'):
+                    self.assertIn('libc6-dev', arguments)
+                if distro == 'fedora':
+                    self.assertIn('glibc-devel', arguments)
+                self.assertNotIn('rustc', arguments)
+                self.assertNotIn('cargo', arguments)
+
+    def test_failed_guest_prerequisite_installation_is_a_setup_failure(self):
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            with self.subTest(distro=distro):
+                result, _ = self.run_setup(distro, installer_exit=42)
+                self.assertEqual(result.returncode, 120, result.stderr)
 
 
 if __name__ == "__main__":
