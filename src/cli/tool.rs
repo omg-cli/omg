@@ -50,7 +50,7 @@ fn restricted_manager_command(
     staging_dir: &Path,
 ) -> Result<Command> {
     let mut command = manager_command(
-        crate::core::privilege::trusted_program("setpriv")?,
+        crate::core::privilege::root_controlled_program_path("setpriv")?,
         staging_dir,
     );
     command

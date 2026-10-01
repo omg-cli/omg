@@ -175,7 +175,7 @@ pub(crate) fn sudo_as_user_program(user: &str, program: &str) -> Result<std::pro
         "Refusing to de-escalate a command to the root account"
     );
 
-    let program = crate::core::privilege::trusted_program(program)?;
+    let program = crate::core::privilege::root_controlled_program_path(program)?;
     let mut command = crate::core::privilege::system_command("sudo")?;
     command.args(["-H", "-u", user, "--"]).arg(program);
     Ok(command)

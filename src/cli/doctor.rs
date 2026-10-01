@@ -1182,7 +1182,7 @@ fn check_required_system_command(cmd: &str, issues: &mut usize) {
         println!("  {}", style::success(&format!("Found dependency: {cmd}")));
         return;
     }
-    if crate::core::privilege::trusted_program(cmd).is_ok() {
+    if crate::core::privilege::root_controlled_program_path(cmd).is_ok() {
         println!("  {}", style::success(&format!("Found dependency: {cmd}")));
     } else {
         println!("  {}", style::error(&format!("Missing dependency: {cmd}")));
@@ -1390,7 +1390,7 @@ pub fn enable_turbo_mode() -> Result<()> {
         true
     };
     if cleanup_done {
-        let setcap = crate::core::privilege::trusted_program("setcap")?;
+        let setcap = crate::core::privilege::root_controlled_program_path("setcap")?;
         let remove = crate::core::privilege::system_command("sudo")?
             .arg("--")
             .arg(setcap)

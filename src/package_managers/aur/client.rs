@@ -172,7 +172,7 @@ fn create_scoped_pgp_home(
         .prefix("aur-pgp-")
         .tempdir_in(cache_dir)
         .context("Failed to create package-scoped AUR PGP keyring")?;
-    let gpg = crate::core::privilege::trusted_program("gpg")?;
+    let gpg = crate::core::privilege::root_controlled_program_path("gpg")?;
     let exported = std::process::Command::new(&gpg)
         .arg("--no-options")
         .arg("--batch")
@@ -556,16 +556,24 @@ fn configure_build_environment(command: &mut Command, home: &Path, user: &str) {
 }
 
 fn native_build_command() -> Result<Command> {
-    let mut command = Command::new(crate::core::privilege::trusted_program("setpriv")?);
+    let mut command = Command::new(crate::core::privilege::root_controlled_program_path(
+        "setpriv",
+    )?);
     command
         .args(["--no-new-privs", "--"])
-        .arg(crate::core::privilege::trusted_program("setsid")?)
+        .arg(crate::core::privilege::root_controlled_program_path(
+            "setsid",
+        )?)
         .args(["-w", "makepkg"]);
     Ok(command)
 }
 
 fn sandbox_command(home: &Path, user: &str) -> Result<Command> {
-    sandbox_command_with(home, user, crate::core::privilege::trusted_program)
+    sandbox_command_with(
+        home,
+        user,
+        crate::core::privilege::root_controlled_program_path,
+    )
 }
 
 fn sandbox_command_with(
@@ -2048,7 +2056,7 @@ impl AurClient {
         }
 
         if !console::user_attended() {
-            let true_program = crate::core::privilege::trusted_program("true")?;
+            let true_program = crate::core::privilege::root_controlled_program_path("true")?;
             let status = crate::core::privilege::sudo_command()?
                 .args(["-n", "--"])
                 .arg(true_program)
@@ -3517,7 +3525,7 @@ impl AurClient {
         env: &MakepkgEnv,
         package: &str,
     ) -> Result<std::process::ExitStatus> {
-        let bwrap_available = crate::core::privilege::trusted_program("bwrap").is_ok();
+        let bwrap_available = crate::core::privilege::root_controlled_program_path("bwrap").is_ok();
 
         if bwrap_available {
             tracing::info!("Using bubblewrap sandbox for secure AUR build");
@@ -3796,14 +3804,18 @@ impl AurClient {
             self.settings.aur.allow_network,
             "Chroot devtools cannot enforce offline builds; choose bubblewrap or explicitly enable aur.allow_network"
         );
-        let mut cmd = if let Ok(pkgctl) = crate::core::privilege::trusted_program("pkgctl") {
+        let mut cmd = if let Ok(pkgctl) =
+            crate::core::privilege::root_controlled_program_path("pkgctl")
+        {
             let mut cmd = Command::new(pkgctl);
             cmd.arg("build");
             if self.settings.aur.secure_makepkg {
                 cmd.arg("--clean");
             }
             cmd
-        } else if let Ok(makechrootpkg) = crate::core::privilege::trusted_program("makechrootpkg") {
+        } else if let Ok(makechrootpkg) =
+            crate::core::privilege::root_controlled_program_path("makechrootpkg")
+        {
             let mut cmd = Command::new(makechrootpkg);
             cmd.args(["-r", "/var/lib/archbuild"]).arg("--");
             cmd
@@ -4830,10 +4842,12 @@ mod tests {
     #[tokio::test]
     async fn native_child_cannot_gain_new_privileges() -> Result<()> {
         // Exercise the real setpriv boundary without sudo or package mutation.
-        let output = Command::new(crate::core::privilege::trusted_program("setpriv")?)
-            .args(["--no-new-privs", "--", "/usr/bin/cat", "/proc/self/status"])
-            .output()
-            .await?;
+        let output = Command::new(crate::core::privilege::root_controlled_program_path(
+            "setpriv",
+        )?)
+        .args(["--no-new-privs", "--", "/usr/bin/cat", "/proc/self/status"])
+        .output()
+        .await?;
         assert!(output.status.success());
         assert!(String::from_utf8(output.stdout)?.contains("NoNewPrivs:\t1"));
         let command = native_build_command()?;
