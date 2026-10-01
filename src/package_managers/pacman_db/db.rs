@@ -1679,12 +1679,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn sync_database_order_follows_pacman_configuration() {
-        if crate::core::is_root() {
-            // Elevated processes ignore OMG_PACMAN_* overrides, so this
-            // fixture test only applies to unprivileged runs.
-            eprintln!("skipped: elevated processes ignore caller path overrides");
+        if crate::config::Settings::rerun_test_unprivileged(
+            "package_managers::pacman_db::db::tests::sync_database_order_follows_pacman_configuration",
+        ) {
             return;
         }
+        assert!(
+            !crate::core::is_root(),
+            "caller path fixture must not run as root"
+        );
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(temp_dir.path().join("core.db"), b"core").unwrap();
         std::fs::write(temp_dir.path().join("custom.db"), b"custom").unwrap();
@@ -1703,17 +1706,24 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(names, ["custom", "core"]);
         });
+        println!(
+            "[omg-config-fixture] test=package_managers::pacman_db::db::tests::sync_database_order_follows_pacman_configuration uid={}",
+            nix::unistd::geteuid()
+        );
     }
 
     #[test]
     #[serial_test::serial]
     fn test_collect_sync_db_paths_excludes_sig_files() {
-        if crate::core::is_root() {
-            // Elevated processes ignore OMG_PACMAN_* overrides, so this
-            // fixture test only applies to unprivileged runs.
-            eprintln!("skipped: elevated processes ignore caller path overrides");
+        if crate::config::Settings::rerun_test_unprivileged(
+            "package_managers::pacman_db::db::tests::test_collect_sync_db_paths_excludes_sig_files",
+        ) {
             return;
         }
+        assert!(
+            !crate::core::is_root(),
+            "caller path fixture must not run as root"
+        );
         let temp_dir = tempfile::TempDir::new().unwrap();
         let config = temp_dir.path().join("pacman.conf");
         std::fs::write(
@@ -1766,6 +1776,10 @@ mod tests {
         assert!(
             !collected_names.contains(&"not-a-db.txt"),
             "Should NOT include non-.db files"
+        );
+        println!(
+            "[omg-config-fixture] test=package_managers::pacman_db::db::tests::test_collect_sync_db_paths_excludes_sig_files uid={}",
+            nix::unistd::geteuid()
         );
     }
 
