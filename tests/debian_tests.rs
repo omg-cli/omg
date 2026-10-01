@@ -853,21 +853,25 @@ mod debian_specific {
     #[cfg(feature = "debian")]
     #[test]
     fn test_debian_stable_packages() {
-        require_debian!();
+        let config = TestConfig::default();
+        assert!(
+            config.is_debian() || config.is_ubuntu(),
+            "native APT candidate parity requires a Debian or Ubuntu host"
+        );
 
         for pkg in &["apt", "dpkg", "systemd"] {
             let policy = std::process::Command::new("apt-cache")
                 .args(["policy", pkg])
                 .env("LC_ALL", "C")
                 .output()
-                .expect("query native Debian package candidate");
+                .expect("query native APT package candidate");
             assert!(policy.status.success(), "apt-cache policy {pkg} failed");
             let policy = String::from_utf8(policy.stdout).expect("APT policy is UTF-8");
             let candidate = policy
                 .lines()
                 .find_map(|line| line.trim().strip_prefix("Candidate: "))
                 .filter(|version| *version != "(none)")
-                .expect("standard Debian package has an APT candidate");
+                .expect("standard APT package has a native candidate");
             let output = apt_integration::native_info(&["search", pkg, "--json"]);
             let rows: Vec<serde_json::Value> =
                 serde_json::from_slice(&output.stdout).expect("search --json returns an array");
@@ -877,7 +881,7 @@ mod debian_specific {
                         && row["version"] == candidate
                         && row["source"] == "Official"
                 }),
-                "OMG omitted native Debian candidate {pkg} {candidate}: {rows:?}"
+                "OMG omitted native APT candidate {pkg} {candidate}: {rows:?}"
             );
         }
     }

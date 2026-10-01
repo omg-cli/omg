@@ -348,26 +348,62 @@ impl Settings {
         CLI_REVIEW_PKGBUILD.store(true, Ordering::SeqCst);
     }
 
-    /// Run environment-selected config fixtures as an ordinary user, including
-    /// when the container test runner is root. Production root path resolution
-    /// deliberately ignores OMG_CONFIG_DIR and must stay exercised unchanged.
+    /// Run an explicitly selected fixture as an ordinary user when the test
+    /// container is root. Keep other root-specific contracts at their real UID.
     #[cfg(test)]
-    pub(crate) fn rerun_config_test_unprivileged(test_name: &str) -> bool {
+    pub(crate) fn rerun_test_unprivileged(test_name: &str) -> bool {
         #[cfg(unix)]
-        if crate::core::is_root() {
+        {
+            use sha2::{Digest, Sha256};
+            use std::io::Read;
             use std::os::unix::fs::PermissionsExt;
             use std::os::unix::process::CommandExt;
 
+            fn executable_digest(path: &std::path::Path) -> String {
+                let mut file = std::fs::File::open(path).expect("open test executable");
+                let mut digest = Sha256::new();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let count = file.read(&mut buffer).expect("hash test executable");
+                    if count == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..count]);
+                }
+                format!("{:x}", digest.finalize())
+            }
+
+            if !crate::core::is_root() {
+                let directly_launched =
+                    std::env::var("OMG_TEST_FIXTURE_PARENT_PID").is_ok_and(|parent| {
+                        parent
+                            .parse::<i32>()
+                            .is_ok_and(|pid| nix::unistd::getppid().as_raw() == pid)
+                    });
+                if directly_launched {
+                    assert_ne!(
+                        nix::unistd::getuid().as_raw(),
+                        0,
+                        "fixture process must not be root"
+                    );
+                    println!(
+                        "[omg-unprivileged-fixture-child] test={test_name} uid={} executable_sha256={}",
+                        nix::unistd::getuid().as_raw(),
+                        executable_digest(&std::env::current_exe().expect("child test executable"))
+                    );
+                }
+                return false;
+            }
             let account = nix::unistd::User::from_name("nobody")
                 .expect("look up unprivileged fixture account")
                 .expect("root test containers must provide nobody");
             assert_ne!(account.uid.as_raw(), 0, "fixture account must not be root");
             // Copy outside potentially root-only checkout ancestors. The parent
             // keeps ownership so the child cannot replace its test executable.
-            let fixture = tempfile::TempDir::new_in("/tmp").expect("test executable directory");
+            let fixture = tempfile::TempDir::new_in("/var/tmp").expect("test executable directory");
             std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o755))
                 .expect("allow fixture account to traverse executable directory");
-            let executable = fixture.path().join("config-test");
+            let executable = fixture.path().join("unprivileged-test");
             std::fs::copy(
                 std::env::current_exe().expect("test executable"),
                 &executable,
@@ -375,25 +411,51 @@ impl Settings {
             .expect("copy test executable");
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
                 .expect("allow fixture account to execute tests");
+            let digest = executable_digest(&executable);
+            println!(
+                "[omg-unprivileged-fixture] test={test_name} parent_uid=0 executable_sha256={digest}"
+            );
             let output = std::process::Command::new(&executable)
                 .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
                 .current_dir(fixture.path())
-                .env("TMPDIR", "/tmp")
+                .env("TMPDIR", "/var/tmp")
+                .env(
+                    "OMG_TEST_FIXTURE_PARENT_PID",
+                    std::process::id().to_string(),
+                )
                 .uid(account.uid.as_raw())
                 .gid(account.gid.as_raw())
                 .output()
-                .expect("execute unprivileged config fixture");
+                .expect("execute unprivileged fixture");
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let expected_proof = format!(
+                "[omg-unprivileged-fixture-child] test={test_name} uid={} executable_sha256={digest}",
+                account.uid.as_raw()
+            );
+            let proofs: Vec<&str> = stdout
+                .lines()
+                .filter_map(|line| {
+                    line.find("[omg-unprivileged-fixture-child]")
+                        .map(|start| &line[start..])
+                })
+                .collect();
             assert!(
-                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                output.status.success()
+                    && stdout.contains("1 passed; 0 failed; 0 ignored;")
+                    && proofs == [expected_proof.as_str()],
                 "unprivileged {test_name} failed or did not run: {}\n{stdout}\n{stderr}",
                 output.status
             );
-            return true;
+            print!("{stdout}");
+            eprint!("{stderr}");
+            true
         }
-        let _ = test_name;
-        false
+        #[cfg(not(unix))]
+        {
+            let _ = test_name;
+            false
+        }
     }
 
     #[cfg(test)]
@@ -744,7 +806,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn save_preserves_comments_and_unknown_keys() {
-        if Settings::rerun_config_test_unprivileged(
+        if Settings::rerun_test_unprivileged(
             "config::settings::tests::save_preserves_comments_and_unknown_keys",
         ) {
             return;
@@ -785,7 +847,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn save_removes_cleared_option_keys() {
-        if Settings::rerun_config_test_unprivileged(
+        if Settings::rerun_test_unprivileged(
             "config::settings::tests::save_removes_cleared_option_keys",
         ) {
             return;
@@ -882,7 +944,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn config_missing_env_dir_loads_defaults() {
-        if Settings::rerun_config_test_unprivileged(
+        if Settings::rerun_test_unprivileged(
             "config::settings::tests::config_missing_env_dir_loads_defaults",
         ) {
             return;
@@ -907,7 +969,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn load_rejects_poisoned_makeflags() {
-        if Settings::rerun_config_test_unprivileged(
+        if Settings::rerun_test_unprivileged(
             "config::settings::tests::load_rejects_poisoned_makeflags",
         ) {
             return;
@@ -933,7 +995,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn load_tolerates_extreme_concurrency_for_consumer_clamping() {
-        if Settings::rerun_config_test_unprivileged(
+        if Settings::rerun_test_unprivileged(
             "config::settings::tests::load_tolerates_extreme_concurrency_for_consumer_clamping",
         ) {
             return;
@@ -957,7 +1019,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn load_accepts_valid_hardening_values() {
-        if Settings::rerun_config_test_unprivileged(
+        if Settings::rerun_test_unprivileged(
             "config::settings::tests::load_accepts_valid_hardening_values",
         ) {
             return;
