@@ -50,6 +50,13 @@ def prepare(root):
     assert linker is not None, "native C linker prerequisite is missing"
     linker_identity, _ = run([linker, "--version"], 5)
     assert linker_identity.stdout.strip(), "native C linker did not identify itself"
+    linker_fixture = root / "native-linker-probe"
+    linker_fixture.mkdir(mode=0o700)
+    linker_source, linker_binary = linker_fixture / "main.c", linker_fixture / "probe"
+    linker_source.write_text('#include <stdio.h>\nint main(void) { puts("OMG_NATIVE_LINKER_OK"); return 0; }\n')
+    run([linker, str(linker_source), "-o", str(linker_binary)], 10)
+    linker_execution, _ = run([str(linker_binary)], 5)
+    assert linker_execution.stdout == "OMG_NATIVE_LINKER_OK\n" and not linker_execution.stderr, "native C linker probe did not execute correctly"
     for name in ("runtime-home", "runtime-data", "runtime-cache", "runtime-config"):
         (root / name).mkdir(mode=0o700)
         owned_directory(root / name, private=True)
@@ -59,7 +66,8 @@ def prepare(root):
     (guard / "guard").chmod(0o700)
     (guard.parent.parent / "current").symlink_to("1.0.0")
     state = {"guard": guard_state(root), "startedMonotonicNS": time.monotonic_ns(),
-             "nativeLinker": {"path": linker, "identity": linker_identity.stdout}}
+             "nativeLinker": {"path": linker, "identity": linker_identity.stdout,
+                              "programSHA256": sha(linker_binary), "programOutput": linker_execution.stdout}}
     (root / "rust-before.json").write_text(json.dumps(state))
 
 

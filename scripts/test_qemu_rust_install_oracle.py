@@ -155,6 +155,32 @@ class RustOracleBoundaryTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "native C linker prerequisite is missing"):
                     SUBJECT.prepare(self.root)
 
+    def test_native_linker_compile_failure_precedes_runtime_installation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = subprocess.CompletedProcess(['cc', '--version'], 0, stdout='fixture cc\n', stderr='')
+            with mock.patch.object(SUBJECT.os, "geteuid", return_value=1000), \
+                    mock.patch.object(SUBJECT, "owned_directory"), \
+                    mock.patch.object(SUBJECT, "run", side_effect=[(fake, 0), subprocess.CalledProcessError(19, ['cc'])]):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    SUBJECT.prepare(root)
+            self.assertFalse((root / "runtime-data").exists())
+            self.assertFalse((root / "rust-before.json").exists())
+
+    def test_native_linker_program_failure_precedes_runtime_installation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = subprocess.CompletedProcess(['cc', '--version'], 0, stdout='fixture cc\n', stderr='')
+            compile_result = subprocess.CompletedProcess(['cc'], 0, stdout='', stderr='')
+            execution = subprocess.CompletedProcess(['probe'], 0, stdout='WRONG\n', stderr='')
+            with mock.patch.object(SUBJECT.os, "geteuid", return_value=1000), \
+                    mock.patch.object(SUBJECT, "owned_directory"), \
+                    mock.patch.object(SUBJECT, "run", side_effect=[(identity, 0), (compile_result, 0), (execution, 0)]):
+                with self.assertRaisesRegex(AssertionError, 'native C linker probe did not execute'):
+                    SUBJECT.prepare(root)
+            self.assertFalse((root / "runtime-data").exists())
+            self.assertFalse((root / "rust-before.json").exists())
+
     def test_actual_executor_rejects_false_success_without_installed_compiler(self):
         if self.rerun_row_body_unprivileged():
             return
