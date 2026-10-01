@@ -1108,7 +1108,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn forged_elevation_policy_handoff_is_rejected() {
-        if crate::config::Settings::rerun_config_test_unprivileged(
+        if crate::config::Settings::rerun_test_unprivileged(
             "core::security::policy::tests::forged_elevation_policy_handoff_is_rejected",
         ) {
             return;
