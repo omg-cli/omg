@@ -215,6 +215,7 @@ exec "{shutil.which("timeout")}" "$@"
             listener.bind(("127.0.0.1", 0))
             listener.listen()
             listener.settimeout(5)
+            port = listener.getsockname()[1]
             accepted = []
             errors = []
 
@@ -237,7 +238,7 @@ exec "{shutil.which("timeout")}" "$@"
                      "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
                      "-o", "StrictHostKeyChecking=yes", "-o",
                      f"UserKnownHostsFile={directory}/known_hosts", "-p",
-                     str(listener.getsockname()[1])],
+                     str(port)],
                     text=True, capture_output=True, timeout=12)
             finally:
                 server.join(timeout=6)
@@ -245,7 +246,11 @@ exec "{shutil.which("timeout")}" "$@"
             self.assertEqual(errors, [])
             self.assertEqual(len(accepted), 2, "one primary call and one diagnostic call")
             self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertIn("Connection reset by peer", result.stderr)
+            self.assertRegex(
+                result.stderr,
+                rf"(?m)^(?:kex_exchange_identification: read: )?Connection reset by "
+                rf"(?:peer|127\.0\.0\.1 port {port})$",
+            )
             self.assertIn("timeout_ssh_exit=255", result.stderr)
             self.assertIn("diagnostic_exit=255", result.stderr)
             self.assertNotIn("timeout_ssh_exit=124", result.stderr)
