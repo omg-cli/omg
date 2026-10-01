@@ -769,7 +769,8 @@ fn with_audit_read_lock<T>(
         }
         Err(error) => {
             if let Err(unlock_error) = unlock_result {
-                tracing::warn!("Failed to unlock audit log after read error: {unlock_error}");
+                let error = tracing_safe_audit_text(&unlock_error.to_string());
+                tracing::warn!("Failed to unlock audit log after read error: {error}");
             }
             Err(error)
         }
@@ -949,10 +950,89 @@ static AUDIT_QUEUE: std::sync::LazyLock<std::sync::mpsc::SyncSender<AuditQueueMe
                 }
             })
         {
+            let error = tracing_safe_audit_text(&error.to_string());
             tracing::error!("Failed to start audit writer thread: {error}");
         }
         sender
     });
+
+/// Diagnose and recover under the cooperating appenders' exclusive lock.
+/// A live writer may be between JSONL writes; only inspect its tail after it
+/// releases the lock. Keep diagnosis, quarantine and logger selection together.
+fn recover_audit_logger(log_path: &Path) -> Result<AuditLogger, AuditError> {
+    let parent = log_path.parent().ok_or_else(|| AuditError::CreateDir {
+        path: log_path.display().to_string(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
+    })?;
+    paths::create_private_data_directory(parent).map_err(|source| AuditError::CreateDir {
+        path: parent.display().to_string(),
+        source,
+    })?;
+    let lock_path = log_path.with_extension("lock");
+    let lock = open_lock_file(&lock_path)?;
+    lock.lock().map_err(|source| AuditError::Open {
+        path: lock_path.display().to_string(),
+        source,
+    })?;
+    let result = (|| {
+        match AuditLogger::new_in(log_path) {
+            Ok(logger) => Ok(logger),
+            Err(AuditError::CorruptLine { .. } | AuditError::MissingHash { .. }) => {
+                // Publish the known history gap before removing active history.
+                // Failure leaves the original bytes in place and refuses startup.
+                let marker = log_path.with_file_name("incomplete");
+                mark_audit_incomplete_at(&marker).map_err(|source| AuditError::Write {
+                    path: marker.display().to_string(),
+                    source,
+                })?;
+                sync_audit_directory(parent)?;
+                let quarantined = quarantine_corrupt_audit_log(log_path)?;
+                sync_audit_directory(parent)?;
+                let logger = AuditLogger::new_in(log_path)?;
+                let path = tracing_safe_audit_text(&quarantined.display().to_string());
+                tracing::warn!(
+                    "Audit log was corrupt; quarantined to {path} and started fresh log"
+                );
+                Ok(logger)
+            }
+            Err(error) => Err(error),
+        }
+    })();
+    let unlock = lock.unlock().map_err(|source| AuditError::Unlock {
+        path: lock_path.display().to_string(),
+        source,
+    });
+    match result {
+        Ok(logger) => {
+            unlock?;
+            Ok(logger)
+        }
+        Err(error) => {
+            if let Err(unlock_error) = unlock {
+                let unlock_error = tracing_safe_audit_text(&unlock_error.to_string());
+                tracing::warn!("Failed to unlock audit log after recovery error: {unlock_error}");
+            }
+            Err(error)
+        }
+    }
+}
+
+// Directory fsync persists the marker name and quarantine rename on Unix.
+// Windows does not support opening a directory with File::open for fsync.
+fn sync_audit_directory(path: &Path) -> Result<(), AuditError> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| AuditError::Write {
+                path: path.display().to_string(),
+                source,
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
 
 /// Open the global audit logger before accepting daemon requests.
 ///
@@ -964,19 +1044,7 @@ pub fn init_audit_logger() -> Result<(), AuditError> {
 /// Initialize the global audit logger at a daemon state's explicit location.
 /// Isolated daemon state must not recover an ambient process data directory.
 pub(crate) fn init_audit_logger_in(log_path: impl AsRef<Path>) -> Result<(), AuditError> {
-    let log_path = log_path.as_ref();
-    let logger = match AuditLogger::new_in(log_path) {
-        Ok(l) => l,
-        Err(AuditError::CorruptLine { .. } | AuditError::MissingHash { .. }) => {
-            let quarantined = quarantine_corrupt_audit_log(log_path)?;
-            tracing::warn!(
-                "Audit log was corrupt; quarantined to {} and started fresh log",
-                quarantined.display()
-            );
-            AuditLogger::new_in(log_path)?
-        }
-        Err(e) => return Err(e),
-    };
+    let logger = recover_audit_logger(log_path.as_ref())?;
     let marker = logger.log_path.with_file_name("incomplete");
     *AUDIT_LOGGER
         .lock()
@@ -998,34 +1066,26 @@ fn record_global(
     resource: &str,
     description: &str,
 ) {
+    let safe_resource = tracing_safe_audit_text(&bounded_audit_field(resource));
     let Ok(mut guard) = AUDIT_LOGGER.lock() else {
         mark_audit_incomplete();
-        tracing::error!("Audit logger state is poisoned; dropping event {event} for {resource}");
+        tracing::error!(
+            "Audit logger state is poisoned; dropping event {event} for {safe_resource}"
+        );
         return;
     };
     if guard.is_none() {
-        match AuditLogger::new() {
+        let log_path = paths::data_dir().join("audit/audit.jsonl");
+        match recover_audit_logger(&log_path) {
             Ok(logger) => {
                 remember_audit_marker(&logger);
                 *guard = Some(logger);
             }
-            Err(AuditError::CorruptLine { .. } | AuditError::MissingHash { .. }) => {
-                let log_path = paths::data_dir().join("audit/audit.jsonl");
-                if let Ok(quarantined) = quarantine_corrupt_audit_log(&log_path) {
-                    tracing::warn!(
-                        "Audit log was corrupt; quarantined to {} and started fresh log",
-                        quarantined.display()
-                    );
-                    if let Ok(logger) = AuditLogger::new() {
-                        remember_audit_marker(&logger);
-                        *guard = Some(logger);
-                    }
-                }
-            }
             Err(error) => {
-                mark_audit_incomplete_at_or_log(&paths::data_dir().join("audit/incomplete"));
+                mark_audit_incomplete_at_or_log(&log_path.with_file_name("incomplete"));
+                let error = tracing_safe_audit_text(&error.to_string());
                 tracing::warn!(
-                    "Audit logger unavailable, dropping event {event} for {resource}: {error}"
+                    "Audit logger unavailable, dropping event {event} for {safe_resource}: {error}"
                 );
                 return;
             }
@@ -1037,7 +1097,8 @@ fn record_global(
     };
     if let Err(error) = logger.log(event, severity, resource, description) {
         mark_audit_incomplete_at_or_log(&logger.log_path.with_file_name("incomplete"));
-        tracing::warn!("Failed to persist audit event {event} for {resource}: {error}");
+        let error = tracing_safe_audit_text(&error.to_string());
+        tracing::warn!("Failed to persist audit event {event} for {safe_resource}: {error}");
     }
 }
 
@@ -1052,20 +1113,30 @@ pub fn audit_log_nonblocking(
     resource: &str,
     description: &str,
 ) {
+    enqueue_audit_event(&AUDIT_QUEUE, event, severity, resource, description);
+}
+
+fn enqueue_audit_event(
+    sender: &std::sync::mpsc::SyncSender<AuditQueueMessage>,
+    event: AuditEventType,
+    severity: AuditSeverity,
+    resource: &str,
+    description: &str,
+) {
     let message = QueuedAuditEvent {
         event,
         severity,
         resource: bounded_audit_field(resource),
         description: bounded_audit_field(description),
     };
-    match AUDIT_QUEUE.try_send(AuditQueueMessage::Event(message)) {
+    match sender.try_send(AuditQueueMessage::Event(message)) {
         Ok(()) => {}
         Err(std::sync::mpsc::TrySendError::Full(AuditQueueMessage::Event(message))) => {
             mark_audit_incomplete();
             tracing::error!(
                 "Audit queue is full; dropping event {} for {}",
                 message.event,
-                message.resource
+                tracing_safe_audit_text(&message.resource)
             );
         }
         Err(std::sync::mpsc::TrySendError::Disconnected(AuditQueueMessage::Event(message))) => {
@@ -1073,7 +1144,7 @@ pub fn audit_log_nonblocking(
             tracing::error!(
                 "Audit writer is unavailable; dropping event {} for {}",
                 message.event,
-                message.resource
+                tracing_safe_audit_text(&message.resource)
             );
         }
         Err(_) => unreachable!("only audit events are submitted by this function"),
@@ -2394,6 +2465,7 @@ fn remember_audit_marker(logger: &AuditLogger) {
 
 fn mark_audit_incomplete_at_or_log(path: &Path) {
     if let Err(error) = mark_audit_incomplete_at(path) {
+        let error = tracing_safe_audit_text(&error.to_string());
         tracing::error!("Cannot persist audit incompleteness marker: {error}");
     }
 }
@@ -2651,6 +2723,428 @@ mod completeness_tests {
             std::os::unix::fs::symlink("missing", &dangling)?;
             assert!(super::ensure_complete_collection(&dangling).is_err());
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod recovery_diagnostic_tests {
+    use super::*;
+    use anyhow::Context;
+
+    fn quarantines(parent: &Path) -> anyhow::Result<Vec<PathBuf>> {
+        Ok(std::fs::read_dir(parent)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+            })
+            .collect())
+    }
+
+    fn clear_global() {
+        *AUDIT_LOGGER.lock().unwrap() = None;
+        *AUDIT_INCOMPLETE_MARKER.write().unwrap() = None;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_recovery_preserves_quarantine_and_persistent_gap() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit/audit.jsonl");
+        paths::create_private_data_directory(path.parent().unwrap())?;
+        let corrupt = b"{\"id\":\"interrupted";
+        std::fs::write(&path, corrupt)?;
+        init_audit_logger_in(&path)?;
+        record_global(
+            AuditEventType::SecurityAudit,
+            AuditSeverity::Info,
+            "after-gap",
+            "persisted",
+        );
+        clear_global();
+        let files = quarantines(path.parent().unwrap())?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(&files[0])?, corrupt);
+        let report = AuditLogger::new_in(&path)?.verify_integrity()?;
+        assert!(report.is_valid());
+        assert_eq!(report.total_entries, 1);
+        let marker = path.with_file_name("incomplete");
+        assert!(ensure_complete_collection(&marker).is_err());
+        init_audit_logger_in(&path)?;
+        clear_global();
+        assert!(ensure_complete_collection(&marker).is_err());
+        assert_eq!(quarantines(path.parent().unwrap())?, files);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lazy_recovery_preserves_quarantine_and_persistent_gap() -> anyhow::Result<()> {
+        assert!(
+            !crate::core::is_root(),
+            "this fixture requires an unprivileged process"
+        );
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit/audit.jsonl");
+        paths::create_private_data_directory(path.parent().unwrap())?;
+        std::fs::write(&path, b"not-json\n")?;
+        clear_global();
+        temp_env::with_var("OMG_DATA_DIR", Some(directory.path()), || {
+            record_global(
+                AuditEventType::SecurityAudit,
+                AuditSeverity::Info,
+                "lazy-after-gap",
+                "persisted",
+            );
+        });
+        clear_global();
+        let files = quarantines(path.parent().unwrap())?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(&files[0])?, b"not-json\n");
+        assert!(AuditLogger::new_in(&path)?.verify_integrity()?.is_valid());
+        assert!(ensure_complete_collection(&path.with_file_name("incomplete")).is_err());
+        init_audit_logger_in(&path)?;
+        clear_global();
+        assert!(ensure_complete_collection(&path.with_file_name("incomplete")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_marker_failure_keeps_original_history() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture requires unprivileged process"
+        );
+        let directory = tempfile::tempdir()?;
+        let parent = directory.path().join("audit");
+        paths::create_private_data_directory(&parent)?;
+        let path = parent.join("audit.jsonl");
+        std::fs::write(&path, b"not-json\n")?;
+        drop(open_lock_file(&path.with_extension("lock"))?);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500))?;
+        let result = recover_audit_logger(&path);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
+        let error = result
+            .err()
+            .context("recovery must refuse an unpersisted marker")?;
+        assert!(
+            matches!(error, AuditError::Write { source, .. } if source.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(std::fs::read(&path)?, b"not-json\n");
+        assert!(quarantines(&parent)?.is_empty());
+        assert!(!path.with_file_name("incomplete").exists());
+        let logger = recover_audit_logger(&path)?;
+        assert!(ensure_complete_collection(&path.with_file_name("incomplete")).is_err());
+        assert_eq!(logger.last_hash, "genesis");
+        assert_eq!(quarantines(&parent)?.len(), 1);
+        Ok(())
+    }
+
+    async fn isolated_child(
+        name: &str,
+        marker: &str,
+        value: &std::ffi::OsStr,
+    ) -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt;
+        const MAX_CAPTURE: u64 = 256 * 1024;
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", name, "--nocapture", "--color", "never"])
+            .env(marker, value)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdout = child.stdout.take().context("piped child stdout")?;
+        let stderr = child.stderr.take().context("piped child stderr")?;
+        let capture = async {
+            let (status, stdout, stderr) = tokio::try_join!(
+                child.wait(),
+                async {
+                    let mut bytes = Vec::new();
+                    stdout.take(MAX_CAPTURE + 1).read_to_end(&mut bytes).await?;
+                    Ok::<_, io::Error>(bytes)
+                },
+                async {
+                    let mut bytes = Vec::new();
+                    stderr.take(MAX_CAPTURE + 1).read_to_end(&mut bytes).await?;
+                    Ok::<_, io::Error>(bytes)
+                },
+            )?;
+            Ok::<_, io::Error>((status, stdout, stderr))
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), capture).await;
+        let (status, stdout, stderr) = match result {
+            Ok(Ok(output)) => output,
+            failure => {
+                if child.try_wait()?.is_none() {
+                    child.kill().await?;
+                }
+                child.wait().await?;
+                anyhow::bail!("owned audit child failed to finish: {failure:?}");
+            }
+        };
+        anyhow::ensure!(
+            stdout.len() <= MAX_CAPTURE as usize && stderr.len() <= MAX_CAPTURE as usize,
+            "child output bound exceeded"
+        );
+        let stdout = String::from_utf8(stdout)?;
+        let stderr = String::from_utf8(stderr)?;
+        anyhow::ensure!(
+            status.success(),
+            "owned audit child failed: {status}\n{stdout}\n{stderr}"
+        );
+        anyhow::ensure!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+            "owned audit child must execute exactly one test: {stdout}"
+        );
+        println!("AUDIT_RECOVERY_CHILD_BEGIN\n{stdout}\n{stderr}\nAUDIT_RECOVERY_CHILD_END");
+        Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct Plaintext(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for Plaintext {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Plaintext {
+        fn capture(&self, operation: impl FnOnce()) {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, operation);
+        }
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_loss_plaintext_escapes_resource_and_marks_gap() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::audit::recovery_diagnostic_tests::queue_loss_plaintext_escapes_resource_and_marks_gap";
+        const MARKER: &str = "OMG_AUDIT_QUEUE_PLAINTEXT_CHILD";
+        if std::env::var_os(MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            return isolated_child(NAME, MARKER, std::ffi::OsStr::new("1")).await;
+        }
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit/audit.jsonl");
+        init_audit_logger_in(&path)?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let resource = "pkg\nFORGED\r\t\u{1b}[31m";
+        enqueue_audit_event(
+            &sender,
+            AuditEventType::SecurityAudit,
+            AuditSeverity::Info,
+            "first",
+            "kept",
+        );
+        let output = Plaintext::default();
+        // Loss marking must also remain independent of the blocked global writer.
+        let guard = AUDIT_LOGGER.lock().unwrap();
+        output.capture(|| {
+            enqueue_audit_event(
+                &sender,
+                AuditEventType::SecurityAudit,
+                AuditSeverity::Info,
+                resource,
+                "lost-full",
+            );
+        });
+        assert!(ensure_complete_collection(&path.with_file_name("incomplete")).is_err());
+        drop(receiver);
+        output.capture(|| {
+            enqueue_audit_event(
+                &sender,
+                AuditEventType::SecurityAudit,
+                AuditSeverity::Info,
+                resource,
+                "lost-disconnected",
+            );
+        });
+        drop(guard);
+        let text = output.text();
+        assert_eq!(text.lines().count(), 2, "{text:?}");
+        assert!(text.contains("Audit queue is full"));
+        assert!(text.contains("Audit writer is unavailable"));
+        assert_eq!(text.matches("pkg\\nFORGED\\r\\t\\u{1b}[31m").count(), 2);
+        assert!(!text.contains('\r') && !text.contains('\u{1b}'));
+        clear_global();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failure_plaintext_escapes_paths_resources_and_keeps_raw_disk() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::audit::recovery_diagnostic_tests::failure_plaintext_escapes_paths_resources_and_keeps_raw_disk";
+        const MARKER: &str = "OMG_AUDIT_FAILURE_PLAINTEXT_CHILD";
+        if std::env::var_os(MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            return isolated_child(NAME, MARKER, std::ffi::OsStr::new("1")).await;
+        }
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit\nFORGED/audit.jsonl");
+        paths::create_private_data_directory(path.parent().unwrap())?;
+        std::fs::write(&path, b"not-json\n")?;
+        let output = Plaintext::default();
+        output.capture(|| {
+            init_audit_logger_in(&path).unwrap();
+        });
+        let text = output.text();
+        assert_eq!(text.lines().count(), 1, "{text:?}");
+        assert!(text.contains("audit\\nFORGED"));
+        assert_eq!(
+            std::fs::read(&quarantines(path.parent().unwrap())?[0])?,
+            b"not-json\n"
+        );
+        record_global(
+            AuditEventType::SecurityAudit,
+            AuditSeverity::Info,
+            "pkg\nraw",
+            "description\nraw",
+        );
+        let entry: AuditEntry = serde_json::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(entry.resource, "pkg\nraw");
+        assert_eq!(entry.description, "description\nraw");
+        assert!(entry.verify());
+        // A directory at the log path forces a genuine typed append/read error.
+        std::fs::rename(&path, path.with_extension("kept"))?;
+        std::fs::create_dir(&path)?;
+        output.capture(|| {
+            record_global(
+                AuditEventType::SecurityAudit,
+                AuditSeverity::Error,
+                "pkg\nFORGED\r\u{1b}",
+                "failed",
+            );
+        });
+        let text = output.text();
+        assert_eq!(text.lines().count(), 2, "{text:?}");
+        assert!(text.contains("pkg\\nFORGED\\r\\u{1b}"));
+        assert!(text.contains("Failed to persist audit event"));
+        assert!(!text.contains('\r') && !text.contains('\u{1b}'));
+        clear_global();
+        assert!(!crate::core::is_root());
+        let unavailable = directory.path().join("unavailable\nFORGED");
+        paths::create_private_data_directory(&unavailable)?;
+        std::fs::write(unavailable.join("audit"), b"not a directory")?;
+        temp_env::with_var("OMG_DATA_DIR", Some(&unavailable), || {
+            output.capture(|| {
+                record_global(
+                    AuditEventType::SecurityAudit,
+                    AuditSeverity::Error,
+                    "pkg\nFORGED",
+                    "unavailable",
+                );
+            });
+        });
+        let text = output.text();
+        assert!(text.contains("Audit logger unavailable"));
+        assert!(text.contains("unavailable\\nFORGED"));
+        assert_eq!(
+            text.lines().count(),
+            4,
+            "marker error plus logger warning: {text:?}"
+        );
+        clear_global();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_cross_process_partial_append() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::audit::recovery_diagnostic_tests::startup_waits_for_cross_process_partial_append";
+        const MARKER: &str = "OMG_AUDIT_PARTIAL_APPEND_CHILD";
+        if let Some(path) = std::env::var_os(MARKER) {
+            let path = PathBuf::from(path);
+            std::fs::write(path.with_extension("ready"), b"ready")?;
+            init_audit_logger_in(&path)?;
+            record_global(
+                AuditEventType::SecurityAudit,
+                AuditSeverity::Info,
+                "second",
+                "after writer lock",
+            );
+            clear_global();
+            let report = AuditLogger::new_in(&path)?.verify_integrity()?;
+            assert!(report.is_valid());
+            assert_eq!(report.total_entries, 2);
+            assert!(quarantines(path.parent().unwrap())?.is_empty());
+            assert!(!path.with_file_name("incomplete").exists());
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let mut logger = AuditLogger::new_in(&path)?;
+        logger.log(
+            AuditEventType::SecurityAudit,
+            AuditSeverity::Info,
+            "first",
+            "writer in progress",
+        )?;
+        let original = std::fs::read(&path)?;
+        let lock = open_lock_file(&path.with_extension("lock"))?;
+        lock.lock()?;
+        std::fs::write(&path, &original[..original.len() / 2])?;
+        let child = isolated_child(NAME, MARKER, path.as_os_str());
+        tokio::pin!(child);
+        let ready = path.with_extension("ready");
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut child => { result?; anyhow::bail!("startup completed while writer held a partial record"); }
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if ready.exists() { break; }
+                    }
+                }
+            }
+            tokio::select! {
+                result = &mut child => { result?; anyhow::bail!("startup failed to wait for writer lock"); }
+                () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            }
+            anyhow::ensure!(quarantines(directory.path())?.is_empty(), "live append was quarantined");
+            anyhow::ensure!(!path.with_file_name("incomplete").exists(), "live append was marked incomplete");
+            Ok::<_, anyhow::Error>(())
+        }).await;
+        // Always release the owned lock, then collect the bounded owned child.
+        let completed =
+            std::fs::write(&path, &original).and_then(|()| File::open(&path)?.sync_all());
+        lock.unlock()?;
+        let child_result = child.await;
+        completed?;
+        observed.context("child readiness deadline")??;
+        child_result?;
+        let final_bytes = std::fs::read(&path)?;
+        assert!(final_bytes.starts_with(&original));
+        let entries = read_all_entries(&path)?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[1].prev_hash,
+            entries[0].hash.as_ref().unwrap().as_str()
+        );
+        assert!(AuditLogger::new_in(&path)?.verify_integrity()?.is_valid());
+        println!(
+            "AUDIT_PARTIAL_APPEND_JSON {}",
+            serde_json::json!({"entries":entries.len(),"originalSHA256":hex::encode(Sha256::digest(&original)),"finalSHA256":hex::encode(Sha256::digest(&final_bytes)),"quarantines":0,"incomplete":false})
+        );
         Ok(())
     }
 }
