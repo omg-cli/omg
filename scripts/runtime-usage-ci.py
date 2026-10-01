@@ -124,12 +124,13 @@ def validate_run(run, expected):
         pr = expected['pr']
         rows = [row for row in run.get('pull_requests', []) if row.get('number') == pr['number']]
         require(len(rows) == 1, 'producer belongs to another PR')
+        # Association SHAs follow live branch updates; the triggering event,
+        # immutable run head and exact tested merge parents bind source bytes.
         for side in ('head', 'base'):
             actual = rows[0].get(side, {})
-            require(actual.get('sha') == pr[side + '_sha']
-                    and actual.get('ref') == pr[side + '_ref']
+            require(actual.get('ref') == pr[side + '_ref']
                     and actual.get('repo', {}).get('id') == pr[side + '_repository_id'],
-                    'producer PR ' + side + ' identity changed')
+                    'producer PR ' + side + ' association changed')
 
 
 def validate_commit(commit, expected, checkout_tree):

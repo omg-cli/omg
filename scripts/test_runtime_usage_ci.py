@@ -72,8 +72,7 @@ class EventIdentityTests(unittest.TestCase):
         for field, value in [('head_sha', self.MERGE), ('event', 'push'), ('run_attempt', 2)]:
             with self.subTest(field=field), self.assertRaises(ValueError):
                 USAGE.validate_run(dict(run, **{field: value}), expected)
-        for side, field, value in [('head', 'sha', 'a' * 40), ('base', 'sha', 'a' * 40),
-                                   ('base', 'ref', 'foreign'), ('head', 'ref', 'foreign')]:
+        for side, field, value in [('base', 'ref', 'foreign'), ('head', 'ref', 'foreign')]:
             wrong = json.loads(json.dumps(run))
             wrong['pull_requests'][0][side][field] = value
             with self.subTest(side=side, field=field), self.assertRaises(ValueError):
@@ -82,6 +81,27 @@ class EventIdentityTests(unittest.TestCase):
         wrong['pull_requests'][0]['number'] = 692
         with self.assertRaisesRegex(ValueError, 'another PR'):
             USAGE.validate_run(wrong, expected)
+        for side in ('head', 'base'):
+            wrong = json.loads(json.dumps(run))
+            wrong['pull_requests'][0][side]['repo']['id'] = 999
+            with self.subTest(side=side), self.assertRaises(ValueError):
+                USAGE.validate_run(wrong, expected)
+
+    def test_mutable_pr_association_shas_do_not_replace_immutable_run_or_tested_source(self):
+        expected, run, commit = self.pr_fixture()
+        refreshed = json.loads(json.dumps(run))
+        # Observed drift on the same run after normal branch/main refresh.
+        refreshed['pull_requests'][0]['head']['sha'] = '98d0145f60364ac724c23e22b84f85f3c853eeab'
+        refreshed['pull_requests'][0]['base']['sha'] = 'a3817fede533981d85f431d9b7d787bbaac932fb'
+        USAGE.validate_run(refreshed, expected)
+        USAGE.validate_commit(commit, expected, self.TREE)
+        self.assertEqual(expected['api_head'], self.HEAD)
+        self.assertEqual(expected['source'], self.MERGE)
+        with self.assertRaises(ValueError):
+            USAGE.validate_run(dict(refreshed, head_sha=refreshed['pull_requests'][0]['head']['sha']), expected)
+        with self.assertRaises(ValueError):
+            USAGE.validate_commit(dict(commit, parents=[dict(sha='a3817fede533981d85f431d9b7d787bbaac932fb'),
+                                                        dict(sha=self.HEAD)]), expected, self.TREE)
 
     def test_wrong_tree_source_or_merge_parent_link_fails(self):
         expected, _, commit = self.pr_fixture()
