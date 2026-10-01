@@ -86,6 +86,19 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting OMG daemon (omgd) v{}", env!("CARGO_PKG_VERSION"));
 
+    // Claim the daemon singleton via an exclusive flock before touching the
+    // socket file. A live daemon holds this lock for its whole lifetime, so
+    // acquiring it proves any previous owner exited and makes the stale-socket
+    // unlink below safe (no TOCTOU where a second start deletes a live
+    // daemon's socket).
+    let _daemon_claim = match claim_daemon_lock(&socket_path) {
+        Ok(claim) => claim,
+        Err(e) => {
+            tracing::error!("{:#}", e);
+            return Err(e);
+        }
+    };
+
     tracing::info!("Initializing daemon state...");
     let state = match omg_lib::daemon::handlers::DaemonState::new() {
         Ok(s) => std::sync::Arc::new(s),
@@ -97,19 +110,6 @@ async fn main() -> Result<()> {
             tracing::error!(
                 "  3. Check permissions and free disk space for ~/.local/share/omg/daemon"
             );
-            return Err(e);
-        }
-    };
-
-    // Claim the daemon singleton via an exclusive flock before touching the
-    // socket file. A live daemon holds this lock for its whole lifetime, so
-    // acquiring it proves any previous owner exited and makes the stale-socket
-    // unlink below safe (no TOCTOU where a second start deletes a live
-    // daemon's socket).
-    let _daemon_claim = match claim_daemon_lock(&socket_path) {
-        Ok(claim) => claim,
-        Err(e) => {
-            tracing::error!("{:#}", e);
             return Err(e);
         }
     };
