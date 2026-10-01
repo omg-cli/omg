@@ -171,6 +171,9 @@ jobs:
       - name: Run portable tests
         run: python3 scripts/run-native-contracts.py --features pgp,license
 
+      - name: Prepare genuine Node activation fixture
+        run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
+
       - name: Verify pure Debian parser and daemon contracts
         env:
           OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces/debian-pure
@@ -395,6 +398,10 @@ jobs:
           tool: nextest
       - name: Verify nextest
         run: cargo nextest --version
+
+      - name: Prepare genuine Node activation fixture
+        if: contains(matrix.features, 'debian')
+        run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
 
       - name: Run unit tests
         run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
@@ -853,6 +860,9 @@ jobs:
           tool: nextest
       - name: Verify nextest
         run: cargo nextest --version
+
+      - name: Prepare genuine Node activation fixture
+        run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
 
       - name: Run unit tests
         run: python3 scripts/run-native-contracts.py --features debian,pgp,license

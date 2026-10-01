@@ -1547,12 +1547,87 @@ mod runtime_management {
 
     #[test]
     fn test_node_version_management() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
         let project = TestProject::new();
         project.with_node_project();
 
+        let fixture =
+            std::path::PathBuf::from(std::env::var_os("OMG_NODE_TEST_FIXTURE").expect(
+                "prepare the genuine Node fixture with scripts/prepare-node-test-fixture.py",
+            ));
+        let metadata = std::fs::symlink_metadata(&fixture).unwrap();
+        assert!(
+            metadata.is_file(),
+            "Node fixture must be a regular executable"
+        );
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        let directory = std::fs::symlink_metadata(fixture.parent().unwrap()).unwrap();
+        assert!(directory.is_dir(), "shared fixture directory must be real");
+        assert_eq!(directory.uid(), nix::unistd::geteuid().as_raw());
+        assert_eq!(
+            directory.mode() & 0o077,
+            0,
+            "shared fixture must be private"
+        );
+        assert_eq!(
+            metadata.mode() & 0o222,
+            0,
+            "shared fixture must be read-only"
+        );
+        assert_eq!(metadata.len(), 96_227_728);
+        let expected = "d9cbc20cbf39eba838b077d3358d3203d549ae1f71e8085c6451d3bd712610ae";
+        assert_eq!(fixture_program_hash(&fixture), expected);
+        let version_dir = project.data_dir.path().join("versions/node/20.10.0");
+        let binary = version_dir.join("bin/node");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::copy(&fixture, &binary).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert_eq!(fixture_program_hash(&binary), expected);
+        assert_eq!(fixture_program_hash(&fixture), expected);
+        std::fs::write(version_dir.join(".omg-install-complete"), "20.10.0\n").unwrap();
+        let before_pin = std::fs::read(project.path().join(".nvmrc")).unwrap();
+        let before_package = std::fs::read(project.path().join("package.json")).unwrap();
+
         let result = project.run(&["use", "node"]);
         result.assert_success();
-        // Should detect version from .nvmrc
+        assert!(result.stdout_contains("Detected version 20.10.0 from file"));
+        let active = project
+            .data_dir
+            .path()
+            .join("versions/node/current/bin/node");
+        assert_eq!(
+            active.canonicalize().unwrap(),
+            binary.canonicalize().unwrap()
+        );
+        let version = std::process::Command::new(&active)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        assert_eq!(version.stdout, b"v20.10.0\n");
+        assert!(version.stderr.is_empty());
+        let arithmetic = std::process::Command::new(&active)
+            .args(["-e", "process.stdout.write(String(6 * 7))"])
+            .output()
+            .unwrap();
+        assert!(arithmetic.status.success());
+        assert_eq!(arithmetic.stdout, b"42");
+        assert!(arithmetic.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(project.path().join(".nvmrc")).unwrap(),
+            before_pin
+        );
+        assert_eq!(
+            std::fs::read(project.path().join("package.json")).unwrap(),
+            before_package
+        );
+        assert_eq!(fixture_program_hash(&binary), expected);
+        assert_eq!(fixture_program_hash(&fixture), expected);
+        assert!(!version_dir.join(".omg-test-mock").exists());
+        assert!(!version_dir.join(".omg-installing").exists());
+        project.close_checked();
     }
 
     #[test]

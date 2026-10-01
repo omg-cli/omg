@@ -3181,7 +3181,6 @@ mod tests {
     /// Application-cold readers, warm OS page cache; not a disk-cold benchmark.
     /// Uses owned buffers; earlier mmap measurements do not describe this reader.
     #[test]
-    #[ignore = "bounded synthetic benchmark; run optimized with --ignored --nocapture"]
     fn snapshot_load_benchmark() -> Result<()> {
         for count in [10_000, 50_000] {
             let directory = tempfile::tempdir()?;
