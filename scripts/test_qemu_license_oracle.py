@@ -283,6 +283,30 @@ class LicenseOracleTests(unittest.TestCase):
         boxed = correct.replace("License Inventory\n", "╭──────────────────╮\n│ License Inventory │\n├──────────────────┤\n")
         ORACLE.check_enterprise_text(boxed, packages)
 
+    def test_enterprise_text_accepts_renderer_dashed_borders_without_hiding_rows(self):
+        packages = self.native()
+        report = ("[License Compliance Scan] 3 total packages\n"
+                  "╭────────────────────────────────────────╮\n"
+                  "│ License Inventory                      │\n"
+                  "╞════════════════════════════════════════╡\n"
+                  "│ Apache-2.0: 1 assignments (33%)          │\n"
+                  "├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤\n"
+                  "│ GPL-3.0-only: 1 assignments (33%)        │\n"
+                  "│ MIT: 1 assignments (33%)                │\n"
+                  "╰────────────────────────────────────────╯\n"
+                  "│ Unresolved License Review              │\n"
+                  "│ 0 unresolved assignments; 1 packages without license metadata │\n"
+                  "│ Policy Violations                      │\n"
+                  "│ beta - Copyleft license requires legal review │\n"
+                  "│ Unknown Licenses                       │\n"
+                  "│ gamma                                  │\n")
+        ORACLE.check_enterprise_text(report, packages)
+        for bad in (report.replace("(33%)", "(999%)", 1),
+                    report.replace("│ gamma", "│ invented"),
+                    report + "╌unexpected content╌\n"):
+            with self.subTest(report=bad), self.assertRaises(AssertionError):
+                ORACLE.check_enterprise_text(bad, packages)
+
     def test_enterprise_text_validates_renderer_limits_and_truncation(self):
         packages = {f"p{i:02}": ("1", ["GPL2" if i % 2 else "GPL3"]) for i in range(23)}
         packages.update({f"unknown{i}": ("1", []) for i in range(7)})

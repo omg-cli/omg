@@ -295,7 +295,7 @@ def check_enterprise_text(report, packages):
     for line in lines:
         if not line.strip() or line == summary:
             continue
-        if set(line.strip()) <= set("─━═┌┐└┘├┤┬┴┼╭╮╰╯╞╡╪╤╧╒╕╘╛+|- "):
+        if set(line.strip()) <= set("─━═╌┌┐└┘├┤┬┴┼╭╮╰╯╞╡╪╤╧╒╕╘╛+|- "):
             continue  # Table border, not report content.
         value = line.strip().strip("│|").strip()
         if value in titles:
