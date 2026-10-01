@@ -31,13 +31,6 @@
       ]
     },
     {
-      "test_id": "omg::debian_tests::debian_specific::test_debian_stable_packages",
-      "reason": "requires Debian",
-      "platforms": [
-        "ubuntu"
-      ]
-    },
-    {
       "test_id": "omg::debian_tests::runtime_management::test_list_available_node",
       "reason": "network tests disabled (set OMG_RUN_NETWORK_TESTS=1)",
       "platforms": [
