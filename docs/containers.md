@@ -113,6 +113,16 @@ unrelated containers or prune shared images as part of checking something else.
 | A digest cannot be pinned | Retry when the publisher is reachable. Inspect the generated recipe before building. |
 | A volume option is rejected | OMG accepts `HOST:CONTAINER` only. Use the native engine if you need a read-only mount. |
 
+## Repository test recipes
+
+For maintainers, the repository's former `docker-compose.yml` stack has been
+retired. [`Dockerfile.apt`](../Dockerfile.apt) remains as a standalone recipe
+checked by the bootstrap security tests in
+[`security_privilege_escalation_tests.rs`](../tests/security_privilege_escalation_tests.rs).
+Those tests require its verified Rust installer, pinned base image and locked
+Cargo build. Keeping this recipe preserves that checked surface; it does not
+imply that a Compose stack or a hosted APT container build runs in current CI.
+
 ## Where to go next
 
 - [Task runner](./task-runner.md) to run project tasks without a container at all.
