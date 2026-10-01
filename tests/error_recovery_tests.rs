@@ -150,19 +150,156 @@ fn test_parallel_builder_self_dependency_is_rejected_as_circular() {
 
 pub mod common;
 
-use common::{TestProject, run_omg, run_omg_with_env};
+use common::{TestProject, fixture_program_hash, run_omg, run_omg_with_env};
 
 #[path = "support/recovery_fixture.rs"]
 mod recovery_fixture;
-use recovery_fixture::{RejectedProxy, seed_missing_aur_index};
+use recovery_fixture::RejectedProxy;
+
+fn run_aur_transport_child(project: &TestProject, proxy: &RejectedProxy) -> std::process::Output {
+    let mut command = std::process::Command::new("timeout");
+    command
+        .args(["--kill-after=2s", "15s"])
+        .arg(std::env::current_exe().expect("ordinary AUR adapter test executable"))
+        .args([
+            "--exact",
+            "test_aur_transport_failure_preserves_state_and_mock_install_recovers",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("HOME", project.home_dir.path())
+        .env(
+            "PATH",
+            std::env::var_os("PATH").expect("native fixture PATH"),
+        )
+        .env("OMG_DATA_DIR", project.data_dir.path())
+        .env("OMG_CONFIG_DIR", project.config_dir.path())
+        .env("OMG_CACHE_DIR", project.data_dir.path().join("cache"))
+        .env("OMG_TEST_MODE", "0")
+        .env("OMG_DISABLE_DAEMON", "1")
+        .env("OMG_DISABLE_TELEMETRY", "1")
+        .env("OMG_AUR_TRANSPORT_CHILD", "adapter");
+    for (key, value) in proxy.env() {
+        command.env(key, value);
+    }
+    let output = command.output().expect("execute actual AUR adapter child");
+    eprintln!(
+        "AUR adapter child exit={:?} proxy_requests={}\n{}\n{}",
+        output.status.code(),
+        proxy.requests(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn copy_fixture_program(
+    directory: &std::path::Path,
+    original: &std::path::Path,
+    name: &str,
+) -> (std::path::PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let copy = directory.join(name);
+    std::fs::copy(original, &copy).expect("copy admitted fixture program");
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755))
+        .expect("ordinary fixture execution");
+    let hash = fixture_program_hash(original);
+    assert_eq!(
+        hash,
+        fixture_program_hash(&copy),
+        "ordinary fixture copy must preserve admitted program bytes"
+    );
+    (copy, hash)
+}
+fn rerun_transport_as_ordinary_user() -> bool {
+    if !omg_lib::core::is_root() {
+        return false;
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let cli = std::fs::symlink_metadata(env!("CARGO_BIN_EXE_omg")).expect("admitted CLI metadata");
+    assert!(cli.is_file(), "admitted CLI must be a regular file");
+    let account = nix::unistd::User::from_name("nobody")
+        .expect("look up ordinary fixture account")
+        .expect("root fixture must provide an ordinary account");
+    assert_ne!(account.uid.as_raw(), 0);
+    let directory =
+        tempfile::TempDir::new_in("/var/tmp").expect("ordinary test executable directory");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("ordinary executable traversal");
+    let original = std::env::current_exe().expect("root test executable");
+    let original_cli = std::path::Path::new(env!("CARGO_BIN_EXE_omg"));
+    if let Some(expected) = std::env::var_os("OMG_CONTRACT_EXPECTED_CLI") {
+        assert_eq!(
+            original_cli.canonicalize().expect("admitted CLI exists"),
+            std::path::Path::new(&expected)
+                .canonicalize()
+                .expect("expected CLI exists"),
+            "root fixture must retain the parent driver subject binding"
+        );
+    }
+    let (copied_cli, cli_hash) = copy_fixture_program(directory.path(), original_cli, "omg");
+    let receipt_path = directory.path().join("cli-subject.json");
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_vec(&serde_json::json!({
+            "original": original_cli, "copy": copied_cli, "sha256": cli_hash
+        }))
+        .expect("CLI receipt serialization"),
+    )
+    .expect("write protected CLI receipt");
+    std::fs::set_permissions(&receipt_path, std::fs::Permissions::from_mode(0o644))
+        .expect("ordinary receipt read with root-only write");
+    let (executable, copied_hash) = copy_fixture_program(directory.path(), &original, "aur-test");
+    let output = std::process::Command::new(
+        omg_lib::core::privilege::root_controlled_program_path("timeout")
+            .expect("root-controlled fixture timeout"),
+    )
+    .args(["--kill-after=2s", "60s"])
+    .arg(
+        omg_lib::core::privilege::root_controlled_program_path("setpriv")
+            .expect("root-controlled privilege drop"),
+    )
+    .args(["--clear-groups", "--no-new-privs"])
+    .arg(format!("--reuid={}", account.uid))
+    .arg(format!("--regid={}", account.gid))
+    .arg(&executable)
+    .args([
+        "--exact",
+        "test_aur_transport_failure_preserves_state_and_mock_install_recovers",
+        "--nocapture",
+    ])
+    .env_clear()
+    .env(
+        "PATH",
+        std::env::var_os("PATH").expect("native fixture PATH"),
+    )
+    .env("HOME", directory.path())
+    .env("TMPDIR", "/var/tmp")
+    .env("OMG_CONTRACT_EXPECTED_CLI", env!("CARGO_BIN_EXE_omg"))
+    .env("OMG_CONTRACT_CLI_ROOT_FIXTURE", &receipt_path)
+    .current_dir(directory.path())
+    .output()
+    .expect("ordinary root fixture child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("ordinary AUR child executable_sha256={copied_hash}\n{stdout}\n{stderr}");
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored;"),
+        "ordinary AUR child failed or did not run: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    assert_eq!(cli_hash, fixture_program_hash(original_cli));
+    assert_eq!(cli_hash, fixture_program_hash(&copied_cli));
+    assert_eq!(copied_hash, fixture_program_hash(&executable));
+    true
+}
 
 fn missing_dry_run(name: &str) -> common::CommandResult {
     let project = TestProject::for_distro("arch");
     let proxy = RejectedProxy::new();
-    seed_missing_aur_index(&project, name);
     let result = project.run_with_env(&["install", "--dry-run", name], &proxy.env());
     assert_eq!(result.exit_code, 1, "{}", result.combined_output());
-    result.assert_stderr_contains("Package not found in AUR");
+    result.assert_stderr_contains(&format!("Package '{name}' was not found"));
     assert!(!result.combined_output().contains("transport failed"));
     assert_eq!(
         proxy.requests(),
@@ -209,7 +346,13 @@ fn test_dry_run_missing_package_fails_with_reason() {
 }
 
 /// Package/config bytes must survive; unresolved lookups create no transaction.
-fn assert_failed_install_recovers(seed_index: bool) {
+#[derive(Clone, Copy)]
+enum FailureFixture {
+    MockMissing,
+    AurTransport,
+}
+
+fn assert_failed_install_recovers(fixture: FailureFixture) {
     let project = TestProject::for_distro("arch");
     let proxy = RejectedProxy::new();
     let env = proxy.env();
@@ -218,24 +361,35 @@ fn assert_failed_install_recovers(seed_index: bool) {
     project
         .run_with_env(&["config", "set", "aur.build_concurrency", "2"], &env)
         .assert_success();
-    if seed_index {
-        seed_missing_aur_index(&project, "fake-package-xyz");
-    }
     let package_state = project.data_dir.path().join("mock_state_pacman.json");
     let config = project.config_dir.path().join("config.toml");
     let before = PersistentBytes::capture(&package_state, &config);
     assert!(!project.data_dir.path().join("history.json").exists());
-    let result = project.run_with_env(&["install", "-y", "fake-package-xyz", "fake-pkg-2"], &env);
-    assert_eq!(result.exit_code, 1, "{}", result.combined_output());
-    if seed_index {
-        result.assert_stderr_contains("Package not found in official repos");
-        assert!(!result.combined_output().contains("transport failed"));
-        assert_eq!(proxy.requests(), 0, "cached missing lookup reached network");
-    } else {
-        result.assert_stderr_contains("AUR RPC transport failed");
-        result.assert_stderr_contains("fake-package-xyz");
-        assert!(!result.combined_output().contains("not found"));
-        assert!(proxy.requests() > 0, "transport fault was not exercised");
+    match fixture {
+        FailureFixture::MockMissing => {
+            let result =
+                project.run_with_env(&["install", "-y", "fake-package-xyz", "fake-pkg-2"], &env);
+            assert_eq!(result.exit_code, 1, "{}", result.combined_output());
+            result.assert_stderr_contains("Package 'fake-package-xyz' not found. Suggestion: use 'omg search' to check available package names");
+            assert!(!result.combined_output().contains("transport failed"));
+            assert_eq!(proxy.requests(), 0, "mock missing lookup reached network");
+        }
+        FailureFixture::AurTransport => {
+            let result = run_aur_transport_child(&project, &proxy);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let stdout = String::from_utf8(result.stdout).expect("UTF-8 AUR adapter result");
+            assert!(stdout.contains("AUR RPC transport failed. Check your internet connection."));
+            assert!(stdout.contains("1 passed; 0 failed; 0 ignored;"));
+            assert!(!stdout.contains("not found"));
+            assert!(
+                proxy.requests() > 0,
+                "actual AUR transport fault was not exercised"
+            );
+        }
     }
     assert!(before.matches(&package_state, &config));
     let history = omg_lib::core::history::HistoryManager::new_in(
@@ -262,12 +416,59 @@ fn assert_failed_install_recovers(seed_index: bool) {
 
 #[test]
 fn test_install_missing_packages_fails_without_corrupting_state() {
-    assert_failed_install_recovers(true);
+    assert_failed_install_recovers(FailureFixture::MockMissing);
 }
 
 #[test]
-fn test_install_transport_failure_preserves_state_and_recovers() {
-    assert_failed_install_recovers(false);
+fn test_aur_transport_failure_preserves_state_and_mock_install_recovers() {
+    if rerun_transport_as_ordinary_user() {
+        return;
+    }
+    if std::env::var("OMG_AUR_TRANSPORT_CHILD").as_deref() == Ok("adapter") {
+        assert!(
+            !omg_lib::core::is_root(),
+            "AUR adapter child must have an ordinary effective UID"
+        );
+        eprintln!(
+            "AUR adapter observed effective_uid={}",
+            nix::unistd::geteuid()
+        );
+        assert!(
+            !omg_lib::core::paths::test_mode(),
+            "AUR adapter child must not use Mock dispatch"
+        );
+        for (variable, resolved) in [
+            ("OMG_DATA_DIR", omg_lib::core::paths::data_dir()),
+            ("OMG_CONFIG_DIR", omg_lib::core::paths::config_dir()),
+            ("OMG_CACHE_DIR", omg_lib::core::paths::cache_dir()),
+        ] {
+            let expected =
+                std::path::PathBuf::from(std::env::var_os(variable).expect("private adapter path"));
+            assert_eq!(
+                resolved, expected,
+                "adapter must resolve private {variable}"
+            );
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("AUR adapter runtime");
+        let error = runtime
+            .block_on(async {
+                omg_lib::package_managers::aur::AurClient::new()
+                    .expect("private AUR settings")
+                    .info("fake-package-xyz")
+                    .await
+            })
+            .expect_err("rejecting proxy must fail the actual AUR lookup");
+        assert_eq!(
+            error.to_string(),
+            "AUR RPC transport failed. Check your internet connection."
+        );
+        println!("{error}");
+        return;
+    }
+    assert_failed_install_recovers(FailureFixture::AurTransport);
 }
 
 #[test]
@@ -423,12 +624,15 @@ fn test_proxy_policy_overrides_every_inherited_spelling_and_bypass() {
             .timeout(std::time::Duration::from_mins(1))
             .args([
                 "--exact",
-                "test_install_transport_failure_preserves_state_and_recovers",
+                "test_aur_transport_failure_preserves_state_and_mock_install_recovers",
                 "--nocapture",
             ])
             .env(key, value);
         let assertion = command.assert().success();
         let output = String::from_utf8_lossy(&assertion.get_output().stdout);
-        assert!(output.contains("1 passed; 0 failed"), "{key}: {output}");
+        assert!(
+            output.contains("1 passed; 0 failed; 0 ignored;"),
+            "{key}: {output}"
+        );
     }
 }

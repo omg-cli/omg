@@ -419,9 +419,13 @@ if [[ -n "$image_policy" ]]; then
     --url "$image_url" --digest "$image_hash" --image "$work/guest/base.qcow2" > "$work/image-provenance.json"
 fi
 timeout 30 docker exec -w /work/guest "$controller" bash -c '"$1" --version; qemu-img info base.qcow2' _ "$qemu_bin" >> "$work/image-setup.log" 2>&1
+cp "$here/qemu-boot-budget.sh" "$work/qemu-boot-budget.sh"
+cp "$here/qemu-boot-diagnostics.sh" "$work/qemu-boot-diagnostics.sh"
+source "$work/qemu-boot-budget.sh"
 cat > "$work/boot.sh" <<'BOOT'
 #!/usr/bin/env bash
 set -euo pipefail
+source /work/qemu-boot-budget.sh
 cd /work/guest
 initial=true
 vm_disk=overlay.qcow2; vm_vars=vars.fd; vm_serial=serial.log
@@ -433,6 +437,7 @@ if [[ $# == 11 ]]; then
   [[ "$vm_serial" == /work/transactions/* && "$vm_serial" != *'/../'* ]] || exit 2
 elif [[ $# != 8 ]]; then exit 2; fi
 [[ ! -e qemu.pid ]] || exit 2
+setup_boot() {
 if [[ "$initial" == true ]]; then
 ssh-keygen -q -t ed25519 -N '' -f client-key
 ssh-keygen -q -t ed25519 -N '' -f guest-host-key
@@ -528,61 +533,91 @@ awk '
   END { exit !(uid && gid && caps && nnp && seccomp) }
 ' "/proc/$qemu_pid/status" || { printf 'QEMU isolation verification failed\n' >&2; exit 1; }
 printf 'QEMU isolation verified: uid=65534 gid=65534 capabilities=none no_new_privs=1 seccomp=2\n'
+}
+export initial vm_disk vm_vars vm_serial
+if timeout --kill-after="${BOOT_PHASE_KILL_GRACE}s" "${BOOT_SETUP_TIMEOUT}s" bash -euo pipefail -c "$(declare -f setup_boot); setup_boot \"\$@\"" _ "$@"; then :; else
+  rc=$?; printf 'Boot setup failed: exit=%s\n' "$rc" >&2; exit "$rc"
+fi
 opts=(-i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=2 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
+boot_ssh() {
+  local rc=0
+  timeout --kill-after="${SSH_KILL_GRACE}s" "${SSH_ATTEMPT_TIMEOUT}s" ssh "${opts[@]}" bench@127.0.0.1 "$@" || rc=$?
+  if (( rc != 0 )); then printf 'Boot SSH command failed: exit=%s\n' "$rc" >&2; fi
+  return "$rc"
+}
 wait_ssh() {
-  local pid serial_bytes kernel_banner qemu_state
-  for attempt in {1..120}; do
+  local before=${1:-} after pid serial_bytes kernel_banner qemu_state
+  local deadline=$(( SECONDS + SSH_WAIT_BUDGET )) remaining probe_timeout delay
+  while (( SECONDS < deadline )); do
     pid=$(<qemu.pid)
     if ! kill -0 "$pid" 2>/dev/null; then
-      printf 'QEMU exited before SSH became ready (attempt %s)\n' "$attempt" >&2
+      printf 'QEMU exited before SSH became ready\n' >&2
       cat qemu-startup.log >&2
       return 1
     fi
-    if timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 true 2>/dev/null; then return 0; fi
-    sleep 2
+    remaining=$(( deadline - SECONDS ))
+    # Never start a probe unless its SIGKILL grace fits inside this phase.
+    (( remaining > SSH_KILL_GRACE )) || break
+    probe_timeout=$(( remaining - SSH_KILL_GRACE ))
+    (( probe_timeout <= SSH_ATTEMPT_TIMEOUT )) || probe_timeout=$SSH_ATTEMPT_TIMEOUT
+    if [[ -z "$before" ]]; then
+      if timeout --kill-after="${SSH_KILL_GRACE}s" "${probe_timeout}s" ssh "${opts[@]}" bench@127.0.0.1 true 2>/dev/null; then return 0; fi
+    elif after=$(timeout --kill-after="${SSH_KILL_GRACE}s" "${probe_timeout}s" ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id 2>/dev/null) && [[ "$after" != "$before" ]]; then
+      printf 'reboot verified: %s -> %s\n' "$before" "$after"
+      return 0
+    fi
+    remaining=$(( deadline - SECONDS ))
+    (( remaining > 0 )) || break
+    delay=$SSH_RETRY_DELAY
+    (( delay <= remaining )) || delay=$remaining
+    sleep "$delay"
   done
   serial_bytes=$(wc -c < "$vm_serial")
   kernel_banner=no
   if grep -aqm1 'Linux version ' "$vm_serial"; then kernel_banner=yes; fi
   qemu_state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf 'unknown')
-  printf 'SSH readiness timed out after 120 attempts: qemu_state=%s serial_bytes=%s kernel_banner_seen=%s\n' \
-    "$qemu_state" "$serial_bytes" "$kernel_banner" >&2
+  printf 'SSH readiness timed out after %s seconds: qemu_state=%s serial_bytes=%s kernel_banner_seen=%s\n' \
+    "$SSH_WAIT_BUDGET" "$qemu_state" "$serial_bytes" "$kernel_banner" >&2
+  if [[ -n "$before" ]]; then printf 'Reboot readiness timed out: previous_boot_id=%s\n' "$before" >&2; fi
   printf 'Last guest serial lines:\n' >&2
   tail -n 6 "$vm_serial" >&2
   return 1
 }
 wait_ssh
-# The controller checks cloud-init's authoritative runtime records and
-# systemd target without starting a second Python process inside the guest.
-bash /work/check-qemu-cloud-init.sh bench@127.0.0.1 "${opts[@]}"
-timeout 15 ssh "${opts[@]}" bench@127.0.0.1 'cat /etc/os-release && uname -r && sudo -n true'
+# Bound both cloud-init commands and their kill grace as one phase.
+if timeout --kill-after="${BOOT_PHASE_KILL_GRACE}s" "${BOOT_CLOUD_INIT_TIMEOUT}s" bash /work/check-qemu-cloud-init.sh bench@127.0.0.1 "${opts[@]}"; then :; else
+  rc=$?; printf 'Boot cloud-init failed: exit=%s\n' "$rc" >&2; exit "$rc"
+fi
+if timeout --kill-after="${BOOT_PHASE_KILL_GRACE}s" "${BOOT_IDENTITY_TIMEOUT}s" ssh "${opts[@]}" bench@127.0.0.1 'cat /etc/os-release && uname -r && sudo -n true'; then :; else
+  rc=$?; printf 'Boot identity failed: exit=%s\n' "$rc" >&2; exit "$rc"
+fi
 if [[ "$initial" == false ]]; then exit 0; fi
 # Arm diagnostics before the first reboot and every subsequent disk clone.
 # The timer has no network-online dependency, so failed DHCP/SSH cannot hide it.
-ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl daemon-reload && sudo -n systemctl enable omg-boot-network.timer'
-ssh "${opts[@]}" bench@127.0.0.1 "sudo -n systemctl enable '$2'"
-before=$(timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id)
-timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl reboot' || true
-for attempt in {1..120}; do
-  if after=$(timeout --kill-after=2s 12s ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id 2>/dev/null) && [[ "$after" != "$before" ]]; then
-    printf 'reboot verified: %s -> %s\n' "$before" "$after"
-    ssh "${opts[@]}" bench@127.0.0.1 "sudo -n true; systemctl is-active '$2'"
-    exit 0
-  fi
-  sleep 2
-done
-exit 1
+boot_ssh 'sudo -n systemctl daemon-reload && sudo -n systemctl enable omg-boot-network.timer'
+boot_ssh "sudo -n systemctl enable '$2'"
+before=$(boot_ssh cat /proc/sys/kernel/random/boot_id)
+boot_ssh 'sudo -n systemctl reboot' || true
+wait_ssh "$before"
+boot_ssh "sudo -n true; systemctl is-active '$2'"
 BOOT
-boot_timeout=700
+# Shared phase totals include both readiness waits, all command kill grace,
+# setup, cloud-init, identity and the dispatch/diagnostic margin.
+boot_timeout=$BOOT_TIMEOUT
 guest_timeout=600
+printf 'ssh_wait_budget=%s boot_timeout=%s guest_timeout=%s\n' \
+  "$SSH_WAIT_BUDGET" "$boot_timeout" "$guest_timeout" >> "$work/metadata.txt"
 if [[ "$qemu_accel" == tcg ]]; then
   # Emulation is an explicit local correctness audit. Keep it bounded without
   # imposing native KVM startup deadlines on a software-emulated guest.
-  boot_timeout=1800
+  boot_timeout=$(( BOOT_TIMEOUT * 2 ))
   guest_timeout=2400
 fi
 printf 'boot_timeout=%s guest_timeout=%s\n' "$boot_timeout" "$guest_timeout" >> "$work/metadata.txt"
-timeout "$boot_timeout" docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1
+boot_rc=0
+timeout --kill-after=5s "$boot_timeout" docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1 || boot_rc=$?
+timeout --kill-after=2s 3s docker exec "$controller" bash /work/qemu-boot-diagnostics.sh > "$work/boot.diagnostics.log" 2>&1 || printf 'Boot diagnostics unavailable\n' >> "$work/boot.diagnostics.log"
+[[ "$boot_rc" == 0 ]] || exit "$boot_rc"
 if [[ -n "$inventory_tiers" ]]; then
   # The inventory executor runs inside the controller (same netns as the
   # guest); /work is bind-mounted there.
@@ -590,7 +625,14 @@ if [[ -n "$inventory_tiers" ]]; then
   cp "$here/qemu-container-fake-engine.sh" "$work/qemu-container-fake-engine.sh"
   cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
+  cp "$here/qemu-rust-install-oracle.py" "$work/qemu-rust-install-oracle.py"
   cp "$here/qemu-arch-update-fixture.sh" "$work/qemu-arch-update-fixture.sh"
+  cp "$here/qemu-run-watch-check.py" "$work/qemu-run-watch-check.py"
+  cp "$here/qemu-enterprise-export-oracle.py" "$work/qemu-enterprise-export-oracle.py"
+  cp "$here/qemu-audit-log-oracle.py" "$work/qemu-audit-log-oracle.py"
+  if [[ "$source_kind" == staged ]]; then
+    cp "$here/../tests/man_page_inventory.txt" "$work/man_page_inventory.txt"
+  fi
   cp "$here/qemu-fedora-update-fixture.sh" "$work/qemu-fedora-update-fixture.sh"
   cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"
   cp "$tsv" "$work/cases.tsv"
@@ -740,10 +782,36 @@ esac
 # never acceptable product refusals. Keep this after the lifecycle probe.
 if [[ -n "$inventory_tiers" ]]; then
   case "$distro" in
-    arch) sudo -n pacman -S --noconfirm --needed git make curl python strace ;;
-    debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace ;;
-    fedora) sudo -n dnf install -y git make curl python3 strace podman rpm-build createrepo_c ;;
+    arch) sudo -n pacman -S --noconfirm --needed git make curl python strace gcc ;;
+    debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace gcc libc6-dev ;;
+    fedora) sudo -n dnf install -y git make curl python3 strace podman rpm-build createrepo_c gcc glibc-devel ;;
   esac > evidence/inventory-setup.txt 2>&1 || exit 120
+  if [[ "$distro" == debian ]]; then
+    # Bookworm ships strace 6.1. --kill-on-exit first appeared in 6.6:
+    # https://strace.io/files/6.6/ . Keep the traced-child cleanup guarantee.
+    # Build as bench, install only this fixture tool into a root-owned prefix.
+    (
+      set -o pipefail
+      build=$(mktemp -d "$HOME/omg-qemu-strace.XXXXXX") || exit 120
+      cd "$build" || exit 120
+      curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 60 \
+        https://strace.io/files/6.6/strace-6.6.tar.xz -o strace-6.6.tar.xz || exit 120
+      printf '%s  %s\n' \
+        421b4186c06b705163e64dc85f271ebdcf67660af8667283147d5e859fc8a96c \
+        strace-6.6.tar.xz | sha256sum --check - || exit 120
+      tar -xf strace-6.6.tar.xz || exit 120
+      cd strace-6.6 || exit 120
+      timeout --kill-after=5s 120s ./configure --prefix=/opt/omg-qemu-strace \
+        --enable-mpers=no --without-libunwind --without-libdw || exit 120
+      timeout --kill-after=5s 180s make -j2 || exit 120
+      sudo -n install -d -m 755 /opt/omg-qemu-strace/bin || exit 120
+      sudo -n install -m 755 src/strace /opt/omg-qemu-strace/bin/strace || exit 120
+      /opt/omg-qemu-strace/bin/strace --version || exit 120
+      /opt/omg-qemu-strace/bin/strace --kill-on-exit -f -qq -e trace=execve \
+        -o "$build/preflight.trace" /usr/bin/true || exit 120
+      grep -Fq 'execve("/usr/bin/true"' "$build/preflight.trace" || exit 120
+    ) > evidence/strace-build.txt 2>&1 || exit 120
+  fi
   # The hermetic `new` row exercises the missing-toolchain refusal. A guest
   # with Cargo installed is a different fixture, not a product failure.
   if command -v cargo > evidence/rust-toolchain.txt; then
@@ -774,6 +842,11 @@ if [[ -n "$inventory_tiers" ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-arch-update-fixture.sh bench@127.0.0.1:qemu-arch-update-fixture.sh
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fedora-update-fixture.sh bench@127.0.0.1:qemu-fedora-update-fixture.sh
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fingerprint-oracle.py bench@127.0.0.1:qemu-fingerprint-oracle.py
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-run-watch-check.py bench@127.0.0.1:qemu-run-watch-check.py
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-enterprise-export-oracle.py bench@127.0.0.1:qemu-enterprise-export-oracle.py
+  if [[ "$source_kind" == staged ]]; then
+    timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/man_page_inventory.txt bench@127.0.0.1:man_page_inventory.txt
+  fi
 fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/daemon-advisory-shutdown.sh bench@127.0.0.1:daemon-advisory-shutdown.sh
 if [[ "$benchmark" == true ]]; then
@@ -965,6 +1038,9 @@ if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
   # (same netns; /work is bind-mounted). Evidence lands in $work/inventory.
   inv_args=(--work /work --distro "$distro" --tiers "$inventory_tiers" --tag "$tag"
     --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv)
+  if [[ "$source_kind" == staged ]]; then
+    inv_args+=(--man-page-inventory /work/man_page_inventory.txt)
+  fi
   [[ "$inventory_mutations" == false ]] || inv_args+=(--allow-mutations)
   [[ "$inventory_isolation" == false ]] || inv_args+=(--isolate-hermetic --network-policy /work/inventory-scopes.json)
   inventory_rc=0
@@ -1026,6 +1102,51 @@ if [[ -n "$inventory_policy" ]]; then
     inventory_harness_error=true
   fi
 fi
+# Reuse the admitted distro artifact in a private guest mount namespace with
+# another supported distro's os-release. This is a separate reported QEMU row:
+# mount/trace setup errors cannot be counted as product refusals.
+if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
+  read -r mismatch_start _ < /proc/uptime
+  mismatch_binary="/home/bench/omg-${tag}-${arch}-linux-${distro}/omg"
+  quoted_mismatch_binary=$(jq -rn --arg binary "$mismatch_binary" '$binary | @sh')
+  mismatch_rc=0
+  timeout --kill-after=5s 180s docker exec -i -w /work/guest "$controller" \
+    ssh -i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5 \
+      -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+      -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts \
+      bench@127.0.0.1 "sudo -n unshare --mount --propagation private python3 - --binary $quoted_mismatch_binary --distro $distro" \
+      < "$here/qemu-backend-mismatch.py" > "$work/backend-mismatch.json" 2> "$work/backend-mismatch.log" || mismatch_rc=$?
+  mismatch_result=HARNESS_ERROR
+  if [[ -f "$work/backend-mismatch.json" && $(wc -c < "$work/backend-mismatch.json") -le 65536 ]]; then
+    if [[ "$mismatch_rc" == 0 ]] && python3 "$here/qemu-backend-mismatch.py" \
+      --distro "$distro" --receipt "$work/backend-mismatch.json" >> "$work/backend-mismatch.log" 2>&1; then
+      mismatch_result=PASS
+    elif [[ "$mismatch_rc" == 1 ]] && jq -e --arg distro "$distro" \
+      '.schema_version == 1 and .distro == $distro and .complete == false and .failure_kind == "product"' \
+      "$work/backend-mismatch.json" >/dev/null; then
+      mismatch_result=FAIL
+      inventory_product_failure=true
+    fi
+  fi
+  if [[ "$mismatch_result" == HARNESS_ERROR ]]; then
+    inventory_harness_error=true
+    rc=120
+  fi
+  read -r mismatch_end _ < /proc/uptime
+  mismatch_elapsed=$(awk -v start="$mismatch_start" -v end="$mismatch_end" \
+    'BEGIN { delta=end-start; if (delta < 0) delta=0; printf "%.2f", delta }')
+  jq -cn --arg distro "$distro" --arg result "$mismatch_result" \
+    --argjson exit_code "$mismatch_rc" --argjson elapsed "$mismatch_elapsed" \
+    '[{case_id:("qemu-" + $distro + "-backend-mismatch"), distro:$distro,
+      result:$result, artifact_source:"backend-mismatch", exit_code:$exit_code,
+      elapsed_seconds:$elapsed}]' > "$work/backend-mismatch-results.json"
+  report_inventory=$(jq -cn --argjson rows "$report_inventory" --arg distro "$distro" \
+    --arg result "$mismatch_result" --argjson exit_code "$mismatch_rc" \
+    --argjson elapsed "$mismatch_elapsed" \
+    '$rows + [{case_id:("qemu-" + $distro + "-backend-mismatch"), distro:$distro,
+      result:$result, exit_code:$exit_code, elapsed_seconds:$elapsed}]')
+fi
+
 if [[ "$storage_faults" == true && "$rc" == 0 ]]; then
   quoted_fault_binary=$(jq -rn --arg b "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" '$b | @sh')
   fault_setup='set -eu; token=$(cat /proc/sys/kernel/random/uuid); printf "%s\n" "$token" > /run/omg-qemu-storage-faults; chmod 444 /run/omg-qemu-storage-faults; exec unshare --mount --propagation private python3 - --binary "$1" --token "$token"'

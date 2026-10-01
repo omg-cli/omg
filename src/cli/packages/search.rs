@@ -401,12 +401,7 @@ async fn search_official_packages(
 
 #[cfg(feature = "arch")]
 async fn search_aur_packages(query: &str, detailed: bool) -> Result<Vec<DisplayPackage>> {
-    if crate::core::paths::test_mode() {
-        return Ok(Vec::new());
-    }
-
-    #[cfg(any(feature = "debian", feature = "debian-pure"))]
-    if crate::core::env::distro::is_debian_like() {
+    if crate::package_managers::resolve_backend()? != crate::package_managers::Backend::Arch {
         return Ok(Vec::new());
     }
 
@@ -447,6 +442,7 @@ pub fn search_sync_cli_with_limit(
     if !crate::cli::packages::common::is_valid_search_query(query) {
         return Ok(false);
     }
+    let backend = crate::package_managers::resolve_backend()?;
 
     // Fast path: official-only search via sync client (zero runtime overhead).
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
@@ -454,7 +450,7 @@ pub fn search_sync_cli_with_limit(
         return search_sync_official_only(query, limit);
     }
 
-    if no_aur || cfg!(not(feature = "arch")) {
+    if no_aur || backend != crate::package_managers::Backend::Arch {
         return search_sync_official_only(query, limit);
     }
 

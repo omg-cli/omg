@@ -15,7 +15,7 @@ class DaemonPathSecurityTests(unittest.TestCase):
             "fn run_daemon_foreground", 1
         )[0]
         self.assertNotIn('PathBuf::from("omgd")', resolver)
-        self.assertIn('trusted_program("omgd")', resolver)
+        self.assertIn('root_controlled_program_path("omgd")', resolver)
 
 
 if __name__ == "__main__":

@@ -1303,21 +1303,104 @@ mod security_validation {
 
     #[test]
     fn local_package_install_requires_explicit_consent() {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_omg"))
-            .args(["install", "/var/tmp/untrusted.pkg.tar.zst"])
-            .output()
-            .expect("install command must execute");
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        for args in [
+            vec!["install", "/var/tmp/untrusted.pkg.tar.zst"],
+            vec!["install", "--yes", "/var/tmp/untrusted.pkg.tar.zst"],
+        ] {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_omg"))
+                .args(args)
+                .env("OMG_NO_TELEMETRY", "1")
+                .output()
+                .expect("install command must execute");
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
 
-        assert!(!output.status.success());
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                combined.contains("Local package archives require explicit consent: pass --allow-local-file after reviewing the archive source"),
+                "local archive refusal must name the explicit consent flag: {combined}"
+            );
+            assert!(
+                !combined.contains("lacks the"),
+                "archive consent must precede backend availability: {combined}"
+            );
+        }
+    }
+
+    #[cfg(not(any(
+        feature = "arch",
+        feature = "debian",
+        feature = "fedora",
+        feature = "macos",
+        target_os = "macos"
+    )))]
+    #[test]
+    fn local_archive_consent_does_not_bypass_backend_availability() {
+        let directory = TempDir::new().expect("archive preflight state");
+        let sentinel = directory.path().join("sentinel");
+        std::fs::write(&sentinel, b"preserved preflight state").expect("write sentinel");
+        let run = |target: &str| {
+            std::process::Command::new(env!("CARGO_BIN_EXE_omg"))
+                .args(["install", "--allow-local-file", "--dry-run", target])
+                .env("OMG_TEST_MODE", "0")
+                .env("OMG_NO_TELEMETRY", "1")
+                .env("HOME", directory.path())
+                .env("OMG_DATA_DIR", directory.path().join("data"))
+                .env("OMG_CONFIG_DIR", directory.path().join("config"))
+                .env("OMG_CACHE_DIR", directory.path().join("cache"))
+                .output()
+                .expect("consented install command must execute")
+        };
+        let ordinary = run("tree");
+        let consented = run("/var/tmp/untrusted.pkg.tar.zst");
+        assert_eq!(ordinary.status.code(), Some(1));
+        assert_eq!(consented.status.code(), Some(1));
+        assert_eq!(ordinary.stderr, consented.stderr);
+        let error = String::from_utf8_lossy(&ordinary.stderr);
+        let expected = if cfg!(feature = "debian-pure")
+            && omg_lib::core::env::distro::is_debian_like()
+        {
+            "The Debian indexing feature is not a live APT backend. Install the Debian/Ubuntu omg build, or rebuild with --no-default-features --features debian,pgp,license".to_owned()
+        } else {
+            let distro = omg_lib::core::env::distro::detect_distro();
+            let feature = match distro {
+                omg_lib::core::env::distro::Distro::Arch => "arch",
+                omg_lib::core::env::distro::Distro::Debian
+                | omg_lib::core::env::distro::Distro::Ubuntu => "debian",
+                omg_lib::core::env::distro::Distro::Fedora => "fedora",
+                omg_lib::core::env::distro::Distro::MacOS => {
+                    panic!("portable Linux fixture requires a Linux host")
+                }
+                omg_lib::core::env::distro::Distro::Unknown => "",
+            };
+            if feature.is_empty() {
+                "Unsupported Linux distribution: no live package backend can be selected".to_owned()
+            } else {
+                format!(
+                    "This omg binary lacks the {feature} package backend required by {distro:?}. Install the matching distro build, or rebuild with --no-default-features --features {feature},pgp,license"
+                )
+            }
+        };
         assert!(
-            combined.contains("--allow-local-file"),
-            "local archive refusal must name the explicit consent flag: {combined}"
+            error.contains(&expected),
+            "missing backend refusal: {error}"
         );
+        assert!(!error.contains("require explicit consent"), "{error}");
+        for output in [ordinary, consented] {
+            assert!(
+                output.stdout.is_empty(),
+                "backend refusal must not report success"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read sentinel"),
+            b"preserved preflight state"
+        );
+        assert!(!directory.path().join("data").exists());
+        assert!(!directory.path().join("cache").exists());
     }
 
     #[cfg(unix)]
@@ -1521,7 +1604,7 @@ mod sbom_audit {
 
     #[test]
     fn test_audit_entry_hash_computation() {
-        use omg_lib::core::security::audit::AuditEntry;
+        use omg_lib::core::security::audit::{AuditEntry, HASH_VERSION_LENGTH_PREFIXED};
 
         let entry = AuditEntry {
             id: "test-123".to_string(),
@@ -1533,6 +1616,7 @@ mod sbom_audit {
             description: "Installed firefox".to_string(),
             metadata: None,
             prev_hash: "genesis".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
 
@@ -1540,13 +1624,18 @@ mod sbom_audit {
         assert!(!hash.is_empty());
         assert_eq!(hash.len(), 64); // SHA-256
 
+        // Independently checked ff01/BE64 encoding from Python hashlib.
+        assert_eq!(
+            hash,
+            "a152b601c0db36599e6487b43768e244196e4b553ffc84007c1e5c0cf1ca3d70"
+        );
         // Hash should be deterministic
         assert_eq!(hash, entry.compute_hash());
     }
 
     #[test]
     fn test_audit_entry_verification() {
-        use omg_lib::core::security::audit::AuditEntry;
+        use omg_lib::core::security::audit::{AuditEntry, HASH_VERSION_LENGTH_PREFIXED};
 
         let mut entry = AuditEntry {
             id: "test-456".to_string(),
@@ -1558,6 +1647,7 @@ mod sbom_audit {
             description: "Removed curl".to_string(),
             metadata: None,
             prev_hash: "abc123".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
 
@@ -1613,7 +1703,7 @@ mod sbom_audit {
 
     #[test]
     fn test_audit_tamper_detection() {
-        use omg_lib::core::security::audit::AuditEntry;
+        use omg_lib::core::security::audit::{AuditEntry, HASH_VERSION_LENGTH_PREFIXED};
         use std::io::Write;
 
         let temp_dir = TempDir::new().unwrap();
@@ -1633,6 +1723,7 @@ mod sbom_audit {
             description: "Install pkg1".to_string(),
             metadata: None,
             prev_hash: "genesis".to_string(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: None,
         };
         entry1.hash = Some(entry1.compute_hash());
@@ -1651,6 +1742,7 @@ mod sbom_audit {
             description: "Remove pkg2".to_string(),
             metadata: None,
             prev_hash: entry1.hash.as_ref().unwrap().clone(),
+            hash_version: HASH_VERSION_LENGTH_PREFIXED,
             hash: Some("invalid_hash".to_string()),
         };
 

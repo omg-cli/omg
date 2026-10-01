@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -30,6 +32,18 @@ TRANSACTION_PRIVATE = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_boot_process_diagnostics_stay_at_explicit_controller_paths(self):
+        paths = (("run-test", "boot.diagnostics.log"),
+                 ("run-test", "transactions", "prepare-install-boot.diagnostics.log"),
+                 ("run-test", "transactions", "resume-boot.diagnostics.log"),
+                 ("run-test", "transactions", "trials", "remove-native-001", "boot.diagnostics.log"))
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertTrue(exporter.allowed_file(path))
+                self.assertFalse(exporter.allowed_file((*path[:-1], path[-1] + ".bak")))
+        self.assertFalse(exporter.allowed_file(("run-test", "guest", "boot.diagnostics.log")))
+        self.assertFalse(exporter.allowed_file(("run-test", "transactions", "trials", "remove-native-001", "transaction-trial", "boot.diagnostics.log")))
+
     def test_doctor_connectivity_evidence_is_bounded_to_guest_diagnostics(self):
         names = ("doctor-connectivity-fallback.json", "doctor-connectivity-fallback.log",
                  "doctor-connectivity-cert.log")
@@ -105,6 +119,8 @@ class AllowlistTests(unittest.TestCase):
 
     def test_known_diagnostics_preserve_report_hierarchy(self):
         for path in ("provenance.json", "run-fixture/results.json", "run-fixture/guest-check.log",
+                     "run-fixture/backend-mismatch-results.json", "run-fixture/backend-mismatch.json",
+                     "run-fixture/backend-mismatch.log",
                      "run-fixture/reporting-status.json",
                      "run-fixture/controller-security.log",
                      "run-fixture/controller-pull.log",
@@ -187,6 +203,23 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(status, 0, report)
         self.assertEqual(report["copied"], [name])
         self.assertEqual((self.destination / name).read_bytes(), b"QEMU network backend failed")
+
+    def test_boot_observations_survive_export_without_private_neighbors(self):
+        names = ("run-test/boot.diagnostics.log",
+                 "run-test/transactions/prepare-install-boot.diagnostics.log",
+                 "run-test/transactions/resume-boot.diagnostics.log",
+                 "run-test/transactions/trials/remove-native-001/boot.diagnostics.log")
+        for name in names:
+            self.fixture(name, b"qemu_process_status=unavailable\nlistener=absent\n")
+        private = "run-test/transactions/trials/remove-native-001/transaction-trial/boot.diagnostics.log"
+        self.fixture(private, b"private-neighbor")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(set(report["copied"]), set(names))
+        for name in names:
+            self.assertEqual((self.destination / name).read_bytes(),
+                             b"qemu_process_status=unavailable\nlistener=absent\n")
+        self.assertFalse((self.destination / private).exists())
 
     def test_daemon_ipc_snapshots_survive_export(self):
         prefix = "run-test/guest/evidence/"
@@ -296,9 +329,32 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(report["bytes"], 0)
         self.assertTrue(any("budget" in item["error"] for item in report["errors"]))
 
-    @unittest.skipUnless(os.name == "posix" and os.environ.get("SUDO_UID"), "requires sudo fixture run")
     def test_root_owned_diagnostics_export_for_runner_without_changing_source(self):
-        uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+        if os.geteuid() != 0:
+            uid, gid = os.getuid(), os.getgid()
+            result = subprocess.run([
+                "sudo", "-n", "env", f"SUDO_UID={uid}", f"SUDO_GID={gid}",
+                sys.executable, "-Werror", str(Path(__file__).resolve()),
+                "DescriptorTests.test_root_owned_diagnostics_export_for_runner_without_changing_source",
+            ], capture_output=True, text=True, timeout=30, check=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Ran 1 test", result.stderr)
+            self.assertIn("\nOK\n", result.stderr)
+            self.assertNotIn("skipped", result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "Exported 1 files (10 bytes); skipped 0 paths; 0 errors",
+                f"root_fixture_actor_uid=0 destination_uid={uid} destination_gid={gid}"
+            ])
+            return
+        self.assertEqual(os.getuid(), 0, "fixture must run at its actual privileged UID")
+        if os.environ.get("SUDO_UID"):
+            uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+        else:
+            import pwd
+
+            account = pwd.getpwnam("nobody")
+            uid, gid = account.pw_uid, account.pw_gid
+        self.assertNotEqual(uid, 0, "export destination must belong to an ordinary user")
         log = self.fixture("run-test/guest/evidence/audit-directory-after.txt")
         log.chmod(0o600)
         self.assertEqual(log.stat().st_uid, 0)
@@ -310,6 +366,7 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(copied.read_bytes(), b"diagnostic")
         self.assertEqual(log.stat().st_uid, 0)
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+        print(f"root_fixture_actor_uid={os.getuid()} destination_uid={copied.stat().st_uid} destination_gid={copied.stat().st_gid}")
 
 
 if __name__ == "__main__":

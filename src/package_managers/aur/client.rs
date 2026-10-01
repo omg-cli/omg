@@ -49,6 +49,7 @@ use crate::runtimes::common::{
 
 use crate::core::security::artifact::ArchiveSnapshot;
 const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc";
+
 const AUR_GIT_URL: &str = "https://aur.archlinux.org";
 const AUR_RPC_MAX_URI: usize = 4400;
 const AUR_SEARCH_MAX_BYTES: usize = 100;
@@ -172,7 +173,7 @@ fn create_scoped_pgp_home(
         .prefix("aur-pgp-")
         .tempdir_in(cache_dir)
         .context("Failed to create package-scoped AUR PGP keyring")?;
-    let gpg = crate::core::privilege::trusted_program("gpg")?;
+    let gpg = crate::core::privilege::root_controlled_program_path("gpg")?;
     let exported = std::process::Command::new(&gpg)
         .arg("--no-options")
         .arg("--batch")
@@ -556,16 +557,24 @@ fn configure_build_environment(command: &mut Command, home: &Path, user: &str) {
 }
 
 fn native_build_command() -> Result<Command> {
-    let mut command = Command::new(crate::core::privilege::trusted_program("setpriv")?);
+    let mut command = Command::new(crate::core::privilege::root_controlled_program_path(
+        "setpriv",
+    )?);
     command
         .args(["--no-new-privs", "--"])
-        .arg(crate::core::privilege::trusted_program("setsid")?)
+        .arg(crate::core::privilege::root_controlled_program_path(
+            "setsid",
+        )?)
         .args(["-w", "makepkg"]);
     Ok(command)
 }
 
 fn sandbox_command(home: &Path, user: &str) -> Result<Command> {
-    sandbox_command_with(home, user, crate::core::privilege::trusted_program)
+    sandbox_command_with(
+        home,
+        user,
+        crate::core::privilege::root_controlled_program_path,
+    )
 }
 
 fn sandbox_command_with(
@@ -2048,7 +2057,7 @@ impl AurClient {
         }
 
         if !console::user_attended() {
-            let true_program = crate::core::privilege::trusted_program("true")?;
+            let true_program = crate::core::privilege::root_controlled_program_path("true")?;
             let status = crate::core::privilege::sudo_command()?
                 .args(["-n", "--"])
                 .arg(true_program)
@@ -3517,7 +3526,7 @@ impl AurClient {
         env: &MakepkgEnv,
         package: &str,
     ) -> Result<std::process::ExitStatus> {
-        let bwrap_available = crate::core::privilege::trusted_program("bwrap").is_ok();
+        let bwrap_available = crate::core::privilege::root_controlled_program_path("bwrap").is_ok();
 
         if bwrap_available {
             tracing::info!("Using bubblewrap sandbox for secure AUR build");
@@ -3796,14 +3805,18 @@ impl AurClient {
             self.settings.aur.allow_network,
             "Chroot devtools cannot enforce offline builds; choose bubblewrap or explicitly enable aur.allow_network"
         );
-        let mut cmd = if let Ok(pkgctl) = crate::core::privilege::trusted_program("pkgctl") {
+        let mut cmd = if let Ok(pkgctl) =
+            crate::core::privilege::root_controlled_program_path("pkgctl")
+        {
             let mut cmd = Command::new(pkgctl);
             cmd.arg("build");
             if self.settings.aur.secure_makepkg {
                 cmd.arg("--clean");
             }
             cmd
-        } else if let Ok(makechrootpkg) = crate::core::privilege::trusted_program("makechrootpkg") {
+        } else if let Ok(makechrootpkg) =
+            crate::core::privilege::root_controlled_program_path("makechrootpkg")
+        {
             let mut cmd = Command::new(makechrootpkg);
             cmd.args(["-r", "/var/lib/archbuild"]).arg("--");
             cmd
@@ -4830,10 +4843,12 @@ mod tests {
     #[tokio::test]
     async fn native_child_cannot_gain_new_privileges() -> Result<()> {
         // Exercise the real setpriv boundary without sudo or package mutation.
-        let output = Command::new(crate::core::privilege::trusted_program("setpriv")?)
-            .args(["--no-new-privs", "--", "/usr/bin/cat", "/proc/self/status"])
-            .output()
-            .await?;
+        let output = Command::new(crate::core::privilege::root_controlled_program_path(
+            "setpriv",
+        )?)
+        .args(["--no-new-privs", "--", "/usr/bin/cat", "/proc/self/status"])
+        .output()
+        .await?;
         assert!(output.status.success());
         assert!(String::from_utf8(output.stdout)?.contains("NoNewPrivs:\t1"));
         let command = native_build_command()?;
@@ -7639,5 +7654,56 @@ mod tests {
         assert!(first.parse::<u64>().is_ok());
         assert!(reproducible_source_epoch("short").is_err());
         assert!(reproducible_source_epoch("not-a-valid-hash!").is_err());
+    }
+}
+
+#[cfg(test)]
+mod empty_rpc_result_tests {
+    use super::AurClient;
+    use anyhow::Result;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn empty_info_reply_is_a_real_completed_rpc_lookup() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/rpc", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                anyhow::ensure!(bytes.len() < 8192, "RPC fixture header exceeds 8 KiB");
+                let mut chunk = [0; 1024];
+                let count = stream
+                    .read(&mut chunk[..(8192 - bytes.len()).min(1024)])
+                    .await?;
+                anyhow::ensure!(count > 0, "RPC fixture closed before complete header");
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8(bytes)?;
+            let body = r#"{"type":"multiinfo","resultcount":0,"results":[]}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await?;
+            anyhow::Ok(request)
+        });
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            AurClient::rpc_info_chunk_at(&endpoint, &["missing-fixture-package".to_owned()]),
+        )
+        .await??;
+        let request = server.await??;
+        assert!(request.starts_with("GET /rpc?v=5&type=info&"), "{request}");
+        assert!(request.contains("missing-fixture-package"), "{request}");
+        assert!(
+            response.results.is_empty(),
+            "empty successful info is absence, not a transport error"
+        );
+        eprintln!(
+            "AUR empty-info completed request={}",
+            request.lines().next().unwrap_or_default()
+        );
+        Ok(())
     }
 }

@@ -31,6 +31,12 @@ pub async fn update(
     no_sync: bool,
     aur_only: bool,
 ) -> Result<()> {
+    #[cfg(feature = "arch")]
+    if super::mock_arch_backend()? {
+        // Retain Arch orchestration with the isolated mock manager. Its AUR
+        // lane is disabled, and development-mode elevation fails closed.
+        return arch::update(check_only, yes, dry_run, no_sync, aur_only).await;
+    }
     dispatch_backend! {
         debian: {
             if aur_only { anyhow::bail!("--aur-only is supported only on Arch Linux"); }

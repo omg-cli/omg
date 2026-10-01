@@ -61,17 +61,30 @@ pub async fn run(network: bool, eol: bool) -> Result<()> {
     let distro = detected_distro();
     let arch_backend = matches!(distro, Distro::Arch);
 
-    // 1. OS Check — every supported backend distro is healthy; only an
-    //    unsupported system is an issue (W3-A-02: a supported Debian system
-    //    must not be reported as permanently unhealthy).
-    if let Some(label) = supported_distro_label(distro) {
-        println!("  {}", style::success(label));
-    } else {
-        println!(
-            "  {}",
-            style::warning("Unsupported system detected (no package-manager backend)")
-        );
-        issues += 1;
+    // 1. OS and compiled backend must agree. A copied binary with the wrong
+    //    feature set must not advertise a healthy package manager.
+    match crate::package_managers::resolve_backend() {
+        Ok(_) => {
+            if let Some(label) = supported_distro_label(distro) {
+                println!("  {}", style::success(label));
+            } else {
+                println!(
+                    "  {}",
+                    style::warning("Unsupported system detected (no package-manager backend)")
+                );
+                issues += 1;
+            }
+        }
+        Err(error) => {
+            println!(
+                "  {} Package backend unavailable: {error}",
+                style::error("✗")
+            );
+            issues += 1;
+            // Native infrastructure checks are meaningful only when this
+            // binary can actually operate the detected host backend.
+            return finish_doctor(issues, warnings);
+        }
     }
 
     // 2. Internet Connectivity (basic check)
@@ -245,7 +258,7 @@ async fn add_native_infra_issues(
 ) {
     *issues += match distro {
         Distro::Debian | Distro::Ubuntu => check_debian_infra(),
-        Distro::Arch => check_arch_infra(),
+        Distro::Arch => check_arch_infra().await,
         Distro::Fedora => fedora_check.await,
         Distro::MacOS | Distro::Unknown => 0,
     };
@@ -293,6 +306,7 @@ fn supported_distro_label(distro: Distro) -> Option<&'static str> {
 /// the name carries `_Packages` and the encoding is one
 /// `package_managers::debian_db` reads (uncompressed, lz4, gz, xz).
 /// InRelease metadata, lock files, and pdiff fragments do not count.
+#[cfg(test)]
 fn is_apt_packages_index(path: &std::path::Path) -> bool {
     let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -301,6 +315,7 @@ fn is_apt_packages_index(path: &std::path::Path) -> bool {
 }
 
 /// Whether a lists directory holds at least one parseable package index.
+#[cfg(test)]
 fn apt_lists_have_packages(lists: &std::path::Path) -> bool {
     lists.is_dir()
         && std::fs::read_dir(lists).is_ok_and(|entries| {
@@ -310,48 +325,57 @@ fn apt_lists_have_packages(lists: &std::path::Path) -> bool {
         })
 }
 
-/// Check the Debian/Ubuntu infrastructure the apt backend actually depends
-/// on (W3-A-02): the dpkg status database and the APT package indexes that
-/// `package_managers::debian_db` parses directly. No other infrastructure is
-/// invented; repo reachability for apt is exactly these on-disk indexes.
+/// Check content from one bounded, read-only snapshot per native input.
 fn check_debian_infra() -> usize {
     if crate::core::paths::test_mode() {
-        // Hermetic like the other checks: report healthy under test mode.
         return 0;
     }
-
-    let mut issues = 0;
-
-    let status = std::path::Path::new("/var/lib/dpkg/status");
-    if status.exists() {
-        println!(
-            "  {}",
-            style::success("dpkg package database (/var/lib/dpkg/status)")
-        );
-    } else {
-        println!(
-            "  {}",
-            style::error("dpkg package database missing (/var/lib/dpkg/status)")
-        );
-        issues += 1;
+    #[cfg(any(feature = "debian", feature = "debian-pure"))]
+    {
+        check_debian_infra_at(
+            std::path::Path::new("/var/lib/dpkg/status"),
+            std::path::Path::new("/var/lib/apt/lists"),
+        )
     }
-
-    let lists = std::path::Path::new("/var/lib/apt/lists");
-    let has_indexes = apt_lists_have_packages(lists);
-    if has_indexes {
+    #[cfg(not(any(feature = "debian", feature = "debian-pure")))]
+    {
         println!(
-            "  {}",
-            style::success("APT package indexes (/var/lib/apt/lists)")
-        );
-    } else {
-        println!(
-            "  {} APT package indexes missing or empty (/var/lib/apt/lists) — run 'sudo apt-get update'",
+            "  {} Debian index validation is unavailable in this binary",
             style::error("✗")
         );
-        issues += 1;
+        1
     }
+}
 
+#[cfg(any(feature = "debian", feature = "debian-pure"))]
+fn check_debian_infra_at(status: &std::path::Path, lists: &std::path::Path) -> usize {
+    let mut issues = 0;
+    for (label, path, result) in [
+        (
+            "dpkg package database",
+            status,
+            crate::package_managers::debian_db::db::validate_native_status(status),
+        ),
+        (
+            "APT package indexes",
+            lists,
+            crate::package_managers::debian_db::db::validate_native_packages(lists),
+        ),
+    ] {
+        match result {
+            Ok(()) => println!("  {}", style::success(&debian_health_label(label, path))),
+            Err(error) => {
+                println!("  {} {label}: {error:#}", style::error("✗"));
+                issues += 1;
+            }
+        }
+    }
     issues
+}
+
+#[cfg(any(feature = "debian", feature = "debian-pure"))]
+fn debian_health_label(label: &str, path: &std::path::Path) -> String {
+    format!("{label} ({})", path.display())
 }
 
 /// Check the tools and local package database used by the Fedora backend.
@@ -610,6 +634,7 @@ async fn query_homebrew_path(
 /// server/config — see #299), so the compression suffix must be stripped
 /// before testing the `_Packages` stem. `InRelease`/`Release` files alone
 /// are not indexes.
+#[cfg(test)]
 fn apt_lists_entry_has_index(file_name: &str) -> bool {
     file_name.ends_with("_Packages")
         || file_name.rsplit_once('.').is_some_and(|(name, encoding)| {
@@ -624,7 +649,7 @@ fn apt_lists_entry_has_index(file_name: &str) -> bool {
 /// the pacman configuration file (`/etc/pacman.conf`) and the ALPM local
 /// package database directory (`/var/lib/pacman/local`).
 #[cfg(feature = "arch")]
-fn check_arch_infra() -> usize {
+async fn check_arch_infra() -> usize {
     if crate::core::paths::test_mode() {
         return 0;
     }
@@ -662,22 +687,58 @@ fn check_arch_infra() -> usize {
         issues += 1;
     }
 
-    let local_dir = crate::core::paths::pacman_local_dir();
+    let local_dir = match crate::core::paths::pacman_local_dir_result() {
+        Ok(path) => path,
+        Err(error) => {
+            println!(
+                "  {} ALPM local package database path unavailable: {error}",
+                style::error("✗")
+            );
+            return issues + 1 + check_pacman_lock(db_path.as_deref());
+        }
+    };
     if local_dir.is_dir() {
-        match crate::package_managers::pacman_db::check_local_db_consistency(&local_dir) {
-            Ok(packages) => println!(
-                "  {} ALPM local package database ({}, {packages} packages verified)",
-                style::success("✓"),
+        let health =
+            crate::package_managers::pacman_db::check_native_local_db_health(&local_dir).await;
+        issues += alpm_health_issue_count(&health);
+        match health {
+            Ok(observed) => {
+                let packages = observed.packages;
+                if let Err(error) = &observed.native {
+                    println!(
+                        "  {} ALPM native database check failed ({}): {error}",
+                        style::error("✗"),
+                        local_dir.display()
+                    );
+                    for entry in &observed.missing {
+                        println!(
+                            "  {} ALPM dependency unsatisfied: {} requires {}",
+                            style::error("✗"),
+                            entry.package,
+                            entry.dependency
+                        );
+                    }
+                }
+                if observed.native.is_ok() {
+                    println!(
+                        "  {} ALPM local package database ({}, {packages} packages verified), dependencies/conflicts/ownership verified",
+                        style::success("✓"),
+                        local_dir.display()
+                    );
+                } else if !observed.missing.is_empty() {
+                    println!(
+                        "  {} ALPM local package database inconsistent: {} of {packages} dependencies unmet ({})",
+                        style::error("✗"),
+                        observed.missing.len(),
+                        local_dir.display()
+                    );
+                }
+            }
+            Err(error) => println!(
+                "  {} ALPM local package database inconsistent ({}): {error}",
+                style::error("✗"),
                 local_dir.display()
             ),
-            Err(error) => {
-                println!(
-                    "  {} ALPM local package database inconsistent ({}): {error}",
-                    style::error("✗"),
-                    local_dir.display()
-                );
-                issues += 1;
-            }
         }
     } else {
         println!(
@@ -693,10 +754,18 @@ fn check_arch_infra() -> usize {
     issues
 }
 
+#[cfg(feature = "arch")]
+fn alpm_health_issue_count(
+    health: &Result<crate::package_managers::pacman_db::NativeLocalDbHealth>,
+) -> usize {
+    // Parser errors stay fatal. Pacman's -Dk is the graph health authority.
+    usize::from(!matches!(health, Ok(observed) if observed.native.is_ok()))
+}
+
 /// Check network connectivity to backend-appropriate mirrors
 #[cfg(not(feature = "arch"))]
-const fn check_arch_infra() -> usize {
-    0
+fn check_arch_infra() -> std::future::Ready<usize> {
+    std::future::ready(0)
 }
 
 fn network_targets(
@@ -1138,7 +1207,7 @@ fn check_required_system_command(cmd: &str, issues: &mut usize) {
         println!("  {}", style::success(&format!("Found dependency: {cmd}")));
         return;
     }
-    if crate::core::privilege::trusted_program(cmd).is_ok() {
+    if crate::core::privilege::root_controlled_program_path(cmd).is_ok() {
         println!("  {}", style::success(&format!("Found dependency: {cmd}")));
     } else {
         println!("  {}", style::error(&format!("Missing dependency: {cmd}")));
@@ -1346,7 +1415,7 @@ pub fn enable_turbo_mode() -> Result<()> {
         true
     };
     if cleanup_done {
-        let setcap = crate::core::privilege::trusted_program("setcap")?;
+        let setcap = crate::core::privilege::root_controlled_program_path("setcap")?;
         let remove = crate::core::privilege::system_command("sudo")?
             .arg("--")
             .arg(setcap)
@@ -1900,6 +1969,99 @@ mod tests {
         assert_eq!(check_pacman_lock(Some(&dir_str)), 1);
     }
 
+    #[cfg(feature = "arch")]
+    fn alpm_doctor_fixture(dependencies: &str) -> tempfile::TempDir {
+        let temp = tempfile::TempDir::new().unwrap();
+        let package = temp.path().join("app");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("desc"),
+            format!("%NAME%\napp\n\n%VERSION%\n1.0-1\n\n%DEPENDS%\n{dependencies}\n"),
+        )
+        .unwrap();
+        std::fs::write(package.join("files"), "").unwrap();
+        temp
+    }
+
+    #[cfg(feature = "arch")]
+    fn alpm_fixture_health(
+        path: &std::path::Path,
+        native: Result<()>,
+    ) -> Result<crate::package_managers::pacman_db::NativeLocalDbHealth> {
+        crate::package_managers::pacman_db::check_local_db_health(path).map(
+            |(packages, missing)| crate::package_managers::pacman_db::NativeLocalDbHealth {
+                packages,
+                missing,
+                native,
+            },
+        )
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_doctor_healthy_snapshot_has_no_issue() {
+        let temp = alpm_doctor_fixture("app>=1");
+        let health = alpm_fixture_health(temp.path(), Ok(()));
+        assert_eq!(alpm_health_issue_count(&health), 0);
+        let observed = health.unwrap();
+        assert_eq!((observed.packages, observed.missing), (1, Vec::new()));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_doctor_wrong_version_is_an_issue_with_raw_relation() {
+        let temp = alpm_doctor_fixture("app>=9");
+        let health = alpm_fixture_health(
+            temp.path(),
+            Err(anyhow::anyhow!("native rejected dependency")),
+        );
+        assert_eq!(alpm_health_issue_count(&health), 1);
+        let observed = health.unwrap();
+        assert_eq!(observed.packages, 1);
+        assert_eq!(
+            observed.missing,
+            vec![crate::package_managers::pacman_db::UnsatisfiedDependency {
+                package: "app".into(),
+                dependency: "app>=9".into()
+            }]
+        );
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_doctor_failed_or_skipped_observation_is_an_issue() {
+        let temp = alpm_doctor_fixture("absent>=9");
+        for path in [temp.path().join("absent"), temp.path().join("app/desc")] {
+            let health = alpm_fixture_health(&path, Ok(()));
+            assert!(health.is_err());
+            assert_eq!(alpm_health_issue_count(&health), 1);
+        }
+        std::fs::write(temp.path().join("app/desc"), "%VERSION%\n1.0-1\n").unwrap();
+        let health = alpm_fixture_health(temp.path(), Ok(()));
+        assert!(health.is_err());
+        assert_eq!(alpm_health_issue_count(&health), 1);
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn alpm_health_native_graph_verdict_and_parser_errors_are_counted_once() {
+        let temp = alpm_doctor_fixture("app>=9");
+        let health = alpm_fixture_health(temp.path(), Ok(()));
+        assert_eq!(alpm_health_issue_count(&health), 0);
+        let rejected = Ok(crate::package_managers::pacman_db::NativeLocalDbHealth {
+            packages: 1,
+            missing: Vec::new(),
+            native: Err(anyhow::anyhow!(
+                "native rejected conflict or file ownership"
+            )),
+        });
+        assert_eq!(alpm_health_issue_count(&rejected), 1);
+        assert_eq!(
+            alpm_health_issue_count(&Err(anyhow::anyhow!("malformed entry"))),
+            1
+        );
+    }
+
     // W3-A-02: every supported backend distro must get a healthy OS verdict;
     // only an unsupported system is an issue.
     #[test]
@@ -2213,5 +2375,86 @@ mod tests {
         let doctor_issues = probe().await;
         assert_eq!(doctor_issues, 1);
         assert!(finish_doctor(doctor_issues, 0).is_err());
+    }
+}
+
+#[cfg(all(test, any(feature = "debian", feature = "debian-pure")))]
+mod debian_native_health_tests {
+    use super::check_debian_infra_at;
+
+    #[test]
+    fn debian_health_labels_satisfy_the_guest_output_oracle() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let output_path = root.path().join("doctor.out");
+        let release_path = root.path().join("os-release");
+        let source = include_str!("../../scripts/qemu-inventory.sh");
+        let (_, oracle) = source.split_once("# BEGIN DOCTOR BACKEND ORACLE").unwrap();
+        let (oracle, _) = oracle.split_once("# END DOCTOR BACKEND ORACLE").unwrap();
+        let command = format!("{oracle}\ncheck_doctor_native_backend \"$1\" \"$2\" \"$3\"\n");
+        for distro in ["debian", "ubuntu"] {
+            std::fs::write(&release_path, format!("ID={distro}\n"))?;
+            let prefix = "  Debian/Ubuntu detected (apt backend)\n  Found dependency: sudo\n  Found dependency: apt-get\n";
+            let healthy = format!(
+                "{prefix}  {}\n  {}\n",
+                super::debian_health_label(
+                    "dpkg package database",
+                    std::path::Path::new("/var/lib/dpkg/status")
+                ),
+                super::debian_health_label(
+                    "APT package indexes",
+                    std::path::Path::new("/var/lib/apt/lists")
+                ),
+            );
+            for (text, expected_success) in [
+                (healthy, true),
+                (
+                    format!("{prefix}  dpkg package database\n  APT package indexes\n"),
+                    false,
+                ),
+            ] {
+                std::fs::write(&output_path, text)?;
+                let result = std::process::Command::new("bash")
+                    .args(["-c", &command, "_", distro])
+                    .arg(&output_path)
+                    .arg(&release_path)
+                    .current_dir(root.path())
+                    .output()?;
+                assert_eq!(
+                    result.status.success(),
+                    expected_success,
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+        assert_eq!(
+            super::debian_health_label("APT package indexes", root.path()),
+            format!("APT package indexes ({})", root.path().display())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn debian_health_counts_content_errors_not_just_paths() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let status = root.path().join("status");
+        let lists = root.path().join("lists");
+        std::fs::create_dir(&lists)?;
+        let index = lists.join("mirror_Packages");
+        std::fs::write(
+            &status,
+            "Package: fixture\nVersion: 1\nArchitecture: amd64\nStatus: hold ok installed\n",
+        )?;
+        std::fs::write(&index, "")?;
+        assert_eq!(check_debian_infra_at(&status, &lists), 0);
+        std::fs::write(&status, "garbage")?;
+        assert_eq!(check_debian_infra_at(&status, &lists), 1);
+        std::fs::write(&index, "Package: fixture\n")?;
+        assert_eq!(check_debian_infra_at(&status, &lists), 2);
+        std::fs::remove_file(&index)?;
+        std::fs::create_dir(&index)?;
+        assert_eq!(check_debian_infra_at(&status, &lists), 2);
+        assert!(super::finish_doctor(2, 0).is_err());
+        Ok(())
     }
 }

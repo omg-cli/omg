@@ -186,7 +186,7 @@ impl Drop for SudoLoop {
 /// - sudo is not installed
 #[must_use]
 pub fn can_use_sudoloop() -> bool {
-    !crate::core::is_root() && crate::core::privilege::trusted_program("sudo").is_ok()
+    !crate::core::is_root() && crate::core::privilege::root_controlled_program_path("sudo").is_ok()
 }
 
 #[cfg(test)]

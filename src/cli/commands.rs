@@ -153,28 +153,50 @@ async fn complete_package_names(
 }
 
 pub(crate) async fn available_package_names() -> Result<Vec<String>> {
+    let backend = crate::package_managers::resolve_backend()?;
     // Official lookup failures fail closed; AUR names remain optional enrichment.
-    #[allow(
-        unused_mut,
-        reason = "mutated only when the Arch completion branch is compiled"
-    )]
-    let mut names = tokio::task::spawn_blocking(official_package_names).await??;
+    let names = if matches!(
+        backend,
+        crate::package_managers::Backend::Fedora
+            | crate::package_managers::Backend::MacOS
+            | crate::package_managers::Backend::Mock
+    ) {
+        crate::package_managers::get_package_manager()?
+            .package_index()
+            .await?
+            .into_iter()
+            .map(|package| package.name)
+            .collect()
+    } else {
+        tokio::task::spawn_blocking(official_package_names).await??
+    };
 
-    // Include AUR packages on Arch. Skip on Debian even if Arch is compiled in.
+    // Mock Arch completion can consume its isolated cache but never refresh it.
     #[cfg(feature = "arch")]
-    {
-        #[cfg(any(feature = "debian", feature = "debian-pure"))]
-        if crate::core::env::distro::is_debian_like() {
-            return Ok(names);
-        }
-
-        let engine = crate::core::completion::CompletionEngine::new();
-        if let Ok(aur_names) = engine.get_aur_package_names().await {
+    let names = {
+        let aur_names = if backend == crate::package_managers::Backend::Arch {
+            crate::core::completion::CompletionEngine::new()
+                .get_aur_package_names()
+                .await
+                .ok()
+        } else if backend == crate::package_managers::Backend::Mock
+            && crate::core::env::distro::detect_distro() == crate::core::env::distro::Distro::Arch
+        {
+            crate::core::completion::CompletionEngine::cached_aur_package_names()
+        } else {
+            None
+        };
+        let mut names = names;
+        if let Some(aur_names) = aur_names {
             names.extend(aur_names);
             names.sort();
             names.dedup();
         }
-    }
+        names
+    };
+
+    #[cfg(not(feature = "arch"))]
+    let _ = backend;
 
     Ok(names)
 }
@@ -206,6 +228,17 @@ fn complete_installed_tools(
     reason = "additive backend feature branches return before compiled fallbacks"
 )]
 fn get_installed_package_names() -> Result<Vec<String>> {
+    let backend = crate::package_managers::resolve_backend()?;
+    if matches!(
+        backend,
+        crate::package_managers::Backend::Fedora
+            | crate::package_managers::Backend::MacOS
+            | crate::package_managers::Backend::Mock
+    ) {
+        return crate::package_managers::list_installed_fast()
+            .map(|installed| installed.into_iter().map(|pkg| pkg.name).collect())
+            .context("Failed to list installed packages for completion");
+    }
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {
         return crate::package_managers::debian_db::list_installed_fast()
@@ -244,6 +277,14 @@ fn get_installed_package_names() -> Result<Vec<String>> {
     reason = "additive backend feature branches return before compiled fallbacks"
 )]
 fn official_package_names() -> Result<Vec<String>> {
+    let backend = crate::package_managers::resolve_backend()?;
+    anyhow::ensure!(
+        matches!(
+            backend,
+            crate::package_managers::Backend::Arch | crate::package_managers::Backend::Debian
+        ),
+        "This backend has no ALPM or APT package-name reader"
+    );
     #[cfg(feature = "debian")]
     if use_debian_backend() {
         return apt_list_all_package_names()
@@ -400,6 +441,7 @@ type StatusSnapshot = (
 /// A missing daemon or binary cache falls back to a direct query, but a failed
 /// direct query is an error rather than a fake "healthy" zero report.
 fn read_status_snapshot() -> Result<StatusSnapshot> {
+    crate::package_managers::resolve_backend()?;
     // Use the same isolated fixture as JSON and async status. Native fast
     // readers may provide their own fixed test records and must not override
     // the explicit adapter (or read a real daemon cache in root-run tests).
@@ -721,7 +763,7 @@ pub fn daemon(foreground: bool) -> Result<()> {
 #[cfg(unix)]
 fn resolve_omgd_path() -> Result<std::path::PathBuf> {
     resolve_omgd_path_from(crate::core::paths::sibling_binary("omgd"), || {
-        crate::core::privilege::trusted_program("omgd")
+        crate::core::privilege::root_controlled_program_path("omgd")
             .context("omgd is not installed beside omg or in a root-controlled system path")
     })
 }
@@ -1257,6 +1299,14 @@ fn history_entry_by_prefix<'a>(
     reason = "feature-gated implementations await while fallback builds do not"
 )]
 pub async fn rollback(id: Option<String>, yes: bool) -> Result<()> {
+    let backend = crate::package_managers::resolve_backend()?;
+    anyhow::ensure!(
+        !matches!(
+            backend,
+            crate::package_managers::Backend::Fedora | crate::package_managers::Backend::MacOS
+        ),
+        "Package rollback is not implemented for the selected {backend:?} backend"
+    );
     let id = match id {
         Some(id) => Some(normalize_transaction_id(&id)?),
         None => None,

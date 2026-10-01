@@ -4,10 +4,55 @@ set -euo pipefail
 target=${1:?guest SSH target required}
 shift
 
+helper_started=$SECONDS
+phase_started=0
+start_phase() {
+  phase_started=$SECONDS
+  printf 'cloud_init_phase=%s started_utc=%s\n' "$1" "$(date -u +%FT%TZ)" >&2
+}
+
+observe_phase() {
+  printf 'cloud_init_phase=%s ended_utc=%s elapsed_seconds=%s timeout_ssh_exit=%s\n' \
+    "$1" "$(date -u +%FT%TZ)" "$(( SECONDS - phase_started ))" "$2" >&2
+}
+
+collect_failed_guest_state() {
+  local diagnostic_rc diagnostic_budget
+  printf 'cloud_init_diagnostics_started_utc=%s\n' "$(date -u +%FT%TZ)" >&2
+  # Keep observation inside the existing 180+60-second phase work allowance,
+  # leaving its timeout kill graces and the outer 250-second limit intact.
+  diagnostic_budget=$(( 180 + 60 - (SECONDS - helper_started) ))
+  if (( diagnostic_budget <= 0 )); then
+    printf 'cloud_init_diagnostics=unavailable_phase_budget\n' >&2
+    return 0
+  fi
+  if (( diagnostic_budget > 5 )); then diagnostic_budget=5; fi
+  # This is a read-only observation after failure, not a readiness retry.
+  if timeout --kill-after=1s "${diagnostic_budget}s" ssh "$@" "$target" '
+    for record in /run/cloud-init/status.json /run/cloud-init/result.json; do
+      printf "cloud_init_record=%s\n" "$record"
+      if test -f "$record"; then head -c 4096 "$record"; else echo unavailable; fi
+      printf "\n"
+    done
+    systemctl show cloud-init-local.service cloud-init.service cloud-init-network.service cloud-init-main.service cloud-config.service cloud-final.service ssh.service sshd.service \
+      --property=Id,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,ActiveEnterTimestamp,InactiveEnterTimestamp --no-pager
+    sudo -n journalctl --boot --unit=cloud-init-local.service --unit=cloud-init.service --unit=cloud-init-network.service --unit=cloud-init-main.service \
+      --unit=cloud-config.service --unit=cloud-final.service --unit=ssh.service --unit=sshd.service \
+      --lines=80 --no-pager --output=short-iso --quiet
+  ' 2>&1 | head -c 16384 >&2; then
+    diagnostic_rc=0
+  else
+    diagnostic_rc=$?
+  fi
+  printf '\ncloud_init_diagnostics_ended_utc=%s diagnostic_exit=%s\n' \
+    "$(date -u +%FT%TZ)" "$diagnostic_rc" >&2
+}
+
 # cloud-init's status command reads these same runtime records. Read them from
 # the controller so a crash in the guest's Python status CLI cannot block OMG
 # coverage after the boot stages themselves have finished.
-if ! status=$(timeout --kill-after=5s 180s ssh "$@" "$target" '
+start_phase status
+if status=$(timeout --kill-after=5s 180s ssh "$@" "$target" '
   until test -f /run/cloud-init/result.json; do
     if systemctl is-failed --quiet cloud-final.service; then
       echo "cloud-final.service failed before publishing result.json" >&2
@@ -17,7 +62,13 @@ if ! status=$(timeout --kill-after=5s 180s ssh "$@" "$target" '
   done
   cat /run/cloud-init/status.json
 '); then
-  echo 'cloud-init did not publish complete status within 180 seconds' >&2
+  observe_phase status 0
+else
+  status_rc=$?
+  observe_phase status "$status_rc"
+  printf 'cloud-init status observation failed; child exit=%s (deadline=180 seconds)\n' "$status_rc" >&2
+  head -c 4096 <<< "$status" >&2
+  collect_failed_guest_state "$@"
   exit 1
 fi
 
@@ -35,11 +86,13 @@ if ! jq -e '
     (($entry | has("recoverable_errors") | not) or ($entry.recoverable_errors == {})))
 ' <<< "$status" >/dev/null; then
   echo 'cloud-init status is incomplete, errored, or degraded:' >&2
-  printf '%s\n' "$status" | head -c 4096 >&2
+  head -c 4096 <<< "$status" >&2
+  collect_failed_guest_state "$@"
   exit 1
 fi
 
-timeout --kill-after=5s 60s ssh "$@" "$target" '
+start_phase target
+if timeout --kill-after=5s 60s ssh "$@" "$target" '
   until systemctl is-active --quiet cloud-init.target; do
     for unit in cloud-init-local.service cloud-init-network.service cloud-init-main.service cloud-config.service cloud-final.service; do
       if systemctl is-failed --quiet "$unit"; then
@@ -55,5 +108,12 @@ timeout --kill-after=5s 60s ssh "$@" "$target" '
       exit 1
     fi
   done
-'
+'; then
+  observe_phase target 0
+else
+  target_rc=$?
+  observe_phase target "$target_rc"
+  collect_failed_guest_state "$@"
+  exit "$target_rc"
+fi
 echo 'cloud-init stages, status, and systemd target verified'

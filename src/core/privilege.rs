@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Privileged command lookup never consults the invoking user's PATH.
 pub const SYSTEM_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// Resolve an executable whose file and every ancestor are controlled by root.
+/// Resolve a canonical executable path whose file and every ancestor are controlled by root.
 /// Canonicalization permits the standard /bin -> /usr/bin merged layout.
-pub fn trusted_program(program: &str) -> anyhow::Result<std::path::PathBuf> {
+pub fn root_controlled_program_path(program: &str) -> anyhow::Result<std::path::PathBuf> {
     let input = std::path::Path::new(program);
     let candidates = if input.is_absolute() {
         vec![input.to_path_buf()]
@@ -60,7 +60,7 @@ fn trusted_executable_path(path: &std::path::Path) -> anyhow::Result<std::path::
 }
 
 pub fn system_command(program: &str) -> anyhow::Result<std::process::Command> {
-    let mut command = std::process::Command::new(trusted_program(program)?);
+    let mut command = std::process::Command::new(root_controlled_program_path(program)?);
     command.env("PATH", SYSTEM_PATH);
     for name in PRIVILEGED_ENV_SCRUB {
         command.env_remove(name);
@@ -401,7 +401,7 @@ pub async fn run_privileged_program(program: &str, args: &[&str]) -> anyhow::Res
     }) {
         crate::core::security::policy::require_native_plan_support(program)?;
     }
-    let program_path = trusted_program(program)?;
+    let program_path = root_controlled_program_path(program)?;
 
     // Pre-flight: validate/refresh credentials WITHOUT running the payload,
     // so a password requirement is detected before any partial work.
@@ -761,7 +761,13 @@ async fn sudo_payload_status(args: &[&str]) -> anyhow::Result<std::process::Exit
     if let Some(policy) = &policy {
         args.insert(0, policy);
     }
-    sudo_payload_status_in(&trusted_program("sudo")?, exe, is_test_mode, &args).await
+    sudo_payload_status_in(
+        &root_controlled_program_path("sudo")?,
+        exe,
+        is_test_mode,
+        &args,
+    )
+    .await
 }
 
 /// Privileged re-exec verbs that are not clap user commands. `update --fast`

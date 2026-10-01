@@ -464,6 +464,23 @@ case "$1" in
     printf '%s\n' "$work" > "$FAKE_QEMU_STATE"
     printf 'fixture-controller\n' ;;
   exec)
+      if [[ "${!#}" == 'sudo -n unshare --mount --propagation private python3 - --binary '* ]]; then
+        cat >/dev/null
+        [[ ${FAKE_QEMU_BACKEND_RECEIPT:-valid} != missing ]] || exit 0
+        receipt=$(jq -n '
+          {schema_version:1,distro:"arch",fixture_distro:"fedora",complete:true,failure_kind:"none",
+           db_before:("a" * 64),db_after:("a" * 64),omgd_state_created:false} |
+          reduce ["doctor","info","search","status","explicit_count","install_dry_run",
+                  "remove_dry_run","update_check","clean_dry_run","dash","omgd"][] as $name
+            (.; .[$name + "_exit"]=1 | .[$name + "_mismatch"]=true | .[$name + "_native_db_access"]=false)')
+        case ${FAKE_QEMU_BACKEND_RECEIPT:-valid} in
+          valid) printf '%s\n' "$receipt" ;;
+          invalid) jq '.doctor_mismatch=false' <<< "$receipt" ;;
+          product) jq '.complete=false | .failure_kind="product"' <<< "$receipt"; exit 1 ;;
+          *) exit 99 ;;
+        esac
+        exit 0
+      fi
       if [[ "${!#}" == collect ]]; then
         cat >/dev/null
         [[ "${FAKE_QEMU_HEALTH_MISSING:-0}" == 0 ]] || exit 1
@@ -650,6 +667,21 @@ for scenario in missing PASS FAIL HARNESS_ERROR BLOCKED SKIPPED partial mixed in
   assert_rc "$expected_rc" "$qemu_runner" --distro arch --release v9.9.9 --staged-dir "$scratch/valid" --inventory-tiers hermetic --evidence-dir "$scratch/qemu-inventory-$scenario"
   unset FAKE_INVENTORY_SHAPE
 done
+export FAKE_INVENTORY_RESULT=PASS
+for backend_receipt in missing invalid product; do
+  export FAKE_QEMU_BACKEND_RECEIPT="$backend_receipt"
+  expected_rc=120 expected_result=HARNESS_ERROR
+  if [[ "$backend_receipt" == product ]]; then expected_rc=1 expected_result=FAIL; fi
+  evidence="$scratch/qemu-backend-receipt-$backend_receipt"
+  assert_rc "$expected_rc" "$qemu_runner" --distro arch --release v9.9.9 --staged-dir "$scratch/valid" \
+    --inventory-tiers hermetic --evidence-dir "$evidence"
+  qemu_result=$(results_file "$evidence")
+  work=${qemu_result%/results.json}
+  jq -e --arg result "$expected_result" \
+    'any(.[]; .case_id=="qemu-arch-backend-mismatch" and .result==$result)' \
+    "$work/backend-mismatch-results.json" >/dev/null || fail 'backend receipt failure lost its verdict'
+done
+unset FAKE_QEMU_BACKEND_RECEIPT FAKE_INVENTORY_RESULT
 printf 'case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup\nfirst\t["status"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop\nsecond\t["info","bash"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop\n' > "$scratch/policy-cases.tsv"
 policy_digest=$(sha256sum "$scratch/policy-cases.tsv" | cut -d ' ' -f 1)
 mkdir "$scratch/inventory-policy.d"

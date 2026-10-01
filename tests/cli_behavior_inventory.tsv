@@ -34,12 +34,12 @@ hooks-run	["hooks","run","pre-commit"]	controlled-error	0	pass	hooks-install	her
 hooks-uninstall	["hooks","uninstall"]	isolated-write	0	pass	hooks-install	hermetic	hermetic:pass	hooks-absent	tempdir-drop
 workspace-init	["workspace","init","smoke"]	isolated-write	0	pass	-	hermetic	hermetic:pass	workspace-initialized	tempdir-drop
 workspace-add	["workspace","add",".","--name","fixture"]	isolated-write	0	pass	workspace-init	hermetic	hermetic:pass	workspace-project-added	tempdir-drop
-workspace-list	["workspace","list"]	read	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
-workspace-run	["workspace","run","true"]	read	1	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
+workspace-list	["workspace","list"]	read	0	pass	workspace-add	hermetic	hermetic:pass	workspace-project-listed	tempdir-drop
+workspace-run	["workspace","run","true"]	read	1	pass	workspace-add	hermetic	hermetic:pass	workspace-missing-task	tempdir-drop
 workspace-diff	["workspace","diff","main"]	read	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
-workspace-check	["workspace","check"]	read	1	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
+workspace-check	["workspace","check"]	read	1	pass	workspace-add	hermetic	hermetic:pass	workspace-missing-lock	tempdir-drop
 workspace-status	["workspace","status"]	read	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
-workspace-remove	["workspace","remove","fixture"]	isolated-write	0	pass	workspace-add	hermetic	hermetic:pass	-	tempdir-drop
+workspace-remove	["workspace","remove","fixture"]	isolated-write	0	pass	workspace-add	hermetic	hermetic:pass	workspace-project-removed	tempdir-drop
 hook-env	["hook-env","--shell","bash"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 daemon	["daemon","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 config	["config"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -55,7 +55,7 @@ privacy-status	["privacy","status"]	read	0	pass	privacy-opt-out	hermetic	hermeti
 privacy-export	["privacy","export","--output","${ROOT}/privacy.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	artifact:privacy.json	tempdir-drop
 privacy-opt-in	["privacy","opt-in"]	isolated-write	0	pass	privacy-opt-out	hermetic	hermetic:pass	privacy-opted-in	tempdir-drop
 privacy-status-enabled	["privacy","status"]	read	0	pass	privacy-opt-in	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	privacy-status-enabled	tempdir-drop
-generate-man	["generate-man","--output","${ROOT}/man"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+generate-man	["generate-man","--output","${ROOT}/man"]	isolated-write	0	pass	-	hermetic	hermetic:pass	man-pages-generated	tempdir-drop
 daemon-status	["daemon-status"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 completions	["completions","bash","--stdout"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 complete	["complete","--shell","bash","--current","se","--last","omg"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -76,7 +76,7 @@ audit-slsa	["audit","slsa","${ROOT}/project/README.md"]	controlled-error	2	pass	
 audit-slsa-identity	["audit","slsa","--certificate-identity","dev@example.invalid","${ROOT}/project/README.md"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 audit-licenses	["audit","licenses","--format","json"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-audit-json	tempdir-drop
 audit-fix	["audit","fix","--dry-run"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
-audit-export	["audit","export","--output","${ROOT}/audit-evidence"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit-export	["audit","export","--output","${ROOT}/audit-evidence"]	isolated-write	1	pass	-	hermetic	hermetic:pass	audit-export-absolute-refusal	tempdir-drop
 audit-eol	["audit","eol"]	read	0	pass	-	hermetic	hermetic:pass	audit-eol-state	tempdir-drop
 run	["run","smoke","--using","make"]	read	0	pass	-	hermetic	hermetic:pass	task-executed	tempdir-drop
 new	["new","rust","smoke-app"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -98,9 +98,9 @@ team-pull	["team","pull"]	isolated-write	0	pass	team-push	hermetic	hermetic:pass
 team-members	["team","members"]	read	1	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 team-dashboard	["team","dashboard","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 team-roles-list	["team","roles","list"]	read	0	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
-team-golden-create	["team","golden-path","create","smoke"]	isolated-write	0	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
-team-golden-list	["team","golden-path","list"]	read	0	pass	team-golden-create	hermetic	hermetic:pass	-	tempdir-drop
-team-golden-delete	["team","golden-path","delete","smoke"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	-	tempdir-drop
+team-golden-create	["team","golden-path","create","smoke"]	isolated-write	0	pass	team-init	hermetic	hermetic:pass	golden-path-created	tempdir-drop
+team-golden-list	["team","golden-path","list"]	read	0	pass	team-golden-create	hermetic	hermetic:pass	golden-path-listed	tempdir-drop
+team-golden-delete	["team","golden-path","delete","smoke"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	golden-path-deleted	tempdir-drop
 team-compliance	["team","compliance"]	read	0	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 team-activity	["team","activity","--days","1"]	read	1	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 container-status	["container","status"]	read	arch:1,debian:1,ubuntu:1,fedora:0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -112,7 +112,7 @@ container-images	["container","images"]	read	arch:1,debian:1,ubuntu:1,fedora:0	p
 container-pull	["container","pull","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 container-stop	["container","stop","missing"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 container-exec	["container","exec","missing","--","true"]	controlled-error	arch:1,debian:1,ubuntu:1,fedora:125	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-container-init	["container","init","--base","debian:bookworm"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+container-init	["container","init","--base","debian:bookworm"]	isolated-write	0	pass	-	hermetic	hermetic:pass	container-init-scaffold	tempdir-drop
 account-link	["account","link","--help"]	help-boundary	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 account-link-stdin	["account","link","--token-stdin"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 account-status	["account","status"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -120,7 +120,7 @@ account-unlink	["account","unlink"]	isolated-write	0	pass	-	hermetic	hermetic:pa
 fleet-status	["fleet","status"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 enterprise-reports	["enterprise","reports"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 enterprise-policy-show	["enterprise","policy","show"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-enterprise-audit-export	["enterprise","audit-export","--output","${ROOT}/enterprise-evidence"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+enterprise-audit-export	["enterprise","audit-export","--output","${ROOT}/enterprise-evidence"]	controlled-error	1	pass	-	hermetic	hermetic:pass	audit-export-absolute-refusal	tempdir-drop
 enterprise-license-scan	["enterprise","license-scan"]	controlled-error	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-enterprise-text	tempdir-drop
 history	["history","--limit","3"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 rollback	["rollback"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -157,19 +157,19 @@ workspace-run-flags	["workspace","run","--parallel","--filter","fixture","--yes"
 workspace-run-parallel-all	["workspace","run","--parallel","--yes","overlap"]	read	0	pass	workspace-add-second	hermetic	hermetic:pass	workspace-all-output	tempdir-drop
 workspace-run-sequential-all	["workspace","run","--yes","smoke"]	read	0	pass	workspace-add-second	hermetic	hermetic:pass	workspace-all-output	tempdir-drop
 complete-full	["complete","--shell","bash","--current","se","--last","omg","--full","omg se"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-audit-log-flags	["audit","log","--limit","3","--severity","error","--export","${ROOT}/audit-log-export.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit-log-flags	["audit","log","--limit","3","--severity","error","--export","${ROOT}/audit-log-export.json"]	isolated-write	0	pass	-	hermetic	hermetic:pass	audit-log-filtered-export	tempdir-drop
 audit-licenses-filter-policy	["audit","licenses","--format","json","--filter","mit","--check-policy"]	read	1	pass	-	hermetic	hermetic:pass	license-audit-mit-json	tempdir-drop
 audit-licenses-export	["audit","licenses","--format","csv","--export","${ROOT}/licenses-export.csv"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-audit-csv	tempdir-drop
 audit-fix-flags	["audit","fix","--dry-run","--yes","--min-severity","high"]	read	1	pass	-	hermetic	hermetic:pass	audit-fix-refusal	tempdir-drop
-audit-export-flags	["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]	isolated-write	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+audit-export-flags	["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]	isolated-write	1	pass	-	hermetic	hermetic:pass	audit-export-absolute-refusal	tempdir-drop
 run-parallel	["run","--parallel","parallel-one,parallel-two"]	read	0	pass	-	hermetic	hermetic:pass	parallel-tasks-executed	tempdir-drop
 run-all	["run","--all","smoke"]	read	0	pass	-	hermetic	hermetic:pass	all-tasks-executed	tempdir-drop
-team-golden-create-flags	["team","golden-path","create","flagged","--node","20","--python","3.12","--packages","ripgrep"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	-	tempdir-drop
-team-compliance-export	["team","compliance","--export","${ROOT}/compliance.json"]	controlled-error	1	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
+team-golden-create-flags	["team","golden-path","create","flagged","--node","20","--python","3.12","--packages","ripgrep"]	isolated-write	0	pass	team-golden-list	hermetic	hermetic:pass	golden-path-flags	tempdir-drop
+team-compliance-export	["team","compliance","--export","${ROOT}/compliance.json"]	controlled-error	1	pass	team-init	hermetic	hermetic:pass	team-compliance-no-report	tempdir-drop
 team-compliance-enforce	["team","compliance","--enforce"]	read	0	pass	team-init	hermetic	hermetic:pass	-	tempdir-drop
 enterprise-reports-type	["enterprise","reports","--report-type","quarterly"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 enterprise-policy-scope	["enterprise","policy","show","--scope","global"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-enterprise-audit-export-flags	["enterprise","audit-export","--framework","iso27001","--period","2025-Q1","--output","./enterprise-evidence-flags"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+enterprise-audit-export-flags	["enterprise","audit-export","--framework","iso27001","--period","2025-Q1","--output","./enterprise-evidence-flags"]	isolated-write	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	enterprise-audit-export-evidence	tempdir-drop
 enterprise-license-scan-export	["enterprise","license-scan","--export","json"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	license-enterprise-json	tempdir-drop
 history-flags	["history","--limit","3","--search","pacman","--type","install","--from","2024-01-01","--to","2026-12-31"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 rollback-yes	["rollback","--yes"]	controlled-error	1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -184,18 +184,20 @@ update-fast	["update","--fast","--yes"]	package-mutation	0	pass	-	container	arch
 doctor-network	["doctor","--network"]	controlled-error	1	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-network-state	tempdir-drop
 doctor-eol	["doctor","--eol"]	controlled-error	1	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-eol-state	tempdir-drop
 doctor-turbo	["doctor","--turbo"]	read	-	declared	-	qemu	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
-run-watch	["run","--watch","smoke"]	interactive	-	declared	-	pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
+run-watch	["run","--watch","smoke"]	isolated-write	0	pass	-	container,pty	arch:pass,debian:pass,ubuntu:pass,fedora:pass	watch-task-rerun	tempdir-drop
 env-share-flags	["env","share","--public","--description","Probe Gist"]	service-mutation	-	declared	-	network,credentialed	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
 env-share-missing-lock	["env","share"]	controlled-error	1	pass	-	hermetic	hermetic:pass	env-share-missing-lock	tempdir-drop
 self-update-force	["self-update","--force"]	service-mutation	-	declared	-	network	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	host-state-restore
 self-update-version	["self-update","--version","0.0.1"]	controlled-error	1	pass	-	hermetic	hermetic:pass	self-update-downgrade-refusal	tempdir-drop
 container-run-detached-argv	["container","run","--name","smoke","--detach","--env","SMOKE=1","--volume","${ROOT}:/tmp/omg-smoke","--workdir","/tmp/omg-smoke","debian:bookworm","--","sh","-c","printf smoke"]	isolated-write	0	pass	-	hermetic	hermetic:pass	container-run-argv	tempdir-drop
+container-shell-argv	["container","shell","--image","debian:bookworm","--workdir","/tmp","--env","SMOKE=1","--volume","${ROOT}:/tmp/omg-smoke"]	isolated-write	0	pass	-	hermetic	hermetic:pass	container-shell-argv	tempdir-drop
+container-build-argv	["container","build","--dockerfile","Dockerfile","--tag","smoke:latest","--no-cache","--build-arg","SMOKE=1","--target","dev"]	isolated-write	0	pass	-	hermetic	hermetic:pass	container-build-argv	tempdir-drop
 container-run-detached	["container","run","--name","smoke","--detach","--env","SMOKE=1","--volume","/tmp:/tmp","--workdir","/tmp","debian:bookworm"]	service-mutation	-	declared	-	nested-container	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
 container-run-interactive	["container","run","--interactive","--name","smoke-tty","debian:bookworm"]	interactive	-	declared	-	nested-container,pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
 container-shell-flags	["container","shell","--image","debian:bookworm","--workdir","/tmp","--env","SMOKE=1","--volume","/tmp:/tmp"]	interactive	-	declared	-	nested-container,pty	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
-container-build-flags	["container","build","--dockerfile","Dockerfile","--tag","smoke:latest","--no-cache","--build-arg","SMOKE=1","--target","dev"]	service-mutation	-	declared	-	nested-container	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
+container-build-flags	["container","build","--dockerfile","Dockerfile.nested","--tag","smoke:nested","--no-cache","--build-arg","SMOKE=1","--target","dev"]	service-mutation	-	declared	-	nested-container	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	container-prune
 clean-yes	["clean","--all","--dry-run","--yes"]	read	arch:0,debian:1,ubuntu:1,fedora:0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
-install-review	["install","--review","--dry-run","pacman"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
+install-review	["install","--review","--dry-run","bash"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 update-review	["update","--check","--review"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 update-no-sync	["update","--check","--no-sync"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 update-aur-only	["update","--check","--aur-only"]	read	arch:0,debian:1,ubuntu:1,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop
@@ -212,3 +214,4 @@ runtime-go-list-installed	["list","go","--json"]	read	0	pass	-	container	arch:pa
 runtime-node-switch-installed	["use","node","v24.21.0"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop
 runtime-python-switch-installed	["use","python","v3.12.14"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop
 runtime-go-switch-installed	["use","go","v1.27.1"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop
+runtime-rust-install	["use","rust","1.85.0"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-rust-installed	tempdir-drop

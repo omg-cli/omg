@@ -18,27 +18,33 @@ class RequiredResultsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, QUICK_GATE="success", BUILD_REQUIRED=required,
                        PORTABLE="success", LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
-                       FEATURE_INTERSECTIONS="success", MACOS="success", UBUNTU="success",
-                       DOCS_AUDIT="success",
+                       FEATURE_INTERSECTIONS="success", MACOS="success", MACOS_NEXTEST_SOURCE="success", UBUNTU="success",
+                       DOCS_AUDIT="success", RUNTIME_USAGE="success",
                        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"))
-            env.update(overrides or {})
+            for key, value in (overrides or {}).items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
             bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
             return subprocess.run([bash, "-c", script], env=env, capture_output=True, text=True, timeout=15)
 
     def test_required_job_skips_fail(self):
-        for job in ("PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "UBUNTU"):
+        for job in ("PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE"):
             with self.subTest(job=job):
                 self.assertNotEqual(self.evaluate("true", {job: "skipped"}).returncode, 0)
 
     def test_docs_only_skips_pass(self):
-        jobs = ("PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "UBUNTU")
+        jobs = ("PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE")
         self.assertEqual(self.evaluate("false", {job: "skipped" for job in jobs}).returncode, 0)
 
     def test_all_success_passes_and_failure_never_does(self):
         self.assertEqual(self.evaluate("true").returncode, 0)
         for required in ("true", "false"):
             for state in ("failure", "cancelled", ""):
-                self.assertNotEqual(self.evaluate(required, {"PORTABLE": state}).returncode, 0)
+                for job in ("PORTABLE", "RUNTIME_USAGE"):
+                    with self.subTest(required=required, state=state, job=job):
+                        self.assertNotEqual(self.evaluate(required, {job: state}).returncode, 0)
 
     def test_docs_audit_failure_always_fails_the_gate(self):
         for required in ("true", "false"):
@@ -47,6 +53,20 @@ class RequiredResultsTests(unittest.TestCase):
                     self.assertNotEqual(
                         self.evaluate(required, {"DOCS_AUDIT": state}).returncode, 0
                     )
+
+    def test_native_nextest_source_proof_is_required_without_a_docs_positive(self):
+        for required in ("true", "false"):
+            for state in ("failure", "cancelled", "", None):
+                with self.subTest(required=required, state=state):
+                    self.assertNotEqual(
+                        self.evaluate(required, {"MACOS_NEXTEST_SOURCE": state}).returncode, 0
+                    )
+        self.assertNotEqual(
+            self.evaluate("true", {"MACOS_NEXTEST_SOURCE": "skipped"}).returncode, 0
+        )
+        self.assertEqual(
+            self.evaluate("false", {"MACOS_NEXTEST_SOURCE": "skipped"}).returncode, 0
+        )
 
     def test_binary_unit_targets_in_every_unit_lane(self):
         text = CI_YML.read_text(encoding="utf-8")

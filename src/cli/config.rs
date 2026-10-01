@@ -219,11 +219,11 @@ pub fn validate() -> Result<()> {
         }
         Err(e) => {
             println!(
-                "  {} Failed to load configuration: {}",
+                "  {} Failed to load configuration: {:#}",
                 style::error("✗"),
                 e
             );
-            issues += 1;
+            return Err(e).context("Configuration validation failed");
         }
     }
 

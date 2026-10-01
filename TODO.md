@@ -282,14 +282,19 @@ No issue or PR on omg-cli/omg tracks any of these as of 2026-09-29.
 
 ### Critical
 
-- [ ] `require_pgp` is satisfied without any PGP evidence. `check_package` takes `grade` as a
-      parameter and only compares it to the floor (`src/core/security/policy.rs:317`); `check_source`
-      synthesizes `Verified` from `!is_aur` alone, with no signature consulted
-      (`src/core/security/policy.rs:284`). Live at `src/cli/packages/install.rs:25,41` and
-      `src/cli/packages/update/arch.rs:88`. An operator writing `require_pgp = true` gets a
-      non-AUR check, not signature enforcement. Docstring at `policy.rs:270-272` already concedes
-      "until a dedicated verification result exists". Fix: thread real verification evidence into
-      the grade. Interim: rename the flag to match its behavior so the config stops lying. verified
+- [ ] Grade APIs lack cryptographic receipts. Correction, 2026-09-30: `check_source`
+      derives a source grade, and `check_package` compares its supplied grade; neither carries
+      signature evidence (`src/core/security/policy.rs`). This does not describe the complete
+      install operation. `enforce_required_package_signature` in `alpm_ops.rs` adds PACKAGE and
+      removes PACKAGE_OPTIONAL and USE_DEFAULT when `require_pgp` is true. Repository and
+      default/local/remote transaction signature settings use it. AUR/local source prechecks
+      conservatively reject these inputs. Production `enforce_install_policy` scans vulnerabilities
+      and propagates scan failure under an explicit policy; only test mode skips that scan and
+      only absent-policy defaults permit its fallback. Prepared ALPM additions, including
+      dependencies, are also scanned and checked by `check_prepared_packages`. Native APT, DNF,
+      and Homebrew refuse explicit OMG policies. Keep the flag and enforcement unchanged.
+      Future grade receipt integration and isolated native signature proof remain open; the
+      earlier universal signature-bypass and vulnerable-official-package assurances were wrong.
 - [ ] Sigstore SignedEntryTimestamp canonicalization is validated only by `debug_assert!`, which is
       compiled out of release builds. `logID` and `body` come from Rekor JSON and are interpolated
       raw into a JSON template (`src/core/security/slsa.rs:353,357`). A `body` containing a quote
@@ -525,12 +530,15 @@ Verified against the crates.io API on 2026-09-29.
 - [ ] The QEMU matrix does block releases, transitively: `ci-success` needs `qemu`
       (`ci.yml:885,903,904,925`) and `release.yml:69,83` gates every build on the resulting ci.yml
       result. An earlier draft of this review claimed otherwise and was wrong. verified
-- [ ] Memory safety is compiler-enforced. Sixteen `unsafe` blocks exist, but only two are production
-      code: `src/bin/omg.rs:777` and `src/package_managers/debian_db/db.rs:336`. Fourteen are inside
-      `#[cfg(test)]`. There are zero `extern "C"` blocks and zero `asm!` macros in `src/`. Because
-      `unsafe_code = "warn"` and sites use `#[expect(unsafe_code)]`, an unsafe block without the
-      attribute fails the build, so sixteen is a complete inventory rather than a grep estimate.
-      verified
+- [ ] Unsafe source inventory is not a soundness proof. Correction, 2026-09-30: the earlier
+      dated inventory reported sixteen blocks, two in production, not compiler-proven safety.
+      Cargo sets `unsafe_code = "warn"`, not deny or forbid. An unannotated block warns unless
+      a command promotes warnings to errors, such as strict Clippy with `-D warnings`.
+      `#[expect(unsafe_code)]` acknowledges a diagnostic; it proves no safety contract.
+      `DebianMmapIndex::archive` relies on aligned, validated, owned bytes remaining
+      immutable. The pre-runtime signal call in `src/bin/omg.rs` has manual signal-disposition
+      obligations. Absence of extern/asm declarations in this crate does not audit ALPM, APT,
+      or other native dependencies. Review those invariants separately from lint success.
 - [ ] The install path's atomic publish was reviewed and holds: NOREPLACE on fresh publish and
       EXCHANGE on replace, a retired tree owned by a `TempDir` and never deleted at the version path,
       and `is_valid_version_dir` rejecting any directory still holding the install marker. flock is

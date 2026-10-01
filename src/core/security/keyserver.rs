@@ -274,7 +274,10 @@ fn gnupg_listing_contains_key(listing: &str, key_id: &str) -> bool {
 }
 
 fn gnupg_command(gnupg_home: &Path) -> Result<std::process::Command, KeyserverError> {
-    gnupg_command_with(gnupg_home, crate::core::privilege::trusted_program)
+    gnupg_command_with(
+        gnupg_home,
+        crate::core::privilege::root_controlled_program_path,
+    )
 }
 
 fn gnupg_command_with(
@@ -586,7 +589,7 @@ mod tests {
         // A PATH-visible GnuPG installation need not meet the hardened launcher
         // policy (for example, a user-owned package-manager installation).
         // Exercise the rejection contract instead of assuming it may execute.
-        if crate::core::privilege::trusted_program("gpg").is_err() {
+        if crate::core::privilege::root_controlled_program_path("gpg").is_err() {
             let error = import_key_into_gnupg(&certificate, home.path())
                 .expect_err("an untrusted GnuPG launcher must never import a key");
             assert!(

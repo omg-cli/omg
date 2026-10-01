@@ -481,9 +481,15 @@ class QemuCloudInitTests(unittest.TestCase):
     def test_guest_probe_runs_after_cloud_init_gate_and_keeps_failures_fatal(self) -> None:
         gate = 'bash /work/check-qemu-cloud-init.sh bench@127.0.0.1 "${opts[@]}"'
         probe = next(line for line in self.text.splitlines()
-                     if line.startswith("timeout 15 ssh ") and "os-release" in line)
+                     if line.startswith("if timeout ") and "os-release" in line)
         self.assertLess(self.text.index(gate), self.text.index(probe))
-        remote = shlex.split(probe)[-1]
+        command = probe.removeprefix("if ").removesuffix("; then :; else")
+        arguments = shlex.split(command)
+        self.assertEqual(arguments[:4], [
+            "timeout", "--kill-after=${BOOT_PHASE_KILL_GRACE}s",
+            "${BOOT_IDENTITY_TIMEOUT}s", "ssh",
+        ])
+        remote = arguments[-1]
         mocks = """
 cat() { printf 'guest-os\n'; }
 uname() { printf 'guest-kernel\n'; }
@@ -500,6 +506,22 @@ sudo() { printf 'sudo-ok\n'; return "$SUDO_STATUS"; }
                 self.assertIn("guest-os", result.stdout)
                 self.assertIn("guest-kernel", result.stdout)
                 self.assertIn("sudo-ok", result.stdout)
+        phase = self.text.split(probe, 1)[1].split("fi\n", 1)[0]
+        for status in (0, 1, 124):
+            with self.subTest(phase_status=status):
+                result = subprocess.run(
+                    [self.bash, "-c", """
+BOOT_PHASE_KILL_GRACE=2
+BOOT_IDENTITY_TIMEOUT=15
+opts=()
+timeout() { return "$PROBE_STATUS"; }
+""" + probe + phase + "fi\n"],
+                    env=dict(os.environ, PROBE_STATUS=str(status)),
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                if status:
+                    self.assertIn(f"Boot identity failed: exit={status}", result.stderr)
 
 
 class HeadlineResolutionTests(unittest.TestCase):

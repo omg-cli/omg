@@ -28,6 +28,10 @@ const REVERSE_DEPENDENCY_DISPLAY_LIMIT: usize = 20;
     )
 )]
 pub async fn run(package: &str, reverse: bool) -> Result<()> {
+    anyhow::ensure!(
+        crate::package_managers::resolve_backend()? != crate::package_managers::Backend::MacOS,
+        "Package dependency analysis is not implemented for Homebrew"
+    );
     crate::core::security::validate_package_name(package)?;
 
     #[cfg(feature = "fedora")]
@@ -477,10 +481,16 @@ mod tests {
         let error = run("tree", false)
             .await
             .expect_err("why requires a backend");
+        let expected = match crate::package_managers::resolve_backend() {
+            Ok(crate::package_managers::Backend::MacOS) => {
+                "Package dependency analysis is not implemented for Homebrew".to_string()
+            }
+            Err(error) => error.to_string(),
+            Ok(_) => "requires a supported package backend".to_string(),
+        };
         assert!(
-            error
-                .to_string()
-                .contains("requires a supported package backend")
+            error.to_string().contains(&expected),
+            "selected backend must fail with its own unsupported-operation cause: {error}"
         );
     }
 }

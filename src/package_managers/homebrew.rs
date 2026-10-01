@@ -1546,6 +1546,51 @@ mod tests {
         assert_eq!(packages[1].description, "");
     }
 
+    #[tokio::test]
+    async fn completion_catalog_includes_names_past_search_limit() -> Result<()> {
+        let formulas = (0..60)
+            .map(|index| FormulaInfo {
+                name: format!("formula-{index:02}"),
+                full_name: format!("formula-{index:02}"),
+                desc: String::new(),
+                homepage: None,
+                versions: FormulaVersions {
+                    stable: Some("1.0".to_string()),
+                    head: None,
+                    bottle: None,
+                },
+                installed: Vec::new(),
+            })
+            .collect();
+        let cache = HomebrewPackageManager::build_cache(
+            formulas,
+            vec![CaskInfo {
+                token: "deep-cask".to_string(),
+                full_token: "homebrew/cask/deep-cask".to_string(),
+                desc: None,
+                homepage: None,
+                version: Some("1.0".to_string()),
+            }],
+        );
+        let manager = HomebrewPackageManager::new();
+        *crate::core::sync::write_cache(&manager.cache) = Some(cache);
+
+        assert_eq!(manager.search("").await?.len(), 50);
+        let names: Vec<_> = manager
+            .package_index()
+            .await?
+            .into_iter()
+            .map(|package| package.name)
+            .collect();
+        assert_eq!(names.len(), 61);
+        assert!(names.iter().any(|name| name == "formula-59"));
+        assert!(names.iter().any(|name| name == "deep-cask"));
+        let matches =
+            crate::core::completion::CompletionEngine::new().fuzzy_match("formula-59", names);
+        assert!(matches.iter().any(|name| name == "formula-59"));
+        Ok(())
+    }
+
     #[test]
     fn formula_search_uses_local_cellar_for_installed_state() -> Result<()> {
         let root = tempfile::tempdir()?;

@@ -115,7 +115,6 @@ async fn refresh_daemon_index_after_sync() -> Result<()> {
 /// startup (or its last `RefreshIndex`), so probing before the refresh would
 /// present the user a stale pre-sync list. The injected futures exist so the
 /// ordering contract is testable; production passes the real IPC calls.
-#[cfg(any(feature = "debian", feature = "debian-pure", not(feature = "arch")))]
 async fn official_updates_after_sync<R, P>(
     pm: &dyn crate::package_managers::PackageManager,
     refresh_index: R,
@@ -138,9 +137,7 @@ where
 /// These backends have no AUR equivalent, so `check_only`, `dry_run`, and the
 /// confirmation prompt cover the entire decision tree.
 ///
-/// Compiled exactly when a consumer backend exists: the Debian module (under
-/// `debian`/`debian-pure`) or the generic module (when Arch is absent).
-#[cfg(any(feature = "debian", feature = "debian-pure", not(feature = "arch")))]
+/// Also used when an additive build selects Fedora or Homebrew.
 #[derive(Clone, Copy)]
 pub(crate) enum UpdateMode {
     Standard,
@@ -148,7 +145,6 @@ pub(crate) enum UpdateMode {
     Turbo,
 }
 
-#[cfg(any(feature = "debian", feature = "debian-pure", not(feature = "arch")))]
 #[expect(clippy::fn_params_excessive_bools)] // Maps to --check / --yes / --dry-run / --no-sync
 pub(crate) async fn update_official_only(
     check_only: bool,
@@ -273,7 +269,6 @@ pub(crate) async fn update_official_only(
 }
 
 /// Blocking terminal prompt moved off the async executor thread.
-#[cfg(any(feature = "debian", feature = "debian-pure", not(feature = "arch")))]
 async fn confirm_proceed_with_upgrade() -> Result<bool> {
     Ok(tokio::task::spawn_blocking(|| {
         dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
@@ -289,9 +284,7 @@ async fn confirm_proceed_with_upgrade() -> Result<bool> {
 ///
 /// Download sizes are unknown without resolving dependencies, so none are
 /// claimed.
-/// Compiled exactly when a consumer backend exists: the Debian module (under
-/// `debian`/`debian-pure`) or the generic module (when Arch is absent).
-#[cfg(any(feature = "debian", feature = "debian-pure", not(feature = "arch")))]
+/// Also used by Fedora and Homebrew when included in an additive build.
 pub(crate) fn update_official_only_dry_run(updates: &[UpdateInfo]) -> Result<()> {
     updates
         .iter()
@@ -334,7 +327,7 @@ async fn confirm_attended(prompt: String, yes: bool, action: &'static str) -> Re
 ///
 /// Fails closed on non-TTY so scripts must pass `--yes`.
 /// Only compiled where the cleanup call site in `clean.rs` is live.
-#[cfg(any(feature = "arch", not(feature = "debian-pure")))]
+#[cfg(any(feature = "arch", feature = "debian", not(feature = "debian-pure")))]
 pub(crate) async fn confirm_cleanup(yes: bool) -> Result<bool> {
     confirm_attended("Proceed with cleanup?".to_string(), yes, "cleanup").await
 }
@@ -354,7 +347,6 @@ pub(crate) async fn confirm_package_mutation(
 }
 
 /// Track removal requests around `PackageService::remove`.
-#[cfg(any(not(feature = "arch"), feature = "debian", feature = "debian-pure"))]
 pub(crate) async fn remove_via_service(packages: &[String]) -> Result<()> {
     let manager = crate::package_managers::get_package_manager()?;
     remove_with_manager(packages, manager).await

@@ -722,6 +722,17 @@ pub async fn download_sources(sources: Vec<SourceFile>, srcdest: &Path) -> Sourc
     SourceDownloadSummary { succeeded, failed }
 }
 
+fn public_source_client(host: &str, addresses: &[std::net::SocketAddr]) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .https_only(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_mins(1))
+        .resolve_to_addrs(host, addresses)
+        .build()?)
+}
+
 /// Resolve and pin public addresses on every hop. Disable ambient proxies and
 /// automatic redirects so neither DNS rebinding nor a redirect reaches the LAN.
 async fn fetch_public_source(value: &str) -> Result<reqwest::Response> {
@@ -754,13 +765,7 @@ async fn fetch_public_source(value: &str) -> Result<reqwest::Response> {
         // here because it covers the whole body download and aborts large
         // files; `.read_timeout()` only fires on stalled reads, matching
         // core::http::download_client.
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(std::time::Duration::from_mins(1))
-            .resolve_to_addrs(&host, &addresses)
-            .build()?;
+        let client = public_source_client(&host, &addresses)?;
         let response = client.get(url.clone()).send().await?;
         if !response.status().is_redirection() {
             return Ok(response);
@@ -991,6 +996,29 @@ mod public_source_tests {
             fetch_public_source("http://example.org/source")
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_transport_refuses_http_without_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = public_source_client("source.invalid", &[address]).unwrap();
+        let url = format!("http://source.invalid:{}/source", address.port());
+        let error = tokio::time::timeout(Duration::from_secs(1), client.get(&url).send())
+            .await
+            .expect("HTTP scheme refusal must precede network I/O")
+            .unwrap_err();
+        assert!(error.is_builder(), "{error}");
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "URL scheme is not allowed"
+        );
+        assert_eq!(error.url().unwrap().as_str(), url);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
         );
     }
 

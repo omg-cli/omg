@@ -219,8 +219,7 @@ impl CompletionEngine {
         Ok(suggestions)
     }
 
-    /// Get AUR package names from cache or refresh if needed
-    pub async fn get_aur_package_names(&self) -> Result<Vec<String>> {
+    pub(crate) fn cached_aur_package_names() -> Option<Vec<String>> {
         let cache = PersistedCompletionCache::load();
         if let Some(last_refresh) = cache
             .entries
@@ -231,8 +230,27 @@ impl CompletionEngine {
             if hours_since < 24 * 3600
                 && let Some(data) = cache.entries.get("aur_packages")
             {
-                return Ok(data.split(',').map(String::from).collect());
+                let names: Vec<_> = data
+                    .split(',')
+                    .take(MAX_AUR_COMPLETION_PACKAGES + 1)
+                    .map(String::from)
+                    .collect();
+                if names.len() <= MAX_AUR_COMPLETION_PACKAGES
+                    && names
+                        .iter()
+                        .all(|name| crate::core::security::validate_package_name(name).is_ok())
+                {
+                    return Some(names);
+                }
             }
+        }
+        None
+    }
+
+    /// Get AUR package names from cache or refresh if needed
+    pub async fn get_aur_package_names(&self) -> Result<Vec<String>> {
+        if let Some(names) = Self::cached_aur_package_names() {
+            return Ok(names);
         }
 
         // Refresh cache

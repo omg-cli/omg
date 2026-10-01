@@ -216,6 +216,125 @@ fn explicit_shortcut_uses_the_same_isolated_state_as_explicit_count() {
     }
 }
 
+#[cfg(feature = "arch")]
+#[test]
+fn mock_fedora_sync_does_not_start_aur_metadata_io() {
+    let project = TestProject::for_distro("fedora");
+    let aur_metadata = project.data_dir.path().join("cache/aur/_meta");
+    assert!(!aur_metadata.exists());
+
+    let result = project.run_with_env(&["sync"], &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "8")]);
+    result.assert_success();
+    assert!(
+        !aur_metadata.exists(),
+        "non-Arch sync created AUR metadata state at {}",
+        aur_metadata.display()
+    );
+    project.close_checked();
+}
+
+#[cfg(feature = "arch")]
+#[test]
+fn mock_arch_read_only_flags_keep_arch_semantics_without_native_access() {
+    let project = TestProject::for_distro("arch");
+    project.mock_install("bash", "5.2.0").unwrap();
+    let state = project.data_dir.path().join("mock_state_pacman.json");
+    let before = std::fs::read(&state).unwrap();
+
+    let removal = project.run(&["remove", "--recursive", "--yes", "--dry-run", "bash"]);
+    removal.assert_success();
+    assert!(removal.stdout.contains("bash"));
+    assert!(
+        removal
+            .stdout
+            .contains("Additional unneeded dependencies would also be removed"),
+        "recursive dry run omitted the dependency scope: {}",
+        removal.combined_output()
+    );
+
+    let update = project.run(&["update", "--check", "--aur-only"]);
+    update.assert_success();
+    assert!(
+        update.stdout.contains("AUR only"),
+        "AUR-only check did not retain its selected scope: {}",
+        update.combined_output()
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), before);
+    assert!(!project.data_dir.path().join("cache/aur/_meta").exists());
+    project.close_checked();
+}
+
+#[test]
+fn mock_clean_refuses_mutation_before_native_package_helpers() {
+    for distro in ["arch", "debian", "fedora"] {
+        let project = TestProject::for_distro(distro);
+        project.mock_install("fixture-package", "1.0.0").unwrap();
+        let backend = match distro {
+            "arch" => "pacman",
+            "fedora" => "dnf",
+            _ => "apt",
+        };
+        let state = project
+            .data_dir
+            .path()
+            .join(format!("mock_state_{backend}.json"));
+        let before = std::fs::read(&state).unwrap();
+
+        let cache = project.pacman_root.path().join("var/cache/pacman/pkg");
+        std::fs::create_dir_all(&cache).unwrap();
+        let older = cache.join("fixture-package-1.0-1-x86_64.pkg.tar.zst");
+        let newer = cache.join("fixture-package-2.0-1-x86_64.pkg.tar.zst");
+        std::fs::write(&older, b"older native cache archive").unwrap();
+        std::fs::write(&newer, b"newer native cache archive").unwrap();
+
+        for args in [
+            &["clean", "--cache", "--yes"][..],
+            &["clean", "--orphans", "--yes"][..],
+        ] {
+            let result = project.run(args);
+            result.assert_failure();
+            assert!(
+                result.stderr.contains("Mock cleanup cannot mutate native"),
+                "{distro}: wrong cleanup refusal: {}",
+                result.combined_output()
+            );
+            assert_eq!(std::fs::read(&state).unwrap(), before);
+            assert_eq!(
+                std::fs::read(&older).unwrap(),
+                b"older native cache archive"
+            );
+            assert_eq!(
+                std::fs::read(&newer).unwrap(),
+                b"newer native cache archive"
+            );
+        }
+
+        let preview = project.run(&["clean", "--all", "--dry-run"]);
+        if distro == "debian" {
+            preview.assert_failure();
+            assert!(
+                preview.stderr.contains("not supported on the APT backend"),
+                "{distro}: unsupported cleanup reported the wrong result: {}",
+                preview.combined_output()
+            );
+        } else {
+            preview.assert_success();
+            assert!(preview.stdout.contains("No changes made (dry run)"));
+            assert!(preview.stdout.contains("mock has no native archives"));
+        }
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        assert_eq!(
+            std::fs::read(&older).unwrap(),
+            b"older native cache archive"
+        );
+        assert_eq!(
+            std::fs::read(&newer).unwrap(),
+            b"newer native cache archive"
+        );
+        project.close_checked();
+    }
+}
+
 #[test]
 fn prompt_counters_preserve_exact_counts_with_global_flags_and_reject_extra_arguments() {
     let project = TestProject::new();
@@ -445,13 +564,32 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
     for (id, assertion) in [
         ("hooks-install", Assertion::HooksInstalled),
         ("hooks-install-force", Assertion::HooksInstalled),
+        ("workspace-run", Assertion::WorkspaceMissingTask),
+        ("workspace-check", Assertion::WorkspaceMissingLock),
+        ("audit-log-flags", Assertion::AuditLogFilteredExport),
         ("workspace-init", Assertion::WorkspaceInitialized),
         ("workspace-add", Assertion::WorkspaceProjectAdded),
+        ("workspace-list", Assertion::WorkspaceProjectListed),
+        ("workspace-remove", Assertion::WorkspaceProjectRemoved),
+        ("container-init", Assertion::ContainerInitScaffold),
         ("workspace-run-parallel-all", Assertion::WorkspaceAllOutput),
         ("update-fast", Assertion::UpdateFastOutput),
         ("update-turbo", Assertion::UpdateTurboOutput),
         ("daemon-foreground", Assertion::DaemonForegroundLifecycle),
         ("clean-orphans-native", Assertion::NativeAptOrphanRemoved),
+        ("generate-man", Assertion::ManPagesGenerated),
+        ("team-golden-create-flags", Assertion::GoldenPathFlags),
+        ("audit-export", Assertion::AuditExportAbsoluteRefusal),
+        ("audit-export-flags", Assertion::AuditExportAbsoluteRefusal),
+        (
+            "enterprise-audit-export",
+            Assertion::AuditExportAbsoluteRefusal,
+        ),
+        (
+            "enterprise-audit-export-flags",
+            Assertion::EnterpriseAuditExportEvidence,
+        ),
+        ("team-compliance-export", Assertion::TeamComplianceNoReport),
     ] {
         let case = cases
             .iter()
@@ -488,6 +626,21 @@ fn behavior_inventory_keeps_offline_refusal_assertions() {
     }
 }
 
+#[test]
+fn behavior_inventory_requires_native_rust_installation_proof() {
+    let cases = behavior_cases();
+    let case = cases
+        .iter()
+        .find(|case| case.id == "runtime-rust-install")
+        .expect("required native Rust installation case");
+    assert_eq!(case.args, ["use", "rust", "1.85.0"]);
+    assert_eq!(case.safety, Safety::IsolatedWrite);
+    assert_eq!(case.tiers, [Tier::Container]);
+    assert_eq!(case.assertions, [Assertion::RuntimeRustInstalled]);
+    assert_eq!(case.cleanup, Cleanup::TempdirDrop);
+    assert!(!case.runs_hermetically());
+}
+
 /// Rows that need their own empty project directory.
 ///
 /// The shared fixture captures an `omg.lock` (env-capture) and other state
@@ -504,6 +657,7 @@ fn needs_isolated_fixture(case: &BehaviorCase) -> bool {
             | "env-share-missing-lock"
             | "ci-init"
             | "ci-init-advanced"
+            | "enterprise-audit-export-flags"
     )
 }
 
@@ -720,10 +874,16 @@ enum Assertion {
     JsonStdout,
     Artifact(String),
     Fingerprint(String),
+    WorkspaceMissingTask,
+    WorkspaceMissingLock,
+    AuditLogFilteredExport,
     WorkspaceFilteredOutput,
     WorkspaceAllOutput,
     WorkspaceInitialized,
     WorkspaceProjectAdded,
+    WorkspaceProjectListed,
+    WorkspaceProjectRemoved,
+    ContainerInitScaffold,
     CiGithubWorkflow,
     CiGithubWorkflowAdvanced,
     PackageDryRunInstall,
@@ -741,6 +901,8 @@ enum Assertion {
     NativeAptTreeRollback,
     NativeAptOrphanRemoved,
     ContainerRunArgv,
+    ContainerShellArgv,
+    ContainerBuildArgv,
     SelfUpdateDowngradeRefusal,
     EnvShareMissingLock,
     DiffMissingLock,
@@ -759,6 +921,10 @@ enum Assertion {
     ConfigValidatePersisted,
     ConfigPathIsolated,
     ConfigResetDefaults,
+    GoldenPathCreated,
+    GoldenPathListed,
+    GoldenPathDeleted,
+    GoldenPathFlags,
     PrivacyOptedOut,
     PrivacyStatusDisabled,
     PrivacyOptedIn,
@@ -766,9 +932,15 @@ enum Assertion {
     RuntimeVersionRemoved,
     RuntimeListState,
     RuntimeSwitchState,
+    RuntimeRustInstalled,
     TaskExecuted,
+    WatchTaskRerun,
     ParallelTasksExecuted,
     AllTasksExecuted,
+    ManPagesGenerated,
+    AuditExportAbsoluteRefusal,
+    EnterpriseAuditExportEvidence,
+    TeamComplianceNoReport,
 }
 
 impl Assertion {
@@ -804,10 +976,16 @@ impl Assertion {
             "sbom-source-failure" => Self::SbomSourceFailure,
             "sbom-inventory-only" => Self::SbomInventoryOnly,
             "json-stdout" => Self::JsonStdout,
+            "workspace-missing-task" => Self::WorkspaceMissingTask,
+            "workspace-missing-lock" => Self::WorkspaceMissingLock,
+            "audit-log-filtered-export" => Self::AuditLogFilteredExport,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
             "workspace-initialized" => Self::WorkspaceInitialized,
             "workspace-project-added" => Self::WorkspaceProjectAdded,
+            "workspace-project-listed" => Self::WorkspaceProjectListed,
+            "workspace-project-removed" => Self::WorkspaceProjectRemoved,
+            "container-init-scaffold" => Self::ContainerInitScaffold,
             "ci-github-workflow" => Self::CiGithubWorkflow,
             "ci-github-workflow-advanced" => Self::CiGithubWorkflowAdvanced,
             "package-dry-run-install" => Self::PackageDryRunInstall,
@@ -825,6 +1003,8 @@ impl Assertion {
             "native-apt-tree-rollback" => Self::NativeAptTreeRollback,
             "native-apt-orphan-removed" => Self::NativeAptOrphanRemoved,
             "container-run-argv" => Self::ContainerRunArgv,
+            "container-shell-argv" => Self::ContainerShellArgv,
+            "container-build-argv" => Self::ContainerBuildArgv,
             "self-update-downgrade-refusal" => Self::SelfUpdateDowngradeRefusal,
             "env-share-missing-lock" => Self::EnvShareMissingLock,
             "diff-missing-lock" => Self::DiffMissingLock,
@@ -843,6 +1023,10 @@ impl Assertion {
             "config-validate-persisted" => Self::ConfigValidatePersisted,
             "config-path-isolated" => Self::ConfigPathIsolated,
             "config-reset-defaults" => Self::ConfigResetDefaults,
+            "golden-path-created" => Self::GoldenPathCreated,
+            "golden-path-listed" => Self::GoldenPathListed,
+            "golden-path-deleted" => Self::GoldenPathDeleted,
+            "golden-path-flags" => Self::GoldenPathFlags,
             "privacy-opted-out" => Self::PrivacyOptedOut,
             "privacy-status-disabled" => Self::PrivacyStatusDisabled,
             "privacy-opted-in" => Self::PrivacyOptedIn,
@@ -850,9 +1034,15 @@ impl Assertion {
             "runtime-version-removed" => Self::RuntimeVersionRemoved,
             "runtime-list-state" => Self::RuntimeListState,
             "runtime-switch-state" => Self::RuntimeSwitchState,
+            "runtime-rust-installed" => Self::RuntimeRustInstalled,
             "task-executed" => Self::TaskExecuted,
+            "watch-task-rerun" => Self::WatchTaskRerun,
             "parallel-tasks-executed" => Self::ParallelTasksExecuted,
             "all-tasks-executed" => Self::AllTasksExecuted,
+            "man-pages-generated" => Self::ManPagesGenerated,
+            "audit-export-absolute-refusal" => Self::AuditExportAbsoluteRefusal,
+            "enterprise-audit-export-evidence" => Self::EnterpriseAuditExportEvidence,
+            "team-compliance-no-report" => Self::TeamComplianceNoReport,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1436,6 +1626,279 @@ fn has_ansi(text: &str) -> bool {
     text.as_bytes().windows(2).any(|pair| pair == b"\x1b[")
 }
 
+fn parse_golden_path_document(text: &str) -> Option<toml::Value> {
+    toml::from_str(text).ok()
+}
+
+#[test]
+fn golden_path_document_parser_accepts_tables_and_refuses_malformed_input() {
+    let text = "[[templates]]\nname = \"smoke\"\npackages = []\ncreated_at = 1700000000\n[templates.runtimes]\n";
+    assert!(text.parse::<toml::Value>().is_err());
+    let document = parse_golden_path_document(text).expect("golden document");
+    assert_eq!(document["templates"].as_array().expect("array").len(), 1);
+    assert_eq!(document["templates"][0]["name"].as_str(), Some("smoke"));
+    assert!(parse_golden_path_document("[[templates]\nname = \"smoke\"").is_none());
+    assert!(parse_golden_path_document("templates = []\ntemplates = []").is_none());
+    let wrong_shape = parse_golden_path_document("templates = \"not an array\"")
+        .expect("valid TOML but wrong shape");
+    assert!(wrong_shape["templates"].as_array().is_none());
+}
+
+fn uses_golden_path_config(id: &str) -> bool {
+    matches!(
+        id,
+        "team-golden-create"
+            | "team-golden-list"
+            | "team-golden-delete"
+            | "team-golden-create-flags"
+    )
+}
+
+#[test]
+fn golden_path_flags_use_the_same_explicit_config_route() {
+    for case in behavior_cases() {
+        if case.assertions.iter().any(|assertion| {
+            matches!(
+                assertion,
+                Assertion::GoldenPathCreated
+                    | Assertion::GoldenPathListed
+                    | Assertion::GoldenPathDeleted
+                    | Assertion::GoldenPathFlags
+            )
+        }) {
+            assert!(
+                uses_golden_path_config(&case.id),
+                "{} omitted from explicit config route",
+                case.id
+            );
+        }
+    }
+    assert!(uses_golden_path_config("team-golden-create-flags"));
+    assert!(!uses_golden_path_config("team-init"));
+}
+
+#[test]
+#[serial]
+fn enterprise_inventory_repaired_rows_run_in_private_state() {
+    let golden = TestProject::for_distro("arch");
+    let config = golden.path().join("golden-path-state");
+    let config_text = config.to_str().expect("UTF-8 golden config");
+    for args in [
+        vec!["team", "golden-path", "create", "smoke"],
+        vec![
+            "team",
+            "golden-path",
+            "create",
+            "flagged",
+            "--node",
+            "20",
+            "--python",
+            "3.12",
+            "--packages",
+            "ripgrep",
+        ],
+    ] {
+        assert!(uses_golden_path_config(if args[3] == "smoke" {
+            "team-golden-create"
+        } else {
+            "team-golden-create-flags"
+        }));
+        golden
+            .run_with_env(&args, &[("OMG_CONFIG_DIR", config_text)])
+            .assert_success();
+    }
+    let document_text = std::fs::read_to_string(config.join("golden-paths.toml"))
+        .expect("persisted golden templates");
+    let document = parse_golden_path_document(&document_text).expect("valid golden TOML");
+    let templates = document["templates"].as_array().expect("templates array");
+    assert_eq!(templates.len(), 2);
+    let flagged = templates
+        .iter()
+        .find(|template| template["name"].as_str() == Some("flagged"))
+        .expect("flagged template");
+    assert_eq!(flagged["runtimes"]["node"].as_str(), Some("20"));
+    assert_eq!(flagged["runtimes"]["python"].as_str(), Some("3.12"));
+    assert_eq!(flagged["packages"].as_array().expect("packages").len(), 1);
+    assert_eq!(flagged["packages"][0].as_str(), Some("ripgrep"));
+
+    let audit = TestProject::for_distro("arch");
+    run_audit_log_oracle("prepare", audit.path());
+    let data = audit.path().join("audit-log-data");
+    let output = audit.path().join("audit-log-export.json");
+    let result = audit.run_with_env(
+        &[
+            "audit",
+            "log",
+            "--limit",
+            "3",
+            "--severity",
+            "error",
+            "--export",
+            output.to_str().expect("UTF-8 export"),
+        ],
+        &[("OMG_DATA_DIR", data.to_str().expect("UTF-8 audit data"))],
+    );
+    result.assert_success();
+    result.assert_stdout_contains("Export successful");
+    run_audit_log_oracle("check", audit.path());
+
+    let workspace = TestProject::for_distro("arch");
+    workspace.create_file("Makefile", "smoke:\n\t@echo smoke-task-ok\n");
+    workspace
+        .run(&["workspace", "init", "smoke"])
+        .assert_success();
+    workspace
+        .run(&["workspace", "add", ".", "--name", "fixture"])
+        .assert_success();
+    let before = ["omg-workspace.toml", "Makefile"]
+        .map(|name| std::fs::read(workspace.path().join(name)).expect("workspace baseline"));
+    let run = workspace.run_with_env(&["workspace", "run", "true"], &[("LC_ALL", "C")]);
+    assert_eq!(run.exit_code, 1, "{}", run.combined_output());
+    run.assert_stdout_contains("Task 'true' not found, trying 'make true'");
+    run.assert_stdout_contains("'omg run true' in '.' exited with code 1");
+    run.assert_stdout_contains("0 succeeded, 1 failed");
+    assert!(
+        run.stderr.contains("No rule to make target 'true'."),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("1 project(s) failed to run 'true'"),
+        "{}",
+        run.stderr
+    );
+    let check = workspace.run(&["workspace", "check"]);
+    assert_eq!(check.exit_code, 1, "{}", check.combined_output());
+    check.assert_stdout_contains("needs attention");
+    assert!(
+        check.stderr.contains("No omg.lock file found"),
+        "{}",
+        check.stderr
+    );
+    assert!(
+        check
+            .stderr
+            .contains("1 project(s) need attention, 0 failed to check (of 1 total)"),
+        "{}",
+        check.stderr
+    );
+    for (name, bytes) in ["omg-workspace.toml", "Makefile"].into_iter().zip(before) {
+        assert_eq!(
+            std::fs::read(workspace.path().join(name)).expect("unchanged workspace"),
+            bytes
+        );
+    }
+    assert!(std::fs::symlink_metadata(workspace.path().join("omg.lock")).is_err());
+}
+
+fn run_audit_log_oracle(mode: &str, root: &std::path::Path) {
+    let output = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/qemu-audit-log-oracle.py"
+        ))
+        .arg(mode)
+        .arg(root)
+        .output()
+        .expect("execute private audit log oracle");
+    assert!(
+        output.status.success(),
+        "audit log oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[serial]
+#[cfg(feature = "arch")]
+fn license_reports_preserve_unresolved_native_operands() {
+    let project = TestProject::for_distro("arch");
+    prepare_behavior_fixture(&project);
+    let metadata = project
+        .pacman_root
+        .path()
+        .join("var/lib/pacman/local/pacman-7.0.0-1/desc");
+    let original = std::fs::read_to_string(&metadata).unwrap();
+    let expression = "MIT AND LicenseRef-private";
+    std::fs::write(&metadata, original.replace("GPL-2.0-or-later", expression)).unwrap();
+    let result = project.run(&["audit", "licenses", "--format", "json"]);
+    result.assert_success();
+    let rows: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(
+        rows,
+        serde_json::json!([{
+            "name": "pacman", "version": "7.0.0-1", "license": expression,
+            "category": "Permissive", "unresolved_review": true
+        }])
+    );
+    let table = project.run(&["audit", "licenses"]);
+    table.assert_success();
+    table.assert_stdout_contains("Unresolved license review: 1");
+    table.assert_stdout_contains("[unresolved license review]");
+    let csv = project.run(&["audit", "licenses", "--format", "csv"]);
+    csv.assert_success();
+    csv.assert_stdout_contains("pacman,7.0.0-1,MIT AND LicenseRef-private,Permissive,true");
+    let enterprise = project.run(&["enterprise", "license-scan", "--export", "json"]);
+    enterprise.assert_success();
+    enterprise
+        .assert_stdout_contains("1 unresolved assignments; 0 packages without license metadata");
+    enterprise.assert_stdout_contains(
+        "MIT AND LicenseRef-private: 1 assignments (100%) [unresolved license review]",
+    );
+    let exports = std::fs::read_dir(project.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("license-scan-")
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exports.len(), 1);
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&exports[0]).unwrap()).unwrap();
+    assert_eq!(
+        report["unresolved_review"],
+        serde_json::json!([{"package": "pacman", "license": expression}])
+    );
+    assert_eq!(report["by_license"][expression], 1);
+}
+
+#[test]
+#[serial]
+fn legacy_security_configuration_refuses_cli_reads_and_writes_without_rewrites() {
+    let project = TestProject::new();
+    let config_path = project.config_dir.path().join("config.toml");
+    let policy_path = project.config_dir.path().join("policy.toml");
+    let config = "[security]\nallow_aur = false\n";
+    std::fs::write(&config_path, config).unwrap();
+    for policy in [None, Some("allow_aur = true\n")] {
+        if let Some(policy) = policy {
+            std::fs::write(&policy_path, policy).unwrap();
+        }
+        for args in [
+            vec!["config", "validate"],
+            vec!["config", "set", "telemetry.enabled", "false"],
+            vec!["audit", "policy"],
+        ] {
+            let result = project.run(&args);
+            result.assert_failure();
+            result.assert_stderr_contains("Manually migrate");
+            result.assert_stderr_contains("policy.toml");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), config);
+            if let Some(policy) = policy {
+                assert_eq!(std::fs::read_to_string(&policy_path).unwrap(), policy);
+            } else {
+                assert!(!policy_path.exists());
+            }
+        }
+    }
+}
+
 #[test]
 #[serial]
 #[cfg(feature = "arch")] // This inventory fixture explicitly seeds a pacman database.
@@ -1460,9 +1923,19 @@ fn behavior_inventory_runs_in_hermetic_state() {
     for (number, case) in behavior_cases().into_iter().enumerate() {
         // Missing-input probes must not inherit files written by earlier rows
         // such as env-capture. Keep the shared fixture for dependent cases.
-        let empty_environment =
-            needs_isolated_fixture(&case).then(|| TestProject::for_distro("arch"));
+        let empty_environment = (needs_isolated_fixture(&case) || case.id == "install-review")
+            .then(|| TestProject::for_distro("arch"));
         let project = empty_environment.as_ref().unwrap_or(&project);
+        if case.id == "install-review" {
+            project
+                .mock_install("bash", "5.2.37-1")
+                .expect("seed isolated review package inventory");
+        }
+        if case.id == "enterprise-audit-export-flags" {
+            project
+                .mock_install("pacman", "7.0.0-1")
+                .expect("seed explicit enterprise export package inventory");
+        }
         let root = project.path().to_string_lossy().into_owned();
         let expanded_args: Vec<String> = case
             .args
@@ -1558,8 +2031,11 @@ fn behavior_inventory_runs_in_hermetic_state() {
             case.id.as_str(),
             "privacy-opt-out" | "privacy-status" | "privacy-opt-in"
         );
+        let golden_path_case = uses_golden_path_config(&case.id);
         let config_dir = project.path().join(if privacy_case {
             "privacy-state"
+        } else if golden_path_case {
+            "golden-path-state"
         } else if case.id == "config-path" {
             "config-path-only"
         } else {
@@ -1578,7 +2054,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
         ];
-        if case.id.starts_with("config-") || privacy_case {
+        if case.id.starts_with("config-") || privacy_case || golden_path_case {
             command_env.push((
                 "OMG_CONFIG_DIR",
                 config_dir.to_str().expect("UTF-8 config path"),
@@ -1657,8 +2133,12 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .expect("seed isolated bash package");
             command_env.push(("OMG_DATA_DIR", path.to_str().expect("UTF-8 mock path")));
         }
-        let container_capture = (case.id == "container-run-detached-argv").then(|| {
-            let capture = project.create_dir("container-engine-capture");
+        let container_capture = matches!(
+            case.id.as_str(),
+            "container-run-detached-argv" | "container-shell-argv" | "container-build-argv"
+        )
+        .then(|| {
+            let capture = project.create_dir(&format!("container-engine-capture-{}", case.id));
             let podman = project.path().join("bin/podman");
             std::fs::write(
                 &podman,
@@ -1669,10 +2149,38 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .expect("make isolated container engine stub executable");
             capture
         });
+        if case.id == "container-build-argv" {
+            project.create_file("Dockerfile", "FROM scratch\n");
+        }
+        if case.id == "container-init" {
+            for name in [
+                ".dockerignore",
+                "Dockerfile.omg.dockerignore",
+                ".containerignore",
+            ] {
+                project.create_file(name, "!.env\n!secrets.key\n");
+            }
+        }
         if let Some(capture) = &container_capture {
             command_env.push((
                 "OMG_QEMU_ENGINE_CAPTURE",
                 capture.to_str().expect("UTF-8 container capture path"),
+            ));
+        }
+        let workspace_before = matches!(case.id.as_str(), "workspace-run" | "workspace-check")
+            .then(|| {
+                assert!(!project.path().join("omg.lock").exists());
+                ["omg-workspace.toml", "Makefile"].map(|name| {
+                    std::fs::read(project.path().join(name))
+                        .expect("read workspace failure baseline")
+                })
+            });
+        let audit_data = project.path().join("audit-log-data");
+        if case.id == "audit-log-flags" {
+            run_audit_log_oracle("prepare", project.path());
+            command_env.push((
+                "OMG_DATA_DIR",
+                audit_data.to_str().expect("UTF-8 audit fixture path"),
             ));
         }
         let started = Instant::now();
@@ -1729,6 +2237,124 @@ fn behavior_inventory_runs_in_hermetic_state() {
         };
         for assertion in &case.assertions {
             match assertion {
+                Assertion::AuditLogFilteredExport => {
+                    run_audit_log_oracle("check", project.path());
+                    if !result.stdout.lines().any(|line| line == "✓ Export successful") {
+                        issues.push("audit log export omitted its success receipt".to_string());
+                    }
+                }
+                Assertion::WorkspaceMissingTask | Assertion::WorkspaceMissingLock => {
+                    let unchanged = workspace_before.as_ref().is_some_and(|before| {
+                        ["omg-workspace.toml", "Makefile"].into_iter().zip(before).all(|(name, bytes)| {
+                            std::fs::read(project.path().join(name)).is_ok_and(|after| after == *bytes)
+                        })
+                    }) && std::fs::symlink_metadata(project.path().join("omg.lock")).is_err();
+                    let precise = if matches!(assertion, Assertion::WorkspaceMissingTask) {
+                        result.stdout.contains("→ Task 'true' not found, trying 'make true'...")
+                            && result.stdout.contains("  ✗ 'omg run true' in '.' exited with code 1")
+                            && result.stdout.lines().any(|line| line == "⚠ 0 succeeded, 1 failed")
+                            && result.stderr.lines().any(|line| line == "Error: 1 project(s) failed to run 'true'")
+                            && result.stderr.contains("No rule to make target 'true'.")
+                    } else {
+                        result.stdout.lines().any(|line| line == "  ⚠ needs attention")
+                            && result.stderr.lines().any(|line| line == "Error: No omg.lock file found")
+                            && result.stderr.lines().any(|line| line == "Error: 1 project(s) need attention, 0 failed to check (of 1 total)")
+                    };
+                    if !unchanged || !precise {
+                        issues.push("negative workspace row did not prove its intended failure and unchanged fixture".to_string());
+                    }
+                }
+                Assertion::GoldenPathFlags => {
+                    let stored = std::fs::read_to_string(config_dir.join("golden-paths.toml"))
+                        .ok()
+                        .and_then(|body| parse_golden_path_document(&body));
+                    let flagged = stored.as_ref().and_then(|document| document.get("templates"))
+                        .and_then(toml::Value::as_array)
+                        .and_then(|templates| templates.iter().find(|template| {
+                            template.get("name").and_then(toml::Value::as_str) == Some("flagged")
+                        }));
+                    let state_ok = flagged.is_some_and(|template| {
+                        template.get("runtimes").and_then(toml::Value::as_table)
+                            .is_some_and(|runtimes| {
+                                runtimes.len() == 2
+                                    && runtimes.get("node").and_then(toml::Value::as_str) == Some("20")
+                                    && runtimes.get("python").and_then(toml::Value::as_str) == Some("3.12")
+                            })
+                            && template.get("packages").and_then(toml::Value::as_array)
+                                .is_some_and(|packages| packages.len() == 1 && packages[0].as_str() == Some("ripgrep"))
+                    });
+                    if !state_ok || !result.stdout.contains("Golden path 'flagged' created!") {
+                        issues.push("golden path flags were not persisted".to_string());
+                    }
+                }
+                Assertion::GoldenPathCreated
+                | Assertion::GoldenPathListed
+                | Assertion::GoldenPathDeleted => {
+                    let stored = std::fs::read_to_string(config_dir.join("golden-paths.toml"))
+                        .ok()
+                        .and_then(|text| parse_golden_path_document(&text));
+                    let templates = stored
+                        .as_ref()
+                        .and_then(|value| value.get("templates"))
+                        .and_then(toml::Value::as_array);
+                    let shape_ok = stored
+                        .as_ref()
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|document| {
+                            document.len() == 1 && document.contains_key("templates")
+                        });
+                    let state_ok = match assertion {
+                        Assertion::GoldenPathDeleted => {
+                            shape_ok && templates.is_some_and(Vec::is_empty)
+                        }
+                        _ => {
+                            shape_ok
+                                && templates.is_some_and(|items| {
+                                    items.len() == 1
+                                        && items[0].as_table().is_some_and(|item| {
+                                            item.len() == 4
+                                                && item.get("name").and_then(toml::Value::as_str)
+                                                    == Some("smoke")
+                                                && item
+                                                    .get("runtimes")
+                                                    .and_then(toml::Value::as_table)
+                                                    .is_some_and(toml::map::Map::is_empty)
+                                                && item
+                                                    .get("packages")
+                                                    .and_then(toml::Value::as_array)
+                                                    .is_some_and(Vec::is_empty)
+                                                && item
+                                                    .get("created_at")
+                                                    .and_then(toml::Value::as_integer)
+                                                    .is_some_and(|timestamp| timestamp > 0)
+                                        })
+                                })
+                        }
+                    };
+                    let output_ok = match assertion {
+                        Assertion::GoldenPathCreated => {
+                            result.stdout.matches("Golden path 'smoke' created!").count() == 1
+                        }
+                        Assertion::GoldenPathListed => {
+                            result.stdout.matches("1 custom template(s)").count() == 1
+                                && result
+                                    .stdout
+                                    .matches("smoke - runtimes: [], packages: 0")
+                                    .count()
+                                    == 1
+                        }
+                        Assertion::GoldenPathDeleted => {
+                            result.stdout.matches("Deleted template 'smoke'").count() == 1
+                                && !result.stdout.contains("Template 'smoke' not found")
+                        }
+                        _ => unreachable!(),
+                    };
+                    if !state_ok || !output_ok {
+                        issues.push(format!(
+                            "golden path {assertion:?} lacks the expected private state or output"
+                        ));
+                    }
+                }
                 Assertion::TaskExecuted => {
                     if !std::fs::read_to_string(project.path().join("smoke-task.marker"))
                         .is_ok_and(|contents| contents == "omg-qemu-smoke-task")
@@ -1758,6 +2384,170 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         || !result.stdout.lines().any(|line| line == "npm-task-ok")
                     {
                         issues.push("run --all missed a Make or npm task".to_string());
+                    }
+                }
+                Assertion::ManPagesGenerated => {
+                    use std::collections::BTreeSet;
+
+                    fn collect_pages(command: &clap::Command, prefix: &str, pages: &mut BTreeSet<String>) {
+                        for subcommand in command.get_subcommands().filter(|cmd| !cmd.is_hide_set()) {
+                            let name = format!("{prefix}-{}", subcommand.get_name());
+                            pages.insert(format!("{name}.1"));
+                            collect_pages(subcommand, &name, pages);
+                        }
+                    }
+
+                    let man_dir = project.path().join("man");
+                    let pages = std::fs::read_dir(&man_dir)
+                        .ok()
+                        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>().ok());
+                    let command = Cli::command();
+                    let mut expected_pages = BTreeSet::from(["omg.1".to_string()]);
+                    collect_pages(&command, "omg", &mut expected_pages);
+                    let manifest_pages = include_str!("man_page_inventory.txt")
+                        .lines()
+                        .filter(|name| cfg!(feature = "license") || !name.starts_with("omg-account"))
+                        .map(str::to_string)
+                        .collect::<BTreeSet<_>>();
+                    if expected_pages != manifest_pages {
+                        issues.push("man page inventory differs from the Clap command tree".to_string());
+                    }
+                    let actual_pages = pages.as_ref().map(|entries| {
+                        entries
+                            .iter()
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .collect::<BTreeSet<_>>()
+                    });
+                    let only_real_pages = man_dir
+                        .symlink_metadata()
+                        .is_ok_and(|metadata| metadata.file_type().is_dir())
+                        && pages.as_ref().is_some_and(|entries| {
+                            entries.len() == expected_pages.len()
+                                && entries.iter().all(|entry| {
+                                    entry.file_type().is_ok_and(|kind| kind.is_file())
+                                        && entry.file_name().to_str().is_some_and(|name| {
+                                            name.starts_with("omg") && name.ends_with(".1")
+                                        })
+                                })
+                        })
+                        && actual_pages.as_ref() == Some(&expected_pages);
+                    let has_sections = expected_pages.iter().all(|name| {
+                        std::fs::read_to_string(man_dir.join(name)).is_ok_and(|page| {
+                            page.lines().any(|line| {
+                                line.starts_with(".TH ")
+                                    && (name != "omg.1"
+                                        || line.to_ascii_lowercase().contains("omg"))
+                            })
+                                && ["NAME", "SYNOPSIS"].iter().all(|section| {
+                                    page.lines().any(|line| {
+                                        line.strip_prefix(".SH ")
+                                            .is_some_and(|title| title.trim_matches('"') == *section)
+                                    })
+                                })
+                        })
+                    });
+                    let announced = result
+                        .stdout
+                        .lines()
+                        .filter_map(|line| {
+                            line.split_once("Generated ")?
+                                .1
+                                .strip_suffix(" man pages")?
+                                .parse::<usize>()
+                                .ok()
+                        })
+                        .collect::<Vec<_>>();
+                    if !only_real_pages || !has_sections
+                        || announced != vec![pages.as_ref().map_or(0, Vec::len)]
+                    {
+                        issues.push("generate-man did not create and count real man pages".to_string());
+                    }
+                }
+                Assertion::AuditExportAbsoluteRefusal => {
+                    let no_artifacts = ["audit-evidence", "audit-evidence-flags", "enterprise-evidence"]
+                        .iter()
+                        .all(|name| {
+                            project.path().join(name).symlink_metadata().is_err_and(|error| {
+                                error.kind() == std::io::ErrorKind::NotFound
+                            })
+                        });
+                    if !result.stderr.contains("Absolute paths not allowed")
+                        || result.stdout.contains("Audit evidence exported")
+                        || result.stdout.contains("Evidence exported to")
+                        || !no_artifacts
+                    {
+                        issues.push("absolute-path audit export did not refuse before writing".to_string());
+                    }
+                }
+                Assertion::EnterpriseAuditExportEvidence => {
+                    use std::collections::BTreeSet;
+
+                    let directory = project.path().join("enterprise-evidence-flags");
+                    let expected = BTreeSet::from([
+                        "limitations.json", "change-log.json", "policy-enforcement.json",
+                        "installed-packages.csv", "sbom-inventory.json",
+                    ]);
+                    let files = std::fs::read_dir(&directory)
+                        .ok()
+                        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>().ok());
+                    let actual = files.as_ref().map(|entries| {
+                        entries.iter().map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .collect::<BTreeSet<_>>()
+                    });
+                    let private_files = files.as_ref().is_some_and(|entries| {
+                        entries.len() == expected.len() && entries.iter().all(|entry| {
+                            entry.metadata().is_ok_and(|metadata| {
+                                metadata.is_file()
+                                    && metadata.permissions().mode().trailing_zeros() >= 6
+                            }) && entry.file_type().is_ok_and(|kind| kind.is_file())
+                        })
+                    });
+                    let json = |name| {
+                        std::fs::read_to_string(directory.join(name)).ok()
+                            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                    };
+                    let contents = json("limitations.json").is_some_and(|value| {
+                        value["unavailable_evidence"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| item["artifact"] == "access-control-matrix")
+                        })
+                    }) && json("change-log.json").is_some_and(|value| value.is_array())
+                        && json("policy-enforcement.json").is_some_and(|value| value.is_object())
+                        && json("sbom-inventory.json").is_some_and(|value| {
+                            value["bomFormat"] == "CycloneDX"
+                                && value["components"].as_array().is_some_and(|items| {
+                                    items.len() == 1 && items[0]["name"] == "pacman"
+                                        && items[0]["version"] == "7.0.0-1"
+                                })
+                        })
+                        && csv::Reader::from_path(directory.join("installed-packages.csv"))
+                            .ok().is_some_and(|mut reader| {
+                                reader.headers().is_ok_and(|headers| {
+                                    headers.iter().collect::<Vec<_>>()
+                                        == ["package", "version", "description"]
+                                }) && reader.records().collect::<Result<Vec<_>, _>>()
+                                    .is_ok_and(|records| records.len() == 1
+                                        && records[0].get(0) == Some("pacman")
+                                        && records[0].get(1) == Some("7.0.0-1"))
+                            });
+                    if actual.as_ref().map(|files| files.iter().map(String::as_str).collect::<BTreeSet<_>>())
+                        != Some(expected) || !private_files || !contents
+                        || !result.stdout.contains("Audit evidence exported")
+                        || !result.stdout.contains("iso27001")
+                        || !result.stdout.contains("2025-Q1")
+                    {
+                        issues.push("enterprise audit export omitted private evidence files".to_string());
+                    }
+                }
+                Assertion::TeamComplianceNoReport => {
+                    let path = project.path().join("compliance.json");
+                    if !path.symlink_metadata().is_err_and(|error| {
+                        error.kind() == std::io::ErrorKind::NotFound
+                    }) || !result.stderr.contains(&format!(
+                        "No compliance data is available to export to '{}'",
+                        path.display()
+                    )) || !result.stderr.contains("compliance evidence requires an evaluated report")
+                    {
+                        issues.push("team compliance export fabricated an unevaluated report".to_string());
                     }
                 }
                 Assertion::PrivacyOptedOut => {
@@ -2046,7 +2836,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         "name": "pacman",
                         "version": "7.0.0-1",
                         "license": "GPL-2.0-or-later",
-                        "category": "Copyleft"
+                        "category": "Copyleft",
+                        "unresolved_review": false
                     }]);
                     if serde_json::from_str::<serde_json::Value>(&result.stdout).ok()
                         != Some(expected)
@@ -2064,7 +2855,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 }
                 Assertion::LicenseAuditCsv => {
                     let path = project.path().join("licenses-export.csv");
-                    let expected = "Package,Version,License,Category\npacman,7.0.0-1,GPL-2.0-or-later,Copyleft\n";
+                    let expected = "Package,Version,License,Category,UnresolvedReview\npacman,7.0.0-1,GPL-2.0-or-later,Copyleft,false\n";
                     let actual = std::fs::read_to_string(path)
                         .ok()
                         .map(|content| content.replace("\r\n", "\n"));
@@ -2077,7 +2868,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         "License Compliance Scan",
                         "1 total packages",
                         "GPL-2.0-or-later: 1 assignments (100%)",
-                        "pacman - Copyleft license (GPL) requires legal review",
+                        "pacman - Copyleft license requires legal review",
+                        "0 unresolved assignments; 0 packages without license metadata",
                     ] {
                         if !result.stdout.contains(expected) {
                             issues.push(format!("enterprise license scan omitted {expected:?}"));
@@ -2099,9 +2891,10 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         "violations": [{
                             "package": "pacman",
                             "license": "GPL-2.0-or-later",
-                            "reason": "Copyleft license (GPL) requires legal review"
+                            "reason": "Copyleft license requires legal review"
                         }],
-                        "unknown": []
+                        "unknown": [],
+                        "unresolved_review": []
                     });
                     let actual = exports.first().and_then(|entry| {
                         std::fs::read_to_string(entry.path()).ok()
@@ -2153,7 +2946,10 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         issues.push("diff did not refuse the requested missing lockfile".to_string());
                     }
                 }
-                Assertion::WorkspaceInitialized | Assertion::WorkspaceProjectAdded => {
+                Assertion::WorkspaceInitialized
+                | Assertion::WorkspaceProjectAdded
+                | Assertion::WorkspaceProjectListed
+                | Assertion::WorkspaceProjectRemoved => {
                     let workspace_file = project.path().join("omg-workspace.toml");
                     let workspace = workspace_file
                         .symlink_metadata()
@@ -2168,7 +2964,10 @@ fn behavior_inventory_runs_in_hermetic_state() {
                                 .get("created_at")
                                 .and_then(toml::Value::as_str)
                                 .is_some_and(|timestamp| !timestamp.is_empty())
-                            && if matches!(assertion, Assertion::WorkspaceInitialized) {
+                            && if matches!(
+                                assertion,
+                                Assertion::WorkspaceInitialized | Assertion::WorkspaceProjectRemoved
+                            ) {
                                 projects.is_none_or(toml::map::Map::is_empty)
                             } else {
                                 projects.is_some_and(|projects| {
@@ -2186,40 +2985,150 @@ fn behavior_inventory_runs_in_hermetic_state() {
                     if !valid {
                         issues.push("workspace command did not persist the expected private workspace state".to_string());
                     }
+                    if matches!(assertion, Assertion::WorkspaceProjectListed) {
+                        let lines: Vec<_> = result.stdout.lines().collect();
+                        let numbered_projects = lines
+                            .iter()
+                            .filter(|line| {
+                                line.trim_start().split_once(". ").is_some_and(|(number, _)| {
+                                    number.parse::<usize>().is_ok()
+                                })
+                            })
+                            .count();
+                        if lines.iter().filter(|line| **line == "OMG Workspace: smoke").count() != 1
+                            || lines.iter().filter(|line| **line == "  1. fixture → .").count() != 1
+                            || numbered_projects != 1
+                            || result.stdout.contains("No projects in workspace")
+                        {
+                            issues.push("workspace list did not render its one persisted project".to_string());
+                        }
+                    } else if matches!(assertion, Assertion::WorkspaceProjectRemoved)
+                        && result
+                            .stdout
+                            .lines()
+                            .filter(|line| *line == "✓ Removed project 'fixture'")
+                            .count()
+                            != 1
+                    {
+                        issues.push("workspace remove did not report the removed fixture".to_string());
+                    }
                 }
-                Assertion::ContainerRunArgv => {
+                Assertion::ContainerInitScaffold => {
+                    let read_regular = |name: &str| {
+                        let path = project.path().join(name);
+                        path.symlink_metadata()
+                            .ok()
+                            .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                            .and_then(|_| std::fs::read_to_string(path).ok())
+                    };
+                    let scaffold = read_regular("Dockerfile.omg").is_some_and(|text| {
+                        let lines: Vec<_> = text.lines().collect();
+                        let directives: Vec<_> = lines
+                            .iter()
+                            .filter_map(|line| line.split_once(' ').map(|(directive, _)| directive))
+                            .filter(|directive| {
+                                matches!(
+                                    *directive,
+                                    "FROM" | "RUN" | "WORKDIR" | "COPY" | "ADD" | "CMD" | "ENTRYPOINT"
+                                )
+                            })
+                            .collect();
+                        lines.first() == Some(&"FROM debian:bookworm")
+                            && lines.last() == Some(&"CMD [\"/bin/bash\"]")
+                            && directives == ["FROM", "RUN", "WORKDIR", "COPY", "CMD"]
+                            && [
+                                "RUN apt-get update && apt-get install -y \\",
+                                "    curl wget git build-essential ca-certificates \\",
+                                "    && rm -rf /var/lib/apt/lists/*",
+                            ]
+                            .iter()
+                            .all(|required| lines.iter().filter(|line| *line == required).count() == 1)
+                            && !text.contains("# WARNING: no pinned digest")
+                    });
+                    let ignored = [
+                        ".dockerignore",
+                        "Dockerfile.omg.dockerignore",
+                        ".containerignore",
+                    ]
+                    .iter()
+                    .all(|name| {
+                        read_regular(name).is_some_and(|text| {
+                            let lines: Vec<_> = text.lines().collect();
+                            lines.starts_with(&["!.env", "!secrets.key"])
+                                && lines.ends_with(&[
+                                    "# added by omg container init",
+                                    ".git", ".env", ".env.*", "!.env.example", "*.pem", "*.key",
+                                    "id_rsa*", ".omg/",
+                                ])
+                        })
+                    });
+                    if !scaffold || !ignored {
+                        issues.push("container init omitted its Debian scaffold or final credential exclusions".to_string());
+                    }
+                    if result
+                        .stdout
+                        .lines()
+                        .filter(|line| *line == "  ✓ Created Dockerfile.omg")
+                        .count()
+                        != 1
+                        || result
+                            .stdout
+                            .lines()
+                            .filter(|line| line.contains("Base image: debian:bookworm"))
+                            .count()
+                            != 1
+                    {
+                        issues.push("container init did not report its generated Debian scaffold".to_string());
+                    }
+                }
+                Assertion::ContainerRunArgv | Assertion::ContainerShellArgv | Assertion::ContainerBuildArgv => {
                     let capture = container_capture
                         .as_ref()
                         .expect("container argv assertion has an isolated fake engine");
-                    let expected_args = [
-                        "--detach".to_string(),
-                        "--name".to_string(),
-                        "smoke".to_string(),
-                        "-w".to_string(),
-                        "/tmp/omg-smoke".to_string(),
-                        "-e".to_string(),
-                        "SMOKE=1".to_string(),
-                        "-v".to_string(),
-                        format!("{root}:/tmp/omg-smoke"),
-                        "--".to_string(),
-                        "debian:bookworm".to_string(),
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        "printf smoke".to_string(),
-                    ];
+                    let (operation, expected_args) = match case.id.as_str() {
+                        "container-run-detached-argv" => ("run", vec![
+                            "--detach".to_string(), "--name".to_string(), "smoke".to_string(),
+                            "-w".to_string(), "/tmp/omg-smoke".to_string(),
+                            "-e".to_string(), "SMOKE=1".to_string(), "-v".to_string(),
+                            format!("{root}:/tmp/omg-smoke"), "--".to_string(),
+                            "debian:bookworm".to_string(), "sh".to_string(),
+                            "-c".to_string(), "printf smoke".to_string(),
+                        ]),
+                        "container-shell-argv" => ("run", vec![
+                            "--rm".to_string(), "-it".to_string(), "--name".to_string(),
+                            format!("{}-dev", project.path().file_name().unwrap().to_string_lossy()
+                                .trim_matches(['.', '_', '-'])),
+                            "-w".to_string(), "/tmp".to_string(),
+                            "-e".to_string(), "TERM=xterm-256color".to_string(),
+                            "-e".to_string(), "SMOKE=1".to_string(),
+                            "-v".to_string(), format!("{root}:/app"),
+                            "-v".to_string(), format!("{root}:/tmp/omg-smoke"),
+                            "--".to_string(), "debian:bookworm".to_string(),
+                            "/bin/bash".to_string(),
+                        ]),
+                        "container-build-argv" => ("build", vec![
+                            "-f".to_string(), "Dockerfile".to_string(),
+                            "-t".to_string(), "smoke:latest".to_string(),
+                            "--no-cache".to_string(), "--build-arg".to_string(),
+                            "SMOKE=1".to_string(), "--target".to_string(),
+                            "dev".to_string(), "--".to_string(), root.clone(),
+                        ]),
+                        _ => unreachable!("validated container assertion row"),
+                    };
                     let expected_argv: Vec<u8> = expected_args
                         .iter()
                         .flat_map(|arg| arg.as_bytes().iter().copied().chain(std::iter::once(0)))
                         .collect();
                     if !std::fs::read_to_string(capture.join("calls"))
-                        .is_ok_and(|calls| calls == "version\nrun\n")
+                        .is_ok_and(|calls| calls == format!("version\n{operation}\n"))
                         || !std::fs::read(capture.join("argv"))
                             .is_ok_and(|argv| argv == expected_argv)
                     {
-                        issues.push("detached container command did not delegate exact argv".to_string());
+                        issues.push("container command did not delegate exact argv".to_string());
                     }
                 }
                 Assertion::UpdateFastOutput
+                | Assertion::WatchTaskRerun
                 | Assertion::UpdateTurboOutput
                 | Assertion::DaemonForegroundLifecycle
                 | Assertion::SearchOfficialLimitThree
@@ -2240,6 +3149,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::RuntimeVersionRemoved
                 | Assertion::RuntimeListState
                 | Assertion::RuntimeSwitchState
+                | Assertion::RuntimeRustInstalled
                 // Test mode always opts out, so only the real guest can prove
                 // enabled privacy status after opt-in.
                 | Assertion::PrivacyStatusEnabled => {
@@ -2423,11 +3333,6 @@ mod install_tests {
         #[cfg(feature = "arch")]
         let proxy = crate::recovery_fixture::RejectedProxy::new();
         #[cfg(feature = "arch")]
-        crate::recovery_fixture::seed_missing_aur_index(
-            &project,
-            "package-that-definitely-does-not-exist-12345",
-        );
-        #[cfg(feature = "arch")]
         let environment = proxy.env();
         #[cfg(not(feature = "arch"))]
         let environment = Vec::new();
@@ -2442,6 +3347,8 @@ mod install_tests {
         #[cfg(feature = "arch")]
         assert_eq!(proxy.requests(), 0, "offline missing lookup contacted RPC");
         assert_eq!(result.exit_code, 1, "{}", result.combined_output());
+        #[cfg(feature = "arch")]
+        result.assert_stderr_contains("Package 'package-that-definitely-does-not-exist-12345' not found. Suggestion: use 'omg search' to check available package names");
         assert!(!result.combined_output().contains("transport failed"));
         project.close_checked();
         result.assert_failure();

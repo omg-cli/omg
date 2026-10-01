@@ -1,7 +1,5 @@
 //! Private missing-package and transport fixtures. No upstream proxy requests.
 
-use crate::common::TestProject;
-use std::fs;
 use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -91,56 +89,4 @@ impl Drop for RejectedProxy {
             .join()
             .expect("isolated proxy worker panicked");
     }
-}
-
-pub fn seed_missing_aur_index(project: &TestProject, query: &str) {
-    let directory = project.data_dir.path().join("cache/aur/_meta");
-    fs::create_dir_all(&directory).unwrap();
-    let archive = directory.join("packages-meta-ext-v1.json.gz");
-    let file = fs::File::create(&archive).unwrap();
-    let mut gzip = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-    // A nonempty search result prevents RPC fallback but matches neither the
-    // requested name nor its -bin alternative.
-    let metadata = serde_json::json!([{
-        "Name": "fixture-neighbor", "Version": "1.0", "Description": query
-    }]);
-    gzip.write_all(metadata.to_string().as_bytes()).unwrap();
-    gzip.finish().unwrap();
-    // Test-local on-disk schema, pinned to aur_index.rs AurEntry/AurArchive.
-    // The real CLI validates and consumes these bytes; no public API is added.
-    #[derive(rkyv::Archive, rkyv::Serialize)]
-    struct SeedEntry {
-        name: String,
-        version: String,
-        maintainer: Option<String>,
-        last_modified: Option<i64>,
-        description: Option<String>,
-        num_votes: i32,
-        popularity: f64,
-        out_of_date: Option<i64>,
-    }
-    #[derive(rkyv::Archive, rkyv::Serialize)]
-    struct SeedArchive {
-        entries: Vec<SeedEntry>,
-    }
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&SeedArchive {
-        entries: vec![SeedEntry {
-            name: "fixture-neighbor".into(),
-            version: "1.0".into(),
-            maintainer: None,
-            last_modified: None,
-            description: Some(query.into()),
-            num_votes: 0,
-            popularity: 0.0,
-            out_of_date: None,
-        }],
-    })
-    .expect("serialize nonexact AUR fixture");
-    fs::write(directory.join("packages-meta-ext-v1.rkyv"), &bytes).unwrap();
-    use sha2::Digest as _;
-    eprintln!(
-        "AUR fixture query={query} gzip_sha256={} index_sha256={}",
-        hex::encode(sha2::Sha256::digest(fs::read(&archive).unwrap())),
-        hex::encode(sha2::Sha256::digest(&bytes)),
-    );
 }
