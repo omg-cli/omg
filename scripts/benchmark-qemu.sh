@@ -786,6 +786,32 @@ if [[ -n "$inventory_tiers" ]]; then
     debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace gcc libc6-dev ;;
     fedora) sudo -n dnf install -y git make curl python3 strace podman rpm-build createrepo_c gcc glibc-devel ;;
   esac > evidence/inventory-setup.txt 2>&1 || exit 120
+  if [[ "$distro" == debian ]]; then
+    # Bookworm ships strace 6.1. --kill-on-exit first appeared in 6.6:
+    # https://strace.io/files/6.6/ . Keep the traced-child cleanup guarantee.
+    # Build as bench, install only this fixture tool into a root-owned prefix.
+    (
+      set -o pipefail
+      build=$(mktemp -d "$HOME/omg-qemu-strace.XXXXXX") || exit 120
+      cd "$build" || exit 120
+      curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 60 \
+        https://strace.io/files/6.6/strace-6.6.tar.xz -o strace-6.6.tar.xz || exit 120
+      printf '%s  %s\n' \
+        421b4186c06b705163e64dc85f271ebdcf67660af8667283147d5e859fc8a96c \
+        strace-6.6.tar.xz | sha256sum --check - || exit 120
+      tar -xf strace-6.6.tar.xz || exit 120
+      cd strace-6.6 || exit 120
+      timeout --kill-after=5s 120s ./configure --prefix=/opt/omg-qemu-strace \
+        --enable-mpers=no --without-libunwind --without-libdw || exit 120
+      timeout --kill-after=5s 180s make -j2 || exit 120
+      sudo -n install -d -m 755 /opt/omg-qemu-strace/bin || exit 120
+      sudo -n install -m 755 src/strace /opt/omg-qemu-strace/bin/strace || exit 120
+      /opt/omg-qemu-strace/bin/strace --version || exit 120
+      /opt/omg-qemu-strace/bin/strace --kill-on-exit -f -qq -e trace=execve \
+        -o "$build/preflight.trace" /usr/bin/true || exit 120
+      grep -Fq 'execve("/usr/bin/true"' "$build/preflight.trace" || exit 120
+    ) > evidence/strace-build.txt 2>&1 || exit 120
+  fi
   # The hermetic `new` row exercises the missing-toolchain refusal. A guest
   # with Cargo installed is a different fixture, not a product failure.
   if command -v cargo > evidence/rust-toolchain.txt; then

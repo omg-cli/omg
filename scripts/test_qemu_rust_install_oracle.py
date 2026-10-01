@@ -213,8 +213,10 @@ class RustGuestPrerequisiteTests(unittest.TestCase):
     def run_setup(self, distro, installer_exit=0):
         driver = (HERE / "benchmark-qemu.sh").read_text()
         marker = '# Inventory fixtures need these tools; missing tools are setup failures,'
-        setup = driver.split(marker, 1)[1].split('  # The hermetic `new` row', 1)[0]
+        setup = driver.split(marker, 1)[1]
         setup = setup[setup.index('  case "$distro" in'):]
+        end = '  esac > evidence/inventory-setup.txt 2>&1 || exit 120'
+        setup = setup[:setup.index(end) + len(end)]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "evidence").mkdir()
