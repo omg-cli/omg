@@ -4,8 +4,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
+import struct
 import subprocess
 import tempfile
+import threading
 import unittest
 
 
@@ -27,23 +30,48 @@ class CloudInitReadyTests(unittest.TestCase):
             if not shutil.which(command):
                 raise RuntimeError(f"{command} is required for cloud-init readiness tests")
 
-    def check(self, status, *, result=True, target_ready_after=1, failed_unit=""):
+    def check(self, status, *, result=True, target_ready_after=1, failed_unit="",
+              status_exit=0, target_exit=0, diagnostic_exit=0, status_timeout=False,
+              diagnostic_journal_bytes=0):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             (temp / "status.json").write_text(json.dumps(status), encoding="utf-8")
+            records = temp / "cloud-init"
+            records.mkdir()
+            (records / "status.json").write_text(json.dumps(status), encoding="utf-8")
+            (records / "result.json").write_text('{"errors": []}\n', encoding="utf-8")
+            before = {record.name: record.read_bytes() for record in records.iterdir()}
+            (temp / "journal.txt").write_text("fixture-journal-ssh-restart\n" + "x" * diagnostic_journal_bytes)
             ssh = temp / "ssh"
             ssh.write_text("""#!/usr/bin/env bash
-if [[ "$*" == *'/run/cloud-init/result.json'* ]]; then
+if [[ "$*" == *'cloud_init_record='* ]]; then
+  echo diagnostic >> "$MOCK_SSH_CALLS"
+  script="${@: -1}"
+  prefix=/run/cloud-init
+  script="${script//"$prefix"/"$MOCK_CLOUD_INIT_DIR"}"
+  bash -c "$script"
+  exit "$MOCK_DIAGNOSTIC_EXIT"
+elif [[ "$*" == *'/run/cloud-init/result.json'* ]]; then
+  echo status >> "$MOCK_SSH_CALLS"
+  if [[ "$MOCK_STATUS_TIMEOUT" == yes ]]; then sleep 5; fi
+  if (( MOCK_STATUS_EXIT != 0 )); then
+    echo 'cloud-final.service failed before publishing result.json' >&2
+    exit "$MOCK_STATUS_EXIT"
+  fi
   [[ "$MOCK_RESULT" == present ]] || exit 1
   cat "$MOCK_STATUS"
 else
+  echo target >> "$MOCK_SSH_CALLS"
+  if (( MOCK_TARGET_EXIT != 0 )); then exit "$MOCK_TARGET_EXIT"; fi
   bash -c "${@: -1}"
 fi
 """, encoding="utf-8")
             ssh.chmod(0o755)
             systemctl = temp / "systemctl"
             systemctl.write_text("""#!/usr/bin/env bash
-if [[ "$1" == is-failed ]]; then
+if [[ "$1" == show ]]; then
+  printf 'Id=cloud-config.service\\nActiveState=failed\\nExecMainStatus=1\\n'
+elif [[ "$1" == is-failed ]]; then
   [[ "$3" == "$MOCK_FAILED_UNIT" ]]
 elif [[ "$1" == is-active && "$3" == cloud-init.target ]]; then
   count=0
@@ -56,15 +84,40 @@ else
 fi
 """, encoding="utf-8")
             systemctl.chmod(0o755)
+            sudo = temp / "sudo"
+            sudo.write_text('#!/usr/bin/env bash\n[[ "$1" == -n ]] || exit 3\nshift\nexec "$@"\n')
+            sudo.chmod(0o755)
+            journalctl = temp / "journalctl"
+            journalctl.write_text('#!/usr/bin/env bash\ncat "$MOCK_JOURNAL"\n')
+            journalctl.chmod(0o755)
+            if status_timeout:
+                timeout = temp / "timeout"
+                timeout.write_text(f'''#!/usr/bin/env bash
+if [[ "$1" == --kill-after=5s && "$2" == 180s ]]; then
+  shift 2
+  exec "{shutil.which("timeout")}" --kill-after=1s 0.1s "$@"
+fi
+exec "{shutil.which("timeout")}" "$@"
+''', encoding="utf-8")
+                timeout.chmod(0o755)
             env = dict(os.environ, PATH=f"{temp}{os.pathsep}{os.environ['PATH']}",
                        MOCK_STATUS=str(temp / "status.json"),
                        MOCK_RESULT="present" if result else "missing",
                        MOCK_TARGET_CALLS=str(temp / "target-calls"),
                        MOCK_TARGET_READY_AFTER=str(target_ready_after),
-                       MOCK_FAILED_UNIT=failed_unit)
+                       MOCK_FAILED_UNIT=failed_unit,
+                       MOCK_SSH_CALLS=str(temp / "ssh-calls"),
+                       MOCK_STATUS_EXIT=str(status_exit),
+                       MOCK_TARGET_EXIT=str(target_exit),
+                       MOCK_DIAGNOSTIC_EXIT=str(diagnostic_exit),
+                       MOCK_CLOUD_INIT_DIR=str(records),
+                       MOCK_JOURNAL=str(temp / "journal.txt"),
+                       MOCK_STATUS_TIMEOUT="yes" if status_timeout else "no")
             completed = subprocess.run(["bash", str(CHECK), "bench@127.0.0.1", "-p", "2222"],
                                        env=env, text=True, capture_output=True, timeout=20)
             calls = int((temp / "target-calls").read_text()) if (temp / "target-calls").exists() else 0
+            self.assertEqual({record.name: record.read_bytes() for record in records.iterdir()}, before,
+                             "diagnostic collection must preserve cloud-init record bytes")
             return completed, calls
 
     def test_completed_clean_nocloud_boot_passes(self):
@@ -118,6 +171,85 @@ fi
         self.assertIn('cp "$here/check-qemu-cloud-init.sh" "$work/check-qemu-cloud-init.sh"', benchmark)
         self.assertIn('bash /work/check-qemu-cloud-init.sh bench@127.0.0.1 "${opts[@]}"', benchmark)
         self.assertNotIn("cloud-init status --wait --long", benchmark)
+
+    def test_status_timeout_and_explicit_stage_failure_are_distinct(self):
+        timeout, _ = self.check(healthy_status(), status_timeout=True)
+        self.assertEqual(timeout.returncode, 1, timeout.stderr)
+        self.assertIn("timeout_ssh_exit=124", timeout.stderr)
+        failed, _ = self.check(healthy_status(), status_exit=1)
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertIn("timeout_ssh_exit=1", failed.stderr)
+        self.assertIn("cloud-final.service failed", failed.stderr)
+        for result in (timeout, failed):
+            self.assertRegex(result.stderr, r"started_utc=\d{4}-\d{2}-\d{2}T")
+            self.assertRegex(result.stderr, r"ended_utc=\d{4}-\d{2}-\d{2}T")
+            self.assertIn("cloud_init_record=", result.stderr)
+            self.assertIn("ExecMainStatus=1", result.stderr)
+            self.assertIn("fixture-journal-ssh-restart", result.stderr)
+            self.assertNotIn("verified", result.stdout)
+
+    def test_failed_diagnostic_preserves_primary_failure(self):
+        status, _ = self.check(healthy_status(), status_exit=255, diagnostic_exit=7)
+        self.assertEqual(status.returncode, 1, status.stderr)
+        self.assertIn("timeout_ssh_exit=255", status.stderr)
+        self.assertIn("diagnostic_exit=7", status.stderr)
+        target, _ = self.check(healthy_status(), target_exit=9, diagnostic_exit=7)
+        self.assertEqual(target.returncode, 9, target.stderr)
+        self.assertIn("cloud_init_phase=target", target.stderr)
+        self.assertIn("timeout_ssh_exit=9", target.stderr)
+        self.assertIn("diagnostic_exit=7", target.stderr)
+
+    def test_diagnostic_output_is_bounded_without_changing_failure(self):
+        result, _ = self.check(healthy_status(), status_exit=1, diagnostic_journal_bytes=40000)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        diagnostic = result.stderr.split("cloud_init_record=", 1)[1].split(
+            "\ncloud_init_diagnostics_ended_utc=", 1)[0]
+        self.assertEqual(len(("cloud_init_record=" + diagnostic).encode()), 16384)
+        self.assertNotIn("verified", result.stdout)
+
+    def test_actual_ssh_connection_reset_is_not_reported_as_timeout(self):
+        ssh = shutil.which("ssh")
+        if not ssh:
+            raise RuntimeError("ssh is required for the native transport fixture")
+        with socket.socket() as listener, tempfile.TemporaryDirectory() as directory:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(5)
+            accepted = []
+            errors = []
+
+            def reset_connections():
+                try:
+                    for _ in range(2):
+                        connection, _ = listener.accept()
+                        with connection:
+                            connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                                  struct.pack("ii", 1, 0))
+                        accepted.append(True)
+                except OSError as error:
+                    errors.append(str(error))
+
+            server = threading.Thread(target=reset_connections)
+            server.start()
+            try:
+                result = subprocess.run(
+                    ["bash", str(CHECK), "bench@127.0.0.1", "-F", "/dev/null",
+                     "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
+                     "-o", "StrictHostKeyChecking=yes", "-o",
+                     f"UserKnownHostsFile={directory}/known_hosts", "-p",
+                     str(listener.getsockname()[1])],
+                    text=True, capture_output=True, timeout=12)
+            finally:
+                server.join(timeout=6)
+            self.assertFalse(server.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(accepted), 2, "one primary call and one diagnostic call")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("Connection reset by peer", result.stderr)
+            self.assertIn("timeout_ssh_exit=255", result.stderr)
+            self.assertIn("diagnostic_exit=255", result.stderr)
+            self.assertNotIn("timeout_ssh_exit=124", result.stderr)
+            self.assertNotIn("verified", result.stdout)
 
 
 if __name__ == "__main__":
