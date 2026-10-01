@@ -42,8 +42,8 @@ use std::path::{Path, PathBuf};
 
 use super::common::{
     GithubRelease, activate_version_with_linked_binary, begin_staged_install,
-    complete_staged_install, extract_tar_gz, fetch_github_releases, is_valid_version_dir,
-    normalize_version, print_already_installed, print_installed, print_using,
+    complete_staged_install, download_to_temp_for_signature, extract_tar_gz, fetch_github_releases,
+    is_valid_version_dir, normalize_version, print_already_installed, print_installed, print_using,
     remove_file_best_effort, uninstall_version, validate_download_filename,
 };
 
@@ -57,13 +57,7 @@ const SWIFT_SIGNING_FINGERPRINTS: &[&str] = &[
 ];
 #[cfg(feature = "pgp")]
 use crate::core::security::pgp::PgpVerifier;
-use crate::{
-    cli::{
-        progress::{Accent, Outcome, ProgressTask, TaskKind, TaskSpec},
-        style,
-    },
-    core::http::download_client,
-};
+use crate::{cli::style, core::http::download_client};
 
 /// GitHub Releases endpoint for version discovery (newest first).
 const SWIFT_RELEASES_URL: &str = "https://api.github.com/repos/swiftlang/swift/releases";
@@ -76,9 +70,6 @@ const SWIFT_KEYS_URL: &str = "https://www.swift.org/keys/all-keys.asc";
 
 /// Root of the official Swift download archive.
 const SWIFT_DOWNLOAD_BASE: &str = "https://download.swift.org";
-
-/// Upper bound for a single download (tarballs are ~1 GiB; keys/sigs are tiny).
-const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Binary path inside the extracted `usr/` tree, also used as the activation
 /// probe and the smoke-test target.
@@ -201,91 +192,42 @@ fn parse_swift_versions(releases: &[GithubRelease]) -> Vec<SwiftVersion> {
     versions
 }
 
-/// Download a file with progress and a size bound. Unlike
-/// [`super::common::download_with_progress`] there is no expected checksum:
-/// integrity comes from the detached GPG signature verified afterwards.
+/// Download into the install's private staging directory with the common
+/// bounded retry and validated range path. Integrity remains the caller's
+/// detached GPG verification before extraction.
 async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
-    use futures::StreamExt as _;
-    use tokio::io::AsyncWriteExt as _;
-
-    let response = client
-        .get(url)
-        .header("User-Agent", super::common::GITHUB_USER_AGENT)
-        .send()
-        .await
-        .with_context(|| format!("Failed to connect to {url}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        if status.as_u16() == 404 {
-            anyhow::bail!(
-                "Version not found (404). Check available versions with: omg list swift --available"
-            );
-        }
-        anyhow::bail!("Download failed: HTTP {status}");
-    }
-
-    let total_size = response.content_length().unwrap_or(0);
-    anyhow::ensure!(
-        total_size <= MAX_DOWNLOAD_BYTES,
-        "Swift download declares {total_size} bytes, exceeding the {MAX_DOWNLOAD_BYTES}-byte limit"
-    );
-    let label = dest.file_name().map_or_else(
-        || "download".to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    let task = ProgressTask::start(&TaskSpec {
-        label,
-        kind: TaskKind::Bytes {
-            total: (total_size > 0).then_some(total_size),
-        },
-        accent: Accent::Network,
-    });
-
-    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
-    tokio::fs::create_dir_all(parent)
-        .await
-        .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
-
-    // Stream into a same-filesystem temporary file so a failed or aborted
-    // download never leaves a partial artifact at `dest`.
-    let temporary = tempfile::Builder::new()
-        .prefix(".download-")
-        .tempfile_in(parent)
-        .with_context(|| format!("Failed to create temporary download for {}", dest.display()))?;
-    let (std_file, temporary_path) = temporary.into_parts();
-    let mut file = tokio::fs::File::from_std(std_file);
-
-    let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
-    while let Some(item) = stream.next().await {
-        let chunk = item.context("Error downloading chunk")?;
-        file.write_all(&chunk)
-            .await
-            .context("Error writing to file")?;
-        downloaded = downloaded
-            .checked_add(chunk.len() as u64)
-            .filter(|total| *total <= MAX_DOWNLOAD_BYTES)
-            .with_context(|| {
-                format!("Swift download exceeds the {MAX_DOWNLOAD_BYTES}-byte limit")
-            })?;
-        task.set_position(downloaded);
-    }
-
-    file.flush()
-        .await
-        .with_context(|| format!("Failed to flush download to: {}", dest.display()))?;
-    file.sync_all()
-        .await
-        .with_context(|| format!("Failed to sync download to: {}", dest.display()))?;
-    drop(file);
-
-    temporary_path
+    download_to_temp_for_signature(client, url, dest)
+        .await?
         .persist(dest)
         .map_err(|error| error.error)
-        .with_context(|| format!("Failed to finalize download: {}", dest.display()))?;
-    task.finish(Outcome::Done);
+        .with_context(|| {
+            format!(
+                "Failed to finalize Swift staged download: {}",
+                dest.display()
+            )
+        })?;
     Ok(())
+}
+
+/// Create an extraction stage only after the detached signature succeeds.
+async fn verify_and_extract_tarball(
+    keyring: &Path,
+    tarball: &Path,
+    signature: &Path,
+    versions_dir: &Path,
+) -> Result<tempfile::TempDir> {
+    println!("{} Verifying GPG signature...", style::informative("→"));
+    if let Err(error) = verify_tarball_signature(keyring, tarball, signature) {
+        remove_file_best_effort(tarball, "runtime archive");
+        remove_file_best_effort(signature, "detached signature");
+        return Err(error);
+    }
+    remove_file_best_effort(signature, "detached signature");
+    println!("{} Extracting (pure Rust)...", style::informative("→"));
+    let staging = begin_staged_install(versions_dir)?;
+    // Strip only the vendor's top directory, preserving its usr/ tree.
+    extract_tar_gz(tarball, staging.path(), 1).await?;
+    Ok(staging)
 }
 
 /// Verify a tarball against its detached `.sig` sidecar using the cached
@@ -508,19 +450,9 @@ impl SwiftManager {
             return Err(error);
         }
 
-        println!("{} Verifying GPG signature...", style::informative("→"));
-        if let Err(error) = verify_tarball_signature(&keyring, &download_path, &sig_path) {
-            remove_file_best_effort(&download_path, "runtime archive");
-            remove_file_best_effort(&sig_path, "detached signature");
-            return Err(error);
-        }
-        remove_file_best_effort(&sig_path, "detached signature");
-
-        println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let staging = begin_staged_install(&self.versions_dir)?;
-        // Strip 1 removes only the `<top>` directory and keeps the official
-        // `usr/bin`, `usr/lib`, … tree intact.
-        extract_tar_gz(&download_path, staging.path(), 1).await?;
+        let staging =
+            verify_and_extract_tarball(&keyring, &download_path, &sig_path, &self.versions_dir)
+                .await?;
         if !staging.path().join(SWIFT_BINARY).is_file() {
             remove_file_best_effort(&download_path, "runtime archive");
             anyhow::bail!(
@@ -641,6 +573,246 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swift_download_retries_and_refuses_invalid_transfers() -> Result<()> {
+        const CHILD: &str = "OMG_SWIFT_DOWNLOAD_FIXTURE";
+        if std::env::var(CHILD).as_deref() == Ok("1") {
+            anyhow::ensure!(crate::core::paths::test_mode());
+            tokio::runtime::Runtime::new()?.block_on(swift_download_fixture())?;
+            println!(
+                "[omg-runtime-download-child] test=runtimes::swift::tests::swift_download_retries_and_refuses_invalid_transfers"
+            );
+            return Ok(());
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "runtimes::swift::tests::swift_download_retries_and_refuses_invalid_transfers",
+                "--nocapture",
+            ])
+            .env("OMG_TEST_MODE", "1")
+            .env(CHILD, "1")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::ensure!(
+            output.status.success()
+                && stdout.matches("1 passed; 0 failed; 0 ignored;").count() == 1
+                && stdout.lines().filter(|line| *line ==
+                    "[omg-runtime-download-child] test=runtimes::swift::tests::swift_download_retries_and_refuses_invalid_transfers"
+                ).count() == 1,
+            "Swift production download probe failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    async fn swift_download_fixture() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for scenario in ["resume", "range", "exhausted", "404"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/archive", listener.local_addr()?);
+            let body = b"Swift signed archive transfer fixture";
+            let attempts = match scenario {
+                "404" => 1,
+                "exhausted" => 3,
+                _ => 2,
+            };
+            let directory = tempfile::tempdir()?;
+            let dest = directory.path().join("archive.tar.gz");
+            fs::write(&dest, b"existing staged artifact")?;
+            let server = async {
+                async fn wait_for_prefix(directory: &Path, prefix: &[u8]) -> Result<()> {
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        loop {
+                            let mut entries = tokio::fs::read_dir(directory).await?;
+                            while let Some(entry) = entries.next_entry().await? {
+                                if entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with(".download-")
+                                    && tokio::fs::read(entry.path()).await? == prefix
+                                {
+                                    return Ok::<_, anyhow::Error>(());
+                                }
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await??;
+                    Ok(())
+                }
+                for step in 0..attempts {
+                    let (mut stream, _) = listener.accept().await?;
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        anyhow::ensure!(request.len() < 4096, "fixture request too large");
+                        request.push(stream.read_u8().await?);
+                    }
+                    let request = String::from_utf8(request)?.to_ascii_lowercase();
+                    anyhow::ensure!(request.contains("accept-encoding: identity\r\n"));
+                    if scenario == "404" {
+                        stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+                    } else if step == 0 || scenario == "exhausted" {
+                        // No validator in the exhausted case forces a complete restart.
+                        let validator = if scenario == "exhausted" {
+                            ""
+                        } else {
+                            "ETag: \"stable\"\r\n"
+                        };
+                        anyhow::ensure!(!request.contains("range: bytes="));
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{validator}Connection: close\r\n\r\n", body.len()).as_bytes()).await?;
+                        stream.write_all(&body[..8]).await?;
+                        if scenario != "exhausted" {
+                            // Do not interrupt until the production writer has
+                            // actually retained this exact prefix. A TCP write
+                            // alone says nothing about the receiver's progress.
+                            wait_for_prefix(directory.path(), &body[..8]).await?;
+                        }
+                    } else {
+                        anyhow::ensure!(request.contains("range: bytes=8-\r\n"));
+                        anyhow::ensure!(request.contains("if-range: \"stable\"\r\n"));
+                        let start = if scenario == "range" { 9 } else { 8 };
+                        stream.write_all(format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{}/{}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n", body.len() - start, body.len() - 1, body.len()).as_bytes()).await?;
+                        stream.write_all(&body[start..]).await?;
+                    }
+                    stream.shutdown().await?;
+                }
+                // A fatal status/range response and exhausted body budget must not reconnect.
+                anyhow::ensure!(
+                    tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+                        .await
+                        .is_err()
+                );
+                Ok::<_, anyhow::Error>(())
+            };
+            let client = reqwest::Client::new();
+            let download = download_file(&client, &url, &dest);
+            let (served, result) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(server, download)
+                })
+                .await?;
+            served?;
+            if scenario == "resume" {
+                result?;
+                assert_eq!(fs::read(&dest)?, body);
+            } else {
+                let error = result.expect_err("invalid transfer must refuse");
+                let text = format!("{error:#}");
+                match scenario {
+                    "range" => assert!(text.contains("range does not match"), "{text}"),
+                    "404" => assert!(text.contains("Version not found (404)"), "{text}"),
+                    _ => assert!(text.contains("Error downloading chunk"), "{text}"),
+                }
+                assert_eq!(fs::read(&dest)?, b"existing staged artifact");
+            }
+            assert_eq!(
+                fs::read_dir(directory.path())?.count(),
+                1,
+                "temporary transfer must be cleaned"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn swift_signature_failure_prevents_extraction() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let tarball = directory.path().join("swift.tar.gz");
+        let signature = directory.path().join("swift.tar.gz.sig");
+        let keyring = directory.path().join("keys.asc");
+        let versions = directory.path().join("versions");
+        fs::create_dir(&versions)?;
+        fs::write(versions.join("existing"), b"installed version remains")?;
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let data = b"must not extract";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive.append_data(&mut header, "swift/usr/bin/swift", &data[..])?;
+        let bytes = archive.into_inner()?.finish()?;
+        fs::write(&tarball, &bytes)?;
+        #[cfg(feature = "pgp")]
+        {
+            use sequoia_openpgp::{
+                Packet,
+                cert::prelude::CertBuilder,
+                packet::signature::SignatureBuilder,
+                policy::StandardPolicy,
+                serialize::Serialize as _,
+                types::{HashAlgorithm, SignatureType},
+            };
+            let (cert, _) = CertBuilder::general_purpose(Some("untrusted@example.invalid"))
+                .set_creation_time(
+                    std::time::SystemTime::now() - std::time::Duration::from_hours(24),
+                )
+                .generate()?;
+            let mut keys = Vec::new();
+            cert.serialize(&mut keys)?;
+            fs::write(&keyring, keys)?;
+            let policy = StandardPolicy::new();
+            let mut signer = cert
+                .keys()
+                .secret()
+                .with_policy(&policy, None)
+                .for_signing()
+                .next()
+                .context("fixture signing key")?
+                .key()
+                .clone()
+                .into_keypair()?;
+            let signed = SignatureBuilder::new(SignatureType::Binary)
+                .set_hash_algo(HashAlgorithm::SHA256)
+                .sign_message(&mut signer, &bytes)?;
+            let mut serialized = Vec::new();
+            Packet::from(signed).serialize(&mut serialized)?;
+            fs::write(&signature, serialized)?;
+            // The fixture is cryptographically valid for its own key, but that
+            // key is outside Swift's explicit vendor fingerprint allowlist.
+            PgpVerifier::from_keyring(&keyring)?.verify_detached(&tarball, &signature)?;
+        }
+        #[cfg(not(feature = "pgp"))]
+        {
+            fs::write(&keyring, b"keyring unavailable without pgp")?;
+            fs::write(&signature, b"invalid detached signature")?;
+        }
+        let error = verify_and_extract_tarball(&keyring, &tarball, &signature, &versions)
+            .await
+            .expect_err("unverified toolchain must refuse before extracting");
+        let text = format!("{error:#}");
+        #[cfg(feature = "pgp")]
+        assert!(
+            text.contains("Failed to load Swift signing keyring"),
+            "{text}"
+        );
+        #[cfg(not(feature = "pgp"))]
+        assert!(
+            text.contains("require GPG signature verification"),
+            "{text}"
+        );
+        assert!(!tarball.exists());
+        assert!(!signature.exists());
+        assert_eq!(fs::read_dir(&versions)?.count(), 1);
+        assert_eq!(
+            fs::read(versions.join("existing"))?,
+            b"installed version remains"
+        );
+        #[cfg(feature = "pgp")]
+        {
+            fs::write(&tarball, bytes)?;
+            let error = verify_and_extract_tarball(&keyring, &tarball, &signature, &versions)
+                .await
+                .expect_err("missing detached signature must refuse");
+            assert!(format!("{error:#}").contains("PGP signature missing"));
+            assert!(!tarball.exists());
+            assert_eq!(fs::read_dir(&versions)?.count(), 1);
+        }
+        Ok(())
+    }
 
     fn release(tag: &str, prerelease: bool) -> GithubRelease {
         GithubRelease {

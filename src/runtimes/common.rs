@@ -721,6 +721,27 @@ where
     unreachable!("final download attempt always returns")
 }
 
+/// Stage an artifact for a caller's detached-signature verification.
+///
+/// This shares the bounded transfer and validated resume path with checksum
+/// downloads. The returned file is unverified and is deleted on drop. Archives
+/// require signature verification before extraction/publication; signing-key
+/// bundles require pinned-fingerprint validation before caching.
+pub(crate) async fn download_to_temp_for_signature(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+) -> Result<tempfile::TempPath> {
+    crate::core::http::validate_download_url(url)?;
+    let (temporary_path, _) = stream_runtime_download_to_temp::<Sha256, _, _>(
+        extract_domain(url),
+        |resume| request_runtime_download(client, url, resume),
+        dest,
+    )
+    .await?;
+    Ok(temporary_path)
+}
+
 /// Download a file with progress bar and checksum verification.
 pub async fn download_with_progress(
     client: &reqwest::Client,
