@@ -70,7 +70,8 @@ class RustOracleBoundaryTests(unittest.TestCase):
             print(f"Rust executor fixture UID={os.geteuid()} sourceSHA256={SUBJECT.sha(ORACLE)}")
             return False
         source_hash = SUBJECT.sha(Path(__file__))
-        command = ["runuser", "-u", self.user.pw_name, "--", "python3", "-m", "unittest", self.id(), "-v"]
+        test_name = f"scripts.{Path(__file__).stem}.{type(self).__qualname__}.{self._testMethodName}"
+        command = ["runuser", "-u", self.user.pw_name, "--", "python3", "-m", "unittest", test_name, "-v"]
         result = subprocess.run(command, cwd=HERE.parent,
                                 env=dict(os.environ, TMPDIR="/var/tmp", PYTHONDONTWRITEBYTECODE="1"),
                                 capture_output=True, text=True, timeout=40)
