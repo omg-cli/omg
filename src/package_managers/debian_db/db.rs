@@ -3902,13 +3902,15 @@ mod tests {
 
     #[test]
     fn optional_mtime_rejects_unreadable_existing() {
-        // chmod 000 does not make a path unreadable to root (Debian CI).
-        if rustix::process::geteuid().is_root() {
-            eprintln!(
-                "skipping optional_mtime_rejects_unreadable_existing: chmod 000 is ignored for root"
-            );
+        if crate::config::Settings::rerun_test_unprivileged(
+            "package_managers::debian_db::db::tests::optional_mtime_rejects_unreadable_existing",
+        ) {
             return;
         }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
         let dir = tempfile::TempDir::new().expect("temp dir");
         let nested = dir.path().join("extended_states");
         std::fs::create_dir(&nested).expect("nested dir");
@@ -3918,6 +3920,13 @@ mod tests {
         let mut denied = original.clone();
         std::os::unix::fs::PermissionsExt::set_mode(&mut denied, 0o000);
         std::fs::set_permissions(dir.path(), denied).expect("deny parent");
+        let denied =
+            std::fs::metadata(&nested).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=package_managers::debian_db::db::tests::optional_mtime_rejects_unreadable_existing uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
         let result = optional_mtime(&nested);
         std::fs::set_permissions(dir.path(), original).expect("restore parent");
         let error = result.expect_err("unreadable existing extended_states must not look missing");

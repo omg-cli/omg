@@ -1779,22 +1779,31 @@ mod tests {
         assert!(db_paths.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_collect_sync_db_paths_unreadable_dir_errors() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let original = std::fs::metadata(temp_dir.path()).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o000))
-                .unwrap();
-        }
-        let blocked = std::fs::read_dir(temp_dir.path()).is_err();
-        let result = collect_sync_db_paths(temp_dir.path());
-        let _ = std::fs::set_permissions(temp_dir.path(), original);
-        if !blocked {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "package_managers::pacman_db::db::tests::test_collect_sync_db_paths_unreadable_dir_errors",
+        ) {
             return;
         }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let original = std::fs::metadata(temp_dir.path()).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied =
+            std::fs::read_dir(temp_dir.path()).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=package_managers::pacman_db::db::tests::test_collect_sync_db_paths_unreadable_dir_errors uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
+        let result = collect_sync_db_paths(temp_dir.path());
+        std::fs::set_permissions(temp_dir.path(), original).expect("restore fixture permissions");
         assert!(
             result.is_err(),
             "unreadable sync dir must fail closed, got {result:?}"
@@ -2155,22 +2164,31 @@ mod tests {
         assert_eq!(newer.sync, older.sync);
     }
 
+    #[cfg(unix)]
     #[test]
     fn sync_identity_unreadable_directory_errors() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let original = std::fs::metadata(temp_dir.path()).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o000))
-                .unwrap();
-        }
-        let blocked = std::fs::read_dir(temp_dir.path()).is_err();
-        let result = SyncDbEpoch::from_sync_dir(temp_dir.path());
-        let _ = std::fs::set_permissions(temp_dir.path(), original);
-        if !blocked {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "package_managers::pacman_db::db::tests::sync_identity_unreadable_directory_errors",
+        ) {
             return;
         }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let original = std::fs::metadata(temp_dir.path()).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied =
+            std::fs::read_dir(temp_dir.path()).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=package_managers::pacman_db::db::tests::sync_identity_unreadable_directory_errors uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
+        let result = SyncDbEpoch::from_sync_dir(temp_dir.path());
+        std::fs::set_permissions(temp_dir.path(), original).expect("restore fixture permissions");
         assert!(
             result.is_err(),
             "unreadable sync dir must fail closed, got {result:?}"

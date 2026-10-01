@@ -405,23 +405,33 @@ mod tests {
         assert_eq!(suggestions.first().map(String::as_str), Some("3.12.0"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn probe_context_unreadable_pin_fails_closed() {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "core::completion::tests::probe_context_unreadable_pin_fails_closed",
+        ) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
         let temp_dir = TempDir::new().unwrap();
         let pin = temp_dir.path().join(".python-version");
         std::fs::write(&pin, "3.12.0\n").unwrap();
         let original = std::fs::metadata(&pin).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        let blocked = std::fs::read_to_string(&pin).is_err();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied =
+            std::fs::read_to_string(&pin).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=core::completion::tests::probe_context_unreadable_pin_fails_closed uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
         let result = CompletionEngine::probe_context_from(temp_dir.path(), "python");
-        let _ = std::fs::set_permissions(&pin, original);
-        if !blocked {
-            return;
-        }
+        std::fs::set_permissions(&pin, original).expect("restore fixture permissions");
         assert!(
             result.is_err(),
             "unreadable pin must fail closed, got {result:?}"

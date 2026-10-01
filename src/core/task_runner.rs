@@ -1826,24 +1826,33 @@ build = "node"
         assert!(tasks.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn unreadable_package_json_fails_closed() {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "core::task_runner::tests::unreadable_package_json_fails_closed",
+        ) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("package.json");
         fs::write(&path, r#"{"scripts": {"test": "echo"}}"#).unwrap();
         let original = fs::metadata(&path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        let blocked = fs::read_to_string(&path).is_err();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs::read_to_string(&path).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=core::task_runner::tests::unreadable_package_json_fails_closed uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
         let detector = TaskDetector::new(temp.path().to_path_buf()).unwrap();
         let result = detector.detect();
-        let _ = fs::set_permissions(&path, original);
-        if !blocked {
-            return;
-        }
+        fs::set_permissions(&path, original).expect("restore fixture permissions");
         assert!(
             result.is_err(),
             "unreadable package.json must fail closed, got {result:?}"
@@ -1962,28 +1971,35 @@ build = "node"
         temp.close().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_nvm_alias_unreadable_fails_closed() {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "core::task_runner::tests::resolve_nvm_alias_unreadable_fails_closed",
+        ) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
         let temp = TempDir::new().unwrap();
         let alias_dir = temp.path().join("alias");
         fs::create_dir(&alias_dir).unwrap();
         let alias = alias_dir.join("lts");
         fs::write(&alias, "20.11.1\n").unwrap();
         let original = fs::metadata(&alias).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&alias, fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        let blocked = fs::read_to_string(&alias).is_err();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&alias, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied =
+            fs::read_to_string(&alias).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=core::task_runner::tests::resolve_nvm_alias_unreadable_fails_closed uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
         let result = resolve_nvm_alias(temp.path(), "lts");
-        let _ = fs::set_permissions(&alias, original);
-        if !blocked {
-            eprintln!(
-                "[omg-skip] current user can read mode-000 alias; permission denial not exercised"
-            );
-            return;
-        }
+        fs::set_permissions(&alias, original).expect("restore fixture permissions");
         assert!(
             result.is_err(),
             "unreadable nvm alias must fail closed, got {result:?}"

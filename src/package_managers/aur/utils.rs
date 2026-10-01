@@ -336,27 +336,40 @@ mod tests {
     fn validate_build_dir_fails_closed_on_uninspectable_directory() {
         use std::os::unix::fs::PermissionsExt;
 
+        if crate::config::Settings::rerun_test_unprivileged(
+            "package_managers::aur::utils::tests::validate_build_dir_fails_closed_on_uninspectable_directory",
+        ) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
+
         let temp = tempfile::tempdir().expect("temp dir");
         let build_root = temp.path().join("root");
         std::fs::create_dir_all(&build_root).expect("build root");
         let pkg_dir = build_root.join("mypkg");
         std::fs::create_dir(&pkg_dir).expect("pkg dir");
 
-        let meta = std::fs::metadata(&pkg_dir).expect("meta");
-        let mut perms = meta.permissions();
+        let meta = std::fs::metadata(&build_root).expect("meta");
+        let original = meta.permissions();
+        let mut perms = original.clone();
         perms.set_mode(0o000);
-        std::fs::set_permissions(&pkg_dir, perms).expect("chmod");
+        std::fs::set_permissions(&build_root, perms).expect("chmod");
 
         let result = validate_build_dir(&build_root, "mypkg");
-        let unreadable = std::fs::symlink_metadata(&pkg_dir).is_err();
+        let denied = std::fs::symlink_metadata(&pkg_dir)
+            .expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=package_managers::aur::utils::tests::validate_build_dir_fails_closed_on_uninspectable_directory uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
 
-        let mut restore = std::fs::metadata(&pkg_dir).expect("meta").permissions();
-        restore.set_mode(0o755);
-        std::fs::set_permissions(&pkg_dir, restore).expect("restore chmod");
+        std::fs::set_permissions(&build_root, original).expect("restore chmod");
 
-        if unreadable {
-            let error = result.expect_err("uninspectable directory must fail closed");
-            assert!(error.to_string().contains("fail"), "got: {error}");
-        }
+        let error = result.expect_err("uninspectable directory must fail closed");
+        assert!(error.to_string().contains("fail"), "got: {error}");
     }
 }

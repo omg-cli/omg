@@ -521,23 +521,32 @@ mod tests {
         assert_eq!(read_hook_file(&path).unwrap().as_deref(), Some("# OMG\n"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_read_hook_file_unreadable_errors() {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "cli::git_hooks::tests::test_read_hook_file_unreadable_errors",
+        ) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("pre-commit");
         fs::write(&path, "# OMG\n").unwrap();
         let original = fs::metadata(&path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        let blocked = fs::read_to_string(&path).is_err();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs::read_to_string(&path).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=cli::git_hooks::tests::test_read_hook_file_unreadable_errors uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
         let result = read_hook_file(&path);
-        let _ = fs::set_permissions(&path, original);
-        if !blocked {
-            return;
-        }
+        fs::set_permissions(&path, original).expect("restore fixture permissions");
         assert!(
             result.is_err(),
             "unreadable hook file must fail closed, got {result:?}"

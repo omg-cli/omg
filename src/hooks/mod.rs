@@ -1734,23 +1734,33 @@ path = "hostile"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_installed_version_req_unreadable_dir_fails_closed() {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "hooks::tests::resolve_installed_version_req_unreadable_dir_fails_closed",
+        ) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
         let dir = tempdir().unwrap();
         let versions_dir = dir.path().join("versions/node");
         fs::create_dir_all(&versions_dir).unwrap();
         let original = fs::metadata(&versions_dir).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&versions_dir, fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        let blocked = fs::read_dir(&versions_dir).is_err();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&versions_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied =
+            fs::read_dir(&versions_dir).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=hooks::tests::resolve_installed_version_req_unreadable_dir_fails_closed uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
         let result = resolve_installed_version_req(&versions_dir, "^20");
-        let _ = fs::set_permissions(&versions_dir, original);
-        if !blocked {
-            return;
-        }
+        fs::set_permissions(&versions_dir, original).expect("restore fixture permissions");
         assert!(
             result.is_err(),
             "unreadable versions directory must fail closed, got {result:?}"
@@ -1803,23 +1813,32 @@ path = "hostile"
         assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_versions_unreadable_pin_errors() {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "hooks::tests::test_detect_versions_unreadable_pin_errors",
+        ) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
         let dir = tempdir().unwrap();
         let pin = dir.path().join(".nvmrc");
         fs::write(&pin, "20.10.0").unwrap();
         let original = fs::metadata(&pin).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&pin, fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        let blocked = fs::read_to_string(&pin).is_err();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&pin, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs::read_to_string(&pin).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=hooks::tests::test_detect_versions_unreadable_pin_errors uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
         let result = detect_versions(dir.path());
-        let _ = fs::set_permissions(&pin, original);
-        if !blocked {
-            return;
-        }
+        fs::set_permissions(&pin, original).expect("restore fixture permissions");
         assert!(
             result.is_err(),
             "unreadable pin file must fail closed, got {result:?}"
@@ -1983,25 +2002,35 @@ path = "hostile"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_nvm_alias_unreadable_fails_closed() {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "hooks::tests::resolve_nvm_alias_unreadable_fails_closed",
+        ) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
         let dir = tempdir().unwrap();
         let alias_dir = dir.path().join("alias");
         fs::create_dir(&alias_dir).unwrap();
         let alias = alias_dir.join("lts");
         fs::write(&alias, "20.11.1\n").unwrap();
         let original = fs::metadata(&alias).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&alias, fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        let blocked = fs::read_to_string(&alias).is_err();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&alias, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied =
+            fs::read_to_string(&alias).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=hooks::tests::resolve_nvm_alias_unreadable_fails_closed uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
         let result = resolve_nvm_alias(dir.path(), "lts");
-        let _ = fs::set_permissions(&alias, original);
-        if !blocked {
-            return;
-        }
+        fs::set_permissions(&alias, original).expect("restore fixture permissions");
         assert!(
             result.is_err(),
             "unreadable nvm alias must fail closed, got {result:?}"

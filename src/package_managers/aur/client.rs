@@ -6364,31 +6364,45 @@ mod tests {
     fn cache_key_fails_when_srcinfo_is_unreadable() {
         use std::os::unix::fs::PermissionsExt;
 
-        let client = AurClient::new().expect("test settings must load");
+        if crate::config::Settings::rerun_test_unprivileged(
+            "package_managers::aur::client::tests::cache_key_fails_when_srcinfo_is_unreadable",
+        ) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
+
         let dir = tempfile::tempdir().expect("temp dir");
+        let client = AurClient {
+            build_dir: dir.path().to_path_buf(),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
         let pkg_dir = dir.path().join("mypkg");
         std::fs::create_dir(&pkg_dir).expect("pkg dir");
         std::fs::write(pkg_dir.join("PKGBUILD"), "pkgname=mypkg\n").expect("pkgbuild");
         let srcinfo = pkg_dir.join(".SRCINFO");
         std::fs::write(&srcinfo, "pkgbase = mypkg\n").expect("srcinfo");
-        let mut permissions = std::fs::metadata(&srcinfo)
+        let original = std::fs::metadata(&srcinfo)
             .expect("srcinfo metadata")
             .permissions();
+        let mut permissions = original.clone();
         permissions.set_mode(0o000);
         std::fs::set_permissions(&srcinfo, permissions).expect("chmod");
 
         let result = client.cache_key(&pkg_dir, "");
-        let unreadable = std::fs::read(&srcinfo).is_err();
+        let denied = std::fs::read(&srcinfo).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=package_managers::aur::client::tests::cache_key_fails_when_srcinfo_is_unreadable uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
 
-        let mut restore = std::fs::metadata(&srcinfo)
-            .expect("srcinfo metadata")
-            .permissions();
-        restore.set_mode(0o644);
-        std::fs::set_permissions(&srcinfo, restore).expect("restore chmod");
+        std::fs::set_permissions(&srcinfo, original).expect("restore chmod");
 
-        if unreadable {
-            result.expect_err("unreadable .SRCINFO must fail closed");
-        }
+        result.expect_err("unreadable .SRCINFO must fail closed");
     }
 
     #[test]

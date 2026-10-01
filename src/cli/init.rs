@@ -1107,23 +1107,33 @@ mod tests {
         assert!(content.contains("omg hook"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_read_optional_shell_rc_unreadable_errors() {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "cli::init::tests::test_read_optional_shell_rc_unreadable_errors",
+        ) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must not run as root"
+        );
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join(".zshrc");
         std::fs::write(&path, "eval \"$(omg hook zsh)\"\n").unwrap();
         let original = std::fs::metadata(&path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        let blocked = std::fs::read_to_string(&path).is_err();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied =
+            std::fs::read_to_string(&path).expect_err("fixture must enforce permission denial");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        println!(
+            "[omg-permission-fixture] test=cli::init::tests::test_read_optional_shell_rc_unreadable_errors uid={} errno=PermissionDenied",
+            nix::unistd::geteuid()
+        );
         let result = read_optional_shell_rc(path.to_str().unwrap());
-        let _ = std::fs::set_permissions(&path, original);
-        if !blocked {
-            return;
-        }
+        std::fs::set_permissions(&path, original).expect("restore fixture permissions");
         assert!(
             result.is_err(),
             "unreadable shell rc must fail closed, got {result:?}"
