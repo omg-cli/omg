@@ -19,26 +19,28 @@ class RequiredResultsTests(unittest.TestCase):
             env = dict(os.environ, QUICK_GATE="success", BUILD_REQUIRED=required,
                        PORTABLE="success", LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
                        FEATURE_INTERSECTIONS="success", MACOS="success", UBUNTU="success",
-                       DOCS_AUDIT="success",
+                       DOCS_AUDIT="success", RUNTIME_USAGE="success",
                        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"))
             env.update(overrides or {})
             bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
             return subprocess.run([bash, "-c", script], env=env, capture_output=True, text=True, timeout=15)
 
     def test_required_job_skips_fail(self):
-        for job in ("PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "UBUNTU"):
+        for job in ("PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "UBUNTU", "RUNTIME_USAGE"):
             with self.subTest(job=job):
                 self.assertNotEqual(self.evaluate("true", {job: "skipped"}).returncode, 0)
 
     def test_docs_only_skips_pass(self):
-        jobs = ("PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "UBUNTU")
+        jobs = ("PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "UBUNTU", "RUNTIME_USAGE")
         self.assertEqual(self.evaluate("false", {job: "skipped" for job in jobs}).returncode, 0)
 
     def test_all_success_passes_and_failure_never_does(self):
         self.assertEqual(self.evaluate("true").returncode, 0)
         for required in ("true", "false"):
             for state in ("failure", "cancelled", ""):
-                self.assertNotEqual(self.evaluate(required, {"PORTABLE": state}).returncode, 0)
+                for job in ("PORTABLE", "RUNTIME_USAGE"):
+                    with self.subTest(required=required, state=state, job=job):
+                        self.assertNotEqual(self.evaluate(required, {job: state}).returncode, 0)
 
     def test_docs_audit_failure_always_fails_the_gate(self):
         for required in ("true", "false"):
