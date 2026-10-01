@@ -161,7 +161,9 @@ class LicenseOracleTests(unittest.TestCase):
         self.output.write_text("[License Compliance Scan] 3 total packages\n"
                                "License Inventory\n│ Apache-2.0: 1 assignments (33%)\n"
                                "│ GPL-3.0-only: 1 assignments (33%)\n"
-                               "│ MIT: 1 assignments (33%)\n",
+                               "│ MIT: 1 assignments (33%)\n"
+                               "Policy Violations\n│ beta - Copyleft license requires legal review\n"
+                               "Unknown Licenses\n│ gamma\n",
                                encoding="utf-8")
         ORACLE.check("enterprise-text", self.output, native)
         self.output.write_text("[License Compliance Scan] 13 total packages\n"
@@ -188,7 +190,9 @@ class LicenseOracleTests(unittest.TestCase):
                                "│ Apache-2.0 OR MIT: 1 assignments (25%)\n"
                                "│ Apache-2.0: 1 assignments (25%)\n"
                                "│ GPL-3.0-only: 1 assignments (25%)\n"
-                               "│ MIT: 1 assignments (25%)\n", encoding="utf-8")
+                               "│ MIT: 1 assignments (25%)\n"
+                               "Policy Violations\n│ beta - Copyleft license requires legal review\n"
+                               "Unknown Licenses\n│ gamma\n", encoding="utf-8")
         ORACLE.check("enterprise-text", self.output, native)
         self.output.write_text(self.output.read_text(encoding="utf-8").replace(
             "│ Apache-2.0 OR MIT: 1 assignments (25%)\n"
@@ -197,6 +201,113 @@ class LicenseOracleTests(unittest.TestCase):
             "│ Apache-2.0 OR MIT: 1 assignments (25%)"), encoding="utf-8")
         with self.assertRaises(AssertionError):
             ORACLE.check("enterprise-text", self.output, native)
+
+    def test_advisory_identifier_literals_case_and_plus_boundaries(self):
+        # Expectations are literal families, not read from Rust or OMG reports.
+        families = {
+            "StrongCopyleft": "AGPL AGPL1 AGPL3 AGPL-1.0 AGPL-1.0-only AGPL-1.0-or-later AGPL-3.0 AGPL-3.0-only AGPL-3.0-or-later".split(),
+            "Copyleft": "GPL GPL1 GPL2 GPL3 LGPL LGPL2 LGPL3 LGPL2.1 GPL-1.0 GPL-1.0-only GPL-1.0-or-later GPL-2.0 GPL-2.0-only GPL-2.0-or-later GPL-3.0 GPL-3.0-only GPL-3.0-or-later LGPL-2.0 LGPL-2.0-only LGPL-2.0-or-later LGPL-2.1 LGPL-2.1-only LGPL-2.1-or-later LGPL-3.0 LGPL-3.0-only LGPL-3.0-or-later MPL MPL-1.0 MPL-1.1 MPL-2.0 MPL-2.0-no-copyleft-exception".split(),
+            "Permissive": "MIT MIT-0 ISC Unlicense CC0 CC0-1.0 0BSD BSD BSD-2-Clause BSD-3-Clause BSD-4-Clause Apache Apache-1.0 Apache-1.1 Apache-2.0".split(),
+            "Proprietary": ["Proprietary", "Commercial"],
+        }
+        for category, identifiers in families.items():
+            for identifier in identifiers:
+                for spelling in (identifier, identifier.lower(), identifier.upper()):
+                    with self.subTest(identifier=spelling):
+                        self.assertEqual(ORACLE.advisory_category(spelling), category)
+                        self.assertEqual(ORACLE.advisory_category(spelling + "+"), category)
+                        self.assertEqual(ORACLE.advisory_category(spelling + "++"), "Unknown")
+                        self.assertEqual(ORACLE.advisory_category(spelling + "-custom"), "Unknown")
+        for identifier in ("Apache-custom", "BSD-custom", "LicenseRef-GPL", "LicenseRef-Proprietary",
+                           "GPL4", "AGPL2", "LGPL2.0", "SSPL-1.0", "BUSL-1.1", "Elastic-2.0"):
+            self.assertEqual(ORACLE.advisory_category(identifier), "Unknown")
+
+    def test_mixed_references_with_base_and_native_assignment_join(self):
+        for reference in ("LicenseRef-private", "DocumentRef-x.1:LicenseRef-private"):
+            self.assertEqual(ORACLE.advisory_category(reference), "Unknown")
+            for operator in ("AND", "OR"):
+                self.assertEqual(ORACLE.advisory_category(f"{reference} {operator} GPL2"), "Copyleft")
+                self.assertEqual(ORACLE.advisory_category(f"MIT {operator} {reference}"), "Permissive")
+                self.assertEqual(ORACLE.advisory_category(f"{reference} {operator} AGPL3+"), "StrongCopyleft")
+        self.assertEqual(ORACLE.advisory_category("MIT WITH AGPL-3.0"), "Permissive")
+        self.assertEqual(ORACLE.advisory_category("GPL2 WITH LicenseRef-exception"), "Copyleft")
+        self.assertEqual(ORACLE.known_category(["GPL2", "LGPL3"]), "Copyleft")
+        self.assertEqual(ORACLE.advisory_category("GPL2, LGPL3"), "Unknown")
+        packages = {"libidn2": ("2.3.8-1", ["GPL2", "LGPL3"])}
+        ORACLE.compare_audit_rows([{"name": "libidn2", "version": "2.3.8-1",
+                                    "license": "GPL2, LGPL3", "category": "Copyleft"}],
+                                  ORACLE.expected_audit(packages))
+        counts, unknown, violations = ORACLE.expected_enterprise(packages)
+        self.assertEqual(dict(counts), {"GPL2": 1, "LGPL3": 1})
+        self.assertEqual(unknown, [])
+        self.assertEqual(violations, [("libidn2", "GPL2", "Copyleft license requires legal review"),
+                                      ("libidn2", "LGPL3", "Copyleft license requires legal review")])
+
+    def test_expression_admission_bounds_and_malformed_inputs(self):
+        for expression in ("MIT" + " " * 4093, " ".join(["MIT"] * 256), "(" * 32 + "MIT" + ")" * 32):
+            self.assertEqual(ORACLE.advisory_category(expression), "Permissive")
+        for expression in ("MIT" + " " * 4094, " ".join(["MIT"] * 257),
+                           "(" * 33 + "MIT" + ")" * 33, " OR ".join(["MIT"] * 100_000),
+                           "MIT!", "MIT & GPL2", "MIT/GPL2", "MIT:GPL2", "M+IT", "MIT++",
+                           "DocumentRef-:LicenseRef-x OR MIT", "DocumentRef-x:LicenseRef- OR MIT",
+                           "DocumentRef-x:LicenseRef-y:z OR MIT", "MIT OR", "MIT WITH",
+                           "MIT WITH OR GPL2", "((MIT)", "MIT)", "MÍT"):
+            self.assertEqual(ORACLE.advisory_category(expression), "Unknown")
+
+    def test_enterprise_text_rejects_missing_extra_duplicate_and_wrong_percentages(self):
+        packages = self.native()
+        correct = ("[License Compliance Scan] 3 total packages\nLicense Inventory\n"
+                   "│ Apache-2.0: 1 assignments (33%)\n│ GPL-3.0-only: 1 assignments (33%)\n"
+                   "│ MIT: 1 assignments (33%)\nPolicy Violations\n"
+                   "│ beta - Copyleft license requires legal review\nUnknown Licenses\n│ gamma\n")
+        ORACLE.check_enterprise_text(correct, packages)
+        bad_reports = [
+            correct.replace("(33%)", "(999%)"),
+            correct.replace("(33%)", "(34%)", 1),
+            correct.replace("Policy Violations\n│ beta - Copyleft license requires legal review\n", ""),
+            correct.replace("Unknown Licenses\n│ gamma\n", ""),
+            correct.replace("│ beta - Copyleft license requires legal review", "│ beta - Copyleft license (GPL) requires legal review"),
+            correct.replace("│ beta - Copyleft license requires legal review", "│ beta - Copyleft license requires legal review\n│ beta - Copyleft license requires legal review"),
+            correct.replace("│ gamma", "│ alpha"),
+            correct.replace("│ gamma", "│ gamma\n│ gamma"),
+            correct.replace("│ gamma", "│ gamma\n│ invented"),
+            correct + "Unknown Licenses\n│ gamma\n",
+            correct + "│ ... and 1 more\n",
+        ]
+        for report in bad_reports:
+            with self.subTest(report=report), self.assertRaises(AssertionError):
+                ORACLE.check_enterprise_text(report, packages)
+        # Actual table decorations must not change the semantic checks.
+        boxed = correct.replace("License Inventory\n", "╭──────────────────╮\n│ License Inventory │\n├──────────────────┤\n")
+        ORACLE.check_enterprise_text(boxed, packages)
+
+    def test_enterprise_text_validates_renderer_limits_and_truncation(self):
+        packages = {f"p{i:02}": ("1", ["GPL2" if i % 2 else "GPL3"]) for i in range(23)}
+        packages.update({f"unknown{i}": ("1", []) for i in range(7)})
+        correct = ("[License Compliance Scan] 30 total packages\nLicense Inventory\n"
+                   "│ GPL2: 11 assignments (48%)\n│ GPL3: 12 assignments (52%)\n"
+                   "Policy Violations\n" + "".join(f"│ p{i:02} - Copyleft license requires legal review\n" for i in range(20))
+                   + "│ ... and 3 more\nUnknown Licenses\n"
+                   + "".join(f"│ unknown{i}\n" for i in range(5)) + "│ ... and 2 more\n")
+        ORACLE.check_enterprise_text(correct, packages)
+        for bad in (correct.replace("... and 3 more", "... and 2 more"),
+                    correct.replace("... and 2 more", "... and 3 more"),
+                    correct.replace("│ ... and 3 more\n", ""),
+                    correct.replace("│ p00 -", "│ invented -"),
+                    correct.replace("│ unknown0\n", "│ unknown1\n")):
+            with self.assertRaises(AssertionError):
+                ORACLE.check_enterprise_text(bad, packages)
+        many = {f"p{i:02}": ("1", [f"LicenseRef-{i:02}"]) for i in range(23)}
+        inventory = ("[License Compliance Scan] 23 total packages\nLicense Inventory\n"
+                     + "".join(f"│ LicenseRef-{i:02}: 1 assignments (4%)\n" for i in range(20))
+                     + "│ ... and 3 more\n")
+        ORACLE.check_enterprise_text(inventory, many)
+        with self.assertRaises(AssertionError):
+            ORACLE.check_enterprise_text(inventory.replace("... and 3 more", "... and 2 more"), many)
+        self.assertEqual(ORACLE.assignment_percentage(1, 8), "12")
+        self.assertEqual(ORACLE.assignment_percentage(3, 8), "38")
+        self.assertEqual(ORACLE.assignment_percentage(1, 3), "33")
+        self.assertEqual(ORACLE.assignment_percentage(2, 3), "67")
 
     def test_symlink_and_world_readable_exports_are_rejected(self):
         native = self.native()

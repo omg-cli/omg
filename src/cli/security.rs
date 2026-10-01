@@ -754,29 +754,14 @@ impl LicenseCategory {
     /// Shared with the enterprise license scan so `omg audit` and
     /// `omg enterprise audit` agree on what counts as copyleft.
     pub(crate) fn from_license(license: &str) -> Self {
-        let tokens = crate::core::security::policy::spdx_license_tokens(license);
-        let mut category = Self::Unknown;
-        for token in &tokens {
-            if token.contains("agpl") {
-                return Self::StrongCopyleft;
-            }
-            if token.contains("gpl") || token.contains("lgpl") || token.contains("mpl") {
-                category = Self::Copyleft;
-                continue;
-            }
-            if token_is_permissive(token) {
-                if category == Self::Unknown {
-                    category = Self::Permissive;
-                }
-                continue;
-            }
-            if (token.contains("proprietary") || token.contains("commercial"))
-                && category == Self::Unknown
-            {
-                category = Self::Proprietary;
-            }
+        use crate::core::security::policy::{LicenseClassification, classify_license_expression};
+        match classify_license_expression(license) {
+            LicenseClassification::Unknown => Self::Unknown,
+            LicenseClassification::Proprietary => Self::Proprietary,
+            LicenseClassification::Permissive => Self::Permissive,
+            LicenseClassification::Copyleft => Self::Copyleft,
+            LicenseClassification::StrongCopyleft => Self::StrongCopyleft,
         }
-        category
     }
 
     fn color(&self) -> String {
@@ -790,12 +775,12 @@ impl LicenseCategory {
     }
 }
 
-fn token_is_permissive(token: &str) -> bool {
-    matches!(
-        token,
-        "mit" | "isc" | "unlicense" | "cc0" | "cc0-1.0" | "0bsd" | "bsd" | "apache"
-    ) || token.starts_with("bsd-")
-        || token.starts_with("apache-")
+/// ALPM's display join is not expression syntax. Normalize only at this
+/// installed-inventory caller, keeping the original metadata for serialization.
+fn installed_license_category(license: &str) -> LicenseCategory {
+    crate::core::security::policy::combined_license_expression(license.split(',').map(str::trim))
+        .as_deref()
+        .map_or(LicenseCategory::Unknown, LicenseCategory::from_license)
 }
 
 type LicenseRow = (String, String, String, LicenseCategory);
@@ -888,7 +873,8 @@ pub fn scan_licenses(
     let installed_count = packages.len();
 
     // Filter by license if specified, categorizing each package once.
-    // `from_license` tokenizes the expression, so it must not be recomputed
+    // Native assignments are combined at this caller, not in the parser.
+    // Classification must not be recomputed
     // separately for the summary, policy check, AND export.
     let filter_terms: Vec<String> = filter
         .map(|f| f.split(',').map(|s| s.trim().to_lowercase()).collect())
@@ -911,7 +897,7 @@ pub fn scan_licenses(
             }
         })
         .map(|(name, license, version)| {
-            let category = LicenseCategory::from_license(&license);
+            let category = installed_license_category(&license);
             (name, license, version, category)
         })
         .collect();
@@ -1778,6 +1764,69 @@ mod tests {
         assert_eq!(spreadsheet_safe_cell("=cmd()"), "'=cmd()");
         assert_eq!(spreadsheet_safe_cell("+1"), "'+1");
         assert_eq!(spreadsheet_safe_cell("normal"), "normal");
+    }
+
+    #[test]
+    fn native_license_assignment_join_keeps_category_and_export_metadata() {
+        // Actual ALPM libidn2 assignment spellings, joined by the inventory caller.
+        let display = ["GPL2", "LGPL3"].join(", ");
+        assert_eq!(
+            LicenseCategory::from_license(&display),
+            LicenseCategory::Unknown
+        );
+        assert_eq!(
+            installed_license_category(&display),
+            LicenseCategory::Copyleft
+        );
+        let rows = vec![(
+            "libidn2".into(),
+            display.clone(),
+            "2.3.8-1".into(),
+            installed_license_category(&display),
+        )];
+        let json: serde_json::Value =
+            serde_json::from_slice(&serialize_license_rows("json", &rows).unwrap()).unwrap();
+        assert_eq!(json[0]["license"], "GPL2, LGPL3");
+        assert_eq!(json[0]["category"], "Copyleft");
+        let csv = String::from_utf8(serialize_license_rows("csv", &rows).unwrap()).unwrap();
+        assert!(csv.contains("libidn2,2.3.8-1,\"GPL2, LGPL3\",Copyleft"));
+        assert_eq!(
+            installed_license_category("MIT, AGPL3+"),
+            LicenseCategory::StrongCopyleft
+        );
+        assert_eq!(
+            installed_license_category("MIT, "),
+            LicenseCategory::Unknown
+        );
+    }
+
+    #[test]
+    fn advisory_identifier_boundaries_and_with_base_are_preserved() {
+        for license in [
+            "LicenseRef-GPL",
+            "Apache-custom",
+            "BSD-custom",
+            "MIT++",
+            "GPL2++",
+            "MIT & GPL2",
+        ] {
+            assert_eq!(
+                LicenseCategory::from_license(license),
+                LicenseCategory::Unknown,
+                "{license}"
+            );
+        }
+        assert_eq!(
+            LicenseCategory::from_license("MIT WITH AGPL-3.0"),
+            LicenseCategory::Permissive
+        );
+        for operator in ["AND", "OR"] {
+            let expression = format!("DocumentRef-x:LicenseRef-private {operator} GPL2");
+            assert_eq!(
+                LicenseCategory::from_license(&expression),
+                LicenseCategory::Copyleft
+            );
+        }
     }
 
     #[test]

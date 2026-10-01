@@ -355,6 +355,79 @@ pub(crate) fn spdx_license_tokens(license: &str) -> Vec<String> {
         .collect()
 }
 
+/// Limited advisory categories, not SPDX validation or legal conclusions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum LicenseClassification {
+    Unknown,
+    Proprietary,
+    Permissive,
+    Copyleft,
+    StrongCopyleft,
+}
+
+/// AND and OR preserve the strongest recognized family; WITH uses its base.
+/// Unknown operands do not erase known families. This category alone does not
+/// report unresolved operands or establish the legal effect of an exception.
+pub(crate) fn classify_license_expression(license: &str) -> LicenseClassification {
+    fn classify(expr: &SpdxExpr) -> LicenseClassification {
+        match expr {
+            SpdxExpr::Id(id) | SpdxExpr::With { id } => classify_license_id(id),
+            SpdxExpr::And(left, right) | SpdxExpr::Or(left, right) => {
+                classify(left).max(classify(right))
+            }
+        }
+    }
+    SpdxParser::parse_expression(license)
+        .as_ref()
+        .map_or(LicenseClassification::Unknown, classify)
+}
+
+fn classify_license_id(id: &str) -> LicenseClassification {
+    use LicenseClassification::{Copyleft, Permissive, Proprietary, StrongCopyleft, Unknown};
+    // Exactly one trailing plus is a recognized native-family alias. Custom
+    // references and arbitrary suffixes never inherit a family from spelling.
+    match id.strip_suffix('+').unwrap_or(id) {
+        "agpl" | "agpl1" | "agpl3" | "agpl-1.0" | "agpl-1.0-only" | "agpl-1.0-or-later"
+        | "agpl-3.0" | "agpl-3.0-only" | "agpl-3.0-or-later" => StrongCopyleft,
+        "gpl"
+        | "gpl1"
+        | "gpl2"
+        | "gpl3"
+        | "lgpl"
+        | "lgpl2"
+        | "lgpl3"
+        | "lgpl2.1"
+        | "gpl-1.0"
+        | "gpl-1.0-only"
+        | "gpl-1.0-or-later"
+        | "gpl-2.0"
+        | "gpl-2.0-only"
+        | "gpl-2.0-or-later"
+        | "gpl-3.0"
+        | "gpl-3.0-only"
+        | "gpl-3.0-or-later"
+        | "lgpl-2.0"
+        | "lgpl-2.0-only"
+        | "lgpl-2.0-or-later"
+        | "lgpl-2.1"
+        | "lgpl-2.1-only"
+        | "lgpl-2.1-or-later"
+        | "lgpl-3.0"
+        | "lgpl-3.0-only"
+        | "lgpl-3.0-or-later"
+        | "mpl"
+        | "mpl-1.0"
+        | "mpl-1.1"
+        | "mpl-2.0"
+        | "mpl-2.0-no-copyleft-exception" => Copyleft,
+        "mit" | "mit-0" | "isc" | "unlicense" | "cc0" | "cc0-1.0" | "0bsd" | "bsd"
+        | "bsd-2-clause" | "bsd-3-clause" | "bsd-4-clause" | "apache" | "apache-1.0"
+        | "apache-1.1" | "apache-2.0" => Permissive,
+        "proprietary" | "commercial" => Proprietary,
+        _ => Unknown,
+    }
+}
+
 /// True when `license` satisfies the allowlist under SPDX expression
 /// semantics: `AND` requires every operand to be allowed, `OR` requires any
 /// one operand to be allowed, and parentheses group sub-expressions. A
@@ -415,7 +488,60 @@ enum SpdxToken {
     Close,
 }
 
-fn spdx_tokenize(license: &str) -> Vec<SpdxToken> {
+// Admission precedes AST construction. The token cap also bounds flat-tree
+// evaluation and recursive destruction, including cleanup of malformed input.
+const MAX_LICENSE_BYTES: usize = 4096;
+const MAX_LICENSE_TOKENS: usize = 256;
+const MAX_LICENSE_NESTING: usize = 32;
+
+fn spdx_identifier_valid(id: &str) -> bool {
+    fn reference_part(part: &str) -> bool {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+    }
+    if let Some((document, license)) = id.split_once(':') {
+        return document
+            .strip_prefix("documentref-")
+            .is_some_and(reference_part)
+            && license
+                .strip_prefix("licenseref-")
+                .is_some_and(reference_part);
+    }
+    let base = id.strip_suffix('+').unwrap_or(id);
+    !base.is_empty()
+        && base
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+}
+
+fn spdx_tokenize(license: &str) -> Option<Vec<SpdxToken>> {
+    if license.len() > MAX_LICENSE_BYTES
+        || license.chars().any(|c| {
+            !(c.is_ascii_alphanumeric()
+                || c.is_ascii_whitespace()
+                || matches!(c, '.' | '-' | '+' | ':' | '(' | ')'))
+        })
+    {
+        return None;
+    }
+    let mut nesting = 0usize;
+    for character in license.chars() {
+        match character {
+            '(' => {
+                nesting += 1;
+                if nesting > MAX_LICENSE_NESTING {
+                    return None;
+                }
+            }
+            ')' => nesting = nesting.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    if nesting != 0 {
+        return None;
+    }
     fn push_word(tokens: &mut Vec<SpdxToken>, word: &mut String) {
         if word.is_empty() {
             return;
@@ -444,12 +570,19 @@ fn spdx_tokenize(license: &str) -> Vec<SpdxToken> {
                 push_word(&mut tokens, &mut word);
                 tokens.push(SpdxToken::Close);
             }
-            c if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+') => word.push(c),
+            c if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | ':') => word.push(c),
             _ => push_word(&mut tokens, &mut word),
         }
     }
     push_word(&mut tokens, &mut word);
-    tokens
+    if tokens.len() > MAX_LICENSE_TOKENS
+        || tokens
+            .iter()
+            .any(|token| matches!(token, SpdxToken::Id(id) if !spdx_identifier_valid(id)))
+    {
+        return None;
+    }
+    Some(tokens)
 }
 
 /// Recursive-descent parser for SPDX expressions with `AND` binding tighter
@@ -463,7 +596,7 @@ struct SpdxParser {
 impl SpdxParser {
     fn parse_expression(license: &str) -> Option<SpdxExpr> {
         let mut parser = Self {
-            tokens: spdx_tokenize(license),
+            tokens: spdx_tokenize(license)?,
             pos: 0,
         };
         let expr = parser.parse_or()?;
@@ -545,11 +678,23 @@ impl SpdxParser {
 pub fn combined_license_expression<'a>(
     licenses: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
-    let entries = licenses
-        .into_iter()
-        .map(|license| format!("({license})"))
-        .collect::<Vec<_>>();
-    (!entries.is_empty()).then(|| entries.join(" AND "))
+    let mut expression = String::new();
+    for license in licenses {
+        let separator = if expression.is_empty() { "" } else { " AND " };
+        let length = expression
+            .len()
+            .checked_add(separator.len())?
+            .checked_add(license.len())?
+            .checked_add(2)?;
+        if length > MAX_LICENSE_BYTES {
+            return None;
+        }
+        expression.push_str(separator);
+        expression.push('(');
+        expression.push_str(license);
+        expression.push(')');
+    }
+    (!expression.is_empty()).then_some(expression)
 }
 
 pub fn require_native_plan_support(backend: &str) -> anyhow::Result<()> {
@@ -632,6 +777,237 @@ mod tests {
                 .is_ok()
         );
         assert!(combined_license_expression(std::iter::empty()).is_none());
+    }
+
+    #[test]
+    fn advisory_family_aliases_have_exact_case_and_one_plus_boundaries() {
+        use LicenseClassification::{Copyleft, Permissive, Proprietary, StrongCopyleft, Unknown};
+        let families = [
+            (
+                StrongCopyleft,
+                vec![
+                    "AGPL",
+                    "AGPL1",
+                    "AGPL3",
+                    "AGPL-1.0",
+                    "AGPL-1.0-only",
+                    "AGPL-1.0-or-later",
+                    "AGPL-3.0",
+                    "AGPL-3.0-only",
+                    "AGPL-3.0-or-later",
+                ],
+            ),
+            (
+                Copyleft,
+                vec![
+                    "GPL",
+                    "GPL1",
+                    "GPL2",
+                    "GPL3",
+                    "LGPL",
+                    "LGPL2",
+                    "LGPL3",
+                    "LGPL2.1",
+                    "GPL-1.0",
+                    "GPL-1.0-only",
+                    "GPL-1.0-or-later",
+                    "GPL-2.0",
+                    "GPL-2.0-only",
+                    "GPL-2.0-or-later",
+                    "GPL-3.0",
+                    "GPL-3.0-only",
+                    "GPL-3.0-or-later",
+                    "LGPL-2.0",
+                    "LGPL-2.0-only",
+                    "LGPL-2.0-or-later",
+                    "LGPL-2.1",
+                    "LGPL-2.1-only",
+                    "LGPL-2.1-or-later",
+                    "LGPL-3.0",
+                    "LGPL-3.0-only",
+                    "LGPL-3.0-or-later",
+                    "MPL",
+                    "MPL-1.0",
+                    "MPL-1.1",
+                    "MPL-2.0",
+                    "MPL-2.0-no-copyleft-exception",
+                ],
+            ),
+            (
+                Permissive,
+                vec![
+                    "MIT",
+                    "MIT-0",
+                    "ISC",
+                    "Unlicense",
+                    "CC0",
+                    "CC0-1.0",
+                    "0BSD",
+                    "BSD",
+                    "BSD-2-Clause",
+                    "BSD-3-Clause",
+                    "BSD-4-Clause",
+                    "Apache",
+                    "Apache-1.0",
+                    "Apache-1.1",
+                    "Apache-2.0",
+                ],
+            ),
+            (Proprietary, vec!["Proprietary", "Commercial"]),
+        ];
+        for (category, identifiers) in families {
+            for id in identifiers {
+                for spelling in [
+                    id.to_owned(),
+                    id.to_ascii_lowercase(),
+                    id.to_ascii_uppercase(),
+                ] {
+                    assert_eq!(
+                        classify_license_expression(&spelling),
+                        category,
+                        "{spelling}"
+                    );
+                    assert_eq!(
+                        classify_license_expression(&format!("{spelling}+")),
+                        category
+                    );
+                    assert_eq!(
+                        classify_license_expression(&format!("{spelling}++")),
+                        Unknown
+                    );
+                    assert_eq!(
+                        classify_license_expression(&format!("{spelling}-custom")),
+                        Unknown
+                    );
+                }
+            }
+        }
+        for id in [
+            "LicenseRef-GPL",
+            "LicenseRef-Proprietary",
+            "Apache-custom",
+            "BSD-custom",
+            "GPL4",
+            "AGPL2",
+            "LGPL2.0",
+            "SSPL-1.0",
+            "BUSL-1.1",
+            "Elastic-2.0",
+        ] {
+            assert_eq!(classify_license_expression(id), Unknown, "{id}");
+        }
+    }
+
+    #[test]
+    fn advisory_unknown_references_and_exception_operands_do_not_invent_families() {
+        use LicenseClassification::{Copyleft, Permissive, StrongCopyleft, Unknown};
+        assert_eq!(classify_license_expression("MIT WITH AGPL-3.0"), Permissive);
+        assert_eq!(
+            classify_license_expression("GPL2 WITH LicenseRef-exception"),
+            Copyleft
+        );
+        assert_eq!(
+            classify_license_expression("DocumentRef-x:LicenseRef-GPL"),
+            Unknown
+        );
+        let allowed = &["MIT".to_owned()];
+        for reference in ["LicenseRef-private", "DocumentRef-x.1:LicenseRef-private"] {
+            for operator in ["AND", "OR"] {
+                assert_eq!(
+                    classify_license_expression(&format!("{reference} {operator} GPL2")),
+                    Copyleft
+                );
+                assert_eq!(
+                    classify_license_expression(&format!("MIT {operator} {reference}")),
+                    Permissive
+                );
+                assert_eq!(
+                    classify_license_expression(&format!("{reference} {operator} AGPL3+")),
+                    StrongCopyleft
+                );
+            }
+            assert!(!license_matches_allowlist(
+                &format!("MIT AND {reference}"),
+                allowed
+            ));
+            assert!(license_matches_allowlist(
+                &format!("MIT OR {reference}"),
+                allowed
+            ));
+        }
+        assert!(license_matches_allowlist("MIT WITH AGPL-3.0", allowed));
+        assert!(license_matches_allowlist("MIT GPL2", allowed));
+    }
+
+    #[test]
+    fn expression_lexical_admission_rejects_unsupported_punctuation() {
+        for expression in [
+            "MIT!",
+            "MIT & GPL2",
+            "MIT, GPL2",
+            "MIT/GPL2",
+            "MIT:GPL2",
+            "DocumentRef-:LicenseRef-x OR MIT",
+            "DocumentRef-x:LicenseRef- OR MIT",
+            "DocumentRef-x:LicenseRef-y:z OR MIT",
+            "MIT++",
+            "M+IT",
+            "MIT OR",
+            "MIT WITH",
+            "MIT WITH OR GPL2",
+            "((MIT)",
+            "MIT)",
+            "MÍT",
+        ] {
+            assert_eq!(
+                classify_license_expression(expression),
+                LicenseClassification::Unknown,
+                "{expression}"
+            );
+            assert!(
+                !license_matches_allowlist(expression, &["MIT".into(), "GPL2".into()]),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn expression_admission_bounds_grouped_flat_and_malformed_cleanup() {
+        let allowed = &["MIT".to_owned()];
+        let at_bytes = format!("MIT{}", " ".repeat(MAX_LICENSE_BYTES - 3));
+        let at_tokens = vec!["MIT"; MAX_LICENSE_TOKENS].join(" ");
+        let at_nesting = format!(
+            "{}MIT{}",
+            "(".repeat(MAX_LICENSE_NESTING),
+            ")".repeat(MAX_LICENSE_NESTING)
+        );
+        for expression in [&at_bytes, &at_tokens, &at_nesting] {
+            assert_eq!(
+                classify_license_expression(expression),
+                LicenseClassification::Permissive
+            );
+            assert!(license_matches_allowlist(expression, allowed));
+        }
+        let huge_flat = vec!["MIT"; 100_000].join(" OR ");
+        let huge_grouped = format!("{}MIT{}", "(".repeat(100_000), ")".repeat(100_000));
+        for expression in [
+            format!("{at_bytes} "),
+            format!("{at_tokens} MIT"),
+            format!("({at_nesting})"),
+            format!("{at_tokens} AND"),
+            huge_flat,
+            huge_grouped,
+        ] {
+            assert_eq!(
+                classify_license_expression(&expression),
+                LicenseClassification::Unknown
+            );
+            assert!(!license_matches_allowlist(&expression, allowed));
+        }
+        // Parsing can fail after constructing a bounded partial flat tree.
+        let malformed = format!("{} AND", vec!["MIT"; 127].join(" AND "));
+        assert!(!license_matches_allowlist(&malformed, allowed));
+        assert!(combined_license_expression([at_bytes.as_str()]).is_none());
     }
 
     #[test]
