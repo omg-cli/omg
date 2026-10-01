@@ -1019,8 +1019,30 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
                           'if command -v makepkg >/dev/null; then echo "  Optional tool available: makepkg"; '
                           'else echo "  Optional tool unavailable: makepkg (Arch AUR builds)"; fi; fi\n')
         healthy_product = healthy_prefix + 'printf "  PATH configured correctly\\nSystem is healthy with warnings.\\n"\n'
-        fault_guard = ('if [[ -n "${OMG_PACMAN_DB_DIR:-}" ]]; then '
-                       'printf "  ALPM local package database inconsistent (fixture): missing files\\n"; exit 1; fi\n')
+        fault_guard = '''graph_db=${OMG_PACMAN_DB_DIR:-}
+if [[ -z "$graph_db" && -n "${OMG_PACMAN_CONF:-}" ]]; then
+  graph_db=$(sed -n 's/^DBPath = //p' "$OMG_PACMAN_CONF")
+fi
+case "$graph_db" in
+  */graph-db/healthy)
+    printf '  ALPM local package database (%s/local, 1 packages verified)\\nSystem is healthy with warnings.\\n' "$graph_db"
+    exit 0 ;;
+  */graph-db/dependency)
+    printf '  ALPM native database check failed (%s/local)\\n  ALPM dependency unsatisfied: first requires omg-fixture-unavailable>=99\\n' "$graph_db"
+    printf 'Error: doctor found 1 health issue(s)\\n' >&2
+    exit 1 ;;
+  */graph-db/conflict|*/graph-db/ownership)
+    printf '  ALPM native database check failed (%s/local)\\n' "$graph_db"
+    printf 'Error: doctor found 1 health issue(s)\\n' >&2
+    exit 1 ;;
+  */graph-db/malformed)
+    printf '  ALPM local package database inconsistent (%s/local): missing files\\n' "$graph_db"
+    printf 'Error: doctor found 1 health issue(s)\\n' >&2
+    exit 1 ;;
+  '') ;;
+  *) printf '  ALPM local package database inconsistent (fixture): missing files\\n'; exit 1 ;;
+esac
+'''
         proxy_logic = ('if [[ "${HTTPS_PROXY:-}" == http://127.0.0.1:1 ]]; then\n'
                    '  printf "  Connectivity probes failed (controlled proxy refusal)\\n"\n'
                    '  resolved=$(command -v omg || true)\n'
@@ -2112,7 +2134,7 @@ python3 - "$8" <<'PY'
 import json, pathlib, sys
 records = [json.loads(line) for line in pathlib.Path('audit-log-data/audit/audit.jsonl').read_text(encoding='utf-8').splitlines()]
 output = pathlib.Path(sys.argv[1])
-output.write_text(json.dumps([records[i] for i in (5, 4, 2)]))
+output.write_text(json.dumps([dict(records[i], hash_version=0) for i in (5, 4, 2)]))
 output.chmod(0o600)
 PY
 printf 'OMG Exporting audit log to %s...\\n✓ Export successful\\n' "$8"
@@ -2125,6 +2147,8 @@ printf 'OMG Exporting audit log to %s...\\n✓ Export successful\\n' "$8"
             ('cp audit-log-data/audit/audit.jsonl "$8"\n', 'FAIL'),
             ('printf changed >> audit-log-data/audit/audit.jsonl\n', 'FAIL'),
             ("python3 -c \"import json,pathlib; p=pathlib.Path('audit-log-export.json'); r=json.loads(p.read_text(encoding='utf-8')); p.write_text(json.dumps(r[::-1]))\"\n", 'FAIL'),
+            ("python3 -c \"import json,pathlib; p=pathlib.Path('audit-log-export.json'); r=json.loads(p.read_text(encoding='utf-8')); r[0].pop('hash_version'); p.write_text(json.dumps(r))\"\n", 'FAIL'),
+            ("python3 -c \"import json,pathlib; p=pathlib.Path('audit-log-export.json'); r=json.loads(p.read_text(encoding='utf-8')); r[0]['hash_version']=1; p.write_text(json.dumps(r))\"\n", 'FAIL'),
         ):
             with self.subTest(mutation=mutation):
                 result, evidence, logs = self.run_inventory(product + mutation, [row])
