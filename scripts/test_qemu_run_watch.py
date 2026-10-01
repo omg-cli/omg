@@ -67,7 +67,6 @@ FAKE_WATCHER = textwrap.dedent("""\
     """)
 
 
-@unittest.skipIf(os.name != "posix", "PTY helper requires POSIX")
 class RunWatchCheck(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="omg-qemu-watch-test-")

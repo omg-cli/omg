@@ -383,6 +383,7 @@ fn needs_isolated_fixture(case: &BehaviorCase) -> bool {
             | "env-share-missing-lock"
             | "ci-init"
             | "ci-init-advanced"
+            | "enterprise-audit-export-flags"
     )
 }
 
@@ -1561,6 +1562,11 @@ fn behavior_inventory_runs_in_hermetic_state() {
         let empty_environment =
             needs_isolated_fixture(&case).then(|| TestProject::for_distro("arch"));
         let project = empty_environment.as_ref().unwrap_or(&project);
+        if case.id == "enterprise-audit-export-flags" {
+            project
+                .mock_install("pacman", "7.0.0-1")
+                .expect("seed explicit enterprise export package inventory");
+        }
         let root = project.path().to_string_lossy().into_owned();
         let expanded_args: Vec<String> = case
             .args
@@ -1877,7 +1883,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                     let precise = if matches!(assertion, Assertion::WorkspaceMissingTask) {
                         result.stdout.contains("→ Task 'true' not found, trying 'make true'...")
                             && result.stdout.contains("  ✗ 'omg run true' in '.' exited with code 1")
-                            && result.stdout.lines().any(|line| line == "✗ 0 succeeded, 1 failed")
+                            && result.stdout.lines().any(|line| line == "⚠ 0 succeeded, 1 failed")
                             && result.stderr.lines().any(|line| line == "Error: 1 project(s) failed to run 'true'")
                             && result.stderr.contains("No rule to make target 'true'.")
                     } else {
@@ -2122,15 +2128,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
                     let private_files = files.as_ref().is_some_and(|entries| {
                         entries.len() == expected.len() && entries.iter().all(|entry| {
                             entry.metadata().is_ok_and(|metadata| {
-                                // `& 0o077` is the readable way to say "no group or
-                                // other permission bits"; clippy suggests a
-                                // trailing_zeros comparison that reads worse. The same
-                                // form is used in src/cli/config.rs and src/core/paths.rs.
-                                #[allow(clippy::verbose_bit_mask)]
-                                {
-                                    metadata.is_file()
-                                        && metadata.permissions().mode() & 0o077 == 0
-                                }
+                                metadata.is_file()
+                                    && metadata.permissions().mode().trailing_zeros() >= 6
                             }) && entry.file_type().is_ok_and(|kind| kind.is_file())
                         })
                     });
@@ -2146,14 +2145,20 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         && json("policy-enforcement.json").is_some_and(|value| value.is_object())
                         && json("sbom-inventory.json").is_some_and(|value| {
                             value["bomFormat"] == "CycloneDX"
-                                && value["components"].as_array().is_some_and(|items| !items.is_empty())
+                                && value["components"].as_array().is_some_and(|items| {
+                                    items.len() == 1 && items[0]["name"] == "pacman"
+                                        && items[0]["version"] == "7.0.0-1"
+                                })
                         })
                         && csv::Reader::from_path(directory.join("installed-packages.csv"))
                             .ok().is_some_and(|mut reader| {
                                 reader.headers().is_ok_and(|headers| {
                                     headers.iter().collect::<Vec<_>>()
                                         == ["package", "version", "description"]
-                                }) && reader.records().next().is_some_and(|record| record.is_ok())
+                                }) && reader.records().collect::<Result<Vec<_>, _>>()
+                                    .is_ok_and(|records| records.len() == 1
+                                        && records[0].get(0) == Some("pacman")
+                                        && records[0].get(1) == Some("7.0.0-1"))
                             });
                     if actual.as_ref().map(|files| files.iter().map(String::as_str).collect::<BTreeSet<_>>())
                         != Some(expected) || !private_files || !contents

@@ -1136,7 +1136,7 @@ check_workspace_failure() {
     workspace-missing-task)
       grep -Fxq "→ Task 'true' not found, trying 'make true'..." "$stdout" \
         && grep -Fxq "  ✗ 'omg run true' in '.' exited with code 1" "$stdout" \
-        && grep -Fxq '✗ 0 succeeded, 1 failed' "$stdout" \
+        && grep -Fxq '⚠ 0 succeeded, 1 failed' "$stdout" \
         && grep -Fxq "Error: 1 project(s) failed to run 'true'" "$stderr" \
         && grep -Fq "No rule to make target 'true'." "$stderr" ;;
     workspace-missing-lock)

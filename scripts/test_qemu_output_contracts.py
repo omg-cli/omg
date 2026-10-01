@@ -13,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
-    @unittest.skipIf(os.name == 'nt', 'PTY inventory fixture requires POSIX')
     def test_run_watch_row_uses_bounded_source_edit_and_receipt(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         row = next(line for line in inventory.splitlines() if line.startswith('run-watch\t'))
@@ -34,7 +33,6 @@ while :; do sleep .05; done
         self.assertEqual(result.returncode, 0, logs)
         self.assertEqual(evidence[0]['result'], 'PASS', logs)
 
-    @unittest.skipIf(os.name == 'nt', 'Guest oracle needs POSIX Bash and Python 3')
     def test_golden_path_oracle_rejects_false_success_and_stale_state(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         oracle = source[source.index('check_golden_path_state() {'):
@@ -352,7 +350,6 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
                     self.assertEqual(evidence[0]['result'], expected, logs)
                     self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
 
-    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_container_shell_and_build_require_exact_fake_engine_argv(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         for case, operation, correct, faults in (
@@ -433,7 +430,6 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
                 self.assertEqual([row['result'] for row in evidence], expected, logs)
                 self.assertEqual(result.returncode, int(expected != ['PASS', 'PASS']), result.stderr)
 
-    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_workspace_list_and_remove_reject_false_green_results(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         rows = [line for line in inventory.splitlines()
@@ -469,7 +465,6 @@ esac
                 self.assertEqual([row['result'] for row in evidence], expected, logs)
                 self.assertEqual(result.returncode, int('FAIL' in expected), result.stderr)
 
-    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_container_init_requires_scaffold_and_final_secret_exclusions(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         row = next(line for line in inventory.splitlines() if line.startswith('container-init\t'))
@@ -1988,7 +1983,6 @@ esac
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
-    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_generated_man_pages_require_real_content_and_matching_count(self):
         row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
                    if line.startswith('generate-man\t'))
@@ -2031,7 +2025,6 @@ printf 'Generated {len(pages)} man pages\\n'
         result, evidence, logs = self.run_inventory(legacy_product, [row], exact_man=True)
         self.assertEqual((result.returncode, evidence[0]['result']), (1, 'FAIL'), logs)
 
-    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_absolute_path_exports_refuse_without_evidence(self):
         rows = [line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
                 if line.startswith(('audit-export\t', 'audit-export-flags\t',
@@ -2056,7 +2049,6 @@ exit 70
                     self.assertEqual(evidence[0]['result'], expected, logs)
                     self.assertEqual(result.returncode, int(expected == 'FAIL'))
 
-    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_enterprise_export_requires_five_private_evidence_files(self):
         row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
                    if line.startswith('enterprise-audit-export-flags\t'))
@@ -2089,7 +2081,6 @@ exit 1
                 self.assertEqual(evidence[0]['result'], expected, logs)
                 self.assertEqual(result.returncode, int(expected == 'FAIL'))
 
-    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_team_compliance_refusal_never_writes_an_unevaluated_report(self):
         rows = [line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
                 if line.startswith(('team-init\t', 'team-compliance-export\t'))]
@@ -2112,7 +2103,6 @@ exit 1
                 self.assertEqual([item['result'] for item in evidence], ['PASS', expected], logs)
                 self.assertEqual(result.returncode, int(expected == 'FAIL'))
 
-    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_audit_log_export_rejects_unfiltered_stale_or_nonprivate_records(self):
         row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
                    if line.startswith('audit-log-flags\t'))
@@ -2143,7 +2133,6 @@ printf 'OMG Exporting audit log to %s...\\n✓ Export successful\\n' "$8"
         result, evidence, logs = self.run_inventory('exit 0\n', [row])
         self.assertEqual((result.returncode, evidence[0]['result']), (1, 'FAIL'), logs)
 
-    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_negative_workspace_rows_reject_unrelated_failures_and_state_changes(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
         prereqs = [line for line in inventory if line.startswith(('workspace-init\t', 'workspace-add\t'))]
@@ -2154,7 +2143,7 @@ add) printf '[projects.fixture]\\npath = "."\\ndepends_on = []\\n' >> omg-worksp
 esac
 '''
         products = {
-            'workspace-run': '''printf "%s\\n" "→ Task 'true' not found, trying 'make true'..." "  ✗ 'omg run true' in '.' exited with code 1" '✗ 0 succeeded, 1 failed'
+            'workspace-run': '''printf "%s\\n" "→ Task 'true' not found, trying 'make true'..." "  ✗ 'omg run true' in '.' exited with code 1" '⚠ 0 succeeded, 1 failed'
 printf "%s\\n" "make: *** No rule to make target 'true'.  Stop." "Error: 1 project(s) failed to run 'true'" >&2
 ''',
             'workspace-check': '''printf '  ⚠ needs attention\\n'
