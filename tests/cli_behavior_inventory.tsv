@@ -214,3 +214,4 @@ runtime-go-list-installed	["list","go","--json"]	read	0	pass	-	container	arch:pa
 runtime-node-switch-installed	["use","node","v24.21.0"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop
 runtime-python-switch-installed	["use","python","v3.12.14"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop
 runtime-go-switch-installed	["use","go","v1.27.1"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop
+runtime-rust-install	["use","rust","1.85.0"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-rust-installed	tempdir-drop
