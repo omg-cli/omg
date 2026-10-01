@@ -590,6 +590,7 @@ if [[ -n "$inventory_tiers" ]]; then
   cp "$here/qemu-container-fake-engine.sh" "$work/qemu-container-fake-engine.sh"
   cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
+  cp "$here/qemu-rust-install-oracle.py" "$work/qemu-rust-install-oracle.py"
   cp "$here/qemu-arch-update-fixture.sh" "$work/qemu-arch-update-fixture.sh"
   cp "$here/qemu-fedora-update-fixture.sh" "$work/qemu-fedora-update-fixture.sh"
   cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"

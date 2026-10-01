@@ -766,6 +766,7 @@ enum Assertion {
     RuntimeVersionRemoved,
     RuntimeListState,
     RuntimeSwitchState,
+    RuntimeRustInstalled,
     TaskExecuted,
     ParallelTasksExecuted,
     AllTasksExecuted,
@@ -850,6 +851,7 @@ impl Assertion {
             "runtime-version-removed" => Self::RuntimeVersionRemoved,
             "runtime-list-state" => Self::RuntimeListState,
             "runtime-switch-state" => Self::RuntimeSwitchState,
+            "runtime-rust-installed" => Self::RuntimeRustInstalled,
             "task-executed" => Self::TaskExecuted,
             "parallel-tasks-executed" => Self::ParallelTasksExecuted,
             "all-tasks-executed" => Self::AllTasksExecuted,
@@ -2240,6 +2242,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::RuntimeVersionRemoved
                 | Assertion::RuntimeListState
                 | Assertion::RuntimeSwitchState
+                | Assertion::RuntimeRustInstalled
                 // Test mode always opts out, so only the real guest can prove
                 // enabled privacy status after opt-in.
                 | Assertion::PrivacyStatusEnabled => {

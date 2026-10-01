@@ -1428,7 +1428,7 @@ out="$root/inventory"
 # Refuse to overwrite evidence from a previous invocation.
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" > "$out/input-sha256.txt"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-rust-install-oracle.py" > "$out/input-sha256.txt"
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
   '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
@@ -1523,7 +1523,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv) ;; *) exit 2 ;; esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
     jq -e '. == ["run", "smoke", "--using", "make"]' <<< "$aj" >/dev/null || exit 2
@@ -1594,6 +1594,12 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
         '. == ["use", $runtime, (if $runtime == "node" then "24.21.0" elif $runtime == "python" then "3.12.14" else "1.27.1" end), "--uninstall"]' <<< "$aj" >/dev/null || exit 2 ;;
     *) [[ "$a" != runtime-version-removed ]] || exit 2 ;;
   esac
+  if [[ "$id" == runtime-rust-install ]]; then
+    [[ "$a" == runtime-rust-installed && "$s" == isolated-write && "$resolved" == 0 && "$t" == container && "$r" == - && "$cleanup" == tempdir-drop ]] || exit 2
+    jq -e '. == ["use","rust","1.85.0"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == runtime-rust-installed ]]; then
+    exit 2
+  fi
   case "$id" in
     runtime-node-list-installed|runtime-python-list-installed|runtime-go-list-installed|runtime-node-switch-installed|runtime-python-switch-installed|runtime-go-switch-installed)
       runtime=${id#runtime-}; runtime=${runtime%%-*}
@@ -1950,6 +1956,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == runtime-python-install || "$case" == runtime-go-install ]]; then
     command_timeout=$((row_timeout * 3))
   fi
+  if [[ "$case" == runtime-rust-install ]]; then
+    # Rust's default profile downloads six sequential component archives.
+    # Allocate one base archive allowance each plus its 30s manifest bound.
+    command_timeout=$((row_timeout * 6 + 30))
+  fi
   # dnf5 cacheonly=metadata reuses repository metadata and still downloads
   # packages (dnf5-caching(7); cached_update_args). Run 35694347149 downloaded
   # 256 MiB and was killed at dnf step 419/420 when the 120s deadline
@@ -1980,6 +1991,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     runtime_version=$(jq -r '.[2]' <<< "$args_json")
     runtime_name=$(jq -r '.[1]' <<< "$args_json")
     remote+="; umask 0002; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install"); $(declare -f check_runtime_usage)"
+  fi
+  if [[ "$case" == runtime-rust-install ]]; then
+    rust_oracle=$(jq -rn --rawfile fixture "$(dirname "$0")/qemu-rust-install-oracle.py" '$fixture | @sh')
+    remote+="; printf '%s' $rust_oracle > qemu-rust-install-oracle.py; python3 qemu-rust-install-oracle.py prepare \"\$rowdir\"; rust_parent_home=\"\$HOME\"; export HOME=\"\$rowdir/runtime-home\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0 OMG_DISABLE_DAEMON=1"
   fi
   if [[ "$assertions" == runtime-version-removed ]]; then
     runtime_name=${case#runtime-}; runtime_name=${runtime_name%-uninstall}
@@ -2141,6 +2156,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == runtime-version-removed ]]; then
     remote+="; if [ \"\$rc\" = 0 ] && ! check_runtime_uninstall '$runtime_name' '$runtime_version'; then assertion=1; fi"
   fi
+  if [[ "$case" == runtime-rust-install ]]; then
+    remote+="; if [ \"\$rc\" = 0 ] && ! timeout --kill-after=5s '$row_timeout' python3 qemu-rust-install-oracle.py check \"\$rowdir\"; then assertion=1; fi; export HOME=\"\$rust_parent_home\""
+  fi
   if [[ "$assertions" == runtime-list-state || "$assertions" == runtime-switch-state ]]; then
     remote+="; if [ \"\$rc\" = 0 ] && ! check_runtime_state '$runtime_name' '$runtime_version' '$runtime_active' '$assertions' command.stdout.log; then assertion=1; fi"
   fi
@@ -2173,6 +2191,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   start_centis=${uptime/./}
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
+  if [[ "$case" == runtime-rust-install ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ "$assertions" == doctor-native-backend ]]; then
     # Four PATH variants plus the minimal-PATH run; Arch also exercises a
