@@ -132,7 +132,8 @@ def run(binary_name, distro):
     source_id = Path("/etc/os-release").read_text().splitlines()
     if not any(line == f"ID={distro}" or line == f'ID="{distro}"' for line in source_id):
         raise RuntimeError("guest /etc/os-release does not match requested distribution")
-    if not shutil.which("strace") or not shutil.which("mount") or not shutil.which("setpriv"):
+    tracer = "/opt/omg-qemu-strace/bin/strace" if distro == "debian" else shutil.which("strace")
+    if not tracer or not os.access(tracer, os.X_OK) or not shutil.which("mount") or not shutil.which("setpriv"):
         raise RuntimeError("backend mismatch fixture requires strace, mount, and setpriv")
 
     root = Path(tempfile.mkdtemp(prefix="omg-backend-mismatch-", dir=account.pw_dir))
@@ -159,17 +160,18 @@ def run(binary_name, distro):
                   "--clear-groups", "--no-new-privs", "--bounding-set=-all",
                   "--inh-caps=-all", "--ambient-caps=-all"]
         trace_probe = subprocess.run(
-            ["strace", "--kill-on-exit", "-f", "-qq", "-yy", "-e", "trace=execve,%file", "-o", str(trace_probe_path)]
+            [tracer, "--kill-on-exit", "-f", "-qq", "-yy", "-e", "trace=execve,%file", "-o", str(trace_probe_path)]
             + prefix + ["/usr/bin/true"], env=env, cwd=root, capture_output=True,
             text=True, timeout=10, check=False)
         if (trace_probe.returncode != 0 or not trace_probe_path.is_file()
                 or 'execve("/usr/bin/true"' not in trace_probe_path.read_text()):
-            raise RuntimeError("strace fixture cannot trace a privilege-dropped command")
+            raise RuntimeError("strace fixture cannot trace a privilege-dropped command: "
+                               f"exit={trace_probe.returncode}, stderr={trace_probe.stderr[-4096:]}")
         expected_feature = FAKE_ID[distro]
         for name, args in PROBES:
             command = [str(daemon if name == "omgd" else binary), *args]
             trace = root / f"{name}.trace"
-            argv = ["strace", "--kill-on-exit", "-f", "-qq", "-yy", "-e", "trace=execve,%file", "-o", str(trace)]
+            argv = [tracer, "--kill-on-exit", "-f", "-qq", "-yy", "-e", "trace=execve,%file", "-o", str(trace)]
             argv += prefix + command
             command_env = env.copy()
             if name == "omgd":
