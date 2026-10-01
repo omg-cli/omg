@@ -2776,11 +2776,28 @@ mod tests {
     #[test]
     fn health_observation_rejects_unreadable_declaring_entry() {
         use std::os::unix::fs::PermissionsExt;
+        if crate::config::Settings::rerun_test_unprivileged(
+            "package_managers::pacman_db::db::tests::health_observation_rejects_unreadable_declaring_entry",
+        ) {
+            return;
+        }
+        let uid = nix::unistd::geteuid().as_raw();
+        assert_ne!(
+            uid, 0,
+            "permission fixture must execute without root DAC bypass"
+        );
         let temp = health_fixture();
-        assert_eq!(fs::metadata(temp.path()).unwrap().uid(), 1000);
+        assert_eq!(fs::metadata(temp.path()).unwrap().uid(), uid);
         let path = temp.path().join("app/desc");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
-        assert!(check_local_db_health(temp.path()).is_err());
+        let error = check_local_db_health(temp.path()).unwrap_err();
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "production health read must preserve PermissionDenied: {error:#}"
+        );
+        println!("[omg-alpm-permission] uid={uid} fixture_owner={uid} cause={error:#}");
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
