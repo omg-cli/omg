@@ -1,6 +1,6 @@
-# Coverage is a ratchet, not a target: the project status compares against the
-# base commit, so coverage can only go up. Uploads stay non-fatal in
-# .github/workflows/coverage.yml, so a Codecov outage can never block a merge.
+# Codecov's project status compares coverage with the base commit. The required
+# GitHub coverage job separately enforces both LLVM summary and mapped-line
+# coverage against the exact base artifact, including when Codecov is unavailable.
 coverage:
   status:
     project:
