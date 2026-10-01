@@ -1,5 +1,7 @@
 # Security and quality TODO
 
+> Historical audit plan from the September 3, 2026 slices. Checkboxes and source line references describe the recorded audit state; they do not establish current behavior or completion. See the [current documentation index](docs/index.md) for supported behavior and the [open issue backlog](https://github.com/omg-cli/omg/issues) for active work. The original plan remains below for provenance.
+
 Source. Five slice audits from 2026-09-03. Each item cites the file and the line that proves it. Work the phases in order. Deletions come before additions.
 
 Counts at this commit. Run `find src -name '*.rs' | wc -l` to regenerate. Run `find . -name '*.ts' -not -path '*/node_modules/*' -not -path './target/*'` to recheck the TypeScript surface. That command returns zero files. EffectTS has no surface here.
