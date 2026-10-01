@@ -2542,11 +2542,6 @@ mod install_tests {
         #[cfg(feature = "arch")]
         let proxy = crate::recovery_fixture::RejectedProxy::new();
         #[cfg(feature = "arch")]
-        crate::recovery_fixture::seed_missing_aur_index(
-            &project,
-            "package-that-definitely-does-not-exist-12345",
-        );
-        #[cfg(feature = "arch")]
         let environment = proxy.env();
         #[cfg(not(feature = "arch"))]
         let environment = Vec::new();
@@ -2561,6 +2556,8 @@ mod install_tests {
         #[cfg(feature = "arch")]
         assert_eq!(proxy.requests(), 0, "offline missing lookup contacted RPC");
         assert_eq!(result.exit_code, 1, "{}", result.combined_output());
+        #[cfg(feature = "arch")]
+        result.assert_stderr_contains("Package 'package-that-definitely-does-not-exist-12345' not found. Suggestion: use 'omg search' to check available package names");
         assert!(!result.combined_output().contains("transport failed"));
         project.close_checked();
         result.assert_failure();
