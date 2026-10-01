@@ -20,6 +20,30 @@ SPEC.loader.exec_module(NATIVE)
 
 
 class WholeSuiteAdmission(unittest.TestCase):
+    def test_ubuntu_2604_requires_native_apt_candidate_execution(self):
+        workflow = (Path(__file__).resolve().parents[1]
+                    / '.github/workflows/ci.yml').read_text()
+        lane = workflow.split('- platform: ubuntu-2604\n', 1)[1]
+        platform_id = lane.split('contract_platform:', 1)[1].splitlines()[0].strip()
+        self.assertEqual(platform_id, 'ubuntu')
+        identity = 'omg::debian_tests::debian_specific::test_debian_stable_packages'
+        execution = {'counts': {'selected': 2, 'passed': 1, 'failed': 0, 'retried': 0},
+                     'tests': {identity: {'selection_state': 'selected', 'runtime_skip': True,
+                                          'runtime_skip_reason': 'requires Debian',
+                                          'attempts': [{'result': 'SKIPPED'}]}}}
+        with patch.dict(os.environ, {'OMG_CONTRACT_PLATFORM': platform_id}):
+            with self.assertRaisesRegex(ValueError, 'unexplained native runtime skip'):
+                NATIVE.admission_exit_code(0, execution, True)
+            executed = copy.deepcopy(execution)
+            executed['counts']['passed'] = 2
+            executed['tests'][identity].update(
+                runtime_skip=False, runtime_skip_reason=None,
+                attempts=[{'result': 'PASS'}])
+            self.assertEqual(NATIVE.admission_exit_code(0, executed, True), 0)
+        with patch.dict(os.environ, {'OMG_CONTRACT_PLATFORM': 'debian-trixie'}):
+            with self.assertRaisesRegex(ValueError, 'unexplained native runtime skip'):
+                NATIVE.admission_exit_code(0, execution, True)
+
     def test_unmapped_first_failure_survives_a_successful_retry(self):
         binary = 'omg::unmapped'
         listing = {'test-count': 1, 'rust-suites': {binary: {

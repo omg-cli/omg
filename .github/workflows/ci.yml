@@ -269,7 +269,7 @@ jobs:
           # APT 7 integration must also pass on Ubuntu itself. This lane does
           # not produce another release archive.
           - platform: ubuntu-2604
-            contract_platform: debian-trixie
+            contract_platform: ubuntu
             image: ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78
             features: debian,pgp,license
             setup: |

@@ -127,6 +127,8 @@ with tempfile.TemporaryDirectory(prefix="omg-apt-pin-") as temporary:
         f'Dir::State::lists "{root / "lists"}";\n'
         f'Dir::State::status "{root / "status"}";\n'
         f'Dir::Cache::archives "{root / "archives"}";\n'
+        f'Dir::Cache::pkgcache "{root / "pkgcache.bin"}";\n'
+        f'Dir::Cache::srcpkgcache "{root / "srcpkgcache.bin"}";\n'
     )
     (root / "empty.conf").write_text("")
     environment = dict(os.environ, APT_CONFIG=str(root / "apt.conf"), OMG_DISABLE_DAEMON="1")
