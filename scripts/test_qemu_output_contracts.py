@@ -13,6 +13,86 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    def test_run_watch_row_uses_bounded_source_edit_and_receipt(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        row = next(line for line in inventory.splitlines() if line.startswith('run-watch\t'))
+        self.assertEqual(row.split('\t')[8], 'watch-task-rerun')
+        product = '''[[ "$1:$2:$3" == run:--watch:smoke && -f src/watch-trigger.txt ]] || exit 70
+make -s smoke || exit 71
+printf 'Watching for changes...\\n'
+while [[ $(cat src/watch-trigger.txt) != 'changed once' ]]; do sleep .02; done
+printf 'File changed, re-running\\n'
+make -s smoke || exit 71
+trap 'exit 130' INT
+while :; do sleep .05; done
+'''
+        result, evidence, logs = self.run_inventory(
+            product, [row], tiers='container', row_timeout=30,
+            home_files={'qemu-run-watch-check.py':
+                        (ROOT / 'scripts/qemu-run-watch-check.py').read_bytes()})
+        self.assertEqual(result.returncode, 0, logs)
+        self.assertEqual(evidence[0]['result'], 'PASS', logs)
+
+    def test_golden_path_oracle_rejects_false_success_and_stale_state(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        oracle = source[source.index('check_golden_path_state() {'):
+                        source.index('check_product_output() {')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'config'
+            config.mkdir()
+            store = config / 'golden-paths.toml'
+            output = root / 'output.log'
+
+            def check(assertion, contents, message):
+                if contents is None:
+                    store.unlink(missing_ok=True)
+                else:
+                    store.write_text(contents, encoding='utf-8')
+                output.write_text(message, encoding='utf-8')
+                return subprocess.run(
+                    ['bash', '-c', oracle + '\n'
+                     + 'export OMG_CONFIG_DIR="$PWD/config"\n'
+                     + 'check_golden_path_state "$1" output.log', '_', assertion],
+                    cwd=root, capture_output=True, text=True)
+
+            template = ('[[templates]]\nname = "smoke"\ncreated_at = 1700000000\n'
+                        'packages = []\n[templates.runtimes]\n')
+            good = {
+                'golden-path-created': "Golden path 'smoke' created!\n",
+                'golden-path-listed': '1 custom template(s)\nsmoke - runtimes: [], packages: 0\n',
+                'golden-path-deleted': "Deleted template 'smoke'\n",
+            }
+            for assertion, message in good.items():
+                state = 'templates = []\n' if assertion == 'golden-path-deleted' else template
+                with self.subTest(assertion=assertion):
+                    self.assertEqual(check(assertion, state, message).returncode, 0)
+                    self.assertNotEqual(check(assertion, None, message).returncode, 0)
+                    self.assertNotEqual(check(assertion, state, '').returncode, 0)
+            for state in (
+                template.replace('"smoke"', '"wrong"'),
+                template.replace('1700000000', '0'),
+                template + template,
+                template.replace('packages = []', 'packages = ["curl"]'),
+                'templates = []\n',
+            ):
+                with self.subTest(state=state):
+                    self.assertNotEqual(check('golden-path-created', state,
+                                              good['golden-path-created']).returncode, 0)
+            self.assertNotEqual(check('golden-path-deleted', template,
+                                      good['golden-path-deleted']).returncode, 0)
+            self.assertNotEqual(check('golden-path-listed', template,
+                                      'No custom templates\n').returncode, 0)
+            flagged = (template + '[[templates]]\nname = "flagged"\ncreated_at = 1700000001\n'
+                       'packages = ["ripgrep"]\n[templates.runtimes]\n'
+                       'node = "20"\npython = "3.12"\n')
+            receipt = "Golden path 'flagged' created!\nNode: 20\nPython: 3.12\nPackages: ripgrep\n"
+            self.assertEqual(check('golden-path-flags', flagged, receipt).returncode, 0)
+            for broken in (flagged.replace('node = "20"', 'node = "22"'),
+                           flagged.replace('packages = ["ripgrep"]', 'packages = []'),
+                           template):
+                self.assertNotEqual(check('golden-path-flags', broken, receipt).returncode, 0)
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_tree_install_remove_rows_reject_collateral_package_and_reason_changes(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
@@ -270,6 +350,39 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
                     self.assertEqual(evidence[0]['result'], expected, logs)
                     self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
 
+    def test_container_shell_and_build_require_exact_fake_engine_argv(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        for case, operation, correct, faults in (
+            ('container-shell-argv', 'shell',
+             'podman run --rm -it --name "$(basename "$PWD")-dev" -w /tmp '
+             '-e TERM=xterm-256color -e SMOKE=1 -v "$PWD:/app" '
+             '-v "$PWD:/tmp/omg-smoke" -- debian:bookworm /bin/bash\n',
+             ('--rm ', '-it ', 'SMOKE=1', ':/app', 'debian:bookworm', '/bin/bash')),
+            ('container-build-argv', 'build',
+             'podman build -f Dockerfile -t smoke:latest --no-cache '
+             '--build-arg SMOKE=1 --target dev -- "$PWD"\n',
+             ('-f Dockerfile ', '-t smoke:latest ', '--no-cache ',
+              '--build-arg SMOKE=1 ', '--target dev ', '"$PWD"')),
+        ):
+            rows = [line for line in inventory.splitlines()
+                    if line.startswith(case + '\t')]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].split('\t')[8], case)
+            prefix = (f'[[ "$1:$2" == container:{operation} ]] || exit 95\n'
+                      'podman --version >/dev/null\n')
+            variants = [('correct', prefix + correct, 'PASS'),
+                        ('no engine call', 'echo claimed-success\n', 'FAIL'),
+                        ('duplicate engine call', prefix + correct + correct, 'FAIL')]
+            for omitted in faults:
+                self.assertIn(omitted, correct)
+                variants.append((f'omit {omitted}', prefix + correct.replace(omitted, '', 1), 'FAIL'))
+            for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+                for label, product, expected in variants:
+                    with self.subTest(case=case, distro=distro, variant=label):
+                        result, evidence, logs = self.run_inventory(product, rows, distro=distro)
+                        self.assertEqual(evidence[0]['result'], expected, logs)
+                        self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_diff_rows_require_the_requested_missing_lockfile_diagnostic(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
@@ -316,6 +429,98 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
                 result, evidence, logs = self.run_inventory(product, rows)
                 self.assertEqual([row['result'] for row in evidence], expected, logs)
                 self.assertEqual(result.returncode, int(expected != ['PASS', 'PASS']), result.stderr)
+
+    def test_workspace_list_and_remove_reject_false_green_results(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if line.startswith(('workspace-init\t', 'workspace-add\t',
+                                    'workspace-list\t', 'workspace-remove\t'))]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual([row.split('\t')[8] for row in rows[-2:]],
+                         ['workspace-project-listed', 'workspace-project-removed'])
+        product = '''case "$2" in
+  init) printf 'name = "smoke"\\ncreated_at = "2026-09-27T00:00:00Z"\\n' > omg-workspace.toml ;;
+  add) printf '[projects.fixture]\\npath = "."\\n' >> omg-workspace.toml ;;
+  list) printf 'OMG Workspace: smoke\\n  1. fixture → .\\n' ;;
+  remove) sed -i '/^\\[projects.fixture\\]/,$d' omg-workspace.toml
+          printf "✓ Removed project 'fixture'\\n" ;;
+esac
+'''
+        for label, altered, expected in (
+            ('correct', product, ['PASS'] * 4),
+            ('list silent', product.replace("list) printf 'OMG Workspace: smoke\\n  1. fixture → .\\n' ;;",
+                                            'list) : ;;'), ['PASS', 'PASS', 'FAIL', 'PASS']),
+            ('list wrong project', product.replace('1. fixture → .', '1. other → .'),
+             ['PASS', 'PASS', 'FAIL', 'PASS']),
+            ('list invented extra project', product.replace('1. fixture → .\\n',
+                                                            '1. fixture → .\\n  2. other → .\\n'),
+             ['PASS', 'PASS', 'FAIL', 'PASS']),
+            ('remove silent', product.replace("remove) sed -i '/^\\[projects.fixture\\]/,$d' omg-workspace.toml",
+                                              'remove) :'), ['PASS', 'PASS', 'PASS', 'FAIL']),
+            ('remove wrong report', product.replace("Removed project 'fixture'", "Removed project 'other'"),
+             ['PASS', 'PASS', 'PASS', 'FAIL']),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(altered, rows)
+                self.assertEqual([row['result'] for row in evidence], expected, logs)
+                self.assertEqual(result.returncode, int('FAIL' in expected), result.stderr)
+
+    def test_container_init_requires_scaffold_and_final_secret_exclusions(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        row = next(line for line in inventory.splitlines() if line.startswith('container-init\t'))
+        self.assertEqual(row.split('\t')[8], 'container-init-scaffold')
+        product = '''if [[ "$1:$2:$3:$4" != container:init:--base:debian:bookworm ]]; then exit 9; fi
+cat > Dockerfile.omg <<'DOCKERFILE'
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \\
+    curl wget git build-essential ca-certificates \\
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY . .
+CMD ["/bin/bash"]
+DOCKERFILE
+for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do
+cat >> "$ignore" <<'IGNORE'
+# added by omg container init
+.git
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+.omg/
+IGNORE
+done
+printf '  ✓ Created Dockerfile.omg\\n│ Base image: debian:bookworm │\\n'
+'''
+        for label, altered, expected in (
+            ('correct', product, 'PASS'),
+            ('missing Dockerfile', product.replace('cat > Dockerfile.omg', 'cat > ignored'), 'FAIL'),
+            ('wrong base', product.replace('FROM debian:bookworm', 'FROM ubuntu:24.04'), 'FAIL'),
+            ('missing build dependencies', product.replace('curl wget git build-essential ca-certificates',
+                                                           'curl wget git'), 'FAIL'),
+            ('missing root protection', product.replace(
+                'for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do',
+                'for ignore in Dockerfile.omg.dockerignore .containerignore; do'), 'FAIL'),
+            ('missing BuildKit protection', product.replace(
+                'for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do',
+                'for ignore in .dockerignore .containerignore; do'), 'FAIL'),
+            ('missing Podman protection', product.replace(
+                'for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do',
+                'for ignore in .dockerignore Dockerfile.omg.dockerignore; do'), 'FAIL'),
+            ('late exception', product + "printf '!*.key\\n' >> .dockerignore\n", 'FAIL'),
+            ('late override exception', product + "printf '!*.key\\n' >> Dockerfile.omg.dockerignore\n", 'FAIL'),
+            ('lost user negations', product + "sed -i '1,2d' .containerignore\n", 'FAIL'),
+            ('extra build command', product.replace('WORKDIR /app', 'RUN echo unexpected\nWORKDIR /app'), 'FAIL'),
+            ('silent output', product.replace("printf '  ✓ Created Dockerfile.omg\\n│ Base image: debian:bookworm │\\n'",
+                                               ':'), 'FAIL'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(altered, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_arch_update_rows_require_bounded_native_fixture_receipt(self):
@@ -1778,7 +1983,189 @@ esac
             self.assertIn('case=fixture verdict=FAIL', log.splitlines()[0])
             self.assertEqual(log.count('product output'), 100)
 
-    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, binary_name='product'):
+    def test_generated_man_pages_require_real_content_and_matching_count(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('generate-man\t'))
+        page = '.TH "omg" "1"\n.SH "NAME"\nomg\\-command\n.SH "SYNOPSIS"\nomg\n'
+        pages = tuple((ROOT / 'tests/man_page_inventory.txt').read_text().splitlines())
+        self.assertEqual(len(pages), 140)
+        product = f'''[[ "$1" == generate-man && "$2" == --output ]] || exit 70
+mkdir -p "$3"
+for name in {shlex.join(pages)}; do
+  printf %s {shlex.quote(page)} > "$3/$name"
+done
+printf 'Generated {len(pages)} man pages\\n'
+'''
+        for mutation, expected in (
+            ('', 'PASS'),
+            ('sed -i "/SYNOPSIS/d" "$3/omg-team.1"\n', 'FAIL'),
+            ('rm "$3/omg-team-golden-path-create.1"\n', 'FAIL'),
+            ('mv "$3/omg-audit-licenses.1" "$3/omg-unrelated.1"\n', 'FAIL'),
+            ('find "$3" -type f ! -name omg.1 ! -name omg-generate-man.1 -delete\n'
+             'printf "Generated 2 man pages\\n"; exit 0\n', 'FAIL'),
+            ('touch "$3/omg-invented.1"\n', 'FAIL'),
+            ('printf "Generated 141 man pages\\n"; exit 0\n', 'FAIL'),
+        ):
+            with self.subTest(mutation=mutation):
+                announcement = f"printf 'Generated {len(pages)} man pages\\n'"
+                command = product.replace(announcement, mutation + announcement)
+                result, evidence, logs = self.run_inventory(command, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'))
+        third_level = {'omg-enterprise-policy-show.1', 'omg-team-roles-list.1',
+                       'omg-team-golden-path-create.1',
+                       'omg-team-golden-path-delete.1',
+                       'omg-team-golden-path-list.1'}
+        legacy_pages = tuple(name for name in pages if name not in third_level)
+        legacy_product = product.replace(shlex.join(pages), shlex.join(legacy_pages)).replace(
+            f'Generated {len(pages)} man pages',
+            f'Generated {len(legacy_pages)} man pages')
+        result, evidence, logs = self.run_inventory(legacy_product, [row], exact_man=False)
+        self.assertEqual((result.returncode, evidence[0]['result']), (0, 'PASS'), logs)
+        result, evidence, logs = self.run_inventory(legacy_product, [row], exact_man=True)
+        self.assertEqual((result.returncode, evidence[0]['result']), (1, 'FAIL'), logs)
+
+    def test_absolute_path_exports_refuse_without_evidence(self):
+        rows = [line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                if line.startswith(('audit-export\t', 'audit-export-flags\t',
+                                    'enterprise-audit-export\t'))]
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            for mutation, expected in (
+                ('', 'PASS'),
+                ('printf "Error: unrelated failure\\n" >&2\n', 'FAIL'),
+                ('mkdir -p "${@: -1}"\n', 'FAIL'),
+            ):
+                with self.subTest(row=row.split('\t', 1)[0], mutation=mutation):
+                    product = mutation + '''if [[ "$*" == *export* ]]; then
+  printf 'Error: Absolute paths not allowed\\n' >&2
+  exit 1
+fi
+exit 70
+'''
+                    if mutation.startswith('printf'):
+                        product = mutation + 'exit 1\n'
+                    result, evidence, logs = self.run_inventory(product, [row])
+                    self.assertEqual(evidence[0]['result'], expected, logs)
+                    self.assertEqual(result.returncode, int(expected == 'FAIL'))
+
+    def test_enterprise_export_requires_five_private_evidence_files(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('enterprise-audit-export-flags\t'))
+        product = '''[[ "$1:$2:$3:$4:$5:$6:$7:$8" == enterprise:audit-export:--framework:iso27001:--period:2025-Q1:--output:./enterprise-evidence-flags ]] || exit 70
+mkdir enterprise-evidence-flags
+printf '%s' '{"unavailable_evidence":[{"artifact":"access-control-matrix","reason":"unavailable"}]}' > enterprise-evidence-flags/limitations.json
+printf '[]' > enterprise-evidence-flags/change-log.json
+printf '{}' > enterprise-evidence-flags/policy-enforcement.json
+printf 'package,version,description\\nbash,1,shell\\n' > enterprise-evidence-flags/installed-packages.csv
+printf '%s' '{"bomFormat":"CycloneDX","specVersion":"1.5","components":[{"name":"bash"}]}' > enterprise-evidence-flags/sbom-inventory.json
+chmod 600 enterprise-evidence-flags/*
+printf 'Audit evidence exported: iso27001 2025-Q1\\n'
+'''
+        for mutation, expected in (
+            ('', 'PASS'),
+            ('rm enterprise-evidence-flags/sbom-inventory.json\n', 'FAIL'),
+            ('chmod 644 enterprise-evidence-flags/limitations.json\n', 'FAIL'),
+            ('printf invalid > enterprise-evidence-flags/change-log.json\n', 'FAIL'),
+        ):
+            with self.subTest(mutation=mutation):
+                result, evidence, logs = self.run_inventory(product + mutation, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'))
+        for mutation, expected in (('', 'PASS'), ('mkdir enterprise-evidence-flags\n', 'FAIL')):
+            with self.subTest(distro='debian', mutation=mutation):
+                product = mutation + '''printf 'Error: Installed-package export requires the Arch package backend\\n' >&2
+exit 1
+'''
+                result, evidence, logs = self.run_inventory(product, [row], distro='debian')
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'))
+
+    def test_team_compliance_refusal_never_writes_an_unevaluated_report(self):
+        rows = [line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                if line.startswith(('team-init\t', 'team-compliance-export\t'))]
+        self.assertEqual(len(rows), 2)
+        for mutation, expected in (
+            ('', 'PASS'),
+            ('printf "Error: unrelated failure\\n" >&2; exit 1\n', 'FAIL'),
+            ('printf fabricated > "$4"\n', 'FAIL'),
+        ):
+            with self.subTest(mutation=mutation):
+                product = '''[[ "$1" == team ]] || exit 70
+if [[ "$2" == init ]]; then exit 0; fi
+[[ "$2" == compliance && "$3" == --export ]] || exit 70
+''' + mutation
+                if not mutation.startswith('printf "Error: unrelated'):
+                    product += '''printf "Error: No compliance data is available to export to '%s'; compliance evidence requires an evaluated report\\n" "$4" >&2
+exit 1
+'''
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([item['result'] for item in evidence], ['PASS', expected], logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'))
+
+    def test_audit_log_export_rejects_unfiltered_stale_or_nonprivate_records(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('audit-log-flags\t'))
+        self.assertEqual(row.split('\t')[8], 'audit-log-filtered-export')
+        product = '''[[ "$1:$2:$3:$4:$5:$6:$7" == audit:log:--limit:3:--severity:error:--export ]] || exit 70
+python3 - "$8" <<'PY'
+import json, pathlib, sys
+records = [json.loads(line) for line in pathlib.Path('audit-log-data/audit/audit.jsonl').read_text(encoding='utf-8').splitlines()]
+output = pathlib.Path(sys.argv[1])
+output.write_text(json.dumps([records[i] for i in (5, 4, 2)]))
+output.chmod(0o600)
+PY
+printf 'OMG Exporting audit log to %s...\\n✓ Export successful\\n' "$8"
+'''
+        for mutation, expected in (
+            ('', 'PASS'),
+            ('rm "$8"\n', 'FAIL'),
+            ('printf "[]" > "$8"\n', 'FAIL'),
+            ('chmod 644 "$8"\n', 'FAIL'),
+            ('cp audit-log-data/audit/audit.jsonl "$8"\n', 'FAIL'),
+            ('printf changed >> audit-log-data/audit/audit.jsonl\n', 'FAIL'),
+            ("python3 -c \"import json,pathlib; p=pathlib.Path('audit-log-export.json'); r=json.loads(p.read_text(encoding='utf-8')); p.write_text(json.dumps(r[::-1]))\"\n", 'FAIL'),
+        ):
+            with self.subTest(mutation=mutation):
+                result, evidence, logs = self.run_inventory(product + mutation, [row])
+                self.assertEqual((result.returncode, evidence[0]['result']),
+                                 (int(expected == 'FAIL'), expected), logs)
+        result, evidence, logs = self.run_inventory('exit 0\n', [row])
+        self.assertEqual((result.returncode, evidence[0]['result']), (1, 'FAIL'), logs)
+
+    def test_negative_workspace_rows_reject_unrelated_failures_and_state_changes(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+        prereqs = [line for line in inventory if line.startswith(('workspace-init\t', 'workspace-add\t'))]
+        self.assertEqual(len(prereqs), 2)
+        setup = '''case "$2" in
+init) printf 'name = "smoke"\\ncreated_at = "2025-01-01"\\n[projects]\\n' > omg-workspace.toml; exit 0 ;;
+add) printf '[projects.fixture]\\npath = "."\\ndepends_on = []\\n' >> omg-workspace.toml; exit 0 ;;
+esac
+'''
+        products = {
+            'workspace-run': '''printf "%s\\n" "→ Task 'true' not found, trying 'make true'..." "  ✗ 'omg run true' in '.' exited with code 1" '⚠ 0 succeeded, 1 failed'
+printf "%s\\n" "make: *** No rule to make target 'true'.  Stop." "Error: 1 project(s) failed to run 'true'" >&2
+''',
+            'workspace-check': '''printf '  ⚠ needs attention\\n'
+printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attention, 0 failed to check (of 1 total)' >&2
+''',
+        }
+        for case, receipt in products.items():
+            row = next(line for line in inventory if line.startswith(case + '\t'))
+            for body, expected in (
+                (receipt, 'PASS'),
+                ('printf "Error: unrelated failure\\n" >&2\n', 'FAIL'),
+                (receipt + 'printf changed >> omg-workspace.toml\n', 'FAIL'),
+                (receipt + 'printf changed >> Makefile\n', 'FAIL'),
+                (receipt + 'printf fabricated > omg.lock\n', 'FAIL'),
+                (receipt.replace('1 project(s)', '2 project(s)'), 'FAIL'),
+            ):
+                with self.subTest(case=case, body=body):
+                    result, evidence, logs = self.run_inventory(setup + body + 'exit 1\n', prereqs + [row])
+                    self.assertEqual([item['result'] for item in evidence], ['PASS', 'PASS', expected], logs)
+                    self.assertEqual(result.returncode, int(expected == 'FAIL'), logs)
+
+    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product'):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -1787,7 +2174,15 @@ esac
             root = Path(directory)
             for name in ('home', 'bin', 'guest'):
                 (root / name).mkdir()
-            for name, content in (home_files or {}).items():
+            guest_files = {
+                'man_page_inventory.txt': (ROOT / 'tests/man_page_inventory.txt').read_bytes(),
+                'qemu-enterprise-export-oracle.py':
+                    (ROOT / 'scripts/qemu-enterprise-export-oracle.py').read_bytes(),
+                'qemu-audit-log-oracle.py':
+                    (ROOT / 'scripts/qemu-audit-log-oracle.py').read_bytes(),
+            }
+            guest_files.update(home_files or {})
+            for name, content in guest_files.items():
                 (root / 'home' / name).write_bytes(content)
             for name, content in (native_commands or {}).items():
                 tool = root / 'bin' / name
@@ -1823,13 +2218,17 @@ esac
                        str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
                        '--binary', shell_path(binary), '--tsv', str(inventory),
                        '--distro', distro, '--tiers', tiers, '--tag', 'fixture']
+            if exact_man:
+                command += ['--man-page-inventory',
+                            shell_path(ROOT / 'tests/man_page_inventory.txt')]
             if row_timeout is not None:
                 command += ['--row-timeout', str(row_timeout)]
             if allow_mutations:
                 command.append('--allow-mutations')
             result = subprocess.run(
                 command,
-                env=env, capture_output=True, text=True, timeout=30)
+                env=env, capture_output=True, text=True,
+                timeout=max(30, (row_timeout or 0) + 10))
             evidence = root / 'inventory/results.json'
             self.assertTrue(evidence.exists(), result.stdout + result.stderr)
             return result, json.loads(evidence.read_text()), {

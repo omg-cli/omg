@@ -103,9 +103,8 @@ pub fn audit_export(
     )))?;
 
     let period_str = period.unwrap_or("current");
-    fs::create_dir_all(output)?;
-
-    // Generate audit files
+    // Resolve every source before creating the export directory. An
+    // unsupported backend must not leave a misleading empty evidence path.
     let files = vec![
         ("limitations.json", generate_audit_export_limitations()?),
         ("change-log.json", generate_change_log_json()?),
@@ -113,6 +112,7 @@ pub fn audit_export(
         ("installed-packages.csv", generate_installed_packages_csv()?),
         ("sbom-inventory.json", generate_sbom_json()?),
     ];
+    fs::create_dir_all(output)?;
 
     let mut file_list = vec![];
     for (filename, content) in &files {

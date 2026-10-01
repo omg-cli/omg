@@ -26,6 +26,19 @@ SPEC.loader.exec_module(POLICY)
 
 
 class PolicyTests(unittest.TestCase):
+    def test_golden_path_chain_requires_semantic_state_oracles(self):
+        with (ROOT / 'tests/cli_behavior_inventory.tsv').open(newline='') as source:
+            rows = {row['case']: row for row in csv.DictReader(source, delimiter='\t')}
+        for case, prerequisite, assertion in (
+            ('team-golden-create', 'team-init', 'golden-path-created'),
+            ('team-golden-list', 'team-golden-create', 'golden-path-listed'),
+            ('team-golden-delete', 'team-golden-list', 'golden-path-deleted'),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(rows[case]['requires'], prerequisite)
+                self.assertEqual(rows[case]['assertions'], assertion)
+                self.assertEqual(rows[case]['targets'], 'hermetic:pass')
+
     def test_all_historical_snapshot_hashes_are_bounded_and_reportable(self):
         policy = ROOT / "tests/qemu-inventory-policy.json"
         index, snapshots = all_snapshots(policy)
@@ -60,6 +73,19 @@ class PolicyTests(unittest.TestCase):
                 self.assertEqual(rows[case]["assertions"], f"fingerprint:{case}")
         self.assertEqual(rows["team-status"]["requires"], "team-push")
         self.assertEqual(rows["team-pull"]["requires"], "team-push")
+
+    def test_workspace_and_container_scaffold_rows_require_semantic_assertions(self):
+        with (ROOT / "tests/cli_behavior_inventory.tsv").open(newline="") as source:
+            rows = {row["case"]: row for row in csv.DictReader(source, delimiter="\t")}
+        for case, assertion, prerequisite in (
+            ("workspace-list", "workspace-project-listed", "workspace-add"),
+            ("workspace-remove", "workspace-project-removed", "workspace-add"),
+            ("container-init", "container-init-scaffold", "-"),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(rows[case]["assertions"], assertion)
+                self.assertEqual(rows[case]["requires"], prerequisite)
+                self.assertEqual(rows[case]["targets"], "hermetic:pass")
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -367,6 +393,10 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(len(cases), len(content.splitlines()) - 1)
         self.assertEqual(len({case["id"] for case in cases}), len(cases))
         by_id = {case["id"]: case for case in cases}
+        self.assertEqual(by_id["run-watch"], {
+            "id": "run-watch", "tiers": ["container", "pty"],
+            "allowed_skips": {}, "network_scope": "offline",
+        })
         self.assertEqual(by_id["doctor-eol"], {
             "id": "doctor-eol", "tiers": ["container"],
             "allowed_skips": {}, "network_scope": "offline",
@@ -375,6 +405,11 @@ class PolicyTests(unittest.TestCase):
             "id": "container-run-detached-argv", "tiers": ["hermetic"],
             "allowed_skips": {}, "network_scope": "offline",
         })
+        for case_id in ("container-shell-argv", "container-build-argv"):
+            self.assertEqual(by_id[case_id], {
+                "id": case_id, "tiers": ["hermetic"],
+                "allowed_skips": {}, "network_scope": "offline",
+            })
         for case_id in ("container-run-detached", "container-run-interactive",
                         "container-shell-flags", "container-build-flags"):
             self.assertEqual(set(by_id[case_id]["allowed_skips"]),

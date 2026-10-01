@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::CommandFactory;
 use clap_mangen::Man;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::args::Cli;
 use super::style;
@@ -46,39 +46,7 @@ pub fn generate(output_dir: Option<String>) -> Result<()> {
     println!("  {} omg.1", style::success("✓"));
     generated += 1;
 
-    // Generate subcommand man pages
-    for subcommand in cmd.get_subcommands() {
-        if subcommand.is_hide_set() {
-            continue;
-        }
-
-        let name = subcommand.get_name();
-        let sub_man = Man::new(subcommand.clone());
-        let sub_man_path = output_path.join(format!("omg-{name}.1"));
-        let mut buffer = Vec::new();
-        sub_man.render(&mut buffer)?;
-        fs::write(&sub_man_path, buffer)
-            .with_context(|| format!("Failed to write {}", sub_man_path.display()))?;
-        println!("  {} omg-{name}.1", style::success("✓"));
-        generated += 1;
-
-        // Generate nested subcommand pages (e.g., `omg-env-capture.1`)
-        for nested in subcommand.get_subcommands() {
-            if nested.is_hide_set() {
-                continue;
-            }
-
-            let nested_name = nested.get_name();
-            let nested_man = Man::new(nested.clone());
-            let nested_path = output_path.join(format!("omg-{name}-{nested_name}.1"));
-            let mut buffer = Vec::new();
-            nested_man.render(&mut buffer)?;
-            fs::write(&nested_path, buffer)
-                .with_context(|| format!("Failed to write {}", nested_path.display()))?;
-            println!("  {} omg-{name}-{nested_name}.1", style::success("✓"));
-            generated += 1;
-        }
-    }
+    generated += render_subcommand_pages(&cmd, &output_path, "omg")?;
 
     println!();
     println!("{} Generated {} man pages", style::success("✓"), generated);
@@ -90,6 +58,20 @@ pub fn generate(output_dir: Option<String>) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn render_subcommand_pages(command: &clap::Command, output: &Path, prefix: &str) -> Result<usize> {
+    let mut generated = 0;
+    for subcommand in command.get_subcommands().filter(|cmd| !cmd.is_hide_set()) {
+        let name = format!("{prefix}-{}", subcommand.get_name());
+        let path = output.join(format!("{name}.1"));
+        let mut buffer = Vec::new();
+        Man::new(subcommand.clone()).render(&mut buffer)?;
+        fs::write(&path, buffer).with_context(|| format!("Failed to write {}", path.display()))?;
+        println!("  {} {name}.1", style::success("✓"));
+        generated += 1 + render_subcommand_pages(subcommand, output, &name)?;
+    }
+    Ok(generated)
 }
 
 /// Simple shell expansion for ~ paths
