@@ -630,6 +630,7 @@ if [[ -n "$inventory_tiers" ]]; then
   cp "$here/qemu-run-watch-check.py" "$work/qemu-run-watch-check.py"
   cp "$here/qemu-enterprise-export-oracle.py" "$work/qemu-enterprise-export-oracle.py"
   cp "$here/qemu-audit-log-oracle.py" "$work/qemu-audit-log-oracle.py"
+  cp "$here/qemu-doctor-index-oracle.py" "$work/qemu-doctor-index-oracle.py"
   if [[ "$source_kind" == staged ]]; then
     cp "$here/../tests/man_page_inventory.txt" "$work/man_page_inventory.txt"
   fi

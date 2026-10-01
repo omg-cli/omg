@@ -8,6 +8,20 @@ import unittest
 
 
 class CargoFixtureTests(unittest.TestCase):
+    def test_native_index_oracle_is_staged_before_controller_upload(self):
+        scripts = Path(__file__).resolve().parent
+        source = (scripts / 'benchmark-qemu.sh').read_text()
+        begin = source.index('  cp "$here/qemu-inventory.sh"')
+        end = source.index('  if [[ "$source_kind" == staged ]]', begin)
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, here=str(scripts), work=directory)
+            result = subprocess.run(['bash', '-e', '-c', source[begin:end]],
+                                    env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            staged = Path(directory) / 'qemu-doctor-index-oracle.py'
+            self.assertTrue(staged.is_file(), 'the controller cannot upload an unstaged guest oracle')
+            self.assertEqual(staged.read_bytes(), (scripts / staged.name).read_bytes())
+
     def test_present_cargo_is_setup_failure_and_absent_cargo_is_valid(self):
         source = (Path(__file__).resolve().parent / 'benchmark-qemu.sh').read_text()
         begin = source.index('  if command -v cargo > evidence/rust-toolchain.txt; then')
