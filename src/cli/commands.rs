@@ -155,11 +155,7 @@ async fn complete_package_names(
 pub(crate) async fn available_package_names() -> Result<Vec<String>> {
     let backend = crate::package_managers::resolve_backend()?;
     // Official lookup failures fail closed; AUR names remain optional enrichment.
-    #[allow(
-        unused_mut,
-        reason = "mutated only when the Arch completion branch is compiled"
-    )]
-    let mut names = if matches!(
+    let names = if matches!(
         backend,
         crate::package_managers::Backend::Fedora
             | crate::package_managers::Backend::MacOS
@@ -175,20 +171,29 @@ pub(crate) async fn available_package_names() -> Result<Vec<String>> {
         tokio::task::spawn_blocking(official_package_names).await??
     };
 
-    // Include AUR packages only when ALPM is selected, even in additive builds.
+    // Mock Arch completion can consume its isolated cache but never refresh it.
     #[cfg(feature = "arch")]
-    {
-        if backend != crate::package_managers::Backend::Arch {
-            return Ok(names);
-        }
-
-        let engine = crate::core::completion::CompletionEngine::new();
-        if let Ok(aur_names) = engine.get_aur_package_names().await {
+    let names = {
+        let aur_names = if backend == crate::package_managers::Backend::Arch {
+            crate::core::completion::CompletionEngine::new()
+                .get_aur_package_names()
+                .await
+                .ok()
+        } else if backend == crate::package_managers::Backend::Mock
+            && crate::core::env::distro::detect_distro() == crate::core::env::distro::Distro::Arch
+        {
+            crate::core::completion::CompletionEngine::cached_aur_package_names()
+        } else {
+            None
+        };
+        let mut names = names;
+        if let Some(aur_names) = aur_names {
             names.extend(aur_names);
             names.sort();
             names.dedup();
         }
-    }
+        names
+    };
 
     #[cfg(not(feature = "arch"))]
     let _ = backend;

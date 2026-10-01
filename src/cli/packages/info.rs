@@ -390,7 +390,12 @@ async fn manager_info(
 
 fn display_manager_info(info: &crate::core::Package, manager_name: &str) {
     let version = info.version.to_string();
-    let source = format!("{} ({manager_name})", info.source);
+    let source = if manager_name == "pacman" && info.source == crate::core::PackageSource::Official
+    {
+        format!("Official repository ({manager_name})")
+    } else {
+        format!("{} ({manager_name})", info.source)
+    };
     ui::print_package_info(
         &ui::InfoCore {
             name: &info.name,

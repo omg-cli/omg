@@ -2565,13 +2565,19 @@ fn status_paragraphs(mut content: &str) -> impl Iterator<Item = &str> {
         if content.is_empty() {
             return None;
         }
-        let separator = [
-            ("\n\n", content.find("\n\n")),
-            ("\r\n\r\n", content.find("\r\n\r\n")),
-        ]
-        .into_iter()
-        .filter_map(|(separator, position)| position.map(|position| (position, separator.len())))
-        .min_by_key(|(position, _)| *position);
+        let bytes = content.as_bytes();
+        let separator = memchr::memchr_iter(b'\n', bytes).find_map(|position| {
+            if bytes.get(position + 1) == Some(&b'\n') {
+                Some((position, 2))
+            } else if position > 0
+                && bytes[position - 1] == b'\r'
+                && bytes.get(position + 1..position + 3) == Some(b"\r\n")
+            {
+                Some((position - 1, 4))
+            } else {
+                None
+            }
+        });
         if let Some((position, length)) = separator {
             let paragraph = &content[..position];
             content = &content[position + length..];
@@ -3705,6 +3711,19 @@ mod tests {
         unsafe {
             std::env::remove_var("OMG_TEST_MODE");
         }
+    }
+
+    #[test]
+    fn status_sizes_accept_mixed_line_endings_and_unicode_descriptions() {
+        let content = "Package: apt\r\nStatus: install ok installed\r\nDescription: café\r\nInstalled-Size: 4\r\n\r\nPackage: vim\nStatus: install ok installed\nDescription: 编辑器\nInstalled-Size: 3\n\nPackage: curl\r\nStatus: install ok installed\r\nInstalled-Size: 2";
+        assert_eq!(
+            packages_with_sizes_from_status(content).expect("valid mixed control file"),
+            vec![
+                ("apt".to_string(), 4 * 1024),
+                ("vim".to_string(), 3 * 1024),
+                ("curl".to_string(), 2 * 1024),
+            ]
+        );
     }
 
     #[test]

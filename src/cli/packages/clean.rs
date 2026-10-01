@@ -605,10 +605,16 @@ mod tests {
         let error = clean(true, false, false, false, false, true)
             .await
             .expect_err("orphan removal with no backend must not look like success");
+        let expected = match crate::package_managers::resolve_backend() {
+            Ok(crate::package_managers::Backend::MacOS) => {
+                "Package cleanup is not implemented for the Homebrew backend".to_string()
+            }
+            Err(error) => error.to_string(),
+            Ok(_) => "not available without an Arch or Debian package backend".to_string(),
+        };
         assert!(
-            error
-                .to_string()
-                .contains("not available without an Arch or Debian package backend")
+            error.to_string().contains(&expected),
+            "selected backend must fail with its own unsupported-operation cause: {error}"
         );
     }
 
@@ -623,10 +629,16 @@ mod tests {
         let error = clean(false, true, false, false, false, true)
             .await
             .expect_err("cache cleanup with no backend must not look like success");
+        let expected = match crate::package_managers::resolve_backend() {
+            Ok(crate::package_managers::Backend::MacOS) => {
+                "Package cleanup is not implemented for the Homebrew backend".to_string()
+            }
+            Err(error) => error.to_string(),
+            Ok(_) => "not available without a package manager backend".to_string(),
+        };
         assert!(
-            error
-                .to_string()
-                .contains("not available without a package manager backend")
+            error.to_string().contains(&expected),
+            "selected backend must fail with its own unsupported-operation cause: {error}"
         );
     }
 
@@ -636,11 +648,15 @@ mod tests {
         let error = clean(false, false, true, false, false, true)
             .await
             .expect_err("AUR cleanup without the Arch backend must not look like success");
-        // Debian-like hosts hit the earlier host-specific bail
-        // ("…on Debian-like systems"); others hit the backend bail.
-        // Both fail closed and share this prefix.
+        let expected = match crate::package_managers::resolve_backend() {
+            Ok(crate::package_managers::Backend::MacOS) => {
+                "Package cleanup is not implemented for the Homebrew backend".to_string()
+            }
+            Err(error) => error.to_string(),
+            Ok(_) => "AUR cleanup is not available".to_string(),
+        };
         assert!(
-            error.to_string().contains("AUR cleanup is not available"),
+            error.to_string().contains(&expected),
             "AUR cleanup without Arch must fail closed; got: {error}"
         );
     }

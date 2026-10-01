@@ -446,10 +446,16 @@ mod tests {
     #[tokio::test]
     async fn size_without_backend_is_an_error() {
         let error = run(None, 20).await.expect_err("size requires a backend");
+        let expected = match crate::package_managers::resolve_backend() {
+            Ok(crate::package_managers::Backend::MacOS) => {
+                "Package size analysis is not implemented for Homebrew".to_string()
+            }
+            Err(error) => error.to_string(),
+            Ok(_) => "requires a supported package backend".to_string(),
+        };
         assert!(
-            error
-                .to_string()
-                .contains("requires a supported package backend")
+            error.to_string().contains(&expected),
+            "selected backend must fail with its own unsupported-operation cause: {error}"
         );
     }
 

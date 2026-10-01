@@ -506,7 +506,9 @@ fn permits_live_lookup(backend: crate::package_managers::Backend) -> bool {
 }
 
 fn mock_missing_error(package: &str, original_error: anyhow::Error) -> anyhow::Error {
-    original_error.context(format!("Package '{package}' not found"))
+    original_error.context(format!(
+        "Package '{package}' not found. Suggestion: use 'omg search' to check available package names"
+    ))
 }
 
 fn consume_replacement_hop(remaining_hops: u32, replacement: &str) -> Result<u32> {
@@ -710,7 +712,7 @@ mod tests {
         let error = mock_missing_error("missing-fixture-package", original.into());
         assert_eq!(
             error.to_string(),
-            "Package 'missing-fixture-package' not found"
+            "Package 'missing-fixture-package' not found. Suggestion: use 'omg search' to check available package names"
         );
         assert!(
             error

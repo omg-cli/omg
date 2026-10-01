@@ -160,26 +160,19 @@ async fn install_with_replacement_budget(
 }
 
 fn validate_install_targets(packages: &[String]) -> Result<()> {
-    #[cfg(feature = "arch")]
-    if super::mock_arch_backend()? {
-        crate::core::security::validate_package_names_or_files(packages)?;
-        return Ok(());
-    }
-
-    dispatch_backend! {
-        debian: {
+    match crate::core::env::distro::detect_distro() {
+        crate::core::env::distro::Distro::Debian | crate::core::env::distro::Distro::Ubuntu => {
             crate::core::security::validate_debian_package_names_or_files(packages)?;
-            Ok(())
-        },
-        arch: {
+        }
+        crate::core::env::distro::Distro::Arch => {
             crate::core::security::validate_package_names_or_files(packages)?;
-            Ok(())
-        },
-        generic: {
+        }
+        _ => {
             crate::core::security::validate_package_names(packages)?;
-            Ok(())
-        },
+        }
     }
+    crate::package_managers::resolve_backend()?;
+    Ok(())
 }
 
 async fn install_dry_run(packages: &[String]) -> Result<()> {

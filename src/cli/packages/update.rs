@@ -32,9 +32,9 @@ pub async fn update(
     aur_only: bool,
 ) -> Result<()> {
     #[cfg(feature = "arch")]
-    if aur_only && super::mock_arch_backend()? {
-        // The mock has no AUR network lane. Preserve Arch's read-only
-        // --aur-only check without routing an official update through ALPM.
+    if super::mock_arch_backend()? {
+        // Retain Arch orchestration with the isolated mock manager. Its AUR
+        // lane is disabled, and development-mode elevation fails closed.
         return arch::update(check_only, yes, dry_run, no_sync, aur_only).await;
     }
     dispatch_backend! {

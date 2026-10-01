@@ -439,10 +439,10 @@ pub fn search_sync_cli_with_limit(
     no_aur: bool,
     limit: usize,
 ) -> Result<bool> {
-    let backend = crate::package_managers::resolve_backend()?;
     if !crate::cli::packages::common::is_valid_search_query(query) {
         return Ok(false);
     }
+    let backend = crate::package_managers::resolve_backend()?;
 
     // Fast path: official-only search via sync client (zero runtime overhead).
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
