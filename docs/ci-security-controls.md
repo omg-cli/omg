@@ -58,12 +58,31 @@ Missing, malformed or oversized required evidence fails admission. Only selected
 crash identity fields are queried; core dumps and process environments are not
 uploaded. These checks detect specified failure classes, not every possible bug.
 
-`tests/qemu-inventory-policy.json` independently records exact supported inventory
-digests, selected tiers and permitted per-case skips. Changing the inventory
-requires a policy review. CI always supplies the policy to the harness. Its
+`tests/qemu-inventory-policy.json` indexes reviewed inventory digests and pins
+the SHA-256 of each separately bounded file in `tests/qemu-inventory-policy.d/`.
+Each file retains the selected tiers, network scopes and permitted per-case
+skips for one exact inventory, including historical release inventories. The
+index has no paths: a validated digest determines the snapshot filename, and
+symlinked files or directories are refused. Changing the inventory requires a
+policy review. CI always supplies the index to the harness. Its
 receipt reports selected, executed, passed, failed, blocked and skipped counts
 separately; a declared CLI-shape test is not advertised as an executed VM case.
 Ad hoc local inventories may run without this release policy.
+
+To add an inventory, copy the nearest reviewed snapshot to a temporary JSON
+file, edit its cases and release labels to match the new TSV exactly, then run:
+
+```sh
+python3 scripts/add-qemu-inventory-snapshot.py \
+  --policy tests/qemu-inventory-policy.json \
+  --inventory tests/cli_behavior_inventory.tsv \
+  --snapshot /path/to/reviewed-snapshot.json
+```
+
+The command adds one digest-named snapshot and one hash entry; it refuses a
+missing, duplicate or mismatched case set and never rewrites old snapshots.
+Review the new file and index entry together. The trusted failure reporter
+loads every pinned snapshot so historical case IDs remain reportable.
 
 The policy also declares each case's network scope. Offline cases run in a fresh
 network namespace as the guest user with no new privileges. Networked cases are

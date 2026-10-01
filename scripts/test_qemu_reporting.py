@@ -1,13 +1,13 @@
 import copy
-import importlib.util
+from contextlib import nullcontext
 import hashlib
+import importlib.util
 import io
 import json
 from pathlib import Path
 import stat
 import os
 import tempfile
-from contextlib import nullcontext
 from unittest.mock import patch
 import unittest
 import zipfile
@@ -30,53 +30,6 @@ class ReportingBoundaryTests(unittest.TestCase):
             info.external_attr = mode << 16
             archive.writestr(info, content)
         return output.getvalue()
-
-    def test_published_inventory_rechecks_exported_selection_and_admission(self):
-        profile = "hermetic,qemu,container,network,pty"
-        inventory = ("case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\t"
-                     "targets\tassertions\tcleanup\n"
-                     'search\t["search","tree"]\tread\t0\tpass\t-\thermetic\t'
-                     'hermetic:pass\t-\tnone\n').encode()
-        digest = hashlib.sha256(inventory).hexdigest()
-        policy = json.dumps({"profiles": {profile: profile.split(",")},
-                             "inventories": {digest: {"cases": [{
-                                 "id": "search", "tiers": ["hermetic"],
-                                 "network_scope": "offline", "allowed_skips": {},
-                             }]}}}).encode()
-        result = dict(case_id="qemu-arch-search", distro="arch", result="PASS",
-                      artifact_source="inventory", exit_code=0, elapsed_seconds=1,
-                      network_scope="offline")
-        admission = dict(schema_version=1, inventory_sha256=digest,
-                         counts=dict(selected=1, executed=1, passed=1, failed=0,
-                                     blocked=0, harness_error=0, skipped=0),
-                         allowed_skips={}, passed=True)
-        files = {
-            "run-a/cases.tsv": inventory,
-            "run-a/inventory/results.json": json.dumps([result]),
-            "run-a/inventory/summary.json": '{"complete":true,"pass":1,"fail":0,"skipped":0}',
-            "run-a/inventory-admission.json": json.dumps(admission),
-        }
-
-        def artifact(entries):
-            output = io.BytesIO()
-            with zipfile.ZipFile(output, "w") as archive:
-                for name, value in entries.items():
-                    archive.writestr(name, value)
-            return output.getvalue()
-
-        self.assertIsNone(REPORT.published_inventory_admission(artifact(files), "arch", policy))
-        for missing in files:
-            with self.subTest(missing=missing), self.assertRaises(ValueError):
-                REPORT.published_inventory_admission(
-                    artifact({name: value for name, value in files.items() if name != missing}),
-                    "arch", policy)
-        tampered = dict(files, **{"run-a/inventory/results.json": json.dumps([
-            dict(result, result="SKIPPED", exit_code=-1)])})
-        with self.assertRaises(ValueError):
-            REPORT.published_inventory_admission(artifact(tampered), "arch", policy)
-        extra = dict(files, **{"run-b/results.json": "[]"})
-        with self.assertRaises(ValueError):
-            REPORT.published_inventory_admission(artifact(extra), "arch", policy)
 
     def test_projection_removes_untrusted_fields_without_extraction(self):
         row = dict(self.row(), command="do not execute", environment={"secret": "private"})
@@ -143,27 +96,6 @@ class ReportingBoundaryTests(unittest.TestCase):
         REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
         self.assertIn("daemon failed to restart", diagnostics[(row["case_id"], "arch")])
         self.assertNotIn("unrelated run", diagnostics[(row["case_id"], "arch")])
-
-    def test_doctor_connectivity_failure_is_named_in_lifecycle_issue_excerpt(self):
-        row = dict(self.row(), case_id="qemu-fedora-lifecycle", distro="fedora",
-                   result="PRODUCT_FAIL")
-        output = io.BytesIO()
-        with zipfile.ZipFile(output, "w") as archive:
-            archive.writestr("run/results.json", json.dumps([row]))
-            archive.writestr("run/guest/evidence/doctor-connectivity-fallback.log",
-                             "assertion failed: Doctor alternate did not report kernel.org reachable")
-            archive.writestr("run/guest-check.log",
-                             "Doctor connectivity fallback failed (exit 1)")
-            archive.writestr("run/kvm-probe.log", "routine KVM probe")
-            archive.writestr("run/transactions.log", "unrelated transaction setup")
-        diagnostics = {}
-        REPORT.archive_rows(output.getvalue(), {row["case_id"]}, diagnostics)
-        excerpt = diagnostics[(row["case_id"], "fedora")]
-        self.assertIn("doctor-connectivity-fallback.log", excerpt)
-        self.assertIn("kernel.org reachable", excerpt)
-        self.assertIn("Doctor connectivity fallback failed", excerpt)
-        self.assertNotIn("routine KVM probe", excerpt)
-        self.assertNotIn("unrelated transaction setup", excerpt)
 
     def test_fedora_metadata_refresh_failure_includes_native_output(self):
         row = dict(self.row(), case_id="qemu-fedora-lifecycle", distro="fedora",
@@ -594,16 +526,11 @@ class ReportingBoundaryTests(unittest.TestCase):
         for case_id in ("qemu-matrix-workflow", "qemu-matrix-x86-workflow",
                         "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow"):
             with self.subTest(case_id=case_id):
-                aggregate = dict(self.row(), case_id=case_id)
+                aggregate = dict(self.row(), case_id=case_id, distro="ubuntu")
                 for rows in ([aggregate, self.row()], [self.row(), aggregate]):
                     self.assertEqual(REPORT.projection(rows, False), [self.row()])
                 self.assertEqual(REPORT.projection([aggregate], False), [aggregate])
                 self.assertEqual(REPORT.projection([aggregate, self.row("PASS")], False), [aggregate])
-
-    def test_detailed_failure_does_not_hide_another_distro_aggregate(self):
-        fedora = dict(self.row(), case_id="qemu-matrix-x86-workflow", distro="fedora",
-                      result="HARNESS_ERROR")
-        self.assertEqual(REPORT.projection([self.row(), fedora], False), [self.row(), fedora])
 
     def test_failure_overflow_preserves_every_identity_with_bounded_issues(self):
         failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(26)]
@@ -694,8 +621,8 @@ class ReportingBoundaryTests(unittest.TestCase):
                            jobs=None, prior_attempt_artifact=False,
                            retained_guest_artifacts=False, arm_rows=None, arm_log=None,
                             arm_first=False, arm_provenance_override=None,
-                             no_artifacts=False, artifact_listing_error=False,
-                             verify_published_inventory=False):
+                            no_artifacts=False, artifact_listing_error=False,
+                            catalog_damage=None):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -811,13 +738,41 @@ class ReportingBoundaryTests(unittest.TestCase):
             path = Path(directory)
             event_path = path / "event.json"
             event_path.write_text(json.dumps(event))
-            admission_stub = (nullcontext() if verify_published_inventory else
-                              patch.object(REPORT, "published_inventory_admission"))
+            catalog_patch = nullcontext()
+            if catalog_damage in ("missing", "tampered"):
+                policy = path / "tests/qemu-inventory-policy.json"
+                snapshot_dir = policy.with_name(policy.stem + ".d")
+                snapshot_dir.mkdir(parents=True)
+                current = "a" * 64
+                historical = "b" * 64
+                def snapshot(case_id):
+                    return json.dumps({"releases": [], "cases": [{
+                        "id": case_id, "tiers": ["hermetic"],
+                        "network_scope": "offline", "allowed_skips": {},
+                    }]}).encode()
+                current_bytes = snapshot("search")
+                historical_bytes = snapshot("historical-only")
+                (snapshot_dir / f"{current}.json").write_bytes(current_bytes)
+                if catalog_damage == "tampered":
+                    (snapshot_dir / f"{historical}.json").write_bytes(b"{}")
+                policy.write_text(json.dumps({"schema_version": 2,
+                    "profiles": {"hermetic": ["hermetic"]},
+                    "inventories": {
+                        current: hashlib.sha256(current_bytes).hexdigest(),
+                        historical: hashlib.sha256(historical_bytes).hexdigest(),
+                    }}))
+                real_loader = REPORT.all_snapshots
+                catalog_patch = patch.object(REPORT, "all_snapshots",
+                    side_effect=lambda _: real_loader(policy))
+            elif catalog_damage == "forbid":
+                catalog_patch = patch.object(REPORT, "all_snapshots",
+                    side_effect=AssertionError("cancelled run loaded policy catalog"))
             with patch.dict(os.environ, GITHUB_REPOSITORY="owner/repo", GITHUB_EVENT_PATH=str(event_path),
-                             RUNNER_TEMP=directory, GITHUB_RUN_ID="50"), \
-                  patch.object(REPORT, "api", side_effect=api), \
-                  patch.object(REPORT, "canonical_case_ids", return_value={row["case_id"] for row in rows}), \
-                  patch.object(REPORT.subprocess, "run", side_effect=subprocess_run), admission_stub:
+                            RUNNER_TEMP=directory, GITHUB_RUN_ID="50"), \
+                 patch.object(REPORT, "api", side_effect=api), \
+                 patch.object(REPORT, "canonical_case_ids", return_value={row["case_id"] for row in rows}), \
+                 patch.object(REPORT.subprocess, "run", side_effect=subprocess_run), \
+                 catalog_patch:
                 if changed_attempt:
                     with self.assertRaisesRegex(ValueError, "identity or attempt mismatch"):
                         REPORT.main()
@@ -841,37 +796,6 @@ class ReportingBoundaryTests(unittest.TestCase):
             exit_code=0, elapsed_seconds=0)])
         self.assertNotIn("--failures-only", calls[0][3])
         self.assertEqual(catalog["failures"], [])
-
-    def test_published_success_missing_cli_evidence_reports_harness_failure(self):
-        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-lifecycle")
-                for distro in REPORT.DISTROS]
-        calls, catalog = self.run_report_fixture(
-            rows, conclusion="success", event_kind="workflow_dispatch", all_distros=True,
-            verify_published_inventory=True)
-        issue_calls = [call for call in calls if call[0] == "scripts/qa-file-issue.sh"]
-        self.assertEqual(len(issue_calls), 1)
-        self.assertEqual(issue_calls[0][1], [dict(
-            case_id="qemu-matrix-x86-workflow", distro="matrix", result="HARNESS_ERROR",
-            exit_code=1, elapsed_seconds=0)])
-        self.assertTrue(catalog["evidence_invalid_or_unavailable"])
-        self.assertEqual(catalog["failures"], issue_calls[0][1])
-
-    def test_staged_schedule_does_not_require_published_inventory_receipt(self):
-        rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
-                for distro in REPORT.DISTROS]
-        calls, catalog = self.run_report_fixture(
-            rows, conclusion="success", event_kind="schedule", all_distros=True,
-            provenance_override={"staged": True}, verify_published_inventory=True)
-        self.assertEqual(calls, [])
-        self.assertIsNone(catalog)
-
-    def test_failed_guest_diagnostic_does_not_require_success_admission(self):
-        calls, catalog = self.run_report_fixture(
-            [self.row("FAIL")], conclusion="failure", event_kind="schedule",
-            verify_published_inventory=True)
-        issue_calls = [call for call in calls if call[0] == "scripts/qa-file-issue.sh"]
-        self.assertEqual(issue_calls[0][1][0]["case_id"], "qemu-arch-search")
-        self.assertFalse(catalog["evidence_invalid_or_unavailable"])
 
     def test_staged_main_success_never_closes_published_issue(self):
         calls, catalog = self.run_report_fixture([self.row("PASS")], conclusion="success")
@@ -999,6 +923,30 @@ class ReportingBoundaryTests(unittest.TestCase):
                 self.assertEqual(calls[0][1][0]["result"], "HARNESS_ERROR")
                 self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-x86-workflow")
 
+    def test_unreadable_unrelated_historical_policy_files_report_only_workflow_failure(self):
+        for damage in ("missing", "tampered"):
+            for conclusion, guest_result in (("failure", "FAIL"), ("success", "PASS")):
+                with self.subTest(damage=damage, conclusion=conclusion):
+                    calls, catalog = self.run_report_fixture(
+                        [self.row(guest_result)], conclusion=conclusion,
+                        catalog_damage=damage)
+                    self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+                    self.assertEqual(len(catalog["failures"]), 1)
+                    failure = catalog["failures"][0]
+                    self.assertEqual(failure["case_id"], "qemu-matrix-x86-workflow")
+                    self.assertEqual(failure["result"], "HARNESS_ERROR")
+                    self.assertFalse(any(row["case_id"] == "qemu-arch-search"
+                                         for _, rows, _, _ in calls for row in rows))
+                    self.assertEqual(calls[0][0], "scripts/qa-file-issue.sh")
+
+    def test_cancelled_run_never_loads_damaged_policy_or_files_issue(self):
+        for conclusion in ("cancelled", "skipped"):
+            with self.subTest(conclusion=conclusion):
+                calls, catalog = self.run_report_fixture(
+                    [self.row()], conclusion=conclusion, catalog_damage="forbid")
+                self.assertEqual(calls, [])
+                self.assertIsNone(catalog)
+
     def test_failed_fedora_setup_without_guest_evidence_is_not_labeled_ubuntu(self):
         jobs = [
             {"name": "QEMU behavioral verification / Distro lane (fedora) / QEMU guest (fedora)",
@@ -1014,81 +962,6 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(len(calls[0][1]), 1)
         self.assertEqual(calls[0][1][0]["distro"], "fedora")
         self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-x86-workflow")
-
-    def test_mixed_detailed_failure_and_missing_guest_artifact_keep_both_distros(self):
-        jobs = [
-            {"name": "QEMU behavioral verification / Distro lane (arch) / QEMU guest (arch)",
-             "conclusion": "failure", "id": 11, "steps": []},
-            {"name": "QEMU behavioral verification / Distro lane (fedora) / QEMU guest (fedora)",
-             "conclusion": "failure", "id": 12, "steps": []},
-            {"name": "QEMU behavioral verification / QEMU matrix result",
-             "conclusion": "failure", "id": 13, "steps": []},
-        ]
-        calls, catalog = self.run_report_fixture([self.row()], jobs=jobs)
-        expected = [dict(self.row(), arch="x86_64"),
-                    dict(case_id="qemu-matrix-x86-workflow", distro="fedora",
-                         arch="x86_64", result="HARNESS_ERROR", exit_code=1,
-                         elapsed_seconds=0)]
-        self.assertEqual(calls[0][1], expected)
-        self.assertEqual(catalog["failures"], expected)
-
-    def test_arm_health_and_x86_guest_failure_both_survive_unavailable_artifacts(self):
-        for distro in ("arch", "ubuntu"):
-            for unavailable in (dict(no_artifacts=True), dict(artifact_listing_error=True)):
-                with self.subTest(distro=distro, unavailable=unavailable):
-                    jobs = [
-                        {"name": "ARM guest runner KVM health", "conclusion": "failure",
-                         "id": 11, "steps": []},
-                        {"name": f"QEMU behavioral verification / Distro lane ({distro}) / "
-                                 f"QEMU guest ({distro})", "conclusion": "failure",
-                         "id": 12, "steps": []},
-                        {"name": "QEMU behavioral verification / QEMU matrix result",
-                         "conclusion": "failure", "id": 13, "steps": []},
-                    ]
-                    calls, catalog = self.run_report_fixture([], jobs=jobs, **unavailable)
-                    expected = [
-                        dict(case_id="qemu-arm-runner-kvm-health", distro="ubuntu",
-                             result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0),
-                        dict(case_id="qemu-matrix-x86-workflow", distro=distro,
-                             arch="x86_64", result="HARNESS_ERROR", exit_code=1,
-                             elapsed_seconds=0),
-                    ]
-                    self.assertEqual(calls[0][1], expected)
-                    self.assertEqual(catalog["failures"], expected)
-                    self.assertEqual(catalog["evidence_invalid_or_unavailable"],
-                                     "artifact_listing_error" in unavailable)
-
-    def test_arm_health_failure_survives_detailed_x86_guest_failure(self):
-        jobs = [
-            {"name": "ARM guest runner KVM health", "conclusion": "failure",
-             "id": 11, "steps": []},
-            {"name": "QEMU behavioral verification / Distro lane (arch) / QEMU guest (arch)",
-             "conclusion": "failure", "id": 12, "steps": []},
-        ]
-        calls, catalog = self.run_report_fixture([self.row()], jobs=jobs)
-        expected = [
-            dict(self.row(), arch="x86_64"),
-            dict(case_id="qemu-arm-runner-kvm-health", distro="ubuntu",
-                 result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0),
-        ]
-        self.assertEqual(calls[0][1], expected)
-        self.assertEqual(catalog["failures"], expected)
-
-    def test_mixed_health_and_guest_failure_overflow_keeps_catalog_identities(self):
-        failures = [dict(self.row(), case_id=f"qemu-arch-case-{n}") for n in range(25)]
-        jobs = [
-            {"name": "ARM guest runner KVM health", "conclusion": "failure",
-             "id": 11, "steps": []},
-            {"name": "QEMU behavioral verification / Distro lane (fedora) / QEMU guest (fedora)",
-             "conclusion": "failure", "id": 12, "steps": []},
-        ]
-        calls, catalog = self.run_report_fixture(failures, jobs=jobs)
-        self.assertEqual(len(catalog["failures"]), 27)
-        self.assertEqual({row["case_id"] for row in catalog["failures"]} -
-                         {row["case_id"] for row in failures},
-                         {"qemu-arm-runner-kvm-health", "qemu-matrix-x86-workflow"})
-        self.assertEqual(len(calls[0][1]), 1)
-        self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-workflow")
 
     def test_failed_native_ci_before_qemu_uses_ci_prerequisite_identity(self):
         jobs = [

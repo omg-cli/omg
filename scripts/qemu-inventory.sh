@@ -1683,9 +1683,9 @@ if [[ "$isolate_hermetic" == true ]]; then
   [[ -f "$network_policy" && ! -L "$network_policy" && $(wc -c < "$network_policy") -le 1048576 ]] || exit 2
   inventory_digest=$(sha256sum "$tsv"); inventory_digest=${inventory_digest%% *}
   scopes=$(jq -ce --arg digest "$inventory_digest" '
-    .inventories[$digest].cases | select(type=="array" and length>0) |
-    if all(.[]; .network_scope=="offline" or .network_scope=="network") then
-      map({key:.id,value:.network_scope}) | from_entries else error("invalid network scope") end' "$network_policy")
+    select(.inventory_sha256 == $digest) | .scopes |
+    select(type=="object" and length>0 and
+           all(.[]; .=="offline" or .=="network"))' "$network_policy")
 fi
 
 root=$(cd "$work" && pwd)
@@ -2317,7 +2317,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ -n "$counter" ]]; then
     remote+="; $(declare -f check_native_counter)"
   elif [[ "$assertions" == doctor-native-backend ]]; then
-    remote+="; $(declare -f check_doctor_native_backend)"
+    remote+="; $(declare -f check_doctor_native_backend); $(declare -f check_doctor_issue_delta)"
   elif [[ "$assertions" == info-native-package ]]; then
     remote+="; $(declare -f check_info_native_package)"
   elif [[ "$assertions" == status-native-fast || "$assertions" == status-native-full ]]; then
@@ -2436,6 +2436,21 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote+="; fault_rc=0; OMG_PACMAN_DB_DIR=\"\$rowdir/fault-db\" OMG_DISABLE_DAEMON=1 timeout --kill-after=5s '$row_timeout' $quoted_binary doctor > doctor-fault.stdout.log 2> doctor-fault.stderr.log || fault_rc=\$?"
       remote+="; if [ \"\$fault_rc\" != 1 ] || ! grep -Fq 'ALPM local package database inconsistent (' doctor-fault.stdout.log; then printf 'assertion failed: doctor accepted a corrupt Arch local package entry\\n' >&2; assertion=1; fi"
     fi
+    # POSIX PATH searches executable files in listed directories. Hold all
+    # other Doctor inputs fixed, including a refused HTTPS proxy, so a live
+    # connectivity fluctuation cannot masquerade as a PATH issue.
+    remote+="; if [[ \"\$rc\" == 0 && \"\$execution_phase\" == product && \"\$assertion\" == 0 ]]; then path_without_omg=/usr/sbin:/usr/bin:/sbin:/bin; path_with_omg=$quoted_binary_dir:\"\$path_without_omg\""
+    remote+="; if env PATH=\"\$path_without_omg\" sh -c 'command -v omg >/dev/null 2>&1'; then printf 'assertion failed: restricted guest PATH still resolves omg\\n' >&2; execution_phase=dependency; rc=2; assertion=1"
+    remote+="; else mkdir -p shadow-bin relative-bin; printf '#!/bin/sh\\nexit 99\\n' > shadow-bin/omg; chmod 700 shadow-bin/omg; ln -s $quoted_binary relative-bin/omg; path_shadow=\"\$rowdir/shadow-bin:\$path_with_omg\"; path_relative=\"./relative-bin:\$path_without_omg\""
+    remote+="; actual_shadow=\$(env PATH=\"\$path_shadow\" sh -c 'command -v omg'); actual_relative=\$(env PATH=\"\$path_relative\" sh -c 'command -v omg'); actual_relative_target=\$(readlink -f \"\$actual_relative\"); expected_binary=\$(readlink -f $quoted_binary); if [[ \"\$actual_shadow\" != \"\$rowdir/shadow-bin/omg\" || \"\$actual_relative\" != *relative-bin/omg || \"\$actual_relative_target\" != \"\$expected_binary\" ]]; then printf 'controlled Doctor shadow/relative PATH fixtures did not resolve: shadow=%q relative=%q\\n' \"\$actual_shadow\" \"\$actual_relative\" >&2; execution_phase=dependency; rc=2; assertion=1"
+    remote+="; else doctor_path_probe() { local selected_path=\$1 output_prefix=\$2; run_omg '$row_timeout' env PATH=\"\$selected_path\" HTTPS_PROXY=http://127.0.0.1:1 https_proxy=http://127.0.0.1:1 HTTP_PROXY=http://127.0.0.1:1 http_proxy=http://127.0.0.1:1 ALL_PROXY=http://127.0.0.1:1 all_proxy=http://127.0.0.1:1 NO_PROXY= no_proxy= OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0 $quoted_binary doctor > \"\$output_prefix.stdout.log\" 2> \"\$output_prefix.stderr.log\"; }"
+    remote+="; doctor_path_probe \"\$path_with_omg\" doctor-path-baseline; path_baseline_rc=\$rc; path_baseline_phase=\$execution_phase; cat doctor-path-baseline.stdout.log doctor-path-baseline.stderr.log >&2"
+    remote+="; doctor_path_probe \"\$path_without_omg\" doctor-path-absent; path_absent_rc=\$rc; path_absent_phase=\$execution_phase; cat doctor-path-absent.stdout.log doctor-path-absent.stderr.log >&2"
+    remote+="; doctor_path_probe \"\$path_shadow\" doctor-path-shadow; path_shadow_rc=\$rc; path_shadow_phase=\$execution_phase; cat doctor-path-shadow.stdout.log doctor-path-shadow.stderr.log >&2"
+    remote+="; doctor_path_probe \"\$path_relative\" doctor-path-relative; path_relative_rc=\$rc; path_relative_phase=\$execution_phase; cat doctor-path-relative.stdout.log doctor-path-relative.stderr.log >&2"
+    remote+="; if [[ \"\$path_baseline_phase\" != product || \"\$path_absent_phase\" != product || \"\$path_shadow_phase\" != product || \"\$path_relative_phase\" != product ]]; then if [[ \"\$path_baseline_phase\" != product ]]; then rc=\$path_baseline_rc; execution_phase=\$path_baseline_phase; elif [[ \"\$path_absent_phase\" != product ]]; then rc=\$path_absent_rc; execution_phase=\$path_absent_phase; elif [[ \"\$path_shadow_phase\" != product ]]; then rc=\$path_shadow_rc; execution_phase=\$path_shadow_phase; else rc=\$path_relative_rc; execution_phase=\$path_relative_phase; fi; printf 'controlled Doctor PATH probe did not execute as a product run\\n' >&2; assertion=1"
+    remote+="; elif ! grep -Fqx '  PATH configured correctly' doctor-path-baseline.stdout.log || ! grep -Fqx '  omg executable not found on PATH' doctor-path-absent.stdout.log || grep -Fqx '  PATH configured correctly' doctor-path-absent.stdout.log || ! grep -Eq '^  PATH resolves a different omg executable first: \".*/shadow-bin/omg\"$' doctor-path-shadow.stdout.log || grep -Fqx '  PATH configured correctly' doctor-path-shadow.stdout.log || ! grep -Fqx '  PATH configured correctly' doctor-path-relative.stdout.log || ! grep -Eq '^  Connectivity probe.*failed' doctor-path-baseline.stdout.log || ! grep -Eq '^  Connectivity probe.*failed' doctor-path-absent.stdout.log || ! grep -Eq '^  Connectivity probe.*failed' doctor-path-shadow.stdout.log || ! grep -Eq '^  Connectivity probe.*failed' doctor-path-relative.stdout.log || ! check_doctor_issue_delta 0 command.stdout.log command.stderr.log \"\$path_baseline_rc\" doctor-path-baseline.stderr.log 1 || ! check_doctor_issue_delta \"\$path_baseline_rc\" doctor-path-baseline.stdout.log doctor-path-baseline.stderr.log \"\$path_absent_rc\" doctor-path-absent.stderr.log 1 || ! check_doctor_issue_delta \"\$path_baseline_rc\" doctor-path-baseline.stdout.log doctor-path-baseline.stderr.log \"\$path_shadow_rc\" doctor-path-shadow.stderr.log 1 || ! check_doctor_issue_delta \"\$path_baseline_rc\" doctor-path-baseline.stdout.log doctor-path-baseline.stderr.log \"\$path_relative_rc\" doctor-path-relative.stderr.log 0; then printf 'assertion failed: controlled Doctor PATH probe lacked the exact diagnostic and issue deltas\\n' >&2; assertion=1; rc=0; execution_phase=product"
+    remote+="; else rc=0; execution_phase=product; fi; fi; fi; fi"
   fi
   if [[ "$assertions" == doctor-native-backend && "$case" == doctor ]]; then
     # The release binary must remain healthy when optional host executables
@@ -2509,7 +2524,14 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   start_centis=${uptime/./}
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
-  if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state || "$assertions" == doctor-native-backend ]]; then budget=$((budget + row_timeout + 5)); fi
+  if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state ]]; then budget=$((budget + row_timeout + 5)); fi
+  if [[ "$assertions" == doctor-native-backend ]]; then
+    # Four PATH variants plus the minimal-PATH run; Arch also exercises a
+    # corrupt local database. Each run owns a separate row_timeout deadline.
+    doctor_extra_runs=5
+    if [[ "$distro" == arch ]]; then doctor_extra_runs=6; fi
+    budget=$((budget + doctor_extra_runs * (row_timeout + 5)))
+  fi
   if [[ -n "$counter" ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == outdated-native-count || "$assertions" == outdated-json-native-count ]]; then budget=$((budget + 32)); fi
   if [[ "$assertions" == status-native-fast ]]; then budget=$((budget + 64)); fi

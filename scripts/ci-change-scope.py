@@ -24,6 +24,8 @@ QEMU_COVERAGE_IRRELEVANT = {
     'scripts/check-qemu-runner-isolation.py',
     'scripts/ci-smoke-report.py',
     'scripts/report-qemu-workflow.py',
+    'scripts/qemu_inventory_policy.py',
+    'scripts/add-qemu-inventory-snapshot.py',
     'scripts/test_ci_smoke_report.py',
     'scripts/test_qemu_runner_isolation.py',
     'tests/qemu-inventory-policy.json',
@@ -36,6 +38,7 @@ def coverage_irrelevant(paths):
         '..' not in PurePosixPath(path).parts and (
             documentation_only([path])
             or path in QEMU_COVERAGE_IRRELEVANT
+            or (path.startswith('tests/qemu-inventory-policy.d/') and path.endswith('.json'))
             or (path.startswith('scripts/qemu-') and path.endswith('.sh'))
             or (path.startswith('scripts/test_qemu_') and path.endswith('.py'))
         )

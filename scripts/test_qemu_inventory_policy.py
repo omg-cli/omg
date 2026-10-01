@@ -3,10 +3,21 @@ import csv
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+from qemu_inventory_policy import all_snapshots, load_index, load_snapshot, network_scopes
+
+
+def reviewed_rules():
+    index, snapshots = all_snapshots(ROOT / "tests/qemu-inventory-policy.json")
+    return {"profiles": index["profiles"], "inventories": snapshots}
+
+
 SPEC = importlib.util.spec_from_file_location("qemu_policy", ROOT / "scripts/check-qemu-inventory.py")
 POLICY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(POLICY)
@@ -26,9 +37,21 @@ class PolicyTests(unittest.TestCase):
                 self.assertEqual(rows[case]['assertions'], assertion)
                 self.assertEqual(rows[case]['targets'], 'hermetic:pass')
 
+    def test_all_historical_snapshot_hashes_are_bounded_and_reportable(self):
+        policy = ROOT / "tests/qemu-inventory-policy.json"
+        index, snapshots = all_snapshots(policy)
+        self.assertGreaterEqual(len(snapshots), 23)
+        self.assertEqual(set(snapshots), set(index["inventories"]))
+        self.assertLessEqual(policy.stat().st_size, 1024 * 1024)
+        for digest, snapshot in snapshots.items():
+            with self.subTest(digest=digest):
+                self.assertTrue(snapshot["cases"])
+                self.assertLessEqual((policy.with_name(policy.stem + ".d") /
+                                      f"{digest}.json").stat().st_size, 1024 * 1024)
+
     def test_current_inventory_has_exact_policy_case_set(self):
         inventory = ROOT / "tests/cli_behavior_inventory.tsv"
-        rules = json.loads((ROOT / "tests/qemu-inventory-policy.json").read_text())
+        rules = reviewed_rules()
         cases = rules["inventories"][hashlib.sha256(inventory.read_bytes()).hexdigest()]["cases"]
         with inventory.open(newline="") as source:
             expected = {row["case"] for row in csv.DictReader(source, delimiter="\t")}
@@ -73,11 +96,13 @@ class PolicyTests(unittest.TestCase):
             b"optional\t[\"doctor\",\"--turbo\"]\tread\t-\tdeclared\t-\thermetic\tarch:pending\t-\tnone\n"
         )
         self.policy = self.root / "policy.json"
-        self.policy.write_text(json.dumps({"profiles": {"hermetic": ["hermetic"]}, "inventories": {
-            hashlib.sha256(self.inventory.read_bytes()).hexdigest(): {"cases": [
+        self.policy_dir = self.root / "policy.d"
+        self.policy_dir.mkdir()
+        self.selection = {"releases": [], "cases": [
                 {"id": "required", "tiers": ["hermetic"], "network_scope": "offline", "allowed_skips": {}},
                 {"id": "optional", "tiers": ["hermetic"], "network_scope": "offline", "allowed_skips": {"arch": "declared-cli-shape-only"}},
-            ]}}}))
+            ]}
+        self.write_policy()
         self.results = self.root / "results.json"
         self.summary = self.root / "summary.json"
         self.rows = [dict(case_id="qemu-arch-required", distro="arch", artifact_source="inventory",
@@ -88,10 +113,17 @@ class PolicyTests(unittest.TestCase):
 
     def repolicy_inventory(self, content):
         self.inventory.write_bytes(content.encode("utf-8"))
-        rules = json.loads(self.policy.read_text())
-        cases = next(iter(rules["inventories"].values()))
-        rules["inventories"] = {hashlib.sha256(self.inventory.read_bytes()).hexdigest(): cases}
-        self.policy.write_text(json.dumps(rules))
+        self.write_policy()
+
+    def write_policy(self):
+        for old in self.policy_dir.iterdir():
+            old.unlink()
+        digest = hashlib.sha256(self.inventory.read_bytes()).hexdigest()
+        content = json.dumps(self.selection).encode("utf-8")
+        (self.policy_dir / f"{digest}.json").write_bytes(content)
+        self.policy.write_text(json.dumps({"schema_version": 2,
+            "profiles": {"hermetic": ["hermetic"]},
+            "inventories": {digest: hashlib.sha256(content).hexdigest()}}))
 
     def admit(self, distro="arch"):
         self.results.write_text(json.dumps(self.rows))
@@ -102,6 +134,100 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(receipt["passed"])
         self.assertEqual(receipt["counts"], dict(selected=2, executed=1, passed=1, failed=0,
                                                blocked=0, harness_error=0, skipped=1))
+
+    def test_scope_projection_is_bound_to_inventory_digest(self):
+        result = network_scopes(self.policy, self.inventory)
+        self.assertEqual(result, {"inventory_sha256": hashlib.sha256(
+            self.inventory.read_bytes()).hexdigest(),
+            "scopes": {"required": "offline", "optional": "offline"}})
+        self.inventory.write_bytes(b"different inventory\n")
+        with self.assertRaises(KeyError):
+            network_scopes(self.policy, self.inventory)
+
+    def test_tampered_snapshot_fails_admission_and_scope_projection(self):
+        snapshot = next(self.policy_dir.iterdir())
+        snapshot.write_bytes(snapshot.read_bytes().replace(b'"offline"', b'"network"', 1))
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            self.admit()
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            network_scopes(self.policy, self.inventory)
+
+    def test_signed_snapshot_cannot_hide_or_retier_inventory_case(self):
+        original = [dict(case) for case in self.selection["cases"]]
+        self.selection["cases"] = original[:1]
+        self.write_policy()
+        with self.assertRaisesRegex(ValueError, "cases or tiers"):
+            self.admit()
+        self.selection["cases"] = original
+        self.selection["cases"][0]["tiers"] = ["container"]
+        self.write_policy()
+        with self.assertRaisesRegex(ValueError, "cases or tiers"):
+            self.admit()
+
+    def test_duplicate_keys_in_index_and_snapshot_fail_closed(self):
+        index = self.policy.read_text()
+        self.policy.write_text(index.replace('"profiles":', '"profiles": {}, "profiles":', 1))
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            self.admit()
+        self.write_policy()
+        snapshot = next(self.policy_dir.iterdir())
+        content = snapshot.read_text().replace('"network_scope": "offline"',
+            '"network_scope": "network", "network_scope": "offline"', 1).encode()
+        snapshot.write_bytes(content)
+        index = json.loads(self.policy.read_text())
+        index["inventories"][next(iter(index["inventories"]))] = hashlib.sha256(content).hexdigest()
+        self.policy.write_text(json.dumps(index))
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            self.admit()
+
+    def test_traversal_digest_and_oversized_snapshot_fail_closed(self):
+        index = json.loads(self.policy.read_text())
+        file_hash = next(iter(index["inventories"].values()))
+        index["inventories"] = {"../outside": file_hash}
+        self.policy.write_text(json.dumps(index))
+        with self.assertRaisesRegex(ValueError, "identity"):
+            self.admit()
+        self.write_policy()
+        snapshot = next(self.policy_dir.iterdir())
+        snapshot.write_bytes(b" " * (1024 * 1024 + 1))
+        with self.assertRaisesRegex(ValueError, "invalid inventory evidence file"):
+            self.admit()
+
+    def test_symlinked_snapshot_and_directory_fail_closed(self):
+        snapshot = next(self.policy_dir.iterdir())
+        target = self.root / "target.json"
+        snapshot.replace(target)
+        try:
+            snapshot.symlink_to(target)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.admit()
+        snapshot.unlink()
+        self.policy_dir.rmdir()
+        self.policy_dir.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "snapshot directory"):
+            self.admit()
+
+    def test_add_command_appends_only_one_reviewed_digest(self):
+        prior = self.policy.read_bytes()
+        prior_file = next(self.policy_dir.iterdir())
+        prior_content = prior_file.read_bytes()
+        self.inventory.write_bytes(self.inventory.read_bytes() +
+            b"new\t[\"status\"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\tnone\n")
+        candidate = self.root / "candidate.json"
+        candidate.write_text(json.dumps({"releases": [], "cases": self.selection["cases"] +
+            [{"id": "new", "tiers": ["hermetic"], "network_scope": "offline", "allowed_skips": {}}]}))
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/add-qemu-inventory-snapshot.py"),
+            "--policy", str(self.policy), "--inventory", str(self.inventory),
+            "--snapshot", str(candidate)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        digest = hashlib.sha256(self.inventory.read_bytes()).hexdigest()
+        self.assertEqual(result.stdout.strip(), digest)
+        self.assertEqual(len(load_index(self.policy)["inventories"]), 2)
+        self.assertEqual(prior_file.read_bytes(), prior_content)
+        self.assertNotEqual(self.policy.read_bytes(), prior)
+        self.assertEqual(len(load_snapshot(self.policy, load_index(self.policy), digest)["cases"]), 3)
 
     def test_wrong_pass_exit_is_rejected(self):
         self.rows[0]["exit_code"] = 1
@@ -125,10 +251,8 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.admit()
 
-        rules = json.loads(self.policy.read_text())
-        cases = next(iter(rules["inventories"].values()))["cases"]
-        cases[1]["allowed_skips"]["fedora"] = "declared-cli-shape-only"
-        self.policy.write_text(json.dumps(rules))
+        self.selection["cases"][1]["allowed_skips"]["fedora"] = "declared-cli-shape-only"
+        self.write_policy()
         for row in self.rows:
             row["case_id"] = row["case_id"].replace("qemu-arch-", "qemu-fedora-")
             row["distro"] = "fedora"
@@ -187,7 +311,7 @@ class PolicyTests(unittest.TestCase):
             self.admit()
 
     def test_published_and_current_network_dependencies_are_explicit(self):
-        rules = json.loads((ROOT / "tests/qemu-inventory-policy.json").read_text())
+        rules = reviewed_rules()
         current = hashlib.sha256((ROOT / "tests/cli_behavior_inventory.tsv").read_bytes()).hexdigest()
         cases = {case['id']: case for case in rules['inventories'][current]['cases']}
         self.assertEqual(cases['audit-sbom-offline']['network_scope'], 'offline')
@@ -237,7 +361,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_current_inventory_and_workflow_have_reviewed_policy(self):
         content = (ROOT / "tests/cli_behavior_inventory.tsv").read_bytes().replace(b"\r\n", b"\n")
-        rules = json.loads((ROOT / "tests/qemu-inventory-policy.json").read_text())
+        rules = reviewed_rules()
         cases = rules["inventories"][hashlib.sha256(content).hexdigest()]["cases"]
         self.assertEqual(len(cases), len(content.splitlines()) - 1)
         self.assertEqual(len({case["id"] for case in cases}), len(cases))
@@ -278,6 +402,43 @@ class PolicyTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
         self.assertEqual(workflow.count("--inventory-policy tests/qemu-inventory-policy.json"), 2)
         self.assertIn('--inventory-tiers "hermetic,container"', workflow)
+
+
+    def test_index_admits_the_inventory_that_is_actually_shipped(self):
+        """The current cli_behavior_inventory.tsv must be admissible.
+
+        Admission computes sha256 over the inventory file and looks the digest
+        up in the index, so a policy that does not contain that digest rejects
+        every run. That is a silent-coverage failure: the sharding change and
+        a content change to the reviewed inventory can land together, drop the
+        old digest, and leave the harness unable to admit anything.
+        """
+        import hashlib
+
+        inventory = (ROOT / "tests" / "cli_behavior_inventory.tsv").read_bytes()
+        digest = hashlib.sha256(inventory).hexdigest()
+        index = json.loads(
+            (ROOT / "tests" / "qemu-inventory-policy.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            digest,
+            index["inventories"],
+            "the shipped inventory is not admissible by the shipped policy",
+        )
+
+    def test_every_indexed_digest_has_a_shard(self):
+        """A digest with no shard file would KeyError at admission time."""
+        policy = ROOT / "tests" / "qemu-inventory-policy.json"
+        shard_dir = policy.with_name(policy.stem + ".d")
+        index = json.loads(policy.read_text(encoding="utf-8"))
+        missing = [d for d in index["inventories"] if not (shard_dir / f"{d}.json").is_file()]
+        self.assertEqual(missing, [], "indexed digests without a shard file")
+
+    def test_index_digests_are_unique_lowercase_hex(self):
+        policy = ROOT / "tests" / "qemu-inventory-policy.json"
+        index = json.loads(policy.read_text(encoding="utf-8"))
+        for digest in index["inventories"]:
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
 
 
 if __name__ == "__main__":

@@ -133,3 +133,9 @@ TODO-mise-removal.md
 # ---- Local agent workspaces (never ship review state) ----
 .pi/
 piolium/
+
+# ---- Audit run artifacts ----
+# Dated CI export directories carry guest serial logs, controller logs and
+# host runner paths. Ignore only the run directories so the first-class audit
+# record (.audit/deep-audit.tsv) stays committable.
+/.audit/run-*/

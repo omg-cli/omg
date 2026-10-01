@@ -1,35 +1,17 @@
 #!/usr/bin/env python3
 """Admit an exact inventory selection against a separately reviewed skip policy."""
 import argparse
-import hashlib
 import json
 import re
 from pathlib import Path
+import sys
 
-LIMIT = 1024 * 1024
-HEADER = "case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from qemu_inventory_policy import HEADER, network_scopes, read_bounded, selected_snapshot, unique_object
+
 DISTROS = {"arch", "debian", "ubuntu", "fedora"}
 EXIT = re.compile(r"(?:0|[1-9][0-9]{0,2})\Z")
 MAPPED_EXIT = re.compile(r"(arch|debian|ubuntu|fedora):(0|[1-9][0-9]{0,2})\Z")
-
-
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate inventory evidence key")
-        result[key] = value
-    return result
-
-
-def read(path):
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > LIMIT:
-        raise ValueError("invalid inventory evidence file")
-    with path.open("rb") as stream:
-        content = stream.read(LIMIT + 1)
-    if len(content) > LIMIT:
-        raise ValueError("inventory evidence exceeded limit")
-    return content
 
 
 def resolve_exit(cell, distro):
@@ -71,18 +53,14 @@ def inventory_exits(content, distro):
     return exits
 
 
-def admit_contents(policy_bytes, inventory_bytes, results_bytes, summary_bytes, distro, tiers):
-    rules = json.loads(policy_bytes, object_pairs_hook=unique_object)
-    digest = hashlib.sha256(inventory_bytes).hexdigest()
-    selection = rules["inventories"][digest]
+def admit(policy, inventory, results, summary, distro, tiers):
+    rules, digest, selection, inventory_bytes = selected_snapshot(policy, inventory)
     exits = inventory_exits(inventory_bytes, distro)
     profile = rules["profiles"][tiers]
     expected = {"qemu-" + distro + "-" + row["id"]: row
                 for row in selection["cases"] if set(row["tiers"]) & set(profile)}
-    if any(case.removeprefix("qemu-" + distro + "-") not in exits for case in expected):
-        raise ValueError("selected case absent from inventory")
-    rows = json.loads(results_bytes, object_pairs_hook=unique_object)
-    completion = json.loads(summary_bytes, object_pairs_hook=unique_object)
+    rows = json.loads(read_bounded(results), object_pairs_hook=unique_object)
+    completion = json.loads(read_bounded(summary), object_pairs_hook=unique_object)
     if not isinstance(rows, list) or not rows or len(rows) != len(expected):
         raise ValueError("missing or extra selected cases")
     counts = dict(selected=len(expected), executed=0, passed=0, failed=0,
@@ -133,18 +111,24 @@ def admit_contents(policy_bytes, inventory_bytes, results_bytes, summary_bytes, 
             "allowed_skips": skips, "passed": counts["executed"] > 0 and expected_summary["fail"] == 0}
 
 
-def admit(policy, inventory, results, summary, distro, tiers):
-    return admit_contents(read(policy), read(inventory), read(results), read(summary), distro, tiers)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("policy", "inventory", "results", "summary"):
+    for name in ("policy", "inventory"):
         parser.add_argument("--" + name, type=Path, required=True)
-    parser.add_argument("--distro", required=True, choices=("arch", "debian", "ubuntu", "fedora"))
-    parser.add_argument("--tiers", required=True)
+    for name in ("results", "summary"):
+        parser.add_argument("--" + name, type=Path)
+    parser.add_argument("--distro", choices=("arch", "debian", "ubuntu", "fedora"))
+    parser.add_argument("--tiers")
+    parser.add_argument("--network-scopes", action="store_true")
     args = parser.parse_args()
     try:
+        if args.network_scopes:
+            if any((args.results, args.summary, args.distro, args.tiers)):
+                raise ValueError("network scope mode accepts only policy and inventory")
+            print(json.dumps(network_scopes(args.policy, args.inventory), separators=(",", ":")))
+            return 0
+        if not all((args.results, args.summary, args.distro, args.tiers)):
+            raise ValueError("missing inventory admission input")
         receipt = admit(args.policy, args.inventory, args.results, args.summary, args.distro, args.tiers)
         print(json.dumps(receipt, indent=2))
         return 0 if receipt["passed"] else 1

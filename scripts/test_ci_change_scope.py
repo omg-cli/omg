@@ -51,6 +51,7 @@ class ScopeTests(unittest.TestCase):
             'scripts/test_ci_smoke_report.py',
             'scripts/test_qemu_runner_isolation.py',
             'tests/qemu-inventory-policy.json',
+            'tests/qemu-inventory-policy.d/' + 'a' * 64 + '.json',
             'docs/local-ci-runner.md',
         ]))
         for paths in ([], ['src/cli/args.rs'], ['tests/fedora_tests.rs'],
