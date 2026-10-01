@@ -490,6 +490,7 @@ fn parse_desc_manual(content: &str, repo: &str) -> Result<SyncDbPackage> {
 }
 
 /// Doctor resolves dependencies from one validated package snapshot.
+#[cfg(test)]
 pub(crate) fn check_local_db_health(path: &Path) -> Result<(usize, Vec<UnsatisfiedDependency>)> {
     let snapshot = LocalHealthSnapshot::capture(path)?;
     validate_health_relations(&snapshot.packages)?;
@@ -501,7 +502,13 @@ pub(crate) fn check_local_db_health(path: &Path) -> Result<(usize, Vec<Unsatisfi
 /// Use pacman's documented offline -Dk operation for dependency, conflict and
 /// duplicate file ownership semantics. An explicit empty config and dbpath
 /// prevent an unrelated configured database or repository from being checked.
-pub(crate) async fn check_native_local_db_health(path: &Path) -> Result<()> {
+pub(crate) struct NativeLocalDbHealth {
+    pub packages: usize,
+    pub missing: Vec<UnsatisfiedDependency>,
+    pub native: Result<()>,
+}
+
+pub(crate) async fn check_native_local_db_health(path: &Path) -> Result<NativeLocalDbHealth> {
     anyhow::ensure!(
         path.is_absolute(),
         "ALPM local database path must be absolute"
@@ -511,6 +518,8 @@ pub(crate) async fn check_native_local_db_health(path: &Path) -> Result<()> {
         "Native ALPM check requires a local directory under its database path"
     );
     let snapshot = LocalHealthSnapshot::capture(path)?;
+    validate_health_relations(&snapshot.packages)?;
+    let missing = unsatisfied_dependencies(&snapshot.packages);
     let mut command = crate::core::privilege::system_command("pacman")?;
     command
         .env_clear()
@@ -528,7 +537,11 @@ pub(crate) async fn check_native_local_db_health(path: &Path) -> Result<()> {
     let result =
         bounded_native_check(command, std::time::Duration::from_secs(15), 1024 * 1024).await;
     snapshot.revalidate(path)?;
-    result
+    Ok(NativeLocalDbHealth {
+        packages: snapshot.packages.len(),
+        missing,
+        native: result,
+    })
 }
 
 async fn bounded_native_check(
