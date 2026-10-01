@@ -305,6 +305,9 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
     for (id, assertion) in [
         ("hooks-install", Assertion::HooksInstalled),
         ("hooks-install-force", Assertion::HooksInstalled),
+        ("workspace-run", Assertion::WorkspaceMissingTask),
+        ("workspace-check", Assertion::WorkspaceMissingLock),
+        ("audit-log-flags", Assertion::AuditLogFilteredExport),
         ("workspace-init", Assertion::WorkspaceInitialized),
         ("workspace-add", Assertion::WorkspaceProjectAdded),
         ("workspace-list", Assertion::WorkspaceProjectListed),
@@ -596,6 +599,9 @@ enum Assertion {
     JsonStdout,
     Artifact(String),
     Fingerprint(String),
+    WorkspaceMissingTask,
+    WorkspaceMissingLock,
+    AuditLogFilteredExport,
     WorkspaceFilteredOutput,
     WorkspaceAllOutput,
     WorkspaceInitialized,
@@ -694,6 +700,9 @@ impl Assertion {
             "sbom-source-failure" => Self::SbomSourceFailure,
             "sbom-inventory-only" => Self::SbomInventoryOnly,
             "json-stdout" => Self::JsonStdout,
+            "workspace-missing-task" => Self::WorkspaceMissingTask,
+            "workspace-missing-lock" => Self::WorkspaceMissingLock,
+            "audit-log-filtered-export" => Self::AuditLogFilteredExport,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
             "workspace-initialized" => Self::WorkspaceInitialized,
@@ -1343,6 +1352,188 @@ fn has_ansi(text: &str) -> bool {
     text.as_bytes().windows(2).any(|pair| pair == b"\x1b[")
 }
 
+fn parse_golden_path_document(text: &str) -> Option<toml::Value> {
+    toml::from_str(text).ok()
+}
+
+#[test]
+fn golden_path_document_parser_accepts_tables_and_refuses_malformed_input() {
+    let text = "[[templates]]\nname = \"smoke\"\npackages = []\ncreated_at = 1700000000\n[templates.runtimes]\n";
+    assert!(text.parse::<toml::Value>().is_err());
+    let document = parse_golden_path_document(text).expect("golden document");
+    assert_eq!(document["templates"].as_array().expect("array").len(), 1);
+    assert_eq!(document["templates"][0]["name"].as_str(), Some("smoke"));
+    assert!(parse_golden_path_document("[[templates]\nname = \"smoke\"").is_none());
+    assert!(parse_golden_path_document("templates = []\ntemplates = []").is_none());
+    let wrong_shape = parse_golden_path_document("templates = \"not an array\"")
+        .expect("valid TOML but wrong shape");
+    assert!(wrong_shape["templates"].as_array().is_none());
+}
+
+fn uses_golden_path_config(id: &str) -> bool {
+    matches!(
+        id,
+        "team-golden-create"
+            | "team-golden-list"
+            | "team-golden-delete"
+            | "team-golden-create-flags"
+    )
+}
+
+#[test]
+fn golden_path_flags_use_the_same_explicit_config_route() {
+    for case in behavior_cases() {
+        if case.assertions.iter().any(|assertion| {
+            matches!(
+                assertion,
+                Assertion::GoldenPathCreated
+                    | Assertion::GoldenPathListed
+                    | Assertion::GoldenPathDeleted
+                    | Assertion::GoldenPathFlags
+            )
+        }) {
+            assert!(
+                uses_golden_path_config(&case.id),
+                "{} omitted from explicit config route",
+                case.id
+            );
+        }
+    }
+    assert!(uses_golden_path_config("team-golden-create-flags"));
+    assert!(!uses_golden_path_config("team-init"));
+}
+
+#[test]
+#[serial]
+fn enterprise_inventory_repaired_rows_run_in_private_state() {
+    let golden = TestProject::for_distro("arch");
+    let config = golden.path().join("golden-path-state");
+    let config_text = config.to_str().expect("UTF-8 golden config");
+    for args in [
+        vec!["team", "golden-path", "create", "smoke"],
+        vec![
+            "team",
+            "golden-path",
+            "create",
+            "flagged",
+            "--node",
+            "20",
+            "--python",
+            "3.12",
+            "--packages",
+            "ripgrep",
+        ],
+    ] {
+        assert!(uses_golden_path_config(if args[3] == "smoke" {
+            "team-golden-create"
+        } else {
+            "team-golden-create-flags"
+        }));
+        golden
+            .run_with_env(&args, &[("OMG_CONFIG_DIR", config_text)])
+            .assert_success();
+    }
+    let document_text = std::fs::read_to_string(config.join("golden-paths.toml"))
+        .expect("persisted golden templates");
+    let document = parse_golden_path_document(&document_text).expect("valid golden TOML");
+    let templates = document["templates"].as_array().expect("templates array");
+    assert_eq!(templates.len(), 2);
+    let flagged = templates
+        .iter()
+        .find(|template| template["name"].as_str() == Some("flagged"))
+        .expect("flagged template");
+    assert_eq!(flagged["runtimes"]["node"].as_str(), Some("20"));
+    assert_eq!(flagged["runtimes"]["python"].as_str(), Some("3.12"));
+    assert_eq!(flagged["packages"].as_array().expect("packages").len(), 1);
+    assert_eq!(flagged["packages"][0].as_str(), Some("ripgrep"));
+
+    let audit = TestProject::for_distro("arch");
+    run_audit_log_oracle("prepare", audit.path());
+    let data = audit.path().join("audit-log-data");
+    let output = audit.path().join("audit-log-export.json");
+    let result = audit.run_with_env(
+        &[
+            "audit",
+            "log",
+            "--limit",
+            "3",
+            "--severity",
+            "error",
+            "--export",
+            output.to_str().expect("UTF-8 export"),
+        ],
+        &[("OMG_DATA_DIR", data.to_str().expect("UTF-8 audit data"))],
+    );
+    result.assert_success();
+    result.assert_stdout_contains("Export successful");
+    run_audit_log_oracle("check", audit.path());
+
+    let workspace = TestProject::for_distro("arch");
+    workspace.create_file("Makefile", "smoke:\n\t@echo smoke-task-ok\n");
+    workspace
+        .run(&["workspace", "init", "smoke"])
+        .assert_success();
+    workspace
+        .run(&["workspace", "add", ".", "--name", "fixture"])
+        .assert_success();
+    let before = ["omg-workspace.toml", "Makefile"]
+        .map(|name| std::fs::read(workspace.path().join(name)).expect("workspace baseline"));
+    let run = workspace.run_with_env(&["workspace", "run", "true"], &[("LC_ALL", "C")]);
+    assert_eq!(run.exit_code, 1, "{}", run.combined_output());
+    run.assert_stdout_contains("Task 'true' not found, trying 'make true'");
+    run.assert_stdout_contains("'omg run true' in '.' exited with code 1");
+    run.assert_stdout_contains("0 succeeded, 1 failed");
+    assert!(
+        run.stderr.contains("No rule to make target 'true'."),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("1 project(s) failed to run 'true'"),
+        "{}",
+        run.stderr
+    );
+    let check = workspace.run(&["workspace", "check"]);
+    assert_eq!(check.exit_code, 1, "{}", check.combined_output());
+    check.assert_stdout_contains("needs attention");
+    assert!(
+        check.stderr.contains("No omg.lock file found"),
+        "{}",
+        check.stderr
+    );
+    assert!(
+        check
+            .stderr
+            .contains("1 project(s) need attention, 0 failed to check (of 1 total)"),
+        "{}",
+        check.stderr
+    );
+    for (name, bytes) in ["omg-workspace.toml", "Makefile"].into_iter().zip(before) {
+        assert_eq!(
+            std::fs::read(workspace.path().join(name)).expect("unchanged workspace"),
+            bytes
+        );
+    }
+    assert!(std::fs::symlink_metadata(workspace.path().join("omg.lock")).is_err());
+}
+
+fn run_audit_log_oracle(mode: &str, root: &std::path::Path) {
+    let output = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/qemu-audit-log-oracle.py"
+        ))
+        .arg(mode)
+        .arg(root)
+        .output()
+        .expect("execute private audit log oracle");
+    assert!(
+        output.status.success(),
+        "audit log oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 #[serial]
 #[cfg(feature = "arch")] // This inventory fixture explicitly seeds a pacman database.
@@ -1465,10 +1656,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
             case.id.as_str(),
             "privacy-opt-out" | "privacy-status" | "privacy-opt-in"
         );
-        let golden_path_case = matches!(
-            case.id.as_str(),
-            "team-golden-create" | "team-golden-list" | "team-golden-delete"
-        );
+        let golden_path_case = uses_golden_path_config(&case.id);
         let config_dir = project.path().join(if privacy_case {
             "privacy-state"
         } else if golden_path_case {
@@ -1604,6 +1792,22 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 capture.to_str().expect("UTF-8 container capture path"),
             ));
         }
+        let workspace_before = matches!(case.id.as_str(), "workspace-run" | "workspace-check")
+            .then(|| {
+                assert!(!project.path().join("omg.lock").exists());
+                ["omg-workspace.toml", "Makefile"].map(|name| {
+                    std::fs::read(project.path().join(name))
+                        .expect("read workspace failure baseline")
+                })
+            });
+        let audit_data = project.path().join("audit-log-data");
+        if case.id == "audit-log-flags" {
+            run_audit_log_oracle("prepare", project.path());
+            command_env.push((
+                "OMG_DATA_DIR",
+                audit_data.to_str().expect("UTF-8 audit fixture path"),
+            ));
+        }
         let started = Instant::now();
         let result = project.run_with_env(&args, &command_env);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1658,10 +1862,37 @@ fn behavior_inventory_runs_in_hermetic_state() {
         };
         for assertion in &case.assertions {
             match assertion {
+                Assertion::AuditLogFilteredExport => {
+                    run_audit_log_oracle("check", project.path());
+                    if !result.stdout.lines().any(|line| line == "✓ Export successful") {
+                        issues.push("audit log export omitted its success receipt".to_string());
+                    }
+                }
+                Assertion::WorkspaceMissingTask | Assertion::WorkspaceMissingLock => {
+                    let unchanged = workspace_before.as_ref().is_some_and(|before| {
+                        ["omg-workspace.toml", "Makefile"].into_iter().zip(before).all(|(name, bytes)| {
+                            std::fs::read(project.path().join(name)).is_ok_and(|after| after == *bytes)
+                        })
+                    }) && std::fs::symlink_metadata(project.path().join("omg.lock")).is_err();
+                    let precise = if matches!(assertion, Assertion::WorkspaceMissingTask) {
+                        result.stdout.contains("→ Task 'true' not found, trying 'make true'...")
+                            && result.stdout.contains("  ✗ 'omg run true' in '.' exited with code 1")
+                            && result.stdout.lines().any(|line| line == "✗ 0 succeeded, 1 failed")
+                            && result.stderr.lines().any(|line| line == "Error: 1 project(s) failed to run 'true'")
+                            && result.stderr.contains("No rule to make target 'true'.")
+                    } else {
+                        result.stdout.lines().any(|line| line == "  ⚠ needs attention")
+                            && result.stderr.lines().any(|line| line == "Error: No omg.lock file found")
+                            && result.stderr.lines().any(|line| line == "Error: 1 project(s) need attention, 0 failed to check (of 1 total)")
+                    };
+                    if !unchanged || !precise {
+                        issues.push("negative workspace row did not prove its intended failure and unchanged fixture".to_string());
+                    }
+                }
                 Assertion::GoldenPathFlags => {
                     let stored = std::fs::read_to_string(config_dir.join("golden-paths.toml"))
                         .ok()
-                        .and_then(|body| body.parse::<toml::Value>().ok());
+                        .and_then(|body| parse_golden_path_document(&body));
                     let flagged = stored.as_ref().and_then(|document| document.get("templates"))
                         .and_then(toml::Value::as_array)
                         .and_then(|templates| templates.iter().find(|template| {
@@ -1686,7 +1917,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::GoldenPathDeleted => {
                     let stored = std::fs::read_to_string(config_dir.join("golden-paths.toml"))
                         .ok()
-                        .and_then(|text| text.parse::<toml::Value>().ok());
+                        .and_then(|text| parse_golden_path_document(&text));
                     let templates = stored
                         .as_ref()
                         .and_then(|value| value.get("templates"))

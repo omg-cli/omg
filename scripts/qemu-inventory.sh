@@ -1124,6 +1124,28 @@ check_file_output_oracle() {
     *) return 2 ;;
   esac
 }
+check_workspace_failure() {
+  local assertion=$1 code=$2 stdout=$3 stderr=$4
+  if [[ "$code" != 1 || -e omg.lock || -L omg.lock
+    || ! -f omg-workspace.toml || -L omg-workspace.toml
+    || ! -f Makefile || -L Makefile ]] \
+    || [[ "$(sha256sum omg-workspace.toml Makefile)" != "$workspace_failure_before" ]]; then
+    printf 'assertion failed: negative workspace fixture changed or exited incorrectly\n' >&2; return 1
+  fi
+  case "$assertion" in
+    workspace-missing-task)
+      grep -Fxq "→ Task 'true' not found, trying 'make true'..." "$stdout" \
+        && grep -Fxq "  ✗ 'omg run true' in '.' exited with code 1" "$stdout" \
+        && grep -Fxq '✗ 0 succeeded, 1 failed' "$stdout" \
+        && grep -Fxq "Error: 1 project(s) failed to run 'true'" "$stderr" \
+        && grep -Fq "No rule to make target 'true'." "$stderr" ;;
+    workspace-missing-lock)
+      grep -Fxq '  ⚠ needs attention' "$stdout" \
+        && grep -Fxq 'Error: No omg.lock file found' "$stderr" \
+        && grep -Fxq 'Error: 1 project(s) need attention, 0 failed to check (of 1 total)' "$stderr" ;;
+    *) return 2 ;;
+  esac || { printf 'assertion failed: workspace refusal did not prove the intended missing input\n' >&2; return 1; }
+}
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
   if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
@@ -1136,6 +1158,14 @@ check_product_output() {
     printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
   fi
   case "$assertion" in
+    workspace-missing-task|workspace-missing-lock)
+      check_workspace_failure "$assertion" "$code" "$stdout" "$stderr" || return 1 ;;
+    audit-log-filtered-export)
+      [[ "$code" == 0 ]] && grep -Fxq '✓ Export successful' "$stdout" \
+        && grep -Fxq "OMG Exporting audit log to $rowdir/audit-log-export.json..." "$stdout" \
+        && python3 "$rowdir/qemu-audit-log-oracle.py" check "$rowdir" || {
+          printf 'assertion failed: audit log export omitted exact filtered private evidence\n' >&2; return 1;
+        } ;;
     man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence)
       check_file_output_oracle "$assertion" "$code" "$stdout" "$stderr" "$distro" || return 1 ;;
   esac
@@ -1664,7 +1694,7 @@ out="$root/inventory"
 # Refuse to overwrite evidence from a previous invocation.
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$(dirname "$0")/qemu-enterprise-export-oracle.py" > "$out/input-sha256.txt"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$(dirname "$0")/qemu-enterprise-export-oracle.py" "$(dirname "$0")/qemu-audit-log-oracle.py" > "$out/input-sha256.txt"
 if [[ "$man_page_mode" == exact ]]; then sha256sum "$man_page_inventory" >> "$out/input-sha256.txt"; fi
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" --arg man_page_mode "$man_page_mode" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
@@ -1760,7 +1790,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock) ;; *) exit 2 ;; esac
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-remove:workspace-project-removed|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
@@ -1769,6 +1799,18 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     generate-man)
       [[ "$a" == man-pages-generated && "$s" == isolated-write && "$resolved" == 0 ]] || exit 2
       jq -e '. == ["generate-man","--output","${ROOT}/man"]' <<< "$aj" >/dev/null || exit 2 ;;
+    audit-log-flags)
+      [[ "$a" == audit-log-filtered-export && "$s" == isolated-write && "$resolved" == 0 ]] || exit 2
+      jq -e '. == ["audit","log","--limit","3","--severity","error","--export","${ROOT}/audit-log-export.json"]' <<< "$aj" >/dev/null || exit 2 ;;
+    workspace-run|workspace-check)
+      [[ "$s" == read && "$resolved" == 1 && "$r" == workspace-add ]] || exit 2
+      if [[ "$id" == workspace-run ]]; then
+        [[ "$a" == workspace-missing-task ]] || exit 2
+        jq -e '. == ["workspace","run","true"]' <<< "$aj" >/dev/null || exit 2
+      else
+        [[ "$a" == workspace-missing-lock ]] || exit 2
+        jq -e '. == ["workspace","check"]' <<< "$aj" >/dev/null || exit 2
+      fi ;;
     audit-export)
       [[ "$a" == audit-export-absolute-refusal && "$s" == isolated-write && "$resolved" == 1 ]] || exit 2
       jq -e '. == ["audit","export","--output","${ROOT}/audit-evidence"]' <<< "$aj" >/dev/null || exit 2 ;;
@@ -1785,7 +1827,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     team-compliance-export)
       [[ "$a" == team-compliance-no-report && "$s" == controlled-error && "$resolved" == 1 && "$r" == team-init ]] || exit 2
       jq -e '. == ["team","compliance","--export","${ROOT}/compliance.json"]' <<< "$aj" >/dev/null || exit 2 ;;
-    *) [[ "$a" != man-pages-generated && "$a" != audit-export-absolute-refusal && "$a" != team-compliance-no-report && "$a" != enterprise-audit-export-evidence ]] || exit 2 ;;
+    *) [[ "$a" != audit-log-filtered-export && "$a" != workspace-missing-task && "$a" != workspace-missing-lock && "$a" != man-pages-generated && "$a" != audit-export-absolute-refusal && "$a" != team-compliance-no-report && "$a" != enterprise-audit-export-evidence ]] || exit 2 ;;
   esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
@@ -2171,12 +2213,16 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; mkdir -p project/critical; printf '%s%s\n' '-----BEGIN ' 'PRIVATE KEY-----' > project/critical/key.pem"
   fi
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
-  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_product_output)"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_workspace_failure); $(declare -f check_product_output)"
   if [[ "$assertions" == package-dry-run-* ]]; then
     remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f check_native_remove_preview)"
   fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; $(declare -f check_apt_tree_absent); $(declare -f prepare_apt_update_fixture); $(declare -f check_apt_update_fixture); $(declare -f native_package_snapshot); $(declare -f check_apt_update_delta); $(declare -f cleanup_apt_update_fixture)"
+  fi
+  if [[ "$assertions" == audit-log-filtered-export ]]; then
+    audit_oracle=$(jq -rn --rawfile fixture "$(dirname "$0")/qemu-audit-log-oracle.py" '$fixture | @sh')
+    remote+="; printf '%s' $audit_oracle > qemu-audit-log-oracle.py; python3 qemu-audit-log-oracle.py prepare \"\$rowdir\"; export OMG_DATA_DIR=\"\$rowdir/audit-log-data\""
   fi
   # The supervisor exits zero after recording a completed CLI's status.
   # Thus a CLI exit 125 cannot be mistaken for timeout's own exit 125.
@@ -2214,6 +2260,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       remote+="; rollback_version=\$(dpkg-query -W '-f=\${Version}' tree) || { printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }; [[ -n \"\$rollback_version\" ]] || { printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
     fi
   done
+  if [[ "$assertions" == workspace-missing-task || "$assertions" == workspace-missing-lock ]]; then
+    remote+="; [[ ! -e omg.lock && ! -L omg.lock ]]; workspace_failure_before=\"\$(sha256sum omg-workspace.toml Makefile)\""
+  fi
   if [[ "$case" == release-package-rollback-tree ]]; then
     remote+="; rollback_id=\$(apt_tree_removal_id \"\$OMG_DATA_DIR/history.json\" \"\$rollback_version\") || { printf 'assertion failed: no unique native tree removal transaction with the installed version\n' >&2; printf '\nOMG_QEMU_RECEIPT:product:0:1\n'; exit 0; }"
     remote+="; [[ \"\$rollback_id\" =~ ^[0-9a-f-]{36}\$ ]] || { printf 'assertion failed: native tree removal transaction has an invalid ID\n' >&2; printf '\nOMG_QEMU_RECEIPT:product:0:1\n'; exit 0; }"

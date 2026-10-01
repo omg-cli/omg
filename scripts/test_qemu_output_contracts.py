@@ -2067,6 +2067,70 @@ exit 1
                 self.assertEqual([item['result'] for item in evidence], ['PASS', expected], logs)
                 self.assertEqual(result.returncode, int(expected == 'FAIL'))
 
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_audit_log_export_rejects_unfiltered_stale_or_nonprivate_records(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('audit-log-flags\t'))
+        self.assertEqual(row.split('\t')[8], 'audit-log-filtered-export')
+        product = '''[[ "$1:$2:$3:$4:$5:$6:$7" == audit:log:--limit:3:--severity:error:--export ]] || exit 70
+python3 - "$8" <<'PY'
+import json, pathlib, sys
+records = [json.loads(line) for line in pathlib.Path('audit-log-data/audit/audit.jsonl').read_text(encoding='utf-8').splitlines()]
+output = pathlib.Path(sys.argv[1])
+output.write_text(json.dumps([records[i] for i in (5, 4, 2)]))
+output.chmod(0o600)
+PY
+printf 'OMG Exporting audit log to %s...\\n✓ Export successful\\n' "$8"
+'''
+        for mutation, expected in (
+            ('', 'PASS'),
+            ('rm "$8"\n', 'FAIL'),
+            ('printf "[]" > "$8"\n', 'FAIL'),
+            ('chmod 644 "$8"\n', 'FAIL'),
+            ('cp audit-log-data/audit/audit.jsonl "$8"\n', 'FAIL'),
+            ('printf changed >> audit-log-data/audit/audit.jsonl\n', 'FAIL'),
+            ("python3 -c \"import json,pathlib; p=pathlib.Path('audit-log-export.json'); r=json.loads(p.read_text(encoding='utf-8')); p.write_text(json.dumps(r[::-1]))\"\n", 'FAIL'),
+        ):
+            with self.subTest(mutation=mutation):
+                result, evidence, logs = self.run_inventory(product + mutation, [row])
+                self.assertEqual((result.returncode, evidence[0]['result']),
+                                 (int(expected == 'FAIL'), expected), logs)
+        result, evidence, logs = self.run_inventory('exit 0\n', [row])
+        self.assertEqual((result.returncode, evidence[0]['result']), (1, 'FAIL'), logs)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_negative_workspace_rows_reject_unrelated_failures_and_state_changes(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+        prereqs = [line for line in inventory if line.startswith(('workspace-init\t', 'workspace-add\t'))]
+        self.assertEqual(len(prereqs), 2)
+        setup = '''case "$2" in
+init) printf 'name = "smoke"\\ncreated_at = "2025-01-01"\\n[projects]\\n' > omg-workspace.toml; exit 0 ;;
+add) printf '[projects.fixture]\\npath = "."\\ndepends_on = []\\n' >> omg-workspace.toml; exit 0 ;;
+esac
+'''
+        products = {
+            'workspace-run': '''printf "%s\\n" "→ Task 'true' not found, trying 'make true'..." "  ✗ 'omg run true' in '.' exited with code 1" '✗ 0 succeeded, 1 failed'
+printf "%s\\n" "make: *** No rule to make target 'true'.  Stop." "Error: 1 project(s) failed to run 'true'" >&2
+''',
+            'workspace-check': '''printf '  ⚠ needs attention\\n'
+printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attention, 0 failed to check (of 1 total)' >&2
+''',
+        }
+        for case, receipt in products.items():
+            row = next(line for line in inventory if line.startswith(case + '\t'))
+            for body, expected in (
+                (receipt, 'PASS'),
+                ('printf "Error: unrelated failure\\n" >&2\n', 'FAIL'),
+                (receipt + 'printf changed >> omg-workspace.toml\n', 'FAIL'),
+                (receipt + 'printf changed >> Makefile\n', 'FAIL'),
+                (receipt + 'printf fabricated > omg.lock\n', 'FAIL'),
+                (receipt.replace('1 project(s)', '2 project(s)'), 'FAIL'),
+            ):
+                with self.subTest(case=case, body=body):
+                    result, evidence, logs = self.run_inventory(setup + body + 'exit 1\n', prereqs + [row])
+                    self.assertEqual([item['result'] for item in evidence], ['PASS', 'PASS', expected], logs)
+                    self.assertEqual(result.returncode, int(expected == 'FAIL'), logs)
+
     def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True):
         def shell_path(path):
             value = path.as_posix()
@@ -2080,6 +2144,8 @@ exit 1
                 'man_page_inventory.txt': (ROOT / 'tests/man_page_inventory.txt').read_bytes(),
                 'qemu-enterprise-export-oracle.py':
                     (ROOT / 'scripts/qemu-enterprise-export-oracle.py').read_bytes(),
+                'qemu-audit-log-oracle.py':
+                    (ROOT / 'scripts/qemu-audit-log-oracle.py').read_bytes(),
             }
             guest_files.update(home_files or {})
             for name, content in guest_files.items():
