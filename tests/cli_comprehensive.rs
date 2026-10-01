@@ -1923,9 +1923,14 @@ fn behavior_inventory_runs_in_hermetic_state() {
     for (number, case) in behavior_cases().into_iter().enumerate() {
         // Missing-input probes must not inherit files written by earlier rows
         // such as env-capture. Keep the shared fixture for dependent cases.
-        let empty_environment =
-            needs_isolated_fixture(&case).then(|| TestProject::for_distro("arch"));
+        let empty_environment = (needs_isolated_fixture(&case) || case.id == "install-review")
+            .then(|| TestProject::for_distro("arch"));
         let project = empty_environment.as_ref().unwrap_or(&project);
+        if case.id == "install-review" {
+            project
+                .mock_install("bash", "5.2.37-1")
+                .expect("seed isolated review package inventory");
+        }
         if case.id == "enterprise-audit-export-flags" {
             project
                 .mock_install("pacman", "7.0.0-1")
