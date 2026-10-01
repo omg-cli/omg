@@ -946,7 +946,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn legacy_security_settings_fail_closed_and_preserve_existing_configuration() {
-        if Settings::rerun_config_test_unprivileged(
+        if Settings::rerun_test_unprivileged(
             "config::settings::tests::legacy_security_settings_fail_closed_and_preserve_existing_configuration",
         ) {
             return;
