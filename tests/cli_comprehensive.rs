@@ -14,9 +14,149 @@
 
 pub mod common;
 
+#[cfg(feature = "arch")]
+#[path = "support/recovery_fixture.rs"]
+mod recovery_fixture;
+
 use clap::{CommandFactory, Parser};
 use common::*;
 use omg_lib::cli::Cli;
+
+// Contamination is child-local. Both repositories are disposable.
+#[test]
+fn foreign_git_environment_cannot_redirect_fixture() {
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        let output = fixture_git_command(dir).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+    fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, dir: &Path, files: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.push((
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        visit(root, root, &mut files);
+        files.sort();
+        files
+    }
+    if let Some(target) = std::env::var_os("OMG_GIT_ISOLATION_CHILD") {
+        let target = Path::new(&target);
+        git(target, &["init", "-q", "--initial-branch=main"]);
+        assert_fixture_git_identity(target);
+        let discovered = git(target, &["rev-parse", "--show-toplevel"]);
+        assert_eq!(
+            Path::new(String::from_utf8(discovered.stdout).unwrap().trim())
+                .canonicalize()
+                .unwrap(),
+            target.canonicalize().unwrap(),
+            "direct Git child must discover the private fixture"
+        );
+        std::fs::write(target.join("fixture.txt"), "private bytes\n").unwrap();
+        git(target, &["add", "fixture.txt"]);
+        git(
+            target,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "private fixture",
+            ],
+        );
+        git(target, &["config", "fixture.identity", "private"]);
+        run_omg_in_dir(&["hooks", "install"], target).assert_success();
+        assert!(
+            target.join(".git/hooks/pre-commit").exists(),
+            "shared CLI Git descendant must write private hooks"
+        );
+        run_omg_in_dir(&["hooks", "uninstall"], target).assert_success();
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let foreign = root.path().join("foreign");
+    let target = root.path().join("target");
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    git(&foreign, &["init", "-q", "--initial-branch=foreign"]);
+    assert_fixture_git_identity(&foreign);
+    std::fs::write(foreign.join("foreign.txt"), "foreign bytes\n").unwrap();
+    git(&foreign, &["add", "foreign.txt"]);
+    git(
+        &foreign,
+        &[
+            "-c",
+            "user.name=Foreign",
+            "-c",
+            "user.email=foreign@example.invalid",
+            "commit",
+            "-qm",
+            "foreign fixture",
+        ],
+    );
+    let config = root.path().join("foreign-config");
+    std::fs::write(&config, "[fixture]\n identity = foreign\n").unwrap();
+    let config_before = std::fs::read(&config).unwrap();
+    let before = snapshot(&foreign);
+    for selectors in [true, false] {
+        // Config-only contamination independently challenges shared CLI descendants.
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        clear_git_environment(&mut child);
+        child
+            .args([
+                "--exact",
+                "foreign_git_environment_cannot_redirect_fixture",
+                "--nocapture",
+            ])
+            .env("OMG_GIT_ISOLATION_CHILD", &target)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", foreign.join("foreign-hooks"))
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_SYSTEM", &config)
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .env("GIT_CEILING_DIRECTORIES", root.path());
+        if selectors {
+            child
+                .env("GIT_DIR", foreign.join(".git"))
+                .env("GIT_COMMON_DIR", foreign.join(".git"))
+                .env("GIT_WORK_TREE", &foreign)
+                .env("GIT_INDEX_FILE", foreign.join(".git/index"));
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "contaminated fixture subprocess failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            snapshot(&foreign),
+            before,
+            "foreign HEAD/config/index/worktree and hooks must remain byte-identical"
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), config_before);
+        std::fs::remove_dir_all(target.join(".git")).unwrap();
+    }
+}
 
 #[test]
 fn explicit_shortcut_uses_the_same_isolated_state_as_explicit_count() {
@@ -1257,7 +1397,6 @@ fn behavior_inventory_declaration_args_parse() {
 #[cfg(feature = "arch")]
 fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
     use std::os::unix::fs::PermissionsExt as _;
-    use std::process::Command;
 
     project.create_file("Makefile", ".PHONY: smoke overlap parallel-one parallel-two\nsmoke:\n\t@printf omg-qemu-smoke-task > smoke-task.marker\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\nparallel-one:\n\t@touch parallel-one.started\n\t@timeout 15 sh -c 'until test -e parallel-two.started; do sleep 0.05; done'\n\t@printf parallel-one > parallel-one.done\n\t@echo parallel-one-ok\nparallel-two:\n\t@touch parallel-two.started\n\t@timeout 15 sh -c 'until test -e parallel-one.started; do sleep 0.05; done'\n\t@printf parallel-two > parallel-two.done\n\t@echo parallel-two-ok\n");
     project.create_file(
@@ -1314,11 +1453,8 @@ fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
     }
 
     let git = |args: &[&str]| {
-        let output = Command::new("git")
+        let output = fixture_git_command(project.path())
             .args(args)
-            .current_dir(project.path())
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .expect("run git fixture command");
         assert!(
@@ -1329,6 +1465,7 @@ fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
         );
     };
     git(&["init", "--quiet", "--initial-branch=main"]);
+    assert_fixture_git_identity(project.path());
     git(&["add", "README.md", "Makefile"]);
     git(&[
         "-c",
@@ -2956,11 +3093,31 @@ mod install_tests {
     // `!success || ...` disjunction also passed when install wrongly succeeded.
     #[test]
     fn test_install_nonexistent() {
-        let result = run_omg(&[
-            "install",
-            "--yes",
+        let project = TestProject::for_distro("arch");
+        #[cfg(feature = "arch")]
+        let proxy = crate::recovery_fixture::RejectedProxy::new();
+        #[cfg(feature = "arch")]
+        crate::recovery_fixture::seed_missing_aur_index(
+            &project,
             "package-that-definitely-does-not-exist-12345",
-        ]);
+        );
+        #[cfg(feature = "arch")]
+        let environment = proxy.env();
+        #[cfg(not(feature = "arch"))]
+        let environment = Vec::new();
+        let result = project.run_with_env(
+            &[
+                "install",
+                "--yes",
+                "package-that-definitely-does-not-exist-12345",
+            ],
+            &environment,
+        );
+        #[cfg(feature = "arch")]
+        assert_eq!(proxy.requests(), 0, "offline missing lookup contacted RPC");
+        assert_eq!(result.exit_code, 1, "{}", result.combined_output());
+        assert!(!result.combined_output().contains("transport failed"));
+        project.close_checked();
         result.assert_failure();
         let combined = result.combined_output();
         assert!(
@@ -3162,19 +3319,21 @@ mod env_tests {
     fn git_hook_uninstall_preserves_composed_and_custom_automation() {
         let repository = tempfile::tempdir().unwrap();
         let hooks = repository.path().join("managed-hooks");
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "core.hooksPath", hooks.to_str().unwrap()],
-        ] {
-            assert!(
-                std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(repository.path())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
+        assert!(
+            fixture_git_command(repository.path())
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_fixture_git_identity(repository.path());
+        assert!(
+            fixture_git_command(repository.path())
+                .args(["config", "core.hooksPath", hooks.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
         run_omg_in_dir(&["hooks", "install"], repository.path()).assert_success();
         let pre_commit = hooks.join("pre-commit");
         let composed = format!(
