@@ -924,6 +924,15 @@ async fn async_main(args: Vec<String>) -> Result<()> {
     );
     set_yes_flag(yes_flag);
 
+    if let Commands::Install {
+        packages,
+        allow_local_file,
+        ..
+    } = &cli.command
+    {
+        omg_lib::core::security::ensure_local_archive_consent(packages, *allow_local_file)?;
+    }
+
     // Reject a binary built for another distro before package commands can
     // connect to a daemon, request elevation, or touch a package database.
     if command_uses_package_backend(&cli.command) {
