@@ -23,6 +23,7 @@ class DockerProvenanceTests(unittest.TestCase):
         build = step('Build native Arch test image')
         self.assertRegex(build, r'cache-from: \|\n(?:            [^\n]*\n)*'
                          r'            type=registry,ref=ghcr.io/omg-cli/omg-buildcache:arch-e2e\n')
+        self.assertNotIn('type=gha', build)
         fork = workflow.split('  docker-e2e:\n', 1)[1].split('    steps:', 1)[0]
         self.assertIn("CACHE_EXPORT: ''", fork)
         self.assertNotIn('packages: write', fork)

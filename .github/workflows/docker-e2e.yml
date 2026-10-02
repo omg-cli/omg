@@ -103,7 +103,6 @@ jobs:
           labels: org.opencontainers.image.revision=${{ github.sha }}
           build-args: NATIVE_REFRESH=${{ steps.evidence.outputs.native-refresh }}
           cache-from: |
-            type=gha,version=2,scope=docker-e2e-arch
             type=registry,ref=ghcr.io/omg-cli/omg-buildcache:arch-e2e
           cache-to: ${{ env.CACHE_EXPORT }}
           no-cache: ${{ github.event_name == 'schedule' || inputs.cold_cache == true }}
