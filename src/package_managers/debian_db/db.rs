@@ -2393,8 +2393,10 @@ fn list_installed_from_paths(
         let architecture = package
             .architecture
             .context("Validated dpkg entry lacks architecture")?;
-        let is_explicit = !auto_installed.contains(&format!("{}:{architecture}", package.name))
-            && !auto_installed.contains(&package.name);
+        let is_explicit = !(auto_installed.contains(&format!("{}:{architecture}", package.name))
+            || auto_installed.contains(&package.name)
+            || (architecture == "all"
+                && auto_installed.contains(&format!("{}:{}", package.name, debian_arch()))));
         installed_set.insert(package.name.clone());
         packages.push(DpkgPackageEntry {
             name: package.name,
@@ -4217,6 +4219,65 @@ mod tests {
         let names = auto_installed_names_from_extended_states(content);
         assert!(names.contains("libc6"));
         assert!(!names.contains("bash"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn installed_auto_flags_apply_native_architecture_only_to_all_packages() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = directory.path().join("status");
+        let extended = directory.path().join("extended_states");
+        let foreign_architecture = if debian_arch() == "amd64" {
+            "i386"
+        } else {
+            "amd64"
+        };
+        fs::write(
+            &status,
+            format!("Package: all-auto\nStatus: install ok installed\nVersion: 1\nArchitecture: all\n\nPackage: all-manual\nStatus: install ok installed\nVersion: 1\nArchitecture: all\n\nPackage: all-foreign-flag\nStatus: install ok installed\nVersion: 1\nArchitecture: all\n\nPackage: legacy-all\nStatus: install ok installed\nVersion: 1\nArchitecture: all\n\nPackage: foreign-native-flag\nStatus: install ok installed\nVersion: 1\nArchitecture: {foreign_architecture}\n"),
+        )
+        .unwrap();
+        fs::write(
+            &extended,
+            format!("Package: all-auto\nArchitecture: {}\nAuto-Installed: 1\n\nPackage: all-foreign-flag\nArchitecture: {foreign_architecture}\nAuto-Installed: 1\n\nPackage: legacy-all\nAuto-Installed: 1\n\nPackage: foreign-native-flag\nArchitecture: {}\nAuto-Installed: 1\n", debian_arch(), debian_arch()),
+        )
+        .unwrap();
+
+        let installed = list_installed_from_paths(&status, &extended).unwrap();
+        assert_eq!(installed.len(), 5);
+        assert!(
+            installed
+                .iter()
+                .filter(|package| package.name != "foreign-native-flag")
+                .all(|package| package.architecture == "all")
+        );
+        assert!(
+            !installed
+                .iter()
+                .find(|package| package.name == "all-auto")
+                .unwrap()
+                .is_explicit,
+            "APT records an Architecture:all package's automatic flag under the native architecture"
+        );
+        assert!(
+            !installed
+                .iter()
+                .find(|package| package.name == "legacy-all")
+                .unwrap()
+                .is_explicit,
+            "legacy architecture-free automatic flags must still apply"
+        );
+        for name in ["all-manual", "all-foreign-flag", "foreign-native-flag"] {
+            assert!(
+                installed
+                    .iter()
+                    .find(|package| package.name == name)
+                    .unwrap()
+                    .is_explicit,
+                "{name} must not inherit an unrelated foreign-architecture flag"
+            );
+        }
+        directory.close().unwrap();
     }
 
     #[test]
