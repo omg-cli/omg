@@ -17,6 +17,53 @@ use common::assertions::assert_process_completed;
 use common::*;
 use proptest::prelude::*;
 
+/// Exercise the real client's refusal of an unavailable upstream proxy.
+fn run_with_refused_metadata(args: &[&str]) -> CommandResult {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let finished = Arc::new(AtomicBool::new(false));
+    let stop = Arc::clone(&finished);
+    let server = std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                    let mut request = [0u8; 4096];
+                    let bytes = stream.read(&mut request).unwrap();
+                    assert!(bytes > 0, "metadata proxy request is empty");
+                    stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("metadata refusal proxy failed: {error}"),
+            }
+        }
+    });
+    let result = run_omg_with_env(args, &[
+        ("HTTPS_PROXY", &proxy), ("HTTP_PROXY", &proxy), ("ALL_PROXY", &proxy),
+        ("NO_PROXY", ""), ("OMG_TEST_COMMAND_TIMEOUT_SECS", "3"),
+    ]);
+    finished.store(true, Ordering::Release);
+    server.join().unwrap();
+    result
+}
+
+fn installed_node(project: &TestProject, version: &str) -> std::path::PathBuf {
+    let directory = project.data_dir.path().join("versions/node").join(version);
+    std::fs::create_dir_all(directory.join("bin")).unwrap();
+    std::fs::write(directory.join("bin/node"), b"installed Node activation fixture").unwrap();
+    directory
+}
+
 // Preserve the ordinary fast-dispatch path for normal queries, while values
 // beginning with '-' must reach the product as data rather than CLI options.
 fn literal_query_args<'a>(command: &'a str, value: &'a str) -> Vec<&'a str> {
@@ -306,7 +353,12 @@ proptest! {
         patch in 0u32..100
     ) {
         let version = format!("{major}.{minor}.{patch}");
-        let result = run_omg(&["use", "node", &version]);
+        let project = TestProject::new();
+        let normalized = version.trim_start_matches('v');
+        let installed = installed_node(&project, normalized);
+        let result = project.run_with_env(&["use", "node", &version], &[("PATH", "")]);
+        result.assert_success();
+        prop_assert_eq!(std::fs::read_link(project.data_dir.path().join("versions/node/current")).unwrap(), installed);
         assert_process_completed(&result);
         // These generated versions always pass validation (digits and dots),
         // so the switch header from src/cli/runtimes.rs must be printed no
@@ -323,8 +375,9 @@ proptest! {
     fn prop_version_aliases(
         alias in prop::sample::select(vec!["lts", "latest", "stable", "current", "lts/*", "lts/iron"])
     ) {
-        let result = run_omg(&["use", "node", alias]);
+        let result = run_with_refused_metadata(&["use", "node", alias]);
         assert_process_completed(&result);
+        result.assert_failure();
         // Aliases containing '/' are rejected by validate_version; every other
         // failure must still carry a diagnostic.
         if !result.success {
@@ -339,7 +392,12 @@ proptest! {
     #[test]
     fn prop_v_prefix_versions(major in 0u32..30, minor in 0u32..30, patch in 0u32..30) {
         let version = format!("v{major}.{minor}.{patch}");
-        let result = run_omg(&["use", "node", &version]);
+        let project = TestProject::new();
+        let normalized = version.trim_start_matches('v');
+        let installed = installed_node(&project, normalized);
+        let result = project.run_with_env(&["use", "node", &version], &[("PATH", "")]);
+        result.assert_success();
+        prop_assert_eq!(std::fs::read_link(project.data_dir.path().join("versions/node/current")).unwrap(), installed);
         assert_process_completed(&result);
         // The switch header (src/cli/runtimes.rs) echoes the version as given
         // — the 'v' prefix is stripped later, inside install_or_use.
@@ -447,7 +505,11 @@ proptest! {
         let project = TestProject::new();
         project.create_file(".nvmrc", &content);
 
-        let result = project.run(&["use", "node"]);
+        let expected = format!("{major}.{minor}.{patch}");
+        let installed = installed_node(&project, &expected);
+        let result = project.run_with_env(&["use", "node"], &[("PATH", "")]);
+        result.assert_success();
+        prop_assert_eq!(std::fs::read_link(project.data_dir.path().join("versions/node/current")).unwrap(), installed);
         assert_process_completed(&result);
     }
 }

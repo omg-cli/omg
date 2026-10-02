@@ -121,7 +121,18 @@ fn detect_installed_runtime(
         other => panic!("unsupported detection fixture runtime: {other}"),
     };
     let versions = project.data_dir.path().join("versions").join(runtime);
-    let installed = versions.join(version);
+    let installed_name = if runtime == "rust" {
+        let platform = match std::env::consts::OS {
+            "linux" => "unknown-linux-gnu",
+            "macos" => "apple-darwin",
+            "windows" => "pc-windows-msvc",
+            other => panic!("unsupported Rust fixture platform: {other}"),
+        };
+        format!("{version}-{}-{platform}", std::env::consts::ARCH)
+    } else {
+        version.to_owned()
+    };
+    let installed = versions.join(installed_name);
     fs::create_dir_all(installed.join("bin")).unwrap();
     fs::write(installed.join("bin").join(binary), b"installed runtime fixture").unwrap();
     assert!(!versions.join("current").exists());
