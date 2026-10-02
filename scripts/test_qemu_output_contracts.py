@@ -2,6 +2,7 @@
 import os
 import json
 import re
+import runpy
 import shlex
 from pathlib import Path
 import shutil
@@ -766,6 +767,28 @@ exit 1
 '''
         result, evidence, logs = self.run_inventory(product, [row])
         self.assertEqual(evidence[0]['result'], 'PASS', f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    def test_local_audit_fixture_uses_published_v1_chain(self):
+        owner = runpy.run_path(str(ROOT / 'scripts/qemu-local-oracle.py'))
+        entries = owner['audit_entries']()
+        # Independent SHA-256 vectors for the published ff01 domain and nine
+        # u64-framed fields, including the empty metadata field. These bind the
+        # actual wire format without letting the fixture verify its own hashes.
+        hashes = [
+            'd3df81db57ea65ffc64aa04a6e8bb82a2c9e266d16d2cc1c0e6de686d381376c',
+            '817dd3e64749aebb815b77fc9a33b4e259973f623223f2ee0911824c59be5516',
+            'a3234184a2fab63e94b4ecd55fa3100d62db224f5e56812fb9dac2f5fe1b3b9f',
+            '5c2cbb9084fedafb5a0e794281c8611fdef6c4c55d0c9ee4ecaeacc85d938d6a',
+        ]
+        self.assertEqual(len(entries), len(hashes))
+        for index, (entry, digest) in enumerate(zip(entries, hashes)):
+            with self.subTest(index=index):
+                self.assertEqual(entry.get('hash_version'), 1)
+                self.assertEqual(entry['hash'], digest)
+                self.assertEqual(entry['prev_hash'], 'genesis' if index == 0 else hashes[index - 1])
+                self.assertNotIn('metadata', entry)
+                self.assertEqual(set(entry), {'id', 'timestamp', 'event_type', 'severity', 'user',
+                                             'resource', 'description', 'prev_hash', 'hash_version', 'hash'})
 
     @staticmethod
     def local_fixture_product():

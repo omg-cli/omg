@@ -241,7 +241,7 @@ pub fn fixture_program_hash(path: &Path) -> String {
     format!("{:x}", hash.finalize())
 }
 
-fn fixture_cli_path() -> PathBuf {
+pub(crate) fn fixture_cli_path() -> PathBuf {
     let original = PathBuf::from(env!("CARGO_BIN_EXE_omg"));
     let Some(receipt) = env::var_os("OMG_CONTRACT_CLI_ROOT_FIXTURE") else {
         return original;

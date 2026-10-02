@@ -119,16 +119,17 @@ def audit_entries():
         entry = {'id': f'fixture-audit-{number}', 'timestamp': f'2025-06-0{number}T12:00:00Z',
                  'event_type': 'package_install', 'severity': severity, 'user': 'fixture',
                  'resource': f'fixture-package-{number}', 'description': f'Fixture event number {number}',
-                 'prev_hash': previous}
-        digest = hashlib.sha256(b'omg-audit-entry\x00v2\x00')
+                 'prev_hash': previous, 'hash_version': 1}
+        # Published AuditEntry v1: invalid-UTF-8 domain, Rust Debug enum names,
+        # and all nine u64-prefixed fields, including absent metadata as empty.
+        digest = hashlib.sha256(b'\xff\x01')
         values = [entry[key] for key in ('id', 'timestamp')]
-        values += ['PACKAGE_INSTALL', severity.upper()]
+        values += ['PackageInstall', severity.title()]
         values += [entry[key] for key in ('user', 'resource', 'description')]
+        values += ['', previous]
         for value in values:
             encoded = value.encode(); digest.update(len(encoded).to_bytes(8, 'big')); digest.update(encoded)
-        digest.update(b'\x00')
-        encoded = previous.encode(); digest.update(len(encoded).to_bytes(8, 'big')); digest.update(encoded)
-        entry['hash'] = previous = 'v2:' + digest.hexdigest()
+        entry['hash'] = previous = digest.hexdigest()
         entries.append(entry)
     return entries
 
