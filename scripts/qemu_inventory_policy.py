@@ -135,7 +135,7 @@ def load_snapshot(policy, index, digest):
 
 
 def verify_inventory_cases(snapshot, content):
-    lines = content.decode("utf-8").split("\n")
+    lines = content.decode("utf-8").replace("\r\n", "\n").split("\n")
     if lines[-1] == "":
         lines.pop()
     if not lines or lines[0] != HEADER:

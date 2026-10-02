@@ -623,6 +623,7 @@ if [[ -n "$inventory_tiers" ]]; then
   # guest); /work is bind-mounted there.
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
   cp "$here/qemu-container-fake-engine.sh" "$work/qemu-container-fake-engine.sh"
+  cp "$here/qemu-local-oracle.py" "$work/qemu-local-oracle.py"
   cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
   cp "$here/qemu-rust-install-oracle.py" "$work/qemu-rust-install-oracle.py"
