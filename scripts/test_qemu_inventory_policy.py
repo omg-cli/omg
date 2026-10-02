@@ -139,6 +139,29 @@ class PolicyTests(unittest.TestCase):
         self.results.write_text(json.dumps(self.rows))
         return POLICY.admit(self.policy, self.inventory, self.results, self.summary, distro, "hermetic")
 
+    def test_staged_network_profile_requires_live_result(self):
+        self.inventory.write_bytes(self.inventory.read_bytes() +
+            b'live\t["doctor","--network"]\tcontrolled-error\t1\tpass\trequired\tnetwork\tarch:pass\t-\tnone\n')
+        self.selection['cases'].append(dict(id='live', tiers=['network'],
+            network_scope='network', allowed_skips={}))
+        self.write_policy()
+        index = json.loads(self.policy.read_text())
+        index['profiles'] = load_index(ROOT / 'tests/qemu-inventory-policy.json')['profiles']
+        self.policy.write_text(json.dumps(index))
+        self.rows.append(dict(case_id='qemu-arch-live', distro='arch',
+            artifact_source='inventory', result='PASS', exit_code=1, network_scope='network'))
+        self.results.write_text(json.dumps(self.rows))
+        self.summary.write_text('{"complete":true,"pass":2,"fail":0,"skipped":1}')
+        receipt = POLICY.admit(self.policy, self.inventory, self.results, self.summary,
+                               'arch', 'hermetic,container,network')
+        self.assertTrue(receipt['passed'])
+        self.assertEqual(receipt['counts'], dict(selected=3, executed=2, passed=2,
+            failed=0, blocked=0, harness_error=0, skipped=1))
+        self.results.write_text(json.dumps(self.rows[:-1]))
+        with self.assertRaisesRegex(ValueError, 'missing or extra selected cases'):
+            POLICY.admit(self.policy, self.inventory, self.results, self.summary,
+                         'arch', 'hermetic,container,network')
+
     def test_counts_separate_executed_from_selected(self):
         receipt = self.admit()
         self.assertTrue(receipt["passed"])
