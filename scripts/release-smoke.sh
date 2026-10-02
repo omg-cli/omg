@@ -606,11 +606,7 @@ prepare_fedora_cache_image() {
   mkdir -p "$context" || return 1
   printf 'FROM %s\n' "$distro_image" > "$recipe" || return 1
   cat >> "$recipe" <<'DOCKERFILE' || return 1
-RUN dnf config-manager setopt \
-  'fedora.metalink=' \
-  'fedora.baseurl=https://dl.fedoraproject.org/pub/fedora/linux/releases/$releasever/Everything/$basearch/os/' \
-  'updates.metalink=' \
-  'updates.baseurl=https://dl.fedoraproject.org/pub/fedora/linux/updates/$releasever/Everything/$basearch/'
+RUN dnf config-manager setopt '*.skip_if_unavailable=False'
 RUN dnf makecache --refresh
 DOCKERFILE
   cp "$recipe" "$run_evidence/fedora-cache-seed.Dockerfile" || return 1

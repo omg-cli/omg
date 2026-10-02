@@ -145,7 +145,7 @@ check_outdated_native_count() {
 
 # BEGIN DOCTOR BACKEND ORACLE
 check_doctor_native_backend() {
-  local distro=$1 output=$2 os_release=${3:-/etc/os-release} exec_receipt=${4:-} restricted_path=${5:-false} guest_id expected
+  local distro=$1 output=$2 os_release=${3:-/etc/os-release} exec_receipt=${4:-} restricted_path=${5:-false} index_receipt=${6:-} guest_id expected
   if [[ ! -f "$os_release" ]]; then
     printf 'native doctor reference lacks an os-release file\n' >&2
     return 2
@@ -205,6 +205,10 @@ check_doctor_native_backend() {
       if ! grep -Fq 'dpkg package database (/var/lib/dpkg/status)' "$output" \
         || ! grep -Fq 'APT package indexes (/var/lib/apt/lists)' "$output"; then
         printf 'assertion failed: doctor omitted an APT or dpkg health check\n' >&2
+        return 1
+      fi
+      if [[ -n "$index_receipt" ]] && ! python3 "$HOME/qemu-doctor-index-oracle.py" --receipt "$index_receipt" --distro "$distro"; then
+        printf 'assertion failed: Doctor native index negative evidence is missing or invalid\n' >&2
         return 1
       fi ;;
     fedora)
@@ -2529,8 +2533,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: counter fixture cleanup failed\\n' >&2; assertion=1; fi"
   fi
   if [[ "$assertions" == doctor-native-backend ]]; then
+    if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+      remote+="; index_probe_rc=0; sudo -n unshare --mount --propagation private python3 \"\$HOME/qemu-doctor-index-oracle.py\" --binary $quoted_binary --distro '$distro' > doctor-index-proof.json 2> doctor-index-proof.stderr || index_probe_rc=\$?; cat doctor-index-proof.json doctor-index-proof.stderr >&2; if [[ \"\$index_probe_rc\" == 1 ]]; then assertion=1; elif [[ \"\$index_probe_rc\" != 0 ]]; then execution_phase=dependency; rc=2; assertion=1; fi"
+    fi
     if [[ "$distro" == fedora ]]; then
       remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log /etc/os-release doctor.exec.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
+    elif [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+      remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log /etc/os-release '' false doctor-index-proof.json || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     else
       remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     fi
