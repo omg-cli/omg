@@ -9,6 +9,8 @@ on:
       - "src/**"
       - "tests/docker_e2e.rs"
       - "scripts/test_docker_workflow.py"
+      - "scripts/docker-info-fixture.py"
+      - "scripts/qemu-aur-fixture.py"
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
