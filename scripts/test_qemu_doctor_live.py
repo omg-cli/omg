@@ -76,6 +76,28 @@ class LiveDoctorTests(unittest.TestCase):
         offline = [row.split('\t') for row in rows if row.startswith('doctor-network\t')]
         self.assertEqual(offline[0][6], 'container')
 
+    def test_real_executor_requires_the_live_report_oracle(self):
+        from scripts.test_qemu_output_contracts import OutputContracts
+        row = ('doctor-network-live\t["doctor","--network"]\tcontrolled-error\t1\tpass\t-\t'
+               'network\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tdoctor-network-live-state\ttempdir-drop')
+        for count, accepted in ((1, True), (2, False)):
+            with self.subTest(count=count):
+                product = '''[[ "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 ]] || exit 70
+printf '  Internet connectivity (github.com reachable)\\n'
+printf '  PATH resolves a different omg executable first: "%s"\\n' "$(command -v omg)"
+if [[ "$2" == --network ]]; then
+  printf 'Network Diagnostics\\n  ✓ Kernel.org (10 ms)\\n  ✓ GitHub (15 ms)\\n\\n  DNS Resolution:\\n    ✓ kernel.org (2 addresses)\\n    ✓ github.com (2 addresses)\\n'
+  printf 'Error: doctor found COUNT health issue(s)\\n' >&2
+else
+  printf 'Error: doctor found 1 health issue(s)\\n' >&2
+fi
+exit 1
+'''.replace('COUNT', str(count))
+                runner = OutputContracts(methodName='runTest')
+                result, rows, logs = runner.run_inventory(product, [row], distro='debian', tiers='network')
+                self.assertEqual(rows[0]['result'], 'PASS' if accepted else 'FAIL', logs)
+                self.assertEqual(result.returncode, 0 if accepted else 1, logs)
+
 
 if __name__ == '__main__':
     unittest.main()
