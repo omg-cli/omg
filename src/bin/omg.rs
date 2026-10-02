@@ -989,22 +989,26 @@ async fn async_main(args: Vec<String>) -> Result<()> {
 
 /// Validate package names for security
 fn command_requires_root(command: &Commands) -> bool {
+    let native_fedora = cfg!(feature = "fedora")
+        && matches!(
+            omg_lib::core::env::distro::detect_distro(),
+            omg_lib::core::env::distro::Distro::Fedora,
+        );
     match command {
         Commands::Sync => true,
+        // DNF5 --store resolves the complete plan without executing it, but
+        // requires root even for a preview. Keep invalid recursion on its
+        // existing unprivileged refusal path before any native plan is made.
+        Commands::Remove {
+            recursive: false, ..
+        } => native_fedora,
         Commands::Clean {
             orphans,
             cache,
             all,
             dry_run,
             ..
-        } => {
-            let native_fedora = cfg!(feature = "fedora")
-                && matches!(
-                    omg_lib::core::env::distro::detect_distro(),
-                    omg_lib::core::env::distro::Distro::Fedora,
-                );
-            !dry_run && (*orphans || *cache || *all) && !native_fedora
-        }
+        } => !dry_run && (*orphans || *cache || *all) && !native_fedora,
         _ => false,
     }
 }
@@ -2214,6 +2218,85 @@ mod tests {
             assert_eq!(transaction.changes[0].new_version.as_deref(), Some("2.0"));
         }
         Ok(())
+    }
+
+    #[test]
+    fn native_fedora_removal_preview_requires_root_before_dispatch() {
+        let cli = Cli::try_parse_from(["omg", "remove", "--dry-run", "jq"]).unwrap();
+        let native_fedora = cfg!(feature = "fedora")
+            && matches!(
+                omg_lib::core::env::distro::detect_distro(),
+                omg_lib::core::env::distro::Distro::Fedora
+            );
+        assert_eq!(command_requires_root(&cli.command), native_fedora);
+    }
+
+    #[test]
+    fn native_fedora_removal_confirmation_requires_root_before_dispatch() {
+        let cli = Cli::try_parse_from(["omg", "remove", "jq"]).unwrap();
+        let native_fedora = cfg!(feature = "fedora")
+            && matches!(
+                omg_lib::core::env::distro::detect_distro(),
+                omg_lib::core::env::distro::Distro::Fedora
+            );
+        assert_eq!(command_requires_root(&cli.command), native_fedora);
+    }
+
+    #[tokio::test]
+    async fn native_fedora_removal_recursive_mode_refuses_without_elevation() {
+        for dry_run in [false, true] {
+            let command = Commands::Remove {
+                packages: vec!["jq".to_owned()],
+                recursive: true,
+                yes: false,
+                dry_run,
+            };
+            assert!(!command_requires_root(&command));
+            #[cfg(feature = "fedora")]
+            if matches!(
+                omg_lib::core::env::distro::detect_distro(),
+                omg_lib::core::env::distro::Distro::Fedora
+            ) {
+                let error =
+                    omg_lib::cli::packages::remove(&["jq".to_owned()], true, false, dry_run)
+                        .await
+                        .expect_err("Fedora recursion must refuse before a plan or confirmation");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Recursive removal is not supported")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_fedora_removal_reexec_preserves_dry_run_and_validation() {
+        let expected: Vec<String> = ["omg", "remove", "--dry-run", "--", "jq"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let mut args = expected.clone();
+        args.insert(1, omg_lib::core::privilege::ELEVATED_MARKER.to_owned());
+        assert_eq!(
+            strip_internal_invocation_markers(&mut args, true),
+            (true, false)
+        );
+        assert_eq!(args, expected);
+        #[cfg(feature = "arch")]
+        assert!(split_elevated_invocation(&args, false).is_none());
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(
+            matches!(&cli.command, Commands::Remove { dry_run: true, packages, .. }
+            if packages == &["jq"])
+        );
+        validate_package_security(&cli.command).unwrap();
+        let invalid = Cli::try_parse_from(["omg", "remove", "--dry-run", "--", "jq;id"]).unwrap();
+        assert!(validate_package_security(&invalid.command).is_err());
+        for args in [["omg", "search", "jq"], ["omg", "info", "jq"]] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(!command_requires_root(&cli.command));
+        }
     }
 
     #[test]

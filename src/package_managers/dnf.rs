@@ -345,11 +345,53 @@ impl DnfPackageManager {
         Ok(plan)
     }
 
+    #[cfg(unix)]
+    fn trusted_removal_preview_parent(parent: &Path) -> Result<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+
+        let canonical = parent
+            .canonicalize()
+            .context("Could not resolve DNF removal preview parent")?;
+        for ancestor in canonical.ancestors() {
+            let metadata = ancestor
+                .metadata()
+                .context("Could not inspect DNF removal preview ancestor")?;
+            anyhow::ensure!(
+                metadata.is_dir() && metadata.uid() == 0,
+                "DNF removal preview ancestors must be root-owned directories"
+            );
+            let writable = metadata.mode() & 0o022 != 0;
+            let protected_sticky_parent = ancestor == canonical && metadata.mode() & 0o1000 != 0;
+            anyhow::ensure!(
+                !writable || protected_sticky_parent,
+                "DNF removal preview ancestor is writable without a safe sticky parent"
+            );
+        }
+        Ok(canonical)
+    }
+
+    fn removal_preview_directory() -> Result<tempfile::TempDir> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The elevated process must not follow caller TMPDIR into a
+            // replaceable directory. Immutable ancestors plus a root-owned
+            // sticky parent protect the private 0700 child's pathname.
+            let parent = Self::trusted_removal_preview_parent(Path::new("/var/tmp"))?;
+            tempfile::Builder::new()
+                .prefix("omg-dnf-removal-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in(parent)
+                .context("Could not create private DNF removal preview directory")
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("DNF removal preview requires a Unix filesystem ownership boundary")
+    }
+
     async fn simulate_removal(packages: &[String]) -> Result<Vec<super::types::RemovalPackage>> {
         use tokio::io::AsyncReadExt;
         crate::core::security::validate_package_names(packages)?;
-        let directory = tempfile::tempdir()
-            .context("Could not create private DNF removal preview directory")?;
+        let directory = Self::removal_preview_directory()?;
         let mut command =
             tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
         command
@@ -1942,6 +1984,71 @@ mod tests {
         let plan = manager.removal_plan(&["tree".into()]).await?;
         assert!(plan.iter().any(|package| package.name == "tree.x86_64"));
         assert_eq!(manager.security_inventory().await?, before);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn removal_preview_directory_ignores_caller_tmpdir() -> Result<()> {
+        let caller = tempfile::tempdir()?;
+        temp_env::with_var("TMPDIR", Some(caller.path()), || -> Result<()> {
+            let directory = DnfPackageManager::removal_preview_directory()?;
+            assert_eq!(directory.path().parent(), Some(Path::new("/var/tmp")));
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removal_preview_directory_is_private_and_removed_after_use() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let directory = DnfPackageManager::removal_preview_directory()?;
+        let path = directory.path().to_owned();
+        let metadata = path.metadata()?;
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        std::fs::write(path.join("transaction.json"), b"private fixture")?;
+        drop(directory);
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removal_preview_parent_rejects_replaceable_ancestors_and_symlink_targets() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::Builder::new()
+            .prefix("omg-dnf-parent-fixture-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(if is_root() { "/var" } else { "/var/tmp" })?;
+        let parent = directory.path().join("parent");
+        std::fs::create_dir(&parent)?;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))?;
+        assert!(DnfPackageManager::trusted_removal_preview_parent(&parent).is_err());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777))?;
+        assert_eq!(
+            DnfPackageManager::trusted_removal_preview_parent(&parent).is_ok(),
+            is_root()
+        );
+        let child = parent.join("private");
+        std::fs::create_dir(&child)?;
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700))?;
+        // A sticky writable directory is safe only as the final allocation
+        // parent, not as an ancestor of a path another user could replace.
+        assert!(DnfPackageManager::trusted_removal_preview_parent(&child).is_err());
+        let trap = directory.path().join("trap");
+        symlink(&child, &trap)?;
+        assert!(DnfPackageManager::trusted_removal_preview_parent(&trap).is_err());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
+        assert_eq!(
+            DnfPackageManager::trusted_removal_preview_parent(&child).is_ok(),
+            is_root()
+        );
+        if is_root() {
+            nix::unistd::chown(&child, Some(nix::unistd::Uid::from_raw(1000)), None)?;
+            assert!(DnfPackageManager::trusted_removal_preview_parent(&child).is_err());
+        }
         Ok(())
     }
 
