@@ -97,6 +97,12 @@ fi
             self.assertTrue(staged.is_file(), 'real lanes must stage the mutation refusal oracle')
             self.assertEqual(staged.read_bytes(), (ROOT / 'scripts/qemu-mutation-refusal.py').read_bytes())
 
+    def test_refusal_inventory_is_independent_of_custom_selected_rows(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text()
+        self.assertIn('cp "$here/../tests/cli_behavior_inventory.tsv" "$work/mutation-refusal-cases.tsv"', source)
+        self.assertIn('--tsv /work/mutation-refusal-cases.tsv', source)
+        self.assertIn('--tsv "$here/../tests/cli_behavior_inventory.tsv"', source)
+
     def test_live_refusal_is_required_before_mutating_inventory(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text()
         start = source.index('  inv_args=(--work /work')
