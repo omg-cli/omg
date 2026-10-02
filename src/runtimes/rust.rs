@@ -936,6 +936,15 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains("running 1 test"),
+            "the isolated child must execute the exact test body: {stdout}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "the isolated child must report its positive body: {stdout}"
+        );
         Ok(())
     }
 
