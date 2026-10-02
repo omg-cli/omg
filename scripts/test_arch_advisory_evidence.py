@@ -120,5 +120,28 @@ class ArchEvidenceTests(unittest.TestCase):
             (self.evidence / name).write_bytes(original)
 
 
+def write_release_smoke_fixture(evidence, archive):
+    """Seed the fake controller only; this is never a native execution receipt."""
+    import shutil
+
+    case = ArchEvidenceTests()
+    case.setUp()
+    try:
+        with tarfile.open(archive, "r:gz") as staged:
+            for name in ("omg", "omgd"):
+                member, = [entry for entry in staged.getmembers() if Path(entry.name).name == name and entry.isfile()]
+                case.receipt[name + "_sha256"] = hashlib.sha256(staged.extractfile(member).read()).hexdigest()
+        case.receipt["native_archive_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        case.write()
+        shutil.copytree(case.evidence, evidence)
+    finally:
+        case.doCleanups()
+
+
 if __name__ == "__main__":
-    unittest.main()
+    import sys
+
+    if len(sys.argv) == 4 and sys.argv[1] == "--write-release-smoke-fixture":
+        write_release_smoke_fixture(Path(sys.argv[2]), Path(sys.argv[3]))
+    else:
+        unittest.main()
