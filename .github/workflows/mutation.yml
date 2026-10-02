@@ -66,6 +66,7 @@ jobs:
           shared-key: portable
           cache-targets: false
           cache-bin: false
+          cache-workspace-crates: false
           save-if: false
 
       - name: Validate portable mutation baseline
@@ -92,7 +93,6 @@ jobs:
             --file src/core/security/secrets.rs \
             --timeout 60 \
             --jobs 2 \
-            --exclude-re 'tests?|bench|mock' \
             --output mutants-report \
             --no-default-features \
             --features pgp,license
