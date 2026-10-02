@@ -1879,6 +1879,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_connectivity_probes_preserve_each_endpoint_status() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local probe client");
+        const PRIMARY: &[u8] =
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        const ALTERNATE: &[u8] =
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let delayed = Duration::from_millis(100);
+        for (primary_delay, alternate_delay) in
+            [(Duration::ZERO, delayed), (delayed, Duration::ZERO)]
+        {
+            let (primary_url, primary_server) = serve_probe_response(PRIMARY, primary_delay).await;
+            let (alternate_url, alternate_server) =
+                serve_probe_response(ALTERNATE, alternate_delay).await;
+            assert_eq!(
+                probe_connectivity(
+                    &client,
+                    [("primary", &primary_url), ("alternate", &alternate_url)],
+                    Duration::from_secs(1)
+                )
+                .await,
+                Err([
+                    ("primary", EndpointProbe::HttpStatus(503)),
+                    ("alternate", EndpointProbe::HttpStatus(502))
+                ])
+            );
+            finish_probe_server(primary_server).await;
+            finish_probe_server(alternate_server).await;
+        }
+    }
+
+    #[tokio::test]
     async fn basic_connectivity_returns_before_an_unneeded_slow_site() {
         const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let client = reqwest::Client::builder()
