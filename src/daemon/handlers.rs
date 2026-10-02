@@ -1611,7 +1611,8 @@ mod tests {
     fn installed_info(name: &str, version: &str) -> crate::core::Package {
         crate::core::Package {
             name: name.into(),
-            version: crate::package_managers::types::parse_version_or_zero(version),
+            version: crate::package_managers::types::parse_version(version)
+                .expect("backend info fixture version must parse"),
             description: "Installed RPM metadata".into(),
             source: crate::core::PackageSource::Official,
             installed: true,
@@ -1623,6 +1624,10 @@ mod tests {
         records: &[(&str, &str, &str)],
         replies: impl IntoIterator<Item = (&'static str, InfoReply)>,
     ) -> anyhow::Result<(tempfile::TempDir, Arc<DaemonState>)> {
+        for (_, version, _) in records {
+            crate::package_managers::types::parse_version(version)
+                .expect("index info fixture version must parse");
+        }
         let directory = tempfile::tempdir()?;
         let backend = InfoSelectionBackend {
             inner: crate::package_managers::mock::MockPackageManager::new_in(
@@ -1646,13 +1651,13 @@ mod tests {
             let (_directory, state) = info_selection_state(
                 "dnf",
                 &[
-                    ("bash", "5.4-1.fc44", "Repository candidate"),
-                    ("bash.x86_64", "5.2-1.fc44", "Stale installed index"),
+                    ("bash", "5.4-1", "Repository candidate"),
+                    ("bash.x86_64", "5.2-1", "Stale installed index"),
                 ],
-                ["bash", "bash.x86_64", "bash-5.3.9-3.fc44.x86_64"].map(|query| {
+                ["bash", "bash.x86_64", "bash-5.3.9-3.x86_64"].map(|query| {
                     (
                         query,
-                        InfoReply::Found(installed_info("bash.x86_64", "5.3.9-3.fc44")),
+                        InfoReply::Found(installed_info("bash.x86_64", "5.3.9-3")),
                     )
                 }),
             )?;
@@ -1671,7 +1676,7 @@ mod tests {
                 }
                 _ => {}
             }
-            for query in ["bash", "bash", "bash.x86_64", "bash-5.3.9-3.fc44.x86_64"] {
+            for query in ["bash", "bash", "bash.x86_64", "bash-5.3.9-3.x86_64"] {
                 let Response::Success {
                     result: ResponseResult::Info(info),
                     ..
@@ -1680,7 +1685,7 @@ mod tests {
                     panic!("installed info must succeed for {query} with {cache_seed} cache");
                 };
                 assert_eq!(info.name, "bash.x86_64", "{query}/{cache_seed}");
-                assert_eq!(info.version, "5.3.9-3.fc44", "{query}/{cache_seed}");
+                assert_eq!(info.version, "5.3.9-3", "{query}/{cache_seed}");
                 assert_eq!(info.description, "Installed RPM metadata");
                 assert_eq!(info.source, WirePackageSource::Official);
                 assert_eq!(info.repo, "official");
@@ -1694,11 +1699,11 @@ mod tests {
         let available = crate::core::Package {
             installed: false,
             description: "Current available repository metadata".into(),
-            ..installed_info("available-tool", "2.0-2.fc44")
+            ..installed_info("available-tool", "2.0-2")
         };
         let (_directory, state) = info_selection_state(
             "dnf",
-            &[("available-tool", "1.0-1.fc44", "Stale repository metadata")],
+            &[("available-tool", "1.0-1", "Stale repository metadata")],
             [("available-tool", InfoReply::Found(available))],
         )?;
         for _ in 0..2 {
@@ -1710,7 +1715,7 @@ mod tests {
                 panic!("an available package must succeed after an installed-package miss");
             };
             assert_eq!(info.name, "available-tool");
-            assert_eq!(info.version, "2.0-2.fc44");
+            assert_eq!(info.version, "2.0-2");
             assert_eq!(info.description, "Current available repository metadata");
             assert_eq!(info.source, WirePackageSource::Official);
             assert_eq!(info.repo, "official");
@@ -1724,25 +1729,20 @@ mod tests {
         let (_directory, state) = info_selection_state(
             "dnf",
             &[
-                ("kernel-core", "6.19-1.fc44", "Repository candidate"),
-                ("kernel-core.x86_64", "6.18-1.fc44", "First installed build"),
+                ("kernel-core", "6.19-1", "Repository candidate"),
+                ("kernel-core.x86_64", "6.18-1", "First installed build"),
             ],
             [
                 ("kernel-core", InfoReply::Failed(cause)),
                 ("kernel-core.x86_64", InfoReply::Failed(cause)),
                 (
-                    "kernel-core-6.18-1.fc44.x86_64",
-                    InfoReply::Found(installed_info("kernel-core.x86_64", "6.18-1.fc44")),
+                    "kernel-core-6.18-1.x86_64",
+                    InfoReply::Found(installed_info("kernel-core.x86_64", "6.18-1")),
                 ),
             ],
         )?;
         assert!(matches!(
-            handle_info(
-                Arc::clone(&state),
-                1,
-                "kernel-core-6.18-1.fc44.x86_64".into()
-            )
-            .await,
+            handle_info(Arc::clone(&state), 1, "kernel-core-6.18-1.x86_64".into()).await,
             Response::Success {
                 result: ResponseResult::Info(_),
                 ..
@@ -1768,11 +1768,8 @@ mod tests {
             } else {
                 Vec::new()
             };
-            let (_directory, state) = info_selection_state(
-                "dnf",
-                &[("bash", "5.3-1.fc44", "Old repository index")],
-                replies,
-            )?;
+            let (_directory, state) =
+                info_selection_state("dnf", &[("bash", "5.3-1", "Old repository index")], replies)?;
             state
                 .cache
                 .insert_info(state.index_snapshot().get("bash").unwrap());
