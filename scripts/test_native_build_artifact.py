@@ -58,6 +58,38 @@ def bundle(provenance, payload, extra=None):
 
 
 class NativeBuildAdmission(unittest.TestCase):
+    def test_merge_group_admits_only_the_exact_candidate_native_owner(self):
+        run = dict(id=123, run_attempt=1, repository={'full_name': 'omg-cli/omg'},
+                   path='.github/workflows/ci.yml', workflow_id=42, event='merge_group',
+                   head_sha='a'*40, pull_requests=[], created_at='2026-09-20T08:55:00Z',
+                   run_started_at='2026-09-20T09:00:00Z', status='in_progress', conclusion=None)
+        artifact = dict(id=9, name='native-release-debian-1', size_in_bytes=100, expired=False,
+                        created_at='2026-09-20T09:01:00Z')
+        context = dict(GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a'*40,
+                       GITHUB_EVENT_NAME='merge_group')
+        event = {'merge_group': {'head_sha': 'a'*40}}
+        def lookup(path):
+            if path.endswith('/workflows/ci.yml'):
+                return {'id': 42, 'path': '.github/workflows/ci.yml'}
+            if '/ci.yml/runs?' in path:
+                self.assertIn('event=merge_group&head_sha=' + 'a'*40, path)
+                return {'workflow_runs': [run]}
+            if '/artifacts?' in path:
+                return {'total_count': 1, 'artifacts': [artifact]}
+            self.fail('unexpected API request: ' + path)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(BUILD, 'api_json', side_effect=lookup), \
+                patch.object(BUILD, 'command_output', return_value='a'*40):
+            selected, _, identity, attempt = BUILD.find_native_artifact(
+                Path(directory), 'debian', context, event)
+            self.assertEqual((selected['id'], attempt, identity['head_sha']), (9, 1, 'a'*40))
+            for change in ({'head_sha': 'b'*40}, {'event': 'push'}):
+                original = dict(run)
+                run.update(change)
+                with self.assertRaisesRegex(ValueError, 'producer mismatch'):
+                    BUILD.find_native_artifact(Path(directory), 'debian', context, event)
+                run.update(original)
+
     def test_artifact_download_retries_only_a_transport_timeout(self):
         path = 'repos/omg-cli/omg/actions/artifacts/123/zip'
         timeout = subprocess.TimeoutExpired(['gh', 'api', path], 90)
@@ -146,7 +178,7 @@ class NativeBuildAdmission(unittest.TestCase):
         self.assertNotIn('issues: write', lane)
         self.assertIn('inputs.staged && inputs.reuse-ci', guest)
         self.assertIn('if: inputs.staged && !inputs.reuse-ci', guest)
-        self.assertIn("reuse-ci: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}", matrix)
+        self.assertIn("reuse-ci: ${{ github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}", matrix)
         self.assertIn('  pull_request:\n  merge_group:', ci)
         self.assertIn('python3 scripts/ci-change-scope.py', ci)
 

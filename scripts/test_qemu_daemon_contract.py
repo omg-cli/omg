@@ -114,6 +114,57 @@ class DaemonContractTests(unittest.TestCase):
             self.assertIn('omg_only=["omg-only"]', result.stderr)
             self.assertIn('omg_duplicates=["omg-only"]', result.stderr)
 
+    @unittest.skipIf(os.name == 'nt', 'native query diagnostics require POSIX jq')
+    def test_query_mismatch_diagnostic_preserves_product_failure_with_old_guest_jq(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        function = source.split('# BEGIN EXPLICIT QUERY ORACLE', 1)[1].split('# END EXPLICIT QUERY ORACLE', 1)[0]
+        script = function + '''
+if ! check_explicit_query_outputs expected listing count shortcut jsoncount; then
+  report_explicit_query_difference expected listing daemon-direct
+  printf 'assertion failed: explicit listing/count differs from native package inventory\n' >&2
+  exit 1
+fi
+'''
+        for listing in ('{"packages":["bash","unexpected"],"count":2}',
+                        '{"packages":"invalid","count":2}',
+                        '{}\n{"packages":["bash","native-only"],"count":2}'):
+            with self.subTest(listing=listing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'expected').write_text('["bash","native-only"]')
+                (root / 'listing').write_text(listing)
+                for name, content in (('count', '2'), ('shortcut', '2'), ('jsoncount', '{"count":2}')):
+                    (root / name).write_text(content)
+                result = subprocess.run([BASH, '-euc', script], cwd=root,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('assertion failed: explicit listing/count differs', result.stderr)
+                self.assertNotIn('compile error', result.stderr)
+                self.assertEqual(result.stdout, '')
+                if 'unexpected' in listing:
+                    self.assertIn('native_only=["native-only"]', result.stderr)
+                    self.assertIn('omg_only=["unexpected"]', result.stderr)
+                else:
+                    self.assertIn('package listing was not a single valid query document', result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'native query diagnostics require POSIX jq')
+    def test_query_mismatch_diagnostic_bounds_large_package_differences(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        function = source.split('# BEGIN EXPLICIT QUERY ORACLE', 1)[1].split('# END EXPLICIT QUERY ORACLE', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'expected').write_text(json.dumps([f'native-{number:03d}' for number in range(60)]))
+            (root / 'listing').write_text(json.dumps({'packages': [f'omg-{number:03d}' for number in range(60)], 'count': 60}))
+            result = subprocess.run([BASH, '-c', function + '\nreport_explicit_query_difference expected listing daemon-direct'],
+                                    cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stderr.splitlines()
+            self.assertIn('daemon-direct native_count=60 omg_count=60', lines)
+            self.assertIn('difference_truncated=true', lines)
+            for prefix in ('native_only=', 'omg_only='):
+                items = json.loads(next(line.removeprefix(prefix) for line in lines if line.startswith(prefix)))
+                self.assertEqual(len(items), 50)
+                self.assertEqual(items[-1], ('native-' if prefix == 'native_only=' else 'omg-') + '049')
+
     @unittest.skipIf(os.name == 'nt', 'package query oracle requires POSIX jq')
     def test_daemon_and_direct_package_queries_must_agree_on_a_real_installed_name(self):
         source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
@@ -160,6 +211,103 @@ class DaemonContractTests(unittest.TestCase):
                 (root / 'daemon').write_text(daemon)
                 (root / 'direct').write_text(direct)
                 result = subprocess.run([BASH, '-c', function + '\ncheck_text_info_outputs bash daemon direct'],
+                                        cwd=root, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'native package identity requires POSIX bash')
+    def test_native_reference_supplies_exact_installed_info_identity(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        helper = (source.split('# BEGIN NATIVE PACKAGE IDENTITY', 1)[1]
+                  .split('# END NATIVE PACKAGE IDENTITY', 1)[0]
+                  if '# BEGIN NATIVE PACKAGE IDENTITY' in source else '')
+        reference = source.split('source /etc/os-release\n', 1)[1].split('\nfor mode in ', 1)[0]
+        cases = [('fedora', 'bash.x86_64\n', 0, 0, 'bash.x86_64'),
+                 ('fedora', 'bash.noarch\n', 0, 0, 'bash.noarch'),
+                 ('arch', '', 0, 0, 'bash'), ('debian', '', 0, 0, 'bash'),
+                 ('ubuntu', '', 0, 0, 'bash'),
+                 ('fedora', '', 0, 1, ''),
+                 ('fedora', 'bash.x86_64\nbash.i686\n', 0, 1, ''),
+                 ('fedora', 'wrong.x86_64\n', 0, 1, ''),
+                 ('fedora', 'bash.x86_64 \n', 0, 1, ''),
+                 ('fedora', 'bash.\n', 0, 1, ''),
+                 ('fedora', 'bash.x86_64\n', 17, 17, '')]
+        prelude = r'''
+                timeout() { shift; "$@"; }
+                rpm() { printf '%s\n' "$@" >> "$evidence/rpm-argv"; printf '%s' "$RPM_FIXTURE"; return "$RPM_EXIT"; }
+                dnf() { printf 'bash\n'; }
+                pacman() { printf 'bash\n'; }
+                dpkg-query() { printf 'bash\n'; }
+                apt-mark() { printf 'bash\n'; }
+        '''
+        for distro, output, rpm_exit, expected_exit, expected_name in cases:
+            with self.subTest(distro=distro, output=output, rpm_exit=rpm_exit), tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run(
+                    [BASH, '-euc', prelude + helper + reference + '\nprintf "%s\\n" "${package_identity:-}"'],
+                    env=dict(os.environ, ID=distro, evidence=directory,
+                             RPM_FIXTURE=output, RPM_EXIT=str(rpm_exit)),
+                    cwd=directory, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, expected_exit, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected_name)
+                argv_file = Path(directory) / 'rpm-argv'
+                if distro == 'fedora' and rpm_exit == 0:
+                    self.assertEqual(argv_file.read_text().splitlines()[-4:],
+                                     ['-q', '--qf', r'%{NAME}.%{ARCH}\n', 'bash'])
+                elif distro != 'fedora':
+                    self.assertFalse(argv_file.exists())
+
+    @unittest.skipIf(os.name == 'nt', 'native package parity requires POSIX jq')
+    def test_package_probe_uses_native_identity_and_rejects_captured_bare_daemon_info(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        functions = ''.join(source.split('# BEGIN ' + marker, 1)[1].split('# END ' + marker, 1)[0]
+                            for marker in ['PACKAGE QUERY ORACLE', 'INFO PROVENANCE ORACLE', 'TEXT INFO ORACLE'])
+        probe = 'if ! check_daemon_info_provenance' + source.split('if ! check_daemon_info_provenance', 1)[1].split("backend_faults='[]'", 1)[0]
+        for identity in ('bash', 'bash.x86_64', 'bash.noarch'):
+            version = '5.3.9-3.fc44'
+            search = [{'name': identity, 'version': version, 'description': 'The GNU Bourne Again shell', 'source': 'Official'}]
+            if identity != 'bash':
+                search += [dict(search[0], name='bash', version='5.3.10-1.fc44')]
+            native = {'name': identity, 'version': version, 'description': 'The GNU Bourne Again shell', 'source': 'Official', 'installed': True}
+            daemon = dict(native, download_size=0)
+            cases = [(daemon, native, search, search, True)]
+            if identity != 'bash':
+                cases += [(dict(daemon, name='bash'), native, search, search, False),
+                          (dict(daemon, name='bash.i686'), native, search, search, False),
+                          (daemon, dict(native, name='bash'), search, search, False),
+                          (daemon, native, search + search, search, False),
+                          (daemon, native, search, [], False),
+                          (dict(daemon, version='wrong'), native, search, search, False)]
+            for daemon_info, native_info, daemon_search, native_search, passed in cases:
+                with self.subTest(identity=identity, daemon_info=daemon_info, native_info=native_info,
+                                  daemon_search=daemon_search, native_search=native_search), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    for name, value in [('daemon-direct-search.json', daemon_search),
+                                        ('daemon-stopped-search.json', native_search),
+                                        ('daemon-direct-info.json', daemon_info),
+                                        ('daemon-stopped-info.json', native_info)]:
+                        (root / name).write_text(json.dumps(value))
+                    for mode, info in [('direct', daemon_info), ('stopped', native_info)]:
+                        (root / ('daemon-' + mode + '-info.txt')).write_text(
+                            '\n          Name: ' + info['name'] + '\n     Installed: yes\n')
+                    result = subprocess.run([BASH, '-c', functions + probe],
+                                            env=dict(os.environ, evidence=directory, package_identity=identity),
+                                            cwd=root, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode == 0, passed, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'exact text identity requires POSIX bash')
+    def test_qualified_text_info_rejects_regex_lookalikes_and_duplicate_names(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        function = source.split('# BEGIN TEXT INFO ORACLE', 1)[1].split('# END TEXT INFO ORACLE', 1)[0]
+        good = '\n          Name: bash.x86_64\n     Installed: yes\n'
+        for daemon, direct, passed in [(good, good, True),
+                                      (good.replace('bash.x86_64', 'bashXx86_64'), good, False),
+                                      (good.replace('bash.x86_64', 'bash-x86_64'), good, False),
+                                      (good, good.replace('bash.x86_64', 'bash.i686'), False),
+                                      (good + good, good, False)]:
+            with self.subTest(daemon=daemon, direct=direct), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'daemon').write_text(daemon)
+                (root / 'direct').write_text(direct)
+                result = subprocess.run([BASH, '-c', function + '\ncheck_text_info_outputs bash.x86_64 daemon direct'],
                                         cwd=root, capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, passed, result.stderr)
 

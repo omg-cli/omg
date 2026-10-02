@@ -269,8 +269,9 @@ class CiDeduplicationTests(unittest.TestCase):
             ["python3", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"],
             ["python3", "tests/test_benchmark_records.py"],
             ["python3", "tests/test_terminal_update_notice.py"],
+            ["python3", "tests/test_audit_repair_shell.py"],
         ]
-        for failed in (0, 1, 2, 3, 4):
+        for failed in range(len(commands) + 1):
             with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / "Makefile").write_bytes((CI_YML.parents[2] / "Makefile").read_bytes())

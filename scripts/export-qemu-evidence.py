@@ -43,7 +43,7 @@ GUEST_FILES = {
     "daemon-direct-before-search.prom", "daemon-direct-after-search.prom",
     "daemon-direct-after-info.prom",
     "dnf-reason-fault.stdout.log", "dnf-reason-fault.stderr.log",
-    "native-explicit.txt", "native-explicit.json",
+    "native-explicit.txt", "native-explicit.json", "native-package-identity.txt",
     "daemon-direct-after-queries.txt", "daemon-foreground-after-queries.txt",
     "qemu-startup.log", "daemon-lifecycle.json",
     "daemon-direct.log", "daemon-foreground.log",
@@ -93,6 +93,10 @@ BENCH_FILES = {
     "installed-after.tsv", "installed-expected.tsv", "manual-before.names",
     "manual-after.names", "manual-expected.names", "cache-before.sha256",
     "cache-after.sha256", "started-at.txt",
+    "native-identity-query.stdout", "native-identity-query.stderr",
+    "native-identity-query-before.stdout", "native-identity-query-before.stderr",
+    "native-identity-query-after.stdout", "native-identity-query-after.stderr",
+    "native-architecture.stdout", "native-architecture.stderr",
 }
 # Additional files emitted by benchmark-hyperfine.sh --guest-transaction.
 # Admit these only at the transaction-trial root, never in cache/data/config.

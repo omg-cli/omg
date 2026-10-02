@@ -63,8 +63,45 @@ class BootTimeoutExceedsReadinessWait(unittest.TestCase):
         self.assertIn('timeout --kill-after=5s "$boot_timeout" docker exec', DRIVER.read_text())
         # The bounded cloud-init wrapper includes BOTH child command kill graces.
         cloud = (ROOT / "scripts/check-qemu-cloud-init.sh").read_text()
-        self.assertIn('timeout --kill-after=5s 180s ssh', cloud)
-        self.assertIn('timeout --kill-after=5s 60s ssh', cloud)
+        status_budget = int(re.search(r'status_timeout=\$\{OMG_QEMU_CLOUD_INIT_TIMEOUT_SECONDS:-(\d+)\}', cloud)[1])
+        target_budget = int(re.search(r'if retry_boot_ssh (\d+) target ', cloud)[1])
+        self.assertEqual((status_budget, target_budget), (180, 60))
+        self.assertIn('retry_boot_ssh "$status_timeout" status "$@" "$target"', cloud)
+        retry = cloud[cloud.index('retry_boot_ssh() {'):cloud.index("\n# cloud-init's status")]
+        elapsed_budgets = []
+        for budget, phase in ((status_budget, 'status'), (target_budget, 'target')):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                # Execute the real retry loop with a deterministic monotonic
+                # clock. Two transport resets consume the same deadline; the
+                # third child consumes its remaining time and kill grace.
+                script = '''set -euo pipefail
+clock=0
+calls=0
+boot_seconds() { printf '%s\\n' "$clock"; }
+sleep() { clock=$((clock + $1)); }
+timeout() {
+  [[ "$1" == --kill-after=5s && "$3" == ssh ]] || return 99
+  remaining=${2%s}
+  printf '%s\\n' "$remaining" >> calls
+  calls=$((calls + 1))
+  if (( calls < 3 )); then return 255; fi
+  clock=$((clock + remaining + 5))
+  return 137
+}
+''' + retry + '\nrc=0\nretry_boot_ssh "$1" "$2" guest || rc=$?\nprintf "%s %s\\n" "$clock" "$rc"\n'
+                result = subprocess.run(['bash', '-c', script, '_', str(budget), phase],
+                                        cwd=directory, env=clean_env(), capture_output=True,
+                                        text=True, timeout=5, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                elapsed, child_status = map(int, result.stdout.split())
+                self.assertEqual(child_status, 137, result.stderr)
+                self.assertEqual((Path(directory) / 'calls').read_text().splitlines(),
+                                 [str(budget), str(budget - 1), str(budget - 2)])
+                self.assertEqual(elapsed, budget + 5)
+                elapsed_budgets.append(elapsed)
+        # Both child kill graces fit inside the driver's cloud-init phase.
+        cloud_wrapper_budget = int(re.search(r'(?m)^BOOT_CLOUD_INIT_TIMEOUT=(\d+)$', BUDGET.read_text())[1])
+        self.assertLessEqual(sum(elapsed_budgets), cloud_wrapper_budget)
 
     def test_clone_timeout_clears_the_inner_budget(self):
         text = TRANSACTIONS.read_text()
@@ -177,9 +214,12 @@ elif 'systemctl reboot' in command:
             tail = boot_source().split('\nwait_ssh\n', 1)[1]
             tail = tail.replace('/work/check-qemu-cloud-init.sh', str(cloud))
             budget = BUDGET.read_text()
-            overrides = {'SSH_WAIT_BUDGET': 3, 'SSH_ATTEMPT_TIMEOUT': 1, 'SSH_KILL_GRACE': 1,
-                         'SSH_RETRY_DELAY': 1, 'BOOT_SETUP_TIMEOUT': 2,
-                         'BOOT_CLOUD_INIT_TIMEOUT': 2, 'BOOT_IDENTITY_TIMEOUT': 2,
+            # A successful 0.7s fake command also pays Python startup and CPU
+            # scheduling time. Leave room for that overhead in this positive
+            # composition; deadline/refusal tests above keep their tight caps.
+            overrides = {'SSH_WAIT_BUDGET': 8, 'SSH_ATTEMPT_TIMEOUT': 4, 'SSH_KILL_GRACE': 1,
+                         'SSH_RETRY_DELAY': 1, 'BOOT_SETUP_TIMEOUT': 4,
+                         'BOOT_CLOUD_INIT_TIMEOUT': 4, 'BOOT_IDENTITY_TIMEOUT': 4,
                          'BOOT_PHASE_KILL_GRACE': 1, 'BOOT_OVERHEAD': 2}
             for name, value in overrides.items():
                 budget, count = re.subn(rf'(?m)^{name}=\d+$', f'{name}={value}', budget)
@@ -192,8 +232,13 @@ elif 'systemctl reboot' in command:
             subject.write_text('initial=false\n' + body)
             clone_function = clone_function.replace('/work/boot.sh', str(subject))
             script = 'set -euo pipefail\n' + budget + '\nclone_boot_timeout=$CLONE_BOOT_TIMEOUT\nboot_args=(bios ssh)\n' + clone_function + '\nstart_clone disk vars serial.log clone.log\n'
+            def diagnostics(result, elapsed):
+                logs = '\n'.join(f'--- {path.name} ---\n{path.read_text()}'
+                                 for path in sorted(root.glob('*.log')))
+                return (f'exit={result.returncode}; elapsed={elapsed:.3f}s\n'
+                        f'--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}\n{logs}')
             result, elapsed = self.run_shell(root, script)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 0, diagnostics(result, elapsed))
             self.assertGreater(elapsed, 2.5)
             self.assertIn('setup fixture complete', (root / 'clone.log').read_text())
             self.assertIn('cloud fixture complete', (root / 'clone.log').read_text())
@@ -202,7 +247,7 @@ elif 'systemctl reboot' in command:
             subject.write_text('initial=true\n' + body)
             script = 'set -euo pipefail\n' + budget + '\ntimeout --kill-after=1s "$BOOT_TIMEOUT" bash "$1" bios ssh\n'
             result, elapsed = self.run_shell(root, script, (str(subject),))
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 0, diagnostics(result, elapsed))
             self.assertGreater(elapsed, 6)
             self.assertIn('reboot verified: old-id -> new-id', result.stdout)
 

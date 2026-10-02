@@ -150,6 +150,11 @@ fn pinned_dockerfile(
     runtime_refs: &[(&str, &str)],
 ) -> Result<String> {
     let draft = manager.generate_dockerfile(base, runtime_refs, &InstallerDigests::new());
+    anyhow::ensure!(
+        draft.runtime_errors.is_empty(),
+        "Cannot generate a container that satisfies project runtime requests: {}",
+        draft.runtime_errors.join("; ")
+    );
     if draft.unpinned_urls.is_empty() {
         return Ok(draft.content);
     }
@@ -573,26 +578,15 @@ pub fn init(base_image: Option<String>) -> Result<()> {
     let requested_base = base_image.unwrap_or_else(|| "ubuntu:24.04".to_string());
     let base = normalized_base_image(&requested_base).to_string();
 
-    // Detect runtimes from project
-    let mut runtimes: Vec<(&str, String)> = Vec::new();
-
-    if cwd.join("package.json").exists() {
-        runtimes.push(("node", "lts".to_string()));
-    }
-    if cwd.join("Cargo.toml").exists() {
-        runtimes.push(("rust", "stable".to_string()));
-    }
-    if cwd.join("go.mod").exists() {
-        runtimes.push(("go", "latest".to_string()));
-    }
-    if cwd.join("pyproject.toml").exists() || cwd.join("requirements.txt").exists() {
-        runtimes.push(("python", "3.12".to_string()));
-    }
+    let runtimes = project_container_runtimes(&cwd)?;
 
     let manager = ContainerManager::new()
         .unwrap_or_else(|_| ContainerManager::with_runtime(ContainerRuntime::Docker));
 
-    let runtime_refs: Vec<(&str, &str)> = runtimes.iter().map(|(r, v)| (*r, v.as_str())).collect();
+    let runtime_refs: Vec<(&str, &str)> = runtimes
+        .iter()
+        .map(|(r, v)| (r.as_str(), v.as_str()))
+        .collect();
 
     let dockerfile = pinned_dockerfile(&manager, &base, &runtime_refs)?;
 
@@ -605,7 +599,12 @@ pub fn init(base_image: Option<String>) -> Result<()> {
     if !runtimes.is_empty() {
         details.push("Detected runtimes:".to_string());
         for (rt, ver) in &runtimes {
-            details.push(format!("  • {rt}: {ver}"));
+            let request = if ver == "system" {
+                "distribution default (no version pin)"
+            } else {
+                ver.as_str()
+            };
+            details.push(format!("  • {rt}: {request}"));
         }
     }
 
@@ -617,6 +616,25 @@ pub fn init(base_image: Option<String>) -> Result<()> {
     ]))?;
 
     Ok(())
+}
+
+fn project_container_runtimes(cwd: &std::path::Path) -> Result<Vec<(String, String)>> {
+    let mut runtimes: std::collections::BTreeMap<_, _> =
+        crate::hooks::detect_versions(cwd)?.into_iter().collect();
+    for (manifest, runtime, version) in [
+        ("package.json", "node", "system"),
+        ("Cargo.toml", "rust", "stable"),
+        ("go.mod", "go", "system"),
+        ("pyproject.toml", "python", "system"),
+        ("requirements.txt", "python", "system"),
+    ] {
+        if cwd.join(manifest).exists() {
+            runtimes
+                .entry(runtime.to_string())
+                .or_insert_with(|| version.to_string());
+        }
+    }
+    Ok(runtimes.into_iter().collect())
 }
 
 fn create_new_dockerfile(path: &std::path::Path, contents: &[u8]) -> Result<()> {
@@ -634,6 +652,68 @@ fn create_new_dockerfile(path: &std::path::Path, contents: &[u8]) -> Result<()> 
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_runtime_requests_preserve_project_version_pins() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("pyproject.toml"),
+            "[project]\nname='test'\n",
+        )?;
+        std::fs::write(directory.path().join(".python-version"), "3.13.2\n")?;
+        std::fs::write(directory.path().join("package.json"), "{}")?;
+        std::fs::write(directory.path().join(".node-version"), "22.13.1\n")?;
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='test'\n",
+        )?;
+        std::fs::write(directory.path().join("rust-toolchain"), "1.85.0\n")?;
+        std::fs::write(directory.path().join("go.mod"), "module test\ngo 1.23.5\n")?;
+        let requests: std::collections::BTreeMap<_, _> =
+            project_container_runtimes(directory.path())?
+                .into_iter()
+                .collect();
+
+        assert_eq!(requests.get("python").map(String::as_str), Some("3.13.2"));
+        assert_eq!(requests.get("node").map(String::as_str), Some("22.13.1"));
+        assert_eq!(requests.get("rust").map(String::as_str), Some("1.85.0"));
+        assert_eq!(requests.get("go").map(String::as_str), Some("1.23.5"));
+        Ok(())
+    }
+
+    #[test]
+    fn dedicated_runtime_pins_are_detected_without_a_manifest() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join(".python-version"), "3.13\n")?;
+
+        assert_eq!(
+            project_container_runtimes(directory.path())?,
+            vec![("python".to_string(), "3.13".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn container_generation_refuses_an_unsupported_python_constraint_before_writing() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let error = pinned_dockerfile(&manager, "ubuntu:24.04", &[("python", ">=3.13")])
+            .expect_err("unsupported version constraints must not silently become distro defaults");
+        assert!(error.to_string().contains("Python") || error.to_string().contains("python"));
+    }
+
+    #[test]
+    fn unpinned_container_runtimes_explicitly_request_distro_defaults() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("package.json"), "{}")?;
+        std::fs::write(directory.path().join("requirements.txt"), "")?;
+        let requests: std::collections::BTreeMap<_, _> =
+            project_container_runtimes(directory.path())?
+                .into_iter()
+                .collect();
+        assert_eq!(requests.get("node").map(String::as_str), Some("system"));
+        assert_eq!(requests.get("python").map(String::as_str), Some("system"));
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

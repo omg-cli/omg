@@ -32,6 +32,21 @@ TRANSACTION_PRIVATE = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_native_benchmark_identity_queries_stay_at_benchmark_roots(self):
+        names = ("native-identity-query.stdout", "native-identity-query.stderr", "native-identity-query-before.stdout", "native-identity-query-before.stderr", "native-identity-query-after.stdout", "native-identity-query-after.stderr", "native-architecture.stdout", "native-architecture.stderr")
+        roots = (("run-test", "guest", "evidence", "benchmarks"),
+                 ("run-test", "transactions", "trials", "install-omg-001", "transaction-trial"))
+        for prefix in roots:
+            for name in names:
+                with self.subTest(prefix=prefix, name=name):
+                    self.assertTrue(exporter.allowed_file((*prefix, name)))
+                    self.assertFalse(exporter.allowed_file((*prefix, "cache", name)))
+                    self.assertFalse(exporter.allowed_file((*prefix, "config", name)))
+                    self.assertFalse(exporter.allowed_file((*prefix, name + ".bak")))
+        for name in names:
+            self.assertFalse(exporter.allowed_file(("run-test", name)))
+            self.assertFalse(exporter.allowed_file(("run-test", "guest", "evidence", name)))
+
     def test_boot_process_diagnostics_stay_at_explicit_controller_paths(self):
         paths = (("run-test", "boot.diagnostics.log"),
                  ("run-test", "transactions", "prepare-install-boot.diagnostics.log"),
@@ -220,6 +235,45 @@ class DescriptorTests(unittest.TestCase):
             self.assertEqual((self.destination / name).read_bytes(),
                              b"qemu_process_status=unavailable\nlistener=absent\n")
         self.assertFalse((self.destination / private).exists())
+
+    def test_native_benchmark_query_streams_are_copied_exactly(self):
+        names = ("native-identity-query.stdout", "native-identity-query.stderr", "native-identity-query-before.stdout", "native-identity-query-before.stderr", "native-identity-query-after.stdout", "native-identity-query-after.stderr", "native-architecture.stdout", "native-architecture.stderr")
+        prefixes = ("run-test/guest/evidence/benchmarks/",
+                    "run-test/transactions/trials/install-omg-001/transaction-trial/")
+        expected = {}
+        excluded = []
+        for prefix in prefixes:
+            for name in names:
+                expected[prefix + name] = (name + "\ntree\tx86_64\t2:2.2.1-4.fc44\n").encode()
+                self.fixture(prefix + name, expected[prefix + name])
+                for neighbor in (prefix + "cache/" + name, prefix + name + ".bak"):
+                    excluded.append(neighbor)
+                    self.fixture(neighbor, b"private-neighbor")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(set(report["copied"]), set(expected))
+        self.assertEqual(report["bytes"], sum(len(value) for value in expected.values()))
+        for name, value in expected.items():
+            self.assertEqual((self.destination / name).read_bytes(), value)
+        for name in excluded:
+            self.assertFalse((self.destination / name).exists())
+
+    def test_native_package_identity_exports_only_at_guest_evidence_root(self):
+        name = "run-test/guest/evidence/native-package-identity.txt"
+        content = b"bash.x86_64\n"
+        self.fixture(name, content)
+        excluded = ("run-test/native-package-identity.txt",
+                    "run-test/guest/evidence/native-package-identity.txt.bak",
+                    "run-test/guest/evidence/config/native-package-identity.txt")
+        for neighbor in excluded:
+            self.fixture(neighbor, b"private-neighbor")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(report["copied"], [name])
+        self.assertEqual(report["bytes"], len(content))
+        self.assertEqual((self.destination / name).read_bytes(), content)
+        for neighbor in excluded:
+            self.assertFalse((self.destination / neighbor).exists())
 
     def test_daemon_ipc_snapshots_survive_export(self):
         prefix = "run-test/guest/evidence/"

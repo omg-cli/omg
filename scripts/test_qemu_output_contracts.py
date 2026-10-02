@@ -1,15 +1,192 @@
 """Exercise the exact guest output oracle with plausible false-green products."""
 import os
+import hashlib
 import json
 import re
+import runpy
 import shlex
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+
+@unittest.skipIf(os.name == 'nt', 'native preview assertions require POSIX bash')
+class NativeRemovalContracts(unittest.TestCase):
+    @staticmethod
+    def functions():
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        return source[source.index('native_installed_version() {'):
+                      source.index('prepare_native_apt_orphan() {')]
+
+    def test_removal_preview_requires_exact_native_identity_version_and_multiplicity(self):
+        header = 'The following packages would be removed:\n'
+        footer = 'No changes made (dry run)\n'
+        cases = [
+            ('bash', '5.3.9-3.fc44', '  ✗ bash 5.3.9-3.fc44\n', True),
+            ('bash.x86_64', '5.3.9-3.fc44', '  ✗ bash.x86_64 5.3.9-3.fc44\n', True),
+            ('bash.x86_64', '2:5.3.9-3.fc44', '  ✗ bash.x86_64 2:5.3.9-3.fc44\n', True),
+            ('bash.x86_64', '5.3.9-3.fc44', '  ✗ bash 5.3.9-3.fc44\n', False),
+            ('bash.x86_64', '5.3.9-3.fc44', '  ✗ bash.i686 5.3.9-3.fc44\n', False),
+            ('bash.x86_64', '5.3.9-3.fc44', '  ✗ bash.x86_64 5.3.8-3.fc44\n', False),
+            ('bash.x86_64', '2:5.3.9-3.fc44', '  ✗ bash.x86_64 5.3.9-3.fc44\n', False),
+            ('bash', '5.3.9-3.fc44', '  ✗ bash 5.3.9-3.fc44\n' * 2, False),
+            ('bash.x86_64', '5.3.9-3.fc44', '', False),
+            ('bash.x86_64', '5.3.9-3.fc44', '  ✗ bash.x86_64 5.3.9-3.fc44 extra\n', False),
+        ]
+        for identity, version, rows, passed in cases:
+            with self.subTest(identity=identity, version=version, rows=rows), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / 'preview').write_text(header + rows + footer, encoding='utf-8')
+                result = subprocess.run(['bash', '-c', self.functions() +
+                                         '\ncheck_native_remove_preview preview "$1" "$2"',
+                                         '_', version, identity], cwd=directory,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
+    def test_arch_removal_rows_require_the_exact_size_format(self):
+        header = 'The following requested packages would be removed:\n'
+        footer = 'No changes made (dry run)\n'
+        cases = [
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.47 MB)\n', True),
+            ('arch', 'bash', '5.3.20-1', '  ✗ bash 5.3.20-1 (9.59 MB)\n', True),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.47 MB) extra\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (unknown MB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (-0.47 MB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.4 MB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.47 GB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.47 MB\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.1-1 (0.47 MB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq-tools 1.8.2-1 (0.47 MB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.47 MB)\n' * 2, False),
+            ('fedora', 'jq.x86_64', '1.8.1-3.fc44',
+             '  ✗ jq.x86_64 1.8.1-3.fc44 (0.47 MB)\n', False),
+        ]
+        for distro, identity, version, rows, passed in cases:
+            with self.subTest(distro=distro, rows=rows), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / 'preview').write_text(header + rows + footer, encoding='utf-8')
+                result = subprocess.run(['bash', '-c', self.functions() +
+                                         '\ncheck_native_remove_preview preview "$1" "$2" "$3"',
+                                         '_', version, identity, distro], cwd=directory,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
+    def test_native_identity_rejects_inexact_or_multiple_rpm_records(self):
+        provider = r"""
+rpm() { printf '%s' "$IDENTITY_OUT"; return "$RPM_EXIT"; }
+"""
+        cases = [('fedora', 'jq\tx86_64\n', 0, 0, 'jq.x86_64'),
+                 ('fedora', 'jq\tnoarch\n', 0, 0, 'jq.noarch'),
+                 ('arch', '', 0, 0, 'jq'), ('debian', '', 0, 0, 'jq'),
+                 ('ubuntu', '', 0, 0, 'jq'),
+                 ('fedora', '', 0, 1, ''),
+                 ('fedora', 'jq\tx86_64\njq\ti686\n', 0, 1, ''),
+                 ('fedora', 'bash\tx86_64\n', 0, 1, ''),
+                 ('fedora', 'jq\tx86_64 \n', 0, 1, ''),
+                 ('fedora', 'jq\tx86_64\n', 17, 17, '')]
+        for distro, output, native_exit, exit_code, expected in cases:
+            with self.subTest(distro=distro, output=output, native_exit=native_exit):
+                result = subprocess.run(['bash', '-c', provider + self.functions() +
+                                         '\nnative_installed_identity "$1" jq', '_', distro],
+                                        env=dict(os.environ, IDENTITY_OUT=output, RPM_EXIT=str(native_exit)),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_fedora_installed_version_retains_nonzero_epoch_and_rejects_bad_records(self):
+        provider = r"""
+rpm() {
+  case "$*" in
+    *EPOCHNUM*) printf '%s\t%s\t%s\n' "$EPOCH" "$VERSION" "$RELEASE" ;;
+    *) printf '%s-%s\n' "$VERSION" "$RELEASE" ;;
+  esac
+  return "$RPM_EXIT"
+}
+"""
+        cases = [('0', '5.3.9', '3.fc44', 0, 0, '5.3.9-3.fc44'),
+                 ('2', '5.3.9', '3.fc44', 0, 0, '2:5.3.9-3.fc44'),
+                 ('bad', '5.3.9', '3.fc44', 0, 1, ''),
+                 ('0', '', '3.fc44', 0, 1, ''),
+                 ('0', '5.3.9\n5.3.8', '3.fc44', 0, 1, ''),
+                 ('0', '5.3.9', '3.fc44', 17, 17, '')]
+        for epoch, version, release, native_exit, exit_code, expected in cases:
+            with self.subTest(epoch=epoch, version=version, native_exit=native_exit):
+                result = subprocess.run(['bash', '-c', provider + self.functions() +
+                                         '\nnative_installed_version fedora bash'],
+                                        env=dict(os.environ, EPOCH=epoch, VERSION=version,
+                                                 RELEASE=release, RPM_EXIT=str(native_exit)),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+
+
+@unittest.skipIf(os.name == 'nt', 'Row transport requires POSIX bash')
+class RowTransportContracts(unittest.TestCase):
+    @staticmethod
+    def receiver(size, digest):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        functions = source[source.index('# BEGIN ROW PROGRAM RECEIVER'):
+                           source.index('# END ROW PROGRAM RECEIVER')]
+        result = subprocess.run(['bash', '-c', functions + '\nrow_program_receiver "$1" "$2"',
+                                 '_', str(size), digest], capture_output=True, timeout=10)
+        return result
+
+    def execute(self, program, stream=None, *, digest=None):
+        receiver = self.receiver(len(program), digest or hashlib.sha256(program).hexdigest())
+        self.assertEqual(receiver.returncode, 0, receiver.stderr)
+        self.assertLess(len(receiver.stdout), 4096)
+        return subprocess.run(['bash', '-c', receiver.stdout.decode()],
+                              input=program if stream is None else stream,
+                              env=dict(os.environ, qemu_row_payload='inherited-export', LC_ALL='C.UTF-8'),
+                              capture_output=True, timeout=10)
+
+    def test_verified_long_program_keeps_bytes_eof_environment_and_exit_behavior(self):
+        body = '''set -eu
+test "$#" -eq 0
+test "$LC_ALL" = C.UTF-8
+! env | grep '^qemu_row_payload='
+if IFS= read -r input; then exit 73; fi
+printf 'unicode: →\\n'
+trap 'printf "exit-trap\\n"' EXIT
+'''
+        for size in (154274, 1048576):
+            program = body.encode() + b'#' + b'x' * (size - len(body.encode()) - 3) + b'\n\n'
+            with self.subTest(size=size):
+                result = self.execute(program)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, 'unicode: →\nexit-trap\n'.encode())
+        program = b'set -eu\ntrap \'printf "exit-trap\\n"\' EXIT\nfalse\nprintf forbidden\n\n'
+        result = self.execute(program)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, b'exit-trap\n')
+        result = self.execute(b'set -eu\ntrap \'printf "exit-trap\\n"\' EXIT\nexit 23\n\n')
+        self.assertEqual((result.returncode, result.stdout), (23, b'exit-trap\n'))
+
+    def test_unverified_or_oversized_stream_cannot_reach_the_program(self):
+        program = b'printf executed\n' + b'#' + b'x' * 140000 + b'\n\n'
+        for label, stream, digest in (
+            ('truncated', program[:-1], None), ('extra', program + b'\n', None),
+            ('wrong bytes', program.replace(b'executed', b'mutated!'), None),
+            ('wrong digest', program, '0' * 64), ('empty', b'', None),
+            ('embedded NUL', program[:20] + b'\0' + program[20:], None),
+            ('over limit', program + b'x' * 1048577, None),
+        ):
+            with self.subTest(label=label):
+                result = self.execute(program, stream, digest=digest)
+                self.assertEqual(result.returncode, 122, result.stderr)
+                self.assertEqual(result.stdout, b'')
+        for size, digest in ((0, '0' * 64), (1048577, '0' * 64),
+                             ('1; printf executed', '0' * 64), (1, 'invalid')):
+            with self.subTest(size=size, digest=digest):
+                result = self.receiver(size, digest)
+                self.assertEqual(result.returncode, 120, result.stderr)
+                self.assertEqual(result.stdout, b'')
 
 
 class OutputContracts(unittest.TestCase):
@@ -30,7 +207,7 @@ while :; do sleep .05; done
             product, [row], tiers='container', row_timeout=30,
             home_files={'qemu-run-watch-check.py':
                         (ROOT / 'scripts/qemu-run-watch-check.py').read_bytes()})
-        self.assertEqual(result.returncode, 0, logs)
+        self.assertEqual(result.returncode, 0, f'{result.stdout}\n{result.stderr}\n{logs}')
         self.assertEqual(evidence[0]['result'], 'PASS', logs)
 
     def test_golden_path_oracle_rejects_false_success_and_stale_state(self):
@@ -392,7 +569,7 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
         for row in rows:
             case = row.split('\t')[0]
             with self.subTest(case=case):
-                self.assertEqual(row.split('\t')[8], 'diff-missing-lock')
+                self.assertEqual(row.split('\t')[8], 'local:' + case)
                 for diagnostic, expected in (
                     ('unrelated failure', 'FAIL'),
                     ('Failed to inspect lockfile other.lock', 'FAIL'),
@@ -411,7 +588,11 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
                 if line.startswith(('workspace-init\t', 'workspace-add\t'))]
         self.assertEqual(len(rows), 2)
         self.assertEqual([row.split('\t')[8] for row in rows],
-                         ['workspace-initialized', 'workspace-project-added'])
+                         ['workspace-init-state', 'workspace-add-state'])
+        # Retain the historical metadata oracle's mutants as well as the full
+        # current workspace-state fixture exercised below.
+        rows = [row.replace('workspace-init-state', 'workspace-initialized')
+                   .replace('workspace-add-state', 'workspace-project-added') for row in rows]
         initialize = ('if [[ "$2" == init ]]; then\n'
                       '  printf \'name = "smoke"\\ncreated_at = "2026-09-27T00:00:00Z"\\n\' > omg-workspace.toml\n'
                       'fi\n')
@@ -437,7 +618,11 @@ chmod 755 "$OMG_QEMU_TEST_TREE_BINARY"
                                     'workspace-list\t', 'workspace-remove\t'))]
         self.assertEqual(len(rows), 4)
         self.assertEqual([row.split('\t')[8] for row in rows[-2:]],
-                         ['workspace-project-listed', 'workspace-project-removed'])
+                         ['workspace-list-state', 'workspace-remove-state'])
+        rows = [row.replace('workspace-init-state', 'workspace-initialized')
+                   .replace('workspace-add-state', 'workspace-project-added')
+                   .replace('workspace-list-state', 'workspace-project-listed')
+                   .replace('workspace-remove-state', 'workspace-project-removed') for row in rows]
         product = '''case "$2" in
   init) printf 'name = "smoke"\\ncreated_at = "2026-09-27T00:00:00Z"\\n' > omg-workspace.toml ;;
   add) printf '[projects.fixture]\\npath = "."\\n' >> omg-workspace.toml ;;
@@ -746,6 +931,598 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
         pin.unlink()
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_invalid_runtime_uninstall_reaches_runtime_dispatch(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('use-uninstall\t'))
+        product = '''if [[ "$*" == 'use --uninstall invalid-runtime 1.0.0' ]]; then
+echo "Error: Unsupported runtime 'invalid-runtime'" >&2
+else
+echo 'Error: --uninstall requires a version: omg use <runtime> <version> --uninstall' >&2
+fi
+exit 1
+'''
+        result, evidence, logs = self.run_inventory(product, [row])
+        self.assertEqual(evidence[0]['result'], 'PASS', f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    def test_local_audit_fixture_uses_published_v1_chain(self):
+        owner = runpy.run_path(str(ROOT / 'scripts/qemu-local-oracle.py'))
+        entries = owner['audit_entries']()
+        # Independent SHA-256 vectors for the published ff01 domain and nine
+        # u64-framed fields, including the empty metadata field. These bind the
+        # actual wire format without letting the fixture verify its own hashes.
+        hashes = [
+            'd3df81db57ea65ffc64aa04a6e8bb82a2c9e266d16d2cc1c0e6de686d381376c',
+            '817dd3e64749aebb815b77fc9a33b4e259973f623223f2ee0911824c59be5516',
+            'a3234184a2fab63e94b4ecd55fa3100d62db224f5e56812fb9dac2f5fe1b3b9f',
+            '5c2cbb9084fedafb5a0e794281c8611fdef6c4c55d0c9ee4ecaeacc85d938d6a',
+        ]
+        self.assertEqual(len(entries), len(hashes))
+        for index, (entry, digest) in enumerate(zip(entries, hashes)):
+            with self.subTest(index=index):
+                self.assertEqual(entry.get('hash_version'), 1)
+                self.assertEqual(entry['hash'], digest)
+                self.assertEqual(entry['prev_hash'], 'genesis' if index == 0 else hashes[index - 1])
+                self.assertNotIn('metadata', entry)
+                self.assertEqual(set(entry), {'id', 'timestamp', 'event_type', 'severity', 'user',
+                                             'resource', 'description', 'prev_hash', 'hash_version', 'hash'})
+
+    @staticmethod
+    def local_fixture_product():
+        source = (ROOT / 'src/cli/tool.rs').read_text()
+        start = source.index('const TOOL_REGISTRY:')
+        records = re.findall(r'\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,?\s*\)', source[start:source.index('];', start)])
+        return 'python3 - "$@" <<\'PY\'\nREGISTRY = ' + repr(records) + '\n' + r'''
+import datetime, hashlib, json, os, pathlib, pwd, subprocess, time, tomllib
+mutant = 'none'
+before = json.loads(pathlib.Path('.qemu-local-before.json').read_text())
+case = before['case']
+data, config, home = (pathlib.Path(os.environ[name]) for name in ('OMG_DATA_DIR','OMG_CONFIG_DIR','HOME'))
+def text(path): return pathlib.Path(path).read_text()
+def save(path, value): pathlib.Path(path).write_text(value)
+def golden(items):
+    lines=[]
+    for item in items:
+        lines += ['[[templates]]', 'name = '+json.dumps(item['name']), 'created_at = '+str(item['created_at']), 'packages = '+json.dumps(item['packages']), '[templates.runtimes]']
+        lines += [key+' = '+json.dumps(value) for key,value in item['runtimes'].items()]
+    save(config/'golden-paths.toml','\n'.join(lines)+'\n')
+missing_account='No dashboard account linked. Run `omg account link --token-stdin` to sync usage to the dashboard.'
+refusals={'diff':'Failed to inspect lockfile missing.lock','diff-from':'Failed to inspect lockfile missing.lock',
+    'audit-export':'Absolute paths not allowed','audit-export-flags':'Absolute paths not allowed',
+    'enterprise-audit-export':'Absolute paths not allowed','rollback':'No history entries available for rollback',
+    'rollback-yes':'No history entries available for rollback','env-export-missing-lock':'Failed to inspect lockfile omg.lock',
+    'account-link-stdin':'Dashboard token is empty','workspace-run':"1 project(s) failed to run 'true'",
+    'workspace-check':'1 project(s) need attention, 0 failed to check (of 1 total)',
+    'team-compliance-export':"No compliance data is available to export to '"+str(pathlib.Path.cwd()/'compliance.json')+"'; compliance evidence requires an evaluated report"}
+for name in ['team-members','team-activity','fleet-status','enterprise-reports','enterprise-reports-type','enterprise-policy-show','enterprise-policy-scope']: refusals[name]=missing_account
+if case == 'metrics':
+    print('Error: Daemon not running. Performance metrics require the daemon (start it with: omg daemon): Failed to connect to daemon at '+os.environ['OMG_SOCKET_PATH'],file=__import__('sys').stderr); raise SystemExit(1)
+if case in refusals:
+    if case == 'workspace-run': print("'omg run true' in '.' exited with code 1")
+    if case == 'workspace-check': print('→ fixture\n  ⚠ needs attention')
+    prefix='Failed to fetch team members for enterprise report: ' if case.startswith('enterprise-reports') else ''
+    print('Error: '+prefix+refusals[case],file=__import__('sys').stderr); raise SystemExit(1)
+if case == 'snapshot-list':
+    rows=json.loads(text(data/'snapshots/index.json'))['snapshots']
+    print('OMG Snapshots')
+    for item in reversed(rows): print(item['id'],datetime.datetime.fromtimestamp(item['created_at'],datetime.timezone.utc).strftime('%Y-%m-%d %H:%M'),item['hash'][:8],item['message'])
+    print(('99' if mutant=='count' else '2')+' snapshots total')
+elif case in ('list','list-available','which','hook-env'):
+    version='99.0.0' if mutant=='version' else '24.21.0'
+    if case=='which': print('node '+version)
+    elif case=='hook-env': print("export PATH='"+str(data/'versions/node'/version/'bin')+"':\"${_OMG_PATH_BASE:-$PATH}\"")
+    elif case=='list': print('OMG Installed runtime versions\n  • node 22.16.0\n  • node '+version+' (active)\n  • python 3.12.14 (active)')
+    else: print('OMG Installed runtime versions\n  • Node.js '+version+'\n  • Python 3.12.14')
+elif case=='hooks-status':
+    print('OMG Git Hooks Status\n  ● pre-commit - installed (unrecognized or modified)')
+    for name in ['post-checkout','post-merge']:
+        installed=pathlib.Path('.git/hooks',name).exists()
+        print(('  ● ' if installed else '  ○ ')+name+' - '+('installed (OMG)' if installed else 'not installed'))
+    print('Hooks directory:',pathlib.Path.cwd()/'.git/hooks')
+elif case=='hooks-run':
+    if mutant!='noop': subprocess.run(['.git/hooks/pre-commit'],check=True)
+    print('OMG Running pre-commit hook...\n✓ Hook completed successfully')
+elif case=='hook-uninstall':
+    rc=home/'.bashrc'
+    if mutant!='noop':
+        save(home/'.bashrc.omg-backup',text(rc));save(rc,'alias keep="echo preserved"\nexport KEEP_VALUE=42\n')
+    print('Shell integration removed (rc file backed up with .omg-backup)')
+elif case=='workspace-diff': print('OMG Comparing workspace environments vs main\n→ fixture\n  No omg.lock file')
+elif case=='config':
+    print('OMG Configuration\ntelemetry.enabled = false\naur.build_concurrency = '+('99' if mutant=='count' else '3')+'\naur.enable_ccache = false\nconfig_file = '+str(config/'config.toml')+'\ndata_dir = '+str(data))
+elif case=='privacy': print('OMG Privacy Settings\nTelemetry: '+('Enabled' if mutant=='count' else 'Disabled'))
+elif case=='account-status': print('OMG Dashboard account\nStatus: '+('Linked' if mutant=='count' else 'Not linked'))
+elif case=='account-unlink':
+    if mutant!='noop': (data/'license.json').unlink()
+    print('Dashboard account unlinked.\nLocal commands are unchanged.')
+elif case=='team-init':
+    member=pwd.getpwuid(os.getuid()).pw_name; now=int(time.time())
+    team={'team_id':'smoke/team','name':'Wrong Team' if mutant=='identity' else 'Smoke Team','member_id':member,'auto_push':False}
+    pathlib.Path('.omg').mkdir(exist_ok=True)
+    save('.omg/team.toml','\n'.join(key+' = '+('false' if value is False else json.dumps(value)) for key,value in team.items())+'\n')
+    status={'format_version':1,'config':dict(team,remote_url=None),'lock_hash':'','members':[{'id':member,'name':member,'env_hash':'','last_sync':now,'in_sync':True,'drift_summary':None}],'updated_at':now}
+    save('.omg/team-status.json',json.dumps(status))
+    for name in ['post-checkout','post-merge']:
+        path=pathlib.Path('.git/hooks')/name;save(path,'#!/bin/sh\n# OMG Team Sync Hook\nif [ -f omg.lock ]; then\n  \"'+os.environ['OMG_QEMU_EXECUTABLE']+'\" env check 2>/dev/null || true\nfi\n');path.chmod(0o755)
+    print('Team workspace initialized!\nTeam ID: smoke/team\nName: Smoke Team')
+elif case=='team-roles-list':
+    print('Team Roles\nAvailable roles\nadmin - Full access (push, policy, members)\nlead - Can push to team lock, manage policies\ndeveloper - Can pull, cannot push without approval\nreadonly - Can only view status')
+elif case.startswith('team-golden-'):
+    items=tomllib.loads(text(config/'golden-paths.toml'))['templates']
+    if case=='team-golden-list':
+        print('Golden Path Templates\n'+str(len(items))+' custom template(s)')
+        for item in items: print(item['name']+' - runtimes: '+json.dumps(list(item['runtimes']))+', packages: '+str(len(item['packages'])))
+    elif case=='team-golden-delete':
+        if mutant!='noop': golden([item for item in items if item['name']!='smoke'])
+        print("Deleted template 'smoke'")
+    else:
+        selected='flagged' if case.endswith('flags') else 'smoke'
+        item={'name':selected,'created_at':int(time.time()),'packages':['ripgrep'] if selected=='flagged' else [],'runtimes':{'node':'20','python':'3.12'} if selected=='flagged' else {}}
+        if mutant=='version': item['runtimes']['node']='99'
+        golden([value for value in items if value['name']!=selected]+[item]);print("Golden path '"+selected+"' created!")
+        if selected=='flagged': print('Node: 20\nPython: 3.12\nPackages: ripgrep')
+elif case.startswith('team-compliance'):
+    print('Compliance Status\nNo local data\nCompliance scoring is not computed locally; view evaluated results on the dashboard')
+    if case.endswith('enforce'): print('Enforcement mode requested, but no compliance evaluation engine exists locally; nothing can be enforced yet')
+elif case.startswith('tool-'):
+    if case=='tool-list':
+        print('OMG Installed Tools:')
+        for link in sorted((data/'bin').iterdir()):
+            if link.is_symlink(): print('  '+link.name+' points to -> '+os.readlink(link))
+    elif case=='tool-search':
+        print("Searching for 'rip'...\nFound "+('99' if mutant=='count' else '5')+" tools:")
+        for name,source,description,category in REGISTRY:
+            if any('rip' in value.lower() for value in (name,description,category)): print(name+' ['+category+'] via '+source.split(':')[0]+'\n'+description)
+    else:
+        print('OMG Tool Registry')
+        for category in sorted({item[3] for item in REGISTRY}):
+            rows=[item for item in REGISTRY if item[3]==category];print('  ['+category+'] ('+str(len(rows))+' tools)')
+            for name,source,description,_ in rows: print('    '+name+' ('+('wrong' if mutant=='manager' else source.split(':')[0])+') - '+description)
+        print('Total: 59 tools available')
+elif case.startswith('audit-'):
+    if case=='audit-policy': print('OMG Security Policy Status\nMinimum Grade: VERIFIED (PGP/Checksum)\nAUR Allowed: No\nPGP Required: '+('No' if mutant=='count' else 'Yes')+'\nBanned Packages: fixture-banned\nAllowed Licenses: MIT Apache-2.0')
+    elif case=='audit-verify': print('Local audit chain consistency verified\nTotal: '+('99' if mutant=='count' else '4')+' entries\nValid: 4 entries\nChain: Internally consistent; not authenticated\nThis check does not prove authenticity or completeness.\nLog Path: '+str(data/'audit/audit.jsonl'))
+    else:
+        entries=[json.loads(line) for line in text(data/'audit/audit.jsonl').splitlines()]
+        entries.reverse()
+        if case=='audit-log-flags':
+            selected=entries if mutant=='filter' else [entry for entry in entries if entry['severity'] in ('error','critical')][:3]
+            path=pathlib.Path('audit-log-export.json');save(path,json.dumps(selected));path.chmod(0o600);print('OMG Exporting audit log to '+str(pathlib.Path.cwd()/path)+'...\n✓ Export successful')
+        else:
+            entries=entries if mutant=='filter' else entries[:3]
+            print('OMG Security Audit Log')
+            for entry in entries: print(entry['timestamp']+' ['+entry['severity'].upper()+'] PackageInstall - '+entry['description']+'\nResource: '+entry['resource'])
+            print('Showing '+str(len(entries))+' of '+str(len(entries))+' entries')
+elif case.startswith('history'):
+    entries=list(reversed(json.loads(text(data/'history.json'))))
+    if case=='history-flags' and mutant!='filter': entries=[entry for entry in entries if entry['transaction_type']=='Install' and 'pacman' in entry['changes'][0]['name'] and entry['timestamp'].startswith('2025')]
+    print('OMG Transaction History ('+('filtered' if case=='history-flags' else 'last 3')+')')
+    for entry in entries[:3]:
+        print('✓ '+entry['timestamp']+' ['+entry['id'][:8]+'] - '+entry['transaction_type']+' (1 changes)')
+        for change in entry['changes']: print('→ '+change['name']+' '+change['old_version']+' → '+change['new_version'])
+elif case=='stats': print('OMG Usage Statistics\nTime Saved: 1.0min\nTotal Commands: '+('99' if mutant=='count' else '37')+'\nQueries Today: 3\nQueries This Month: 9\nMost Used Commands:\n→ search (21x)\n→ list (16x)')
+elif case=='init':
+    if mutant!='skipped':
+        packages=before['packages']; runtimes={'node':'24.21.0','python':'3.12.14'}
+        payload=''.join(name+':'+version+';' for name,version in sorted(runtimes.items()))+''.join(name+';' for name in packages)
+        save('omg.lock','schema_version = 1\npackages = '+json.dumps(packages)+'\ntimestamp = '+str(int(time.time()))+'\nhash = "'+hashlib.sha256(payload.encode()).hexdigest()+'"\n[runtimes]\nnode = "24.21.0"\npython = "3.12.14"\n')
+    print('OMG Setting up with defaults...\n→ Shell hook: skipped\n→ Daemon setup: skipped\n→ Capturing environment... '+('(skipped: unrelated permission denied)' if mutant=='skipped' else '✓')+'\n✓ Setup complete!')
+''' + '\nPY\n'
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_local_family_contracts_accept_matching_output_and_state(self):
+        rows = []
+        for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()[1:]:
+            fields = line.split('\t')
+            if fields[8] == 'local:' + fields[0]:
+                rows.append('\t'.join(fields))
+        self.assertEqual(len(rows), 52)
+        rows = self.rows_with_prerequisites(rows)
+        result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(), rows, native_commands={'pacman': 'printf "fixture-package\\n"\n'})
+        self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows),
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_local_family_contracts_reject_wrong_values_and_noop_mutations(self):
+        mutations = {'snapshot-list': 'count', 'list': 'version', 'list-available': 'version',
+                     'which': 'version', 'hook-env': 'version', 'hooks-run': 'noop',
+                     'hook-uninstall': 'noop', 'config': 'count', 'privacy': 'count',
+                     'account-status': 'count', 'account-unlink': 'noop', 'team-init': 'identity',
+                     'team-golden-delete': 'noop', 'team-golden-create-flags': 'version',
+                     'tool-search': 'count', 'tool-registry': 'manager', 'audit-policy': 'count',
+                     'audit-verify': 'count', 'audit-log': 'filter', 'audit-log-flags': 'filter',
+                     'history-flags': 'filter', 'stats': 'count', 'init': 'skipped'}
+        source_rows = {line.split('\t')[0]: line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()[1:]}
+        for case, mutant in mutations.items():
+            with self.subTest(case=case, mutant=mutant):
+                product = self.local_fixture_product().replace("case = before['case']", "case = before['case']\nmutant = " + repr(mutant) + ' if case == ' + repr(case) + " else 'none'")
+                rows = self.rows_with_prerequisites([source_rows[case]])
+                result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(product), rows, native_commands={'pacman': 'printf "fixture-package\\n"\n'})
+                self.assertEqual([item['result'] for item in evidence], ['PASS'] * (len(rows) - 1) + ['FAIL'], f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_local_review_counterexamples_are_rejected(self):
+        source_rows = {line.split('\t')[0]: line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()[1:]}
+        product = self.local_fixture_product()
+        comment_hooks = product + '''for name in post-checkout post-merge; do
+printf '#!/bin/sh\n# OMG Team Sync Hook\n# %s env check\nexit 0\n' "$OMG_QEMU_EXECUTABLE" > ".git/hooks/$name"
+done
+'''
+        wrong_date = product.replace("datetime.datetime.fromtimestamp(item['created_at'],datetime.timezone.utc).strftime('%Y-%m-%d %H:%M')", "'1900-01-01 00:00'")
+        for case, producer in [('team-init', comment_hooks), ('snapshot-list', wrong_date),
+                               ('audit-log', product.replace("mutant = 'none'", "mutant = 'filter'")),
+                               ('init', product.replace("mutant = 'none'", "mutant = 'skipped'"))]:
+            with self.subTest(case=case):
+                fields = source_rows[case].split('\t'); fields[5] = '-'
+                result, evidence, logs = self.run_inventory(producer, ['\t'.join(fields)], native_commands={'pacman': 'printf "fixture-package\\n"\n'})
+                self.assertEqual(evidence[0]['result'], 'FAIL', f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_flagged_golden_path_retains_declared_output_values(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('team-golden-create-flags\t'))
+        rows = self.rows_with_prerequisites([row])
+        valid = self.local_fixture_product()
+        for details, expected in (('Node: 20\nPython: 3.12\nPackages: ripgrep', 'PASS'),
+                                  ('', 'FAIL'),
+                                  ('Node: 99\nPython: 3.12\nPackages: ripgrep', 'FAIL')):
+            with self.subTest(details=details), mock.patch.dict(os.environ, {
+                    'remote': 'inherited-export', 'row_program': 'inherited-export'}):
+                product = valid.replace("print('Node: 20\\nPython: 3.12\\nPackages: ripgrep')", 'print(' + repr(details) + ')')
+                result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(product), rows)
+                self.assertEqual([item['result'] for item in evidence], ['PASS'] * (len(rows) - 1) + [expected],
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_additional_local_refusals_bind_the_cause_and_artifact_boundary(self):
+        ids = {'diff', 'diff-from', 'audit-export', 'audit-export-flags',
+               'rollback', 'rollback-yes', 'env-export-missing-lock', 'metrics'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        valid = '''case "$1" in
+diff) echo 'Error: Failed to inspect lockfile missing.lock' >&2 ;;
+audit) echo 'Error: Absolute paths not allowed' >&2 ;;
+rollback) echo 'Error: No history entries available for rollback' >&2 ;;
+env) echo 'Error: Failed to inspect lockfile omg.lock' >&2 ;;
+metrics) echo 'Error: Daemon not running. Performance metrics require the daemon (start it with: omg daemon)' >&2; echo "Failed to connect to daemon at $OMG_SOCKET_PATH" >&2 ;;
+esac
+exit 1
+'''
+        for product, expected, label in (
+            ('echo unrelated permission error >&2\nexit 1\n', 'FAIL', 'wrong cause'),
+            ('touch omg.lock\n' + valid, 'FAIL', 'created a forbidden lock'),
+            ('mkdir -p audit-evidence\n' + valid, 'FAIL', 'wrote an export directory'),
+            (valid, 'PASS', 'specific cause and preserved artifact boundary'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], [expected] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_remaining_local_families_reject_generic_success_and_refusal(self):
+        ids = {'snapshot-list','list','hooks-status','hooks-run','workspace-diff','hook-env','config','privacy','which',
+               'audit-log','audit-verify','audit-policy','tool-list','tool-search','tool-registry','team-init',
+               'team-roles-list','team-golden-create','team-golden-list','team-golden-delete','team-compliance',
+               'account-status','account-unlink','history','stats','init','list-available','hook-uninstall',
+               'audit-log-flags','team-golden-create-flags','team-compliance-enforce','history-flags',
+               'workspace-run','workspace-check','team-members','team-activity','account-link-stdin','fleet-status',
+               'enterprise-reports','enterprise-policy-show','enterprise-audit-export','team-compliance-export',
+               'enterprise-reports-type','enterprise-policy-scope'}
+        rows = []
+        for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()[1:]:
+            fields = line.split('\t')
+            if fields[0] in ids:
+                rows.append('\t'.join(fields))
+        self.assertEqual(len(rows), len(ids))
+        for row in rows:
+            case, _, _, expected_code = row.split('\t')[:4]
+            with self.subTest(case=case):
+                # Real dependency declarations stay intact. Only the selected
+                # command emits unrelated output; its parents use valid state.
+                product = ('case_id=$(python3 -c "import json;print(json.load(open(\'.qemu-local-before.json\'))[\'case\'])")\n'
+                           'if [[ "$case_id" == ' + shlex.quote(case) + ' ]]; then\n'
+                           'echo unrelated output\necho unrelated permission error >&2\nexit ' + expected_code + '\nfi\n'
+                           + self.local_fixture_product())
+                selected = self.rows_with_prerequisites([row])
+                result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(product), selected, native_commands={'pacman': 'printf "fixture-package\\n"\n'})
+                self.assertEqual([item['result'] for item in evidence], ['PASS'] * (len(selected) - 1) + ['FAIL'],
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @staticmethod
+    def rows_with_prerequisites(rows):
+        source = {line.split('\t')[0]: line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()[1:]}
+        selected = []
+        seen = set()
+        def append(row):
+            fields = row.split('\t')
+            if fields[0] in seen:
+                return
+            if fields[5] != '-':
+                for parent in fields[5].split(','):
+                    append(source[parent])
+            seen.add(fields[0])
+            selected.append(row)
+        for row in rows:
+            append(row)
+        return selected
+
+    def local_fixture_with_workspace(self, product=None):
+        hooks = 'if [[ "$1:$2" == hooks:install ]]; then\nmkdir -p .git/hooks\n'
+        for name, (content, _) in self.generated_hooks().items():
+            hooks += 'printf %s ' + shlex.quote(content) + ' > .git/hooks/' + shlex.quote(name) + '\n'
+        hooks += 'chmod 755 .git/hooks/pre-commit .git/hooks/post-checkout .git/hooks/post-merge\nexit 0\nfi\n'
+        return (hooks + 'if [[ "$1" == workspace && ( "$2" == init || "$2" == add ) ]]; then\n'
+                + self.workspace_fixture_product() + '\nexit $?\nfi\n'
+                + (product if product is not None else self.local_fixture_product()))
+
+    @staticmethod
+    def workspace_fixture_product():
+        return "python3 - \"$@\" <<'PY'\n" + r'''
+import datetime, json, pathlib, sys, tomllib
+args = sys.argv[1:]
+path = pathlib.Path('omg-workspace.toml')
+action = args[1]
+if action == 'init':
+    state = {'name': args[2], 'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'projects': {}}
+else:
+    state = tomllib.loads(path.read_text())
+if action == 'add':
+    state['projects'][args[4]] = {'path': args[2], 'depends_on': [], 'commands': {'build': 'make build', 'test': 'make test'}}
+elif action == 'remove':
+    del state['projects'][args[2]]
+if action in ('init', 'add', 'remove'):
+    lines = ['name = ' + json.dumps(state['name']), 'created_at = ' + json.dumps(state['created_at']), '[projects]']
+    for name, project in state['projects'].items():
+        lines += ['[projects.' + name + ']', 'path = ' + json.dumps(project['path']), 'depends_on = []', '[projects.' + name + '.commands]']
+        lines += [key + ' = ' + json.dumps(value) for key, value in project['commands'].items()]
+    path.write_text('\n'.join(lines) + '\n')
+if action == 'init':
+    print("OMG Initializing workspace 'smoke'\n✓ Created omg-workspace.toml")
+elif action == 'add':
+    print("✓ Added project '" + args[4] + "' (" + args[2] + ")")
+elif action == 'remove':
+    print("✓ Removed project 'fixture'")
+elif action == 'list':
+    print('OMG Workspace: smoke\n  1. fixture → .\n     commands: test, build')
+elif action == 'status':
+    print('OMG Workspace Status: smoke\n  Projects: 1 projects\n    ○ fixture - no omg.lock\n  ⚠ 0 healthy, 1 need attention')
+''' + '\nPY\n'
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_workspace_rows_require_persisted_fixture_state(self):
+        ids = {'workspace-init', 'workspace-add', 'workspace-list', 'workspace-status',
+               'workspace-remove', 'workspace-readd-after-remove', 'workspace-add-second'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        for product, valid, label in (
+            ('exit 0\n', False, 'silent no-op'),
+            ("printf 'OMG Workspace: smoke\\n  1. fixture → .\\n'\n", False, 'forged output'),
+            (self.workspace_fixture_product(), True, 'persisted state and matching output'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows)
+                if valid:
+                    self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows),
+                                     f'{result.stdout}\n{result.stderr}\n{logs}')
+                else:
+                    self.assertNotIn('PASS', [row['result'] for row in evidence],
+                                     f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if valid else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_workspace_rows_reject_wrong_state_and_display(self):
+        ids = {'workspace-init', 'workspace-add', 'workspace-list', 'workspace-status', 'workspace-remove'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        valid = self.workspace_fixture_product()
+        for label, original, replacement, failed in (
+            ('wrong project path', "'path': args[2]", "'path': 'elsewhere'", 'workspace-add'),
+            ('wrong detected command', "'test': 'make test'", "'test': 'ignored'", 'workspace-add'),
+            ('remove keeps project', "del state['projects'][args[2]]", 'pass', 'workspace-remove'),
+            ('list names missing project', '1. fixture → .', '1. imaginary → .', 'workspace-list'),
+            ('status claims healthy', '0 healthy, 1 need attention', '1 healthy, 0 need attention', 'workspace-status'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(valid.replace(original, replacement), rows)
+                by_id = {row['case_id'].removeprefix('qemu-arch-'): row for row in evidence}
+                self.assertEqual(by_id[failed]['result'], 'FAIL',
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_bash_completion_artifacts_must_complete_commands(self):
+        ids = {'completions', 'completions-install'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        completion = (ROOT / 'src/hooks/completions/bash.sh').read_text(encoding='utf-8')
+        for content, expected, label in (
+            ('', 'FAIL', 'empty artifact'),
+            ('# plausible completion file\ntrue\n', 'FAIL', 'valid shell with no completion'),
+            (completion.replace('search s install', 'unrelated s install'), 'FAIL', 'wrong command candidates'),
+            (completion, 'PASS', 'registered completion with real candidates'),
+        ):
+            product = ('if [[ "$*" == *--stdout* ]]; then printf %s ' + shlex.quote(content) + '; else\n'
+                       'mkdir -p "$HOME/.local/share/bash-completion/completions"\n'
+                       'printf %s ' + shlex.quote(content) + ' > "$HOME/.local/share/bash-completion/completions/omg"\n'
+                       'echo "Installed bash completions"\nfi\n')
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], [expected] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_man_generation_requires_command_documentation(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('generate-man\t'))
+        count = len((ROOT / 'tests/man_page_inventory.txt').read_text(encoding='utf-8').splitlines())
+        valid = '''mkdir -p "$3"
+while IFS= read -r file; do
+  page=${file%.1}
+  printf '.TH %s 1\n.SH NAME\n%s \\- command documentation\n.SH SYNOPSIS\n%s [options]\n.SH DESCRIPTION\nDocumented command\n' "$page" "$page" "$page" > "$3/$file"
+done
+''' .replace('done\n', 'done < "$HOME/man_page_inventory.txt"\n') + f"printf '✓ Generated {count} man pages\\n'\n"
+        for product, expected, label in (
+            ('exit 0\n', 'FAIL', 'no artifacts'),
+            (valid.replace('.SH SYNOPSIS', '.SH UNRELATED'), 'FAIL', 'not command reference pages'),
+            (valid + 'mv "$3/omg-workspace-init.1" "$3/unrelated-init.1"\n', 'FAIL', 'missing nested command'),
+            (valid.replace(f'Generated {count}', 'Generated 99'), 'FAIL', 'false page count'),
+            (valid, 'PASS', 'documented root and command pages'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_dynamic_completion_returns_the_requested_env_candidate(self):
+        ids = {'complete', 'complete-full'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        for output, expected in (('', 'FAIL'), ('check\n', 'FAIL'),
+                                 ('capture\ncapture\n', 'FAIL'), ('capture\n', 'PASS')):
+            with self.subTest(output=output):
+                product = 'printf %s ' + shlex.quote(output) + '\n'
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], [expected] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_ci_cache_returns_the_documented_paths_and_key(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('ci-cache\t'))
+        valid = ('OMG CI Cache Paths\n  ~/.local/share/omg/\n  ~/.local/share/omg/versions/\n'
+                 '  ~/.cargo/registry/\n  ~/.cargo/git/\n  ~/.npm/\n'
+                 "  omg-${{ runner.os }}-${{ hashFiles('omg.lock') }}\n")
+        for output, expected in (('', 'FAIL'), ('OMG CI Cache Paths\n', 'FAIL'),
+                                 (valid.replace('omg.lock', 'wrong.lock'), 'FAIL'), (valid, 'PASS')):
+            with self.subTest(output=output):
+                result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(output) + '\n', [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_bash_hook_preserves_prompt_array_and_sigint_behavior(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('hook\t'))
+        source = (ROOT / 'src/hooks/mod.rs').read_text(encoding='utf-8')
+        hook = re.search(r'const BASH_HOOK: &str = r#"(.*?)"#;', source, re.S).group(1)
+        for content, expected, label in (
+            ('', 'FAIL', 'no hook'),
+            ('# OMG Bash hook\ntrue\n', 'FAIL', 'plausible text'),
+            (hook.replace('eval "$previous_int_trap"', 'trap - SIGINT'), 'FAIL', 'lost SIGINT handler'),
+            (hook, 'PASS', 'registered and executed hook'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(content) + '\n', [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_container_init_requires_build_recipe_and_ignore_protection(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('container-init\t'))
+        ignore = ('!.env\n!secrets.key\n# added by omg container init\n.git\n.env\n.env.*\n'
+                  '!.env.example\n*.pem\n*.key\nid_rsa*\n.omg/\n')
+        dockerfile = ('FROM debian:bookworm\n'
+                      'RUN apt-get update && apt-get install -y \\\n    curl wget git build-essential ca-certificates \\\n    && rm -rf /var/lib/apt/lists/*\n'
+                      'WORKDIR /app\nCOPY . .\nCMD ["/bin/bash"]\n')
+        valid = ('printf %s ' + shlex.quote(dockerfile) + ' > Dockerfile.omg\n'
+                 'for file in .dockerignore Dockerfile.omg.dockerignore .containerignore; do\n'
+                 '  printf %s ' + shlex.quote(ignore) + ' > "$file"\ndone\n'
+                 "printf '  ✓ Created Dockerfile.omg\\nBase image: debian:bookworm\\n'\n")
+        for product, expected, label in (
+            ('exit 0\n', 'FAIL', 'no artifacts'),
+            (valid.replace('FROM debian:bookworm', 'FROM unrelated:latest'), 'FAIL', 'wrong requested base'),
+            (valid.replace('.env.*', '# omitted credential pattern'), 'FAIL', 'unprotected build context'),
+            (valid.replace('!secrets.key', '# lost custom rule'), 'FAIL', 'discarded existing ignore file'),
+            (valid, 'PASS', 'recipe and protected existing ignore files'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_local_refusals_require_the_specific_cause_and_preserve_fixtures(self):
+        ids = {'ci-validate', 'snapshot-restore', 'snapshot-restore-yes', 'snapshot-delete',
+               'use', 'use-uninstall', 'env-plan-missing-manifest'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        valid = '''case "$1" in
+ci) echo "Error: No omg.lock found; run 'omg env capture' before CI validation" >&2 ;;
+snapshot) echo "Error: Snapshot 'missing' not found" >&2 ;;
+use) echo "Error: Unsupported runtime 'invalid-runtime'" >&2 ;;
+env) echo "Error: Cannot read .omg.toml for environment planning" >&2 ;;
+esac
+exit 1
+'''
+        for product, expected, label in (
+            ('echo unrelated permission error >&2\nexit 1\n', 'FAIL', 'unrelated error'),
+            ('touch omg.lock\n' + valid, 'FAIL', 'creates forbidden lock'),
+            ('echo changed >> Makefile\n' + valid, 'FAIL', 'changes existing fixture'),
+            (valid, 'PASS', 'specific refusal without state changes'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], [expected] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_daemon_status_reports_the_isolated_missing_socket(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('daemon-status\t'))
+        valid = '''printf 'OMG Daemon Status\n  ✗ Daemon socket not found\n    Path: %s\n' "$OMG_SOCKET_PATH"
+'''
+        for product, expected, label in (
+            ('exit 0\n', 'FAIL', 'silent success'),
+            (valid.replace('Daemon socket not found', 'Daemon running'), 'FAIL', 'wrong socket state'),
+            (valid.replace('"$OMG_SOCKET_PATH"', 'unrelated.sock'), 'FAIL', 'wrong selected socket'),
+            ('touch "$OMG_SOCKET_PATH"\n' + valid, 'FAIL', 'claims absent socket after creating one'),
+            (valid, 'PASS', 'missing private socket identified'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_search_queries_require_an_official_firefox_result(self):
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ('search', 'search-quiet')]
+        self.assertEqual(len(rows), 2)
+        for output, expected in (
+            ('', 'FAIL'),
+            ('  | Search\n    firefox\n', 'FAIL'),
+            ('  | Search\n    firefox\n  unrelated 1.0  Official\n', 'FAIL'),
+            ('  | Search\n    firefox\n  firefox 130.0  AUR\n', 'FAIL'),
+            ('  | Search\n    firefox\n  firefox 130.0  Official\n', 'PASS'),
+        ):
+            with self.subTest(output=output):
+                product = 'printf %s ' + shlex.quote(output) + '\n'
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], [expected] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_run_requires_the_make_task_to_execute(self):
         row = next(line for line in
                    (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
@@ -853,32 +1630,41 @@ printf 'Inst tree [0.0.1] (2.0 local)\\n'
         row = next(line for line in
                    (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
                    if line.startswith('remove\t'))
-        native = {'rpm': 'case "$1" in\n'
-                         '  -qa) printf "bash\\t5.3-1\\n" ;;\n'
-                         '  -q) printf "5.3-1\\n" ;;\n'
-                         '  *) exit 2 ;;\n'
-                         'esac\n',
-                  'dnf': 'printf "bash\\tUser\\n"\n'}
-        preview = "printf '%s\\n' '  | Remove Preview' '    dry run' " \
+        native = {'rpm': r"""
+case "$1" in
+  -qa) printf 'jq.x86_64\t1.8.1-3.fc44\n' ;;
+  -q)
+    case "$*" in
+      *EPOCHNUM*) printf '0\t1.8.1\t3.fc44\n' ;;
+      *ARCH*) printf 'jq\tx86_64\n' ;;
+      *) printf '1.8.1-3.fc44\n' ;;
+    esac ;;
+  *) exit 2 ;;
+esac
+""", 'dnf': "printf 'jq\tUser\n'\n"}
+        preview = "[[ \"$1:$2:$3\" == remove:--dry-run:jq ]] || exit 70\n" \
+                  "printf '%s\n' '  | Remove Preview' '    dry run' " \
                   "'  → The following packages would be removed:' " \
-                  "'    ✗ bash 5.3-1' '  ℹ No changes made (dry run)'\n"
+                  "'    ✗ jq.x86_64 1.8.1-3.fc44' " \
+                  "'    ✗ oniguruma.x86_64 6.9.10-3.fc44' " \
+                  "'  ℹ No changes made (dry run)'\n"
         result, evidence, logs = self.run_inventory(preview, [row],
-                                                     distro='fedora', native_commands=native)
+                                                   distro='fedora', native_commands=native)
         self.assertEqual(evidence[0]['result'], 'PASS',
                          f'{result.stdout}\n{result.stderr}\n{logs}')
+        for changed in ('jq', 'jq.i686', 'jq.x86_64 0.0-1'):
+            mutated = preview.replace('jq.x86_64 1.8.1-3.fc44',
+                                      changed if ' ' in changed else changed + ' 1.8.1-3.fc44')
+            result, evidence, logs = self.run_inventory(mutated, [row],
+                                                       distro='fedora', native_commands=native)
+            self.assertEqual(evidence[0]['result'], 'FAIL',
+                             f'{result.stdout}\n{result.stderr}\n{logs}')
+            self.assertIn('lacks the exact native installed package identity/version', logs['remove.log'])
         result, evidence, logs = self.run_inventory(
-            preview.replace('bash 5.3-1', 'bash (feature-specific info unavailable)'),
+            preview.replace("'    ✗ jq.x86_64 1.8.1-3.fc44'",
+                            "'    ✗ jq.x86_64 1.8.1-3.fc44' '    ✗ jq.x86_64 1.8.1-3.fc44'"),
             [row], distro='fedora', native_commands=native)
-        self.assertEqual(evidence[0]['result'], 'FAIL',
-                         f'{result.stdout}\n{result.stderr}\n{logs}')
-        self.assertIn('lacks the native installed bash version', logs['remove.log'])
-        result, evidence, logs = self.run_inventory(
-            preview.replace('✗ bash 5.3-1', '✗ bash 0.0-1')
-            + "printf '%s\\n' 'unrelated bash 5.3-1 diagnostic'\n",
-            [row], distro='fedora', native_commands=native)
-        self.assertEqual(evidence[0]['result'], 'FAIL',
-                         f'{result.stdout}\n{result.stderr}\n{logs}')
-        self.assertIn('lacks the native installed bash version', logs['remove.log'])
+        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
 
     def test_recursive_remove_requires_the_backend_specific_refusal(self):
         for distro, explanation in (
@@ -2140,10 +2926,9 @@ exit 1
             ('printf fabricated > "$4"\n', 'FAIL'),
         ):
             with self.subTest(mutation=mutation):
-                product = '''[[ "$1" == team ]] || exit 70
-if [[ "$2" == init ]]; then exit 0; fi
-[[ "$2" == compliance && "$3" == --export ]] || exit 70
-''' + mutation
+                product = ('[[ "$1" == team ]] || exit 70\n'
+                           'if [[ "$2" == init ]]; then\n' + self.local_fixture_product() + '\nexit $?\nfi\n'
+                           '[[ "$2" == compliance && "$3" == --export ]] || exit 70\n') + mutation
                 if not mutation.startswith('printf "Error: unrelated'):
                     product += '''printf "Error: No compliance data is available to export to '%s'; compliance evidence requires an evaluated report\\n" "$4" >&2
 exit 1
@@ -2155,7 +2940,9 @@ exit 1
     def test_audit_log_export_rejects_unfiltered_stale_or_nonprivate_records(self):
         row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
                    if line.startswith('audit-log-flags\t'))
-        self.assertEqual(row.split('\t')[8], 'audit-log-filtered-export')
+        self.assertEqual(row.split('\t')[8], 'local:audit-log-flags')
+        # Exercise the retained richer historical six-record export contract.
+        row = row.replace('local:audit-log-flags', 'audit-log-filtered-export')
         product = '''[[ "$1:$2:$3:$4:$5:$6:$7" == audit:log:--limit:3:--severity:error:--export ]] || exit 70
 python3 - "$8" <<'PY'
 import json, pathlib, sys
@@ -2188,16 +2975,13 @@ printf 'OMG Exporting audit log to %s...\\n✓ Export successful\\n' "$8"
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
         prereqs = [line for line in inventory if line.startswith(('workspace-init\t', 'workspace-add\t'))]
         self.assertEqual(len(prereqs), 2)
-        setup = '''case "$2" in
-init) printf 'name = "smoke"\\ncreated_at = "2025-01-01"\\n[projects]\\n' > omg-workspace.toml; exit 0 ;;
-add) printf '[projects.fixture]\\npath = "."\\ndepends_on = []\\n' >> omg-workspace.toml; exit 0 ;;
-esac
-'''
+        setup = ('if [[ "$2" == init || "$2" == add ]]; then\n'
+                 + self.workspace_fixture_product() + '\nexit $?\nfi\n')
         products = {
             'workspace-run': '''printf "%s\\n" "→ Task 'true' not found, trying 'make true'..." "  ✗ 'omg run true' in '.' exited with code 1" '⚠ 0 succeeded, 1 failed'
 printf "%s\\n" "make: *** No rule to make target 'true'.  Stop." "Error: 1 project(s) failed to run 'true'" >&2
 ''',
-            'workspace-check': '''printf '  ⚠ needs attention\\n'
+            'workspace-check': '''printf '→ fixture\\n  ⚠ needs attention\\n'
 printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attention, 0 failed to check (of 1 total)' >&2
 ''',
         }
@@ -2216,7 +3000,212 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
                     self.assertEqual([item['result'] for item in evidence], ['PASS', 'PASS', expected], logs)
                     self.assertEqual(result.returncode, int(expected == 'FAIL'), logs)
 
-    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product'):
+
+    @unittest.skipIf(os.name == 'nt', 'Generated offline launch requires POSIX bash')
+    def test_offline_preview_launch_admits_only_the_exact_fedora_dry_run(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
+        launch = source[start:source.index('  # Bash SECONDS', start)]
+        defaults = dict(distro='fedora', case='remove', safety='read',
+                        assertions='package-dry-run-remove', expected_ux='pass',
+                        requires='-', tier='hermetic', targets='hermetic:pass',
+                        cleanup='tempdir-drop', network_scope='offline', ssh_user='fixture',
+                        args_json='["remove","--dry-run","jq"]')
+        variants = [('exact native preview', {}, '0:retained')]
+        for key, value in (
+            ('distro', 'arch'), ('distro', 'debian'), ('distro', 'ubuntu'), ('ssh_user', 'root'),
+            ('case', 'other'), ('safety', 'package-mutation'),
+            ('assertions', '-'), ('expected_ux', 'declared'), ('requires', 'help'),
+            ('tier', 'container'), ('targets', 'fedora:pass'), ('cleanup', 'container-prune'),
+            ('args_json', '["remove","jq"]'),
+            ('args_json', '["remove","--dry-run","--yes","jq"]'),
+            ('args_json', '["remove","--recursive","--dry-run","jq"]'),
+            ('args_json', '["remove","--dry-run","bash"]'),
+            ('args_json', '["remove","--dry-run","jq","other"]'),
+        ):
+            variants.append((key + '=' + value, {key: value}, '1:dropped'))
+        variants += [('wrong expected exit', {'resolved_exit': '1'}, '1:dropped'),
+                     ('prerequisite chain', {'chain_entry': 'help'}, '1:dropped'),
+                     ('network row unchanged', {'network_scope': 'network'}, 'unwrapped'),
+                     ('install row', {'case': 'install', 'assertions': 'package-dry-run-install',
+                                      'args_json': '["install","--dry-run","pacman"]'}, '1:dropped'),
+                     ('recursive removal row', {'case': 'remove-flags',
+                                               'assertions': 'package-dry-run-recursive'}, '1:dropped')]
+        wrappers = r"""
+sudo() { [[ "$1" == -n ]] || return 90; shift; "$@"; }
+unshare() { [[ "$1:$2" == --net:-- ]] || return 91; shift 2; "$@"; }
+setpriv() {
+  local nnp=0 bound=retained uid= gid= clear=0 inh=0 ambient=0
+  while [[ "$1" != env ]]; do
+    case "$1" in
+      --reuid=*) uid=${1#*=} ;; --regid=*) gid=${1#*=} ;;
+      --clear-groups) clear=1 ;; --no-new-privs) nnp=1 ;;
+      --bounding-set=-all) bound=dropped ;; --inh-caps=-all) inh=1 ;;
+      --ambient-caps=-all) ambient=1 ;; *) return 92 ;;
+    esac; shift
+  done
+  [[ "$uid" == "$(id -u)" && "$gid" == "$(id -g)" && "$uid" != 0 && "$clear:$inh:$ambient" == 1:1:1 ]] || return 93
+  export OMG_QEMU_TEST_LAUNCH="$nnp:$bound"
+  "$@"
+}
+export -f sudo unshare setpriv
+"""
+        for label, changes, expected in variants:
+            values = dict(defaults, **{k: v for k, v in changes.items()
+                                      if k not in {'resolved_exit', 'chain_entry'}})
+            assignments = '\n'.join(f'{key}={shlex.quote(value)}' for key, value in values.items())
+            chain = shlex.quote(changes['chain_entry']) if 'chain_entry' in changes else ''
+            setup = (assignments + '\ndeclare -A row_exit=([$case]='
+                     + shlex.quote(changes.get('resolved_exit', '0')) + ')\nchain=(' + chain + ')\n')
+            script = (wrappers + setup
+                      + 'remote=' + shlex.quote('bash -c ' + shlex.quote(
+                          'printf %s "${OMG_QEMU_TEST_LAUNCH:-unwrapped}"')) + '\n'
+                      + launch + '\nbash -c "$remote"\n')
+            with self.subTest(label=label):
+                result = subprocess.run(['bash', '-c', script], capture_output=True,
+                                        text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected, label)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX descriptors')
+    def test_fedora_preview_actual_runner_keeps_native_plan_and_setup_failures(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('remove\t'))
+        native = {'rpm': r"""
+case "$1" in
+  -qa) printf 'jq\t0\t1.8.1\t3.fc44\tx86_64\noniguruma\t0\t6.9.10\t3.fc44\tx86_64\n' ;;
+  -q) case "$*" in *EPOCHNUM*) printf '0\t1.8.1\t3.fc44\n' ;; *ARCH*) printf 'jq\tx86_64\n' ;; *) exit 2 ;; esac ;;
+  *) exit 2 ;;
+esac
+""", 'dnf': "printf 'jq x86_64 User\\noniguruma x86_64 Dependency\\n'\n",
+                  'sudo': '[[ "$1" == -n ]] || exit 90\nshift\nexec "$@"\n',
+                  'unshare': '[[ "$1:$2" == --net:-- ]] || exit 91\nshift 2\nexec "$@"\n',
+                  'setpriv': r"""
+export OMG_QEMU_TEST_NNP=0
+while [[ "$1" != env ]]; do
+  [[ "$1" != --no-new-privs ]] || export OMG_QEMU_TEST_NNP=1
+  shift
+done
+exec "$@"
+"""}
+        captured = ('sudo: The "no new privileges" flag is set, which prevents sudo from running as root.\n'
+                    'sudo: If sudo is running in a container, you may need to adjust the container configuration to disable the flag.\n')
+        preview = ("[[ \"$1:$2:$3\" == remove:--dry-run:jq ]] || exit 70\n"
+                   + 'if [[ "$OMG_QEMU_TEST_NNP" == 1 ]]; then printf %s '
+                   + shlex.quote(captured) + ' >&2; exit 1; fi\n'
+                   + "printf '%s\\n' '  | Remove Preview' '    dry run' "
+                   "'  → The following packages would be removed:' "
+                   "'    ✗ jq.x86_64 1.8.1-3.fc44' "
+                   "'    ✗ oniguruma.x86_64 6.9.10-3.fc44' '  ℹ No changes made (dry run)'\n")
+        result, evidence, logs = self.run_inventory(preview, [row], distro='fedora',
+                                                   native_commands=native, isolation_scope='offline')
+        self.assertEqual(result.returncode, 0, f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertEqual(evidence[0]['result'], 'PASS', logs)
+        self.assertIn('OMG_QEMU_RECEIPT:product:0:0', logs['remove.stdout.log'])
+        for label, product, commands, expected in (
+            ('native installed-state changed', 'touch native-state-changed\n' + preview,
+             dict(native, rpm=native['rpm'].replace('-qa) ', '-qa) [[ ! -e native-state-changed ]] || { echo changed; exit 0; }; ')), 'FAIL'),
+            ('native reasons changed', 'touch native-reason-changed\n' + preview,
+             dict(native, dnf='[[ ! -e native-reason-changed ]] || { echo changed; exit 0; }\n' + native['dnf']), 'FAIL'),
+            ('wrong canonical identity', preview.replace('✗ jq.x86_64', '✗ jq.i686'), native, 'FAIL'),
+            ('silent product', 'exit 0\n', native, 'FAIL'),
+            ('namespace setup failed', preview, dict(native, unshare='exit 73\n'), 'HARNESS_ERROR'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, [row], distro='fedora',
+                                                           native_commands=commands, isolation_scope='offline')
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                if expected == 'HARNESS_ERROR':
+                    self.assertNotIn('OMG_QEMU_RECEIPT:product:', logs['remove.stdout.log'])
+
+        for column, value in ((1, '["remove","jq"]'),
+                              (1, '["remove","--dry-run","--yes","jq"]'),
+                              (1, '["remove","--recursive","--dry-run","jq"]'),
+                              (1, '["remove","--dry-run","jq","other"]'),
+                              (2, 'package-mutation'), (3, '1'), (8, '-')):
+            fields = row.split('\t')
+            fields[column] = value
+            with self.subTest(label='invalid admission tuple', column=column, value=value):
+                result, evidence, logs = self.run_inventory(preview, ['\t'.join(fields)],
+                                                           distro='fedora', native_commands=native,
+                                                           isolation_scope='offline', allow_mutations=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(evidence, [], logs)
+                self.assertEqual(logs, {})
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX descriptors')
+    def test_rollback_refusals_bind_the_backend_and_preserve_absent_history(self):
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in {'rollback', 'rollback-yes'}]
+        self.assertEqual(len(rows), 2)
+        empty = 'Error: No history entries available for rollback\n'
+        fedora = 'Error: Package rollback is not implemented for the selected Fedora backend\n'
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            cause = fedora if distro == 'fedora' else empty
+            good = 'printf %s ' + shlex.quote(cause) + ' >&2\nexit 1\n'
+            with self.subTest(distro=distro):
+                result, evidence, logs = self.run_inventory(good, rows, distro=distro)
+                self.assertEqual(result.returncode, 0, logs)
+                self.assertEqual([item['result'] for item in evidence], ['PASS', 'PASS'], logs)
+        supported = 'printf %s ' + shlex.quote(empty) + ' >&2\nexit 1\n'
+        for label, product in (
+            ('supported stdout contamination', 'echo unrelated\n' + supported),
+            ('supported stderr preamble', 'echo unrelated >&2\n' + supported),
+            ('supported history created', 'printf "[]" > "$OMG_DATA_DIR/history.json"\n' + supported),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows, distro='arch')
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'], logs)
+        for distro in ('arch', 'debian', 'ubuntu'):
+            with self.subTest(label='wrong Fedora cause', distro=distro):
+                result, evidence, logs = self.run_inventory(good, rows, distro=distro)
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'], logs)
+        for label, product in (
+            ('wrong history cause', 'printf %s ' + shlex.quote(empty) + ' >&2\nexit 1\n'),
+            ('wrong backend cause', good.replace('Fedora backend', 'MacOS backend')),
+            ('generic sudo refusal', 'echo "sudo: a password is required" >&2\nexit 1\n'),
+            ('stdout contamination', 'echo unrelated\n' + good),
+            ('stderr preamble', 'echo unrelated >&2\n' + good),
+            ('incorrect success', good.replace('exit 1', 'exit 0')),
+            ('incorrect refusal exit', good.replace('exit 1', 'exit 2')),
+            ('created empty history', 'printf "[]" > "$OMG_DATA_DIR/history.json"\n' + good),
+            ('changed unrelated fixture', 'echo changed >> "$OMG_DATA_DIR/fixture-unrelated.txt"\n' + good),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows, distro='fedora')
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'], logs)
+
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX descriptors')
+    def test_stream_transport_keeps_product_eof_following_rows_and_setup_refusals(self):
+        rows = [case + '\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop'
+                for case in ('help-one', 'help-two')]
+        product = '''if IFS= read -r input; then echo "product consumed stdin" >&2; exit 73; fi
+[[ -z "${qemu_row_payload+x}" ]] || exit 74
+printf 'Usage: fixture\\n'
+'''
+        for label, prefix, suffix, expected in (
+            ('exact stream', '', '', 'PASS'),
+            ('truncated', '', 'head -c -1 | ', 'HARNESS_ERROR'),
+            ('extra bytes', '', '{ cat; printf extra; } | ', 'HARNESS_ERROR'),
+            ('NUL inserted', '', '{ printf "\\0"; cat; } | ', 'HARNESS_ERROR'),
+            ('setup failed', 'exit 73\n', '', 'HARNESS_ERROR'),
+        ):
+            ssh = prefix + 'export qemu_row_payload=inherited-export\n' + suffix + 'bash -c "${@: -1}"\n'
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows, ssh_body=ssh)
+                self.assertEqual(result.returncode, int(expected != 'PASS'), logs)
+                self.assertEqual([item['result'] for item in evidence], [expected, expected], logs)
+                if expected != 'PASS':
+                    self.assertFalse(any('OMG_QEMU_RECEIPT:product:' in value for value in logs.values()), logs)
+
+    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product', isolation_scope=None, ssh_body=None):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -2248,15 +3237,9 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
             binary.write_text('#!/bin/bash\n' + product, encoding='utf-8', newline='\n')
             binary.chmod(0o755)
             ssh = root / 'bin/ssh'
-            if fake_tree_binary:
-                ssh.write_text(
-                    '#!/usr/bin/env bash\n'
-                    'remote=${@: -1}\n'
-                    'remote=${remote//\\/usr\\/bin\\/tree/$OMG_QEMU_TEST_TREE_BINARY}\n'
-                    'exec bash -c "$remote"\n', encoding='utf-8', newline='\n')
-            else:
-                ssh.write_text('#!/usr/bin/env bash\nexec bash -c "${@: -1}"\n',
-                               encoding='utf-8', newline='\n')
+            ssh.write_text('#!/usr/bin/env bash\n' +
+                           (ssh_body or 'exec bash -c "${@: -1}"\n'),
+                           encoding='utf-8', newline='\n')
             ssh.chmod(0o755)
             inventory = root / 'cases.tsv'
             inventory.write_text(
@@ -2265,12 +3248,33 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
             env = dict(os.environ, HOME=shell_path(root / 'home'),
                        GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
                        PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
+            driver = ROOT / 'scripts/qemu-inventory.sh'
             if fake_tree_binary:
                 env['OMG_QEMU_TEST_TREE_BINARY'] = shell_path(root / 'home/tree-binary')
+                # Substitute the native path in a private controller copy,
+                # before its size/hash are computed. Keep the receiver exact;
+                # changing streamed bytes would rightly fail authentication.
+                fixture_scripts = root / 'scripts'
+                fixture_scripts.mkdir()
+                for helper in (ROOT / 'scripts').iterdir():
+                    if helper.is_file() and helper.name != driver.name:
+                        (fixture_scripts / helper.name).symlink_to(helper)
+                fixture_driver = fixture_scripts / driver.name
+                fixture_driver.write_text(driver.read_text(encoding='utf-8').replace(
+                    '/usr/bin/tree', shell_path(root / 'home/tree-binary')),
+                    encoding='utf-8', newline='\n')
+                driver = fixture_driver
             command = [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'),
-                       str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
+                       str(driver), '--work', str(root),
                        '--binary', shell_path(binary), '--tsv', str(inventory),
                        '--distro', distro, '--tiers', tiers, '--tag', 'fixture']
+            if isolation_scope is not None:
+                policy = root / 'network-policy.json'
+                policy.write_text(json.dumps({
+                    'inventory_sha256': hashlib.sha256(inventory.read_bytes()).hexdigest(),
+                    'scopes': {row.split('\t', 1)[0]: isolation_scope for row in rows},
+                }), encoding='utf-8')
+                command += ['--isolate-hermetic', '--network-policy', str(policy)]
             if exact_man:
                 command += ['--man-page-inventory',
                             shell_path(ROOT / 'tests/man_page_inventory.txt')]
@@ -2281,7 +3285,7 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
             result = subprocess.run(
                 command,
                 env=env, capture_output=True, text=True,
-                timeout=max(30, (row_timeout or 0) + 10))
+                timeout=max(120, (row_timeout or 0) + 10))
             evidence = root / 'inventory/results.json'
             self.assertTrue(evidence.exists(), result.stdout + result.stderr)
             return result, json.loads(evidence.read_text()), {

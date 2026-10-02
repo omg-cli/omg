@@ -61,9 +61,8 @@ fn dependency_plan(
     srcinfo: &SourceInfoV1,
     requested_outputs: &[String],
 ) -> Result<(Vec<String>, Vec<String>)> {
-    let Some(arch) = super::aur::utils::current_arch() else {
-        return Ok((Vec::new(), requested_outputs.to_vec()));
-    };
+    let arch = super::aur::utils::current_arch()
+        .context("Unsupported host architecture for AUR dependency resolution")?;
     let packages = srcinfo
         .packages_for_architecture(arch)
         .map(|package| (package.name.to_string(), package))
