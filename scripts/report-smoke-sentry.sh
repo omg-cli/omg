@@ -40,7 +40,8 @@ failures="$(jq -ce '
     ((.distro | IN("arch", "debian", "ubuntu", "fedora", "macos")) or
      (.distro == "matrix" and
       (.case_id | IN("qemu-matrix-workflow", "qemu-matrix-x86-workflow",
-                     "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow")))) and
+                     "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow",
+                     "ci-non-qemu-workflow")))) and
     (.result | IN("PASS", "SKIPPED", "EXPECTED_REJECTION", "PRODUCT_FAIL", "HARNESS_ERROR", "FAIL", "BLOCKED")) and
     (.exit_code | type == "number" and floor == . and . >= -1 and . <= 255) and
     (.elapsed_seconds | type == "number" and . >= 0 and . <= 86400))
