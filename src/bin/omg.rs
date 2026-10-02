@@ -1441,32 +1441,32 @@ async fn handle_migrate_command(command: &MigrateCommands) -> Result<()> {
     }
 }
 
+const fn command_supports_json(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Search { .. }
+            | Commands::Info { .. }
+            | Commands::Explicit { .. }
+            | Commands::ExplicitCount
+            | Commands::TotalCount
+            | Commands::OrphanCount
+            | Commands::UpdateCount
+            | Commands::List { .. }
+            | Commands::Status { .. }
+            | Commands::History { .. }
+            | Commands::Stats
+            | Commands::Outdated
+    )
+}
+
 /// Main command dispatcher - routes commands to appropriate handlers
 #[expect(clippy::too_many_lines)]
 async fn dispatch_command(command: &Commands, ctx: &omg_lib::cli::CliContext) -> Result<()> {
     // Global --json contract: reject unsupported combinations explicitly instead
-    // of silently emitting human-readable output (wave-5 F3). `privacy` is
-    // accepted because `privacy status` is the scripted JSON entrypoint.
-    if ctx.json
-        && !matches!(
-            command,
-            Commands::Search { .. }
-                | Commands::Info { .. }
-                | Commands::Explicit { .. }
-                | Commands::ExplicitCount
-                | Commands::TotalCount
-                | Commands::OrphanCount
-                | Commands::UpdateCount
-                | Commands::List { .. }
-                | Commands::Status { .. }
-                | Commands::History { .. }
-                | Commands::Stats
-                | Commands::Outdated
-                | Commands::Privacy { .. }
-        )
-    {
+    // of silently emitting human-readable output.
+    if ctx.json && !command_supports_json(command) {
         anyhow::bail!(
-            "--json is not supported for `{}`; supported: search, info, explicit, list, status, history, stats, outdated, privacy status",
+            "--json is not supported for `{}`; supported: search, info, explicit, list, status, history, stats, outdated",
             command_name(command)
         );
     }
@@ -2097,6 +2097,21 @@ mod fast_path_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn privacy_commands_cannot_advertise_unimplemented_json() {
+        use omg_lib::cli::PrivacyCommands;
+        for command in [
+            None,
+            Some(PrivacyCommands::Status),
+            Some(PrivacyCommands::OptOut),
+            Some(PrivacyCommands::OptIn),
+            Some(PrivacyCommands::Export { output: None }),
+        ] {
+            assert!(!super::command_supports_json(&super::Commands::Privacy {
+                command
+            }));
+        }
+    }
     #[test]
     fn update_flags_preserve_cached_execution() {
         use super::{UpdateExecution, update_execution};

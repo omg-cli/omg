@@ -91,6 +91,12 @@ omg remove --dry-run ripgrep
 omg remove ripgrep
 ```
 
+APT and DNF previews query the native removal solver and include dependent
+packages it would remove. The normal confirmation uses that complete package
+count. Other adapters report only the requested installed targets when they do
+not support simulation. The preview describes the package state at query time;
+the native transaction resolves its changes again when it runs.
+
 `omg remove --recursive ripgrep` also removes unused dependencies on the Arch backend. Other backends do not promise that behavior. The native package system decides whether a dependency conflict blocks removal.
 
 ## Inspect counts and clean up
