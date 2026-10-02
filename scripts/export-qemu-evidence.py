@@ -93,6 +93,9 @@ OSV_FILES.update(
     for phase in ("untrusted-tls", "direct-plain", "direct-findings", "daemon-plain", "daemon-findings", "daemon-before", "daemon-after")
     for stream in ("stdout", "stderr")
 )
+ARCH_ADVISORY_FILES = OSV_FILES | {
+    "native-feed.json", "native-nss-before.conf", "private-nss.conf", "dns-isolation.json",
+}
 BENCH_FILES = {
     "summary.json", "preflight.json", "os-release", "boot-id.txt", "cpuinfo.txt",
     "meminfo.txt", "kernel.txt", "binary-sha256.txt", "hyperfine-version.txt",
@@ -132,7 +135,7 @@ def allowed_directory(parts):
         return False
     rest = parts[1:]
     return rest in ((), ("guest",), ("guest", "evidence"),
-                    ("guest", "evidence", "benchmarks"), ("guest", "evidence", "osv"), ("inventory",),
+                    ("guest", "evidence", "benchmarks"), ("guest", "evidence", "osv"), ("guest", "evidence", "arch-advisory"), ("inventory",),
                     ("inventory", "rows"), ("transactions",), ("transactions", "trials")) or (
         len(rest) in (3, 4) and rest[:2] == ("transactions", "trials")
         and re.fullmatch(NAME, rest[2]) is not None
@@ -154,6 +157,8 @@ def allowed_file(parts):
         return name in GUEST_FILES
     if parent == ("guest", "evidence", "osv"):
         return name in OSV_FILES
+    if parent == ("guest", "evidence", "arch-advisory"):
+        return name in ARCH_ADVISORY_FILES
     if parent == ("inventory",):
         return name in {"results.json", "summary.json", "metadata.json", "input-sha256.txt"}
     if parent == ("inventory", "rows"):

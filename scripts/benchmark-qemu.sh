@@ -657,6 +657,9 @@ if [[ "$benchmark" == true ]]; then
   fi
   sha256sum "$work/benchmark-hyperfine.sh" "$work/record-benchmark-run.py" > "$work/benchmark-driver-sha256.txt"
 fi
+if [[ "$distro" == arch ]]; then
+  cp "$here/qemu-arch-advisory-check.sh" "$here/qemu-arch-advisory-oracle.py" "$work/"
+fi
 if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
   cp "$here/qemu-osv-check.sh" "$here/qemu-osv-positive-oracle.py" "$work/"
 fi
@@ -837,6 +840,9 @@ fi
 if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
   bash "$HOME/qemu-osv-check.sh" "$bin" "$daemon" "$digest" "$HOME/evidence"
 fi
+if [[ "$distro" == arch ]]; then
+  bash "$HOME/qemu-arch-advisory-check.sh" "$bin" "$daemon" "$digest" "$HOME/evidence"
+fi
 echo 'PASS: package lifecycle and native version parity'
 GUEST
 opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
@@ -848,6 +854,10 @@ timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
 if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
     /work/qemu-osv-check.sh /work/qemu-osv-positive-oracle.py bench@127.0.0.1:
+fi
+if [[ "$distro" == arch ]]; then
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
+    /work/qemu-arch-advisory-check.sh /work/qemu-arch-advisory-oracle.py bench@127.0.0.1:
 fi
 if [[ "$distro" == arch ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-aur-check.sh /work/qemu-aur-fixture.py bench@127.0.0.1:
@@ -928,6 +938,13 @@ if [[ "$rc" == 0 && ( "$distro" == debian || "$distro" == ubuntu ) ]]; then
   if ! python3 "$here/qemu-osv-evidence.py" --evidence-dir "$work/guest/evidence/osv" \
     --archive "$work/release/$archive" --distro "$distro"; then
     printf 'Missing or incomplete archive-bound positive OSV evidence\n' >&2
+    exit 1
+  fi
+fi
+if [[ "$rc" == 0 && "$distro" == arch ]]; then
+  if ! python3 "$here/qemu-arch-advisory-evidence.py" --evidence-dir "$work/guest/evidence/arch-advisory" \
+    --archive "$work/release/$archive"; then
+    printf 'Missing or incomplete archive-bound positive native Arch advisory evidence\n' >&2
     exit 1
   fi
 fi
