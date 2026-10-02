@@ -5,6 +5,11 @@
       "hermetic",
       "container"
     ],
+    "hermetic,container,network": [
+      "hermetic",
+      "container",
+      "network"
+    ],
     "hermetic,qemu,container,network,pty": [
       "hermetic",
       "qemu",
