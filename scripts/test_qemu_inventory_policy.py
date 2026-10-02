@@ -26,6 +26,14 @@ SPEC.loader.exec_module(POLICY)
 
 
 class PolicyTests(unittest.TestCase):
+    def test_native_orphan_cleanup_executes_on_fedora(self):
+        with (ROOT / 'tests/cli_behavior_inventory.tsv').open(newline='') as source:
+            rows = {row['case']: row for row in csv.DictReader(source, delimiter='\t')}
+        row = rows['clean-orphans-native']
+        self.assertEqual(json.loads(row['args_json']), ['clean', '--orphans', '--yes'])
+        self.assertIn('fedora:pass', row['targets'].split(','))
+        self.assertEqual(row['assertions'], 'native-orphan-removed')
+
     def test_golden_path_chain_requires_semantic_state_oracles(self):
         with (ROOT / 'tests/cli_behavior_inventory.tsv').open(newline='') as source:
             rows = {row['case']: row for row in csv.DictReader(source, delimiter='\t')}

@@ -417,10 +417,8 @@ async fn handle_fedora_clean(
         return Ok(());
     }
     // No top-level prompt here: DnfPackageManager::cleanup owns the y/n
-    // contract, proven by fedora_tests (decline exit 1 + history, accept
-    // removes, empty stdin succeeds). A second prompt would double-consume
-    // piped answers. `--yes` remains accepted for forward uniformity.
-    let _ = yes;
+    // contract. A second prompt would double-consume piped answers; forward
+    // explicit confirmation to the native transaction instead.
     if orphans || all {
         if dry_run {
             let packages = DnfPackageManager::orphan_packages().await?;
@@ -430,7 +428,9 @@ async fn handle_fedora_clean(
             }
         } else {
             let history = crate::core::history::HistoryManager::new()?;
-            manager.cleanup(DnfCleanup::Orphans, Some(&history)).await?;
+            manager
+                .cleanup(DnfCleanup::Orphans { yes }, Some(&history))
+                .await?;
         }
     }
     if cache || all {

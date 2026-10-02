@@ -246,7 +246,7 @@ enum NativeOutcome {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DnfCleanup {
-    Orphans,
+    Orphans { yes: bool },
     PackageCache,
 }
 
@@ -1372,10 +1372,14 @@ impl DnfPackageManager {
         history: Option<&crate::core::history::HistoryManager>,
     ) -> Result<()> {
         match operation {
-            DnfCleanup::Orphans => {
+            DnfCleanup::Orphans { yes } => {
+                let mut arguments = vec!["autoremove".to_owned()];
+                if yes {
+                    arguments.push("--assumeyes".to_owned());
+                }
                 self.recorded_mutation(
                     crate::core::history::TransactionType::Remove,
-                    vec!["autoremove".to_owned()],
+                    arguments,
                     history,
                 )
                 .await
