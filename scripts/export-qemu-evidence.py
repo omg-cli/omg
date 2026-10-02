@@ -84,6 +84,15 @@ GUEST_FILES.update(
                    "-after-queries.txt", "-explicit.json", "-count.txt",
                    "-shortcut.txt", "-count.json")
 )
+OSV_FILES = {
+    "receipt.json", "native-query.tsv", "os-release", "fixture-events.json", "daemon.log",
+    "parent-system-before.sha256", "parent-system-after.sha256", "worker.log",
+}
+OSV_FILES.update(
+    phase + "." + stream
+    for phase in ("untrusted-tls", "direct-plain", "direct-findings", "daemon-plain", "daemon-findings", "daemon-before", "daemon-after")
+    for stream in ("stdout", "stderr")
+)
 BENCH_FILES = {
     "summary.json", "preflight.json", "os-release", "boot-id.txt", "cpuinfo.txt",
     "meminfo.txt", "kernel.txt", "binary-sha256.txt", "hyperfine-version.txt",
@@ -123,7 +132,7 @@ def allowed_directory(parts):
         return False
     rest = parts[1:]
     return rest in ((), ("guest",), ("guest", "evidence"),
-                    ("guest", "evidence", "benchmarks"), ("inventory",),
+                    ("guest", "evidence", "benchmarks"), ("guest", "evidence", "osv"), ("inventory",),
                     ("inventory", "rows"), ("transactions",), ("transactions", "trials")) or (
         len(rest) in (3, 4) and rest[:2] == ("transactions", "trials")
         and re.fullmatch(NAME, rest[2]) is not None
@@ -143,6 +152,8 @@ def allowed_file(parts):
         return name == "serial.log"
     if parent == ("guest", "evidence"):
         return name in GUEST_FILES
+    if parent == ("guest", "evidence", "osv"):
+        return name in OSV_FILES
     if parent == ("inventory",):
         return name in {"results.json", "summary.json", "metadata.json", "input-sha256.txt"}
     if parent == ("inventory", "rows"):

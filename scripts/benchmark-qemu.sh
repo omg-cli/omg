@@ -657,6 +657,9 @@ if [[ "$benchmark" == true ]]; then
   fi
   sha256sum "$work/benchmark-hyperfine.sh" "$work/record-benchmark-run.py" > "$work/benchmark-driver-sha256.txt"
 fi
+if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+  cp "$here/qemu-osv-check.sh" "$here/qemu-osv-positive-oracle.py" "$work/"
+fi
 cp "$here/qemu-daemon-check.sh" "$work/qemu-daemon-check.sh"
 cp "$here/qemu-aur-check.sh" "$here/qemu-aur-fixture.py" "$work/"
 cp "$here/qemu-doctor-connectivity-check.sh" "$here/qemu-doctor-connectivity-fixture.py" "$work/"
@@ -831,6 +834,9 @@ if [[ -n "$inventory_tiers" ]]; then
     if command -v docker >> evidence/container-engine.txt || command -v podman >> evidence/container-engine.txt; then exit 120; fi
   fi
 fi
+if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+  bash "$HOME/qemu-osv-check.sh" "$bin" "$daemon" "$digest" "$HOME/evidence"
+fi
 echo 'PASS: package lifecycle and native version parity'
 GUEST
 opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
@@ -839,6 +845,10 @@ timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /wo
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
   /work/qemu-doctor-connectivity-check.sh /work/qemu-doctor-connectivity-fixture.py bench@127.0.0.1:
+if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
+    /work/qemu-osv-check.sh /work/qemu-osv-positive-oracle.py bench@127.0.0.1:
+fi
 if [[ "$distro" == arch ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-aur-check.sh /work/qemu-aur-fixture.py bench@127.0.0.1:
 fi
@@ -912,6 +922,13 @@ if [[ "$rc" == 0 ]]; then
       printf 'Missing or incomplete Arch AUR flag evidence\n' >&2
       exit 1
     fi
+  fi
+fi
+if [[ "$rc" == 0 && ( "$distro" == debian || "$distro" == ubuntu ) ]]; then
+  if ! python3 "$here/qemu-osv-evidence.py" --evidence-dir "$work/guest/evidence/osv" \
+    --archive "$work/release/$archive" --distro "$distro"; then
+    printf 'Missing or incomplete archive-bound positive OSV evidence\n' >&2
+    exit 1
   fi
 fi
 if [[ "$benchmark" == true && "$rc" == 0 ]]; then
