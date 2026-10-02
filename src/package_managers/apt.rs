@@ -437,25 +437,45 @@ fn candidate_packages_for_names(matches: Vec<Package>) -> Result<Vec<Package>> {
 /// so its dependencies and sizes must not be paired with a native candidate.
 pub(crate) fn candidate_index_packages() -> Result<Vec<PackageInfo>> {
     let (_apt_guard, cache) = open_cache(&[])?;
-    let packages: Vec<_> = cache
+    let mut selected: Vec<_> = cache
         .packages(&PackageSort::default())
-        .filter_map(|pkg| {
+        .enumerate()
+        .filter_map(|(ordinal, pkg)| {
             let version = pkg.candidate().or_else(|| pkg.installed())?;
-            Some(PackageInfo {
-                name: pkg.name().to_string(),
-                version: parse_version_or_zero(version.version()),
-                description: selected_summary(&version),
-                url: None,
-                size: version.size(),
-                install_size: Some(i64::try_from(version.installed_size()).unwrap_or(i64::MAX)),
-                download_size: Some(version.size()),
-                repo: "apt".to_string(),
-                depends: collect_depends(&version),
-                licenses: Vec::new(),
-                installed: pkg.is_installed(),
-            })
+            let location = version
+                .version_files()
+                .next()
+                .map(|file| file.record_location());
+            Some((location, ordinal, pkg, version))
         })
         .collect();
+    // APT restarts compressed-file decoding on a backwards seek. Reading the
+    // already selected versions in file order keeps the full catalogue cheap.
+    selected.sort_by_key(|(location, ..)| *location);
+    let mut packages: Vec<_> = selected
+        .into_iter()
+        .map(|(_, ordinal, pkg, version)| {
+            (
+                ordinal,
+                PackageInfo {
+                    name: pkg.name().to_string(),
+                    version: parse_version_or_zero(version.version()),
+                    description: selected_summary(&version),
+                    url: None,
+                    size: version.size(),
+                    install_size: Some(i64::try_from(version.installed_size()).unwrap_or(i64::MAX)),
+                    download_size: Some(version.size()),
+                    repo: "apt".to_string(),
+                    depends: collect_depends(&version),
+                    licenses: Vec::new(),
+                    installed: pkg.is_installed(),
+                },
+            )
+        })
+        .collect();
+    // Preserve the original native iteration order used by index tie breakers.
+    packages.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+    let packages: Vec<_> = packages.into_iter().map(|(_, package)| package).collect();
     anyhow::ensure!(!packages.is_empty(), "APT candidate catalog is empty");
     Ok(packages)
 }
