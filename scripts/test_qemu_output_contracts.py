@@ -1,5 +1,6 @@
 """Exercise the exact guest output oracle with plausible false-green products."""
 import os
+import hashlib
 import json
 import re
 import runpy
@@ -2933,7 +2934,188 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
                     self.assertEqual([item['result'] for item in evidence], ['PASS', 'PASS', expected], logs)
                     self.assertEqual(result.returncode, int(expected == 'FAIL'), logs)
 
-    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product'):
+
+    @unittest.skipIf(os.name == 'nt', 'Generated offline launch requires POSIX bash')
+    def test_offline_preview_launch_admits_only_the_exact_fedora_dry_run(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
+        launch = source[start:source.index('  # Bash SECONDS', start)]
+        defaults = dict(distro='fedora', case='remove', safety='read',
+                        assertions='package-dry-run-remove', expected_ux='pass',
+                        requires='-', tier='hermetic', targets='hermetic:pass',
+                        cleanup='tempdir-drop', network_scope='offline', ssh_user='fixture',
+                        args_json='["remove","--dry-run","jq"]')
+        variants = [('exact native preview', {}, '0:retained')]
+        for key, value in (
+            ('distro', 'arch'), ('distro', 'debian'), ('distro', 'ubuntu'), ('ssh_user', 'root'),
+            ('case', 'other'), ('safety', 'package-mutation'),
+            ('assertions', '-'), ('expected_ux', 'declared'), ('requires', 'help'),
+            ('tier', 'container'), ('targets', 'fedora:pass'), ('cleanup', 'container-prune'),
+            ('args_json', '["remove","jq"]'),
+            ('args_json', '["remove","--dry-run","--yes","jq"]'),
+            ('args_json', '["remove","--recursive","--dry-run","jq"]'),
+            ('args_json', '["remove","--dry-run","bash"]'),
+            ('args_json', '["remove","--dry-run","jq","other"]'),
+        ):
+            variants.append((key + '=' + value, {key: value}, '1:dropped'))
+        variants += [('wrong expected exit', {'resolved_exit': '1'}, '1:dropped'),
+                     ('prerequisite chain', {'chain_entry': 'help'}, '1:dropped'),
+                     ('network row unchanged', {'network_scope': 'network'}, 'unwrapped'),
+                     ('install row', {'case': 'install', 'assertions': 'package-dry-run-install',
+                                      'args_json': '["install","--dry-run","pacman"]'}, '1:dropped'),
+                     ('recursive removal row', {'case': 'remove-flags',
+                                               'assertions': 'package-dry-run-recursive'}, '1:dropped')]
+        wrappers = r"""
+sudo() { [[ "$1" == -n ]] || return 90; shift; "$@"; }
+unshare() { [[ "$1:$2" == --net:-- ]] || return 91; shift 2; "$@"; }
+setpriv() {
+  local nnp=0 bound=retained uid= gid= clear=0 inh=0 ambient=0
+  while [[ "$1" != env ]]; do
+    case "$1" in
+      --reuid=*) uid=${1#*=} ;; --regid=*) gid=${1#*=} ;;
+      --clear-groups) clear=1 ;; --no-new-privs) nnp=1 ;;
+      --bounding-set=-all) bound=dropped ;; --inh-caps=-all) inh=1 ;;
+      --ambient-caps=-all) ambient=1 ;; *) return 92 ;;
+    esac; shift
+  done
+  [[ "$uid" == "$(id -u)" && "$gid" == "$(id -g)" && "$uid" != 0 && "$clear:$inh:$ambient" == 1:1:1 ]] || return 93
+  export OMG_QEMU_TEST_LAUNCH="$nnp:$bound"
+  "$@"
+}
+export -f sudo unshare setpriv
+"""
+        for label, changes, expected in variants:
+            values = dict(defaults, **{k: v for k, v in changes.items()
+                                      if k not in {'resolved_exit', 'chain_entry'}})
+            assignments = '\n'.join(f'{key}={shlex.quote(value)}' for key, value in values.items())
+            chain = shlex.quote(changes['chain_entry']) if 'chain_entry' in changes else ''
+            setup = (assignments + '\ndeclare -A row_exit=([$case]='
+                     + shlex.quote(changes.get('resolved_exit', '0')) + ')\nchain=(' + chain + ')\n')
+            script = (wrappers + setup
+                      + 'remote=' + shlex.quote('bash -c ' + shlex.quote(
+                          'printf %s "${OMG_QEMU_TEST_LAUNCH:-unwrapped}"')) + '\n'
+                      + launch + '\nbash -c "$remote"\n')
+            with self.subTest(label=label):
+                result = subprocess.run(['bash', '-c', script], capture_output=True,
+                                        text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected, label)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX descriptors')
+    def test_fedora_preview_actual_runner_keeps_native_plan_and_setup_failures(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('remove\t'))
+        native = {'rpm': r"""
+case "$1" in
+  -qa) printf 'jq\t0\t1.8.1\t3.fc44\tx86_64\noniguruma\t0\t6.9.10\t3.fc44\tx86_64\n' ;;
+  -q) case "$*" in *EPOCHNUM*) printf '0\t1.8.1\t3.fc44\n' ;; *ARCH*) printf 'jq\tx86_64\n' ;; *) exit 2 ;; esac ;;
+  *) exit 2 ;;
+esac
+""", 'dnf': "printf 'jq x86_64 User\\noniguruma x86_64 Dependency\\n'\n",
+                  'sudo': '[[ "$1" == -n ]] || exit 90\nshift\nexec "$@"\n',
+                  'unshare': '[[ "$1:$2" == --net:-- ]] || exit 91\nshift 2\nexec "$@"\n',
+                  'setpriv': r"""
+export OMG_QEMU_TEST_NNP=0
+while [[ "$1" != env ]]; do
+  [[ "$1" != --no-new-privs ]] || export OMG_QEMU_TEST_NNP=1
+  shift
+done
+exec "$@"
+"""}
+        captured = ('sudo: The "no new privileges" flag is set, which prevents sudo from running as root.\n'
+                    'sudo: If sudo is running in a container, you may need to adjust the container configuration to disable the flag.\n')
+        preview = ("[[ \"$1:$2:$3\" == remove:--dry-run:jq ]] || exit 70\n"
+                   + 'if [[ "$OMG_QEMU_TEST_NNP" == 1 ]]; then printf %s '
+                   + shlex.quote(captured) + ' >&2; exit 1; fi\n'
+                   + "printf '%s\\n' '  | Remove Preview' '    dry run' "
+                   "'  → The following packages would be removed:' "
+                   "'    ✗ jq.x86_64 1.8.1-3.fc44' "
+                   "'    ✗ oniguruma.x86_64 6.9.10-3.fc44' '  ℹ No changes made (dry run)'\n")
+        result, evidence, logs = self.run_inventory(preview, [row], distro='fedora',
+                                                   native_commands=native, isolation_scope='offline')
+        self.assertEqual(result.returncode, 0, f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertEqual(evidence[0]['result'], 'PASS', logs)
+        self.assertIn('OMG_QEMU_RECEIPT:product:0:0', logs['remove.stdout.log'])
+        for label, product, commands, expected in (
+            ('native installed-state changed', 'touch native-state-changed\n' + preview,
+             dict(native, rpm=native['rpm'].replace('-qa) ', '-qa) [[ ! -e native-state-changed ]] || { echo changed; exit 0; }; ')), 'FAIL'),
+            ('native reasons changed', 'touch native-reason-changed\n' + preview,
+             dict(native, dnf='[[ ! -e native-reason-changed ]] || { echo changed; exit 0; }\n' + native['dnf']), 'FAIL'),
+            ('wrong canonical identity', preview.replace('✗ jq.x86_64', '✗ jq.i686'), native, 'FAIL'),
+            ('silent product', 'exit 0\n', native, 'FAIL'),
+            ('namespace setup failed', preview, dict(native, unshare='exit 73\n'), 'HARNESS_ERROR'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, [row], distro='fedora',
+                                                           native_commands=commands, isolation_scope='offline')
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                if expected == 'HARNESS_ERROR':
+                    self.assertNotIn('OMG_QEMU_RECEIPT:product:', logs['remove.stdout.log'])
+
+        for column, value in ((1, '["remove","jq"]'),
+                              (1, '["remove","--dry-run","--yes","jq"]'),
+                              (1, '["remove","--recursive","--dry-run","jq"]'),
+                              (1, '["remove","--dry-run","jq","other"]'),
+                              (2, 'package-mutation'), (3, '1'), (8, '-')):
+            fields = row.split('\t')
+            fields[column] = value
+            with self.subTest(label='invalid admission tuple', column=column, value=value):
+                result, evidence, logs = self.run_inventory(preview, ['\t'.join(fields)],
+                                                           distro='fedora', native_commands=native,
+                                                           isolation_scope='offline', allow_mutations=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(evidence, [], logs)
+                self.assertEqual(logs, {})
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX descriptors')
+    def test_rollback_refusals_bind_the_backend_and_preserve_absent_history(self):
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in {'rollback', 'rollback-yes'}]
+        self.assertEqual(len(rows), 2)
+        empty = 'Error: No history entries available for rollback\n'
+        fedora = 'Error: Package rollback is not implemented for the selected Fedora backend\n'
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            cause = fedora if distro == 'fedora' else empty
+            good = 'printf %s ' + shlex.quote(cause) + ' >&2\nexit 1\n'
+            with self.subTest(distro=distro):
+                result, evidence, logs = self.run_inventory(good, rows, distro=distro)
+                self.assertEqual(result.returncode, 0, logs)
+                self.assertEqual([item['result'] for item in evidence], ['PASS', 'PASS'], logs)
+        supported = 'printf %s ' + shlex.quote(empty) + ' >&2\nexit 1\n'
+        for label, product in (
+            ('supported stdout contamination', 'echo unrelated\n' + supported),
+            ('supported stderr preamble', 'echo unrelated >&2\n' + supported),
+            ('supported history created', 'printf "[]" > "$OMG_DATA_DIR/history.json"\n' + supported),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows, distro='arch')
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'], logs)
+        for distro in ('arch', 'debian', 'ubuntu'):
+            with self.subTest(label='wrong Fedora cause', distro=distro):
+                result, evidence, logs = self.run_inventory(good, rows, distro=distro)
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'], logs)
+        for label, product in (
+            ('wrong history cause', 'printf %s ' + shlex.quote(empty) + ' >&2\nexit 1\n'),
+            ('wrong backend cause', good.replace('Fedora backend', 'MacOS backend')),
+            ('generic sudo refusal', 'echo "sudo: a password is required" >&2\nexit 1\n'),
+            ('stdout contamination', 'echo unrelated\n' + good),
+            ('stderr preamble', 'echo unrelated >&2\n' + good),
+            ('incorrect success', good.replace('exit 1', 'exit 0')),
+            ('incorrect refusal exit', good.replace('exit 1', 'exit 2')),
+            ('created empty history', 'printf "[]" > "$OMG_DATA_DIR/history.json"\n' + good),
+            ('changed unrelated fixture', 'echo changed >> "$OMG_DATA_DIR/fixture-unrelated.txt"\n' + good),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows, distro='fedora')
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'], logs)
+
+    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product', isolation_scope=None):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -2988,6 +3170,13 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
                        str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
                        '--binary', shell_path(binary), '--tsv', str(inventory),
                        '--distro', distro, '--tiers', tiers, '--tag', 'fixture']
+            if isolation_scope is not None:
+                policy = root / 'network-policy.json'
+                policy.write_text(json.dumps({
+                    'inventory_sha256': hashlib.sha256(inventory.read_bytes()).hexdigest(),
+                    'scopes': {row.split('\t', 1)[0]: isolation_scope for row in rows},
+                }), encoding='utf-8')
+                command += ['--isolate-hermetic', '--network-policy', str(policy)]
             if exact_man:
                 command += ['--man-page-inventory',
                             shell_path(ROOT / 'tests/man_page_inventory.txt')]

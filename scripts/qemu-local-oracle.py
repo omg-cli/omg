@@ -158,6 +158,9 @@ def prepare(case):
         write(config / 'config.toml', 'telemetry_enabled = false\n[aur]\nbuild_concurrency = 3\nenable_ccache = false\n')
     write(data / 'fixture-unrelated.txt', 'keep unrelated data\n')
     write(config / 'fixture-unrelated.txt', 'keep unrelated configuration\n')
+    if case in {'rollback', 'rollback-yes'}:
+        require(os.environ.get('OMG_QEMU_DISTRO') in {'arch', 'debian', 'ubuntu', 'fedora'}, 'rollback fixture requires the selected backend')
+        require(absent(data / 'history.json'), 'rollback fixture must start without private history')
     if case == 'metrics':
         # The harness sets this before execution too; subprocess environment changes
         # cannot propagate from this fixture process to its caller.
@@ -227,6 +230,7 @@ def prepare(case):
     if case.startswith('team-golden-'): before['golden'] = templates
     if case == 'tool-list': before['tools'] = {str(link): os.readlink(link) for link in (data / 'bin').iterdir() if link.is_symlink()}
     if case == 'init': before['packages'] = native_packages(os.environ['OMG_QEMU_DISTRO'])
+    if case in {'rollback', 'rollback-yes'}: before['rollback_distro'] = os.environ['OMG_QEMU_DISTRO']
     write('.qemu-local-before.json', json.dumps(before))
 
 
@@ -239,7 +243,15 @@ def check(case, code, stdout, stderr):
     data, config, home = (Path(os.environ[name]) for name in ('OMG_DATA_DIR', 'OMG_CONFIG_DIR', 'HOME'))
     stdout = re.sub(r'\x1b\[[0-9;]*m', '', stdout)
     if case in REFUSALS:
-        require(code == 1 and REFUSALS[case] in stderr, f'incorrect {case} refusal cause')
+        if case in {'rollback', 'rollback-yes'}:
+            distro = os.environ.get('OMG_QEMU_DISTRO')
+            require(distro == before['rollback_distro'], 'rollback fixture is bound to another backend')
+            cause = ('Package rollback is not implemented for the selected Fedora backend'
+                     if distro == 'fedora' else REFUSALS[case])
+            require(code == 1 and stdout == '' and stderr == f'Error: {cause}\n', f'incorrect {case} refusal cause')
+            require(absent(data / 'history.json'), 'rollback refusal created private history')
+        else:
+            require(code == 1 and REFUSALS[case] in stderr, f'incorrect {case} refusal cause')
         for name in ('omg.lock', '.omg.toml', 'missing.lock', 'missing-b.lock', 'audit-evidence',
                      'audit-evidence-flags', 'enterprise-evidence', 'compliance.json'):
             require(absent(name), f'refusal created forbidden artifact: {name}')
