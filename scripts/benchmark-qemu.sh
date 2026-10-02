@@ -657,6 +657,9 @@ if [[ "$benchmark" == true ]]; then
   fi
   sha256sum "$work/benchmark-hyperfine.sh" "$work/record-benchmark-run.py" > "$work/benchmark-driver-sha256.txt"
 fi
+if [[ "$distro" == fedora ]]; then
+  cp "$here/qemu-fedora-advisory-check.sh" "$here/qemu-fedora-advisory-oracle.py" "$work/"
+fi
 if [[ "$distro" == arch ]]; then
   cp "$here/qemu-arch-advisory-check.sh" "$here/qemu-arch-advisory-oracle.py" "$work/"
 fi
@@ -734,6 +737,7 @@ version=$("${version_cmd[@]}")
 # Exercise both direct daemon startup and the actual CLI foreground launcher
 # while the package databases and installed fixture are available.
 guest_tools=(jq openssl)
+[[ "$distro" != fedora ]] || guest_tools+=(createrepo_c gnupg2)
 if [[ "$distro" == arch ]]; then guest_tools+=(python); else guest_tools+=(python3); fi
 [[ "$benchmark" != true ]] || guest_tools+=(hyperfine)
 case "$distro" in
@@ -843,6 +847,9 @@ fi
 if [[ "$distro" == arch ]]; then
   bash "$HOME/qemu-arch-advisory-check.sh" "$bin" "$daemon" "$digest" "$HOME/evidence"
 fi
+if [[ "$distro" == fedora ]]; then
+  bash "$HOME/qemu-fedora-advisory-check.sh" "$bin" "$daemon" "$digest" "$HOME/evidence"
+fi
 echo 'PASS: package lifecycle and native version parity'
 GUEST
 opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
@@ -854,6 +861,10 @@ timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
 if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
     /work/qemu-osv-check.sh /work/qemu-osv-positive-oracle.py bench@127.0.0.1:
+fi
+if [[ "$distro" == fedora ]]; then
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
+    /work/qemu-fedora-advisory-check.sh /work/qemu-fedora-advisory-oracle.py bench@127.0.0.1:
 fi
 if [[ "$distro" == arch ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
@@ -945,6 +956,13 @@ if [[ "$rc" == 0 && "$distro" == arch ]]; then
   if ! python3 "$here/qemu-arch-advisory-evidence.py" --evidence-dir "$work/guest/evidence/arch-advisory" \
     --archive "$work/release/$archive"; then
     printf 'Missing or incomplete archive-bound positive native Arch advisory evidence\n' >&2
+    exit 1
+  fi
+fi
+if [[ "$rc" == 0 && "$distro" == fedora ]]; then
+  if ! python3 "$here/qemu-fedora-advisory-evidence.py" --evidence-dir "$work/guest/evidence/fedora-advisory" \
+    --archive "$work/release/$archive"; then
+    printf 'Missing or incomplete archive-bound signed native Fedora advisory evidence\n' >&2
     exit 1
   fi
 fi
