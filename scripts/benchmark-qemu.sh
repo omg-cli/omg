@@ -9,6 +9,7 @@ inventory_file=
 inventory_policy=
 image_policy=
 image_cache=
+image_cache_budget_bytes=4294967296
 arch=
 print_pins=false
 benchmark=false
@@ -25,7 +26,7 @@ root="$HOME/.cache/build-targets/omg-qemu-benchmark"
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 while (($#)); do
   case "$1" in
-    --distro|--release|--staged-dir|--release-dir|--inventory-file|--inventory-policy|--image-policy|--image-cache|--evidence-dir|--inventory-tiers|--arch)
+    --distro|--release|--staged-dir|--release-dir|--inventory-file|--inventory-policy|--image-policy|--image-cache|--image-cache-budget-bytes|--evidence-dir|--inventory-tiers|--arch)
       [[ $# -ge 2 && -n "$2" ]] || exit 2
       case "$1" in
         --distro) distro=$2 ;; --release) tag=$2 ;; --staged-dir) staged_dir=$2 ;; --evidence-dir) root=$2 ;;
@@ -33,6 +34,7 @@ while (($#)); do
         --inventory-policy) inventory_policy=$2 ;;
         --image-policy) image_policy=$2 ;;
         --image-cache) image_cache=$2 ;;
+        --image-cache-budget-bytes) [[ "$2" =~ ^[0-9]+$ ]] || exit 2; image_cache_budget_bytes=$2 ;;
         --inventory-tiers) inventory_tiers=$2 ;; --arch) arch=$2 ;;
       esac
       shift 2 ;;
@@ -54,7 +56,7 @@ Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|ubuntu|fedora]
   [--evidence-dir DIR] [--benchmark] [--benchmark-transactions COUNT]
   [--print-pins] [--inventory-tiers CSV] [--inventory-allow-mutations]
   [--inventory-policy JSON]
-  [--image-policy JSON] [--image-cache DIR]
+  [--image-policy JSON] [--image-cache DIR] [--image-cache-budget-bytes BYTES]
   [--inventory-isolate-hermetic]
   [--allow-tcg]
 
@@ -76,6 +78,8 @@ CI requires --inventory-policy to pin the selection and permitted skips.
 --benchmark-transactions COUNT runs independently reset install/remove trials
 (1-100 per tool). Requires Docker, KVM, jq, and coreutils. Direct published
 downloads need gh; release preparation and benchmarks need Python 3.
+Optional image-cache writes default to a cumulative 4 GiB file-byte budget,
+including temporary copies. A full cache is bypassed without eviction.
 No compilation or host package changes. ARM still requires staged ARM binaries.
 HELP
       exit 0 ;;
@@ -216,7 +220,7 @@ if [[ "$distro" == all ]]; then
   [[ -z "$inventory_file" ]] || args+=(--inventory-file "$inventory_file")
   [[ -z "$inventory_policy" ]] || args+=(--inventory-policy "$inventory_policy")
   [[ -z "$image_policy" ]] || args+=(--image-policy "$image_policy")
-  [[ -z "$image_cache" ]] || args+=(--image-cache "$image_cache")
+  [[ -z "$image_cache" ]] || args+=(--image-cache "$image_cache" --image-cache-budget-bytes "$image_cache_budget_bytes")
   [[ "$benchmark" == false ]] || args+=(--benchmark)
   [[ "$transaction_samples" == 0 ]] || args+=(--benchmark-transactions "$transaction_samples")
   [[ -z "$inventory_tiers" ]] || args+=(--inventory-tiers "$inventory_tiers")
@@ -412,7 +416,14 @@ fi
 # verify the complete image digest before any guest boot or cache write.
 timeout 960 docker exec "$controller" bash -c 'set -e; cd /work/guest; if [[ ! -f base.qcow2 ]]; then curl --fail --location --connect-timeout 20 --max-time 900 --retry 4 --retry-all-errors --retry-delay 5 --retry-max-time 900 -o base.qcow2 "$1"; fi; printf "%s  base.qcow2\n" "$2" | "$3" -c -' _ "$image_url" "$image_hash" "$hash_tool" > "$work/image-setup.log" 2>&1
 if [[ -n "$cache_file" && "$cache_hit" == false ]]; then
-  timeout 90 python3 "$here/qemu-image-cache.py" "$work/guest/base.qcow2" "$cache_file" --algorithm "${hash_tool%sum}" --digest "$image_hash" >> "$work/image-cache.log" 2>&1
+  cache_write_status=0
+  timeout 90 python3 "$here/qemu-image-cache.py" "$work/guest/base.qcow2" "$cache_file" --algorithm "${hash_tool%sum}" --digest "$image_hash" \
+    --cache-write --cache-budget-bytes "$image_cache_budget_bytes" >> "$work/image-cache.log" 2>&1 || cache_write_status=$?
+  case "$cache_write_status" in
+    0) ;;
+    4) printf 'verified private image used; optional cache write bypassed: byte budget exhausted\n' >> "$work/image-cache.log" ;;
+    *) exit "$cache_write_status" ;;
+  esac
 fi
 if [[ -n "$image_policy" ]]; then
   timeout 90 python3 "$here/verify-qemu-image.py" --manifest "$image_policy" --identity "$distro-$arch" \
