@@ -11,13 +11,15 @@
 //!    on a daemon-less machine.
 //! 2. **generate_dockerfile** per-runtime blocks and per-base-image-family
 //!    fallbacks, plus the security fallbacks (unsafe base image, runtime name,
-//!    version), as exact-string contracts.
+//!    version). Generated version guards execute against private matching,
+//!    mismatching, empty and failed providers; installer recipes retain their
+//!    download-before-execution and explicit request contracts.
 
 pub mod common;
 
 use common::*;
 use omg_lib::core::container::{
-    ContainerConfig, ContainerManager, ContainerRuntime, dev_container_config,
+    ContainerConfig, ContainerManager, ContainerRuntime, GeneratedDockerfile, dev_container_config,
 };
 use std::fs;
 use std::io::Write as _;
@@ -516,53 +518,157 @@ fn list_images_parses_runtime_tsv_into_exact_fields() {
 // ===========================================================================
 
 fn dockerfile_for(base_image: &str, runtimes: &[(&str, &str)]) -> String {
-    ContainerManager::with_runtime(ContainerRuntime::Docker)
-        .generate_dockerfile(
-            base_image,
-            runtimes,
-            &omg_lib::core::container::InstallerDigests::new(),
+    generated_for(base_image, runtimes).content
+}
+
+fn generated_for(base_image: &str, runtimes: &[(&str, &str)]) -> GeneratedDockerfile {
+    ContainerManager::with_runtime(ContainerRuntime::Docker).generate_dockerfile(
+        base_image,
+        runtimes,
+        &omg_lib::core::container::InstallerDigests::new(),
+    )
+}
+
+fn assert_runtime_request_refused(base: &str, runtime: &str, request: &str) {
+    let generated = generated_for(base, &[(runtime, request)]);
+    assert!(
+        generated
+            .runtime_errors
+            .iter()
+            .any(|error| error.to_ascii_lowercase().contains(runtime)),
+        "unsupported {runtime} request {request:?} must be reported: {generated:?}"
+    );
+    assert!(
+        generated.content.contains(&format!(
+            "OMG cannot satisfy runtime version request for {runtime}"
+        )) && generated.content.contains(" >&2; exit 1"),
+        "direct Dockerfile consumers must also fail closed: {}",
+        generated.content
+    );
+    assert!(
+        generated.unpinned_urls.is_empty(),
+        "refused requests must not schedule installer downloads: {generated:?}"
+    );
+}
+
+/// Run the emitted shell, including its real provider-status handling. A
+/// matching output from a failed provider must not be accepted as a version.
+fn assert_generated_version_guard(
+    dockerfile: &str,
+    runtime: &str,
+    matching: &str,
+    mismatching: &str,
+) {
+    let checks: Vec<_> = dockerfile
+        .lines()
+        .filter_map(|line| line.strip_prefix("RUN "))
+        .filter(|line| line.contains(&format!("OMG runtime version mismatch: {runtime} ")))
+        .collect();
+    assert_eq!(
+        checks.len(),
+        1,
+        "one executable {runtime} guard required:\n{dockerfile}"
+    );
+    let fixture = tempfile::tempdir().expect("private version provider directory");
+    let bin = fixture.path().join("bin");
+    fs::create_dir(&bin).expect("provider bin directory");
+    let program = bin.join(if runtime == "python" {
+        "python3"
+    } else {
+        runtime
+    });
+    for (output, exit_code, accepted) in [
+        (matching, 0, true),
+        (mismatching, 0, false),
+        (matching, 17, false),
+        ("", 0, false),
+    ] {
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\nexit {exit_code}\n",
+                output.replace('\'', "'\\''")
+            ),
         )
-        .content
+        .expect("write isolated version provider");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+            .expect("provider executable permissions");
+        let result = std::process::Command::new("/bin/sh")
+            .args(["-c", checks[0]])
+            .current_dir(fixture.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .expect("execute actual generated version guard");
+        assert_eq!(
+            result.status.success(),
+            accepted,
+            "{runtime} guard with output {output:?}, provider exit {exit_code}: status={}, stdout={:?}, stderr={:?}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    fixture.close().expect("remove version provider fixture");
 }
 
 #[test]
 fn dockerfile_node_versions_map_to_nodesource_major_channels() {
-    let lts = dockerfile_for("ubuntu:24.04", &[("node", "lts")]);
+    let major = dockerfile_for("ubuntu:24.04", &[("node", "20")]);
     assert!(
-        lts.contains("# Install Node.js\n"),
+        major.contains("# Install Node.js\n"),
         "node block marker missing"
     );
     assert!(
-        lts.contains("ENV NODE_VERSION=20\n"),
-        "'lts' must pin NODE_VERSION=20, got:\n{lts}"
+        major.contains("ENV NODE_VERSION=20\n"),
+        "numeric major must select NODE_VERSION=20, got:\n{major}"
     );
+    assert_generated_version_guard(&major, "node", "20.13.1", "21.0.0");
     assert!(
-        lts.contains("-o /tmp/nodesource-setup.sh https://deb.nodesource.com/setup_20.x")
-            && lts.contains("bash /tmp/nodesource-setup.sh")
-            && !lts.contains("setup_20.x | bash"),
-        "NodeSource setup must be downloaded before execution, got:\n{lts}"
+        major.contains("-o /tmp/nodesource-setup.sh https://deb.nodesource.com/setup_20.x")
+            && major.contains("bash /tmp/nodesource-setup.sh")
+            && !major.contains("setup_20.x | bash"),
+        "NodeSource setup must be downloaded before execution, got:\n{major}"
     );
 
     let explicit = dockerfile_for("debian:bookworm-slim", &[("node", "21.7.0")]);
     assert!(explicit.contains("ENV NODE_VERSION=21\n"));
+    assert!(explicit.contains("https://deb.nodesource.com/setup_21.x"));
+    assert_generated_version_guard(&explicit, "node", "21.7.0", "21.7.1");
+    assert_runtime_request_refused("ubuntu:24.04", "node", "lts");
 }
 
 #[test]
-fn dockerfile_go_latest_resolves_to_pinned_go_version() {
-    let latest = dockerfile_for("ubuntu:24.04", &[("go", "latest")]);
+fn dockerfile_go_requires_an_exact_release_and_verifies_the_installed_provider() {
+    assert_runtime_request_refused("ubuntu:24.04", "go", "latest");
+    assert_runtime_request_refused("ubuntu:24.04", "go", "1.23");
+    let pinned = dockerfile_for("ubuntu:24.04", &[("go", "1.22.0")]);
     assert!(
-        latest.contains("ENV GO_VERSION=1.22.0\n"),
-        "'latest' go must resolve to GO_VERSION=1.22.0, got:\n{latest}"
+        pinned.contains("ENV GO_VERSION=1.22.0\n"),
+        "an explicit release must retain GO_VERSION=1.22.0, got:\n{pinned}"
     );
     assert!(
-        latest.contains("-o /tmp/omg-go.tar.gz https://go.dev/dl/go1.22.0.linux-amd64.tar.gz")
-            && latest.contains("tar -C /usr/local -xzf /tmp/omg-go.tar.gz"),
-        "go tarball must be downloaded before extraction, got:\n{latest}"
+        pinned.contains("-o /tmp/omg-go.tar.gz https://go.dev/dl/go1.22.0.linux-amd64.tar.gz")
+            && pinned.contains("tar -C /usr/local -xzf /tmp/omg-go.tar.gz"),
+        "go tarball must be downloaded before extraction, got:\n{pinned}"
     );
-    assert!(latest.contains("ENV PATH=$PATH:/usr/local/go/bin"));
+    assert!(pinned.contains("ENV PATH=$PATH:/usr/local/go/bin"));
+    assert!(pinned.contains("OMG Go archive requires Debian amd64"));
+    assert_generated_version_guard(
+        &pinned,
+        "go",
+        "go version go1.22.0 linux/amd64",
+        "go version go1.22.1 linux/amd64",
+    );
 
     let explicit = dockerfile_for("ubuntu:24.04", &[("go", "1.23.4")]);
     assert!(explicit.contains("ENV GO_VERSION=1.23.4\n"));
+    assert!(explicit.contains("https://go.dev/dl/go1.23.4.linux-amd64.tar.gz"));
+    assert_generated_version_guard(
+        &explicit,
+        "go",
+        "go version go1.23.4 linux/amd64",
+        "go version go1.23.5 linux/amd64",
+    );
 }
 
 #[test]
@@ -572,9 +678,17 @@ fn dockerfile_java_selects_package_by_version_shape() {
         digits.contains("apt-get install -y openjdk-17-jdk \\\n"),
         "all-digit java version must map to openjdk-<v>-jdk, got:\n{digits}"
     );
+    assert_generated_version_guard(
+        &digits,
+        "java",
+        "openjdk version \"17.0.15\" 2025-04-15",
+        "openjdk version \"21.0.1\" 2023-10-17",
+    );
 
-    let latest = dockerfile_for("ubuntu:24.04", &[("java", "latest")]);
-    assert!(latest.contains("apt-get install -y default-jdk \\\n"));
+    let system = dockerfile_for("ubuntu:24.04", &[("java", "system")]);
+    assert!(system.contains("apt-get install -y default-jdk &&"));
+    assert!(system.contains("# java: distribution default (no version pin)"));
+    assert_runtime_request_refused("ubuntu:24.04", "java", "latest");
 
     let empty = dockerfile_for("ubuntu:24.04", &[("java", "")]);
     assert!(
@@ -584,15 +698,18 @@ fn dockerfile_java_selects_package_by_version_shape() {
 }
 
 #[test]
-fn dockerfile_ruby_maps_latest_to_ruby_full_else_ruby_prefixed_spec() {
-    let latest = dockerfile_for("debian:bookworm-slim", &[("ruby", "latest")]);
-    assert!(latest.contains("apt-get install -y ruby-full \\\n"));
+fn dockerfile_ruby_distinguishes_system_packages_from_verified_version_requests() {
+    let system = dockerfile_for("debian:bookworm-slim", &[("ruby", "system")]);
+    assert!(system.contains("apt-get install -y ruby &&"));
+    assert!(system.contains("# ruby: distribution default (no version pin)"));
+    assert_runtime_request_refused("debian:bookworm-slim", "ruby", "latest");
 
     let pinned = dockerfile_for("debian:bookworm-slim", &[("ruby", "3.2.1")]);
     assert!(
         pinned.contains("apt-get install -y ruby3.2 \\\n"),
         "pinned ruby must map to the distro's major.minor package, got:\n{pinned}"
     );
+    assert_generated_version_guard(&pinned, "ruby", "3.2.1", "3.2.2");
 }
 
 #[test]
@@ -609,22 +726,30 @@ fn dockerfile_rust_installs_exact_toolchain_via_rustup() {
 }
 
 #[test]
-fn dockerfile_python_sets_python_version_env_and_symlink() {
+fn dockerfile_python_labels_distro_default_and_checks_the_requested_version() {
     let df = dockerfile_for("ubuntu:24.04", &[("python", "3.11.0")]);
-    assert!(df.contains("ENV PYTHON_VERSION=3.11.0\n"));
+    assert!(
+        !df.contains("ENV PYTHON_VERSION="),
+        "a label cannot pin distro Python"
+    );
+    assert!(df.contains("# Install Python (distribution default)"));
+    assert!(df.contains("# Required Python version: 3.11.0"));
     assert!(df.contains("python3 python3-pip python3-venv \\"));
     assert!(df.contains("ln -sf /usr/bin/python3 /usr/bin/python"));
+    assert_generated_version_guard(&df, "python", "3.11.0", "3.12.0");
 }
 
 #[test]
 fn dockerfile_bun_installs_via_official_script_and_extends_path() {
-    let df = dockerfile_for("ubuntu:24.04", &[("bun", "ignored")]);
+    let df = dockerfile_for("ubuntu:24.04", &[("bun", "1.1.38")]);
     assert!(
         df.contains("-o /tmp/omg-bun-install.sh https://bun.sh/install")
             && df.contains("bash /tmp/omg-bun-install.sh"),
         "bun install script must be downloaded before execution, got:\n{df}"
     );
     assert!(df.contains("ENV PATH=$PATH:/root/.bun/bin"));
+    assert_generated_version_guard(&df, "bun", "1.1.38", "1.1.39");
+    assert_runtime_request_refused("ubuntu:24.04", "bun", "ignored");
 }
 
 #[test]
@@ -663,14 +788,14 @@ fn dockerfile_unknown_runtime_falls_back_per_base_image_family() {
 
 #[test]
 fn dockerfile_truly_unknown_base_image_emits_manual_install_warning() {
-    let df = dockerfile_for("distroless:latest", &[("htop", "1.0")]);
+    let df = dockerfile_for("distroless:latest", &[("htop", "system")]);
     assert!(
         df.contains("# WARNING: Unknown base image 'distroless:latest'"),
         "unrecognized base must warn explicitly, got:\n{df}"
     );
-    assert!(
-        df.contains("# Please manually install htop 1.0 using your distribution's package manager")
-    );
+    assert!(df.contains(
+        "# Please manually install htop system using your distribution's package manager"
+    ));
     assert!(df.contains(
         "# Supported base images: ubuntu, debian, arch, alpine, fedora, rhel, centos, opensuse"
     ));
@@ -678,6 +803,16 @@ fn dockerfile_truly_unknown_base_image_emits_manual_install_warning() {
         !df.contains("install -y htop"),
         "no package-manager line may be fabricated for an unknown base"
     );
+    assert_runtime_request_refused("distroless:latest", "htop", "1.0");
+}
+
+#[test]
+fn dockerfile_numeric_major_and_minor_guards_respect_component_boundaries() {
+    for (request, accepted, rejected) in [("3", "3.12.9", "30.12.9"), ("3.11", "3.11.9", "3.110.9")]
+    {
+        let df = dockerfile_for("ubuntu:24.04", &[("python", request)]);
+        assert_generated_version_guard(&df, "python", accepted, rejected);
+    }
 }
 
 #[test]
