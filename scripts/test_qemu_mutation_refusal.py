@@ -35,11 +35,12 @@ class MutationRefusalTests(unittest.TestCase):
             calls = root / 'calls'
             ssh = commands / 'ssh'
             ssh.write_text('''#!/bin/bash
-printf '%s\\n' "$*" >> "$CALLS"
 if [[ "$*" == *OMG_QEMU_RECEIPT* ]]; then
+  printf 'OMG_QEMU_RECEIPT\\n' >> "$CALLS"
   printf 'tree official\\nOMG_QEMU_RECEIPT:product:0:0\\n'
   exit 0
 fi
+printf 'native-snapshot\\n' >> "$CALLS"
 count=$(grep -vc OMG_QEMU_RECEIPT "$CALLS")
 if [[ "$FAULT" == state-changed && "$count" -ge 2 ]]; then
   printf 'installed packages\\nbase 2.0\\ninstall reasons\\nbase\\n'
