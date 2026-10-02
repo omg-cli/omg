@@ -509,6 +509,16 @@ fn needs_arg_separator(command: &str) -> bool {
         .any(|manager| command.eq_ignore_ascii_case(manager))
 }
 
+fn validate_task_name(task_name: &str) -> Result<()> {
+    if task_name
+        .chars()
+        .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_' | ':' | '.'))
+    {
+        anyhow::bail!("Invalid task name: {task_name}");
+    }
+    Ok(())
+}
+
 /// Execute a task with advanced options.
 ///
 /// Task resolution order:
@@ -516,7 +526,7 @@ fn needs_arg_separator(command: &str) -> bool {
 /// 2. Ordered manifest-driven fallbacks (`make`, `npm run`, `task`, …).
 /// 3. As a final resort, `task_name` itself is executed as a command resolved
 ///    from `PATH`. This passthrough is intentional and bounded: the name was
-///    validated against `[A-Za-z0-9._-]` up front, so `omg run <tool>` behaves
+///    validated against `[A-Za-z0-9._:-]` up front, so `omg run <tool>` behaves
 ///    like invoking `<tool>` directly.
 pub fn run_task_advanced(
     task_name: &str,
@@ -525,12 +535,7 @@ pub fn run_task_advanced(
     all: bool,
 ) -> Result<()> {
     // SECURITY: Validate task name
-    if task_name
-        .chars()
-        .any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.')
-    {
-        anyhow::bail!("Invalid task name: {task_name}");
-    }
+    validate_task_name(task_name)?;
 
     let current_dir = std::env::current_dir()?;
     let detector = TaskDetector::new(current_dir.clone())?;
@@ -1504,6 +1509,16 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn task_names_accept_discovered_node_and_mise_colons() {
+        assert!(validate_task_name("build:prod").is_ok());
+    }
+
+    #[test]
+    fn task_names_reject_shell_metacharacters() {
+        assert!(validate_task_name("build;touch /tmp/unsafe").is_err());
+    }
+
+    #[test]
     fn executable_commands_allow_relative_path_tools() {
         // Regression: package-name validation rejected `./gradlew`, which this
         // runner itself detects and generates for Gradle projects.
@@ -2200,6 +2215,77 @@ var_colon ::= value
             !arg.to_string_lossy()
                 .contains(&dir.path().display().to_string())
         }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mise_child_source_sees_parent_path_directives() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("mise.toml"),
+            "[env._]\npath = ['parent-bin']\n",
+        )
+        .unwrap();
+        let child = dir.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("mise.toml"), "[env._]\nsource = 'child.sh'\n").unwrap();
+        fs::write(child.join("child.sh"), "export SOURCE_PATH=\"$PATH\"\n").unwrap();
+        let mut command = Command::new("sh");
+        let resolved = crate::config::mise_env::load_mise_env_chain(
+            &child,
+            &command_environment(&command).unwrap(),
+            crate::config::mise_env::Strictness::Strict,
+        )
+        .unwrap();
+        apply_resolved_environment(&mut command, &resolved).unwrap();
+        let environment = command_environment(&command).unwrap();
+        assert!(
+            environment["SOURCE_PATH"]
+                .split(':')
+                .any(|path| path == dir.path().join("parent-bin").to_string_lossy()),
+            "child source did not see the parent's configured executable path"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mise_child_paths_survive_parent_source_path_changes() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("mise.toml"),
+            "[env._]\nsource = 'parent.sh'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("parent.sh"),
+            "export PATH=\"$PATH:/source-extra\"\n",
+        )
+        .unwrap();
+        let child = dir.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("mise.toml"), "[env._]\npath = ['child-bin']\n").unwrap();
+        let mut command = Command::new("sh");
+        let resolved = crate::config::mise_env::load_mise_env_chain(
+            &child,
+            &command_environment(&command).unwrap(),
+            crate::config::mise_env::Strictness::Strict,
+        )
+        .unwrap();
+        apply_resolved_environment(&mut command, &resolved).unwrap();
+        let environment = command_environment(&command).unwrap();
+        assert!(
+            environment["PATH"]
+                .split(':')
+                .any(|path| path == child.join("child-bin").to_string_lossy()),
+            "parent source assignment erased the child's later path directive"
+        );
+        assert_eq!(
+            environment["PATH"]
+                .split(':')
+                .filter(|path| *path == "/source-extra")
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -370,32 +370,9 @@ pub fn list_installed_with_licenses() -> Result<Vec<(String, String, String)>> {
 
 /// Check if a package has an available update
 pub fn has_update(package: &str) -> Result<bool> {
-    with_handle(|handle| {
-        // Get local version; an uninstalled package simply has no update.
-        let local_pkg = match handle.localdb().pkg(package) {
-            Ok(pkg) => pkg,
-            Err(alpm::Error::PkgNotFound) => return Ok(false),
-            Err(e) => {
-                return Err(anyhow::anyhow!(e))
-                    .with_context(|| format!("Failed to query local package '{package}'"));
-            }
-        };
-        let local_ver = local_pkg.version();
-
-        // Check sync databases for newer version
-        for db in handle.syncdbs() {
-            if let Ok(sync_pkg) = db.pkg(package) {
-                let sync_ver = sync_pkg.version();
-                if alpm::vercmp(sync_ver.as_str(), local_ver.as_str())
-                    == std::cmp::Ordering::Greater
-                {
-                    return Ok(true);
-                }
-            }
-        }
-
-        Ok(false)
-    })
+    Ok(pacman_db::check_updates_cached()?
+        .iter()
+        .any(|update| update.name == package))
 }
 
 /// Check if package is installed - FAST (cached local db, no libalpm init)
@@ -469,6 +446,82 @@ pub fn list_all_package_names() -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn security_update_eligibility_respects_repository_priority_and_ignore_filters() {
+        if crate::core::is_root() {
+            eprintln!("skipped: fixture overrides require an unprivileged process");
+            return;
+        }
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+                clear_alpm_cache();
+            }
+        }
+        let _restore = Restore;
+        for (first_version, filter, expected) in [
+            ("1.0-1", "", false),
+            ("2.0-1", "IgnorePkg = fixture-*\n", false),
+            ("2.0-1", "IgnoreGroup = fixture-group\n", false),
+            ("2.0-1", "", true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("root");
+            let database = root.join("var/lib/pacman");
+            let local = database.join("local");
+            std::fs::create_dir_all(local.join("fixture-package-1.0-1")).unwrap();
+            std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+            std::fs::write(
+                local.join("fixture-package-1.0-1/desc"),
+                "%NAME%\nfixture-package\n\n%VERSION%\n1.0-1\n\n%REASON%\n0\n",
+            )
+            .unwrap();
+            let sync = database.join("sync");
+            std::fs::create_dir_all(&sync).unwrap();
+            for (repository, version) in [("first", first_version), ("second", "3.0-1")] {
+                let content = format!(
+                    "%NAME%\nfixture-package\n\n%VERSION%\n{version}\n\n%GROUPS%\nfixture-group\n\n%ARCH%\nx86_64\n"
+                );
+                let encoder = flate2::write::GzEncoder::new(
+                    std::fs::File::create(sync.join(format!("{repository}.db"))).unwrap(),
+                    flate2::Compression::fast(),
+                );
+                let mut archive = tar::Builder::new(encoder);
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive
+                    .append_data(
+                        &mut header,
+                        format!("fixture-package-{version}/desc"),
+                        content.as_bytes(),
+                    )
+                    .unwrap();
+                archive.into_inner().unwrap().finish().unwrap();
+            }
+            let config = directory.path().join("pacman.conf");
+            std::fs::write(&config, format!("[options]\nSigLevel = Never\n{filter}[first]\nServer = https://first.example/$repo/$arch\n[second]\nServer = https://second.example/$repo/$arch\n")).unwrap();
+            clear_alpm_cache();
+            paths::set_test_overrides(Some(root), Some(database));
+            temp_env::with_vars(
+                [
+                    ("OMG_PACMAN_CONF", Some(config.to_str().unwrap())),
+                    ("OMG_CACHE_DIR", Some(directory.path().to_str().unwrap())),
+                ],
+                || {
+                    assert_eq!(
+                        has_update("fixture-package").unwrap(),
+                        expected,
+                        "first={first_version}, filter={filter:?}"
+                    );
+                },
+            );
+        }
+    }
 
     #[test]
     fn security_inventory_matches_native_pacman_identities() {

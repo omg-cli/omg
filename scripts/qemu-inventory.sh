@@ -9,6 +9,152 @@
 set -euo pipefail
 # BEGIN PRODUCT OUTPUT ORACLE
 # This exact function is sent to the guest and exercised by fault-injection tests.
+check_workspace_state() {
+  python3 - "$1" "$2" <<'PY'
+import datetime, pathlib, re, sys, tomllib
+assertion, output = sys.argv[1:]
+try:
+    path = pathlib.Path('omg-workspace.toml')
+    assert path.is_file() and not path.is_symlink() and path.stat().st_size <= 1048576, 'missing regular workspace file'
+    state = tomllib.loads(path.read_text())
+    assert set(state) == {'name', 'created_at', 'projects'} and state['name'] == 'smoke', 'wrong workspace identity'
+    timestamp = datetime.datetime.fromisoformat(state['created_at'].replace('Z', '+00:00'))
+    assert timestamp.utcoffset() is not None, 'workspace creation time lacks timezone'
+    expected = {} if assertion in ('workspace-init-state', 'workspace-remove-state') else {'fixture': '.'}
+    if assertion == 'workspace-second-state':
+        expected['other'] = 'project'
+    projects = state['projects']
+    assert set(projects) == set(expected), 'incorrect persisted project set'
+    for name, location in expected.items():
+        project = projects[name]
+        assert set(project) == {'path', 'depends_on', 'commands'}, 'incorrect project fields'
+        assert project['path'] == location and project['depends_on'] == [], 'incorrect path or dependencies'
+        assert project['commands'] == {'build': 'make build', 'test': 'make test'}, 'Makefile commands were not detected'
+        assert pathlib.Path(location).is_dir(), 'registered project directory does not exist'
+    text = pathlib.Path(output).read_text()
+    if assertion == 'workspace-init-state':
+        assert "Initializing workspace 'smoke'" in text and 'Created omg-workspace.toml' in text, 'missing initialization result'
+    elif assertion in ('workspace-add-state', 'workspace-second-state'):
+        name, location = ('other', 'project') if assertion == 'workspace-second-state' else ('fixture', '.')
+        assert f"Added project '{name}' ({location})" in text, 'missing matching registration result'
+    elif assertion == 'workspace-remove-state':
+        assert "Removed project 'fixture'" in text, 'missing removal result'
+    elif assertion == 'workspace-list-state':
+        assert 'OMG Workspace: smoke' in text, 'wrong listed workspace'
+        assert re.findall(r'^  \d+\. .*$', text, re.M) == ['  1. fixture → .'], 'listing disagrees with project state'
+        commands = re.findall(r'^     commands: (.*)$', text, re.M)
+        assert len(commands) == 1 and set(commands[0].split(', ')) == {'build', 'test'}, 'listing lacks detected commands'
+    elif assertion == 'workspace-status-state':
+        assert 'OMG Workspace Status: smoke' in text and '  Projects: 1 projects' in text, 'wrong workspace status count'
+        assert re.findall(r'^    [○●✗] .*$', text, re.M) == ['    ○ fixture - no omg.lock'], 'status disagrees with missing project lock'
+        assert '  ⚠ 0 healthy, 1 need attention' in text and not pathlib.Path('omg.lock').exists(), 'incorrect health summary'
+except (AssertionError, KeyError, TypeError, ValueError, OSError) as error:
+    raise SystemExit(f'assertion failed: workspace state/output contract: {error}')
+PY
+}
+
+check_bash_completion_artifact() {
+  local artifact=$1
+  if [[ ! -f "$artifact" || -L "$artifact" ]] || ! bash -n "$artifact"; then
+    printf 'assertion failed: missing or invalid regular Bash completion artifact\n' >&2; return 1
+  fi
+  if ! timeout --kill-after=2s 10 bash --noprofile --norc -c '
+    set -eu
+    source "$1"
+    [[ $(complete -p omg) == "complete -F _omg_completions omg" ]]
+    COMP_WORDS=(omg se); COMP_CWORD=1; COMP_LINE="omg se"
+    _omg_completions
+    [[ ${#COMPREPLY[@]} == 2 && $(printf "%s\n" "${COMPREPLY[@]}" | sort) == $'"'"'search\nself-update'"'"' ]]
+    COMP_WORDS=(omg work); COMP_LINE="omg work"
+    _omg_completions
+    [[ ${#COMPREPLY[@]} == 1 && ${COMPREPLY[0]} == workspace ]]
+  ' _ "$artifact"; then
+    printf 'assertion failed: Bash completion does not register and complete known commands\n' >&2; return 1
+  fi
+}
+
+check_man_artifacts() {
+  python3 - "$1" <<'PY'
+import pathlib, re, sys
+try:
+    directory = pathlib.Path('man')
+    assert directory.is_dir() and not directory.is_symlink(), 'missing regular man directory'
+    pages = list(directory.glob('*.1'))
+    required = {'omg.1': 'omg', 'omg-search.1': 'search', 'omg-workspace.1': 'workspace', 'omg-workspace-init.1': 'init'}
+    assert set(required) <= {page.name for page in pages}, 'missing root, search, workspace or nested init reference'
+    for page in pages:
+        assert page.is_file() and not page.is_symlink() and page.stat().st_size <= 1048576, 'invalid regular man page'
+        text = page.read_text()
+        if page.name in required:
+            title = required[page.name]
+            assert re.search(r'^\.TH ' + re.escape(title) + r' 1(?:\s|$)', text, re.M), 'incorrect command title'
+            assert re.search(r'^' + re.escape(title) + r' \\-', text, re.M), 'missing command NAME definition'
+        for section in ('NAME', 'SYNOPSIS', 'DESCRIPTION'):
+            assert re.search(r'^\.SH "?' + section + r'"?$', text, re.M), 'missing command reference section'
+    reported = re.findall(r'^✓ Generated (\d+) man pages$', pathlib.Path(sys.argv[1]).read_text(), re.M)
+    assert reported == [str(len(pages))], 'reported page count disagrees with generated references'
+except (AssertionError, ValueError, OSError) as error:
+    raise SystemExit(f'assertion failed: man generation contract: {error}')
+PY
+}
+
+check_bash_hook_behavior() {
+  local artifact=$1
+  if ! bash -n "$artifact"; then
+    printf 'assertion failed: Bash hook output is not valid shell\n' >&2; return 1
+  fi
+  mkdir -p .qemu-hook/bin
+  cat > .qemu-hook/bin/omg <<'HOOK_OMG'
+#!/usr/bin/env bash
+[[ "$*" == 'hook-env -s bash' ]] || exit 23
+printf '%s\n' "$*" >> "$OMG_QEMU_HOOK_CALLS"
+printf 'export OMG_QEMU_HOOK_EXECUTED=1\n'
+HOOK_OMG
+  chmod 755 .qemu-hook/bin/omg
+  if ! PATH="$PWD/.qemu-hook/bin:$PATH" OMG_QEMU_HOOK_CALLS="$PWD/.qemu-hook/calls" \
+    timeout --kill-after=2s 10 bash --noprofile --norc -c '
+      set -eu
+      PROMPT_COMMAND=(true :)
+      source "$1"
+      source "$1"
+      [[ ${#PROMPT_COMMAND[@]} == 3 && ${PROMPT_COMMAND[0]} == _omg_hook && ${PROMPT_COMMAND[1]} == true && ${PROMPT_COMMAND[2]} == : ]]
+      trap -- "printf custom-sigint" SIGINT
+      previous_trap=$(trap -p SIGINT)
+      set +e
+      (exit 37)
+      _omg_hook
+      result=$?
+      set -e
+      [[ $result == 37 && ${OMG_QEMU_HOOK_EXECUTED:-} == 1 && $(trap -p SIGINT) == "$previous_trap" ]]
+      [[ $(cat "$OMG_QEMU_HOOK_CALLS") == "hook-env -s bash" ]]
+    ' _ "$artifact"; then
+    printf 'assertion failed: Bash hook lost prompt, exit status, environment execution or SIGINT behavior\n' >&2; return 1
+  fi
+}
+
+check_container_init_artifacts() {
+  python3 - "$1" <<'PY'
+import pathlib, sys
+try:
+    path = pathlib.Path('Dockerfile.omg')
+    assert path.is_file() and not path.is_symlink() and path.stat().st_size <= 1048576, 'missing regular Dockerfile'
+    recipe = path.read_text()
+    for line in ('FROM debian:bookworm', 'LABEL maintainer="OMG Team"', 'WORKDIR /app', 'COPY . .', 'CMD ["/bin/bash"]'):
+        assert line in recipe.splitlines(), 'missing requested build instruction: ' + line
+    assert 'apt-get update && apt-get install -y' in recipe and 'build-essential ca-certificates' in recipe, 'missing Debian build prerequisites'
+    protection = '# added by omg container init\n.git\n.env\n.env.*\n!.env.example\n*.pem\n*.key\nid_rsa*\n.omg/\n'
+    for name in ('.dockerignore', 'Dockerfile.omg.dockerignore', '.containerignore'):
+        path = pathlib.Path(name)
+        assert path.is_file() and not path.is_symlink() and path.stat().st_size <= 1048576, 'missing regular ignore file'
+        text = path.read_text()
+        assert '!*\n# qemu-preserve\n' in text and text.endswith(protection), 'lost user rules or trailing credential protection in ' + name
+    text = pathlib.Path(sys.argv[1]).read_text()
+    assert 'Created Dockerfile.omg' in text and 'Base image: debian:bookworm' in text, 'result does not describe requested recipe'
+except (AssertionError, ValueError, OSError) as error:
+    raise SystemExit(f'assertion failed: container init contract: {error}')
+PY
+}
+
 check_runtime_usage() {
   local runtime=$1 mode
   mode=$(stat -c %a "$OMG_DATA_DIR") || mode=""
@@ -563,22 +709,53 @@ cleanup_native_tree_fixture() {
 }
 
 native_installed_version() {
-  local distro=$1 package=$2
+  local distro=$1 package=$2 output
   case "$distro" in
     arch) pacman -Q "$package" | awk -v name="$package" '$1 == name { print $2 }' ;;
     debian|ubuntu) dpkg-query -W '-f=${Status}\t${Version}\n' "$package" | awk -F '\t' '$1 == "install ok installed" { print $2 }' ;;
-    fedora) rpm -q --qf '%{VERSION}-%{RELEASE}\n' "$package" ;;
+    fedora)
+      output=$(rpm -q --qf '%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\n' "$package") || return $?
+      printf '%s\n' "$output" | awk -F '\t' '
+        NR != 1 || NF != 3 || $1 !~ /^[0-9]+$/ ||
+          $2 !~ /^[^[:space:]:]+$/ || $3 !~ /^[^[:space:]:]+$/ { invalid = 1 }
+        { epoch = $1; version = $2; release = $3 }
+        END {
+          if (NR != 1 || invalid) exit 1
+          printf "%s%s-%s\n", epoch == "0" ? "" : epoch ":", version, release
+        }
+      ' ;;
+    *) return 1 ;;
+  esac
+}
+
+native_installed_identity() {
+  local distro=$1 package=$2 output
+  case "$distro" in
+    arch|debian|ubuntu) printf '%s\n' "$package" ;;
+    fedora)
+      output=$(rpm -q --qf '%{NAME}\t%{ARCH}\n' "$package") || return $?
+      printf '%s\n' "$output" | awk -F '\t' -v name="$package" '
+        NR != 1 || NF != 2 || $1 != name || $2 !~ /^[A-Za-z0-9_]+$/ { invalid = 1 }
+        { identity = $1 "." $2 }
+        END { if (NR != 1 || invalid) exit 1; print identity }
+      ' ;;
     *) return 1 ;;
   esac
 }
 
 check_native_remove_preview() {
-  local output=$1 version=$2
-  awk -v version="$version" '
+  local output=$1 version=$2 identity=${3:-bash} distro=${4:-}
+  awk -v version="$version" -v identity="$identity" -v distro="$distro" '
     /The following .*packages would be removed:/ { in_list = 1; next }
     /No changes made \(dry run\)/ { in_list = 0 }
-    in_list && $1 == "✗" && $2 == "bash" && $3 == version { found = 1 }
-    END { exit !found }
+    in_list && $1 == "✗" && $2 == identity {
+      found++;
+      if ($3 != version) invalid = 1;
+      if (distro == "arch") {
+        if (NF != 5 || $4 !~ /^\([0-9]+\.[0-9][0-9]$/ || $5 != "MB)") invalid = 1;
+      } else if (NF != 3) invalid = 1;
+    }
+    END { exit !(found == 1 && !invalid) }
   ' "$output"
 }
 
@@ -1283,6 +1460,16 @@ check_workspace_failure() {
 }
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
+  if [[ "$assertion" == local:* ]]; then
+    python3 .qemu-local-oracle.py check "${assertion#local:}" "$code" "$stdout" "$stderr" || return 1
+    if [[ "$assertion" == local:team-golden-create-flags ]] \
+      && { [[ $(grep -Fc "Golden path 'flagged' created!" "$stdout") != 1 ]] \
+        || ! grep -Fq 'Node: 20' "$stdout" || ! grep -Fq 'Python: 3.12' "$stdout" \
+        || ! grep -Fq 'Packages: ripgrep' "$stdout"; }; then
+      printf 'assertion failed: golden path output omits requested runtime/package values\n' >&2
+      return 1
+    fi
+  fi
   if grep -Eq 'panicked at|thread .main. panicked' "$stdout" "$stderr"; then
     printf 'assertion failed: product emitted a panic report\n' >&2; return 1
   fi
@@ -1304,6 +1491,22 @@ check_product_output() {
     man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence)
       check_file_output_oracle "$assertion" "$code" "$stdout" "$stderr" "$distro" || return 1 ;;
   esac
+  if [[ "$assertion" == missing-lock-ci-refusal || "$assertion" == missing-snapshot-refusal \
+    || "$assertion" == invalid-runtime-refusal || "$assertion" == missing-env-manifest-refusal ]]; then
+    local expected_reason
+    case "$assertion" in
+      missing-lock-ci-refusal) expected_reason='No omg.lock found' ;;
+      missing-snapshot-refusal) expected_reason="Snapshot 'missing' not found" ;;
+      invalid-runtime-refusal) expected_reason="Unsupported runtime 'invalid-runtime'" ;;
+      missing-env-manifest-refusal) expected_reason='Cannot read .omg.toml for environment planning' ;;
+    esac
+    if [[ "$code" != 1 ]] || ! grep -Fq "$expected_reason" "$stderr" \
+      || [[ -e omg.lock || -L omg.lock || -e .omg.toml || -L .omg.toml \
+            || -e "$OMG_DATA_DIR/versions/invalid-runtime" || -L "$OMG_DATA_DIR/versions/invalid-runtime" ]] \
+      || ! sha256sum -c .qemu-refusal-before.sha256 >/dev/null 2>&1; then
+      printf 'assertion failed: local refusal has the wrong cause or changed fixture state\n' >&2; return 1
+    fi
+  fi
   if [[ "$assertion" == license-* ]]; then
     local mode=${assertion#license-} report=$stdout
     if [[ "$distro" != arch ]]; then
@@ -1348,6 +1551,7 @@ check_product_output() {
       local preview='  | Install Preview' changes='  ℹ • No changes will be made (dry run)' target=pacman
       if [[ "$assertion" != package-dry-run-install ]]; then
         preview='  | Remove Preview'; changes='  ℹ No changes made (dry run)'; target=bash
+        [[ "$assertion" != package-dry-run-remove ]] || target=jq
       fi
       if [[ "$code" != 0 ]] || ! grep -Fxq "$preview" "$stdout" \
         || ! grep -Fxq '    dry run' "$stdout" \
@@ -1567,6 +1771,38 @@ PY
         check_config_oracle "$assertion" "$stdout" || return 1 ;;
       golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags)
         check_golden_path_state "$assertion" "$stdout" || return 1 ;;
+      workspace-init-state|workspace-add-state|workspace-second-state|workspace-remove-state|workspace-list-state|workspace-status-state)
+        check_workspace_state "$assertion" "$stdout" || return 1 ;;
+      bash-completion-stdout)
+        check_bash_completion_artifact "$stdout" || return 1 ;;
+      bash-completion-installed)
+        check_bash_completion_artifact "$HOME/.local/share/bash-completion/completions/omg" || return 1 ;;
+      completion-env-capture)
+        if [[ $(grep -Fxc capture "$stdout" || true) != 1 ]] \
+          || [[ $(grep -cv '^$' "$stdout" || true) != 1 ]]; then
+          printf 'assertion failed: env completion did not return exactly the capture candidate\n' >&2; return 1
+        fi ;;
+      bash-hook-behavior)
+        check_bash_hook_behavior "$stdout" || return 1 ;;
+      container-init-artifacts)
+        check_container_init_artifacts "$stdout" || return 1 ;;
+      ci-cache-paths)
+        local cache_path
+        for cache_path in '~/.local/share/omg/' '~/.local/share/omg/versions/' '~/.cargo/registry/' '~/.cargo/git/' '~/.npm/' 'omg-${{ runner.os }}-${{ hashFiles('\''omg.lock'\'') }}'; do
+          if [[ $(grep -Fxc "  $cache_path" "$stdout" || true) != 1 ]]; then
+            printf 'assertion failed: ci cache lacks exactly one documented path or lock-based key\n' >&2; return 1
+          fi
+        done ;;
+      daemon-status-missing-socket)
+        if [[ "${OMG_SOCKET_PATH:-}" != "$rowdir/daemon-socket/omg.sock" \
+              || -e "$OMG_SOCKET_PATH" || -L "$OMG_SOCKET_PATH" ]] \
+          || ! grep -Fxq 'OMG Daemon Status' "$stdout" \
+          || ! grep -Fxq '  ✗ Daemon socket not found' "$stdout" \
+          || ! grep -Fxq "    Path: $OMG_SOCKET_PATH" "$stdout"; then
+          printf 'assertion failed: daemon status did not identify its missing private socket\n' >&2; return 1
+        fi ;;
+      man-command-artifacts)
+        check_man_artifacts "$stdout" || return 1 ;;
       privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled)
         check_privacy_oracle "$assertion" "$stdout" || return 1 ;;
       hooks-installed|hooks-absent)
@@ -1642,6 +1878,19 @@ PY
           END { exit !(results > 0 && trees == 1 && !bad) }
         ' "$stdout"; then
           printf 'assertion failed: search lacks a ranked official tree result\n' >&2; return 1
+        fi ;;
+      search-firefox-results)
+        local target=firefox
+        [[ "$distro" != debian ]] || target=firefox-esr
+        if [[ "$code" != 0 ]] || ! grep -Fxq '  | Search' "$stdout" \
+          || ! grep -Fxq '    firefox' "$stdout" \
+          || ! awk -v target="$target" '
+            /^  [^[:space:]]+ [^[:space:]]+  / {
+              if ($1 == target && $2 ~ /^[0-9]/ && $3 == "Official" && NF == 3) matches++
+            }
+            END { exit !(matches == 1) }
+          ' "$stdout"; then
+          printf 'assertion failed: firefox search lacks its official package and version\n' >&2; return 1
         fi ;;
       search-official-limit-three)
         if ! awk '
@@ -1759,6 +2008,52 @@ write_row_log() {
   } > "$destination"
 }
 # END ROW LOG
+
+# BEGIN ROW PROGRAM RECEIVER
+# Only this small receiver enters SSH argv. The generated supervisor is read
+# completely and authenticated before fixtures or the product can execute.
+row_program_receiver() {
+  local size=$1 digest=$2 receiver
+  if [[ ! "$size" =~ ^[1-9][0-9]{0,6}$ ]] || ((size > 1048576)) \
+    || [[ ! "$digest" =~ ^[a-f0-9]{64}$ ]]; then
+    printf 'error: invalid or oversized inventory row program\n' >&2
+    return 120
+  fi
+  receiver=$(cat <<'QEMU_ROW_RECEIVER'
+unset qemu_row_payload
+qemu_row_payload=
+export -n qemu_row_payload
+if LC_ALL=C IFS= builtin read -r -d '' -n 1048577 qemu_row_payload; then
+  qemu_row_read_status=0
+else
+  qemu_row_read_status=$?
+fi
+if [ "$qemu_row_read_status" != 1 ]; then
+  printf 'error: inventory row stream did not end at bounded EOF\n' >&2
+  exit 122
+fi
+qemu_row_size=$(builtin printf '%s' "$qemu_row_payload" | wc -c)
+if [ "$qemu_row_size" != "$qemu_row_expected_size" ]; then
+  printf 'error: inventory row stream size mismatch\n' >&2
+  exit 122
+fi
+if ! qemu_row_digest=$(builtin printf '%s' "$qemu_row_payload" | sha256sum); then
+  printf 'error: inventory row stream digest failed\n' >&2
+  exit 122
+fi
+if [ "$qemu_row_digest" != "$qemu_row_expected_sha  -" ]; then
+  printf 'error: inventory row stream digest mismatch\n' >&2
+  exit 122
+fi
+set --
+builtin eval "$qemu_row_payload" </dev/null
+QEMU_ROW_RECEIVER
+)
+  printf -v receiver 'qemu_row_expected_size=%s; qemu_row_expected_sha=%s\n%s' "$size" "$digest" "$receiver"
+  printf 'bash -c %s' "$(jq -rn --arg s "$receiver" '$s | @sh')"
+}
+# END ROW PROGRAM RECEIVER
+
 trap 'rc=$?; if [[ "$rc" == 2 ]]; then printf "error: invalid inventory configuration or row %s\n" "${id:-<preflight>}" >&2; fi' EXIT
 
 work=""; distro=""; tiers=""; tag=""; binary=""; tsv=""
@@ -1829,7 +2124,8 @@ out="$root/inventory"
 # Refuse to overwrite evidence from a previous invocation.
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$(dirname "$0")/qemu-enterprise-export-oracle.py" "$(dirname "$0")/qemu-audit-log-oracle.py" "$(dirname "$0")/qemu-rust-install-oracle.py" > "$out/input-sha256.txt"
+local_oracle_path="$(dirname "${BASH_SOURCE[0]}")/qemu-local-oracle.py"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$local_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$(dirname "$0")/qemu-enterprise-export-oracle.py" "$(dirname "$0")/qemu-audit-log-oracle.py" "$(dirname "$0")/qemu-rust-install-oracle.py" > "$out/input-sha256.txt"
 if [[ "$man_page_mode" == exact ]]; then sha256sum "$man_page_inventory" >> "$out/input-sha256.txt"; fi
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" --arg man_page_mode "$man_page_mode" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
@@ -1925,9 +2221,9 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock|local:*|missing-lock-ci-refusal|missing-snapshot-refusal|invalid-runtime-refusal|missing-env-manifest-refusal|daemon-status-missing-socket|bash-hook-behavior|ci-cache-paths|container-init-artifacts|completion-env-capture|workspace-init-state|workspace-add-state|workspace-second-state|workspace-remove-state|workspace-list-state|workspace-status-state|bash-completion-stdout|bash-completion-installed|man-command-artifacts|search-firefox-results) ;; *) exit 2 ;; esac
   case "$id:$a" in
-    workspace-list:workspace-project-listed|workspace-remove:workspace-project-removed|container-init:container-init-scaffold) ;;
+    workspace-list:workspace-project-listed|workspace-list:workspace-list-state|workspace-remove:workspace-project-removed|workspace-remove:workspace-remove-state|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
   esac
   case "$id" in
@@ -1935,35 +2231,36 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
       [[ "$a" == man-pages-generated && "$s" == isolated-write && "$resolved" == 0 ]] || exit 2
       jq -e '. == ["generate-man","--output","${ROOT}/man"]' <<< "$aj" >/dev/null || exit 2 ;;
     audit-log-flags)
-      [[ "$a" == audit-log-filtered-export && "$s" == isolated-write && "$resolved" == 0 ]] || exit 2
+      [[ ( "$a" == audit-log-filtered-export || "$a" == local:audit-log-flags ) && "$s" == isolated-write && "$resolved" == 0 ]] || exit 2
       jq -e '. == ["audit","log","--limit","3","--severity","error","--export","${ROOT}/audit-log-export.json"]' <<< "$aj" >/dev/null || exit 2 ;;
     workspace-run|workspace-check)
       [[ "$s" == read && "$resolved" == 1 && "$r" == workspace-add ]] || exit 2
       if [[ "$id" == workspace-run ]]; then
-        [[ "$a" == workspace-missing-task ]] || exit 2
+        [[ ( "$a" == workspace-missing-task || "$a" == local:workspace-run ) ]] || exit 2
         jq -e '. == ["workspace","run","true"]' <<< "$aj" >/dev/null || exit 2
       else
-        [[ "$a" == workspace-missing-lock ]] || exit 2
+        [[ ( "$a" == workspace-missing-lock || "$a" == local:workspace-check ) ]] || exit 2
         jq -e '. == ["workspace","check"]' <<< "$aj" >/dev/null || exit 2
       fi ;;
     audit-export)
-      [[ "$a" == audit-export-absolute-refusal && "$s" == isolated-write && "$resolved" == 1 ]] || exit 2
+      [[ ( "$a" == audit-export-absolute-refusal || "$a" == local:$id ) && "$s" == isolated-write && "$resolved" == 1 ]] || exit 2
       jq -e '. == ["audit","export","--output","${ROOT}/audit-evidence"]' <<< "$aj" >/dev/null || exit 2 ;;
     audit-export-flags)
-      [[ "$a" == audit-export-absolute-refusal && "$s" == isolated-write && "$resolved" == 1 ]] || exit 2
+      [[ ( "$a" == audit-export-absolute-refusal || "$a" == local:$id ) && "$s" == isolated-write && "$resolved" == 1 ]] || exit 2
       jq -e '. == ["audit","export","--framework","soc2","--period","2024-Q4","--output","${ROOT}/audit-evidence-flags"]' <<< "$aj" >/dev/null || exit 2 ;;
     enterprise-audit-export)
-      [[ "$a" == audit-export-absolute-refusal && "$s" == controlled-error && "$resolved" == 1 ]] || exit 2
+      [[ ( "$a" == audit-export-absolute-refusal || "$a" == local:$id ) && "$s" == controlled-error && "$resolved" == 1 ]] || exit 2
       jq -e '. == ["enterprise","audit-export","--output","${ROOT}/enterprise-evidence"]' <<< "$aj" >/dev/null || exit 2 ;;
     enterprise-audit-export-flags)
       [[ "$a" == enterprise-audit-export-evidence && "$s" == isolated-write
         && "$e" == 'arch:0,debian:1,ubuntu:1,fedora:1' ]] || exit 2
       jq -e '. == ["enterprise","audit-export","--framework","iso27001","--period","2025-Q1","--output","./enterprise-evidence-flags"]' <<< "$aj" >/dev/null || exit 2 ;;
     team-compliance-export)
-      [[ "$a" == team-compliance-no-report && "$s" == controlled-error && "$resolved" == 1 && "$r" == team-init ]] || exit 2
+      [[ ( "$a" == team-compliance-no-report || "$a" == local:team-compliance-export ) && "$s" == controlled-error && "$resolved" == 1 && "$r" == team-init ]] || exit 2
       jq -e '. == ["team","compliance","--export","${ROOT}/compliance.json"]' <<< "$aj" >/dev/null || exit 2 ;;
     *) [[ "$a" != audit-log-filtered-export && "$a" != workspace-missing-task && "$a" != workspace-missing-lock && "$a" != man-pages-generated && "$a" != audit-export-absolute-refusal && "$a" != team-compliance-no-report && "$a" != enterprise-audit-export-evidence ]] || exit 2 ;;
   esac
+  if [[ "$a" == local:* ]]; then [[ "$a" == "local:$id" ]] || exit 2; fi
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
     jq -e '. == ["run", "smoke", "--using", "make"]' <<< "$aj" >/dev/null || exit 2
@@ -1997,7 +2294,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
       jq -e '. == ["install", "--yes", "--dry-run", "--allow-local-file", "pacman"]' <<< "$aj" >/dev/null || exit 2 ;;
     remove)
       [[ "$a" == package-dry-run-remove && "$s" == read && "$resolved" == 0 ]] || exit 2
-      jq -e '. == ["remove", "--dry-run", "bash"]' <<< "$aj" >/dev/null || exit 2 ;;
+      jq -e '. == ["remove", "--dry-run", "jq"]' <<< "$aj" >/dev/null || exit 2 ;;
     remove-flags)
       [[ "$a" == package-dry-run-recursive && "$s" == read ]] || exit 2
       jq -e '. == ["remove", "--recursive", "--yes", "--dry-run", "bash"]' <<< "$aj" >/dev/null || exit 2 ;;
@@ -2020,13 +2317,13 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   esac
   case "$id" in
     team-golden-create)
-      [[ "$a" == golden-path-created && "$r" == team-init ]] || exit 2 ;;
+      [[ ( "$a" == golden-path-created || "$a" == local:team-golden-create ) && "$r" == team-init ]] || exit 2 ;;
     team-golden-list)
-      [[ "$a" == golden-path-listed && "$r" == team-golden-create ]] || exit 2 ;;
+      [[ ( "$a" == golden-path-listed || "$a" == local:team-golden-list ) && "$r" == team-golden-create ]] || exit 2 ;;
     team-golden-delete)
-      [[ "$a" == golden-path-deleted && "$r" == team-golden-list ]] || exit 2 ;;
+      [[ ( "$a" == golden-path-deleted || "$a" == local:team-golden-delete ) && "$r" == team-golden-list ]] || exit 2 ;;
     team-golden-create-flags)
-      [[ "$a" == golden-path-flags && "$r" == team-golden-list && "$resolved" == 0 ]] || exit 2
+      [[ ( "$a" == golden-path-flags || "$a" == local:team-golden-create-flags ) && "$r" == team-golden-list && "$resolved" == 0 ]] || exit 2
       jq -e '. == ["team","golden-path","create","flagged","--node","20","--python","3.12","--packages","ripgrep"]' <<< "$aj" >/dev/null || exit 2 ;;
     *) [[ "$a" != golden-path-created && "$a" != golden-path-listed && "$a" != golden-path-deleted && "$a" != golden-path-flags ]] || exit 2 ;;
   esac
@@ -2209,6 +2506,7 @@ prereq_runnable() { # id -> 0 when replayable
 
 # Process substitution (not a pipeline): pass/fail counters below must
 # survive the loop; a `tail | while` pipeline would trap them in a subshell.
+local_oracle_source=$(jq -Rrs '@sh' "$(dirname "${BASH_SOURCE[0]}")/qemu-local-oracle.py")
 while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux requires tier targets assertions cleanup; do
   # Case ids flow into a remote shell command below: reject anything
   # outside the identifier shape instead of executing it.
@@ -2284,7 +2582,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   }
   quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
-  remote="set -eu; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
+  export -n remote row_program
+  remote="set -eu; export OMG_QEMU_EXECUTABLE=$quoted_binary OMG_QEMU_DISTRO='$distro'; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
   if [[ "$man_page_mode" == exact ]]; then remote+="; export OMG_QEMU_EXACT_MAN_PAGES=1"; fi
   if [[ "$assertions" == container-run-argv || "$assertions" == container-shell-argv || "$assertions" == container-build-argv ]]; then
     remote+="; mkdir -p \"\$rowdir/engine\"; printf '%s' $container_engine > \"\$rowdir/engine/podman\"; chmod 700 \"\$rowdir/engine/podman\"; ln -s /bin/false \"\$rowdir/engine/docker\""
@@ -2300,6 +2599,15 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == team-golden-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/golden-config\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
   fi
+  needs_local=false
+  if [[ "$assertions" == local:* ]]; then
+    needs_local=true
+    remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: local fixtures require an unprivileged guest user\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+    remote+="; export OMG_CONFIG_DIR=\"\$rowdir/local-config\" OMG_DATA_DIR=\"\$rowdir/local-data\" OMG_CACHE_DIR=\"\$rowdir/local-cache\" OMG_SOCKET_PATH=\"\$rowdir/local-socket/omg.sock\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0 TZ=UTC HOME=\"\$rowdir/local-home\"; mkdir -p \"\$HOME\" \"\$rowdir/local-socket\"; chmod 700 \"\$HOME\" \"\$rowdir/local-socket\"; unset OMG_DASHBOARD_TOKEN"
+  fi
+  [[ "$case" != metrics ]] || remote+="; export OMG_DISABLE_DAEMON=0"
+  for p in "${chain[@]}"; do [[ "${row_assertions[$p]}" != local:* ]] || needs_local=true; done
+  if [[ "$needs_local" == true ]]; then remote+="; printf '%s' $local_oracle_source > .qemu-local-oracle.py"; fi
   if [[ "$assertions" == doctor-eol-state || "$assertions" == audit-eol-state ]]; then
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: EOL fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/eol-config\" OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/eol-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
     remote+="; mkdir -p \"\$OMG_DATA_DIR/versions/node/16.20.2\" \"\$OMG_DATA_DIR/versions/python/3.12.14\"; ln -s 16.20.2 \"\$OMG_DATA_DIR/versions/node/current\"; ln -s 3.12.14 \"\$OMG_DATA_DIR/versions/python/current\""
@@ -2308,6 +2616,15 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == doctor-network-state ]]; then
     remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: doctor network fixture requires an unprivileged guest user\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/network-config\" OMG_DATA_DIR=\"\$rowdir/network-data\" OMG_CACHE_DIR=\"\$rowdir/network-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
     remote+="; $(declare -f check_doctor_issue_delta); $(declare -f check_doctor_network_output)"
+  fi
+  if [[ "$assertions" == bash-completion-installed ]]; then
+    remote+="; export HOME=\"\$rowdir/completion-home\"; mkdir -p \"\$HOME\""
+  fi
+  if [[ "$assertions" == container-init-artifacts ]]; then
+    remote+="; for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do printf \"!*\\n# qemu-preserve\\n\" > \"\$ignore\"; done"
+  fi
+  if [[ "$assertions" == missing-lock-ci-refusal || "$assertions" == missing-snapshot-refusal || "$assertions" == invalid-runtime-refusal || "$assertions" == missing-env-manifest-refusal || "$assertions" == daemon-status-missing-socket ]]; then
+    remote+="; export OMG_DATA_DIR=\"\$rowdir/refusal-data\" OMG_CONFIG_DIR=\"\$rowdir/refusal-config\" OMG_CACHE_DIR=\"\$rowdir/refusal-cache\" OMG_DISABLE_DAEMON=1 OMG_SOCKET_PATH=\"\$rowdir/daemon-socket/omg.sock\"; mkdir -m 700 \"\$rowdir/daemon-socket\""
   fi
   if [[ "$case" == config-* ]]; then
     remote+="; export OMG_CONFIG_DIR=\"\$rowdir/config\""
@@ -2357,9 +2674,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; mkdir -p project/critical; printf '%s%s\n' '-----BEGIN ' 'PRIVATE KEY-----' > project/critical/key.pem"
   fi
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
-  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_workspace_failure); $(declare -f check_product_output)"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_workspace_failure); $(declare -f check_product_output); $(declare -f check_workspace_state); $(declare -f check_bash_completion_artifact); $(declare -f check_man_artifacts); $(declare -f check_bash_hook_behavior); $(declare -f check_container_init_artifacts)"
   if [[ "$assertions" == package-dry-run-* ]]; then
-    remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f check_native_remove_preview)"
+    remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f native_installed_identity); $(declare -f check_native_remove_preview)"
   fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; $(declare -f check_apt_tree_absent); $(declare -f prepare_apt_update_fixture); $(declare -f check_apt_update_fixture); $(declare -f native_package_snapshot); $(declare -f check_apt_update_delta); $(declare -f cleanup_apt_update_fixture)"
@@ -2396,6 +2713,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   for p in "${chain[@]}"; do
     pargs=$(quote_args "${row_args[$p]}")
+    if [[ "${row_assertions[$p]}" == local:* ]]; then
+      remote+="; python3 .qemu-local-oracle.py prepare '$p' || { printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+    fi
     remote+="; run_omg '$row_timeout' $quoted_binary $pargs > '$p.prereq.log' 2> '$p.prereq.stderr.log'"
     remote+="; printf 'prereq $p exit=%s\n' \"\$rc\" >&2; cat '$p.prereq.log' '$p.prereq.stderr.log' >&2"
     remote+="; if [ \"\$rc\" != '${row_exit[$p]}' ] || [ \"\$execution_phase\" != product ]; then printf '\nOMG_QEMU_RECEIPT:dependency:%s:0\n' \"\$rc\"; exit 0; fi"
@@ -2411,11 +2731,20 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; rollback_id=\$(apt_tree_removal_id \"\$OMG_DATA_DIR/history.json\" \"\$rollback_version\") || { printf 'assertion failed: no unique native tree removal transaction with the installed version\n' >&2; printf '\nOMG_QEMU_RECEIPT:product:0:1\n'; exit 0; }"
     remote+="; [[ \"\$rollback_id\" =~ ^[0-9a-f-]{36}\$ ]] || { printf 'assertion failed: native tree removal transaction has an invalid ID\n' >&2; printf '\nOMG_QEMU_RECEIPT:product:0:1\n'; exit 0; }"
   fi
+  if [[ "$assertions" == local:* ]]; then
+    remote+="; python3 .qemu-local-oracle.py prepare '$case' || { printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+  fi
+  if [[ "$assertions" == missing-lock-ci-refusal || "$assertions" == missing-snapshot-refusal || "$assertions" == invalid-runtime-refusal || "$assertions" == missing-env-manifest-refusal ]]; then
+    remote+="; printf keep-refusal-fixture > refusal-sentinel.txt; sha256sum Makefile project/README.md project/Makefile refusal-sentinel.txt > .qemu-refusal-before.sha256"
+  fi
   if [[ "$assertions" == package-dry-run-* ]]; then
     remote+="; native_before=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package baseline is unavailable\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
     if [[ "$assertions" != package-dry-run-install ]]; then
-      remote+="; installed_version=\$(native_installed_version '$distro' bash) || { printf 'assertion failed: native bash package query failed\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
-      remote+="; [[ -n \"\$installed_version\" ]] || { printf 'assertion failed: bash is not installed in this guest\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+      preview_package=bash
+      [[ "$assertions" != package-dry-run-remove ]] || preview_package=jq
+      remote+="; installed_version=\$(native_installed_version '$distro' '$preview_package') || { printf 'assertion failed: native installed package version query failed\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+      remote+="; installed_identity=\$(native_installed_identity '$distro' '$preview_package') || { printf 'assertion failed: native installed package identity query failed\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+      remote+="; [[ -n \"\$installed_version\" ]] || { printf 'assertion failed: preview package is not installed in this guest\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
     fi
   fi
   if [[ "$case" == team-status || "$case" == team-pull ]]; then
@@ -2532,7 +2861,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if ! command -v strace >/dev/null || ! strace --seccomp-bpf -f -qq -e trace=execve -o doctor.preflight.log true; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve -o doctor.exec.log $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   else
-    remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
+    remote+="; run_omg '$command_timeout' $quoted_binary $arg_string </dev/null > command.stdout.log 2> command.stderr.log; assertion=0"
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
@@ -2558,7 +2887,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$assertions" == package-dry-run-* ]]; then
     if [[ "$assertions" != package-dry-run-install && "$assertions" != package-dry-run-recursive || "$assertions" == package-dry-run-recursive && "$distro" == arch ]]; then
-      remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_native_remove_preview command.stdout.log \"\$installed_version\"; then printf 'assertion failed: remove preview lacks the native installed bash version\n' >&2; assertion=1; fi"
+      remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_native_remove_preview command.stdout.log \"\$installed_version\" \"\$installed_identity\" '$distro'; then printf 'assertion failed: remove preview lacks the exact native installed package identity/version\n' >&2; assertion=1; fi"
     fi
     remote+="; native_after=\$(native_package_snapshot '$distro') || { assertion=1; printf 'assertion failed: native package after-state is unavailable\n' >&2; }"
     remote+="; if [[ \"\$execution_phase\" == product && \"\$native_before\" != \"\$native_after\" ]]; then printf 'assertion failed: dry run changed native installed-package state or reasons\n' >&2; assertion=1; fi"
@@ -2584,7 +2913,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ -n "$counter" ]]; then
     remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_native_counter '$distro' '$counter' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
-    remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: counter fixture cleanup failed\\n' >&2; assertion=1; fi"
+    remote+="; cd \"\${rowdir%/*}\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: counter fixture cleanup failed\\n' >&2; assertion=1; fi"
   fi
   if [[ "$assertions" == doctor-native-backend ]]; then
     if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
@@ -2654,7 +2983,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then
     remote+="; if [ \"\$rc\" = 0 ] && ! check_${runtime_name}_install '$runtime_version'; then assertion=1; fi"
     remote+="; if [ \"\$rc\" = 0 ] && ! check_runtime_usage '$runtime_name'; then assertion=1; fi"
-    remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: runtime fixture cleanup failed\\n' >&2; assertion=1; fi"
+    remote+="; cd \"\${rowdir%/*}\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: runtime fixture cleanup failed\\n' >&2; assertion=1; fi"
   fi
   if [[ "$assertions" == runtime-version-removed ]]; then
     remote+="; if [ \"\$rc\" = 0 ] && ! check_runtime_uninstall '$runtime_name' '$runtime_version'; then assertion=1; fi"
@@ -2668,11 +2997,18 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   # Every inventory row receives a private fixture directory. Product-specific
   # cleanup assertions run above; removal here proves the harness itself does
   # not leak state that could make a later row pass.
-  remote+="; cd \"\$HOME\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: row fixture cleanup failed (%s)\\n' '$cleanup' >&2; assertion=1; fi"
+  remote+="; cd \"\${rowdir%/*}\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: row fixture cleanup failed (%s)\\n' '$cleanup' >&2; assertion=1; fi"
   # A receipt is emitted only after setup and the command complete. SSH
   # transport/tool failures cannot satisfy an expected product refusal.
   remote+="; printf '\nOMG_QEMU_RECEIPT:%s:%s:%s\n' \"\$execution_phase\" \"\$rc\" \"\$assertion\""
-  remote="bash -c $(jq -rn --arg s "$remote" '$s | @sh')"
+  # Keep the program out of every external argv and exported environment.
+  # Receiver failures cannot emit a product receipt or satisfy a refusal.
+  row_program=$remote
+  row_program_size=$(builtin printf '%s' "$row_program" | wc -c)
+  row_program_digest=$(builtin printf '%s' "$row_program" | sha256sum)
+  row_program_digest=${row_program_digest%% *}
+  receiver_status=0
+  remote=$(row_program_receiver "$row_program_size" "$row_program_digest") || receiver_status=$?
   if [[ "$network_scope" == offline ]]; then
     # Put the supervisor AND its receipt inside the namespace. A namespace
     # setup failure must be a transport/harness error, never an expected CLI
@@ -2684,7 +3020,25 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       # network namespace while running the lifecycle itself as the SSH user.
       remote="sudo -n unshare --net -- sudo -n -u '$ssh_user' env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
     else
-      remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+      # Native DNF5 stored-plan resolution requires authenticated root even
+      # for a dry run. Admit only this exact validated, prerequisite-free row;
+      # keep its initial user/group/capability drop and offline namespace.
+      preview_privilege=false
+      if [[ "$distro" == fedora && "$case" == remove && "$safety" == read
+            && "$assertions" == package-dry-run-remove && "${row_exit[$case]}" == 0
+            && "$expected_ux" == pass && "$requires" == - && ${#chain[@]} == 0
+            && "$tier" == hermetic && "$targets" == hermetic:pass
+            && "$cleanup" == tempdir-drop && "$ssh_user" != root ]] \
+        && jq -e '. == ["remove", "--dry-run", "jq"]' <<< "$args_json" >/dev/null; then
+        preview_privilege=true
+      fi
+      if [[ "$preview_privilege" == false ]]; then
+        remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+      else
+        # Retain the bounding set solely so sudo can authenticate this native
+        # preview. Refuse an initial root user before any fixture or receipt.
+        remote="test \$(id -u) -ne 0 && sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
+      fi
     fi
   fi
   # Bash SECONDS follows wall-clock adjustments; WSL can step that clock
@@ -2721,7 +3075,15 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$case" == runtime-go-install ]]; then budget=$((budget + 210)); fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then budget=$((budget + 60)); fi
-  timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
+  if ((receiver_status != 0)); then
+    transport=$receiver_status
+    : > "$out/rows/$case.stdout.log"
+    printf 'error: invalid or oversized inventory row program\n' > "$out/rows/$case.stderr.log"
+  else
+    # opts[0] is -n. Remove it only for this explicit pipe: SSH receives the
+    # exact program, never this TSV loop's stdin. The verified body sees EOF.
+    builtin printf '%s' "$row_program" | timeout --kill-after=5s "$budget" ssh "${opts[@]:1}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
+  fi
   read -r uptime _ < /proc/uptime
   elapsed=$(( (10#${uptime/./} - 10#$start_centis) / 100 ))
   verdict=HARNESS_ERROR; rc=$transport

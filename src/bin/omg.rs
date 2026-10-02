@@ -989,22 +989,26 @@ async fn async_main(args: Vec<String>) -> Result<()> {
 
 /// Validate package names for security
 fn command_requires_root(command: &Commands) -> bool {
+    let native_fedora = cfg!(feature = "fedora")
+        && matches!(
+            omg_lib::core::env::distro::detect_distro(),
+            omg_lib::core::env::distro::Distro::Fedora,
+        );
     match command {
         Commands::Sync => true,
+        // DNF5 --store resolves the complete plan without executing it, but
+        // requires root even for a preview. Keep invalid recursion on its
+        // existing unprivileged refusal path before any native plan is made.
+        Commands::Remove {
+            recursive: false, ..
+        } => native_fedora,
         Commands::Clean {
             orphans,
             cache,
             all,
             dry_run,
             ..
-        } => {
-            let native_fedora = cfg!(feature = "fedora")
-                && matches!(
-                    omg_lib::core::env::distro::detect_distro(),
-                    omg_lib::core::env::distro::Distro::Fedora,
-                );
-            !dry_run && (*orphans || *cache || *all) && !native_fedora
-        }
+        } => !dry_run && (*orphans || *cache || *all) && !native_fedora,
         _ => false,
     }
 }
@@ -1441,32 +1445,32 @@ async fn handle_migrate_command(command: &MigrateCommands) -> Result<()> {
     }
 }
 
+const fn command_supports_json(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Search { .. }
+            | Commands::Info { .. }
+            | Commands::Explicit { .. }
+            | Commands::ExplicitCount
+            | Commands::TotalCount
+            | Commands::OrphanCount
+            | Commands::UpdateCount
+            | Commands::List { .. }
+            | Commands::Status { .. }
+            | Commands::History { .. }
+            | Commands::Stats
+            | Commands::Outdated
+    )
+}
+
 /// Main command dispatcher - routes commands to appropriate handlers
 #[expect(clippy::too_many_lines)]
 async fn dispatch_command(command: &Commands, ctx: &omg_lib::cli::CliContext) -> Result<()> {
     // Global --json contract: reject unsupported combinations explicitly instead
-    // of silently emitting human-readable output (wave-5 F3). `privacy` is
-    // accepted because `privacy status` is the scripted JSON entrypoint.
-    if ctx.json
-        && !matches!(
-            command,
-            Commands::Search { .. }
-                | Commands::Info { .. }
-                | Commands::Explicit { .. }
-                | Commands::ExplicitCount
-                | Commands::TotalCount
-                | Commands::OrphanCount
-                | Commands::UpdateCount
-                | Commands::List { .. }
-                | Commands::Status { .. }
-                | Commands::History { .. }
-                | Commands::Stats
-                | Commands::Outdated
-                | Commands::Privacy { .. }
-        )
-    {
+    // of silently emitting human-readable output.
+    if ctx.json && !command_supports_json(command) {
         anyhow::bail!(
-            "--json is not supported for `{}`; supported: search, info, explicit, list, status, history, stats, outdated, privacy status",
+            "--json is not supported for `{}`; supported: search, info, explicit, list, status, history, stats, outdated",
             command_name(command)
         );
     }
@@ -2098,6 +2102,21 @@ mod fast_path_tests {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn privacy_commands_cannot_advertise_unimplemented_json() {
+        use omg_lib::cli::PrivacyCommands;
+        for command in [
+            None,
+            Some(PrivacyCommands::Status),
+            Some(PrivacyCommands::OptOut),
+            Some(PrivacyCommands::OptIn),
+            Some(PrivacyCommands::Export { output: None }),
+        ] {
+            assert!(!super::command_supports_json(&super::Commands::Privacy {
+                command
+            }));
+        }
+    }
+    #[test]
     fn update_flags_preserve_cached_execution() {
         use super::{UpdateExecution, update_execution};
         for (fast, turbo, no_sync, expected) in [
@@ -2199,6 +2218,85 @@ mod tests {
             assert_eq!(transaction.changes[0].new_version.as_deref(), Some("2.0"));
         }
         Ok(())
+    }
+
+    #[test]
+    fn native_fedora_removal_preview_requires_root_before_dispatch() {
+        let cli = Cli::try_parse_from(["omg", "remove", "--dry-run", "jq"]).unwrap();
+        let native_fedora = cfg!(feature = "fedora")
+            && matches!(
+                omg_lib::core::env::distro::detect_distro(),
+                omg_lib::core::env::distro::Distro::Fedora
+            );
+        assert_eq!(command_requires_root(&cli.command), native_fedora);
+    }
+
+    #[test]
+    fn native_fedora_removal_confirmation_requires_root_before_dispatch() {
+        let cli = Cli::try_parse_from(["omg", "remove", "jq"]).unwrap();
+        let native_fedora = cfg!(feature = "fedora")
+            && matches!(
+                omg_lib::core::env::distro::detect_distro(),
+                omg_lib::core::env::distro::Distro::Fedora
+            );
+        assert_eq!(command_requires_root(&cli.command), native_fedora);
+    }
+
+    #[tokio::test]
+    async fn native_fedora_removal_recursive_mode_refuses_without_elevation() {
+        for dry_run in [false, true] {
+            let command = Commands::Remove {
+                packages: vec!["jq".to_owned()],
+                recursive: true,
+                yes: false,
+                dry_run,
+            };
+            assert!(!command_requires_root(&command));
+            #[cfg(feature = "fedora")]
+            if matches!(
+                omg_lib::core::env::distro::detect_distro(),
+                omg_lib::core::env::distro::Distro::Fedora
+            ) {
+                let error =
+                    omg_lib::cli::packages::remove(&["jq".to_owned()], true, false, dry_run)
+                        .await
+                        .expect_err("Fedora recursion must refuse before a plan or confirmation");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Recursive removal is not supported")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_fedora_removal_reexec_preserves_dry_run_and_validation() {
+        let expected: Vec<String> = ["omg", "remove", "--dry-run", "--", "jq"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let mut args = expected.clone();
+        args.insert(1, omg_lib::core::privilege::ELEVATED_MARKER.to_owned());
+        assert_eq!(
+            strip_internal_invocation_markers(&mut args, true),
+            (true, false)
+        );
+        assert_eq!(args, expected);
+        #[cfg(feature = "arch")]
+        assert!(split_elevated_invocation(&args, false).is_none());
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(
+            matches!(&cli.command, Commands::Remove { dry_run: true, packages, .. }
+            if packages == &["jq"])
+        );
+        validate_package_security(&cli.command).unwrap();
+        let invalid = Cli::try_parse_from(["omg", "remove", "--dry-run", "--", "jq;id"]).unwrap();
+        assert!(validate_package_security(&invalid.command).is_err());
+        for args in [["omg", "search", "jq"], ["omg", "info", "jq"]] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(!command_requires_root(&cli.command));
+        }
     }
 
     #[test]

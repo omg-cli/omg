@@ -704,8 +704,6 @@ struct Resolver<'a> {
     /// Index into `assigned` for override-in-place.
     index: HashMap<String, usize>,
     unset: Vec<String>,
-    paths: Vec<String>,
-    sources: Vec<PathBuf>,
     redacted: HashSet<String>,
     patterns: &'a [String],
     strict: Strictness,
@@ -838,8 +836,6 @@ fn resolve_one(
         assigned: Vec::new(),
         index: HashMap::new(),
         unset: Vec::new(),
-        paths: Vec::new(),
-        sources: Vec::new(),
         redacted: HashSet::new(),
         patterns,
         strict,
@@ -852,22 +848,58 @@ fn resolve_one(
         for entry in &parsed.entries {
             resolver.apply_entry(entry, tools_phase)?;
         }
-        for (path, phase) in &parsed.paths {
-            if *phase == tools_phase {
-                resolver.paths.push(path.display().to_string());
-            }
+        let paths: Vec<String> = parsed
+            .paths
+            .iter()
+            .filter(|(_, phase)| *phase == tools_phase)
+            .map(|(path, _)| path.display().to_string())
+            .collect();
+        if !paths.is_empty() {
+            let current = resolver.lookup("PATH").unwrap_or_default();
+            let path = if current.is_empty() {
+                paths.join(":")
+            } else {
+                format!("{}:{current}", paths.join(":"))
+            };
+            // PATH is an ordered layer effect like any other assignment.
+            // Deferring it would hide parent paths from later source scripts
+            // and let a parent source overwrite a child's later directive.
+            resolver.assign("PATH", path, false);
         }
         for (script, phase) in &parsed.sources {
-            if *phase == tools_phase && !resolver.sources.contains(script) {
-                resolver.sources.push(script.clone());
+            if *phase != tools_phase {
+                continue;
             }
+            #[cfg(unix)]
+            {
+                // Resolve source effects in their declaring layer so later
+                // documents see them and can override them. Do not replay
+                // these scripts after the chain has already been merged.
+                let mut effective = resolver.base.clone();
+                effective.extend(resolver.assigned.iter().cloned());
+                for name in &resolver.unset {
+                    effective.remove(name);
+                }
+                let sourced = eval_sourced_file(script, &effective)?;
+                for (key, value) in sourced.set {
+                    resolver.assign(&key, value, false);
+                }
+                for key in sourced.unset {
+                    resolver.remove(&key);
+                }
+            }
+            #[cfg(not(unix))]
+            anyhow::bail!(
+                "_.source scripts require a Unix shell: {}",
+                script.display()
+            );
         }
     }
     Ok(ResolvedEnv {
         set: resolver.assigned,
         unset: resolver.unset,
-        path_additions: resolver.paths,
-        sources: resolver.sources,
+        path_additions: Vec::new(),
+        sources: Vec::new(),
         redacted: resolver.redacted,
     })
 }
@@ -1403,6 +1435,33 @@ mod tests {
         assert_eq!(get(&resolved, "A").as_deref(), Some("child"));
         assert!(get(&resolved, "B").is_none());
         assert!(resolved.unset.contains(&"B".to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chain_parent_source_supplies_child_templates_and_requirements() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mise.toml"),
+            "[env._]\nsource = \"parent.sh\"\n",
+        )
+        .expect("parent config");
+        std::fs::write(
+            dir.path().join("parent.sh"),
+            "export FROM_SOURCE=parent\nexport MODE=parent\n",
+        )
+        .expect("parent source");
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).expect("child directory");
+        std::fs::write(child.join("mise.toml"), "[env]\nMODE = \"child\"\nCOPY = \"{{env.FROM_SOURCE}}\"\nFROM_SOURCE = { required = true }\n").expect("child config");
+        let resolved = load_mise_env_chain(&child, &std::env::vars().collect(), Strictness::Strict)
+            .expect("source precedes child resolution");
+        assert_eq!(get(&resolved, "COPY").as_deref(), Some("parent"));
+        assert_eq!(get(&resolved, "MODE").as_deref(), Some("child"));
+        assert!(
+            resolved.sources.is_empty(),
+            "sources must be evaluated exactly once in their layer"
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -610,6 +611,202 @@ class HeadlineResolutionTests(unittest.TestCase):
         self.assertEqual(stderr.read_text(), "native failure\n")
         self.assertEqual((result.stdout, result.stderr), ("", ""))
 
+
+
+class FedoraBenchmarkIdentityTests(unittest.TestCase):
+    # Exact streams from run37047627326/attempt1 artifact11246206635,
+    # server-bound ZIP SHA4563fa20d3ee5731cf8114a407127d2e410b0e2ecca1a43964c8015f7eeb91d5.
+    PRODUCT = '\n  | Info\n    tree.x86_64\n          Name: tree.x86_64\n       Version: 2.2.1-4.fc44\n        Source: Official repository (dnf)\n     Installed: yes\n   Description: File system tree viewer\n'
+    NATIVE = 'Name        : tree\nVersion     : 2.2.1\nRelease     : 4.fc44\nArchitecture: x86_64\nInstall Date: Fri Oct  2 18:46:45 2026\nGroup       : Unspecified\nSize        : 122910\nLicense     : GPL-2.0-or-later AND LGPL-2.1-or-later\nSignature   :\n              RSA/SHA256, Mon Jan 19 08:40:13 2026, Key ID dbfcf71c6d9f90a6\nSource RPM  : tree-pkg-2.2.1-4.fc44.src.rpm\nBuild Date  : Sun Jan 18 22:06:31 2026\nBuild Host  : buildvm-x86-10.rdu3.fedoraproject.org\nPackager    : Fedora Project\nVendor      : Fedora Project\nURL         : https://oldmanprogrammer.net/source.php?dir=projects/tree\nBug URL     : https://bugz.fedoraproject.org/tree-pkg\nSummary     : File system tree viewer\nDescription :\nThe tree utility recursively displays the contents of directories in a\ntree-like format.  Tree is basically a UNIX port of the DOS tree\nutility.\n'
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="fedora-benchmark-info-")
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.script = Path(__file__).resolve().parents[1] / "benchmark-hyperfine.sh"
+
+    def definition(self, name: str) -> str:
+        text = self.script.read_text(encoding="utf-8")
+        marker = "    " + name + "() {\n"
+        if marker not in text:
+            return ""
+        body = text.split(marker, 1)[1].split("\n    }\n", 1)[0]
+        return name + "() {\n" + body + "\n}\n"
+
+    def normalize(self, value: str, native: bool = False, phase: str = "installed",
+                  arch: str = "x86_64", evr: str = "2.2.1-4.fc44") -> subprocess.CompletedProcess[str]:
+        path = self.directory / "input.txt"
+        path.write_text(value, encoding="utf-8")
+        return subprocess.run(
+            ["/bin/bash", "-s", "--", "true" if native else "false", str(path), phase, arch, evr],
+            input="set -euo pipefail\ndistro=fedora\n" + self.definition("normalize_info") + 'normalize_info "$@"\n',
+            cwd=self.directory, capture_output=True, text=True, check=False, timeout=10,
+        )
+
+    def query(self, value: str, phase: str = "installed", arch: str = "x86_64",
+              evr: str = "") -> subprocess.CompletedProcess[str]:
+        path = self.directory / "query.txt"
+        path.write_text(value, encoding="utf-8")
+        return subprocess.run(
+            ["/bin/bash", "-s", "--", str(path), phase, arch, evr],
+            input="set -euo pipefail\n" + self.definition("fedora_identity_from_query") + 'fedora_identity_from_query "$@"\n',
+            cwd=self.directory, capture_output=True, text=True, check=False, timeout=10,
+        )
+
+    def test_recorded_installed_info_preserves_exact_native_identity(self) -> None:
+        self.assertEqual(hashlib.sha256(self.PRODUCT.encode()).hexdigest(),
+                         "26bfa84afc88b7eea564031e47bc1fb9a82423608d4c668a1f9cc7c951b6c7cf")
+        self.assertEqual(hashlib.sha256(self.NATIVE.encode()).hexdigest(),
+                         "e9dd1f4385078aa444e85aeea8bf1bc106c11dd0b00fc993f67a2c852fac4e95")
+        for value, native in ((self.PRODUCT, False), (self.NATIVE, True)):
+            with self.subTest(native=native):
+                result = self.normalize(value, native)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "tree.x86_64\t2.2.1-4.fc44\n")
+
+    def test_installed_product_rejects_wrong_identity_version_and_duplicates(self) -> None:
+        for value in (
+            self.PRODUCT.replace("tree.x86_64", "tree"),
+            self.PRODUCT.replace("tree.x86_64", "tree.i686"),
+            self.PRODUCT.replace("tree.x86_64", "tree-x86_64"),
+            self.PRODUCT.replace("tree.x86_64", "tree.addon.x86_64"),
+            self.PRODUCT.replace("2.2.1-4.fc44", "2.2.2-4.fc44"),
+            self.PRODUCT.replace("Version: 2.2.1-4.fc44", "Version: 1:2.2.1-4.fc44"),
+            self.PRODUCT + "Name: tree.x86_64\n",
+            self.PRODUCT + "Version: 2.2.1-4.fc44\n",
+        ):
+            with self.subTest(value=value):
+                result = self.normalize(value)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "")
+
+    def test_native_info_rejects_wrong_fields_and_ambiguous_records(self) -> None:
+        for value in (
+            self.NATIVE.replace("Architecture: x86_64", "Architecture: i686"),
+            self.NATIVE.replace("Architecture: x86_64", "Architecture: "),
+            self.NATIVE.replace("Name        : tree", "Name        : tree.addon"),
+            self.NATIVE.replace("Version     : 2.2.1", "Version     : 2.2.2"),
+            self.NATIVE.replace("Release     : 4.fc44", "Release     : 5.fc44"),
+            self.NATIVE + "Architecture: x86_64\n",
+            self.NATIVE + "Name: tree\n",
+            self.NATIVE + "Version: 2.2.1\n",
+            self.NATIVE + "Release: 4.fc44\n",
+            self.NATIVE + "Epoch: 1\n",
+            self.NATIVE + "Epoch: 0\nEpoch: 0\n",
+        ):
+            with self.subTest(value=value):
+                result = self.normalize(value, True)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "")
+
+    def test_available_shape_is_explicit_and_epoch_remains_bound(self) -> None:
+        available = self.PRODUCT.replace("tree.x86_64", "tree").replace("Installed: yes", "Installed: no")
+        for value, native in ((available, False), (self.NATIVE, True)):
+            result = self.normalize(value, native, "available")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "tree.x86_64\t2.2.1-4.fc44\n")
+        self.assertNotEqual(self.normalize(self.PRODUCT, phase="available").returncode, 0)
+        self.assertNotEqual(self.normalize(available, phase="unknown").returncode, 0)
+        versioned = self.PRODUCT.replace("2.2.1-4.fc44", "2:2.2.1-4.fc44")
+        self.assertEqual(self.normalize(versioned, evr="2:2.2.1-4.fc44").stdout,
+                         "tree.x86_64\t2:2.2.1-4.fc44\n")
+        self.assertEqual(self.normalize(self.NATIVE + "Epoch: 2\n", True, evr="2:2.2.1-4.fc44").stdout,
+                         "tree.x86_64\t2:2.2.1-4.fc44\n")
+        self.assertNotEqual(self.normalize(self.NATIVE + "Epoch: 1\n", True, evr="2:2.2.1-4.fc44").returncode, 0)
+
+    def test_machine_query_pins_one_installed_or_exact_available_candidate(self) -> None:
+        installed = "tree\tx86_64\t0:2.2.1-4.fc44\n"
+        self.assertEqual(self.query(installed).stdout, "tree.x86_64\t2.2.1-4.fc44\n")
+        self.assertEqual(self.query(installed.replace("0:", "2:")).stdout,
+                         "tree.x86_64\t2:2.2.1-4.fc44\n")
+        available = installed + "tree\ti686\t0:2.2.1-4.fc44\n" + "tree\tx86_64\t0:2.1-1.fc44\n"
+        self.assertEqual(self.query(available, "available", evr="2.2.1-4.fc44").stdout,
+                         "tree.x86_64\t2.2.1-4.fc44\n")
+        for value, phase, evr in (
+            ("", "installed", ""), (installed * 2, "installed", ""),
+            (installed + "tree\ti686\t2.2.1-4.fc44\n", "installed", ""),
+            (installed.replace("x86_64", "i686"), "installed", ""),
+            (installed.replace("tree\t", "tree.addon\t"), "installed", ""),
+            (installed.replace("\t0:", "\t00:"), "installed", ""),
+            (installed.replace("x86_64", "x86-64"), "installed", ""),
+            (installed.replace("4.fc44", "4.fc44 extra"), "installed", ""),
+            (installed * 2, "available", "2.2.1-4.fc44"),
+            (installed, "available", "1:2.2.1-4.fc44"),
+            (installed.replace("x86_64", "i686"), "available", "2.2.1-4.fc44"),
+        ):
+            with self.subTest(value=value, phase=phase, evr=evr):
+                result = self.query(value, phase, evr=evr)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "")
+
+    def test_native_query_failure_preserves_streams_and_exact_exit(self) -> None:
+        tools = self.directory / "tools"
+        tools.mkdir()
+        for name in ("rpm", "dnf"):
+            executable = tools / name
+            executable.write_text("#!/bin/sh\nprintf 'tree\\tx86_64\\t0:2.2.1-4.fc44\\n'\nprintf 'native-query-refused\\n' >&2\nexit 17\n", encoding="utf-8")
+            executable.chmod(0o700)
+        definitions = self.definition("fedora_identity_from_query") + self.definition("capture_fedora_info_identity")
+        invocation = 'set -euo pipefail\nEXPORT_DIR=$1\n' + definitions + 'capture_fedora_info_identity installed "" ""\n'
+        result = subprocess.run(["/bin/bash", "-s", "--", str(self.directory)], input=invocation,
+                                cwd=self.directory, env={**os.environ, "PATH": str(tools) + ":" + os.environ["PATH"]},
+                                capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual((self.directory / "native-identity-query.stdout").read_text(), "tree\tx86_64\t0:2.2.1-4.fc44\n")
+        self.assertEqual((self.directory / "native-identity-query.stderr").read_text(), "native-query-refused\n")
+
+    def test_product_phase_requires_single_installed_flag(self) -> None:
+        for value, phase in (
+            (self.PRODUCT.replace("Installed: yes", "Installed: no"), "installed"),
+            (self.PRODUCT.replace("Installed: yes", "Installed: unknown"), "installed"),
+            (self.PRODUCT.replace("   Installed: yes\n", ""), "installed"),
+            (self.PRODUCT + "Installed: yes\n", "installed"),
+            (self.PRODUCT.replace("tree.x86_64", "tree"), "available"),
+        ):
+            with self.subTest(value=value, phase=phase):
+                result = self.normalize(value, phase=phase)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "")
+
+    def test_available_capture_is_cache_only_and_records_exact_native_arguments(self) -> None:
+        tools = self.directory / "tools"
+        tools.mkdir()
+        rpm = tools / "rpm"
+        rpm.write_text("#!/bin/sh\nprintf 'x86_64\\n'\n", encoding="utf-8")
+        dnf = tools / "dnf"
+        dnf.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$QUERY_ARGUMENTS\"\nprintf 'tree\\tx86_64\\t2:2.2.1-4.fc44\\ntree\\ti686\\t2:2.2.1-4.fc44\\ntree\\tx86_64\\t2.1-1.fc44\\n'\n", encoding="utf-8")
+        rpm.chmod(0o700)
+        dnf.chmod(0o700)
+        definitions = self.definition("fedora_identity_from_query") + self.definition("capture_fedora_info_identity")
+        invocation = 'set -euo pipefail\nEXPORT_DIR=$1\n' + definitions + 'capture_fedora_info_identity available -before "2:2.2.1-4.fc44"\n'
+        arguments = self.directory / "query-arguments.txt"
+        result = subprocess.run(["/bin/bash", "-s", "--", str(self.directory)], input=invocation,
+                                cwd=self.directory, env={**os.environ, "PATH": str(tools) + ":" + os.environ["PATH"], "QUERY_ARGUMENTS": str(arguments)},
+                                capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "tree.x86_64\t2:2.2.1-4.fc44\n")
+        self.assertEqual(arguments.read_text().splitlines(),
+                         ["--cacheonly", "repoquery", "--available", "--latest-limit=1", "--arch=x86_64", "--queryformat", "%{name}\t%{arch}\t%{evr}\\n", "tree"])
+        self.assertEqual((self.directory / "native-architecture.stdout").read_text(), "x86_64\n")
+        self.assertTrue((self.directory / "native-identity-query-before.stdout").read_text().startswith("tree\tx86_64\t2:"))
+        self.assertEqual((self.directory / "native-identity-query-before.stderr").read_text(), "")
+
+    def test_machine_query_refuses_oversized_available_stream(self) -> None:
+        value = "tree\tx86_64\t2.2.1-4.fc44\n" + "tree\ti686\t2.2.1-4.fc44\n" * 4000
+        self.assertGreater(len(value.encode()), 65536)
+        result = self.query(value, "available", evr="2.2.1-4.fc44")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout, "")
+
+    def test_non_fedora_name_version_contract_stays_bare_and_exact(self) -> None:
+        path = self.directory / "non-fedora.txt"
+        path.write_text("Name: tree\nVersion: 2.2.1-4\n", encoding="utf-8")
+        invocation = 'set -euo pipefail\ndistro=arch\n' + self.definition("normalize_info") + 'normalize_info false "$1" installed "" "2.2.1-4"\n'
+        result = subprocess.run(["/bin/bash", "-s", "--", str(path)], input=invocation,
+                                capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "tree\t2.2.1-4\n")
 
 if __name__ == "__main__":
     unittest.main()

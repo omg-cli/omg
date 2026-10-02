@@ -97,6 +97,39 @@ impl SystemBackendAccess {
     }
 }
 
+#[cfg_attr(
+    not(feature = "arch"),
+    allow(
+        clippy::needless_pass_by_value,
+        reason = "native retirement must consume backend ownership on Arch"
+    )
+)]
+fn retire_system_backend(backends: SystemBackendAccess) {
+    #[cfg(feature = "arch")]
+    if let SystemBackendAccess::Production {
+        alpm_worker: Some(alpm_worker),
+    } = backends
+    {
+        let mut retained = alpm_worker;
+        loop {
+            match Arc::try_unwrap(retained) {
+                Ok(worker) => {
+                    drop(worker);
+                    break;
+                }
+                Err(shared) => {
+                    // Retain the final owner so an async request releasing its
+                    // lease cannot inherit the native thread's blocking join.
+                    retained = shared;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "arch"))]
+    let _ = backends;
+}
+
 /// Index contents and their source observation are one publication unit.
 struct PublishedIndex {
     index: Arc<PackageIndex>,
@@ -121,8 +154,9 @@ pub struct DaemonState {
     /// Locked because RefreshIndex must swap in a fresh AlpmWorker: libalpm
     /// caches loaded syncdbs in memory and never revalidates them on disk, so
     /// a worker that predates `omg sync` serves a frozen update list forever.
-    system_backends: RwLock<SystemBackendAccess>,
-    refresh_lock: tokio::sync::Mutex<()>,
+    system_backends: Arc<RwLock<SystemBackendAccess>>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    native_tasks: tokio_util::task::TaskTracker,
     refresh_debounce: RefreshDebounce,
     index_generation: AtomicU64,
     pub(super) runtime_versions: Arc<RwLock<Vec<(String, String)>>>,
@@ -164,7 +198,7 @@ impl DaemonState {
     }
 
     /// Atomically publish a rebuilt index and invalidate derived caches.
-    fn replace_index(
+    pub(super) fn replace_index(
         &self,
         index: PackageIndex,
         #[cfg(feature = "arch")] epoch: crate::package_managers::pacman_db::AlpmCatalogEpoch,
@@ -181,6 +215,7 @@ impl DaemonState {
         };
         self.index_generation.fetch_add(1, Ordering::Release);
         self.cache.clear();
+        self.persistent.invalidate_status();
         package_count
     }
 
@@ -188,17 +223,72 @@ impl DaemonState {
     /// sync databases from disk. Called by RefreshIndex (after `omg sync`):
     /// without this, a worker created before the sync serves its frozen
     /// in-memory update list until daemon restart.
-    fn refresh_system_backends(&self) -> anyhow::Result<()> {
+    async fn refresh_system_backends(
+        &self,
+        refresh_guard: tokio::sync::OwnedMutexGuard<()>,
+        #[cfg(feature = "arch")] expected_epoch: Option<
+            crate::package_managers::pacman_db::AlpmCatalogEpoch,
+        >,
+    ) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
+        anyhow::ensure!(
+            !self.native_tasks.is_closed(),
+            "Native backends are shutting down"
+        );
         if !self.uses_production_backends() {
+            return Ok(refresh_guard);
+        }
+        let backends = Arc::clone(&self.system_backends);
+        let lifecycle = self.native_tasks.clone();
+        self.native_tasks
+            .spawn_blocking(move || {
+                // This task owns serialization even if its awaiting request is
+                // cancelled during uninterruptible native initialization/retirement.
+                let replacement = SystemBackendAccess::production()?;
+                anyhow::ensure!(!lifecycle.is_closed(), "Native backends are shutting down");
+                #[cfg(feature = "arch")]
+                if let Some(epoch) = expected_epoch {
+                    epoch.ensure_unchanged(
+                        crate::package_managers::pacman_db::AlpmCatalogEpoch::observe()?,
+                    )?;
+                }
+                let retired = {
+                    let mut current = backends
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::mem::replace(&mut *current, replacement)
+                };
+                retire_system_backend(retired);
+                Ok(refresh_guard)
+            })
+            .await
+            .context("Native backend refresh task panicked")?
+    }
+
+    pub(super) async fn drain_native_backends(
+        &self,
+        deadline: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        self.native_tasks.close();
+        if !self.uses_production_backends() && self.native_tasks.is_empty() {
             return Ok(());
         }
-        let replacement = SystemBackendAccess::production()?;
-        let mut backends = self
-            .system_backends
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *backends = replacement;
-        Ok(())
+        tokio::time::timeout(deadline, async {
+            let refresh_guard = Arc::clone(&self.refresh_lock).lock_owned().await;
+            let backends = Arc::clone(&self.system_backends);
+            self.native_tasks.spawn_blocking(move || {
+                let retired = {
+                    let mut current = backends.write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::mem::replace(&mut *current, SystemBackendAccess::Isolated)
+                };
+                retire_system_backend(retired);
+                drop(refresh_guard);
+            }).await.context("Native backend retirement task panicked")?;
+            self.native_tasks.wait().await;
+            anyhow::Ok(())
+        }).await.context(
+            "Native backend shutdown exceeded its deadline; uninterruptible native work may still be running"
+        )?
     }
 
     fn uses_production_backends(&self) -> bool {
@@ -208,9 +298,12 @@ impl DaemonState {
             .is_production()
     }
 
-    /// Rebuild the published index and reincarnate libalpm. Callers must hold
-    /// `refresh_lock`.
-    async fn rebuild_production_index(&self) -> anyhow::Result<usize> {
+    /// Rebuild the published index and reincarnate libalpm while owning refresh
+    /// serialization through native work and index publication.
+    async fn rebuild_production_index(
+        &self,
+        refresh_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> anyhow::Result<usize> {
         #[cfg(feature = "arch")]
         let arch_backend = self
             .system_backends
@@ -225,7 +318,13 @@ impl DaemonState {
             crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH
         };
         let index = PackageIndex::for_package_manager(Arc::clone(&self.package_manager)).await?;
-        self.refresh_system_backends()?;
+        let _refresh_guard = self
+            .refresh_system_backends(
+                refresh_guard,
+                #[cfg(feature = "arch")]
+                arch_backend.then_some(epoch),
+            )
+            .await?;
         #[cfg(feature = "arch")]
         if arch_backend {
             epoch.ensure_unchanged(
@@ -238,7 +337,6 @@ impl DaemonState {
             #[cfg(feature = "arch")]
             epoch,
         );
-        self.persistent.invalidate_status();
         Ok(packages)
     }
 
@@ -252,11 +350,11 @@ impl DaemonState {
         if !self.catalog_needs_heal() {
             return Ok(());
         }
-        let _refresh_guard = self.refresh_lock.lock().await;
+        let refresh_guard = Arc::clone(&self.refresh_lock).lock_owned().await;
         if !self.catalog_needs_heal() {
             return Ok(());
         }
-        self.rebuild_production_index().await?;
+        self.rebuild_production_index(refresh_guard).await?;
         Ok(())
     }
 
@@ -439,8 +537,9 @@ impl DaemonState {
             ),
             security_scan_lock: tokio::sync::Mutex::new(()),
             background_security_scans,
-            system_backends: RwLock::new(system_backends),
-            refresh_lock: tokio::sync::Mutex::new(()),
+            system_backends: Arc::new(RwLock::new(system_backends)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            native_tasks: tokio_util::task::TaskTracker::new(),
             refresh_debounce: RefreshDebounce::default(),
             index_generation: AtomicU64::new(0),
             runtime_versions: Arc::new(RwLock::new(Vec::new())),
@@ -566,7 +665,7 @@ async fn handle_refresh_index(state: Arc<DaemonState>, id: RequestId) -> Respons
     }
 
     let observed_generation = state.index_generation.load(Ordering::Acquire);
-    let _refresh_guard = state.refresh_lock.lock().await;
+    let refresh_guard = Arc::clone(&state.refresh_lock).lock_owned().await;
     if state.index_generation.load(Ordering::Acquire) != observed_generation {
         let packages = state.index_snapshot().len();
         tracing::debug!(packages, "Coalesced concurrent package index refresh");
@@ -589,7 +688,14 @@ async fn handle_refresh_index(state: Arc<DaemonState>, id: RequestId) -> Respons
         .refresh_debounce
         .should_skip(std::time::Instant::now(), disk_newer_than_loaded)
     {
-        if let Err(error) = state.refresh_system_backends() {
+        if let Err(error) = state
+            .refresh_system_backends(
+                refresh_guard,
+                #[cfg(feature = "arch")]
+                None,
+            )
+            .await
+        {
             return internal_error(id, format!("Failed to refresh package backends: {error:#}"));
         }
         let packages = state.index_snapshot().len();
@@ -600,7 +706,7 @@ async fn handle_refresh_index(state: Arc<DaemonState>, id: RequestId) -> Respons
         };
     }
 
-    let packages = match state.rebuild_production_index().await {
+    let packages = match state.rebuild_production_index(refresh_guard).await {
         Ok(packages) => packages,
         Err(error) => {
             return internal_error(id, format!("Failed to rebuild package index: {error:#}"));
@@ -854,8 +960,13 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
         return validation_error(id, format!("Invalid package name: {e}"));
     }
 
+    // DNF resolves installed architecture/build ambiguity against its current RPM
+    // snapshot. Repository records and name-keyed daemon caches cannot own that
+    // selection, including a canonical name cached by a prior full NEVRA query.
+    let cache_info = state.package_manager.name() != "dnf";
+
     // 1. Check cache first (Arc clone is cheap - just pointer copy)
-    if let Some(cached) = state.cache.get_info(&package) {
+    if cache_info && let Some(cached) = state.cache.get_info(&package) {
         // METRICS: Cache hit
         GLOBAL_METRICS.inc_cache_hits();
         return Response::Success {
@@ -864,7 +975,7 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
         };
     }
 
-    if state.cache.is_info_miss(&package) {
+    if cache_info && state.cache.is_info_miss(&package) {
         return not_found_error(id, format!("Package not found: {package}"));
     }
 
@@ -873,7 +984,7 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
 
     // 2. Try official index (instant hash lookup).
     let index = state.index_snapshot();
-    if let Some(pkg) = index.get(&package) {
+    if cache_info && let Some(pkg) = index.get(&package) {
         // Clone once, then use Arc for cheap sharing. Cache only while this
         // snapshot is still current; a refresh clears all older entries.
         let info = Arc::new(pkg);
@@ -903,14 +1014,20 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
                 url: String::new(), // info.url not in Package struct currently
                 size: 0,
                 download_size: 0,
-                repo: String::new(),
+                repo: if cache_info {
+                    String::new()
+                } else {
+                    "official".into()
+                },
                 depends: Vec::new(),
                 licenses: Vec::new(),
                 source: WirePackageSource::Official,
             });
-            state.with_current_index(&index, || {
-                state.cache.insert_info_arc(Arc::clone(&detailed));
-            });
+            if cache_info {
+                state.with_current_index(&index, || {
+                    state.cache.insert_info_arc(Arc::clone(&detailed));
+                });
+            }
             return Response::Success {
                 id,
                 result: ResponseResult::Info(Arc::unwrap_or_clone(detailed)),
@@ -941,11 +1058,12 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
     // Only a genuine miss (empty results or no exact name match) falls
     // through to the negative cache.
     #[cfg(feature = "arch")]
-    if state
-        .system_backends
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .has_alpm_worker()
+    if cache_info
+        && state
+            .system_backends
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_alpm_worker()
     {
         match tokio::time::timeout(DAEMON_INFO_AUR_TIMEOUT, search_detailed(&package)).await {
             Ok(Ok(details)) => {
@@ -991,9 +1109,11 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
         }
     }
 
-    state.with_current_index(&index, || {
-        state.cache.insert_info_miss(&package);
-    });
+    if cache_info {
+        state.with_current_index(&index, || {
+            state.cache.insert_info_miss(&package);
+        });
+    }
 
     not_found_error(id, format!("Package not found: {package}"))
 }
@@ -1115,12 +1235,15 @@ async fn handle_list_explicit(state: Arc<DaemonState>, id: RequestId) -> Respons
         };
     }
 
+    let index = state.index_snapshot();
     let packages_result = state.explicit_packages().await;
 
     match packages_result {
         Ok(packages) => {
             let packages_arc = Arc::new(packages);
-            state.cache.update_explicit_arc(Arc::clone(&packages_arc));
+            state.with_current_index(&index, || {
+                state.cache.update_explicit_arc(Arc::clone(&packages_arc));
+            });
             Response::Success {
                 id,
                 result: ResponseResult::Explicit(ExplicitResult {
@@ -1141,6 +1264,7 @@ async fn handle_explicit_count(state: Arc<DaemonState>, id: RequestId) -> Respon
         };
     }
 
+    let index = state.index_snapshot();
     let count_result = state
         .explicit_packages()
         .await
@@ -1148,7 +1272,9 @@ async fn handle_explicit_count(state: Arc<DaemonState>, id: RequestId) -> Respon
 
     match count_result {
         Ok(count) => {
-            state.cache.update_explicit_count(count);
+            state.with_current_index(&index, || {
+                state.cache.update_explicit_count(count);
+            });
             Response::Success {
                 id,
                 result: ResponseResult::ExplicitCount(count),
@@ -1425,10 +1551,287 @@ mod tests {
     type BackendFuture<'a, T> =
         std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
 
+    enum InfoReply {
+        Found(crate::core::Package),
+        Failed(&'static str),
+    }
+
+    struct InfoSelectionBackend {
+        inner: crate::package_managers::mock::MockPackageManager,
+        backend_name: &'static str,
+        replies: std::collections::HashMap<&'static str, InfoReply>,
+    }
+
+    impl PackageManager for InfoSelectionBackend {
+        fn name(&self) -> &'static str {
+            self.backend_name
+        }
+        fn search(&self, query: &str) -> BackendFuture<'_, Vec<crate::core::Package>> {
+            self.inner.search(query)
+        }
+        fn install(&self, packages: &[String]) -> BackendFuture<'_, ()> {
+            self.inner.install(packages)
+        }
+        fn remove(&self, packages: &[String]) -> BackendFuture<'_, ()> {
+            self.inner.remove(packages)
+        }
+        fn update(&self) -> BackendFuture<'_, ()> {
+            self.inner.update()
+        }
+        fn sync(&self) -> BackendFuture<'_, ()> {
+            self.inner.sync()
+        }
+        fn info(&self, package: &str) -> BackendFuture<'_, Option<crate::core::Package>> {
+            let result = match self.replies.get(package) {
+                Some(InfoReply::Found(info)) => Ok(Some(info.clone())),
+                Some(InfoReply::Failed(message)) => Err(anyhow::anyhow!("{message}")),
+                None => Ok(None),
+            };
+            Box::pin(async move { result })
+        }
+        fn list_installed(&self) -> BackendFuture<'_, Vec<crate::core::Package>> {
+            self.inner.list_installed()
+        }
+        fn get_status(&self, fast: bool) -> BackendFuture<'_, (usize, usize, usize, usize)> {
+            self.inner.get_status(fast)
+        }
+        fn list_explicit(&self) -> BackendFuture<'_, Vec<String>> {
+            self.inner.list_explicit()
+        }
+        fn list_updates(
+            &self,
+        ) -> BackendFuture<'_, Vec<crate::package_managers::types::UpdateInfo>> {
+            self.inner.list_updates()
+        }
+        fn is_installed(&self, package: &str) -> BackendFuture<'_, bool> {
+            self.inner.is_installed(package)
+        }
+    }
+
+    fn installed_info(name: &str, version: &str) -> crate::core::Package {
+        crate::core::Package {
+            name: name.into(),
+            version: crate::package_managers::types::parse_version(version)
+                .expect("backend info fixture version must parse"),
+            description: "Installed RPM metadata".into(),
+            source: crate::core::PackageSource::Official,
+            installed: true,
+        }
+    }
+
+    fn info_selection_state(
+        backend_name: &'static str,
+        records: &[(&str, &str, &str)],
+        replies: impl IntoIterator<Item = (&'static str, InfoReply)>,
+    ) -> anyhow::Result<(tempfile::TempDir, Arc<DaemonState>)> {
+        for (_, version, _) in records {
+            crate::package_managers::types::parse_version(version)
+                .expect("index info fixture version must parse");
+        }
+        let directory = tempfile::tempdir()?;
+        let backend = InfoSelectionBackend {
+            inner: crate::package_managers::mock::MockPackageManager::new_in(
+                "arch",
+                directory.path(),
+            ),
+            backend_name,
+            replies: replies.into_iter().collect(),
+        };
+        let state = DaemonState::new_isolated(
+            directory.path(),
+            PackageIndex::from_records(records),
+            Arc::new(backend),
+        )?;
+        Ok((directory, Arc::new(state)))
+    }
+
+    #[tokio::test]
+    async fn dnf_info_uses_installed_identity_over_repository_index() -> anyhow::Result<()> {
+        for cache_seed in ["none", "positive", "negative"] {
+            let (_directory, state) = info_selection_state(
+                "dnf",
+                &[
+                    ("bash", "5.4-1", "Repository candidate"),
+                    ("bash.x86_64", "5.2-1", "Stale installed index"),
+                ],
+                ["bash", "bash.x86_64", "bash-5.3.9-3.x86_64"].map(|query| {
+                    (
+                        query,
+                        InfoReply::Found(installed_info("bash.x86_64", "5.3.9-3")),
+                    )
+                }),
+            )?;
+            match cache_seed {
+                "positive" => {
+                    state
+                        .cache
+                        .insert_info(state.index_snapshot().get("bash").unwrap());
+                    state
+                        .cache
+                        .insert_info(state.index_snapshot().get("bash.x86_64").unwrap());
+                }
+                "negative" => {
+                    state.cache.insert_info_miss("bash");
+                    state.cache.insert_info_miss("bash.x86_64");
+                }
+                _ => {}
+            }
+            for query in ["bash", "bash", "bash.x86_64", "bash-5.3.9-3.x86_64"] {
+                let Response::Success {
+                    result: ResponseResult::Info(info),
+                    ..
+                } = handle_info(Arc::clone(&state), 1, query.into()).await
+                else {
+                    panic!("installed info must succeed for {query} with {cache_seed} cache");
+                };
+                assert_eq!(info.name, "bash.x86_64", "{query}/{cache_seed}");
+                assert_eq!(info.version, "5.3.9-3", "{query}/{cache_seed}");
+                assert_eq!(info.description, "Installed RPM metadata");
+                assert_eq!(info.source, WirePackageSource::Official);
+                assert_eq!(info.repo, "official");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dnf_info_uses_available_backend_metadata_after_installed_miss() -> anyhow::Result<()> {
+        let available = crate::core::Package {
+            installed: false,
+            description: "Current available repository metadata".into(),
+            ..installed_info("available-tool", "2.0-2")
+        };
+        let (_directory, state) = info_selection_state(
+            "dnf",
+            &[("available-tool", "1.0-1", "Stale repository metadata")],
+            [("available-tool", InfoReply::Found(available))],
+        )?;
+        for _ in 0..2 {
+            let Response::Success {
+                result: ResponseResult::Info(info),
+                ..
+            } = handle_info(Arc::clone(&state), 1, "available-tool".into()).await
+            else {
+                panic!("an available package must succeed after an installed-package miss");
+            };
+            assert_eq!(info.name, "available-tool");
+            assert_eq!(info.version, "2.0-2");
+            assert_eq!(info.description, "Current available repository metadata");
+            assert_eq!(info.source, WirePackageSource::Official);
+            assert_eq!(info.repo, "official");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dnf_info_reports_ambiguity_after_nevra_lookup() -> anyhow::Result<()> {
+        let cause = "Package has multiple installed builds; specify the full NEVRA";
+        let (_directory, state) = info_selection_state(
+            "dnf",
+            &[
+                ("kernel-core", "6.19-1", "Repository candidate"),
+                ("kernel-core.x86_64", "6.18-1", "First installed build"),
+            ],
+            [
+                ("kernel-core", InfoReply::Failed(cause)),
+                ("kernel-core.x86_64", InfoReply::Failed(cause)),
+                (
+                    "kernel-core-6.18-1.x86_64",
+                    InfoReply::Found(installed_info("kernel-core.x86_64", "6.18-1")),
+                ),
+            ],
+        )?;
+        assert!(matches!(
+            handle_info(Arc::clone(&state), 1, "kernel-core-6.18-1.x86_64".into()).await,
+            Response::Success {
+                result: ResponseResult::Info(_),
+                ..
+            }
+        ));
+        for query in ["kernel-core.x86_64", "kernel-core"] {
+            let Response::Error { code, message, .. } =
+                handle_info(Arc::clone(&state), 2, query.into()).await
+            else {
+                panic!("ambiguous {query} must refuse after a full NEVRA lookup");
+            };
+            assert_eq!(code, error_codes::INTERNAL_ERROR);
+            assert!(message.contains(cause), "{message}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dnf_info_preserves_native_errors_and_misses_over_index() -> anyhow::Result<()> {
+        for fails in [false, true] {
+            let replies = if fails {
+                vec![("bash", InfoReply::Failed("RPM database unavailable"))]
+            } else {
+                Vec::new()
+            };
+            let (_directory, state) =
+                info_selection_state("dnf", &[("bash", "5.3-1", "Old repository index")], replies)?;
+            state
+                .cache
+                .insert_info(state.index_snapshot().get("bash").unwrap());
+            let Response::Error { code, message, .. } =
+                handle_info(Arc::clone(&state), 1, "bash".into()).await
+            else {
+                panic!("cached repository metadata must not hide a native error or miss");
+            };
+            if fails {
+                assert_eq!(code, error_codes::INTERNAL_ERROR);
+                assert!(message.contains("RPM database unavailable"));
+            } else {
+                assert_eq!(code, error_codes::PACKAGE_NOT_FOUND);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_dnf_info_retains_index_and_cache_fast_paths() -> anyhow::Result<()> {
+        for backend_name in ["pacman", "apt", "brew"] {
+            let (_directory, state) = info_selection_state(
+                backend_name,
+                &[("bash", "5.3", "Repository metadata")],
+                [("bash", InfoReply::Failed("Backend should not be queried"))],
+            )?;
+            let Response::Success {
+                result: ResponseResult::Info(info),
+                ..
+            } = handle_info(Arc::clone(&state), 1, "bash".into()).await
+            else {
+                panic!("{backend_name} index fast path must remain available");
+            };
+            assert_eq!(info.name, "bash");
+            assert_eq!(info.description, "Repository metadata");
+            state.cache.insert_info(DetailedPackageInfo {
+                version: "cached-version".into(),
+                ..info
+            });
+            let Response::Success {
+                result: ResponseResult::Info(cached),
+                ..
+            } = handle_info(Arc::clone(&state), 2, "bash".into()).await
+            else {
+                panic!("{backend_name} cached fast path must remain available");
+            };
+            assert_eq!(cached.version, "cached-version");
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    enum PausedLookup {
+        Info,
+        Explicit,
+    }
+
     struct PausedInfoBackend {
         inner: crate::package_managers::mock::MockPackageManager,
         started: tokio::sync::Notify,
         resume: tokio::sync::Notify,
+        lookup: PausedLookup,
     }
 
     impl PackageManager for PausedInfoBackend {
@@ -1454,8 +1857,10 @@ mod tests {
             let lookup = self.inner.info(package);
             Box::pin(async move {
                 let result = lookup.await;
-                self.started.notify_one();
-                self.resume.notified().await;
+                if matches!(self.lookup, PausedLookup::Info) {
+                    self.started.notify_one();
+                    self.resume.notified().await;
+                }
                 result
             })
         }
@@ -1466,7 +1871,14 @@ mod tests {
             self.inner.get_status(fast)
         }
         fn list_explicit(&self) -> BackendFuture<'_, Vec<String>> {
-            self.inner.list_explicit()
+            Box::pin(async move {
+                let result = self.inner.list_explicit().await;
+                if matches!(self.lookup, PausedLookup::Explicit) {
+                    self.started.notify_one();
+                    self.resume.notified().await;
+                }
+                result
+            })
         }
         fn list_updates(
             &self,
@@ -1489,6 +1901,7 @@ mod tests {
                 ),
                 started: tokio::sync::Notify::new(),
                 resume: tokio::sync::Notify::new(),
+                lookup: PausedLookup::Info,
             });
             let state = Arc::new(
                 DaemonState::new_isolated(directory.path(), PackageIndex::empty(), backend.clone())
@@ -1563,6 +1976,385 @@ mod tests {
             };
             assert_eq!(info.version, "99.0");
         }
+    }
+
+    fn paused_explicit_state()
+    -> anyhow::Result<(tempfile::TempDir, Arc<DaemonState>, Arc<PausedInfoBackend>)> {
+        let directory = tempfile::tempdir()?;
+        let backend = Arc::new(PausedInfoBackend {
+            inner: crate::package_managers::mock::MockPackageManager::new_in(
+                "arch",
+                directory.path(),
+            ),
+            started: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+            lookup: PausedLookup::Explicit,
+        });
+        backend.inner.set_installed_version("old-package", "1")?;
+        let state = Arc::new(DaemonState::new_isolated(
+            directory.path(),
+            PackageIndex::from_records(&[("old-package", "1", "old snapshot")]),
+            backend.clone(),
+        )?);
+        Ok((directory, state, backend))
+    }
+
+    #[tokio::test]
+    async fn daemon_publication_explicit_list_cannot_resurrect_a_stale_cache() -> anyhow::Result<()>
+    {
+        let (_directory, state, backend) = paused_explicit_state()?;
+        let request_state = Arc::clone(&state);
+        let request = tokio::spawn(async move { handle_list_explicit(request_state, 1).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.started.notified(),
+        )
+        .await?;
+        backend.inner.remove(&["old-package".into()]).await?;
+        backend.inner.set_installed_version("fresh-package", "2")?;
+        state.replace_index(
+            PackageIndex::from_records(&[("fresh-package", "2", "fresh snapshot")]),
+            #[cfg(feature = "arch")]
+            crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+        );
+        backend.resume.notify_one();
+        let response = request.await?;
+        assert!(matches!(response, Response::Success { .. }));
+        assert!(
+            state.cache.get_explicit().is_none(),
+            "old list must not regain a fresh TTL"
+        );
+        assert!(state.cache.get_explicit_count().is_none());
+        backend.resume.notify_one();
+        let Response::Success {
+            result: ResponseResult::Explicit(result),
+            ..
+        } = handle_list_explicit(Arc::clone(&state), 2).await
+        else {
+            panic!("fresh lookup must succeed")
+        };
+        assert_eq!(result.packages, ["fresh-package"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_publication_explicit_count_cannot_resurrect_a_stale_cache() -> anyhow::Result<()>
+    {
+        let (_directory, state, backend) = paused_explicit_state()?;
+        let request_state = Arc::clone(&state);
+        let request = tokio::spawn(async move { handle_explicit_count(request_state, 3).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.started.notified(),
+        )
+        .await?;
+        backend.inner.remove(&["old-package".into()]).await?;
+        state.replace_index(
+            PackageIndex::empty(),
+            #[cfg(feature = "arch")]
+            crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+        );
+        backend.resume.notify_one();
+        let response = request.await?;
+        assert!(matches!(response, Response::Success { .. }));
+        assert!(
+            state.cache.get_explicit_count().is_none(),
+            "old count must not regain a fresh TTL"
+        );
+        backend.resume.notify_one();
+        let Response::Success {
+            result: ResponseResult::ExplicitCount(count),
+            ..
+        } = handle_explicit_count(Arc::clone(&state), 4).await
+        else {
+            panic!("fresh count must succeed")
+        };
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "arch")]
+    #[serial_test::serial]
+    fn daemon_native_initializer_does_not_block_the_async_executor() -> anyhow::Result<()> {
+        if crate::core::is_root() {
+            eprintln!("skipped: native path overrides require an unprivileged fixture run");
+            return Ok(());
+        }
+        with_native_backend_fixture(|state, directory| {
+            let config = directory.join("pacman.conf");
+            std::fs::remove_file(&config)?;
+            nix::unistd::mkfifo(&config, nix::sys::stat::Mode::S_IRWXU)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async move {
+                let (tick, ticks) = std::sync::mpsc::channel();
+                let controller = std::thread::spawn(move || -> anyhow::Result<bool> {
+                    use std::io::Write;
+                    let responsive = ticks
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .is_ok();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(config)?
+                        .write_all(NATIVE_FIXTURE_CONFIG.as_bytes())?;
+                    Ok(responsive)
+                });
+                let ticker = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    let _ = tick.send(());
+                });
+                tokio::task::yield_now().await;
+                let refresh_guard = Arc::clone(&state.refresh_lock).lock_owned().await;
+                let refreshed = state.refresh_system_backends(refresh_guard, None).await;
+                let responsive = controller.join().expect("fixture controller completed")?;
+                refreshed?;
+                ticker.await?;
+                assert!(
+                    responsive,
+                    "native initialization prevented an unrelated timer from running"
+                );
+                Ok(())
+            })
+        })
+    }
+
+    #[test]
+    #[cfg(feature = "arch")]
+    #[serial_test::serial]
+    fn daemon_native_retirement_releases_backend_lock_and_executor() -> anyhow::Result<()> {
+        if crate::core::is_root() {
+            eprintln!("skipped: native path overrides require an unprivileged fixture run");
+            return Ok(());
+        }
+        with_native_backend_fixture(|state, _directory| {
+            let (started, shutdown_started) = std::sync::mpsc::channel();
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let (release, released) = std::sync::mpsc::channel();
+            let worker = crate::package_managers::alpm_worker::worker_with_shutdown_gate(
+                started,
+                Arc::clone(&notify),
+                released,
+            );
+            *state.system_backends.write().expect("fixture backend lock") =
+                SystemBackendAccess::Production {
+                    alpm_worker: Some(Arc::new(worker)),
+                };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async move {
+                let (tick, ticks) = std::sync::mpsc::channel();
+                let observed_state = Arc::clone(&state);
+                let controller = std::thread::spawn(move || -> anyhow::Result<(bool, bool)> {
+                    shutdown_started.recv_timeout(std::time::Duration::from_secs(5))?;
+                    let lock_free = observed_state.system_backends.try_read().is_ok();
+                    let responsive = ticks
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .is_ok();
+                    release.send(())?;
+                    Ok((lock_free, responsive))
+                });
+                let ticker = tokio::spawn(async move {
+                    notify.notified().await;
+                    let _ = tick.send(());
+                });
+                let refresh_guard = Arc::clone(&state.refresh_lock).lock_owned().await;
+                let refreshed = state.refresh_system_backends(refresh_guard, None).await;
+                let (lock_free, responsive) =
+                    controller.join().expect("fixture controller completed")?;
+                refreshed?;
+                ticker.await?;
+                assert!(
+                    lock_free,
+                    "retired worker was destroyed while holding the backend write lock"
+                );
+                assert!(
+                    responsive,
+                    "native destruction blocked an unrelated async task"
+                );
+                Ok(())
+            })
+        })
+    }
+
+    #[cfg(feature = "arch")]
+    const NATIVE_FIXTURE_CONFIG: &str = "[options]\nSigLevel = Optional TrustAll\n\n[core]\nServer = https://example.invalid/$repo/os/$arch\n";
+
+    #[test]
+    #[cfg(feature = "arch")]
+    #[serial_test::serial]
+    fn daemon_native_cancelled_request_retains_serialization_until_work_finishes()
+    -> anyhow::Result<()> {
+        if crate::core::is_root() {
+            eprintln!("skipped: native path overrides require an unprivileged fixture run");
+            return Ok(());
+        }
+        with_native_backend_fixture(|state, directory| {
+            let config = directory.join("pacman.conf");
+            std::fs::remove_file(&config)?;
+            nix::unistd::mkfifo(&config, nix::sys::stat::Mode::S_IRWXU)?;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    let request_state = Arc::clone(&state);
+                    let request = tokio::spawn(async move {
+                        let guard = Arc::clone(&request_state.refresh_lock).lock_owned().await;
+                        request_state.refresh_system_backends(guard, None).await
+                    });
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while state.native_tasks.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await?;
+                    request.abort();
+                    assert!(
+                        request
+                            .await
+                            .expect_err("request was cancelled")
+                            .is_cancelled()
+                    );
+                    assert!(
+                        state.refresh_lock.try_lock().is_err(),
+                        "request cancellation must not admit another native replacement"
+                    );
+                    let controller = std::thread::spawn(move || -> anyhow::Result<()> {
+                        use std::io::Write;
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(config)?
+                            .write_all(NATIVE_FIXTURE_CONFIG.as_bytes())?;
+                        Ok(())
+                    });
+                    state
+                        .drain_native_backends(std::time::Duration::from_secs(5))
+                        .await?;
+                    controller.join().expect("fixture writer completed")?;
+                    assert!(
+                        state.native_tasks.is_empty(),
+                        "shutdown must join cancelled request's native work"
+                    );
+                    Ok(())
+                })
+        })
+    }
+
+    #[test]
+    #[cfg(feature = "arch")]
+    #[serial_test::serial]
+    fn daemon_native_retirement_keeps_final_join_off_the_request_executor() -> anyhow::Result<()> {
+        if crate::core::is_root() {
+            eprintln!("skipped: native path overrides require an unprivileged fixture run");
+            return Ok(());
+        }
+        with_native_backend_fixture(|state, _directory| {
+            let (started, shutdown_started) = std::sync::mpsc::channel();
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let (release, released) = std::sync::mpsc::channel();
+            let worker = Arc::new(
+                crate::package_managers::alpm_worker::worker_with_shutdown_gate(
+                    started,
+                    Arc::clone(&notify),
+                    released,
+                ),
+            );
+            *state.system_backends.write().expect("fixture backend lock") =
+                SystemBackendAccess::Production {
+                    alpm_worker: Some(Arc::clone(&worker)),
+                };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    let (tick, ticks) = std::sync::mpsc::channel();
+                    let controller = std::thread::spawn(move || -> anyhow::Result<bool> {
+                        shutdown_started.recv_timeout(std::time::Duration::from_secs(5))?;
+                        let responsive = ticks
+                            .recv_timeout(std::time::Duration::from_secs(2))
+                            .is_ok();
+                        release.send(())?;
+                        Ok(responsive)
+                    });
+                    let ticker = tokio::spawn(async move {
+                        notify.notified().await;
+                        let _ = tick.send(());
+                    });
+                    let request_state = Arc::clone(&state);
+                    let refresh = tokio::spawn(async move {
+                        let guard = Arc::clone(&request_state.refresh_lock).lock_owned().await;
+                        request_state.refresh_system_backends(guard, None).await
+                    });
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        loop {
+                            let old_is_published = {
+                                let current =
+                                    state.system_backends.read().expect("fixture backend lock");
+                                matches!(&*current, SystemBackendAccess::Production { alpm_worker: Some(alpm_worker) }
+                                if Arc::ptr_eq(alpm_worker, &worker))
+                            };
+                            if !old_is_published {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await?;
+                    drop(worker);
+                    drop(refresh.await??);
+                    ticker.await?;
+                    assert!(
+                        controller.join().expect("fixture controller completed")?,
+                        "last request lease inherited the native thread's blocking join"
+                    );
+                    state
+                        .drain_native_backends(std::time::Duration::from_secs(5))
+                        .await?;
+                    Ok(())
+                })
+        })
+    }
+
+    #[cfg(feature = "arch")]
+    fn with_native_backend_fixture(
+        run: impl FnOnce(Arc<DaemonState>, &Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let database = directory.path().join("db");
+        let config = directory.path().join("pacman.conf");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir_all(database.join("local"))?;
+        std::fs::create_dir_all(database.join("sync"))?;
+        std::fs::write(&config, NATIVE_FIXTURE_CONFIG)?;
+        // libalpm creates its database-version marker on first open. Bootstrap
+        // this private database before the production epoch-stability bracket.
+        drop(alpm::Alpm::new::<&str>(
+            root.to_string_lossy().as_ref(),
+            database.to_string_lossy().as_ref(),
+        )?);
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_ROOT", Some(root.as_os_str())),
+                ("OMG_PACMAN_DB_DIR", Some(database.as_os_str())),
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+            ],
+            || {
+                let state = Arc::new(DaemonState::new_isolated(
+                    directory.path(),
+                    PackageIndex::empty(),
+                    Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+                        "arch",
+                        directory.path(),
+                    )),
+                )?);
+                *state.system_backends.write().expect("fixture backend lock") =
+                    SystemBackendAccess::production()?;
+                run(state, directory.path())
+            },
+        )
     }
 
     #[test]
@@ -1787,7 +2579,7 @@ mod tests {
             let mut state =
                 DaemonState::new_isolated(directory.path(), PackageIndex::empty(), manager)
                     .unwrap();
-            state.system_backends = RwLock::new(SystemBackendAccess::Production {});
+            state.system_backends = Arc::new(RwLock::new(SystemBackendAccess::Production {}));
             assert_eq!(state.status_counts().await.unwrap(), (1, 1, 0, 0));
             assert_eq!(state.explicit_packages().await.unwrap(), vec!["git"]);
         }

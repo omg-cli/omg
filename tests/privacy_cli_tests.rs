@@ -118,6 +118,14 @@ fn test_privacy_export_without_license() {
     init_test_env();
     let project = TestProject::new();
     let output_path = project.path().join("local-export.json");
+    let config = "telemetry_enabled = false\n";
+    fs::write(project.config_dir.path().join("config.toml"), config).unwrap();
+    let usage = serde_json::json!({ "commands": { "privacy": 2 } });
+    fs::write(
+        project.data_dir.path().join("usage.json"),
+        serde_json::to_vec(&usage).unwrap(),
+    )
+    .unwrap();
 
     let result = project.run(&[
         "privacy",
@@ -129,8 +137,11 @@ fn test_privacy_export_without_license() {
     result.assert_success();
     let exported: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
-    assert!(exported.get("local").is_some());
+    assert_eq!(exported["scope"], "local");
+    assert_eq!(exported["local"]["config.toml"], config);
+    assert_eq!(exported["local"]["usage.json"], usage);
     assert!(exported["remote"].is_null());
+    project.close_checked();
 }
 
 // test_privacy_export_with_output_flag deleted (tst03): redundant duplicate of
@@ -432,24 +443,58 @@ fn test_privacy_status_shows_env_override() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_privacy_status_json_output() {
-    // ===== ARRANGE =====
+fn test_privacy_status_rejects_unimplemented_json() {
     init_test_env();
 
-    // ===== ACT =====
-    let result = run_omg(&["--json", "privacy", "status"]);
+    // Privacy status renders human text; parser acceptance of a global flag
+    // must not turn that text into a successful scripted JSON response.
+    let requests: [&[&str]; 4] = [
+        &["--json", "privacy"],
+        &["privacy", "--json"],
+        &["--json", "privacy", "status"],
+        &["privacy", "status", "--json"],
+    ];
+    for request in requests {
+        let result = run_omg(request);
+        result.assert_failure();
+        assert_eq!(result.exit_code, 1, "request: {request:?}");
+        assert!(result.stdout.is_empty(), "request: {request:?}: {result:?}");
+        result.assert_stderr_contains("--json is not supported for `privacy`");
+    }
+}
 
-    // ===== ASSERT =====
-    // The global --json gate explicitly allowlists `privacy` and documents it
-    // as the scripted JSON entrypoint (src/bin/omg.rs dispatch_command), so a
-    // scripted caller must get exit-code success. NOTE: the handler currently
-    // renders human-readable text even under --json; that gap is recorded as a
-    // SUSPECTED PRODUCT BUG in the tst03 report rather than asserted here.
-    result.assert_success();
-    assert!(
-        !result.combined_output().trim().is_empty(),
-        "--json privacy status must produce output"
-    );
+#[test]
+fn test_privacy_json_rejects_mutating_subcommands_before_dispatch() {
+    for subcommand in ["opt-in", "opt-out", "export"] {
+        let project = TestProject::new();
+        let config_path = project.config_dir.path().join("config.toml");
+        let config = if subcommand == "opt-out" {
+            "telemetry_enabled = true\n"
+        } else {
+            "telemetry_enabled = false\n"
+        };
+        fs::write(&config_path, config).unwrap();
+        let output_path = project.path().join("existing-export.json");
+        let original_export = b"{\"sentinel\":true}\n";
+        fs::write(&output_path, original_export).unwrap();
+        let mut request = vec!["--json", "privacy", subcommand];
+        if subcommand == "export" {
+            request.extend(["--output", output_path.to_str().unwrap()]);
+        }
+
+        let result = project.run(&request);
+
+        result.assert_failure();
+        assert_eq!(result.exit_code, 1, "subcommand: {subcommand}");
+        assert!(
+            result.stdout.is_empty(),
+            "subcommand: {subcommand}: {result:?}"
+        );
+        result.assert_stderr_contains("--json is not supported for `privacy`");
+        assert_eq!(fs::read(&config_path).unwrap(), config.as_bytes());
+        assert_eq!(fs::read(&output_path).unwrap(), original_export);
+        project.close_checked();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

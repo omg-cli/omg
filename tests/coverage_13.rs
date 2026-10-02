@@ -102,10 +102,9 @@ fn build_with_default_dockerfile_reaches_the_engine() {
     );
 }
 
-/// Contract: project marker files are detected and each mapped to its pinned
-/// runtime installation block in the generated Dockerfile:
-/// package.json → node (NODE_VERSION=20), Cargo.toml → rust,
-/// go.mod → go (GO_VERSION=1.22.0), requirements.txt → python (PYTHON_VERSION=3.12).
+/// Contract: marker-only projects use honest distribution defaults for Node,
+/// Go and Python, while Rust retains the documented stable toolchain recipe.
+/// A marker must not invent a numeric version pin.
 #[test]
 fn init_detects_project_runtimes_into_dockerfile() {
     let project = TestProject::new();
@@ -118,22 +117,129 @@ fn init_detects_project_runtimes_into_dockerfile() {
     result.assert_success();
 
     let dockerfile = project.read_file("Dockerfile.omg").expect("dockerfile");
-    assert!(
-        dockerfile.contains("ENV NODE_VERSION=20\n"),
-        "node runtime block missing:\n{dockerfile}"
-    );
+    for (runtime, package) in [
+        ("node", "nodejs"),
+        ("go", "golang-go"),
+        ("python", "python3"),
+    ] {
+        assert!(
+            dockerfile.contains(&format!(
+                "# {runtime}: distribution default (no version pin)"
+            )) && dockerfile.contains(&format!("apt-get install -y {package} &&")),
+            "{runtime} must use a labelled distribution package:\n{dockerfile}"
+        );
+        result.assert_stdout_contains(&format!("{runtime}: distribution default (no version pin)"));
+    }
+    for invented_pin in [
+        "ENV NODE_VERSION=",
+        "ENV GO_VERSION=",
+        "ENV PYTHON_VERSION=",
+    ] {
+        assert!(
+            !dockerfile.contains(invented_pin),
+            "marker-only project must not invent {invented_pin}:\n{dockerfile}"
+        );
+    }
     assert!(
         dockerfile.contains("# Install Rust") && dockerfile.contains("--default-toolchain stable"),
         "rust runtime block missing:\n{dockerfile}"
     );
     assert!(
-        dockerfile.contains("ENV GO_VERSION=1.22.0\n"),
-        "go runtime block missing:\n{dockerfile}"
+        dockerfile.contains("sha256sum -c -"),
+        "Rust installer must retain its checksum verification:\n{dockerfile}"
     );
-    assert!(
-        dockerfile.contains("ENV PYTHON_VERSION=3.12\n"),
-        "python runtime block missing:\n{dockerfile}"
-    );
+    project.close_checked();
+}
+
+/// Explicit project pins survive CLI detection and become a real build guard,
+/// even when the installation uses a distribution-default Python package.
+#[test]
+fn init_preserves_explicit_python_pin_and_emits_an_executable_version_guard() {
+    let project = TestProject::new();
+    project.create_file("requirements.txt", "requests==2.31.0\n");
+    project.create_file(".python-version", "3.13.2\n");
+
+    let result = project.run(&["container", "init"]);
+    result.assert_success();
+    result.assert_stdout_contains("python: 3.13.2");
+    let dockerfile = project
+        .read_file("Dockerfile.omg")
+        .expect("Dockerfile created");
+    assert!(dockerfile.contains("# Required Python version: 3.13.2"));
+    assert!(!dockerfile.contains("ENV PYTHON_VERSION="));
+    let guard = dockerfile
+        .lines()
+        .filter_map(|line| line.strip_prefix("RUN "))
+        .find(|line| line.contains("OMG runtime version mismatch: python "))
+        .expect("generated recipe must execute its Python version guard");
+    let provider = TempDir::new().expect("private Python provider");
+    let executable = provider.path().join("python3");
+    for (version, accepted) in [("3.13.2", true), ("3.13.3", false)] {
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n"),
+        )
+        .expect("write private version provider");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("make private provider executable");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", guard])
+            .env("PATH", provider.path())
+            .current_dir(provider.path())
+            .output()
+            .expect("execute emitted Python guard");
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "requested 3.13.2, provider {version}: status={}, stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    provider.close().expect("remove private provider");
+    project.close_checked();
+}
+
+/// An unfulfillable project pin is refused before Dockerfile creation or any
+/// mutation of existing build-context ignore rules.
+#[test]
+fn init_refuses_unsupported_project_pins_before_writing_recipe_or_ignore_files() {
+    for (pin_file, request, runtime) in [
+        (".python-version", ">=3.13", "python"),
+        (".node-version", "lts", "node"),
+    ] {
+        let project = TestProject::new();
+        project.create_file(pin_file, request);
+        let ignores = [
+            ".dockerignore",
+            "Dockerfile.omg.dockerignore",
+            ".containerignore",
+        ];
+        let sentinel = "# user rules\n!.env\n!secrets.key\n";
+        for ignore in ignores {
+            project.create_file(ignore, sentinel);
+        }
+
+        let result = project.run(&["container", "init"]);
+        result.assert_failure();
+        result.assert_stderr_contains(
+            "Cannot generate a container that satisfies project runtime requests",
+        );
+        result.assert_stderr_contains(runtime);
+        assert!(!result.stdout.contains("Created Dockerfile.omg"));
+        assert!(
+            !project.path().join("Dockerfile.omg").exists(),
+            "refused {pin_file} request {request:?} must not create a recipe"
+        );
+        for ignore in ignores {
+            assert_eq!(
+                fs::read(project.path().join(ignore)).expect("existing ignore file readable"),
+                sentinel.as_bytes(),
+                "refused {pin_file} request {request:?} must preserve {ignore}"
+            );
+        }
+        project.close_checked();
+    }
 }
 
 /// Contract: when `Dockerfile.omg` already exists, `init` fails with the

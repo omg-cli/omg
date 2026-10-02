@@ -827,7 +827,7 @@ enum PendingArchiveLink {
     Hard { path: PathBuf, target: PathBuf },
 }
 
-fn validate_relative_symlink_target(link_path: &Path, target: &Path) -> Result<()> {
+pub(crate) fn validate_relative_symlink_target(link_path: &Path, target: &Path) -> Result<()> {
     let mut resolved = link_path
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);

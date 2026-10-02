@@ -38,9 +38,9 @@ class PolicyTests(unittest.TestCase):
         with (ROOT / 'tests/cli_behavior_inventory.tsv').open(newline='') as source:
             rows = {row['case']: row for row in csv.DictReader(source, delimiter='\t')}
         for case, prerequisite, assertion in (
-            ('team-golden-create', 'team-init', 'golden-path-created'),
-            ('team-golden-list', 'team-golden-create', 'golden-path-listed'),
-            ('team-golden-delete', 'team-golden-list', 'golden-path-deleted'),
+            ('team-golden-create', 'team-init', 'local:team-golden-create'),
+            ('team-golden-list', 'team-golden-create', 'local:team-golden-list'),
+            ('team-golden-delete', 'team-golden-list', 'local:team-golden-delete'),
         ):
             with self.subTest(case=case):
                 self.assertEqual(rows[case]['requires'], prerequisite)
@@ -86,8 +86,8 @@ class PolicyTests(unittest.TestCase):
         with (ROOT / "tests/cli_behavior_inventory.tsv").open(newline="") as source:
             rows = {row["case"]: row for row in csv.DictReader(source, delimiter="\t")}
         for case, assertion, prerequisite in (
-            ("workspace-list", "workspace-project-listed", "workspace-add"),
-            ("workspace-remove", "workspace-project-removed", "workspace-add"),
+            ("workspace-list", "workspace-list-state", "workspace-add"),
+            ("workspace-remove", "workspace-remove-state", "workspace-add"),
             ("container-init", "container-init-scaffold", "-"),
         ):
             with self.subTest(case=case):
@@ -172,6 +172,10 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(receipt["passed"])
         self.assertEqual(receipt["counts"], dict(selected=2, executed=1, passed=1, failed=0,
                                                blocked=0, harness_error=0, skipped=1))
+
+    def test_crlf_inventory_expected_exit_is_admitted(self):
+        self.repolicy_inventory(self.inventory.read_text().replace('\n', '\r\n'))
+        self.assertTrue(self.admit()['passed'])
 
     def test_scope_projection_is_bound_to_inventory_digest(self):
         result = network_scopes(self.policy, self.inventory)

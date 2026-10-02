@@ -5,13 +5,26 @@ use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
 pub(in crate::package_managers) fn current_arch() -> Option<SystemArchitecture> {
-    match std::env::consts::ARCH {
+    architecture_for_rust_target(std::env::consts::ARCH)
+}
+
+fn architecture_for_rust_target(architecture: &str) -> Option<SystemArchitecture> {
+    match architecture {
         "x86_64" => Some(SystemArchitecture::X86_64),
         "aarch64" => Some(SystemArchitecture::Aarch64),
         "arm" => Some(SystemArchitecture::Arm),
-        "i686" => Some(SystemArchitecture::I686),
+        "x86" => Some(SystemArchitecture::I686),
         _ => None,
     }
+}
+
+pub(in crate::package_managers) fn package_architecture_matches(
+    target: &str,
+    package_architecture: &str,
+) -> bool {
+    architecture_for_rust_target(target).is_some_and(|host| {
+        package_architecture == "any" || package_architecture == host.to_string()
+    })
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -272,6 +285,18 @@ pub fn create_dir_as_user_sync(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_x86_maps_to_arch_i686() {
+        assert_eq!(
+            architecture_for_rust_target("x86"),
+            Some(SystemArchitecture::I686)
+        );
+        assert!(package_architecture_matches("x86", "i686"));
+        assert!(package_architecture_matches("x86", "any"));
+        assert!(!package_architecture_matches("x86", "x86"));
+        assert!(!package_architecture_matches("unsupported", "any"));
+    }
 
     #[test]
     fn account_home_never_invents_a_home_directory() {

@@ -34,19 +34,38 @@ class MutationRefusalTests(unittest.TestCase):
             commands.mkdir()
             calls = root / 'calls'
             ssh = commands / 'ssh'
-            ssh.write_text('''#!/bin/bash
-if [[ "$*" == *OMG_QEMU_RECEIPT* ]]; then
-  printf 'OMG_QEMU_RECEIPT\\n' >> "$CALLS"
-  printf 'tree official\\nOMG_QEMU_RECEIPT:product:0:0\\n'
-  exit 0
-fi
-printf 'native-snapshot\\n' >> "$CALLS"
-count=$(grep -vc OMG_QEMU_RECEIPT "$CALLS")
-if [[ "$FAULT" == state-changed && "$count" -ge 2 ]]; then
-  printf 'installed packages\\nbase 2.0\\ninstall reasons\\nbase\\n'
-else
-  printf 'installed packages\\nbase 1.0\\ninstall reasons\\nbase\\n'
-fi
+            ssh.write_text('''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+calls = Path(os.environ['CALLS'])
+fault = os.environ['FAULT']
+command = shlex.split(sys.argv[-1])
+if command[:2] == ['bash', '-c'] and len(command) == 3 and 'qemu_row_expected_size=' in command[2]:
+    # Execute the real small receiver through size/SHA/EOF verification, then
+    # substitute the fixture response for the authenticated supervisor only.
+    receiver = command[2]
+    final = 'builtin eval "$qemu_row_payload" </dev/null'
+    assert receiver.endswith(final), 'the receiver execution seam changed'
+    response = ('[[ "$qemu_row_payload" == *OMG_QEMU_RECEIPT* ]] || exit 123\\n'
+                'printf "OMG_QEMU_RECEIPT\\\\n" >> "$CALLS"\\n'
+                'printf "tree official\\\\nOMG_QEMU_RECEIPT:product:0:0\\\\n"\\n')
+    receiver = receiver[:-len(final)] + response
+    if fault == 'stream-corrupted':
+        result = subprocess.run(['bash', '-c', receiver], input=sys.stdin.buffer.read() + b'\\n')
+    else:
+        result = subprocess.run(['bash', '-c', receiver], stdin=sys.stdin.buffer)
+    raise SystemExit(result.returncode)
+with calls.open('a') as output:
+    output.write('native-snapshot\\n')
+count = sum('OMG_QEMU_RECEIPT' not in line for line in calls.read_text().splitlines())
+if fault == 'state-changed' and count >= 2:
+    print('installed packages\\nbase 2.0\\ninstall reasons\\nbase')
+else:
+    print('installed packages\\nbase 1.0\\ninstall reasons\\nbase')
 ''')
             ssh.chmod(0o755)
             receipt = work / 'mutation-refusal.json'
@@ -76,7 +95,7 @@ fi
         self.assertFalse(receipt['metadata']['allow_mutations'])
 
     def test_enabled_gate_and_changed_native_state_cannot_prove_refusal(self):
-        for fault in ('gate-enabled', 'state-changed'):
+        for fault in ('gate-enabled', 'state-changed', 'stream-corrupted'):
             with self.subTest(fault=fault):
                 result, verification, receipt, _ = self.run_probe(fault)
                 self.assertNotEqual(result.returncode, 0)
