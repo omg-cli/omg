@@ -343,13 +343,13 @@ jobs:
           rmdir "$scratch"
 
       - name: Run disposable guest lifecycle + read benchmarks + inventory rows
-        # Staged runs exercise hermetic/container inventory; published runs add network/PTY coverage.
+        # Staged runs exercise current-source hermetic/container/network inventory; published runs add QEMU/PTY coverage.
         env:
           STAGED: ${{ inputs.staged }}
         run: |
           args=(--distro "${{ inputs.distro }}" --release "${{ inputs.tag }}" --benchmark --evidence-dir "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME" --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json)
           if [[ "$STAGED" == 'true' ]]; then
-            args+=(--staged-dir staged --inventory-tiers "hermetic,container" --inventory-allow-mutations)
+            args+=(--staged-dir staged --inventory-tiers "hermetic,container,network" --inventory-allow-mutations)
           else
             # No nested-container: guests have no docker-in-guest (yet).
             # Declared-ux rows (self-update-*, daemon-foreground) self-skip.

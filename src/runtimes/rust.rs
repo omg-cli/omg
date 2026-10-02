@@ -914,6 +914,170 @@ mod tests {
     }
 
     #[test]
+    fn https_manifest_install_verifies_payloads_publication_and_activation() -> Result<()> {
+        const CHILD: &str = "OMG_RUST_INSTALL_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(crate::core::paths::test_mode());
+            return tokio::runtime::Runtime::new()?.block_on(async {
+                install_fixture(false).await?;
+                install_fixture(true).await
+            });
+        }
+        // Isolate the existing debug-only loopback policy to this child process.
+        // No process-global environment mutation or production policy changes.
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "runtimes::rust::tests::https_manifest_install_verifies_payloads_publication_and_activation", "--nocapture"])
+            .env(CHILD, "1")
+            .env("OMG_TEST_MODE", "1")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "isolated install fixture failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains("running 1 test"),
+            "the isolated child must execute the exact test body: {stdout}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "the isolated child must report its positive body: {stdout}"
+        );
+        Ok(())
+    }
+
+    async fn install_fixture(corrupt: bool) -> Result<()> {
+        use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
+        let toolchain = RustToolchainSpec::parse("1.93.1")?;
+        let mut manifest = String::from("[pkg.rustc]\nversion = \"1.93.1\"\n");
+        let mut routes = Vec::new();
+        for (component, file, payload, xz) in [
+            ("cargo", "bin/cargo", b"downloaded cargo".as_slice(), false),
+            (
+                "rust-std",
+                "lib/libstd.rlib",
+                b"downloaded standard library".as_slice(),
+                true,
+            ),
+            (
+                "rustc",
+                "bin/rustc",
+                b"downloaded compiler".as_slice(),
+                false,
+            ),
+        ] {
+            let tar = component_archive(
+                &format!("{component}-1.93.1-target/{component}/{file}"),
+                EntryType::Regular,
+                payload,
+            )?;
+            let mut archive = if xz { xz_tar(tar)? } else { gzip_tar(&tar)? };
+            let extension = if xz { "xz" } else { "gz" };
+            let path = format!("/dist/{component}.tar.{extension}");
+            let hash = format!("{:x}", Sha256::digest(&archive));
+            if corrupt && component == "cargo" {
+                archive.push(0);
+            }
+            routes.push((path, archive));
+            write!(
+                manifest,
+                "[pkg.{component}.target.{}]\nurl = \"ARCHIVE_BASE/dist/{component}.tar.{extension}\"\nhash = \"{hash}\"\n",
+                toolchain.host
+            )?;
+        }
+        if corrupt {
+            routes.truncate(1);
+        }
+        let archives = super::super::test_https::HttpFixture::new(routes).await?;
+        let manifest = manifest.replace("ARCHIVE_BASE", &format!("http://{}", archives.address));
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "static.rust-lang.org",
+            vec![(
+                "/dist/channel-rust-1.93.1.toml".into(),
+                manifest.into_bytes(),
+            )],
+        )
+        .await?;
+        let versions = TempDir::new()?;
+        let manager = RustManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        let request = RustToolchainRequest {
+            channel: "1.93.1".into(),
+            profile: Some("minimal".into()),
+            ..Default::default()
+        };
+        let result = manager.ensure_toolchain(&request).await;
+        let directory = manager.toolchain_dir(&toolchain);
+        if corrupt {
+            let error = result.expect_err("corrupt component must not publish a toolchain");
+            assert!(format!("{error:#}").contains("Checksum mismatch"));
+            assert!(!directory.exists());
+            assert!(!versions.path().join("current").exists());
+            let names: Vec<_> = fs::read_dir(versions.path())?
+                .map(|entry| entry.map(|item| item.file_name()))
+                .collect::<std::io::Result<_>>()?;
+            assert_eq!(names, [".mutation.lock"]);
+            assert_eq!(
+                fixture.finish().await?,
+                ["GET /dist/channel-rust-1.93.1.toml HTTP/1.1"]
+            );
+            assert_eq!(
+                archives.finish().await?,
+                ["GET /dist/cargo.tar.gz HTTP/1.1"]
+            );
+            return Ok(());
+        }
+        result?;
+        assert_eq!(
+            fs::read(directory.join("bin/rustc"))?,
+            b"downloaded compiler"
+        );
+        assert_eq!(fs::read(directory.join("bin/cargo"))?, b"downloaded cargo");
+        assert_eq!(
+            fs::read(directory.join("lib/libstd.rlib"))?,
+            b"downloaded standard library"
+        );
+        let metadata = RustManager::read_metadata(&directory)?;
+        assert_eq!(metadata.release.as_deref(), Some("1.93.1"));
+        assert_eq!(
+            metadata.components,
+            BTreeSet::from(["cargo".into(), "rust-std".into(), "rustc".into()])
+        );
+        assert!(metadata.targets.is_empty());
+        manager.install("1.93.1").await?;
+        assert_eq!(fs::read_link(versions.path().join("current"))?, directory);
+        assert_eq!(
+            fixture.finish().await?,
+            ["GET /dist/channel-rust-1.93.1.toml HTTP/1.1"]
+        );
+        assert_eq!(
+            archives.finish().await?,
+            [
+                "GET /dist/cargo.tar.gz HTTP/1.1",
+                "GET /dist/rust-std.tar.xz HTTP/1.1",
+                "GET /dist/rustc.tar.gz HTTP/1.1"
+            ]
+        );
+        let names: BTreeSet<_> = fs::read_dir(versions.path())?
+            .map(|entry| entry.map(|item| item.file_name()))
+            .collect::<std::io::Result<_>>()?;
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                ".mutation.lock".into(),
+                "current".into(),
+                toolchain.name().into()
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_rust_manager_new() {
         let mgr = RustManager::new();
         assert!(mgr.versions_dir.ends_with("rust"));

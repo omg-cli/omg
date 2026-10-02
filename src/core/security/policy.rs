@@ -1234,6 +1234,51 @@ mod tests {
     }
 
     #[test]
+    fn optional_policy_rejects_non_file_errors_for_policy_and_legacy_config() {
+        // Only an absent optional file permits defaults. A directory or
+        // oversized file must preserve its read error and path.
+        for filename in ["policy.toml", "config.toml"] {
+            for oversized in [false, true] {
+                let temp = tempfile::tempdir().expect("optional policy fixture");
+                let invalid = temp.path().join(filename);
+                if oversized {
+                    fs::write(&invalid, vec![b' '; MAX_POLICY_BYTES as usize + 1])
+                        .expect("oversized optional file");
+                } else {
+                    fs::create_dir(&invalid).expect("non-file optional path");
+                }
+                let error = SecurityPolicy::load_optional(temp.path().join("policy.toml"))
+                    .expect_err("non-file errors must not select permissive defaults");
+                assert!(
+                    matches!(error, PolicyError::Read { ref path, ref source }
+                        if path == &invalid.display().to_string()
+                            && source.kind() != io::ErrorKind::NotFound),
+                    "filename={filename}, oversized={oversized}, error={error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn license_display_tokens_preserve_identifiers_without_expression_operators() {
+        // SPDX Annex D defines identifiers, +, grouping, AND/OR/WITH and
+        // case-insensitive license identifiers. This is the display filter's
+        // bounded token oracle, not validation of an entire SPDX expression.
+        // https://spdx.github.io/spdx-spec/v2.3/SPDX-license-expressions/
+        assert_eq!(
+            spdx_license_tokens("MIT AND (Apache-2.0 OR GPL-2.0+ WITH Classpath-exception-2.0)"),
+            ["mit", "apache-2.0", "gpl-2.0+", "classpath-exception-2.0"]
+        );
+        assert_eq!(
+            spdx_license_tokens("mIt\tOr\nApAcHe-2.0"),
+            ["mit", "apache-2.0"]
+        );
+        for empty in ["", " \t\n()", "AND OR WITH", "and or with", "💥"] {
+            assert!(spdx_license_tokens(empty).is_empty(), "{empty:?}");
+        }
+    }
+
+    #[test]
     fn load_optional_uses_defaults_when_policy_is_missing() {
         let temp = tempfile::TempDir::new().expect("temp dir");
         let policy = SecurityPolicy::load_optional(temp.path().join("policy.toml"))

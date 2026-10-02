@@ -27,6 +27,7 @@ HOST_FILES = {
     "transaction-validation.log", "inventory.log",
     "guest-health.json", "controller-health.json", "controller-final-state.json", "health-validation.log",
     "inventory-admission.json",
+    "mutation-refusal.json", "mutation-refusal.log", "mutation-refusal-cases.tsv",
     "storage-faults.json", "storage-faults.log",
     "egress-policy.json", "egress-policy.log",
     "image-provenance.json", "image-cache.log",

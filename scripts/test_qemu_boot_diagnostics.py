@@ -1,5 +1,7 @@
 """Run the observer against native proc/socket state; no guest success is claimed."""
 from pathlib import Path
+import os
+import signal
 import socket
 import subprocess
 import tempfile
@@ -32,13 +34,37 @@ class BootDiagnostics(unittest.TestCase):
                 live = self.observe(directory)
                 self.assertIn(f"qemu_pid={child.pid}", live)
                 self.assertRegex(live, rf"(?m)^Pid:\s+{child.pid}$")
-                self.assertRegex(live, r"(?m)^State:\s+[RS]")
+                self.assertRegex(live, rf"(?m)^PPid:\s+{os.getpid()}$")
+                # Kernel proc documentation defines D as a live uninterruptible wait:
+                # https://docs.kernel.org/filesystems/proc.html#process-specific-subdirectories
+                self.assertRegex(live, r"(?m)^State:\s+[RSD] \(")
+                self.assertNotIn("qemu_process_status=unavailable", live)
                 self.assertIsNone(child.poll(), "the observer must not signal the child")
             finally:
                 child.terminate()
                 child.wait(timeout=5)
             dead = self.observe(directory)
             self.assertIn("qemu_process_status=unavailable", dead)
+
+    def test_stopped_child_state_is_preserved_without_resuming_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            child = subprocess.Popen(['sleep', '30'])
+            try:
+                os.kill(child.pid, signal.SIGSTOP)
+                stopped_pid, status = os.waitpid(child.pid, os.WUNTRACED)
+                self.assertEqual(stopped_pid, child.pid)
+                self.assertTrue(os.WIFSTOPPED(status))
+                (Path(directory) / 'qemu.pid').write_text(f'{child.pid}\n')
+                output = self.observe(directory)
+                self.assertRegex(output, rf'(?m)^Pid:\s+{child.pid}$')
+                self.assertRegex(output, r'(?m)^State:\s+T \(stopped\)$')
+                native_status = Path(f'/proc/{child.pid}/status').read_text()
+                self.assertRegex(native_status, r'(?m)^State:\s+T \(stopped\)$')
+                self.assertIsNone(child.poll())
+            finally:
+                os.kill(child.pid, signal.SIGCONT)
+                child.terminate()
+                child.wait(timeout=5)
 
     def test_real_listener_port_is_observed(self):
         with socket.socket() as listener, tempfile.TemporaryDirectory() as directory:

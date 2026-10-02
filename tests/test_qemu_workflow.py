@@ -267,6 +267,8 @@ class QemuWorkflowTests(unittest.TestCase):
                 self.assertEqual('--staged-dir' in args, staged)
                 self.assertEqual('--release-dir' in args, not staged)
                 self.assertEqual('--inventory-file' in args, not staged)
+                tiers = args[args.index('--inventory-tiers') + 1].split(',')
+                self.assertIn('network', tiers, 'current-head guests must execute live-network inventory')
 
     def test_nightly_builds_restore_native_caches_without_extra_saves(self):
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')

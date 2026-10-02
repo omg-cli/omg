@@ -113,11 +113,62 @@ class OptimizationContracts(unittest.TestCase):
         self.assertIn('--summary-only', coverage)
 
     def test_mutation_baseline_mode_cannot_weaken_full_score_gate(self):
+        from test_mutation_reports import MutationReportsTests, SOURCE, mutant
+
         text = (WORKFLOWS / 'mutation.yml').read_text()
         self.assertIn('cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast', text)
-        self.assertIn('if [ "$score" -lt 75 ]', text)
         self.assertIn('exit "$mutants_exit"', text)
-        self.assertEqual(text.count("if: github.event_name != 'pull_request' && inputs.baseline-only != true"), 3)
+        full_condition = "if: github.event_name != 'pull_request' && inputs.baseline-only != true"
+        for name in ('Install cargo-mutants', 'Run mutation testing',
+                     'Download all mutation shards', 'Require complete mutation coverage and score'):
+            block = text.split(f'      - name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn(full_condition, block)
+
+        barrier = step_script('mutation.yml', 'Require successful complete jobs')
+        for status in ('success', 'failure', 'cancelled', 'skipped'):
+            with self.subTest(job_status=status):
+                result = subprocess.run([BASH, '-e', '-c', barrier],
+                                        env=dict(os.environ, MUTATION_RESULT=status),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0 if status == 'success' else 1,
+                                 result.stdout + result.stderr)
+
+        fixture = MutationReportsTests('test_complete_partition_accepts_original_global_75_percent_floor')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        directory = fixture.root
+        fixture.root = directory / 'mutation-shards'
+        fixture.root.mkdir()
+        scripts = directory / 'scripts'
+        scripts.mkdir()
+        (scripts / 'check-mutation-results.py').write_bytes((ROOT / 'scripts/check-mutation-results.py').read_bytes())
+        fixture.manifest = [mutant(i) for i in range(64)]
+        script = step_script('mutation.yml', 'Require complete mutation coverage and score')
+        environment = dict(os.environ, GITHUB_SHA=SOURCE, GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1')
+        for caught, expected_exit in ((48, 0), (47, 1)):
+            with self.subTest(caught=caught):
+                fixture.make_reports(['CaughtMutant'] * caught + ['MissedMutant'] * (64 - caught), shards=16)
+                result = subprocess.run([BASH, '-e', '-c', script], cwd=directory,
+                                        env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
+        fixture.make_reports(['CaughtMutant'] * 64, shards=16)
+        fixture.change('shard-15/mutants.out/outcomes.json', lambda value: value.update(end_time=None))
+        result = subprocess.run([BASH, '-e', '-c', script], cwd=directory,
+                                env=environment, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('incomplete', result.stderr)
+
+    def test_mutation_expands_http_scope_and_reuses_downloads_without_cache_growth(self):
+        text = (WORKFLOWS / 'mutation.yml').read_text()
+        self.assertIn('--file src/core/http.rs', text)
+        begin = text.index('      - name: Setup Rust cache')
+        end = text.index('      - name: Validate portable mutation baseline', begin)
+        cache = text[begin:end]
+        for setting in ('prefix-key: "v3-portable-registry"', 'shared-key: portable',
+                        'cache-targets: false', 'cache-bin: false', 'cache-workspace-crates: false', 'save-if: false'):
+            self.assertIn(setting, cache)
+        self.assertNotIn('cache-on-failure: true', cache)
+        self.assertNotIn('--exclude-re', text)
 
     def test_heavy_schedules_do_not_start_at_top_of_hour(self):
         schedules = []
