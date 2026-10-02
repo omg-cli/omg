@@ -46,6 +46,34 @@ class NativeRemovalContracts(unittest.TestCase):
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode == 0, passed, result.stderr)
 
+    def test_arch_removal_rows_require_the_exact_size_format(self):
+        header = 'The following requested packages would be removed:\n'
+        footer = 'No changes made (dry run)\n'
+        cases = [
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.47 MB)\n', True),
+            ('arch', 'bash', '5.3.20-1', '  ✗ bash 5.3.20-1 (9.59 MB)\n', True),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.47 MB) extra\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (unknown MB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (-0.47 MB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.4 MB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.47 GB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.47 MB\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.1-1 (0.47 MB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq-tools 1.8.2-1 (0.47 MB)\n', False),
+            ('arch', 'jq', '1.8.2-1', '  ✗ jq 1.8.2-1 (0.47 MB)\n' * 2, False),
+            ('fedora', 'jq.x86_64', '1.8.1-3.fc44',
+             '  ✗ jq.x86_64 1.8.1-3.fc44 (0.47 MB)\n', False),
+        ]
+        for distro, identity, version, rows, passed in cases:
+            with self.subTest(distro=distro, rows=rows), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / 'preview').write_text(header + rows + footer, encoding='utf-8')
+                result = subprocess.run(['bash', '-c', self.functions() +
+                                         '\ncheck_native_remove_preview preview "$1" "$2" "$3"',
+                                         '_', version, identity, distro], cwd=directory,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
     def test_native_identity_rejects_inexact_or_multiple_rpm_records(self):
         provider = r"""
 rpm() { printf '%s' "$IDENTITY_OUT"; return "$RPM_EXIT"; }

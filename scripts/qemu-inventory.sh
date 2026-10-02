@@ -744,12 +744,16 @@ native_installed_identity() {
 }
 
 check_native_remove_preview() {
-  local output=$1 version=$2 identity=${3:-bash}
-  awk -v version="$version" -v identity="$identity" '
+  local output=$1 version=$2 identity=${3:-bash} distro=${4:-}
+  awk -v version="$version" -v identity="$identity" -v distro="$distro" '
     /The following .*packages would be removed:/ { in_list = 1; next }
     /No changes made \(dry run\)/ { in_list = 0 }
     in_list && $1 == "✗" && $2 == identity {
-      found++; if (NF != 3 || $3 != version) invalid = 1
+      found++;
+      if ($3 != version) invalid = 1;
+      if (distro == "arch") {
+        if (NF != 5 || $4 !~ /^\([0-9]+\.[0-9][0-9]$/ || $5 != "MB)") invalid = 1;
+      } else if (NF != 3) invalid = 1;
     }
     END { exit !(found == 1 && !invalid) }
   ' "$output"
@@ -2828,7 +2832,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$assertions" == package-dry-run-* ]]; then
     if [[ "$assertions" != package-dry-run-install && "$assertions" != package-dry-run-recursive || "$assertions" == package-dry-run-recursive && "$distro" == arch ]]; then
-      remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_native_remove_preview command.stdout.log \"\$installed_version\" \"\$installed_identity\"; then printf 'assertion failed: remove preview lacks the exact native installed package identity/version\n' >&2; assertion=1; fi"
+      remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_native_remove_preview command.stdout.log \"\$installed_version\" \"\$installed_identity\" '$distro'; then printf 'assertion failed: remove preview lacks the exact native installed package identity/version\n' >&2; assertion=1; fi"
     fi
     remote+="; native_after=\$(native_package_snapshot '$distro') || { assertion=1; printf 'assertion failed: native package after-state is unavailable\n' >&2; }"
     remote+="; if [[ \"\$execution_phase\" == product && \"\$native_before\" != \"\$native_after\" ]]; then printf 'assertion failed: dry run changed native installed-package state or reasons\n' >&2; assertion=1; fi"
