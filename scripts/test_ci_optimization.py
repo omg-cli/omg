@@ -126,9 +126,10 @@ class OptimizationContracts(unittest.TestCase):
         end = text.index('      - name: Validate portable mutation baseline', begin)
         cache = text[begin:end]
         for setting in ('prefix-key: "v3-portable-registry"', 'shared-key: portable',
-                        'cache-targets: false', 'cache-bin: false', 'save-if: false'):
+                        'cache-targets: false', 'cache-bin: false', 'cache-workspace-crates: false', 'save-if: false'):
             self.assertIn(setting, cache)
         self.assertNotIn('cache-on-failure: true', cache)
+        self.assertNotIn('--exclude-re', text)
 
     def test_heavy_schedules_do_not_start_at_top_of_hour(self):
         schedules = []
