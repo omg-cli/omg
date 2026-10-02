@@ -464,7 +464,11 @@ class PolicyTests(unittest.TestCase):
                     })
         workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
         self.assertEqual(workflow.count("--inventory-policy tests/qemu-inventory-policy.json"), 2)
-        self.assertIn('--inventory-tiers "hermetic,container"', workflow)
+        import re
+        profiles = re.findall(r'--inventory-tiers ["]?([a-z,-]+)', workflow)
+        self.assertEqual(len(profiles), 3)
+        for profile in profiles:
+            self.assertIn(profile, rules['profiles'], 'workflow selection requires reviewed admission')
 
 
     def test_index_admits_the_inventory_that_is_actually_shipped(self):

@@ -72,7 +72,7 @@ class LiveDoctorTests(unittest.TestCase):
         rows = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
         live = [row.split('\t') for row in rows if row.startswith('doctor-network-live\t')]
         self.assertEqual(len(live), 1, 'an executed network-tier row is missing')
-        self.assertEqual(live[0][1:7], ['["doctor","--network"]', 'controlled-error', '1', 'pass', '-', 'network'])
+        self.assertEqual(live[0][1:7], ['["doctor","--network"]', 'controlled-error', '1', 'pass', 'doctor', 'network'])
         self.assertEqual(live[0][8], 'doctor-network-live-state')
         self.assertEqual(live[0][5], 'doctor', 'live probes require the native Doctor baseline')
         offline = [row.split('\t') for row in rows if row.startswith('doctor-network\t')]
