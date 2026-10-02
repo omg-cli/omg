@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <apt-pkg/cachefile.h>
 #include <apt-pkg/policy.h>
 #include <cstddef>
@@ -71,6 +72,7 @@ struct PkgFileIterator : public pkgCache::PkgFileIterator {
 struct VerFileIterator : public pkgCache::VerFileIterator {
 	void raw_next() { (*this)++; }
 	std::size_t index() const { return this->Index(); }
+	std::uint64_t record_offset() const { return (*this)->Offset; }
 
 	UniquePtr<VerFileIterator> unique() const { return std::make_unique<VerFileIterator>(*this); }
 

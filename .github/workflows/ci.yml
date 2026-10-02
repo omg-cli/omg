@@ -241,7 +241,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
@@ -259,7 +259,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
@@ -284,7 +284,7 @@ jobs:
               test "$(uname -m)" = x86_64
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               ldconfig -p | grep -F 'libapt-pkg.so.7'
               curl --proto '=https' --tlsv1.2 -fsSL \
@@ -376,6 +376,28 @@ jobs:
       - name: Build Ubuntu 26.04 validation binary
         if: matrix.platform == 'ubuntu-2604'
         run: cargo build --release --no-default-features --features debian,pgp,license --locked
+
+      - name: Verify complete native APT daemon catalogue
+        if: contains(matrix.features, 'debian')
+        shell: bash
+        run: |
+          set -euo pipefail
+          useradd --create-home omg-catalog
+          runuser -u omg-catalog -- python3 scripts/test-debian-daemon-catalog.py \
+            --omg-binary "$GITHUB_WORKSPACE/target/release/omg" \
+            --omgd-binary "$GITHUB_WORKSPACE/target/release/omgd" \
+            --evidence-dir "/tmp/omg-catalog-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}"
+
+      - name: Preserve native APT catalogue proof
+        if: always() && contains(matrix.features, 'debian')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apt-daemon-catalog-${{ matrix.platform }}
+          path: |
+            /tmp/omg-catalog-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/receipt.json
+            /tmp/omg-catalog-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/daemon.log
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Upload native release pair
         if: matrix.platform != 'ubuntu-2604'
@@ -902,7 +924,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libapt-pkg-dev \
+            libapt-pkg-dev python3-apt \
             pkg-config \
             libssl-dev \
             clang \
@@ -926,6 +948,45 @@ jobs:
 
       - name: Build release
         run: python3 scripts/native-build-artifact.py build --distro ubuntu --image ubuntu-24.04 --features debian,pgp,license --destination "$RUNNER_TEMP/native-release"
+
+      - name: Verify complete native APT daemon catalogue
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo useradd --create-home omg-catalog
+          inputs="/tmp/omg-catalog-inputs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo install -d -m 755 "$inputs"
+          sudo install -m 644 scripts/test-debian-daemon-catalog.py "$inputs/test-debian-daemon-catalog.py"
+          for name in omg omgd; do
+            sudo install -m 755 "target/release/$name" "$inputs/$name"
+            cmp "target/release/$name" "$inputs/$name"
+          done
+          sudo runuser -u omg-catalog -- env OMG_CONTRACT_SOURCE_SHA="$GITHUB_SHA" \
+            python3 "$inputs/test-debian-daemon-catalog.py" \
+            --omg-binary "$inputs/omg" \
+            --omgd-binary "$inputs/omgd" \
+            --evidence-dir "/tmp/omg-catalog-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ubuntu"
+
+      - name: Export native APT catalogue proof for the runner
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in receipt.json daemon.log; do
+            source="/tmp/omg-catalog-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ubuntu/$name"
+            sudo install -D -m 644 "$source" "$RUNNER_TEMP/apt-daemon-catalog/$name"
+          done
+
+      - name: Preserve native APT catalogue proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apt-daemon-catalog-ubuntu
+          path: |
+            ${{ runner.temp }}/apt-daemon-catalog/receipt.json
+            ${{ runner.temp }}/apt-daemon-catalog/daemon.log
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Upload native release pair
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
