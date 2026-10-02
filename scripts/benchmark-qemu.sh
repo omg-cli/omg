@@ -707,7 +707,7 @@ case "$distro" in
     sudo -n apt-get update > evidence/index-update.txt 2>&1 || exit 120
     native=(apt-cache --no-all-versions show tree)
     version_cmd=(dpkg-query -W '-f=${Version}\n' tree) ;;
-  fedora) sudo -n dnf -y makecache > evidence/index-update.txt 2>&1 || exit 120; native=(rpm -qi tree); version_cmd=(rpm -q --qf '%{VERSION}-%{RELEASE}\n' tree) ;;
+  fedora) sudo -n dnf -y makecache > evidence/index-update.txt 2>&1 || exit 120; native=(rpm -qi tree); version_cmd=(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' tree) ;;
 esac
 installed() {
   case "$distro" in arch) pacman -Q tree ;; debian|ubuntu) [[ $(dpkg-query -W '-f=${Status}' tree 2>/dev/null) == 'install ok installed' ]] ;; fedora) rpm -q tree ;; esac
@@ -721,7 +721,17 @@ installed
 "${native[@]}" > evidence/native-info.txt
 version=$("${version_cmd[@]}")
 [[ "$distro" != arch ]] || version=${version#tree }
-[[ $(awk '$1 == "Name:" {print $2}' evidence/omg-info.txt) == tree ]]
+expected_name=tree
+if [[ "$distro" == fedora ]]; then
+  expected_name=$(rpm -q --qf '%{NAME}.%{ARCH}\n' tree)
+  version=${version#0:}
+  if [[ ! "$expected_name" =~ ^tree\.[[:alnum:]_]+$ ||
+        ! "$version" =~ ^([1-9][0-9]*:)?[[:alnum:]_+~^.]+-[[:alnum:]_+~^.]+$ ]]; then
+    printf 'Native RPM identity/version is not a single valid installed record\n' >&2
+    exit 120
+  fi
+fi
+[[ $(awk '$1 == "Name:" {print $2}' evidence/omg-info.txt) == "$expected_name" ]]
 [[ $(awk '$1 == "Version:" {print $2}' evidence/omg-info.txt) == "$version" ]]
 # Exercise both direct daemon startup and the actual CLI foreground launcher
 # while the package databases and installed fixture are available.
