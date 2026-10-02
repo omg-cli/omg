@@ -107,6 +107,44 @@ fn create_test_project(dir: &Path, config_type: &str) {
     }
 }
 
+/// Exercise detection and activation of an installed runtime without downloads.
+fn detect_installed_runtime(
+    project: &TestProject,
+    directory: &Path,
+    runtime: &str,
+    version: &str,
+) -> CommandResult {
+    let binary = match runtime {
+        "node" => "node",
+        "python" => "python3",
+        "rust" => "rustc",
+        other => panic!("unsupported detection fixture runtime: {other}"),
+    };
+    let versions = project.data_dir.path().join("versions").join(runtime);
+    let installed = versions.join(version);
+    fs::create_dir_all(installed.join("bin")).unwrap();
+    fs::write(installed.join("bin").join(binary), b"installed runtime fixture").unwrap();
+    assert!(!versions.join("current").exists());
+    let result = run_omg_with_options(
+        &["use", runtime],
+        Some(directory),
+        &[
+            ("OMG_DATA_DIR", project.data_dir.path().to_str().unwrap()),
+            ("HTTPS_PROXY", "http://127.0.0.1:9"),
+            ("HTTP_PROXY", "http://127.0.0.1:9"),
+            ("ALL_PROXY", "http://127.0.0.1:9"),
+            ("NO_PROXY", ""),
+            ("PATH", ""),
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", "3"),
+        ],
+    );
+    result.assert_success();
+    result.assert_stdout_contains(version);
+    assert_eq!(fs::read_link(versions.join("current")).unwrap(), installed);
+    assert!(installed.join("bin").join(binary).is_file());
+    result
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CLI FOUNDATION TESTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -511,20 +549,20 @@ mod runtime_management {
 
     #[test]
     fn test_use_with_nvmrc() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         create_test_project(temp_dir.path(), "node");
 
-        let result = run_omg_in_dir(&["use", "node"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "node", "20.10.0");
         // Falsifiable: detection must report the EXACT version from .nvmrc.
         result.assert_stdout_contains("20.10.0");
     }
 
     #[test]
     fn test_use_with_python_version() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         create_test_project(temp_dir.path(), "python");
 
-        let result = run_omg_in_dir(&["use", "python"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "python", "3.11.0");
         // Falsifiable: detection must report the EXACT version from
         // .python-version.
         result.assert_stdout_contains("3.11.0");
@@ -1188,8 +1226,8 @@ mod integration_scenarios {
 
     #[test]
     fn scenario_switching_projects() {
-        let project1 = TempDir::new().unwrap();
-        let project2 = TempDir::new().unwrap();
+        let project1 = TestProject::new();
+        let project2 = TestProject::new();
 
         // Project 1 uses Node 18
         let mut f = File::create(project1.path().join(".nvmrc")).unwrap();
@@ -1200,10 +1238,10 @@ mod integration_scenarios {
         writeln!(f, "20.0.0").unwrap();
 
         // Switch to project 1
-        let result1 = run_omg_in_dir(&["use", "node"], project1.path());
+        let result1 = detect_installed_runtime(&project1, project1.path(), "node", "18.0.0");
 
         // Switch to project 2
-        let result2 = run_omg_in_dir(&["use", "node"], project2.path());
+        let result2 = detect_installed_runtime(&project2, project2.path(), "node", "20.0.0");
 
         // Falsifiable: EACH project must resolve to ITS OWN version. The old
         // `contains("18") || contains("20")` passed when both projects
@@ -1297,13 +1335,7 @@ mod version_detection {
     fn test_nvmrc_detection() {
         let project = TestProject::new();
         project.create_file(".nvmrc", "20.10.0\n");
-        let result = project.run_with_env(
-            &["use", "node"],
-            &[("HTTPS_PROXY", "http://127.0.0.1:9"), ("HTTP_PROXY", "http://127.0.0.1:9"),
-              ("ALL_PROXY", "http://127.0.0.1:9"), ("NO_PROXY", ""), ("PATH", ""),
-              ("OMG_TEST_COMMAND_TIMEOUT_SECS", "3")],
-        );
-        result.assert_success();
+        let result = detect_installed_runtime(&project, project.path(), "node", "20.10.0");
         // Falsifiable: the EXACT version must be reported; a generic
         // "Detected" message with the wrong version must fail this.
         result.assert_stdout_contains("20.10.0");
@@ -1311,32 +1343,32 @@ mod version_detection {
 
     #[test]
     fn test_node_version_file_detection() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         let mut f = File::create(temp_dir.path().join(".node-version")).unwrap();
         writeln!(f, "18.19.0").unwrap();
 
-        let result = run_omg_in_dir(&["use", "node"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "node", "18.19.0");
         result.assert_stdout_contains("18.19.0");
     }
 
     #[test]
     fn test_python_version_detection() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         let mut f = File::create(temp_dir.path().join(".python-version")).unwrap();
         writeln!(f, "3.12.0").unwrap();
 
-        let result = run_omg_in_dir(&["use", "python"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "python", "3.12.0");
         result.assert_stdout_contains("3.12.0");
     }
 
     #[test]
     fn test_tool_versions_multi_runtime() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         let mut f = File::create(temp_dir.path().join(".tool-versions")).unwrap();
         writeln!(f, "nodejs 20.10.0\npython 3.11.0\nruby 3.2.0\ngo 1.21.0").unwrap();
 
         // Each runtime should be detected
-        let result = run_omg_in_dir(&["use", "node"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "node", "20.10.0");
         result.assert_stdout_contains("20.10.0");
     }
 
@@ -1352,11 +1384,11 @@ mod version_detection {
 
     #[test]
     fn test_package_json_volta() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         let mut f = File::create(temp_dir.path().join("package.json")).unwrap();
         writeln!(f, r#"{{"name": "test", "volta": {{"node": "18.18.0"}}}}"#).unwrap();
 
-        let result = run_omg_in_dir(&["use", "node"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "node", "18.18.0");
         result.assert_stdout_contains("18.18.0");
     }
 
@@ -1379,11 +1411,11 @@ mod version_detection {
 
     #[test]
     fn test_rust_toolchain_toml_detection() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         let mut f = File::create(temp_dir.path().join("rust-toolchain.toml")).unwrap();
         writeln!(f, "[toolchain]\nchannel = \"1.75.0\"").unwrap();
 
-        let result = run_omg_in_dir(&["use", "rust"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "rust", "1.75.0");
         // Falsifiable: the channel version from rust-toolchain.toml must be
         // reported verbatim ('stable' would match any resolution).
         result.assert_stdout_contains("1.75.0");
@@ -1391,11 +1423,11 @@ mod version_detection {
 
     #[test]
     fn test_version_whitespace_trimming() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         let mut f = File::create(temp_dir.path().join(".nvmrc")).unwrap();
         writeln!(f, "  20.10.0  \n").unwrap();
 
-        let result = run_omg_in_dir(&["use", "node"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "node", "20.10.0");
         assert!(
             result.stdout.contains("20.10.0"),
             "Should trim whitespace from version files"
@@ -1404,11 +1436,11 @@ mod version_detection {
 
     #[test]
     fn test_version_v_prefix_handling() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         let mut f = File::create(temp_dir.path().join(".nvmrc")).unwrap();
         writeln!(f, "v20.10.0").unwrap();
 
-        let result = run_omg_in_dir(&["use", "node"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "node", "20.10.0");
         assert!(
             result.stdout.contains("20.10.0"),
             "Should handle v prefix in version"
@@ -1417,7 +1449,7 @@ mod version_detection {
 
     #[test]
     fn test_parent_directory_version_search() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
 
         // Create .nvmrc at root
         let mut f = File::create(temp_dir.path().join(".nvmrc")).unwrap();
@@ -1428,7 +1460,7 @@ mod version_detection {
         fs::create_dir_all(&nested).unwrap();
 
         // Should find .nvmrc from parent
-        let result = run_omg_in_dir(&["use", "node"], &nested);
+        let result = detect_installed_runtime(&temp_dir, &nested, "node", "20.10.0");
         result.assert_stdout_contains("20.10.0");
     }
 }
@@ -1551,7 +1583,7 @@ mod regression_tests {
     /// Regression: engines should take priority over volta in package.json
     #[test]
     fn test_package_json_engines_priority() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         let mut f = File::create(temp_dir.path().join("package.json")).unwrap();
         writeln!(
             f,
@@ -1559,7 +1591,7 @@ mod regression_tests {
         )
         .unwrap();
 
-        let result = run_omg_in_dir(&["use", "node"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "node", "22.0.0");
         assert!(
             result.stdout.contains("22.0.0"),
             "engines (22.0.0) should take priority over volta (16.0.0): {}",
