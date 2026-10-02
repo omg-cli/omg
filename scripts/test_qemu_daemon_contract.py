@@ -114,6 +114,57 @@ class DaemonContractTests(unittest.TestCase):
             self.assertIn('omg_only=["omg-only"]', result.stderr)
             self.assertIn('omg_duplicates=["omg-only"]', result.stderr)
 
+    @unittest.skipIf(os.name == 'nt', 'native query diagnostics require POSIX jq')
+    def test_query_mismatch_diagnostic_preserves_product_failure_with_old_guest_jq(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        function = source.split('# BEGIN EXPLICIT QUERY ORACLE', 1)[1].split('# END EXPLICIT QUERY ORACLE', 1)[0]
+        script = function + '''
+if ! check_explicit_query_outputs expected listing count shortcut jsoncount; then
+  report_explicit_query_difference expected listing daemon-direct
+  printf 'assertion failed: explicit listing/count differs from native package inventory\n' >&2
+  exit 1
+fi
+'''
+        for listing in ('{"packages":["bash","unexpected"],"count":2}',
+                        '{"packages":"invalid","count":2}',
+                        '{}\n{"packages":["bash","native-only"],"count":2}'):
+            with self.subTest(listing=listing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'expected').write_text('["bash","native-only"]')
+                (root / 'listing').write_text(listing)
+                for name, content in (('count', '2'), ('shortcut', '2'), ('jsoncount', '{"count":2}')):
+                    (root / name).write_text(content)
+                result = subprocess.run([BASH, '-euc', script], cwd=root,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('assertion failed: explicit listing/count differs', result.stderr)
+                self.assertNotIn('compile error', result.stderr)
+                self.assertEqual(result.stdout, '')
+                if 'unexpected' in listing:
+                    self.assertIn('native_only=["native-only"]', result.stderr)
+                    self.assertIn('omg_only=["unexpected"]', result.stderr)
+                else:
+                    self.assertIn('package listing was not a single valid query document', result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'native query diagnostics require POSIX jq')
+    def test_query_mismatch_diagnostic_bounds_large_package_differences(self):
+        source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')
+        function = source.split('# BEGIN EXPLICIT QUERY ORACLE', 1)[1].split('# END EXPLICIT QUERY ORACLE', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'expected').write_text(json.dumps([f'native-{number:03d}' for number in range(60)]))
+            (root / 'listing').write_text(json.dumps({'packages': [f'omg-{number:03d}' for number in range(60)], 'count': 60}))
+            result = subprocess.run([BASH, '-c', function + '\nreport_explicit_query_difference expected listing daemon-direct'],
+                                    cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stderr.splitlines()
+            self.assertIn('daemon-direct native_count=60 omg_count=60', lines)
+            self.assertIn('difference_truncated=true', lines)
+            for prefix in ('native_only=', 'omg_only='):
+                items = json.loads(next(line.removeprefix(prefix) for line in lines if line.startswith(prefix)))
+                self.assertEqual(len(items), 50)
+                self.assertEqual(items[-1], ('native-' if prefix == 'native_only=' else 'omg-') + '049')
+
     @unittest.skipIf(os.name == 'nt', 'package query oracle requires POSIX jq')
     def test_daemon_and_direct_package_queries_must_agree_on_a_real_installed_name(self):
         source = (ROOT / 'scripts/qemu-daemon-check.sh').read_text(encoding='utf-8')

@@ -18,7 +18,7 @@ check_explicit_query_outputs() {
 }
 report_explicit_query_difference() {
   local expected=$1 listing=$2 label=$3
-  jq -r -s --slurpfile expected "$expected" --arg label "$label" '
+  jq -r -s --slurpfile expected "$expected" --arg probe_name "$label" '
     if length == 1 and (.[0] | type == "object") and
        (.[0].packages | type == "array") and
        ($expected | length == 1) and ($expected[0] | type == "array") then
@@ -26,13 +26,13 @@ report_explicit_query_difference() {
       (($expected[0] - $actual) | unique) as $native_only |
       (($actual - $expected[0]) | unique) as $omg_only |
       ($actual | sort | group_by(.) | map(select(length > 1) | .[0])) as $omg_duplicates |
-      "\($label) native_count=\($expected[0] | length) omg_count=\($actual | length)",
+      "\($probe_name) native_count=\($expected[0] | length) omg_count=\($actual | length)",
       "native_only=\($native_only[0:50] | @json)",
       "omg_only=\($omg_only[0:50] | @json)",
       "omg_duplicates=\($omg_duplicates[0:50] | @json)",
       "difference_truncated=\(($native_only | length) > 50 or ($omg_only | length) > 50 or ($omg_duplicates | length) > 50)"
     else
-      "\($label) package listing was not a single valid query document"
+      "\($probe_name) package listing was not a single valid query document"
     end
   ' "$listing" >&2
 }
