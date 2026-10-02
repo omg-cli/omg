@@ -941,6 +941,7 @@ mod tests {
 
     async fn install_fixture(corrupt: bool) -> Result<()> {
         use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
         let toolchain = RustToolchainSpec::parse("1.93.1")?;
         let mut manifest = String::from("[pkg.rustc]\nversion = \"1.93.1\"\n");
         let mut routes = Vec::new();
@@ -972,7 +973,11 @@ mod tests {
                 archive.push(0);
             }
             routes.push((path, archive));
-            manifest.push_str(&format!("[pkg.{component}.target.{}]\nurl = \"ARCHIVE_BASE/dist/{component}.tar.{extension}\"\nhash = \"{hash}\"\n", toolchain.host));
+            write!(
+                manifest,
+                "[pkg.{component}.target.{}]\nurl = \"ARCHIVE_BASE/dist/{component}.tar.{extension}\"\nhash = \"{hash}\"\n",
+                toolchain.host
+            )?;
         }
         if corrupt {
             routes.truncate(1);
