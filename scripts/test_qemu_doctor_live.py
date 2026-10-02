@@ -95,6 +95,7 @@ exit 1
 '''.replace('COUNT', str(count))
                 runner = OutputContracts(methodName='runTest')
                 result, rows, logs = runner.run_inventory(product, [row], distro='debian', tiers='network')
+                self.assertEqual(len(rows), 1, 'the real executor did not admit the reviewed live network row')
                 self.assertEqual(rows[0]['result'], 'PASS' if accepted else 'FAIL', logs)
                 self.assertEqual(result.returncode, 0 if accepted else 1, logs)
 
