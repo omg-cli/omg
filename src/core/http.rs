@@ -400,6 +400,87 @@ mod tests {
         assert!(validate_resolved_addresses(&[], false).is_err());
     }
 
+    #[test]
+    fn resolved_download_addresses_preserve_ipv6_global_boundaries() {
+        // IANA IPv6 Address Space and Special-Purpose registries:
+        // https://www.iana.org/assignments/ipv6-address-space/
+        // https://www.iana.org/assignments/iana-ipv6-special-registry/
+        // The existing downloader conservatively rejects Teredo and 6to4.
+        let public: std::net::SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        for raw in [
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "2000:db8::1",
+            "2003:db8::1",
+            "2001:db7:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2001:db9::1",
+        ] {
+            let address = std::net::SocketAddr::new(raw.parse().unwrap(), 443);
+            assert!(
+                validate_resolved_addresses(&[address], false).is_ok(),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "::",
+            "::1",
+            "::ffff:8.8.8.8",
+            "100::1",
+            "fc00::1",
+            "fdff::1",
+            "fe80::1",
+            "ff02::1",
+            "1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "4000::1",
+            "2001:db8::",
+            "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2001::",
+            "2001:0:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2002::",
+            "2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            let address = std::net::SocketAddr::new(raw.parse().unwrap(), 443);
+            assert!(
+                validate_resolved_addresses(&[address], false).is_err(),
+                "{raw}"
+            );
+            assert!(
+                validate_resolved_addresses(&[public, address], false).is_err(),
+                "{raw}"
+            );
+            assert!(
+                validate_resolved_addresses(&[address, public], false).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_download_addresses_preserve_shared_space_boundaries() -> anyhow::Result<()> {
+        use std::net::SocketAddr;
+
+        for allowed in [
+            "100.63.255.254:443",
+            "100.128.0.1:443",
+            "8.64.0.1:443",
+            "8.127.255.254:443",
+        ] {
+            let address: SocketAddr = allowed.parse()?;
+            assert!(
+                validate_resolved_addresses(&[address], false).is_ok(),
+                "ordinary unicast address {allowed} must not be confused with 100.64.0.0/10"
+            );
+        }
+        let public: SocketAddr = "8.8.8.8:443".parse()?;
+        for blocked in ["100.64.0.0:443", "100.127.255.255:443"] {
+            let address: SocketAddr = blocked.parse()?;
+            assert!(validate_resolved_addresses(&[address], false).is_err());
+            assert!(validate_resolved_addresses(&[public, address], false).is_err());
+            assert!(validate_resolved_addresses(&[address], true).is_err());
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn download_client_allows_long_transfers_that_keep_progressing() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

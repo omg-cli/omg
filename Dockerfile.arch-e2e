@@ -19,6 +19,7 @@ RUN echo "Native package refresh: ${NATIVE_REFRESH}" && \
         curl \
         pkgconf \
         openssl \
+        python \
         libarchive \
         clang \
         cmake

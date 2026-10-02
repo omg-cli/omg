@@ -303,6 +303,7 @@ cvss = "2.2.0"
 lzma-rs = "0.3" # Test-only XZ encoder for synthetic archives.
 tokio = { version = "1.49", features = ["test-util"] }
 rcgen = "=0.13.2"
+tokio-rustls = { version = "=0.26.4", default-features = false } # Real TLS fixtures; already locked transitively.
 criterion = { version = "0.8", features = ["html_reports"] }
 assert_cmd = "2.1"
 proptest = "1.4"                                             # Property-based testing

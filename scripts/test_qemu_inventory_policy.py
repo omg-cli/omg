@@ -139,6 +139,34 @@ class PolicyTests(unittest.TestCase):
         self.results.write_text(json.dumps(self.rows))
         return POLICY.admit(self.policy, self.inventory, self.results, self.summary, distro, "hermetic")
 
+    def test_staged_network_profile_requires_live_result(self):
+        self.inventory.write_bytes(self.inventory.read_bytes() +
+            b'live\t["doctor","--network"]\tcontrolled-error\t1\tpass\trequired\tnetwork\tarch:pass\t-\tnone\n')
+        self.selection['cases'].append(dict(id='live', tiers=['network'],
+            network_scope='network', allowed_skips={}))
+        self.write_policy()
+        index = json.loads(self.policy.read_text())
+        index['profiles'] = load_index(ROOT / 'tests/qemu-inventory-policy.json')['profiles']
+        self.policy.write_text(json.dumps(index))
+        self.rows.append(dict(case_id='qemu-arch-live', distro='arch',
+            artifact_source='inventory', result='PASS', exit_code=1, network_scope='network'))
+        self.results.write_text(json.dumps(self.rows))
+        self.summary.write_text('{"complete":true,"pass":2,"fail":0,"skipped":1}')
+        command = [sys.executable, str(ROOT / 'scripts/check-qemu-inventory.py'),
+            '--policy', str(self.policy), '--inventory', str(self.inventory),
+            '--results', str(self.results), '--summary', str(self.summary),
+            '--distro', 'arch', '--tiers', 'hermetic,container,network']
+        result = subprocess.run(command, capture_output=True, text=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertTrue(receipt['passed'])
+        self.assertEqual(receipt['counts'], dict(selected=3, executed=2, passed=2,
+            failed=0, blocked=0, harness_error=0, skipped=1))
+        self.results.write_text(json.dumps(self.rows[:-1]))
+        result = subprocess.run(command, capture_output=True, text=True, timeout=3)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(json.loads(result.stdout)['passed'])
+
     def test_counts_separate_executed_from_selected(self):
         receipt = self.admit()
         self.assertTrue(receipt["passed"])
@@ -436,7 +464,11 @@ class PolicyTests(unittest.TestCase):
                     })
         workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
         self.assertEqual(workflow.count("--inventory-policy tests/qemu-inventory-policy.json"), 2)
-        self.assertIn('--inventory-tiers "hermetic,container"', workflow)
+        import re
+        profiles = re.findall(r'--inventory-tiers ["]?([a-z,-]+)', workflow)
+        self.assertEqual(len(profiles), 3)
+        for profile in profiles:
+            self.assertIn(profile, rules['profiles'], 'workflow selection requires reviewed admission')
 
 
     def test_index_admits_the_inventory_that_is_actually_shipped(self):

@@ -300,14 +300,19 @@ fn test_docker_nonexistent_package() {
     require_docker_tests();
     assert!(ensure_docker_image(), "Docker image not ready");
 
-    let (_success, stdout, stderr) = run_in_docker(&["omg", "info", "package-does-not-exist-xyz"]);
-
-    // Every info lookup path bails with this message for missing packages.
-    let combined = format!("{stdout}{stderr}");
-    let plain = strip_ansi(&combined);
+    let (success, stdout, stderr) = run_in_docker_with_options(
+        &["--network", "none"],
+        &[
+            "python3",
+            "-c",
+            include_str!("../scripts/docker-info-fixture.py"),
+            include_str!("../scripts/qemu-aur-fixture.py"),
+        ],
+    );
+    assert!(success, "Native info fixture failed: {stdout}\n{stderr}");
     assert!(
-        plain.contains("not found"),
-        "Should report 'Package ... not found', got: {plain}"
+        stdout.contains("INFO_FIXTURE_PASS missing=1 untrusted_tls=1 native_state_unchanged=1"),
+        "Both real CLI lookup outcomes and unchanged native state must be proven: {stdout}"
     );
 }
 

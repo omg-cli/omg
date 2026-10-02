@@ -914,6 +914,7 @@ enum Assertion {
     DoctorNativeBackend,
     DoctorEolState,
     DoctorNetworkState,
+    DoctorNetworkLiveState,
     InfoNativePackage,
     ConfigSetPersisted,
     ConfigGetPersisted,
@@ -1016,6 +1017,7 @@ impl Assertion {
             "doctor-native-backend" => Self::DoctorNativeBackend,
             "doctor-eol-state" => Self::DoctorEolState,
             "doctor-network-state" => Self::DoctorNetworkState,
+            "doctor-network-live-state" => Self::DoctorNetworkLiveState,
             "info-native-package" => Self::InfoNativePackage,
             "config-set-persisted" => Self::ConfigSetPersisted,
             "config-get-persisted" => Self::ConfigGetPersisted,
@@ -3145,6 +3147,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::DoctorNativeBackend
                 | Assertion::DoctorEolState
                 | Assertion::DoctorNetworkState
+                | Assertion::DoctorNetworkLiveState
                 | Assertion::InfoNativePackage
                 | Assertion::RuntimeVersionRemoved
                 | Assertion::RuntimeListState

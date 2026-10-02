@@ -17,6 +17,12 @@ on:
       - tests/coverage_4.rs
       - tests/coverage_5.rs
       - tests/common/**
+      - src/core/archive.rs
+      - src/core/runtime_resolver.rs
+      - src/core/http.rs
+      - src/core/security/**
+      - scripts/check-mutation-results.py
+      - scripts/test_mutation_reports.py
       - .github/workflows/mutation.yml
   workflow_dispatch:
     inputs:
@@ -38,9 +44,14 @@ env:
 
 jobs:
   mutation:
-    name: cargo-mutants
+    name: Mutation shard (${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: ${{ fromJSON((github.event_name == 'pull_request' || inputs.baseline-only == true) && '[0]' || '[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]') }}
 
     steps:
       - name: Checkout repository
@@ -60,13 +71,17 @@ jobs:
         env:
           ZSTD_CLEVEL: "6"
         with:
-          prefix-key: "mutation"
-          # Mutants uses scratch build directories, not the root target.
-          cache-targets: ${{ github.event_name == 'pull_request' || inputs.baseline-only == true }}
+          # Reuse the portable producer's Cargo downloads. Mutants compiles
+          # scratch trees and must not evict the native producer caches.
+          prefix-key: "v3-portable-registry"
+          shared-key: portable
+          cache-targets: false
           cache-bin: false
-          # Failed baselines still compiled valid dependencies. Preserve that
-          # work while repairs are verified; GitHub isolates PR cache writes.
-          cache-on-failure: true
+          cache-workspace-crates: false
+          save-if: false
+
+      - name: Test complete mutation report admission
+        run: python3 -m unittest discover -s scripts -p test_mutation_reports.py
 
       - name: Validate portable mutation baseline
         if: github.event_name == 'pull_request' || inputs.baseline-only == true
@@ -80,24 +95,36 @@ jobs:
 
       - name: Run mutation testing
         if: github.event_name != 'pull_request' && inputs.baseline-only != true
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
         run: |
-          set +e
-          cargo mutants \
-            --package omg \
-            --file src/core/archive.rs \
-            --file src/core/runtime_resolver.rs \
-            --file src/core/security/validation.rs \
-            --file src/core/security/policy.rs \
-            --file src/core/security/secrets.rs \
-            --timeout 60 \
-            --jobs 2 \
-            --exclude-re 'tests?|bench|mock' \
-            --output mutants-report \
-            --no-default-features \
+          # Use the same complete discovery arguments for every shard.
+          # https://mutants.rs/shards.html
+          common=(
+            --package omg
+            --file src/core/archive.rs
+            --file src/core/runtime_resolver.rs
+            --file src/core/http.rs
+            --file src/core/security/validation.rs
+            --file src/core/security/policy.rs
+            --file src/core/security/secrets.rs
+            --no-default-features
             --features pgp,license
+            --cargo-arg=--locked
+            --no-shuffle
+          )
+          mkdir -p mutants-report
+          cargo mutants "${common[@]}" --list --json > mutants-report/expected-mutants.json
+          python3 scripts/check-mutation-results.py mutants-report \
+            --source-sha "$(git rev-parse HEAD)" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --shards 16 --record-shard "$SHARD_INDEX"
+          set +e
+          cargo mutants "${common[@]}" \
+            --baseline run --shard "$SHARD_INDEX/16" --sharding slice \
+            --timeout 60 --jobs 2 --output mutants-report
           mutants_exit=$?
           set -e
-
           case "$mutants_exit" in
             0|2|3) ;;
             *)
@@ -110,34 +137,46 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always() && github.event_name != 'pull_request' && inputs.baseline-only != true
         with:
-          name: mutation-report
+          name: shard-${{ matrix.shard }}
           path: mutants-report/
           retention-days: 30
+          if-no-files-found: error
 
-      - name: Check mutation score
+  mutation-result:
+    name: cargo-mutants
+    needs: mutation
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require successful complete jobs
+        env:
+          MUTATION_RESULT: ${{ needs.mutation.result }}
+        run: |
+          if [ "$MUTATION_RESULT" != success ]; then
+            echo "Mutation baseline or shard job failed: $MUTATION_RESULT" >&2
+            exit 1
+          fi
+
+      - name: Report complete portable baseline
+        if: github.event_name == 'pull_request' || inputs.baseline-only == true
+        run: echo "Complete portable baseline passed; this run did not test mutants."
+
+      - name: Download all mutation shards
+        if: github.event_name != 'pull_request' && inputs.baseline-only != true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: shard-*
+          path: mutation-shards
+
+      - name: Require complete mutation coverage and score
         if: github.event_name != 'pull_request' && inputs.baseline-only != true
         run: |
-          result_dir="mutants-report/mutants.out"
-          for report in caught.txt missed.txt timeout.txt; do
-            if [ ! -f "$result_dir/$report" ]; then
-              echo "Missing mutation report: $result_dir/$report" >&2
-              exit 1
-            fi
-          done
-
-          caught=$(wc -l < "$result_dir/caught.txt")
-          missed=$(wc -l < "$result_dir/missed.txt")
-          timed_out=$(wc -l < "$result_dir/timeout.txt")
-          total=$((caught + missed + timed_out))
-          if [ "$total" -eq 0 ]; then
-            echo "Mutation run tested zero viable mutants" >&2
-            exit 1
-          fi
-
-          score=$((caught * 100 / total))
-          echo "Mutation score: $score% ($caught/$total mutants caught; $missed missed; $timed_out timed out)"
-          if [ "$score" -lt 75 ]; then
-            echo "Mutation score $score% is below the required 75% threshold" >&2
-            exit 1
-          fi
-          echo "::notice::Mutation score $score% meets the 75% threshold"
+          python3 scripts/check-mutation-results.py mutation-shards \
+            --source-sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --shards 16
