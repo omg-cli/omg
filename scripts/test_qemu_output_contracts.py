@@ -13,6 +13,88 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+
+@unittest.skipIf(os.name == 'nt', 'native preview assertions require POSIX bash')
+class NativeRemovalContracts(unittest.TestCase):
+    @staticmethod
+    def functions():
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        return source[source.index('native_installed_version() {'):
+                      source.index('prepare_native_apt_orphan() {')]
+
+    def test_removal_preview_requires_exact_native_identity_version_and_multiplicity(self):
+        header = 'The following packages would be removed:\n'
+        footer = 'No changes made (dry run)\n'
+        cases = [
+            ('bash', '5.3.9-3.fc44', '  ✗ bash 5.3.9-3.fc44\n', True),
+            ('bash.x86_64', '5.3.9-3.fc44', '  ✗ bash.x86_64 5.3.9-3.fc44\n', True),
+            ('bash.x86_64', '2:5.3.9-3.fc44', '  ✗ bash.x86_64 2:5.3.9-3.fc44\n', True),
+            ('bash.x86_64', '5.3.9-3.fc44', '  ✗ bash 5.3.9-3.fc44\n', False),
+            ('bash.x86_64', '5.3.9-3.fc44', '  ✗ bash.i686 5.3.9-3.fc44\n', False),
+            ('bash.x86_64', '5.3.9-3.fc44', '  ✗ bash.x86_64 5.3.8-3.fc44\n', False),
+            ('bash.x86_64', '2:5.3.9-3.fc44', '  ✗ bash.x86_64 5.3.9-3.fc44\n', False),
+            ('bash', '5.3.9-3.fc44', '  ✗ bash 5.3.9-3.fc44\n' * 2, False),
+            ('bash.x86_64', '5.3.9-3.fc44', '', False),
+            ('bash.x86_64', '5.3.9-3.fc44', '  ✗ bash.x86_64 5.3.9-3.fc44 extra\n', False),
+        ]
+        for identity, version, rows, passed in cases:
+            with self.subTest(identity=identity, version=version, rows=rows), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / 'preview').write_text(header + rows + footer, encoding='utf-8')
+                result = subprocess.run(['bash', '-c', self.functions() +
+                                         '\ncheck_native_remove_preview preview "$1" "$2"',
+                                         '_', version, identity], cwd=directory,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, passed, result.stderr)
+
+    def test_native_identity_rejects_inexact_or_multiple_rpm_records(self):
+        provider = r"""
+rpm() { printf '%s' "$IDENTITY_OUT"; return "$RPM_EXIT"; }
+"""
+        cases = [('fedora', 'jq\tx86_64\n', 0, 0, 'jq.x86_64'),
+                 ('fedora', 'jq\tnoarch\n', 0, 0, 'jq.noarch'),
+                 ('arch', '', 0, 0, 'jq'), ('debian', '', 0, 0, 'jq'),
+                 ('ubuntu', '', 0, 0, 'jq'),
+                 ('fedora', '', 0, 1, ''),
+                 ('fedora', 'jq\tx86_64\njq\ti686\n', 0, 1, ''),
+                 ('fedora', 'bash\tx86_64\n', 0, 1, ''),
+                 ('fedora', 'jq\tx86_64 \n', 0, 1, ''),
+                 ('fedora', 'jq\tx86_64\n', 17, 17, '')]
+        for distro, output, native_exit, exit_code, expected in cases:
+            with self.subTest(distro=distro, output=output, native_exit=native_exit):
+                result = subprocess.run(['bash', '-c', provider + self.functions() +
+                                         '\nnative_installed_identity "$1" jq', '_', distro],
+                                        env=dict(os.environ, IDENTITY_OUT=output, RPM_EXIT=str(native_exit)),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_fedora_installed_version_retains_nonzero_epoch_and_rejects_bad_records(self):
+        provider = r"""
+rpm() {
+  case "$*" in
+    *EPOCHNUM*) printf '%s\t%s\t%s\n' "$EPOCH" "$VERSION" "$RELEASE" ;;
+    *) printf '%s-%s\n' "$VERSION" "$RELEASE" ;;
+  esac
+  return "$RPM_EXIT"
+}
+"""
+        cases = [('0', '5.3.9', '3.fc44', 0, 0, '5.3.9-3.fc44'),
+                 ('2', '5.3.9', '3.fc44', 0, 0, '2:5.3.9-3.fc44'),
+                 ('bad', '5.3.9', '3.fc44', 0, 1, ''),
+                 ('0', '', '3.fc44', 0, 1, ''),
+                 ('0', '5.3.9\n5.3.8', '3.fc44', 0, 1, ''),
+                 ('0', '5.3.9', '3.fc44', 17, 17, '')]
+        for epoch, version, release, native_exit, exit_code, expected in cases:
+            with self.subTest(epoch=epoch, version=version, native_exit=native_exit):
+                result = subprocess.run(['bash', '-c', provider + self.functions() +
+                                         '\nnative_installed_version fedora bash'],
+                                        env=dict(os.environ, EPOCH=epoch, VERSION=version,
+                                                 RELEASE=release, RPM_EXIT=str(native_exit)),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+
 class OutputContracts(unittest.TestCase):
     def test_run_watch_row_uses_bounded_source_edit_and_receipt(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
@@ -1453,32 +1535,41 @@ exit 1
         row = next(line for line in
                    (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
                    if line.startswith('remove\t'))
-        native = {'rpm': 'case "$1" in\n'
-                         '  -qa) printf "bash\\t5.3-1\\n" ;;\n'
-                         '  -q) printf "5.3-1\\n" ;;\n'
-                         '  *) exit 2 ;;\n'
-                         'esac\n',
-                  'dnf': 'printf "bash\\tUser\\n"\n'}
-        preview = "printf '%s\\n' '  | Remove Preview' '    dry run' " \
+        native = {'rpm': r"""
+case "$1" in
+  -qa) printf 'jq.x86_64\t1.8.1-3.fc44\n' ;;
+  -q)
+    case "$*" in
+      *EPOCHNUM*) printf '0\t1.8.1\t3.fc44\n' ;;
+      *ARCH*) printf 'jq\tx86_64\n' ;;
+      *) printf '1.8.1-3.fc44\n' ;;
+    esac ;;
+  *) exit 2 ;;
+esac
+""", 'dnf': "printf 'jq\tUser\n'\n"}
+        preview = "[[ \"$1:$2:$3\" == remove:--dry-run:jq ]] || exit 70\n" \
+                  "printf '%s\n' '  | Remove Preview' '    dry run' " \
                   "'  → The following packages would be removed:' " \
-                  "'    ✗ bash 5.3-1' '  ℹ No changes made (dry run)'\n"
+                  "'    ✗ jq.x86_64 1.8.1-3.fc44' " \
+                  "'    ✗ oniguruma.x86_64 6.9.10-3.fc44' " \
+                  "'  ℹ No changes made (dry run)'\n"
         result, evidence, logs = self.run_inventory(preview, [row],
-                                                     distro='fedora', native_commands=native)
+                                                   distro='fedora', native_commands=native)
         self.assertEqual(evidence[0]['result'], 'PASS',
                          f'{result.stdout}\n{result.stderr}\n{logs}')
+        for changed in ('jq', 'jq.i686', 'jq.x86_64 0.0-1'):
+            mutated = preview.replace('jq.x86_64 1.8.1-3.fc44',
+                                      changed if ' ' in changed else changed + ' 1.8.1-3.fc44')
+            result, evidence, logs = self.run_inventory(mutated, [row],
+                                                       distro='fedora', native_commands=native)
+            self.assertEqual(evidence[0]['result'], 'FAIL',
+                             f'{result.stdout}\n{result.stderr}\n{logs}')
+            self.assertIn('lacks the exact native installed package identity/version', logs['remove.log'])
         result, evidence, logs = self.run_inventory(
-            preview.replace('bash 5.3-1', 'bash (feature-specific info unavailable)'),
+            preview.replace("'    ✗ jq.x86_64 1.8.1-3.fc44'",
+                            "'    ✗ jq.x86_64 1.8.1-3.fc44' '    ✗ jq.x86_64 1.8.1-3.fc44'"),
             [row], distro='fedora', native_commands=native)
-        self.assertEqual(evidence[0]['result'], 'FAIL',
-                         f'{result.stdout}\n{result.stderr}\n{logs}')
-        self.assertIn('lacks the native installed bash version', logs['remove.log'])
-        result, evidence, logs = self.run_inventory(
-            preview.replace('✗ bash 5.3-1', '✗ bash 0.0-1')
-            + "printf '%s\\n' 'unrelated bash 5.3-1 diagnostic'\n",
-            [row], distro='fedora', native_commands=native)
-        self.assertEqual(evidence[0]['result'], 'FAIL',
-                         f'{result.stdout}\n{result.stderr}\n{logs}')
-        self.assertIn('lacks the native installed bash version', logs['remove.log'])
+        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
 
     def test_recursive_remove_requires_the_backend_specific_refusal(self):
         for distro, explanation in (

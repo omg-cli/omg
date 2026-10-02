@@ -1,7 +1,7 @@
 case	args_json	safety	expected_exit	expected_ux	requires	tier	targets	assertions	cleanup
 search	["search","firefox"]	read	0	pass	-	hermetic	hermetic:pass	search-firefox-results	tempdir-drop
 install	["install","--dry-run","pacman"]	read	0	pass	-	hermetic	hermetic:pass	package-dry-run-install	tempdir-drop
-remove	["remove","--dry-run","bash"]	read	0	pass	-	hermetic	hermetic:pass	package-dry-run-remove	tempdir-drop
+remove	["remove","--dry-run","jq"]	read	0	pass	-	hermetic	hermetic:pass	package-dry-run-remove	tempdir-drop
 update	["update","--check"]	read	0	pass	-	hermetic	hermetic:pass	-	tempdir-drop
 info	["info","pacman"]	read	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	info-native-package	tempdir-drop
 why	["why","pacman"]	read	arch:0,debian:0,ubuntu:0,fedora:1	pass	-	hermetic	hermetic:pass	-	tempdir-drop

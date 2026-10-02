@@ -2514,8 +2514,13 @@ fn behavior_inventory_runs_in_hermetic_state() {
             .then(|| project.path().join("remove-state"));
         if let Some(path) = &remove_data_dir {
             let mock = omg_lib::package_managers::mock::MockPackageManager::new_in("arch", path);
-            mock.set_installed_version("bash", "5.3.20-1")
-                .expect("seed isolated bash package");
+            let (package, version) = if case.id == "remove" {
+                ("jq", "1.8.1-3")
+            } else {
+                ("bash", "5.3.20-1")
+            };
+            mock.set_installed_version(package, version)
+                .expect("seed isolated removal package");
             command_env.push(("OMG_DATA_DIR", path.to_str().expect("UTF-8 mock path")));
         }
         let container_capture = matches!(
@@ -3180,8 +3185,10 @@ fn behavior_inventory_runs_in_hermetic_state() {
                     };
                     let package_line = if install {
                         "│ pacman  ┆"
-                    } else {
+                    } else if matches!(assertion, Assertion::PackageDryRunRecursive) {
                         "    ✗ bash "
+                    } else {
+                        "    ✗ jq "
                     };
                     if !result.stdout.lines().any(|line| line == preview)
                         || !result.stdout.lines().any(|line| line == "    dry run")

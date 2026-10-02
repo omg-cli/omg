@@ -709,22 +709,49 @@ cleanup_native_tree_fixture() {
 }
 
 native_installed_version() {
-  local distro=$1 package=$2
+  local distro=$1 package=$2 output
   case "$distro" in
     arch) pacman -Q "$package" | awk -v name="$package" '$1 == name { print $2 }' ;;
     debian|ubuntu) dpkg-query -W '-f=${Status}\t${Version}\n' "$package" | awk -F '\t' '$1 == "install ok installed" { print $2 }' ;;
-    fedora) rpm -q --qf '%{VERSION}-%{RELEASE}\n' "$package" ;;
+    fedora)
+      output=$(rpm -q --qf '%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\n' "$package") || return $?
+      printf '%s\n' "$output" | awk -F '\t' '
+        NR != 1 || NF != 3 || $1 !~ /^[0-9]+$/ ||
+          $2 !~ /^[^[:space:]:]+$/ || $3 !~ /^[^[:space:]:]+$/ { invalid = 1 }
+        { epoch = $1; version = $2; release = $3 }
+        END {
+          if (NR != 1 || invalid) exit 1
+          printf "%s%s-%s\n", epoch == "0" ? "" : epoch ":", version, release
+        }
+      ' ;;
+    *) return 1 ;;
+  esac
+}
+
+native_installed_identity() {
+  local distro=$1 package=$2 output
+  case "$distro" in
+    arch|debian|ubuntu) printf '%s\n' "$package" ;;
+    fedora)
+      output=$(rpm -q --qf '%{NAME}\t%{ARCH}\n' "$package") || return $?
+      printf '%s\n' "$output" | awk -F '\t' -v name="$package" '
+        NR != 1 || NF != 2 || $1 != name || $2 !~ /^[A-Za-z0-9_]+$/ { invalid = 1 }
+        { identity = $1 "." $2 }
+        END { if (NR != 1 || invalid) exit 1; print identity }
+      ' ;;
     *) return 1 ;;
   esac
 }
 
 check_native_remove_preview() {
-  local output=$1 version=$2
-  awk -v version="$version" '
+  local output=$1 version=$2 identity=${3:-bash}
+  awk -v version="$version" -v identity="$identity" '
     /The following .*packages would be removed:/ { in_list = 1; next }
     /No changes made \(dry run\)/ { in_list = 0 }
-    in_list && $1 == "✗" && $2 == "bash" && $3 == version { found = 1 }
-    END { exit !found }
+    in_list && $1 == "✗" && $2 == identity {
+      found++; if (NF != 3 || $3 != version) invalid = 1
+    }
+    END { exit !(found == 1 && !invalid) }
   ' "$output"
 }
 
@@ -1520,6 +1547,7 @@ check_product_output() {
       local preview='  | Install Preview' changes='  ℹ • No changes will be made (dry run)' target=pacman
       if [[ "$assertion" != package-dry-run-install ]]; then
         preview='  | Remove Preview'; changes='  ℹ No changes made (dry run)'; target=bash
+        [[ "$assertion" != package-dry-run-remove ]] || target=jq
       fi
       if [[ "$code" != 0 ]] || ! grep -Fxq "$preview" "$stdout" \
         || ! grep -Fxq '    dry run' "$stdout" \
@@ -2216,7 +2244,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
       jq -e '. == ["install", "--yes", "--dry-run", "--allow-local-file", "pacman"]' <<< "$aj" >/dev/null || exit 2 ;;
     remove)
       [[ "$a" == package-dry-run-remove && "$s" == read && "$resolved" == 0 ]] || exit 2
-      jq -e '. == ["remove", "--dry-run", "bash"]' <<< "$aj" >/dev/null || exit 2 ;;
+      jq -e '. == ["remove", "--dry-run", "jq"]' <<< "$aj" >/dev/null || exit 2 ;;
     remove-flags)
       [[ "$a" == package-dry-run-recursive && "$s" == read ]] || exit 2
       jq -e '. == ["remove", "--recursive", "--yes", "--dry-run", "bash"]' <<< "$aj" >/dev/null || exit 2 ;;
@@ -2594,7 +2622,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
   remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_workspace_failure); $(declare -f check_product_output); $(declare -f check_workspace_state); $(declare -f check_bash_completion_artifact); $(declare -f check_man_artifacts); $(declare -f check_bash_hook_behavior); $(declare -f check_container_init_artifacts)"
   if [[ "$assertions" == package-dry-run-* ]]; then
-    remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f check_native_remove_preview)"
+    remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f native_installed_identity); $(declare -f check_native_remove_preview)"
   fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; $(declare -f check_apt_tree_absent); $(declare -f prepare_apt_update_fixture); $(declare -f check_apt_update_fixture); $(declare -f native_package_snapshot); $(declare -f check_apt_update_delta); $(declare -f cleanup_apt_update_fixture)"
@@ -2658,8 +2686,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == package-dry-run-* ]]; then
     remote+="; native_before=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package baseline is unavailable\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
     if [[ "$assertions" != package-dry-run-install ]]; then
-      remote+="; installed_version=\$(native_installed_version '$distro' bash) || { printf 'assertion failed: native bash package query failed\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
-      remote+="; [[ -n \"\$installed_version\" ]] || { printf 'assertion failed: bash is not installed in this guest\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+      preview_package=bash
+      [[ "$assertions" != package-dry-run-remove ]] || preview_package=jq
+      remote+="; installed_version=\$(native_installed_version '$distro' '$preview_package') || { printf 'assertion failed: native installed package version query failed\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+      remote+="; installed_identity=\$(native_installed_identity '$distro' '$preview_package') || { printf 'assertion failed: native installed package identity query failed\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
+      remote+="; [[ -n \"\$installed_version\" ]] || { printf 'assertion failed: preview package is not installed in this guest\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
     fi
   fi
   if [[ "$case" == team-status || "$case" == team-pull ]]; then
@@ -2797,7 +2828,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$assertions" == package-dry-run-* ]]; then
     if [[ "$assertions" != package-dry-run-install && "$assertions" != package-dry-run-recursive || "$assertions" == package-dry-run-recursive && "$distro" == arch ]]; then
-      remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_native_remove_preview command.stdout.log \"\$installed_version\"; then printf 'assertion failed: remove preview lacks the native installed bash version\n' >&2; assertion=1; fi"
+      remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]] && ! check_native_remove_preview command.stdout.log \"\$installed_version\" \"\$installed_identity\"; then printf 'assertion failed: remove preview lacks the exact native installed package identity/version\n' >&2; assertion=1; fi"
     fi
     remote+="; native_after=\$(native_package_snapshot '$distro') || { assertion=1; printf 'assertion failed: native package after-state is unavailable\n' >&2; }"
     remote+="; if [[ \"\$execution_phase\" == product && \"\$native_before\" != \"\$native_after\" ]]; then printf 'assertion failed: dry run changed native installed-package state or reasons\n' >&2; assertion=1; fi"
