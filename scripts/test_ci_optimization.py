@@ -119,6 +119,17 @@ class OptimizationContracts(unittest.TestCase):
         self.assertIn('exit "$mutants_exit"', text)
         self.assertEqual(text.count("if: github.event_name != 'pull_request' && inputs.baseline-only != true"), 3)
 
+    def test_mutation_expands_http_scope_and_reuses_downloads_without_cache_growth(self):
+        text = (WORKFLOWS / 'mutation.yml').read_text()
+        self.assertIn('--file src/core/http.rs', text)
+        begin = text.index('      - name: Setup Rust cache')
+        end = text.index('      - name: Validate portable mutation baseline', begin)
+        cache = text[begin:end]
+        for setting in ('prefix-key: "v3-portable-registry"', 'shared-key: portable',
+                        'cache-targets: false', 'cache-bin: false', 'save-if: false'):
+            self.assertIn(setting, cache)
+        self.assertNotIn('cache-on-failure: true', cache)
+
     def test_heavy_schedules_do_not_start_at_top_of_hour(self):
         schedules = []
         for filename in ('audit.yml', 'benchmark.yml', 'mutation.yml'):
