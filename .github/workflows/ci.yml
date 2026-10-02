@@ -126,8 +126,11 @@ jobs:
         env:
           ZSTD_CLEVEL: "6"
         with:
-          prefix-key: "v2-portable"
+          # Reserve compiled-cache storage for native producers and coverage.
+          prefix-key: "v3-portable-registry"
           shared-key: "portable"
+          cache-targets: false
+          cache-bin: false
           cache-on-failure: true
           # PRs restore main's cache; merge-ref writes only benefit that PR's reruns.
           save-if: ${{ github.ref == 'refs/heads/main' }}

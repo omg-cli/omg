@@ -85,8 +85,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          prefix-key: v2-benchmark-dependencies
+          # Preserve registry reuse without competing with native producers.
+          prefix-key: v3-benchmark-registry
           shared-key: arch-f3691b4dde62ba4c4
+          cache-targets: false
           cache-bin: false
           cache-workspace-crates: false
 
