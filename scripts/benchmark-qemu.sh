@@ -623,6 +623,8 @@ if [[ -n "$inventory_tiers" ]]; then
   # guest); /work is bind-mounted there.
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
   cp "$here/qemu-doctor-live-oracle.py" "$work/qemu-doctor-live-oracle.py"
+  cp "$here/qemu-mutation-refusal.py" "$work/qemu-mutation-refusal.py"
+  cp "$here/../tests/cli_behavior_inventory.tsv" "$work/mutation-refusal-cases.tsv"
   cp "$here/qemu-container-fake-engine.sh" "$work/qemu-container-fake-engine.sh"
   cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
@@ -1048,8 +1050,31 @@ if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
   fi
   [[ "$inventory_mutations" == false ]] || inv_args+=(--allow-mutations)
   [[ "$inventory_isolation" == false ]] || inv_args+=(--isolate-hermetic --network-policy /work/inventory-scopes.json)
+  # Refusal evidence is independent of the normal inventory's mutation opt-in.
+  refusal_rc=0
+  timeout --kill-after=5s 90 docker exec -w /work "$controller" python3 /work/qemu-mutation-refusal.py \
+    collect --work /work --receipt - --distro "$distro" --tag "$tag" \
+    --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/mutation-refusal-cases.tsv \
+    > "$work/mutation-refusal.json" 2> "$work/mutation-refusal.log" || refusal_rc=$?
+  if [[ "$refusal_rc" == 0 ]]; then
+    python3 "$here/qemu-mutation-refusal.py" verify --receipt "$work/mutation-refusal.json" \
+      --distro "$distro" --tag "$tag" --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" \
+      --tsv "$here/../tests/cli_behavior_inventory.tsv" >> "$work/mutation-refusal.log" 2>&1 || refusal_rc=$?
+  fi
+  if [[ "$refusal_rc" != 0 ]]; then
+    printf 'Native mutation refusal proof failed; see %s/mutation-refusal.log\n' "$work" >&2
+  fi
   inventory_rc=0
-  timeout --kill-after=5s 3600 docker exec -w /work "$controller" bash /work/qemu-inventory.sh "${inv_args[@]}" > "$work/inventory.log" 2>&1 || inventory_rc=$?
+  if [[ "$refusal_rc" == 0 ]]; then
+    timeout --kill-after=5s 3600 docker exec -w /work "$controller" bash /work/qemu-inventory.sh "${inv_args[@]}" > "$work/inventory.log" 2>&1 || inventory_rc=$?
+  else
+    inventory_rc=120
+    mkdir -p "$work/inventory"
+    jq -n --argjson ids "$expected_ids" --arg distro "$distro" '
+      $ids | map({case_id:., distro:$distro, artifact_source:"inventory",
+        result:"BLOCKED", exit_code:-1, elapsed_seconds:0})' > "$work/inventory/results.json"
+    printf '{"complete":false,"reason":"mutation refusal proof failed"}\n' > "$work/inventory/summary.json"
+  fi
   # Validate identity and values even for interrupted reports. Partial
   # reports may prove failures but can never prove a passing selection.
   inventory_snapshot='null'

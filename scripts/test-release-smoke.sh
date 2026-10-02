@@ -488,8 +488,44 @@ case "$1" in
         exit 0
       fi
     for argument in "$@"; do
+      if [[ "$argument" == /work/qemu-mutation-refusal.py ]]; then
+        work=$(<"$FAKE_QEMU_STATE")
+        [[ ${FAKE_MUTATION_REFUSAL:-valid} != missing ]] || exit 0
+        python3 - "$work" "$@" <<'PY'
+import importlib.util, json, os, pathlib, sys
+work = pathlib.Path(sys.argv[1])
+arguments = sys.argv[2:]
+spec = importlib.util.spec_from_file_location('refusal', work / 'qemu-mutation-refusal.py')
+oracle = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(oracle)
+source, selection = oracle.subset(work / 'mutation-refusal-cases.tsv')
+value = lambda flag: arguments[arguments.index(flag) + 1]
+distro = value('--distro')
+receipt = {'schema_version': 1, 'kind': 'mutation-refusal', 'complete': True,
+           'distro': distro, 'source_sha256': oracle.digest(source),
+           'subset_sha256': oracle.digest(selection),
+           'oracle_sha256': oracle.digest((work / 'qemu-mutation-refusal.py').read_bytes()),
+           'executor_sha256': oracle.digest((work / 'qemu-inventory.sh').read_bytes()),
+           'state_before_sha256': 'a' * 64, 'state_after_sha256': 'a' * 64,
+           'metadata': {'allow_mutations': False, 'allow_credentialed': False,
+                        'distro': distro, 'binary': value('--binary'),
+                        'release': value('--tag'), 'tiers': 'container'},
+           'summary': {'complete': True},
+           'results': [{'case_id': 'qemu-' + distro + '-' + case, 'distro': distro,
+                        'artifact_source': 'inventory', 'result': 'PASS' if index == 0 else 'SKIPPED',
+                        'exit_code': 0 if index == 0 else -1, 'elapsed_seconds': 0}
+                       for index, case in enumerate(oracle.CASES)]}
+fault = os.environ.get('FAKE_MUTATION_REFUSAL', 'valid')
+if fault == 'enabled': receipt['metadata']['allow_mutations'] = True
+elif fault == 'changed': receipt['state_after_sha256'] = 'b' * 64
+elif fault == 'incomplete': receipt['complete'] = False
+print(json.dumps(receipt))
+PY
+        exit 0
+      fi
       if [[ "$argument" == /work/qemu-inventory.sh ]]; then
         work=$(<"$FAKE_QEMU_STATE")
+        printf 'inventory executed\n' >> "$work/fixture-inventory-calls.log"
         if [[ -n "${FAKE_INVENTORY_RESULT:-}" ]]; then
           mkdir -p "$work/inventory"
           jq -Rn --arg verdict "$FAKE_INVENTORY_RESULT" '
@@ -668,6 +704,18 @@ for scenario in missing PASS FAIL HARNESS_ERROR BLOCKED SKIPPED partial mixed in
   unset FAKE_INVENTORY_SHAPE
 done
 export FAKE_INVENTORY_RESULT=PASS
+for refusal in missing enabled changed incomplete; do
+  export FAKE_MUTATION_REFUSAL="$refusal"
+  evidence="$scratch/qemu-mutation-refusal-$refusal"
+  assert_rc 3 "$qemu_runner" --distro arch --release v9.9.9 --staged-dir "$scratch/valid" \
+    --inventory-tiers hermetic --evidence-dir "$evidence"
+  qemu_result=$(results_file "$evidence")
+  work=${qemu_result%/results.json}
+  [[ ! -e "$work/fixture-inventory-calls.log" ]] || fail 'invalid refusal proof allowed inventory execution'
+  jq -e 'length > 0 and all(.[]; .result == "BLOCKED")' "$work/inventory/results.json" >/dev/null \
+    || fail 'invalid refusal proof did not block every selected row'
+done
+unset FAKE_MUTATION_REFUSAL
 for backend_receipt in missing invalid product; do
   export FAKE_QEMU_BACKEND_RECEIPT="$backend_receipt"
   expected_rc=120 expected_result=HARNESS_ERROR
