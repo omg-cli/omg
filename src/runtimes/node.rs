@@ -379,6 +379,34 @@ mod tests {
         assert!(serde_json::from_str::<Wire>(r#"{ "lts": 42 }"#).is_err());
     }
 
+    #[tokio::test]
+    async fn https_alias_resolution_requires_the_exact_release_identity() -> Result<()> {
+        let body = br#"[{"version":"v21.0.0","lts":false},{"version":"v20.10.0","lts":"Iron"},{"version":"v18.19.0","lts":"Hydrogen"}]"#;
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "nodejs.org",
+            (0..4)
+                .map(|_| ("/dist/index.json".into(), body.to_vec()))
+                .collect(),
+        )
+        .await?;
+        let versions = tempfile::TempDir::new()?;
+        let manager = NodeManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        assert_eq!(manager.resolve_alias("latest").await?, "21.0.0");
+        assert_eq!(manager.resolve_alias("lts").await?, "20.10.0");
+        assert_eq!(manager.resolve_alias("lts/iron").await?, "20.10.0");
+        assert!(manager.resolve_alias("lts/missing").await.is_err());
+        assert_eq!(manager.resolve_alias("v20.10.0").await?, "20.10.0");
+        assert_eq!(
+            fixture.finish().await?,
+            vec!["GET /dist/index.json HTTP/1.1"; 4]
+        );
+        assert_eq!(std::fs::read_dir(versions.path())?.count(), 0);
+        Ok(())
+    }
+
     fn fixture_versions() -> Vec<NodeVersion> {
         vec![
             NodeVersion {

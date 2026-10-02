@@ -24,6 +24,9 @@ pub(crate) mod swift;
 pub(crate) mod tool_registry;
 pub(crate) mod zig;
 
+#[cfg(test)]
+mod test_https;
+
 pub(crate) use bun::BunManager;
 pub(crate) use deno::DenoManager;
 pub(crate) use dotnet::DotnetManager;
