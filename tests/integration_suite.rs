@@ -1295,11 +1295,15 @@ mod version_detection {
 
     #[test]
     fn test_nvmrc_detection() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut f = File::create(temp_dir.path().join(".nvmrc")).unwrap();
-        writeln!(f, "20.10.0").unwrap();
-
-        let result = run_omg_in_dir(&["use", "node"], temp_dir.path());
+        let project = TestProject::new();
+        project.create_file(".nvmrc", "20.10.0\n");
+        let result = project.run_with_env(
+            &["use", "node"],
+            &[("HTTPS_PROXY", "http://127.0.0.1:9"), ("HTTP_PROXY", "http://127.0.0.1:9"),
+              ("ALL_PROXY", "http://127.0.0.1:9"), ("NO_PROXY", ""), ("PATH", ""),
+              ("OMG_TEST_COMMAND_TIMEOUT_SECS", "3")],
+        );
+        result.assert_success();
         // Falsifiable: the EXACT version must be reported; a generic
         // "Detected" message with the wrong version must fail this.
         result.assert_stdout_contains("20.10.0");
