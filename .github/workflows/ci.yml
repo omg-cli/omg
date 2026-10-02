@@ -954,10 +954,17 @@ jobs:
         run: |
           set -euo pipefail
           sudo useradd --create-home omg-catalog
+          inputs="/tmp/omg-catalog-inputs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo install -d -m 755 "$inputs"
+          sudo install -m 644 scripts/test-debian-daemon-catalog.py "$inputs/test-debian-daemon-catalog.py"
+          for name in omg omgd; do
+            sudo install -m 755 "target/release/$name" "$inputs/$name"
+            cmp "target/release/$name" "$inputs/$name"
+          done
           sudo runuser -u omg-catalog -- env OMG_CONTRACT_SOURCE_SHA="$GITHUB_SHA" \
-            python3 "$GITHUB_WORKSPACE/scripts/test-debian-daemon-catalog.py" \
-            --omg-binary "$GITHUB_WORKSPACE/target/release/omg" \
-            --omgd-binary "$GITHUB_WORKSPACE/target/release/omgd" \
+            python3 "$inputs/test-debian-daemon-catalog.py" \
+            --omg-binary "$inputs/omg" \
+            --omgd-binary "$inputs/omgd" \
             --evidence-dir "/tmp/omg-catalog-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ubuntu"
 
       - name: Export native APT catalogue proof for the runner
