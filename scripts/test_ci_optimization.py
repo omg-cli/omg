@@ -21,6 +21,21 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_portable_and_benchmark_preserve_native_cache_budget(self):
+        for filename, old_prefix, new_prefix in (
+            ('ci.yml', 'v2-portable', 'v3-portable-registry'),
+            ('benchmark.yml', 'v2-benchmark-dependencies', 'v3-benchmark-registry'),
+        ):
+            with self.subTest(workflow=filename):
+                text = (WORKFLOWS / filename).read_text()
+                blocks = re.split(r'(?m)^      - ', text)
+                caches = [block for block in blocks
+                          if 'uses: Swatinem/rust-cache@' in block and new_prefix in block]
+                self.assertEqual(len(caches), 1, 'registry-only cache must use a fresh prefix')
+                self.assertIn('cache-targets: false', caches[0])
+                self.assertIn('cache-bin: false', caches[0])
+                self.assertNotIn(old_prefix, text)
+
     def test_ci_profiles_do_not_retry_failures(self):
         config = tomllib.loads((ROOT / '.config/nextest.toml').read_text())
         for name in ('ci', 'ci-junit'):
