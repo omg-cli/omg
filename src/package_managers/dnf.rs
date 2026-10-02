@@ -35,7 +35,9 @@ mod rpm_tags {
     pub const NAME: u32 = 1000;
     pub const VERSION: u32 = 1001;
     pub const RELEASE: u32 = 1002;
+    pub const EPOCH: u32 = 1003;
     pub const SUMMARY: u32 = 1004;
+    pub const ARCH: u32 = 1022;
 }
 
 // RPM header data types (librpm numbering): 1=CHAR 2=INT8 3=INT16 4=INT32
@@ -162,8 +164,26 @@ struct InstalledPackage {
     name: String,
     version: String,
     release: String,
+    architecture: String,
     summary: String,
     reason: InstallReason,
+}
+
+impl InstalledPackage {
+    fn identity(&self) -> String {
+        if self.architecture.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}.{}", self.name, self.architecture)
+        }
+    }
+
+    fn nevra(&self) -> String {
+        format!(
+            "{}-{}-{}.{}",
+            self.name, self.version, self.release, self.architecture
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +242,17 @@ struct NativeTransactionPackage {
     action: String,
 }
 
+#[derive(serde::Deserialize)]
+struct StoredRemovalTransaction {
+    version: String,
+    #[serde(default)]
+    rpms: Vec<NativeTransactionPackage>,
+    #[serde(default)]
+    groups: Vec<serde_json::Value>,
+    #[serde(default)]
+    environments: Vec<serde_json::Value>,
+}
+
 #[derive(Default)]
 struct NativeVersionChanges {
     removed: BTreeSet<String>,
@@ -272,6 +303,81 @@ impl Default for DnfPackageManager {
 }
 
 impl DnfPackageManager {
+    fn parse_removal_plan(bytes: &[u8]) -> Result<Vec<super::types::RemovalPackage>> {
+        let transaction: StoredRemovalTransaction = serde_json::from_slice(bytes)
+            .context("DNF5 did not produce a valid stored removal transaction")?;
+        anyhow::ensure!(
+            transaction.version == "1.0",
+            "Unsupported DNF5 stored transaction version"
+        );
+        anyhow::ensure!(
+            transaction.groups.is_empty() && transaction.environments.is_empty(),
+            "DNF removal would also modify groups or environments"
+        );
+        let mut seen = BTreeSet::new();
+        let mut plan = transaction
+            .rpms
+            .into_iter()
+            .map(|package| {
+                anyhow::ensure!(
+                    package.action == "Remove",
+                    "DNF removal would also perform '{}'; inspect the transaction with dnf",
+                    package.action
+                );
+                anyhow::ensure!(
+                    seen.insert(package.nevra.clone()),
+                    "Duplicate DNF removal identity"
+                );
+                let (name, architecture) = super::dnf_advisory::package_identity(&package.nevra)?;
+                let version =
+                    &package.nevra[name.len() + 1..package.nevra.len() - architecture.len() - 1];
+                Ok(super::types::RemovalPackage {
+                    name: format!("{name}.{architecture}"),
+                    version: version.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        plan.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.version.cmp(&right.version))
+        });
+        Ok(plan)
+    }
+
+    async fn simulate_removal(packages: &[String]) -> Result<Vec<super::types::RemovalPackage>> {
+        use tokio::io::AsyncReadExt;
+        crate::core::security::validate_package_names(packages)?;
+        let directory = tempfile::tempdir()
+            .context("Could not create private DNF removal preview directory")?;
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command
+            .env("LC_ALL", "C")
+            .args([
+                "--cacheonly".to_owned(),
+                format!("--setopt=logdir={}", directory.path().display()),
+                "remove".to_owned(),
+                "--assumeyes".to_owned(),
+                format!("--store={}", directory.path().display()),
+            ])
+            .args(packages);
+        Self::query_output(command)
+            .await
+            .context("Could not simulate removal with DNF5 --store")?;
+        let file = tokio::fs::File::open(directory.path().join("transaction.json"))
+            .await
+            .context("DNF5 did not store a removal transaction")?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() <= 64 * 1024 * 1024,
+            "DNF removal plan exceeds 64 MiB"
+        );
+        Self::parse_removal_plan(&bytes)
+    }
     fn cached_update_args() -> Vec<String> {
         ["--setopt=cacheonly=metadata", "upgrade", "-y"]
             .into_iter()
@@ -392,14 +498,23 @@ impl DnfPackageManager {
             .cache_read()
             .as_ref()
             .filter(|snapshot| snapshot.observation.is_current(&self.rpm_db_path))
-            .map(|snapshot| snapshot.packages.contains_key(package));
+            .map(|snapshot| {
+                snapshot.packages.contains_key(package)
+                    || snapshot.packages.values().flatten().any(|installed| {
+                        installed.identity() == package || installed.nevra() == package
+                    })
+            });
         if let Some(installed) = cached {
             return Ok(installed);
         }
         Ok(self
             .load_installed_packages_blocking()?
             .iter()
-            .any(|installed| installed.name == package))
+            .any(|installed| {
+                installed.name == package
+                    || installed.identity() == package
+                    || installed.nevra() == package
+            }))
     }
 
     async fn apply_current_install_reasons(packages: &mut [InstalledPackage]) -> Result<()> {
@@ -449,7 +564,7 @@ impl DnfPackageManager {
             .args([
                 "-qa",
                 "--queryformat",
-                "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{SUMMARY}\n",
+                "%{NAME}\t%{VERSION}\t%{RELEASE}\t%{SUMMARY}\t%{EPOCHNUM}\t%{ARCH}\n",
             ])
             .output()
             .context("Failed to execute rpm -qa")?;
@@ -513,20 +628,26 @@ impl DnfPackageManager {
 
     fn parse_rpm_qa_line(line: &str) -> Result<InstalledPackage> {
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 4 {
+        if fields.len() != 6 {
             anyhow::bail!(
-                "malformed rpm -qa output: expected 4 fields, got {}",
+                "malformed rpm -qa output: expected 6 fields, got {}",
                 fields.len()
             );
         }
 
+        let epoch: u32 = fields[4].parse().context("Malformed RPM epoch")?;
+        anyhow::ensure!(!fields[5].is_empty(), "RPM architecture is missing");
         Ok(InstalledPackage {
             name: fields[0].to_string(),
-            version: fields[1].to_string(),
+            version: if epoch == 0 {
+                fields[1].to_owned()
+            } else {
+                format!("{epoch}:{}", fields[1])
+            },
             release: fields[2].to_string(),
+            architecture: fields[5].to_owned(),
             summary: fields[3].to_string(),
-            // The query emits four fields and install reasons are populated
-            // separately from `dnf repoquery --userinstalled`.
+            // Install reasons are populated separately from DNF's state.
             reason: InstallReason::Dependency,
         })
     }
@@ -657,10 +778,24 @@ impl DnfPackageManager {
             anyhow::bail!("RPM header missing NAME tag");
         }
 
+        let epoch = tags
+            .get(&rpm_tags::EPOCH)
+            .map(|bytes| {
+                let bytes: [u8; 4] = (*bytes).try_into().context("Malformed RPM EPOCH tag")?;
+                Ok::<_, anyhow::Error>(u32::from_be_bytes(bytes))
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let version = get_string(rpm_tags::VERSION);
         Ok(InstalledPackage {
             name,
-            version: get_string(rpm_tags::VERSION),
+            version: if epoch == 0 {
+                version
+            } else {
+                format!("{epoch}:{version}")
+            },
             release: get_string(rpm_tags::RELEASE),
+            architecture: get_string(rpm_tags::ARCH),
             summary: get_string(rpm_tags::SUMMARY),
             reason: InstallReason::Dependency,
         })
@@ -1577,7 +1712,7 @@ impl PackageManager for DnfPackageManager {
                         || pkg.summary.to_lowercase().contains(&query_lower)
                 })
                 .map(|pkg| Package {
-                    name: pkg.name.clone(),
+                    name: pkg.identity(),
                     version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
                     description: pkg.summary.clone(),
                     source: PackageSource::Official,
@@ -1634,6 +1769,13 @@ impl PackageManager for DnfPackageManager {
         })
     }
 
+    fn removal_plan<'a>(
+        &'a self,
+        packages: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::RemovalPackage>>> + Send + 'a>> {
+        Box::pin(Self::simulate_removal(packages))
+    }
+
     fn update(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(self.execute_dnf(vec!["upgrade".to_owned(), "-y".to_owned()]))
     }
@@ -1670,9 +1812,17 @@ impl PackageManager for DnfPackageManager {
         Box::pin(async move {
             let installed = self.load_installed_packages().await?;
 
-            if let Some(pkg) = installed.iter().find(|p| p.name == package) {
+            let matches = installed
+                .iter()
+                .filter(|p| p.name == package || p.identity() == package || p.nevra() == package)
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                matches.len() <= 1,
+                "Package '{package}' has multiple installed builds; specify the full NEVRA"
+            );
+            if let Some(pkg) = matches.first() {
                 return Ok(Some(Package {
-                    name: pkg.name.clone(),
+                    name: pkg.identity(),
                     version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
                     description: pkg.summary.clone(),
                     source: PackageSource::Official,
@@ -1694,7 +1844,7 @@ impl PackageManager for DnfPackageManager {
             Ok(installed
                 .into_iter()
                 .map(|pkg| Package {
-                    name: pkg.name,
+                    name: pkg.identity(),
                     version: parse_version_or_zero(&format!("{}-{}", pkg.version, pkg.release)),
                     description: pkg.summary,
                     source: PackageSource::Official,
@@ -1779,6 +1929,102 @@ fn reject_unsealed_local_rpm_targets(packages: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires Fedora DNF5 with the installed leaf fixture tree; stores a plan only"]
+    async fn native_removal_simulation_preserves_installed_inventory() -> Result<()> {
+        let manager = DnfPackageManager::new();
+        anyhow::ensure!(
+            manager.is_installed("tree").await?,
+            "installed tree fixture required"
+        );
+        let before = manager.security_inventory().await?;
+        let plan = manager.removal_plan(&["tree".into()]).await?;
+        assert!(plan.iter().any(|package| package.name == "tree.x86_64"));
+        assert_eq!(manager.security_inventory().await?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn stored_removal_plan_includes_dependents_and_native_identities() {
+        let plan = DnfPackageManager::parse_removal_plan(
+            br#"{"version":"1.0","rpms":[
+            {"nevra":"library-2:1.0-1.fc44.i686","action":"Remove"},
+            {"nevra":"application-2.0-1.fc44.x86_64","action":"Remove"}] }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                super::super::types::RemovalPackage {
+                    name: "application.x86_64".into(),
+                    version: "2.0-1.fc44".into()
+                },
+                super::super::types::RemovalPackage {
+                    name: "library.i686".into(),
+                    version: "2:1.0-1.fc44".into()
+                }
+            ]
+        );
+        for bad in [
+            br#"{"version":"2.0","rpms":[]}"#.as_slice(),
+            br#"{"version":"1.0","rpms":[{"nevra":"library-1-1.x86_64","action":"Install"}]}"#,
+            br#"{"version":"1.0","rpms":[{"nevra":"broken","action":"Remove"}]}"#,
+            br#"{"version":"1.0","groups":[{}]}"#,
+        ] {
+            assert!(DnfPackageManager::parse_removal_plan(bad).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_inventory_preserves_epoch_and_multilib_identity() -> Result<()> {
+        let make_header = |architecture: &str| {
+            let mut data = b"example\0".to_vec();
+            data.extend(b"1.0\0");
+            data.extend(b"1.fc44\0");
+            data.push(0);
+            data.extend(2u32.to_be_bytes());
+            data.extend(architecture.as_bytes());
+            data.push(0);
+            strict_header(
+                &[
+                    (1000, 6, 0, 1),
+                    (1001, 6, 8, 1),
+                    (1002, 6, 12, 1),
+                    (1003, 4, 20, 1),
+                    (1022, 6, 24, 1),
+                ],
+                &data,
+            )
+        };
+        let amd64 = make_header("x86_64");
+        let i686 = make_header("i686");
+        let directory = write_packages_db(&[&amd64, &i686]);
+        let mut manager = DnfPackageManager::new();
+        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let mut installed = manager.list_installed().await?;
+        installed.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(
+            installed
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            ["example.i686", "example.x86_64"]
+        );
+        assert!(
+            installed
+                .iter()
+                .all(|package| package.version.to_string() == "2:1.0-1.fc44")
+        );
+        assert!(manager.info("example").await.is_err());
+        assert_eq!(
+            manager.info("example.i686").await?.unwrap().name,
+            "example.i686"
+        );
+        assert!(manager.is_installed("example.i686").await?);
+        assert!(manager.is_installed("example-2:1.0-1.fc44.i686").await?);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn native_advisory_identity_excludes_patched_versions_and_other_architectures() {
@@ -2749,6 +2995,7 @@ mod tests {
             name: "bash".to_string(),
             version: "5.2".to_string(),
             release: "1.fc42".to_string(),
+            architecture: "x86_64".to_string(),
             summary: "GNU shell".to_string(),
             reason: InstallReason::Dependency,
         }];
@@ -2965,6 +3212,7 @@ mod tests {
                 name: "glibc".to_string(),
                 version: "2.41".to_string(),
                 release: release.to_string(),
+                architecture: "x86_64".to_string(),
                 summary: "C library".to_string(),
                 reason: InstallReason::Dependency,
             })
@@ -2996,6 +3244,7 @@ mod tests {
                 name: "kernel-core".to_string(),
                 version: "6.17.1".to_string(),
                 release: "1.fc44".to_string(),
+                architecture: "x86_64".to_string(),
                 summary: "Kernel".to_string(),
                 reason: InstallReason::User,
             },
@@ -3003,6 +3252,7 @@ mod tests {
                 name: "kernel-core".to_string(),
                 version: "6.17.2".to_string(),
                 release: "1.fc44".to_string(),
+                architecture: "x86_64".to_string(),
                 summary: "Kernel".to_string(),
                 reason: InstallReason::User,
             },
@@ -3010,6 +3260,7 @@ mod tests {
                 name: "kernel-modules".to_string(),
                 version: "6.17.2".to_string(),
                 release: "1.fc44".to_string(),
+                architecture: "x86_64".to_string(),
                 summary: "Kernel modules".to_string(),
                 reason: InstallReason::Dependency,
             },
@@ -3032,6 +3283,7 @@ mod tests {
                 name: "glibc".to_string(),
                 version: "2.41".to_string(),
                 release: "1.fc42.x86_64".to_string(),
+                architecture: "x86_64".to_string(),
                 summary: "C library".to_string(),
                 reason: InstallReason::Dependency,
             }],
@@ -3042,6 +3294,7 @@ mod tests {
                 name: "bash".to_string(),
                 version: "5.2".to_string(),
                 release: "1.fc42".to_string(),
+                architecture: "x86_64".to_string(),
                 summary: "GNU shell".to_string(),
                 reason: InstallReason::User,
             }],
@@ -3059,7 +3312,7 @@ mod tests {
     #[test]
     fn test_parse_rpm_qa_line_reads_installed_package() {
         let pkg = DnfPackageManager::parse_rpm_qa_line(
-            "bash\t5.2.15\t1.fc39\tThe GNU Bourne Again shell",
+            "bash\t5.2.15\t1.fc39\tThe GNU Bourne Again shell\t0\tx86_64",
         )
         .expect("valid rpm -qa line");
         assert_eq!(pkg.name, "bash");
@@ -3142,4 +3395,10 @@ mod tests {
             assert!(message.contains(needle), "missing {needle:?} in: {message}");
         }
     }
+}
+#[test]
+fn ordinary_rpm_inventory_preserves_epoch() {
+    let package =
+        DnfPackageManager::parse_rpm_qa_line("example\t1.0\t1.fc44\tsummary\t2\tx86_64").unwrap();
+    assert_eq!(package.version, "2:1.0");
 }

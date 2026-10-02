@@ -2697,7 +2697,7 @@ impl AurClient {
     }
 
     fn archive_architecture_approved(srcinfo: &str, architecture: &str) -> bool {
-        (architecture == "any" || architecture == std::env::consts::ARCH)
+        super::utils::package_architecture_matches(std::env::consts::ARCH, architecture)
             && srcinfo
                 .lines()
                 .filter_map(|line| line.split_once('='))
@@ -6512,7 +6512,8 @@ mod tests {
             b"pkgname=fixture\npkgver=1.0\npkgrel=1\n",
         )?;
         let archive = root.join("fixture.pkg.tar.gz");
-        let host = std::env::consts::ARCH;
+        let host_architecture = super::super::utils::current_arch().unwrap().to_string();
+        let host = host_architecture.as_str();
         for (declared, actual, expected) in [
             ("any", None, false),
             ("any", Some("any"), true),

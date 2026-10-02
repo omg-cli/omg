@@ -342,6 +342,28 @@ impl PackageManager for MockPackageManager {
         Box::pin(async move { Ok(()) })
     }
 
+    fn removal_plan<'a>(
+        &'a self,
+        packages: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::RemovalPackage>>> + Send + 'a>> {
+        Box::pin(async move {
+            let state = self.load_state()?;
+            packages
+                .iter()
+                .map(|name| {
+                    let version = state
+                        .installed
+                        .get(name)
+                        .with_context(|| format!("Package '{name}' is not installed"))?;
+                    Ok(super::types::RemovalPackage {
+                        name: name.clone(),
+                        version: version.clone(),
+                    })
+                })
+                .collect()
+        })
+    }
+
     fn sync(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move { Ok(()) })
     }
