@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 
-CASES = ('release-package-install-tree', 'release-package-remove-tree')
+CASES = ('release-package-search-tree', 'release-package-install-tree', 'release-package-remove-tree')
 SNAPSHOTS = {
     'arch': "pacman -Q; printf '\\ninstall reasons\\n'; pacman -Qqe",
     'debian': "dpkg-query -W '-f=${Package}\\t${Version}\\t${Status}\\t${Architecture}\\n'; printf '\\ninstall reasons\\n'; apt-mark showmanual",
@@ -28,11 +28,12 @@ def subset(path):
         raise ValueError('source inventory is missing or oversized')
     lines = data.splitlines(keepends=True)
     selected = [line for line in lines[1:] if line.split(b'\t', 1)[0].decode() in CASES]
-    if len(selected) != 2 or [line.split(b'\t', 1)[0].decode() for line in selected] != list(CASES):
+    if len(selected) != 3 or [line.split(b'\t', 1)[0].decode() for line in selected] != list(CASES):
         raise ValueError('source inventory must contain each refusal row exactly once')
-    for line, operation in zip(selected, ('install', 'remove')):
+    for line, operation, safety in zip(selected, ('search', 'install', 'remove'), ('read', 'package-mutation', 'package-mutation')):
         cells = line.decode().rstrip('\r\n').split('\t')
-        if len(cells) != 10 or json.loads(cells[1]) != [operation, '--yes', 'tree'] or cells[2] != 'package-mutation':
+        argv = [operation, 'tree'] if operation == 'search' else [operation, '--yes', 'tree']
+        if len(cells) != 10 or json.loads(cells[1]) != argv or cells[2] != safety:
             raise ValueError('refusal rows must preserve reviewed tree package mutations')
     return data, lines[0] + b''.join(selected)
 
@@ -50,9 +51,12 @@ def verify(receipt, args):
     if not isinstance(metadata, dict) or metadata.get('allow_mutations') is not False or metadata.get('allow_credentialed') is not False or metadata.get('distro') != args.distro or metadata.get('binary') != args.binary or metadata.get('release') != args.tag or metadata.get('tiers') != 'container':
         raise ValueError('executor opt-in or guest identity is invalid')
     rows = receipt.get('results', [])
-    if not isinstance(rows, list) or len(rows) != 2 or any(not isinstance(row, dict) for row in rows) or [row.get('case_id') for row in rows] != ['qemu-' + args.distro + '-' + case for case in CASES]:
+    if not isinstance(rows, list) or len(rows) != 3 or any(not isinstance(row, dict) for row in rows) or [row.get('case_id') for row in rows] != ['qemu-' + args.distro + '-' + case for case in CASES]:
         raise ValueError('refusal rows are missing, duplicated or unexpected')
-    if any(row.get('result') != 'SKIPPED' or row.get('exit_code') != -1 or row.get('elapsed_seconds') != 0 or row.get('artifact_source') != 'inventory' or row.get('distro') != args.distro for row in rows):
+    control = rows[0]
+    if control.get('result') != 'PASS' or control.get('exit_code') != 0 or control.get('artifact_source') != 'inventory' or control.get('distro') != args.distro:
+        raise ValueError('read-only positive control did not execute successfully')
+    if any(row.get('result') != 'SKIPPED' or row.get('exit_code') != -1 or row.get('elapsed_seconds') != 0 or row.get('artifact_source') != 'inventory' or row.get('distro') != args.distro for row in rows[1:]):
         raise ValueError('a mutation row executed or failed instead of being refused')
     summary = receipt.get('summary', {})
     if not isinstance(summary, dict) or summary.get('complete') is not True:

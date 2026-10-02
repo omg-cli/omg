@@ -36,7 +36,11 @@ class MutationRefusalTests(unittest.TestCase):
             ssh = commands / 'ssh'
             ssh.write_text('''#!/bin/bash
 printf '%s\\n' "$*" >> "$CALLS"
-count=$(wc -l < "$CALLS")
+if [[ "$*" == *OMG_QEMU_RECEIPT* ]]; then
+  printf 'tree official\\nOMG_QEMU_RECEIPT:product:0:0\\n'
+  exit 0
+fi
+count=$(grep -vc OMG_QEMU_RECEIPT "$CALLS")
 if [[ "$FAULT" == state-changed && "$count" -ge 2 ]]; then
   printf 'installed packages\\nbase 2.0\\ninstall reasons\\nbase\\n'
 else
@@ -64,9 +68,10 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(verification.returncode, 0, verification.stderr)
         self.assertTrue(receipt['complete'])
-        self.assertEqual(len(calls), 2, 'only the before/after native snapshots may use SSH')
+        self.assertEqual(len(calls), 3, 'only two native snapshots and the read-only control may use SSH')
+        self.assertEqual(sum('OMG_QEMU_RECEIPT' in call for call in calls), 1)
         self.assertEqual(receipt['state_before_sha256'], receipt['state_after_sha256'])
-        self.assertEqual([row['result'] for row in receipt['results']], ['SKIPPED', 'SKIPPED'])
+        self.assertEqual([row['result'] for row in receipt['results']], ['PASS', 'SKIPPED', 'SKIPPED'])
         self.assertFalse(receipt['metadata']['allow_mutations'])
 
     def test_enabled_gate_and_changed_native_state_cannot_prove_refusal(self):
