@@ -1218,6 +1218,25 @@ mod tests {
     }
     use super::*;
 
+    #[test]
+    fn append_open_failure_preserves_native_cause_and_target() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("audit.jsonl");
+        std::fs::create_dir(&path)?;
+        let Err(AuditError::Open {
+            path: reported,
+            source,
+        }) = open_append_file(&path)
+        else {
+            anyhow::bail!("an audit append target directory must return its native open failure");
+        };
+        assert_eq!(reported, path.display().to_string());
+        assert!(source.raw_os_error().is_some());
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(&path)?.count(), 0);
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     mod system_directory {
         use super::*;
