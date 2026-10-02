@@ -2008,6 +2008,52 @@ write_row_log() {
   } > "$destination"
 }
 # END ROW LOG
+
+# BEGIN ROW PROGRAM RECEIVER
+# Only this small receiver enters SSH argv. The generated supervisor is read
+# completely and authenticated before fixtures or the product can execute.
+row_program_receiver() {
+  local size=$1 digest=$2 receiver
+  if [[ ! "$size" =~ ^[1-9][0-9]{0,6}$ ]] || ((size > 1048576)) \
+    || [[ ! "$digest" =~ ^[a-f0-9]{64}$ ]]; then
+    printf 'error: invalid or oversized inventory row program\n' >&2
+    return 120
+  fi
+  receiver=$(cat <<'QEMU_ROW_RECEIVER'
+unset qemu_row_payload
+qemu_row_payload=
+export -n qemu_row_payload
+if LC_ALL=C IFS= builtin read -r -d '' -n 1048577 qemu_row_payload; then
+  qemu_row_read_status=0
+else
+  qemu_row_read_status=$?
+fi
+if [ "$qemu_row_read_status" != 1 ]; then
+  printf 'error: inventory row stream did not end at bounded EOF\n' >&2
+  exit 122
+fi
+qemu_row_size=$(builtin printf '%s' "$qemu_row_payload" | wc -c)
+if [ "$qemu_row_size" != "$qemu_row_expected_size" ]; then
+  printf 'error: inventory row stream size mismatch\n' >&2
+  exit 122
+fi
+if ! qemu_row_digest=$(builtin printf '%s' "$qemu_row_payload" | sha256sum); then
+  printf 'error: inventory row stream digest failed\n' >&2
+  exit 122
+fi
+if [ "$qemu_row_digest" != "$qemu_row_expected_sha  -" ]; then
+  printf 'error: inventory row stream digest mismatch\n' >&2
+  exit 122
+fi
+set --
+builtin eval "$qemu_row_payload" </dev/null
+QEMU_ROW_RECEIVER
+)
+  printf -v receiver 'qemu_row_expected_size=%s; qemu_row_expected_sha=%s\n%s' "$size" "$digest" "$receiver"
+  printf 'bash -c %s' "$(jq -rn --arg s "$receiver" '$s | @sh')"
+}
+# END ROW PROGRAM RECEIVER
+
 trap 'rc=$?; if [[ "$rc" == 2 ]]; then printf "error: invalid inventory configuration or row %s\n" "${id:-<preflight>}" >&2; fi' EXIT
 
 work=""; distro=""; tiers=""; tag=""; binary=""; tsv=""
@@ -2533,6 +2579,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   }
   quoted_binary=$(jq -rn --arg b "$binary" '$b | @sh')
   quoted_binary_dir=$(jq -rn --arg b "${binary%/*}" '$b | @sh')
+  export -n remote row_program
   remote="set -eu; export OMG_QEMU_EXECUTABLE=$quoted_binary OMG_QEMU_DISTRO='$distro'; rowdir=\$(mktemp -d \"\$HOME/inventory-$case.XXXXXX\"); cd \"\$rowdir\""
   if [[ "$man_page_mode" == exact ]]; then remote+="; export OMG_QEMU_EXACT_MAN_PAGES=1"; fi
   if [[ "$assertions" == container-run-argv || "$assertions" == container-shell-argv || "$assertions" == container-build-argv ]]; then
@@ -2943,7 +2990,14 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   # A receipt is emitted only after setup and the command complete. SSH
   # transport/tool failures cannot satisfy an expected product refusal.
   remote+="; printf '\nOMG_QEMU_RECEIPT:%s:%s:%s\n' \"\$execution_phase\" \"\$rc\" \"\$assertion\""
-  remote="bash -c $(jq -rn --arg s "$remote" '$s | @sh')"
+  # Keep the program out of every external argv and exported environment.
+  # Receiver failures cannot emit a product receipt or satisfy a refusal.
+  row_program=$remote
+  row_program_size=$(builtin printf '%s' "$row_program" | wc -c)
+  row_program_digest=$(builtin printf '%s' "$row_program" | sha256sum)
+  row_program_digest=${row_program_digest%% *}
+  receiver_status=0
+  remote=$(row_program_receiver "$row_program_size" "$row_program_digest") || receiver_status=$?
   if [[ "$network_scope" == offline ]]; then
     # Put the supervisor AND its receipt inside the namespace. A namespace
     # setup failure must be a transport/harness error, never an expected CLI
@@ -3010,7 +3064,15 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$case" == runtime-go-install ]]; then budget=$((budget + 210)); fi
   if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then budget=$((budget + 60)); fi
-  timeout --kill-after=5s "$budget" ssh "${opts[@]}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
+  if ((receiver_status != 0)); then
+    transport=$receiver_status
+    : > "$out/rows/$case.stdout.log"
+    printf 'error: invalid or oversized inventory row program\n' > "$out/rows/$case.stderr.log"
+  else
+    # opts[0] is -n. Remove it only for this explicit pipe: SSH receives the
+    # exact program, never this TSV loop's stdin. The verified body sees EOF.
+    builtin printf '%s' "$row_program" | timeout --kill-after=5s "$budget" ssh "${opts[@]:1}" "$target" "$remote" > "$out/rows/$case.stdout.log" 2> "$out/rows/$case.stderr.log" || transport=$?
+  fi
   read -r uptime _ < /proc/uptime
   elapsed=$(( (10#${uptime/./} - 10#$start_centis) / 100 ))
   verdict=HARNESS_ERROR; rc=$transport

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -122,6 +123,70 @@ rpm() {
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, exit_code, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
+
+
+
+@unittest.skipIf(os.name == 'nt', 'Row transport requires POSIX bash')
+class RowTransportContracts(unittest.TestCase):
+    @staticmethod
+    def receiver(size, digest):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        functions = source[source.index('# BEGIN ROW PROGRAM RECEIVER'):
+                           source.index('# END ROW PROGRAM RECEIVER')]
+        result = subprocess.run(['bash', '-c', functions + '\nrow_program_receiver "$1" "$2"',
+                                 '_', str(size), digest], capture_output=True, timeout=10)
+        return result
+
+    def execute(self, program, stream=None, *, digest=None):
+        receiver = self.receiver(len(program), digest or hashlib.sha256(program).hexdigest())
+        self.assertEqual(receiver.returncode, 0, receiver.stderr)
+        self.assertLess(len(receiver.stdout), 4096)
+        return subprocess.run(['bash', '-c', receiver.stdout.decode()],
+                              input=program if stream is None else stream,
+                              env=dict(os.environ, qemu_row_payload='inherited-export', LC_ALL='C.UTF-8'),
+                              capture_output=True, timeout=10)
+
+    def test_verified_long_program_keeps_bytes_eof_environment_and_exit_behavior(self):
+        body = '''set -eu
+test "$#" -eq 0
+test "$LC_ALL" = C.UTF-8
+! env | grep '^qemu_row_payload='
+if IFS= read -r input; then exit 73; fi
+printf 'unicode: →\\n'
+trap 'printf "exit-trap\\n"' EXIT
+'''
+        for size in (154274, 1048576):
+            program = body.encode() + b'#' + b'x' * (size - len(body.encode()) - 3) + b'\n\n'
+            with self.subTest(size=size):
+                result = self.execute(program)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, 'unicode: →\nexit-trap\n'.encode())
+        program = b'set -eu\ntrap \'printf "exit-trap\\n"\' EXIT\nfalse\nprintf forbidden\n\n'
+        result = self.execute(program)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, b'exit-trap\n')
+        result = self.execute(b'set -eu\ntrap \'printf "exit-trap\\n"\' EXIT\nexit 23\n\n')
+        self.assertEqual((result.returncode, result.stdout), (23, b'exit-trap\n'))
+
+    def test_unverified_or_oversized_stream_cannot_reach_the_program(self):
+        program = b'printf executed\n' + b'#' + b'x' * 140000 + b'\n\n'
+        for label, stream, digest in (
+            ('truncated', program[:-1], None), ('extra', program + b'\n', None),
+            ('wrong bytes', program.replace(b'executed', b'mutated!'), None),
+            ('wrong digest', program, '0' * 64), ('empty', b'', None),
+            ('embedded NUL', program[:20] + b'\0' + program[20:], None),
+            ('over limit', program + b'x' * 1048577, None),
+        ):
+            with self.subTest(label=label):
+                result = self.execute(program, stream, digest=digest)
+                self.assertEqual(result.returncode, 122, result.stderr)
+                self.assertEqual(result.stdout, b'')
+        for size, digest in ((0, '0' * 64), (1048577, '0' * 64),
+                             ('1; printf executed', '0' * 64), (1, 'invalid')):
+            with self.subTest(size=size, digest=digest):
+                result = self.receiver(size, digest)
+                self.assertEqual(result.returncode, 120, result.stderr)
+                self.assertEqual(result.stdout, b'')
 
 
 class OutputContracts(unittest.TestCase):
@@ -1100,7 +1165,8 @@ done
         for details, expected in (('Node: 20\nPython: 3.12\nPackages: ripgrep', 'PASS'),
                                   ('', 'FAIL'),
                                   ('Node: 99\nPython: 3.12\nPackages: ripgrep', 'FAIL')):
-            with self.subTest(details=details):
+            with self.subTest(details=details), mock.patch.dict(os.environ, {
+                    'remote': 'inherited-export', 'row_program': 'inherited-export'}):
                 product = valid.replace("print('Node: 20\\nPython: 3.12\\nPackages: ripgrep')", 'print(' + repr(details) + ')')
                 result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(product), rows)
                 self.assertEqual([item['result'] for item in evidence], ['PASS'] * (len(rows) - 1) + [expected],
@@ -3115,7 +3181,31 @@ exec "$@"
                 self.assertEqual(result.returncode, 1, logs)
                 self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'], logs)
 
-    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product', isolation_scope=None):
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX descriptors')
+    def test_stream_transport_keeps_product_eof_following_rows_and_setup_refusals(self):
+        rows = [case + '\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop'
+                for case in ('help-one', 'help-two')]
+        product = '''if IFS= read -r input; then echo "product consumed stdin" >&2; exit 73; fi
+[[ -z "${qemu_row_payload+x}" ]] || exit 74
+printf 'Usage: fixture\\n'
+'''
+        for label, prefix, suffix, expected in (
+            ('exact stream', '', '', 'PASS'),
+            ('truncated', '', 'head -c -1 | ', 'HARNESS_ERROR'),
+            ('extra bytes', '', '{ cat; printf extra; } | ', 'HARNESS_ERROR'),
+            ('NUL inserted', '', '{ printf "\\0"; cat; } | ', 'HARNESS_ERROR'),
+            ('setup failed', 'exit 73\n', '', 'HARNESS_ERROR'),
+        ):
+            ssh = prefix + 'export qemu_row_payload=inherited-export\n' + suffix + 'bash -c "${@: -1}"\n'
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows, ssh_body=ssh)
+                self.assertEqual(result.returncode, int(expected != 'PASS'), logs)
+                self.assertEqual([item['result'] for item in evidence], [expected, expected], logs)
+                if expected != 'PASS':
+                    self.assertFalse(any('OMG_QEMU_RECEIPT:product:' in value for value in logs.values()), logs)
+
+    def run_inventory(self, product, rows, *, native_commands=None, home_files=None, distro='arch', tiers='hermetic', row_timeout=None, allow_mutations=False, fake_tree_binary=False, exact_man=True, binary_name='product', isolation_scope=None, ssh_body=None):
         def shell_path(path):
             value = path.as_posix()
             return '/' + value[0].lower() + value[2:] if os.name == 'nt' else value
@@ -3147,15 +3237,9 @@ exec "$@"
             binary.write_text('#!/bin/bash\n' + product, encoding='utf-8', newline='\n')
             binary.chmod(0o755)
             ssh = root / 'bin/ssh'
-            if fake_tree_binary:
-                ssh.write_text(
-                    '#!/usr/bin/env bash\n'
-                    'remote=${@: -1}\n'
-                    'remote=${remote//\\/usr\\/bin\\/tree/$OMG_QEMU_TEST_TREE_BINARY}\n'
-                    'exec bash -c "$remote"\n', encoding='utf-8', newline='\n')
-            else:
-                ssh.write_text('#!/usr/bin/env bash\nexec bash -c "${@: -1}"\n',
-                               encoding='utf-8', newline='\n')
+            ssh.write_text('#!/usr/bin/env bash\n' +
+                           (ssh_body or 'exec bash -c "${@: -1}"\n'),
+                           encoding='utf-8', newline='\n')
             ssh.chmod(0o755)
             inventory = root / 'cases.tsv'
             inventory.write_text(
@@ -3164,10 +3248,24 @@ exec "$@"
             env = dict(os.environ, HOME=shell_path(root / 'home'),
                        GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
                        PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
+            driver = ROOT / 'scripts/qemu-inventory.sh'
             if fake_tree_binary:
                 env['OMG_QEMU_TEST_TREE_BINARY'] = shell_path(root / 'home/tree-binary')
+                # Substitute the native path in a private controller copy,
+                # before its size/hash are computed. Keep the receiver exact;
+                # changing streamed bytes would rightly fail authentication.
+                fixture_scripts = root / 'scripts'
+                fixture_scripts.mkdir()
+                for helper in (ROOT / 'scripts').iterdir():
+                    if helper.is_file() and helper.name != driver.name:
+                        (fixture_scripts / helper.name).symlink_to(helper)
+                fixture_driver = fixture_scripts / driver.name
+                fixture_driver.write_text(driver.read_text(encoding='utf-8').replace(
+                    '/usr/bin/tree', shell_path(root / 'home/tree-binary')),
+                    encoding='utf-8', newline='\n')
+                driver = fixture_driver
             command = [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'),
-                       str(ROOT / 'scripts/qemu-inventory.sh'), '--work', str(root),
+                       str(driver), '--work', str(root),
                        '--binary', shell_path(binary), '--tsv', str(inventory),
                        '--distro', distro, '--tiers', tiers, '--tag', 'fixture']
             if isolation_scope is not None:
