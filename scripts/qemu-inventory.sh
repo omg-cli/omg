@@ -617,6 +617,49 @@ check_native_apt_orphan_removed() {
   fi
 }
 
+prepare_native_orphan() {
+  local distro=$1 marked
+  if [[ "$distro" != fedora ]]; then
+    prepare_native_apt_orphan "$distro"
+    return $?
+  fi
+  check_native_tree_state "$distro" installed || return 1
+  if ! dnf --cacheonly repoquery --unneeded --queryformat '%{name}.%{arch}\n' > baseline-unneeded.tsv \
+    || [[ -s baseline-unneeded.tsv ]] \
+    || ! native_package_snapshot "$distro" > orphan-before.state \
+    || ! rpm -q --qf '%{ARCH}' tree > orphan-target.arch; then
+    printf 'assertion failed: Fedora orphan baseline is unavailable or contains unrelated orphans\n' >&2
+    return 1
+  fi
+  if ! sudo -n dnf mark dependency --assumeyes tree > dnf-mark.log 2>&1 \
+    || ! dnf --cacheonly repoquery --unneeded --queryformat '%{name}.%{arch}\n' > orphan-preview.log \
+    || [[ $(cat orphan-preview.log) != "tree.$(cat orphan-target.arch)" ]]; then
+    printf 'assertion failed: native DNF did not select exactly the tree fixture as an orphan\n' >&2
+    return 1
+  fi
+  marked=$(native_package_snapshot "$distro") || return 1
+  check_native_tree_only_delta "$(cat orphan-before.state)" "$marked"
+}
+
+check_native_orphan_removed() {
+  local distro=$1 output=$2 after expected architecture
+  if [[ "$distro" != fedora ]]; then
+    check_native_apt_orphan_removed "$distro" "$output"
+    return $?
+  fi
+  check_native_tree_state "$distro" absent || return 1
+  [[ -s orphan-before.state && -s orphan-target.arch ]] || return 1
+  architecture=$(cat orphan-target.arch) || return 1
+  [[ "$architecture" == x86_64 || "$architecture" == aarch64 ]] || return 1
+  expected=$(awk -v architecture="$architecture" \
+    '$1 != "tree" || ($2 != architecture && $5 != architecture)' orphan-before.state) || return 1
+  after=$(native_package_snapshot "$distro") || return 1
+  if [[ "$after" != "$expected" ]]; then
+    printf 'assertion failed: Fedora orphan cleanup changed unrelated package versions or install reasons\n' >&2
+    return 1
+  fi
+}
+
 check_go_install() (
   local version=$1 base expected active executable fixture observed status
   base="$OMG_DATA_DIR/versions/go"
@@ -1587,8 +1630,8 @@ PY
         local expected=installed
         [[ "$assertion" != native-tree-absent ]] || expected=absent
         check_native_tree_state "$distro" "$expected" || return 1 ;;
-      native-apt-orphan-removed)
-        check_native_apt_orphan_removed "$distro" "$stdout" || return 1 ;;
+      native-apt-orphan-removed|native-orphan-removed)
+        check_native_orphan_removed "$distro" "$stdout" || return 1 ;;
       search-official-tree-output)
         if ! awk '
           /^  [^[:space:]]+ [^[:space:]]+  / {
@@ -1882,7 +1925,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock) ;; *) exit 2 ;; esac
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-remove:workspace-project-removed|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
@@ -2103,7 +2146,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     [[ "$id" == release-package-rollback-tree && "$r" == release-package-remove-tree && "$s" == package-mutation && "$resolved" == 0 && "$t" == container && "$tg" == arch:not-applicable,debian:pass,ubuntu:pass,fedora:not-applicable ]] || exit 2
     jq -e '. == ["rollback", "--yes"]' <<< "$aj" >/dev/null || exit 2
   fi
-  if [[ "$a" == native-apt-orphan-removed ]]; then [[ "$id" == clean-orphans-native ]] || exit 2; fi
+  if [[ "$a" == native-apt-orphan-removed || "$a" == native-orphan-removed ]]; then [[ "$id" == clean-orphans-native ]] || exit 2; fi
   if [[ "$id" == container-run-detached-argv ]]; then
     [[ "$a" == container-run-argv && "$s" == isolated-write && "$resolved" == 0 && "$t" == hermetic && "$tg" == hermetic:pass ]] || exit 2
     jq -e '. == ["container","run","--name","smoke","--detach","--env","SMOKE=1","--volume","${ROOT}:/tmp/omg-smoke","--workdir","/tmp/omg-smoke","debian:bookworm","--","sh","-c","printf smoke"]' <<< "$aj" >/dev/null || exit 2
@@ -2331,7 +2374,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; $(declare -f check_native_tree_state)"
   fi
   if [[ "$case" == clean-orphans-native ]]; then
-    remote+="; $(declare -f prepare_native_apt_orphan); $(declare -f check_native_apt_orphan_removed)"
+    remote+="; $(declare -f native_package_snapshot); $(declare -f check_native_tree_only_delta); $(declare -f prepare_native_apt_orphan); $(declare -f check_native_apt_orphan_removed); $(declare -f prepare_native_orphan); $(declare -f check_native_orphan_removed)"
   fi
   if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree || "$case" == clean-orphans-native ]]; then
     remote+="; if ! check_native_tree_state '$distro' absent; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
@@ -2376,7 +2419,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; python3 \"\$HOME/qemu-fingerprint-oracle.py\" prepare-team-refresh '$distro' \"\$rowdir\" /dev/null"
   fi
   if [[ "$case" == clean-orphans-native ]]; then
-    remote+="; if ! prepare_native_apt_orphan '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi; export OMG_DISABLE_DAEMON=1"
+    remote+="; if ! prepare_native_orphan '$distro'; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi; export OMG_DISABLE_DAEMON=1"
   fi
   if [[ "$case" == hooks-install-force ]]; then
     # An identical reinstall cannot prove --force is honored. Replace each

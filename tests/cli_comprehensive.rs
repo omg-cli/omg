@@ -576,7 +576,7 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
         ("update-fast", Assertion::UpdateFastOutput),
         ("update-turbo", Assertion::UpdateTurboOutput),
         ("daemon-foreground", Assertion::DaemonForegroundLifecycle),
-        ("clean-orphans-native", Assertion::NativeAptOrphanRemoved),
+        ("clean-orphans-native", Assertion::NativeOrphanRemoved),
         ("generate-man", Assertion::ManPagesGenerated),
         ("team-golden-create-flags", Assertion::GoldenPathFlags),
         ("audit-export", Assertion::AuditExportAbsoluteRefusal),
@@ -899,7 +899,7 @@ enum Assertion {
     NativeTreeInstalled,
     NativeTreeAbsent,
     NativeAptTreeRollback,
-    NativeAptOrphanRemoved,
+    NativeOrphanRemoved,
     ContainerRunArgv,
     ContainerShellArgv,
     ContainerBuildArgv,
@@ -1001,7 +1001,7 @@ impl Assertion {
             "native-tree-installed" => Self::NativeTreeInstalled,
             "native-tree-absent" => Self::NativeTreeAbsent,
             "native-apt-tree-rollback" => Self::NativeAptTreeRollback,
-            "native-apt-orphan-removed" => Self::NativeAptOrphanRemoved,
+            "native-apt-orphan-removed" | "native-orphan-removed" => Self::NativeOrphanRemoved,
             "container-run-argv" => Self::ContainerRunArgv,
             "container-shell-argv" => Self::ContainerShellArgv,
             "container-build-argv" => Self::ContainerBuildArgv,
@@ -3136,7 +3136,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::NativeTreeInstalled
                 | Assertion::NativeTreeAbsent
                 | Assertion::NativeAptTreeRollback
-                | Assertion::NativeAptOrphanRemoved
+                | Assertion::NativeOrphanRemoved
                 | Assertion::NativeCount
                 | Assertion::StatusNativeFast
                 | Assertion::StatusNativeFull
