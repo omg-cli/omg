@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -98,6 +99,19 @@ exit 1
                 self.assertEqual(len(rows), 1, 'the real executor did not admit the reviewed live network row')
                 self.assertEqual(rows[0]['result'], 'PASS' if accepted else 'FAIL', logs)
                 self.assertEqual(result.returncode, 0 if accepted else 1, logs)
+
+    def test_oracle_is_staged_for_the_real_controller(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text()
+        begin = source.index('  cp "$here/qemu-inventory.sh"')
+        end = source.index('  if [[ "$source_kind" == staged ]]', begin)
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(['bash', '-e', '-c', source[begin:end]],
+                                    env=dict(os.environ, here=str(ROOT / 'scripts'), work=directory),
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            staged = Path(directory) / 'qemu-doctor-live-oracle.py'
+            self.assertTrue(staged.is_file(), 'real controllers must receive the live report oracle')
+            self.assertEqual(staged.read_bytes(), (ROOT / 'scripts/qemu-doctor-live-oracle.py').read_bytes())
 
 
 if __name__ == '__main__':
