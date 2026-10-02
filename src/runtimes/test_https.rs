@@ -130,3 +130,68 @@ async fn fixture_certificate_requires_explicit_client_trust() -> Result<()> {
     );
     Ok(())
 }
+
+/// Direct loopback HTTP is admitted only by the existing debug test-mode policy.
+pub(super) struct HttpFixture {
+    pub(super) address: std::net::SocketAddr,
+    task: Option<JoinHandle<Result<Vec<String>>>>,
+}
+
+impl HttpFixture {
+    pub(super) async fn new(routes: Vec<(String, Vec<u8>)>) -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (path, body) in routes {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+                let request =
+                    tokio::time::timeout(Duration::from_secs(5), headers(&mut stream)).await??;
+                let expected = format!("GET {path} HTTP/1.1");
+                anyhow::ensure!(
+                    request.lines().next() == Some(expected.as_str()),
+                    "unexpected archive request: {request}"
+                );
+                anyhow::ensure!(
+                    request
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case(&format!("host: {address}"))),
+                    "unexpected archive authority"
+                );
+                requests.push(expected);
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                stream.write_all(&body).await?;
+                stream.shutdown().await?;
+            }
+            Ok(requests)
+        });
+        Ok(Self {
+            address,
+            task: Some(task),
+        })
+    }
+
+    pub(super) async fn finish(mut self) -> Result<Vec<String>> {
+        let task = self.task.as_mut().context("HTTP fixture task is absent")?;
+        let requests = tokio::time::timeout(Duration::from_secs(5), task).await???;
+        self.task = None;
+        Ok(requests)
+    }
+}
+
+impl Drop for HttpFixture {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
