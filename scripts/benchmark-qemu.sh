@@ -623,6 +623,7 @@ if [[ -n "$inventory_tiers" ]]; then
   # guest); /work is bind-mounted there.
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
   cp "$here/qemu-mutation-refusal.py" "$work/qemu-mutation-refusal.py"
+  cp "$here/../tests/cli_behavior_inventory.tsv" "$work/mutation-refusal-cases.tsv"
   cp "$here/qemu-container-fake-engine.sh" "$work/qemu-container-fake-engine.sh"
   cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
@@ -1052,12 +1053,12 @@ if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
   refusal_rc=0
   timeout --kill-after=5s 90 docker exec -w /work "$controller" python3 /work/qemu-mutation-refusal.py \
     collect --work /work --receipt - --distro "$distro" --tag "$tag" \
-    --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv \
+    --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/mutation-refusal-cases.tsv \
     > "$work/mutation-refusal.json" 2> "$work/mutation-refusal.log" || refusal_rc=$?
   if [[ "$refusal_rc" == 0 ]]; then
     python3 "$here/qemu-mutation-refusal.py" verify --receipt "$work/mutation-refusal.json" \
       --distro "$distro" --tag "$tag" --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" \
-      --tsv "$tsv" >> "$work/mutation-refusal.log" 2>&1 || refusal_rc=$?
+      --tsv "$here/../tests/cli_behavior_inventory.tsv" >> "$work/mutation-refusal.log" 2>&1 || refusal_rc=$?
   fi
   if [[ "$refusal_rc" != 0 ]]; then
     printf 'Native mutation refusal proof failed; see %s/mutation-refusal.log\n' "$work" >&2
