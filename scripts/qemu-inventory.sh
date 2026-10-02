@@ -1448,7 +1448,7 @@ check_product_output() {
       printf 'assertion failed: doctor EOL did not classify both confined runtimes\n' >&2; return 1
     fi
   fi
-  if [[ "$assertion" == doctor-network-state ]]; then
+  if [[ "$assertion" == doctor-network-state || "$assertion" == doctor-network-live-state ]]; then
     if [[ "$code" != 1 ]] || ! grep -Fxq 'Network Diagnostics' "$stdout"; then
       printf 'assertion failed: doctor network did not report a failed diagnostic run\n' >&2; return 1
     fi
@@ -1925,7 +1925,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock) ;; *) exit 2 ;; esac
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-remove:workspace-project-removed|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
@@ -2103,7 +2103,10 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   if [[ "$id" == doctor-network ]]; then
     [[ "$a" == doctor-network-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == container ]] || exit 2
     jq -e '. == ["doctor", "--network"]' <<< "$aj" >/dev/null || exit 2
-  elif [[ "$a" == doctor-network-state ]]; then
+  elif [[ "$id" == doctor-network-live ]]; then
+    [[ "$a" == doctor-network-live-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == network ]] || exit 2
+    jq -e '. == ["doctor", "--network"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == doctor-network-state || "$a" == doctor-network-live-state ]]; then
     exit 2
   fi
   if [[ "$id" == audit-secrets ]]; then
@@ -2427,7 +2430,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # the normal installed-hook oracle must observe real replacement.
     remote+="; for hook in pre-commit post-checkout post-merge; do printf '#!/bin/sh\\n# user-owned hook fixture\\nexit 23\\n' > \".git/hooks/\$hook\"; chmod 640 \".git/hooks/\$hook\"; done"
   fi
-  if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state ]]; then
+  if [[ "$assertions" == doctor-network-live-state ]]; then
+    live_oracle=$(jq -rn --rawfile fixture "$(dirname "$0")/qemu-doctor-live-oracle.py" '$fixture | @sh')
+    remote+="; [[ \$(id -u) != 0 ]] || { printf 'assertion failed: live network fixture requires an unprivileged guest user\\n' >&2; exit 2; }; export OMG_CONFIG_DIR=\"\$rowdir/live-network-config\" OMG_DATA_DIR=\"\$rowdir/live-network-data\" OMG_CACHE_DIR=\"\$rowdir/live-network-cache\" OMG_DISABLE_DAEMON=1 OMG_TEST_MODE=0"
+    remote+="; mkdir -p path-shadow; printf '#!/bin/sh\\nexit 95\\n' > path-shadow/omg; chmod 755 path-shadow/omg; export PATH=\"\$rowdir/path-shadow:\$PATH\"; printf '%s' $live_oracle > qemu-doctor-live-oracle.py"
+  fi
+  if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state || "$assertions" == doctor-network-live-state ]]; then
     remote+="; run_omg '$row_timeout' $quoted_binary doctor > doctor.baseline.stdout.log 2> doctor.baseline.stderr.log; baseline_rc=\$rc; baseline_phase=\$execution_phase"
     remote+="; cat doctor.baseline.stdout.log doctor.baseline.stderr.log >&2"
   fi
@@ -2562,6 +2570,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; expected_network_delta=\$(check_doctor_network_output '$distro' command.stdout.log) || assertion=1"
     remote+="; if [[ \"\$baseline_phase\" != product || \"\$assertion\" != 0 ]] || ! check_doctor_issue_delta \"\$baseline_rc\" doctor.baseline.stdout.log doctor.baseline.stderr.log \"\$rc\" command.stderr.log \"\$expected_network_delta\"; then printf 'assertion failed: doctor network issue count did not match failed probes\n' >&2; assertion=1; fi"
   fi
+  if [[ "$assertions" == doctor-network-live-state ]]; then
+    remote+="; if [[ \"\$baseline_phase\" != product || \"\$execution_phase\" != product ]]; then printf 'assertion failed: live network command did not finish as product\\n' >&2; assertion=1; else python3 qemu-doctor-live-oracle.py --distro '$distro' --baseline-exit \"\$baseline_rc\" --exit \"\$rc\" --baseline-out doctor.baseline.stdout.log --baseline-err doctor.baseline.stderr.log --out command.stdout.log --err command.stderr.log > doctor-network-live-proof.json || assertion=1; cat doctor-network-live-proof.json >&2; fi"
+  fi
   if [[ ( "$distro" == fedora || "$distro" == arch && "$safety" == package-mutation ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; if [[ \"\$rc\" == 120 ]] && grep -Fq 'OMG_QEMU_FIXTURE_SETUP_FAILED' command.stderr.log; then execution_phase=dependency; fi"
     remote+="; if [[ \"\$rc\" == 121 ]] && grep -Fq 'OMG_QEMU_FIXTURE_CLEANUP_FAILED' command.stderr.log; then execution_phase=dependency; fi"
@@ -2684,7 +2695,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
   if [[ "$case" == runtime-rust-install ]]; then budget=$((budget + row_timeout + 5)); fi
-  if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state ]]; then budget=$((budget + row_timeout + 5)); fi
+  if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state || "$assertions" == doctor-network-live-state ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ "$assertions" == doctor-native-backend ]]; then
     # Four PATH variants plus the minimal-PATH run. Arch adds the existing
     # corrupt-entry probe, five graph states and two configured DBPath states, each with its own

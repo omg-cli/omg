@@ -182,6 +182,7 @@ daemon-foreground	["daemon","--foreground"]	service-mutation	0	pass	-	container	
 update-turbo	["update","--turbo","--yes"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-turbo-output	none
 update-fast	["update","--fast","--yes"]	package-mutation	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	update-fast-output	none
 doctor-network	["doctor","--network"]	controlled-error	1	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-network-state	tempdir-drop
+doctor-network-live	["doctor","--network"]	controlled-error	1	pass	-	network	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-network-live-state	tempdir-drop
 doctor-eol	["doctor","--eol"]	controlled-error	1	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	doctor-eol-state	tempdir-drop
 doctor-turbo	["doctor","--turbo"]	read	-	declared	-	qemu	arch:pending,debian:pending,ubuntu:pending,fedora:pending	-	none
 run-watch	["run","--watch","smoke"]	isolated-write	0	pass	-	container,pty	arch:pass,debian:pass,ubuntu:pass,fedora:pass	watch-task-rerun	tempdir-drop
