@@ -974,9 +974,7 @@ jobs:
           set -euo pipefail
           for name in receipt.json daemon.log; do
             source="/tmp/omg-catalog-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ubuntu/$name"
-            if [[ -f "$source" ]]; then
-              sudo install -D -m 644 "$source" "$RUNNER_TEMP/apt-daemon-catalog/$name"
-            fi
+            sudo install -D -m 644 "$source" "$RUNNER_TEMP/apt-daemon-catalog/$name"
           done
 
       - name: Preserve native APT catalogue proof
