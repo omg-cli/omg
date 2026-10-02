@@ -221,6 +221,23 @@ class DescriptorTests(unittest.TestCase):
                              b"qemu_process_status=unavailable\nlistener=absent\n")
         self.assertFalse((self.destination / private).exists())
 
+    def test_native_package_identity_exports_only_at_guest_evidence_root(self):
+        name = "run-test/guest/evidence/native-package-identity.txt"
+        content = b"bash.x86_64\n"
+        self.fixture(name, content)
+        excluded = ("run-test/native-package-identity.txt",
+                    "run-test/guest/evidence/native-package-identity.txt.bak",
+                    "run-test/guest/evidence/config/native-package-identity.txt")
+        for neighbor in excluded:
+            self.fixture(neighbor, b"private-neighbor")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(report["copied"], [name])
+        self.assertEqual(report["bytes"], len(content))
+        self.assertEqual((self.destination / name).read_bytes(), content)
+        for neighbor in excluded:
+            self.assertFalse((self.destination / neighbor).exists())
+
     def test_daemon_ipc_snapshots_survive_export(self):
         prefix = "run-test/guest/evidence/"
         names = (

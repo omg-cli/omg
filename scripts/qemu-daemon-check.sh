@@ -37,6 +37,26 @@ report_explicit_query_difference() {
   ' "$listing" >&2
 }
 # END EXPLICIT QUERY ORACLE
+# BEGIN NATIVE PACKAGE IDENTITY
+native_package_identity() {
+  local distro=$1 name=$2 output=$3
+  if [[ "$distro" == fedora ]]; then
+    timeout 30 rpm -q --qf '%{NAME}.%{ARCH}\n' "$name" > "$output" || return $?
+    awk -v name="$name" '
+      NR != 1 || substr($0, 1, length(name) + 1) != name "." ||
+        substr($0, length(name) + 2) !~ /^[A-Za-z0-9_]+$/ { invalid = 1 }
+      { identity = $0 }
+      END { if (NR != 1 || invalid) exit 1; print identity }
+    ' "$output" || {
+      printf 'native RPM query did not return one %s.ARCH identity\n' "$name" >&2
+      return 1
+    }
+  else
+    printf '%s\n' "$name" > "$output" || return $?
+    cat "$output"
+  fi
+}
+# END NATIVE PACKAGE IDENTITY
 # BEGIN PACKAGE QUERY ORACLE
 check_package_query_outputs() {
   local name=$1 daemon_search=$2 daemon_info=$3 direct_search=$4 direct_info=$5
@@ -111,7 +131,13 @@ check_daemon_info_provenance() {
 check_text_info_outputs() {
   local name=$1 daemon_output=$2 direct_output=$3 output
   for output in "$daemon_output" "$direct_output"; do
-    grep -Eq "^[[:space:]]+Name: ${name}$" "$output" || return 1
+    awk -v name="$name" '
+      /^[[:space:]]+Name: / {
+        value = $0; sub(/^[[:space:]]+Name: /, "", value)
+        count++; if (value != name) invalid = 1
+      }
+      END { exit !(count == 1 && !invalid) }
+    ' "$output" || return 1
     grep -Eq '^[[:space:]]+Installed: yes$' "$output" || return 1
   done
 }
@@ -264,6 +290,7 @@ case "$ID" in
   fedora) timeout 30 rpm -q bash >/dev/null; timeout 30 dnf --cacheonly repoquery --userinstalled --qf '%{name}\n' > "$evidence/native-explicit.txt" ;;
   *) printf 'Unsupported native query fixture: %s\n' "$ID" >&2; exit 2 ;;
 esac
+package_identity=$(native_package_identity "$ID" bash "$evidence/native-package-identity.txt")
 jq -Rn '[inputs | select(length > 0)] | sort | unique' < "$evidence/native-explicit.txt" > "$evidence/native-explicit.json"
 for mode in direct foreground direct-sigint foreground-sigint; do
   if [[ "$mode" == direct* ]]; then
@@ -426,13 +453,13 @@ if ! check_daemon_info_provenance "$evidence/daemon-direct-info.json" \
   printf 'assertion failed: daemon JSON info lacks IPC response provenance\n' >&2
   exit 1
 fi
-if ! check_package_query_outputs bash \
+if ! check_package_query_outputs "$package_identity" \
   "$evidence/daemon-direct-search.json" "$evidence/daemon-direct-info.json" \
   "$evidence/daemon-stopped-search.json" "$evidence/daemon-stopped-info.json"; then
   printf 'assertion failed: daemon-backed search/info differs from direct native package data\n' >&2
   exit 1
 fi
-if ! check_text_info_outputs bash \
+if ! check_text_info_outputs "$package_identity" \
   "$evidence/daemon-direct-info.txt" "$evidence/daemon-stopped-info.txt"; then
   printf 'assertion failed: daemon-backed text info concealed native installation state\n' >&2
   exit 1

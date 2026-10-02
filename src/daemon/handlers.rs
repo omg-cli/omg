@@ -960,8 +960,13 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
         return validation_error(id, format!("Invalid package name: {e}"));
     }
 
+    // DNF resolves installed architecture/build ambiguity against its current RPM
+    // snapshot. Repository records and name-keyed daemon caches cannot own that
+    // selection, including a canonical name cached by a prior full NEVRA query.
+    let cache_info = state.package_manager.name() != "dnf";
+
     // 1. Check cache first (Arc clone is cheap - just pointer copy)
-    if let Some(cached) = state.cache.get_info(&package) {
+    if cache_info && let Some(cached) = state.cache.get_info(&package) {
         // METRICS: Cache hit
         GLOBAL_METRICS.inc_cache_hits();
         return Response::Success {
@@ -970,7 +975,7 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
         };
     }
 
-    if state.cache.is_info_miss(&package) {
+    if cache_info && state.cache.is_info_miss(&package) {
         return not_found_error(id, format!("Package not found: {package}"));
     }
 
@@ -979,7 +984,7 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
 
     // 2. Try official index (instant hash lookup).
     let index = state.index_snapshot();
-    if let Some(pkg) = index.get(&package) {
+    if cache_info && let Some(pkg) = index.get(&package) {
         // Clone once, then use Arc for cheap sharing. Cache only while this
         // snapshot is still current; a refresh clears all older entries.
         let info = Arc::new(pkg);
@@ -1009,14 +1014,20 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
                 url: String::new(), // info.url not in Package struct currently
                 size: 0,
                 download_size: 0,
-                repo: String::new(),
+                repo: if cache_info {
+                    String::new()
+                } else {
+                    "official".into()
+                },
                 depends: Vec::new(),
                 licenses: Vec::new(),
                 source: WirePackageSource::Official,
             });
-            state.with_current_index(&index, || {
-                state.cache.insert_info_arc(Arc::clone(&detailed));
-            });
+            if cache_info {
+                state.with_current_index(&index, || {
+                    state.cache.insert_info_arc(Arc::clone(&detailed));
+                });
+            }
             return Response::Success {
                 id,
                 result: ResponseResult::Info(Arc::unwrap_or_clone(detailed)),
@@ -1047,11 +1058,12 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
     // Only a genuine miss (empty results or no exact name match) falls
     // through to the negative cache.
     #[cfg(feature = "arch")]
-    if state
-        .system_backends
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .has_alpm_worker()
+    if cache_info
+        && state
+            .system_backends
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_alpm_worker()
     {
         match tokio::time::timeout(DAEMON_INFO_AUR_TIMEOUT, search_detailed(&package)).await {
             Ok(Ok(details)) => {
@@ -1097,9 +1109,11 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
         }
     }
 
-    state.with_current_index(&index, || {
-        state.cache.insert_info_miss(&package);
-    });
+    if cache_info {
+        state.with_current_index(&index, || {
+            state.cache.insert_info_miss(&package);
+        });
+    }
 
     not_found_error(id, format!("Package not found: {package}"))
 }
@@ -1536,6 +1550,279 @@ mod tests {
 
     type BackendFuture<'a, T> =
         std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
+
+    enum InfoReply {
+        Found(crate::core::Package),
+        Failed(&'static str),
+    }
+
+    struct InfoSelectionBackend {
+        inner: crate::package_managers::mock::MockPackageManager,
+        backend_name: &'static str,
+        replies: std::collections::HashMap<&'static str, InfoReply>,
+    }
+
+    impl PackageManager for InfoSelectionBackend {
+        fn name(&self) -> &'static str {
+            self.backend_name
+        }
+        fn search(&self, query: &str) -> BackendFuture<'_, Vec<crate::core::Package>> {
+            self.inner.search(query)
+        }
+        fn install(&self, packages: &[String]) -> BackendFuture<'_, ()> {
+            self.inner.install(packages)
+        }
+        fn remove(&self, packages: &[String]) -> BackendFuture<'_, ()> {
+            self.inner.remove(packages)
+        }
+        fn update(&self) -> BackendFuture<'_, ()> {
+            self.inner.update()
+        }
+        fn sync(&self) -> BackendFuture<'_, ()> {
+            self.inner.sync()
+        }
+        fn info(&self, package: &str) -> BackendFuture<'_, Option<crate::core::Package>> {
+            let result = match self.replies.get(package) {
+                Some(InfoReply::Found(info)) => Ok(Some(info.clone())),
+                Some(InfoReply::Failed(message)) => Err(anyhow::anyhow!("{message}")),
+                None => Ok(None),
+            };
+            Box::pin(async move { result })
+        }
+        fn list_installed(&self) -> BackendFuture<'_, Vec<crate::core::Package>> {
+            self.inner.list_installed()
+        }
+        fn get_status(&self, fast: bool) -> BackendFuture<'_, (usize, usize, usize, usize)> {
+            self.inner.get_status(fast)
+        }
+        fn list_explicit(&self) -> BackendFuture<'_, Vec<String>> {
+            self.inner.list_explicit()
+        }
+        fn list_updates(
+            &self,
+        ) -> BackendFuture<'_, Vec<crate::package_managers::types::UpdateInfo>> {
+            self.inner.list_updates()
+        }
+        fn is_installed(&self, package: &str) -> BackendFuture<'_, bool> {
+            self.inner.is_installed(package)
+        }
+    }
+
+    fn installed_info(name: &str, version: &str) -> crate::core::Package {
+        crate::core::Package {
+            name: name.into(),
+            version: crate::package_managers::types::parse_version_or_zero(version),
+            description: "Installed RPM metadata".into(),
+            source: crate::core::PackageSource::Official,
+            installed: true,
+        }
+    }
+
+    fn info_selection_state(
+        backend_name: &'static str,
+        records: &[(&str, &str, &str)],
+        replies: impl IntoIterator<Item = (&'static str, InfoReply)>,
+    ) -> anyhow::Result<(tempfile::TempDir, Arc<DaemonState>)> {
+        let directory = tempfile::tempdir()?;
+        let backend = InfoSelectionBackend {
+            inner: crate::package_managers::mock::MockPackageManager::new_in(
+                "arch",
+                directory.path(),
+            ),
+            backend_name,
+            replies: replies.into_iter().collect(),
+        };
+        let state = DaemonState::new_isolated(
+            directory.path(),
+            PackageIndex::from_records(records),
+            Arc::new(backend),
+        )?;
+        Ok((directory, Arc::new(state)))
+    }
+
+    #[tokio::test]
+    async fn dnf_info_uses_installed_identity_over_repository_index() -> anyhow::Result<()> {
+        for cache_seed in ["none", "positive", "negative"] {
+            let (_directory, state) = info_selection_state(
+                "dnf",
+                &[
+                    ("bash", "5.4-1.fc44", "Repository candidate"),
+                    ("bash.x86_64", "5.2-1.fc44", "Stale installed index"),
+                ],
+                ["bash", "bash.x86_64", "bash-5.3.9-3.fc44.x86_64"].map(|query| {
+                    (
+                        query,
+                        InfoReply::Found(installed_info("bash.x86_64", "5.3.9-3.fc44")),
+                    )
+                }),
+            )?;
+            match cache_seed {
+                "positive" => {
+                    state
+                        .cache
+                        .insert_info(state.index_snapshot().get("bash").unwrap());
+                    state
+                        .cache
+                        .insert_info(state.index_snapshot().get("bash.x86_64").unwrap());
+                }
+                "negative" => {
+                    state.cache.insert_info_miss("bash");
+                    state.cache.insert_info_miss("bash.x86_64");
+                }
+                _ => {}
+            }
+            for query in ["bash", "bash", "bash.x86_64", "bash-5.3.9-3.fc44.x86_64"] {
+                let Response::Success {
+                    result: ResponseResult::Info(info),
+                    ..
+                } = handle_info(Arc::clone(&state), 1, query.into()).await
+                else {
+                    panic!("installed info must succeed for {query} with {cache_seed} cache");
+                };
+                assert_eq!(info.name, "bash.x86_64", "{query}/{cache_seed}");
+                assert_eq!(info.version, "5.3.9-3.fc44", "{query}/{cache_seed}");
+                assert_eq!(info.description, "Installed RPM metadata");
+                assert_eq!(info.source, WirePackageSource::Official);
+                assert_eq!(info.repo, "official");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dnf_info_uses_available_backend_metadata_after_installed_miss() -> anyhow::Result<()> {
+        let available = crate::core::Package {
+            installed: false,
+            description: "Current available repository metadata".into(),
+            ..installed_info("available-tool", "2.0-2.fc44")
+        };
+        let (_directory, state) = info_selection_state(
+            "dnf",
+            &[("available-tool", "1.0-1.fc44", "Stale repository metadata")],
+            [("available-tool", InfoReply::Found(available))],
+        )?;
+        for _ in 0..2 {
+            let Response::Success {
+                result: ResponseResult::Info(info),
+                ..
+            } = handle_info(Arc::clone(&state), 1, "available-tool".into()).await
+            else {
+                panic!("an available package must succeed after an installed-package miss");
+            };
+            assert_eq!(info.name, "available-tool");
+            assert_eq!(info.version, "2.0-2.fc44");
+            assert_eq!(info.description, "Current available repository metadata");
+            assert_eq!(info.source, WirePackageSource::Official);
+            assert_eq!(info.repo, "official");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dnf_info_reports_ambiguity_after_nevra_lookup() -> anyhow::Result<()> {
+        let cause = "Package has multiple installed builds; specify the full NEVRA";
+        let (_directory, state) = info_selection_state(
+            "dnf",
+            &[
+                ("kernel-core", "6.19-1.fc44", "Repository candidate"),
+                ("kernel-core.x86_64", "6.18-1.fc44", "First installed build"),
+            ],
+            [
+                ("kernel-core", InfoReply::Failed(cause)),
+                ("kernel-core.x86_64", InfoReply::Failed(cause)),
+                (
+                    "kernel-core-6.18-1.fc44.x86_64",
+                    InfoReply::Found(installed_info("kernel-core.x86_64", "6.18-1.fc44")),
+                ),
+            ],
+        )?;
+        assert!(matches!(
+            handle_info(
+                Arc::clone(&state),
+                1,
+                "kernel-core-6.18-1.fc44.x86_64".into()
+            )
+            .await,
+            Response::Success {
+                result: ResponseResult::Info(_),
+                ..
+            }
+        ));
+        for query in ["kernel-core.x86_64", "kernel-core"] {
+            let Response::Error { code, message, .. } =
+                handle_info(Arc::clone(&state), 2, query.into()).await
+            else {
+                panic!("ambiguous {query} must refuse after a full NEVRA lookup");
+            };
+            assert_eq!(code, error_codes::INTERNAL_ERROR);
+            assert!(message.contains(cause), "{message}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dnf_info_preserves_native_errors_and_misses_over_index() -> anyhow::Result<()> {
+        for fails in [false, true] {
+            let replies = if fails {
+                vec![("bash", InfoReply::Failed("RPM database unavailable"))]
+            } else {
+                Vec::new()
+            };
+            let (_directory, state) = info_selection_state(
+                "dnf",
+                &[("bash", "5.3-1.fc44", "Old repository index")],
+                replies,
+            )?;
+            state
+                .cache
+                .insert_info(state.index_snapshot().get("bash").unwrap());
+            let Response::Error { code, message, .. } =
+                handle_info(Arc::clone(&state), 1, "bash".into()).await
+            else {
+                panic!("cached repository metadata must not hide a native error or miss");
+            };
+            if fails {
+                assert_eq!(code, error_codes::INTERNAL_ERROR);
+                assert!(message.contains("RPM database unavailable"));
+            } else {
+                assert_eq!(code, error_codes::PACKAGE_NOT_FOUND);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_dnf_info_retains_index_and_cache_fast_paths() -> anyhow::Result<()> {
+        for backend_name in ["pacman", "apt", "brew"] {
+            let (_directory, state) = info_selection_state(
+                backend_name,
+                &[("bash", "5.3", "Repository metadata")],
+                [("bash", InfoReply::Failed("Backend should not be queried"))],
+            )?;
+            let Response::Success {
+                result: ResponseResult::Info(info),
+                ..
+            } = handle_info(Arc::clone(&state), 1, "bash".into()).await
+            else {
+                panic!("{backend_name} index fast path must remain available");
+            };
+            assert_eq!(info.name, "bash");
+            assert_eq!(info.description, "Repository metadata");
+            state.cache.insert_info(DetailedPackageInfo {
+                version: "cached-version".into(),
+                ..info
+            });
+            let Response::Success {
+                result: ResponseResult::Info(cached),
+                ..
+            } = handle_info(Arc::clone(&state), 2, "bash".into()).await
+            else {
+                panic!("{backend_name} cached fast path must remain available");
+            };
+            assert_eq!(cached.version, "cached-version");
+        }
+        Ok(())
+    }
 
     #[derive(Clone, Copy)]
     enum PausedLookup {

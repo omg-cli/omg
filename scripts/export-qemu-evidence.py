@@ -42,7 +42,7 @@ GUEST_FILES = {
     "daemon-direct-before-search.prom", "daemon-direct-after-search.prom",
     "daemon-direct-after-info.prom",
     "dnf-reason-fault.stdout.log", "dnf-reason-fault.stderr.log",
-    "native-explicit.txt", "native-explicit.json",
+    "native-explicit.txt", "native-explicit.json", "native-package-identity.txt",
     "daemon-direct-after-queries.txt", "daemon-foreground-after-queries.txt",
     "qemu-startup.log", "daemon-lifecycle.json",
     "daemon-direct.log", "daemon-foreground.log",
