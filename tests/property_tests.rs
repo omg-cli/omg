@@ -34,8 +34,12 @@ fn run_with_refused_metadata(args: &[&str]) -> CommandResult {
         while !stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-                    stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
                     let mut request = [0u8; 4096];
                     let bytes = stream.read(&mut request).unwrap();
                     assert!(bytes > 0, "metadata proxy request is empty");
@@ -48,10 +52,16 @@ fn run_with_refused_metadata(args: &[&str]) -> CommandResult {
             }
         }
     });
-    let result = run_omg_with_env(args, &[
-        ("HTTPS_PROXY", &proxy), ("HTTP_PROXY", &proxy), ("ALL_PROXY", &proxy),
-        ("NO_PROXY", ""), ("OMG_TEST_COMMAND_TIMEOUT_SECS", "3"),
-    ]);
+    let result = run_omg_with_env(
+        args,
+        &[
+            ("HTTPS_PROXY", &proxy),
+            ("HTTP_PROXY", &proxy),
+            ("ALL_PROXY", &proxy),
+            ("NO_PROXY", ""),
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", "3"),
+        ],
+    );
     finished.store(true, Ordering::Release);
     server.join().unwrap();
     result
@@ -60,7 +70,11 @@ fn run_with_refused_metadata(args: &[&str]) -> CommandResult {
 fn installed_node(project: &TestProject, version: &str) -> std::path::PathBuf {
     let directory = project.data_dir.path().join("versions/node").join(version);
     std::fs::create_dir_all(directory.join("bin")).unwrap();
-    std::fs::write(directory.join("bin/node"), b"installed Node activation fixture").unwrap();
+    std::fs::write(
+        directory.join("bin/node"),
+        b"installed Node activation fixture",
+    )
+    .unwrap();
     directory
 }
 

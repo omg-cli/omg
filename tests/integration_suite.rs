@@ -134,7 +134,11 @@ fn detect_installed_runtime(
     };
     let installed = versions.join(installed_name);
     fs::create_dir_all(installed.join("bin")).unwrap();
-    fs::write(installed.join("bin").join(binary), b"installed runtime fixture").unwrap();
+    fs::write(
+        installed.join("bin").join(binary),
+        b"installed runtime fixture",
+    )
+    .unwrap();
     assert!(!versions.join("current").exists());
     let result = run_omg_with_options(
         &["use", runtime],

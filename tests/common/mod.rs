@@ -498,7 +498,7 @@ fn run_omg_with_home(
                     break;
                 }
 
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(error) => panic!("Failed waiting for omg process: {error}"),
         }
