@@ -564,13 +564,28 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
     for (id, assertion) in [
         ("hooks-install", Assertion::HooksInstalled),
         ("hooks-install-force", Assertion::HooksInstalled),
-        ("workspace-run", Assertion::WorkspaceMissingTask),
-        ("workspace-check", Assertion::WorkspaceMissingLock),
-        ("audit-log-flags", Assertion::AuditLogFilteredExport),
-        ("workspace-init", Assertion::WorkspaceInitialized),
-        ("workspace-add", Assertion::WorkspaceProjectAdded),
-        ("workspace-list", Assertion::WorkspaceProjectListed),
-        ("workspace-remove", Assertion::WorkspaceProjectRemoved),
+        ("workspace-run", Assertion::parse("local:workspace-run", 1)),
+        (
+            "workspace-check",
+            Assertion::parse("local:workspace-check", 1),
+        ),
+        (
+            "audit-log-flags",
+            Assertion::parse("local:audit-log-flags", 1),
+        ),
+        (
+            "workspace-init",
+            Assertion::parse("workspace-init-state", 1),
+        ),
+        ("workspace-add", Assertion::parse("workspace-add-state", 1)),
+        (
+            "workspace-list",
+            Assertion::parse("workspace-list-state", 1),
+        ),
+        (
+            "workspace-remove",
+            Assertion::parse("workspace-remove-state", 1),
+        ),
         ("container-init", Assertion::ContainerInitScaffold),
         ("workspace-run-parallel-all", Assertion::WorkspaceAllOutput),
         ("update-fast", Assertion::UpdateFastOutput),
@@ -578,18 +593,27 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
         ("daemon-foreground", Assertion::DaemonForegroundLifecycle),
         ("clean-orphans-native", Assertion::NativeOrphanRemoved),
         ("generate-man", Assertion::ManPagesGenerated),
-        ("team-golden-create-flags", Assertion::GoldenPathFlags),
-        ("audit-export", Assertion::AuditExportAbsoluteRefusal),
-        ("audit-export-flags", Assertion::AuditExportAbsoluteRefusal),
+        (
+            "team-golden-create-flags",
+            Assertion::parse("local:team-golden-create-flags", 1),
+        ),
+        ("audit-export", Assertion::parse("local:audit-export", 1)),
+        (
+            "audit-export-flags",
+            Assertion::parse("local:audit-export-flags", 1),
+        ),
         (
             "enterprise-audit-export",
-            Assertion::AuditExportAbsoluteRefusal,
+            Assertion::parse("local:enterprise-audit-export", 1),
         ),
         (
             "enterprise-audit-export-flags",
             Assertion::EnterpriseAuditExportEvidence,
         ),
-        ("team-compliance-export", Assertion::TeamComplianceNoReport),
+        (
+            "team-compliance-export",
+            Assertion::parse("local:team-compliance-export", 1),
+        ),
     ] {
         let case = cases
             .iter()
@@ -606,8 +630,8 @@ fn behavior_inventory_keeps_hook_and_workspace_assertions() {
 fn behavior_inventory_keeps_offline_refusal_assertions() {
     let cases = behavior_cases();
     for (id, assertion) in [
-        ("diff", Assertion::DiffMissingLock),
-        ("diff-from", Assertion::DiffMissingLock),
+        ("diff", Assertion::parse("local:diff", 1)),
+        ("diff-from", Assertion::parse("local:diff-from", 1)),
         ("self-update-version", Assertion::SelfUpdateDowngradeRefusal),
         ("env-share-missing-lock", Assertion::EnvShareMissingLock),
     ] {
@@ -648,7 +672,18 @@ fn behavior_inventory_requires_native_rust_installation_proof() {
 /// variants also need separate destinations because the command deliberately
 /// preserves an existing workflow instead of replacing it.
 fn needs_isolated_fixture(case: &BehaviorCase) -> bool {
-    matches!(
+    case.owned_contract().is_some_and(|raw| {
+        (raw.starts_with("local:") && case.id != "team-init")
+            || matches!(
+                raw,
+                "missing-lock-ci-refusal"
+                    | "missing-snapshot-refusal"
+                    | "invalid-runtime-refusal"
+                    | "missing-env-manifest-refusal"
+                    | "daemon-status-missing-socket"
+                    | "bash-completion-installed"
+            )
+    }) || matches!(
         case.id.as_str(),
         "diff"
             | "diff-from"
@@ -667,6 +702,10 @@ fn missing_lock_rows_run_without_the_shared_fixture() {
     for case in cases.iter().filter(|case| {
         case.assertions.contains(&Assertion::EnvShareMissingLock)
             || case.assertions.contains(&Assertion::DiffMissingLock)
+            || matches!(
+                case.owned_contract(),
+                Some("local:diff" | "local:diff-from")
+            )
     }) {
         assert!(
             needs_isolated_fixture(case),
@@ -873,6 +912,7 @@ enum Assertion {
     SbomInventoryOnly,
     JsonStdout,
     Artifact(String),
+    OwnedContract(String),
     Fingerprint(String),
     WorkspaceMissingTask,
     WorkspaceMissingLock,
@@ -946,6 +986,35 @@ enum Assertion {
 
 impl Assertion {
     fn parse(raw: &str, line_number: usize) -> Self {
+        if let Some(case) = raw.strip_prefix("local:") {
+            assert!(
+                local_contract_ids().contains(case),
+                "unknown local oracle contract on inventory line {line_number}: {raw}"
+            );
+            return Self::OwnedContract(raw.to_string());
+        }
+        if matches!(
+            raw,
+            "search-firefox-results"
+                | "missing-snapshot-refusal"
+                | "missing-lock-ci-refusal"
+                | "ci-cache-paths"
+                | "invalid-runtime-refusal"
+                | "bash-hook-behavior"
+                | "workspace-init-state"
+                | "workspace-add-state"
+                | "workspace-second-state"
+                | "workspace-remove-state"
+                | "workspace-list-state"
+                | "workspace-status-state"
+                | "daemon-status-missing-socket"
+                | "bash-completion-stdout"
+                | "bash-completion-installed"
+                | "completion-env-capture"
+                | "missing-env-manifest-refusal"
+        ) {
+            return Self::OwnedContract(raw.to_string());
+        }
         if let Some(case) = raw.strip_prefix("fingerprint:") {
             assert!(
                 matches!(
@@ -1077,6 +1146,26 @@ impl Assertion {
     }
 }
 
+/// Read the closed contract set from the same Python owner embedded in this test.
+/// Parsing its literal declarations avoids accepting arbitrary `local:*` tokens.
+fn local_contract_ids() -> &'static std::collections::HashSet<String> {
+    static IDS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("python3")
+            .args(["-c", "import ast,json,sys\ntree=ast.parse(sys.stdin.read())\nvalues={node.targets[0].id:node.value for node in tree.body if isinstance(node,ast.Assign) and isinstance(node.targets[0],ast.Name) and node.targets[0].id in ('REFUSALS','OUTPUTS')}\nassert set(values)=={'REFUSALS','OUTPUTS'} and isinstance(values['REFUSALS'],ast.Dict)\nrefusals={ast.literal_eval(key) for key in values['REFUSALS'].keys}\noutputs=ast.literal_eval(values['OUTPUTS'])\nassert all(isinstance(name,str) for name in refusals|outputs)\nprint(json.dumps(sorted(refusals|outputs)))"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().expect("parse the local oracle's declared contract set");
+        child.stdin.take().expect("oracle declaration input")
+            .write_all(include_bytes!("../scripts/qemu-local-oracle.py"))
+            .expect("write embedded oracle source");
+        let output = child.wait_with_output().expect("read oracle declaration result");
+        assert!(output.status.success(), "invalid local oracle declarations: {}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice(&output.stdout).expect("local oracle contract names")
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cleanup {
     TempdirDrop,
@@ -1120,6 +1209,17 @@ struct BehaviorCase {
 
 impl BehaviorCase {
     fn validate_schema(&self) {
+        for assertion in &self.assertions {
+            if let Assertion::OwnedContract(raw) = assertion
+                && let Some(owner_case) = raw.strip_prefix("local:")
+            {
+                assert_eq!(
+                    owner_case, self.id,
+                    "case {} on line {} must use its own local oracle fixture",
+                    self.id, self.line
+                );
+            }
+        }
         assert!(
             !self.tiers.is_empty(),
             "case {} on line {}: execution tiers cannot be empty",
@@ -1223,6 +1323,15 @@ impl BehaviorCase {
 
     fn runs_hermetically(&self) -> bool {
         self.tiers == [Tier::Hermetic] && self.expected_ux == UxState::Pass
+    }
+
+    fn owned_contract(&self) -> Option<&str> {
+        self.assertions
+            .iter()
+            .find_map(|assertion| match assertion {
+                Assertion::OwnedContract(raw) => Some(raw.as_str()),
+                _ => None,
+            })
     }
 }
 
@@ -1471,6 +1580,76 @@ fn behavior_inventory_artifact_parser_rejects_escaping_paths() {
 }
 
 #[test]
+fn behavior_inventory_named_contracts_are_not_artifact_paths() {
+    for raw in [
+        "search-firefox-results",
+        "workspace-init-state",
+        "bash-completion-stdout",
+        "local:diff",
+        "local:team-golden-create-flags",
+    ] {
+        assert!(
+            !matches!(Assertion::parse(raw, 1), Assertion::Artifact(_)),
+            "named contract {raw} must retain its owner and identity"
+        );
+    }
+}
+
+#[test]
+fn behavior_inventory_rejects_unknown_owner_contracts_and_wrong_fixture_binding() {
+    for raw in [
+        "local:",
+        "local:not-a-real-command",
+        "arbitrary-output-check",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| Assertion::parse(raw, 1)).is_err(),
+            "unknown contract {raw} must not be treated as verified"
+        );
+    }
+    let mut case = behavior_cases()
+        .into_iter()
+        .find(|case| case.id == "stats")
+        .expect("stats fixture");
+    case.assertions = vec![Assertion::parse("local:diff", case.line)];
+    assert!(
+        std::panic::catch_unwind(|| case.validate_schema()).is_err(),
+        "an existing local contract must remain bound to its own row"
+    );
+}
+
+#[test]
+#[cfg(feature = "arch")]
+fn owned_contracts_reject_empty_success_and_wrong_refusal() {
+    for (raw, code, stderr) in [
+        ("local:stats", 0, ""),
+        ("local:diff", 1, "Error: unrelated permission refusal"),
+        ("bash-completion-stdout", 0, ""),
+        ("workspace-init-state", 0, ""),
+    ] {
+        let project = TestProject::for_distro("arch");
+        let (home, path) = prepare_behavior_fixture(&project);
+        let cache = project.data_dir.path().join("cache");
+        let environment = [
+            ("HOME", home.as_str()),
+            ("PATH", path.as_str()),
+            ("OMG_DATA_DIR", project.data_dir.path().to_str().unwrap()),
+            (
+                "OMG_CONFIG_DIR",
+                project.config_dir.path().to_str().unwrap(),
+            ),
+            ("OMG_CACHE_DIR", cache.to_str().unwrap()),
+            ("OMG_DISABLE_DAEMON", "1"),
+        ];
+        prepare_owned_contract(&project, raw, &environment);
+        assert!(
+            check_owned_contract(&project, &environment, "read", raw, code, "", stderr).is_err(),
+            "{raw} silently accepted an empty success or the wrong refusal cause"
+        );
+    }
+}
+
+#[test]
 fn behavior_inventory_release_targets_classify_every_distro_once() {
     let valid = "arch:pending,debian:pending,ubuntu:pending,fedora:pending";
     assert!(matches!(
@@ -1667,6 +1846,7 @@ fn golden_path_flags_use_the_same_explicit_config_route() {
                     | Assertion::GoldenPathDeleted
                     | Assertion::GoldenPathFlags
             )
+                || matches!(assertion, Assertion::OwnedContract(raw) if raw.starts_with("local:team-golden-"))
         }) {
             assert!(
                 uses_golden_path_config(&case.id),
@@ -1810,6 +1990,125 @@ fn run_audit_log_oracle(mode: &str, root: &std::path::Path) {
     );
 }
 
+#[cfg(feature = "arch")]
+fn owned_oracle_command(
+    project: &TestProject,
+    environment: &[(&str, &str)],
+    program: &str,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command
+        .current_dir(project.path())
+        .envs(environment.iter().copied())
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("OMG_DISABLE_TELEMETRY", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    command
+}
+
+#[cfg(feature = "arch")]
+fn prepare_owned_contract(project: &TestProject, raw: &str, environment: &[(&str, &str)]) {
+    use std::os::unix::fs::PermissionsExt as _;
+    project.create_file(
+        ".qemu-local-oracle.py",
+        include_str!("../scripts/qemu-local-oracle.py"),
+    );
+    if let Some(case) = raw.strip_prefix("local:") {
+        if case == "init" {
+            project
+                .mock_install("pacman", "7.0.0-1")
+                .expect("seed explicit mock package for init capture");
+            // The independent provider reads only the private fixture. A mock
+            // capture must never be compared to the machine's installed packages.
+            let provider = project.create_file(
+                "bin/pacman",
+                "#!/bin/sh\n[ \"$*\" = '-Qqe' ] || exit 97\nprintf 'pacman\\n'\n",
+            );
+            std::fs::set_permissions(provider, std::fs::Permissions::from_mode(0o700))
+                .expect("private package query provider");
+        }
+        let result = owned_oracle_command(project, environment, "python3")
+            .args([".qemu-local-oracle.py", "prepare", case])
+            .output()
+            .expect("prepare local owner fixture");
+        assert!(
+            result.status.success(),
+            "{raw} fixture failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    } else if matches!(
+        raw,
+        "missing-lock-ci-refusal"
+            | "missing-snapshot-refusal"
+            | "invalid-runtime-refusal"
+            | "missing-env-manifest-refusal"
+    ) {
+        project.create_file("refusal-sentinel.txt", "keep-refusal-fixture");
+        let result = owned_oracle_command(project, environment, "bash")
+            .args(["-eu", "-c", "sha256sum Makefile project/README.md project/Makefile refusal-sentinel.txt > .qemu-refusal-before.sha256"])
+            .output().expect("capture private refusal baseline");
+        assert!(
+            result.status.success(),
+            "refusal fixture failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[cfg(feature = "arch")]
+fn check_owned_contract(
+    project: &TestProject,
+    environment: &[(&str, &str)],
+    safety: &str,
+    raw: &str,
+    exit: i32,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), String> {
+    project.create_file("command.stdout.log", stdout);
+    project.create_file("command.stderr.log", stderr);
+    let owner = include_str!("../scripts/qemu-inventory.sh")
+        .split_once("# BEGIN PRODUCT OUTPUT ORACLE\n")
+        .or_else(|| {
+            include_str!("../scripts/qemu-inventory.sh")
+                .split_once("# BEGIN PRODUCT OUTPUT ORACLE\r\n")
+        })
+        .expect("shipped output oracle opening marker")
+        .1
+        .split_once("# END PRODUCT OUTPUT ORACLE")
+        .expect("shipped output oracle closing marker")
+        .0
+        .replace("\r\n", "\n");
+    project.create_file(
+        ".owned-output-oracle.sh",
+        &format!("{owner}\nrowdir=$PWD\ncheck_product_output \"$@\"\n"),
+    );
+    let result = owned_oracle_command(project, environment, "bash")
+        .args([
+            "-eu",
+            ".owned-output-oracle.sh",
+            safety,
+            raw,
+            &exit.to_string(),
+            "command.stdout.log",
+            "command.stderr.log",
+            "arch",
+        ])
+        .output()
+        .map_err(|error| format!("failed to execute {raw} owner: {error}"))?;
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{raw} owner rejected output ({}): {}{}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        ))
+    }
+}
+
 #[test]
 #[serial]
 #[cfg(feature = "arch")]
@@ -1910,7 +2209,13 @@ fn behavior_inventory_runs_in_hermetic_state() {
     use std::time::Instant;
 
     let project = TestProject::for_distro("arch");
-    let (home, path) = prepare_behavior_fixture(&project);
+    let shared_paths = prepare_behavior_fixture(&project);
+    // Workspace transitions share their actual prior results while missing-lock
+    // probes and seeded local contracts receive separate disposable fixtures.
+    let workspace_project = TestProject::for_distro("arch");
+    let workspace_paths = prepare_behavior_fixture(&workspace_project);
+    let team_project = TestProject::for_distro("arch");
+    let team_paths = prepare_behavior_fixture(&team_project);
     let evidence_dir =
         std::env::var_os("OMG_CLI_BEHAVIOR_EVIDENCE_DIR").map(std::path::PathBuf::from);
     if let Some(dir) = &evidence_dir {
@@ -1927,7 +2232,26 @@ fn behavior_inventory_runs_in_hermetic_state() {
         // such as env-capture. Keep the shared fixture for dependent cases.
         let empty_environment = (needs_isolated_fixture(&case) || case.id == "install-review")
             .then(|| TestProject::for_distro("arch"));
-        let project = empty_environment.as_ref().unwrap_or(&project);
+        let isolated_paths = empty_environment.as_ref().map(prepare_behavior_fixture);
+        let workspace_case = case.id.starts_with("workspace-") && empty_environment.is_none();
+        let team_case = matches!(
+            case.id.as_str(),
+            "team-init" | "team-push" | "team-status" | "team-pull"
+        );
+        let project = empty_environment.as_ref().unwrap_or(if workspace_case {
+            &workspace_project
+        } else if team_case {
+            &team_project
+        } else {
+            &project
+        });
+        let (home, path) = isolated_paths.as_ref().unwrap_or(if workspace_case {
+            &workspace_paths
+        } else if team_case {
+            &team_paths
+        } else {
+            &shared_paths
+        });
         if case.id == "install-review" {
             project
                 .mock_install("bash", "5.2.37-1")
@@ -2046,6 +2370,9 @@ fn behavior_inventory_runs_in_hermetic_state() {
         let privacy_data_dir = project.path().join("privacy-data");
         let fingerprint_data_dir = project.path().join("fingerprint-data");
         let eol_data_dir = project.path().join("eol-data");
+        let owned_cache = project.data_dir.path().join("cache");
+        let owned_socket = project.path().join("daemon-socket/omg.sock");
+        let owned_cli = common::fixture_cli_path();
         let mut command_env = vec![
             ("HOME", home.as_str()),
             ("PATH", path.as_str()),
@@ -2061,6 +2388,64 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 "OMG_CONFIG_DIR",
                 config_dir.to_str().expect("UTF-8 config path"),
             ));
+        }
+        if case.owned_contract().is_some() {
+            command_env.retain(|(key, _)| {
+                !matches!(*key, "OMG_DATA_DIR" | "OMG_CONFIG_DIR" | "OMG_CACHE_DIR")
+            });
+            command_env.extend([
+                (
+                    "OMG_DATA_DIR",
+                    project
+                        .data_dir
+                        .path()
+                        .to_str()
+                        .expect("private owner data path"),
+                ),
+                (
+                    "OMG_CONFIG_DIR",
+                    project
+                        .config_dir
+                        .path()
+                        .to_str()
+                        .expect("private owner config path"),
+                ),
+                (
+                    "OMG_CACHE_DIR",
+                    owned_cache.to_str().expect("private owner cache path"),
+                ),
+                (
+                    "OMG_SOCKET_PATH",
+                    owned_socket.to_str().expect("private owner socket path"),
+                ),
+                ("OMG_QEMU_DISTRO", "arch"),
+                (
+                    "OMG_QEMU_EXECUTABLE",
+                    owned_cli.to_str().expect("admitted CLI path"),
+                ),
+                (
+                    "OMG_DISABLE_DAEMON",
+                    if case.id == "metrics" { "0" } else { "1" },
+                ),
+            ]);
+            std::fs::create_dir_all(owned_socket.parent().expect("private socket parent"))
+                .expect("create private socket parent");
+            std::fs::set_permissions(
+                owned_socket.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .expect("private socket permissions");
+            let invocation = project.path().join("bin/omg");
+            if !invocation.exists() {
+                std::os::unix::fs::symlink(&owned_cli, invocation)
+                    .expect("private fixture CLI invocation");
+            }
+            if case.id == "metrics" {
+                // Test mode deliberately disables daemon access before looking
+                // at the socket. This read-only row must reach its own absent
+                // private socket, without selecting mock or host daemon state.
+                command_env.push(("OMG_TEST_MODE", "0"));
+            }
         }
         let license_policy_dir = project.path().join("license-policy-state");
         if case.assertions.contains(&Assertion::LicenseAuditMitJson) {
@@ -2131,8 +2516,13 @@ fn behavior_inventory_runs_in_hermetic_state() {
             .then(|| project.path().join("remove-state"));
         if let Some(path) = &remove_data_dir {
             let mock = omg_lib::package_managers::mock::MockPackageManager::new_in("arch", path);
-            mock.set_installed_version("bash", "5.3.20-1")
-                .expect("seed isolated bash package");
+            let (package, version) = if case.id == "remove" {
+                ("jq", "1.8.1-3")
+            } else {
+                ("bash", "5.3.20-1")
+            };
+            mock.set_installed_version(package, version)
+                .expect("seed isolated removal package");
             command_env.push(("OMG_DATA_DIR", path.to_str().expect("UTF-8 mock path")));
         }
         let container_capture = matches!(
@@ -2169,7 +2559,18 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 capture.to_str().expect("UTF-8 container capture path"),
             ));
         }
-        let workspace_before = matches!(case.id.as_str(), "workspace-run" | "workspace-check")
+        if let Some(raw) = case.owned_contract() {
+            prepare_owned_contract(project, raw, &command_env);
+        }
+        let workspace_before = case
+            .assertions
+            .iter()
+            .any(|assertion| {
+                matches!(
+                    assertion,
+                    Assertion::WorkspaceMissingTask | Assertion::WorkspaceMissingLock
+                )
+            })
             .then(|| {
                 assert!(!project.path().join("omg.lock").exists());
                 ["omg-workspace.toml", "Makefile"].map(|name| {
@@ -2178,7 +2579,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 })
             });
         let audit_data = project.path().join("audit-log-data");
-        if case.id == "audit-log-flags" {
+        if case.assertions.contains(&Assertion::AuditLogFilteredExport) {
             run_audit_log_oracle("prepare", project.path());
             command_env.push((
                 "OMG_DATA_DIR",
@@ -2239,6 +2640,12 @@ fn behavior_inventory_runs_in_hermetic_state() {
         };
         for assertion in &case.assertions {
             match assertion {
+                Assertion::OwnedContract(raw) => {
+                    if let Err(reason) = check_owned_contract(project, &command_env, case.safety.as_str(), raw,
+                        result.exit_code, &result.stdout, &result.stderr) {
+                        issues.push(reason);
+                    }
+                }
                 Assertion::AuditLogFilteredExport => {
                     run_audit_log_oracle("check", project.path());
                     if !result.stdout.lines().any(|line| line == "✓ Export successful") {
@@ -2780,8 +3187,10 @@ fn behavior_inventory_runs_in_hermetic_state() {
                     };
                     let package_line = if install {
                         "│ pacman  ┆"
-                    } else {
+                    } else if matches!(assertion, Assertion::PackageDryRunRecursive) {
                         "    ✗ bash "
+                    } else {
+                        "    ✗ jq "
                     };
                     if !result.stdout.lines().any(|line| line == preview)
                         || !result.stdout.lines().any(|line| line == "    dry run")
@@ -3294,7 +3703,7 @@ fn closed_stdout_uses_sigpipe_without_a_panic_report() {
     drop(reader);
     let writer = std::os::fd::OwnedFd::from(writer);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_omg"))
+    let child = Command::new(common::fixture_cli_path())
         .arg("daemon-status")
         .env("OMG_DISABLE_DAEMON", "1")
         .env("OMG_DISABLE_TELEMETRY", "1")

@@ -290,6 +290,7 @@ ci-workflow-quick: check-shell-syntax
 	python3 -m unittest discover -s scripts -p 'test_*.py'
 	python3 tests/test_benchmark_records.py
 	python3 tests/test_terminal_update_notice.py
+	python3 tests/test_audit_repair_shell.py
 
 ci-local-quick: ci-workflow-quick
 	cargo check --all-targets --no-default-features --features pgp,license --locked

@@ -1208,7 +1208,8 @@ uninstall_omg() {
     if grep -Fqx -- "$path_line" "$rc_file" ||
       grep -Fqx -- "$legacy_path_line" "$rc_file" ||
       grep -qE "# OMG Package Manager|omg hook" "$rc_file"; then
-      cp "$rc_file" "$rc_file.omg-backup"
+      [[ ! -L "$rc_file.omg-backup" ]] || error "Refusing symlink shell backup: $rc_file.omg-backup"
+      cp "$rc_file" "$rc_file.omg-backup" || error "Failed to back up $rc_file; shell configuration was retained"
       local filtered
       filtered=$(mktemp "${rc_file}.omg-remove.XXXXXX") || error "Failed to stage shell cleanup"
       cp -p "$rc_file" "$filtered" || error "Failed to preserve shell file permissions"

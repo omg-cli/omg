@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          packages=(base-devel git curl pkgconf openssl libarchive clang cmake)
+          packages=(base-devel git curl pkgconf openssl libarchive clang cmake python)
           # One full upgrade/install transaction keeps the rolling container
           # consistent and avoids resolving the package graph twice.
           if pacman -Syu --noconfirm --needed "${packages[@]}" 2>&1 | tee /tmp/omg-pacman-setup.log; then

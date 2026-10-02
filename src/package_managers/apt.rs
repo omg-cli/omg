@@ -145,6 +145,22 @@ impl crate::package_managers::PackageManager for AptPackageManager {
         })
     }
 
+    fn removal_plan<'a>(
+        &'a self,
+        packages: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::RemovalPackage>>> + Send + 'a>> {
+        let packages = packages.to_vec();
+        Box::pin(async move {
+            crate::core::security::validate_package_names(&packages)?;
+            tokio::task::spawn_blocking(move || {
+                let (_apt_guard, cache) = open_cache_inner(&[], false)?;
+                plan_removal_in_cache(&cache, &packages)
+            })
+            .await
+            .context("APT removal simulation task failed")?
+        })
+    }
+
     fn update(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             if !is_root() {
@@ -635,10 +651,19 @@ pub fn get_system_status() -> Result<(usize, usize, usize, usize)> {
 }
 
 fn open_cache(local_files: &[String]) -> Result<(MutexGuard<'static, ()>, Cache)> {
+    open_cache_inner(local_files, true)
+}
+
+fn open_cache_inner(
+    local_files: &[String],
+    repair_fetch_dirs: bool,
+) -> Result<(MutexGuard<'static, ()>, Cache)> {
     let guard = APT_CACHE_LOCK
         .lock()
         .map_err(|_| anyhow!("APT cache lock poisoned; restart OMG before accessing libapt"))?;
-    ensure_apt_fetch_dirs();
+    if repair_fetch_dirs {
+        ensure_apt_fetch_dirs();
+    }
     let files: Vec<&str> = local_files.iter().map(String::as_str).collect();
     let cache = Cache::new(&files).map_err(|e| anyhow!("APT cache error: {e:?}"))?;
     // Callers bind the guard first and cache second: reverse local drop order
@@ -746,10 +771,26 @@ fn remove_blocking(packages: &[String]) -> Result<()> {
 
 fn remove_blocking_inner(packages: &[String]) -> Result<()> {
     let (_apt_guard, cache) = open_cache(&[])?;
+    plan_removal_in_cache(&cache, packages)?;
+
+    let mut acquire_progress = AcquireProgress::apt();
+    let mut install_progress = InstallProgress::apt();
+    cache
+        .commit(&mut acquire_progress, &mut install_progress)
+        .map_err(|e| anyhow!("APT commit error: {e:?}"))?;
+
+    Ok(())
+}
+
+fn plan_removal_in_cache(
+    cache: &Cache,
+    packages: &[String],
+) -> Result<Vec<super::types::RemovalPackage>> {
     for pkg_name in packages {
         let pkg = cache
             .get(pkg_name)
             .with_context(|| format!("Package not found: {pkg_name}"))?;
+        anyhow::ensure!(pkg.is_installed(), "Package '{pkg_name}' is not installed");
         anyhow::ensure!(
             pkg.mark_delete(false),
             "APT could not mark package for removal: {pkg_name}"
@@ -761,13 +802,23 @@ fn remove_blocking_inner(packages: &[String]) -> Result<()> {
         .resolve(true)
         .map_err(|e| anyhow!("APT resolve error: {e:?}"))?;
 
-    let mut acquire_progress = AcquireProgress::apt();
-    let mut install_progress = InstallProgress::apt();
     cache
-        .commit(&mut acquire_progress, &mut install_progress)
-        .map_err(|e| anyhow!("APT commit error: {e:?}"))?;
-
-    Ok(())
+        .get_changes(true)
+        .map(|pkg| {
+            anyhow::ensure!(
+                pkg.marked_delete(),
+                "APT removal would also change '{}'; inspect the transaction with apt-get",
+                pkg.fullname(false)
+            );
+            let installed = pkg
+                .installed()
+                .context("APT removal target has no installed version")?;
+            Ok(super::types::RemovalPackage {
+                name: pkg.fullname(true),
+                version: installed.version().to_owned(),
+            })
+        })
+        .collect()
 }
 
 fn update_blocking() -> Result<()> {
@@ -934,6 +985,59 @@ mod tests {
         assert!(super::APT_CACHE_LOCK.try_lock().is_err());
         drop(guard);
         assert!(super::APT_CACHE_LOCK.try_lock().is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_removal_plan_includes_reverse_dependencies_without_writing_status()
+    -> anyhow::Result<()> {
+        let _guard = super::APT_CACHE_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir()?;
+        let status = directory.path().join("status");
+        let original = "Package: application\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2.0\nDepends: library\nDescription: application fixture\n\nPackage: library\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1.0\nDescription: library fixture\n";
+        std::fs::write(&status, original)?;
+        let sources = directory.path().join("sources.list");
+        std::fs::write(&sources, "")?;
+        let config = rust_apt::config::Config::new();
+        let overrides = [
+            ("Dir::State::status", status.to_str().unwrap()),
+            ("Dir::Etc::sourcelist", sources.to_str().unwrap()),
+            ("Dir::Etc::sourceparts", directory.path().to_str().unwrap()),
+            ("Dir::Cache::pkgcache", ""),
+            ("Dir::Cache::srcpkgcache", ""),
+        ];
+        struct Restore(Vec<(&'static str, Option<String>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let config = rust_apt::config::Config::new();
+                for (key, value) in &self.0 {
+                    config.clear(key);
+                    if let Some(value) = value {
+                        config.set(key, value);
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            overrides
+                .iter()
+                .map(|(key, _)| (*key, config.get(key)))
+                .collect(),
+        );
+        for (key, value) in overrides {
+            config.set(key, value);
+        }
+        let cache = rust_apt::Cache::new::<&str>(&[])
+            .map_err(|error| anyhow::anyhow!("fixture cache: {error:?}"))?;
+        let plan = super::plan_removal_in_cache(&cache, &["library".into()])?;
+        assert_eq!(
+            plan.iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            ["application", "library"]
+        );
+        assert_eq!(std::fs::read_to_string(status)?, original);
+        Ok(())
     }
 
     fn failed_output(stderr: &[u8]) -> std::process::Output {

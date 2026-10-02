@@ -120,11 +120,19 @@ pub async fn run(
 async fn write_fast_status_async(
     status: crate::core::fast_status::FastStatus,
     path: PathBuf,
-) -> Result<()> {
-    tokio::task::spawn_blocking(move || status.write_to_file(&path))
-        .await
-        .context("Fast-status writer panicked")??;
-    Ok(())
+    state: Arc<DaemonState>,
+    index: Arc<super::index::PackageIndex>,
+) -> Result<bool> {
+    let published = tokio::task::spawn_blocking(move || {
+        let mut result = Ok(());
+        let published = state.with_current_index(&index, || {
+            result = status.write_to_file(&path);
+        });
+        result.map(|()| published)
+    })
+    .await
+    .context("Fast-status writer panicked")??;
+    Ok(published)
 }
 
 fn validate_signal_result(result: std::io::Result<()>, signal: &str) -> Result<()> {
@@ -173,6 +181,7 @@ async fn run_with_status_path(
             if shutdown.is_cancelled() {
                 return;
             }
+            let index = state.index_snapshot();
             let data_dir = state.runtime_data_dir.clone();
             let versions = match tokio::task::spawn_blocking(move || {
                 use crate::cli::runtimes::{ensure_active_version_in, known_runtimes};
@@ -218,10 +227,17 @@ async fn run_with_status_path(
             };
             let fast_status =
                 crate::core::fast_status::FastStatus::new(total, explicit, orphans, updates);
-            if let Err(error) =
-                write_fast_status_async(fast_status, fast_status_path.to_path_buf()).await
+            match write_fast_status_async(
+                fast_status,
+                fast_status_path.to_path_buf(),
+                Arc::clone(state),
+                Arc::clone(&index),
+            )
+            .await
             {
-                tracing::warn!("Failed to write fast status file: {error}");
+                Ok(false) => return,
+                Ok(true) => {}
+                Err(error) => tracing::warn!("Failed to write fast status file: {error}"),
             }
 
             // Isolated fixtures must explicitly configure their advisory
@@ -261,10 +277,12 @@ async fn run_with_status_path(
             .0;
             let res_arc = Arc::new(res);
             // The in-memory cache is authoritative, so persistence is best-effort.
-            if let Err(error) = state.persistent.set_status(&res_arc) {
-                tracing::warn!("Failed to persist status cache: {error}");
-            }
-            state.cache.update_status(res_arc);
+            state.with_current_index(&index, || {
+                if let Err(error) = state.persistent.set_status(&res_arc) {
+                    tracing::warn!("Failed to persist status cache: {error}");
+                }
+                state.cache.update_status(res_arc);
+            });
         }
 
         /// Pre-compute caches for instant first queries.
@@ -278,9 +296,12 @@ async fn run_with_status_path(
             // Pre-compute explicit package list for instant first query.
             // The state owns the backend choice so isolated daemons never
             // fall through to a host package database.
+            let explicit_index = state.index_snapshot();
             match state.explicit_packages().await {
                 Ok(packages) => {
-                    state.cache.update_explicit(packages);
+                    state.with_current_index(&explicit_index, || {
+                        state.cache.update_explicit(packages);
+                    });
                     tracing::debug!("Pre-warmed explicit package cache");
                 }
                 Err(error) => {
@@ -313,35 +334,32 @@ async fn run_with_status_path(
             }
         }
 
-        // Initial refresh
-        refresh_status(&state_worker, &fast_status_path, &worker_token).await;
-        prewarm_caches(&state_worker, &worker_token).await;
+        async fn maintain(
+            state: &Arc<DaemonState>,
+            fast_status_path: &std::path::Path,
+            shutdown: &CancellationToken,
+        ) {
+            refresh_status(state, fast_status_path, shutdown).await;
+            prewarm_caches(state, shutdown).await;
+        }
 
-        // Track last cleanup time for periodic mmap cleanup
         let mut last_cleanup = tokio::time::Instant::now();
         let mut schedule = BackgroundSchedule::new();
+        let mut maintenance = Box::pin(maintain(&state_worker, &fast_status_path, &worker_token));
+        let mut maintenance_running = true;
 
         loop {
-            match schedule.next(&worker_token).await {
+            tokio::select! {
+            biased;
+            event = schedule.next(&worker_token) => match event {
                 BackgroundEvent::Shutdown => {
                     tracing::info!("Background worker shutting down");
                     break;
                 }
                 BackgroundEvent::Maintenance => {
-                    tracing::debug!("Refreshing system status cache...");
-                    refresh_status(&state_worker, &fast_status_path, &worker_token).await;
-                    // Independent of status publication: a failed scan must
-                    // not degrade first-query latency for unrelated paths.
-                    prewarm_caches(&state_worker, &worker_token).await;
-                    tracing::debug!("Status cache refreshed");
-
-                    // Periodic mmap cleanup (every 30 min) to prevent 500MB+ memory leaks
-                    if last_cleanup.elapsed() >= MEMORY_CLEANUP_INTERVAL {
-                        #[cfg(any(feature = "debian", feature = "debian-pure"))]
-                        {
-                            crate::package_managers::debian_db::cleanup_expired_mmaps();
-                        }
-                        last_cleanup = tokio::time::Instant::now();
+                    if !maintenance_running {
+                        maintenance.set(maintain(&state_worker, &fast_status_path, &worker_token));
+                        maintenance_running = true;
                     }
                 }
                 BackgroundEvent::SocketHealth => {
@@ -357,6 +375,16 @@ async fn run_with_status_path(
                         break;
                     }
                 }
+            },
+            () = &mut maintenance, if maintenance_running => {
+                maintenance_running = false;
+                tracing::debug!("Status cache refreshed");
+                if last_cleanup.elapsed() >= MEMORY_CLEANUP_INTERVAL {
+                    #[cfg(any(feature = "debian", feature = "debian-pure"))]
+                    crate::package_managers::debian_db::cleanup_expired_mmaps();
+                    last_cleanup = tokio::time::Instant::now();
+                }
+            }
             }
         }
     });
@@ -484,6 +512,7 @@ async fn run_with_status_path(
         Duration::from_secs(30),
     )
     .await;
+    let native_result = state.drain_native_backends(Duration::from_secs(30)).await;
     let audit_result = crate::core::security::audit::drain_audit_queue().await;
     if intake_result.is_err()
         && let Err(error) = &shutdown_result
@@ -491,12 +520,18 @@ async fn run_with_status_path(
         tracing::error!("Additional daemon shutdown failure: {error:#}");
     }
     if (intake_result.is_err() || shutdown_result.is_err())
+        && let Err(error) = &native_result
+    {
+        tracing::error!("Additional native backend drain failure: {error:#}");
+    }
+    if (intake_result.is_err() || shutdown_result.is_err() || native_result.is_err())
         && let Err(error) = &audit_result
     {
         tracing::error!("Additional audit drain failure: {error:#}");
     }
     intake_result?;
     shutdown_result?;
+    native_result?;
     audit_result?;
     if internal_failure.is_none() {
         internal_failure = internal_failure_rx.try_recv().ok();
@@ -839,6 +874,120 @@ async fn handle_client_with_idle_timeout(
 
 #[cfg(test)]
 mod tests {
+    struct PausedAdvisorySource {
+        started: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl crate::core::security::vulnerability::VulnerabilitySource for PausedAdvisorySource {
+        fn scan_package<'a>(
+            &'a self,
+            _name: &'a str,
+            _version: &'a crate::package_managers::types::Version,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            Vec<crate::core::security::vulnerability::VulnerabilityReport>,
+                            crate::core::security::vulnerability::VulnerabilityError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.resume.notified().await;
+                Ok(vec![])
+            })
+        }
+    }
+
+    async fn daemon_with_paused_scan() -> Result<(
+        tempfile::TempDir,
+        Arc<DaemonState>,
+        Arc<PausedAdvisorySource>,
+        PathBuf,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        let directory = tempfile::tempdir()?;
+        let backend = Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+            "arch",
+            directory.path(),
+        ));
+        backend.set_installed_version("held-package", "1")?;
+        let source = Arc::new(PausedAdvisorySource {
+            started: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let mut state = DaemonState::new_isolated_with_scanner(
+            directory.path(),
+            super::super::index::PackageIndex::from_records(&[("held-package", "1", "held")]),
+            backend,
+            source.clone(),
+        )?;
+        state.background_security_scans = true;
+        let state = Arc::new(state);
+        let socket = directory.path().join("held.sock");
+        let listener = UnixListener::bind(&socket)?;
+        let server = tokio::spawn(run_with_status_path(
+            listener,
+            state.clone(),
+            socket.clone(),
+            directory.path().join("omg.status"),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), source.started.notified()).await?;
+        Ok((directory, state, source, socket, server))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn daemon_watchdog_detects_removed_socket_during_initial_scan() -> Result<()> {
+        let (_directory, _state, _source, socket, mut server) = daemon_with_paused_scan().await?;
+        tokio::time::pause();
+        std::fs::remove_file(&socket)?;
+        tokio::time::advance(SOCKET_HEALTH_CHECK_INTERVAL + Duration::from_secs(1)).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        server.abort();
+        let error = outcome
+            .context("socket watchdog waited for the held security scan")??
+            .expect_err("removed socket must produce an unsuccessful daemon exit");
+        assert!(error.to_string().contains("removed externally"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn daemon_publication_background_scan_cannot_resurrect_a_stale_snapshot() -> Result<()> {
+        let (_directory, state, source, _socket, server) = daemon_with_paused_scan().await?;
+        state.replace_index(
+            super::super::index::PackageIndex::empty(),
+            #[cfg(feature = "arch")]
+            crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+        );
+        source.resume.notify_one();
+        let complete = tokio::time::timeout(Duration::from_secs(5), async {
+            while state.cache.get("git").is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        server.abort();
+        complete.context("initial maintenance did not finish")?;
+        assert!(
+            state.cache.get_status().is_none(),
+            "old inventory must not be freshly cached"
+        );
+        assert!(
+            state
+                .persistent
+                .get_status(Duration::from_mins(5))?
+                .is_none(),
+            "old inventory must not survive refresh on disk"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn shutdown_waits_for_owned_work_to_finish() {
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -1170,7 +1319,19 @@ mod tests {
         let path = directory.path().join("status.bin");
         let status = crate::core::fast_status::FastStatus::new(10, 4, 1, 2);
 
-        write_fast_status_async(status, path.clone())
+        let state = Arc::new(
+            DaemonState::new_isolated(
+                directory.path(),
+                super::super::index::PackageIndex::empty(),
+                Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+                    "arch",
+                    directory.path(),
+                )),
+            )
+            .expect("isolated fast-status state"),
+        );
+        let index = state.index_snapshot();
+        write_fast_status_async(status, path.clone(), state, index)
             .await
             .expect("write fast status");
 

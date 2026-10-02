@@ -1,5 +1,12 @@
 //! Shared package manager types
 
+/// One installed package selected by a native removal solver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalPackage {
+    pub name: String,
+    pub version: String,
+}
+
 /// Installed identity for security exports. Native versions are opaque strings;
 /// absent metadata remains absent rather than being inferred from the host.
 #[derive(Debug, Clone, PartialEq, Eq)]

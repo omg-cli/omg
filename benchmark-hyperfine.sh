@@ -300,19 +300,113 @@ if [[ "$GUEST_MODE" == true ]]; then
     export OMG_CONFIG_DIR="$EXPORT_DIR/config"
     export OMG_NO_TELEMETRY=1
     mkdir -p "$OMG_CACHE_DIR" "$OMG_DATA_DIR" "$OMG_CONFIG_DIR"
+    fedora_identity_from_query() {
+        local bytes
+        bytes=$(wc -c < "$1") || return
+        bytes=${bytes//[[:space:]]/}
+        [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -le 65536 ]] || return 1
+        awk -F '\t' -v phase="$2" -v arch="$3" -v exact_evr="$4" '
+          BEGIN {
+            sub(/^0:/, "", exact_evr);
+            if (phase != "installed" && phase != "available") invalid=1;
+            if (phase == "available" && (arch == "" || exact_evr == "")) invalid=1;
+          }
+          {
+            rows++;
+            if (NF != 3 || $1 != "tree" || $2 !~ /^[A-Za-z0-9_]+$/ ||
+                $3 !~ /^(0:|[1-9][0-9]*:)?[A-Za-z0-9_+~^.]+-[A-Za-z0-9_+~^.]+$/) {
+              invalid=1; next;
+            }
+            evr=$3; sub(/^0:/, "", evr);
+            if ((arch == "" || $2 == arch) && (exact_evr == "" || evr == exact_evr)) {
+              matches++; name=$1 "." $2; version=evr;
+            }
+          }
+          END {
+            if (invalid || matches != 1 || (phase == "installed" && rows != 1)) exit 1;
+            print name "\t" version;
+          }' "$1"
+    }
+    capture_fedora_info_identity() {
+        local phase=$1 suffix=$2 exact_evr=$3 arch="" status=0
+        [[ "$phase" == installed || "$phase" == available ]] || return 1
+        [[ "$suffix" == "" || "$suffix" == -before || "$suffix" == -after ]] || return 1
+        local query_stdout="$EXPORT_DIR/native-identity-query$suffix.stdout"
+        local query_stderr="$EXPORT_DIR/native-identity-query$suffix.stderr"
+        [[ ! -e "$query_stdout" && ! -e "$query_stderr" ]] || return 1
+        if [[ "$phase" == available ]]; then
+            [[ ! -e "$EXPORT_DIR/native-architecture.stdout" && ! -e "$EXPORT_DIR/native-architecture.stderr" ]] || return 1
+            timeout --kill-after=5s 60s rpm --eval '%{_arch}' \
+                > "$EXPORT_DIR/native-architecture.stdout" 2> "$EXPORT_DIR/native-architecture.stderr" || status=$?
+            [[ "$status" == 0 ]] || return "$status"
+            arch=$(cat "$EXPORT_DIR/native-architecture.stdout") || return
+            [[ "$arch" =~ ^[A-Za-z0-9_]+$ ]] || return 1
+            timeout --kill-after=5s 60s dnf --cacheonly repoquery --available --latest-limit=1 \
+                "--arch=$arch" --queryformat $'%{name}\t%{arch}\t%{evr}\\n' tree \
+                > "$query_stdout" 2> "$query_stderr" || status=$?
+        else
+            timeout --kill-after=5s 60s rpm -q \
+                --qf '%{NAME}\t%{ARCH}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' tree \
+                > "$query_stdout" 2> "$query_stderr" || status=$?
+        fi
+        [[ "$status" == 0 ]] || return "$status"
+        fedora_identity_from_query "$query_stdout" "$phase" "$arch" "$exact_evr"
+    }
+    prepare_info_reference() {
+        info_phase=$1 info_arch="" info_evr=$3
+        if [[ "$distro" == fedora ]]; then
+            local reference identity
+            reference=$(capture_fedora_info_identity "$1" "$2" "$3") || return
+            IFS=$'\t' read -r identity info_evr <<< "$reference"
+            info_arch=${identity#tree.}
+        fi
+    }
     normalize_info() {
-        awk -v rpm_release="$1" '
+        awk -v rpm_release="$1" -v distro="$distro" -v phase="${3:-installed}" \
+            -v arch="${4:-}" -v expected_evr="${5:-}" '
           {sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, "")}
           /^(Name|Package)[[:space:]]*:/ {sub(/^[^:]*:[[:space:]]*/, ""); name=$0; names++}
           /^Version[[:space:]]*:/ {sub(/^[^:]*:[[:space:]]*/, ""); version=$0; versions++}
           /^Release[[:space:]]*:/ {sub(/^[^:]*:[[:space:]]*/, ""); release=$0; releases++}
+          /^Architecture[[:space:]]*:/ {sub(/^[^:]*:[[:space:]]*/, ""); architecture=$0; architectures++}
+          /^Epoch[[:space:]]*:/ {sub(/^[^:]*:[[:space:]]*/, ""); epoch=$0; epochs++}
+          /^Installed[[:space:]]*:/ {sub(/^[^:]*:[[:space:]]*/, ""); installed=$0; installed_fields++}
           END {
-            if (names != 1 || versions != 1 || name != "tree" || version == "") exit 1;
-            if (rpm_release == "true") {
-              if (releases != 1 || release == "") exit 1;
-              version=version "-" release;
+            if (names != 1 || versions != 1 || version == "" ||
+                (phase != "installed" && phase != "available")) exit 1;
+            if (distro == "fedora") {
+              sub(/^0:/, "", expected_evr);
+              if (arch !~ /^[A-Za-z0-9_]+$/ ||
+                  expected_evr !~ /^([1-9][0-9]*:)?[A-Za-z0-9_+~^.]+-[A-Za-z0-9_+~^.]+$/) exit 1;
+              expected_epoch="0"; base_evr=expected_evr;
+              if (index(base_evr, ":")) {
+                expected_epoch=substr(base_evr, 1, index(base_evr, ":")-1);
+                sub(/^[^:]*:/, "", base_evr);
+              }
+              if (rpm_release == "true") {
+                if (name != "tree" || architectures != 1 || architecture != arch ||
+                    releases != 1 || release == "" || epochs > 1 ||
+                    (epochs == 1 && epoch != expected_epoch)) exit 1;
+                if (index(version, ":")) {
+                  version_epoch=substr(version, 1, index(version, ":")-1);
+                  if (version_epoch != expected_epoch) exit 1;
+                  sub(/^[^:]*:/, "", version);
+                }
+                if (version "-" release != base_evr) exit 1;
+              } else if (rpm_release == "false") {
+                expected_name=(phase == "installed" ? "tree." arch : "tree");
+                sub(/^0:/, "", version);
+                expected_installed=(phase == "installed" ? "yes" : "no");
+                if (name != expected_name || version != expected_evr ||
+                    installed_fields != 1 || installed != expected_installed ||
+                    architectures > 1 || (architectures == 1 && architecture != arch) ||
+                    releases > 1 || epochs > 1 || (epochs == 1 && epoch != expected_epoch)) exit 1;
+              } else exit 1;
+              print "tree." arch "\t" expected_evr;
+            } else {
+              if (name != "tree" || (expected_evr != "" && version != expected_evr)) exit 1;
+              print name "\t" version;
             }
-            print name "\t" version;
           }' "$2"
     }
     case "$distro" in
@@ -376,10 +470,15 @@ if [[ "$GUEST_MODE" == true ]]; then
             fi
             "${privileged[@]}" "$OMG" info tree > "$EXPORT_DIR/omg-info-$phase.stdout" 2> "$EXPORT_DIR/omg-info-$phase.stderr"
             "${privileged[@]}" "${identity_native[@]}" > "$EXPORT_DIR/native-info-$phase.stdout" 2> "$EXPORT_DIR/native-info-$phase.stderr"
-            normalize_info false "$EXPORT_DIR/omg-info-$phase.stdout" > "$EXPORT_DIR/omg-identity-$phase.tsv"
+            local identity_phase=installed
+            [[ "$phase" != before || "$GUEST_TRANSACTION" != install ]] || identity_phase=available
+            prepare_info_reference "$identity_phase" "-$phase" "$expected_version"
+            normalize_info false "$EXPORT_DIR/omg-info-$phase.stdout" "$info_phase" "$info_arch" "$info_evr" > "$EXPORT_DIR/omg-identity-$phase.tsv"
             normalize_info "$([[ "$distro" == fedora ]] && echo true || echo false)" \
-                "$EXPORT_DIR/native-info-$phase.stdout" > "$EXPORT_DIR/native-identity-$phase.tsv"
-            printf 'tree\t%s\n' "$expected_version" > "$EXPORT_DIR/expected-identity.tsv"
+                "$EXPORT_DIR/native-info-$phase.stdout" "$info_phase" "$info_arch" "$info_evr" > "$EXPORT_DIR/native-identity-$phase.tsv"
+            local expected_name=tree
+            [[ "$distro" != fedora ]] || expected_name="tree.$info_arch"
+            printf '%s\t%s\n' "$expected_name" "$info_evr" > "$EXPORT_DIR/expected-identity.tsv"
             cmp "$EXPORT_DIR/omg-identity-$phase.tsv" "$EXPORT_DIR/expected-identity.tsv"
             cmp "$EXPORT_DIR/native-identity-$phase.tsv" "$EXPORT_DIR/expected-identity.tsv"
         }
@@ -489,14 +588,16 @@ if [[ "$GUEST_MODE" == true ]]; then
     fi
     "$OMG" info tree > "$EXPORT_DIR/omg-info.stdout" 2> "$EXPORT_DIR/omg-info.stderr"
     "${native[@]}" > "$EXPORT_DIR/native-info.stdout" 2> "$EXPORT_DIR/native-info.stderr"
-    normalize_info false "$EXPORT_DIR/omg-info.stdout" > "$EXPORT_DIR/omg-identity.tsv"
+    prepare_info_reference installed "" ""
+    initial_info_evr=$info_evr
+    normalize_info false "$EXPORT_DIR/omg-info.stdout" "$info_phase" "$info_arch" "$info_evr" > "$EXPORT_DIR/omg-identity.tsv"
     normalize_info "$([[ "$distro" == fedora ]] && echo true || echo false)" \
-        "$EXPORT_DIR/native-info.stdout" > "$EXPORT_DIR/native-identity.tsv"
+        "$EXPORT_DIR/native-info.stdout" "$info_phase" "$info_arch" "$info_evr" > "$EXPORT_DIR/native-identity.tsv"
     cmp "$EXPORT_DIR/omg-identity.tsv" "$EXPORT_DIR/native-identity.tsv"
     if [[ ${#extra_native[@]} -gt 0 ]]; then
         "${extra_native[@]}" > "$EXPORT_DIR/extra-info.stdout" 2> "$EXPORT_DIR/extra-info.stderr"
         normalize_info "$([[ "$distro" == fedora ]] && echo true || echo false)" \
-            "$EXPORT_DIR/extra-info.stdout" > "$EXPORT_DIR/extra-identity.tsv"
+            "$EXPORT_DIR/extra-info.stdout" "$info_phase" "$info_arch" "$info_evr" > "$EXPORT_DIR/extra-identity.tsv"
         cmp "$EXPORT_DIR/omg-identity.tsv" "$EXPORT_DIR/extra-identity.tsv"
         "$extra_name" --version > "$EXPORT_DIR/extra-version.txt" 2>&1
     fi
@@ -528,15 +629,16 @@ if [[ "$GUEST_MODE" == true ]]; then
     ' "$EXPORT_DIR/info.json" >/dev/null
     "$OMG" info tree > "$EXPORT_DIR/omg-info-after.stdout" 2> "$EXPORT_DIR/omg-info-after.stderr"
     "${native[@]}" > "$EXPORT_DIR/native-info-after.stdout" 2> "$EXPORT_DIR/native-info-after.stderr"
-    normalize_info false "$EXPORT_DIR/omg-info-after.stdout" > "$EXPORT_DIR/omg-identity-after.tsv"
+    prepare_info_reference installed -after "$initial_info_evr"
+    normalize_info false "$EXPORT_DIR/omg-info-after.stdout" "$info_phase" "$info_arch" "$info_evr" > "$EXPORT_DIR/omg-identity-after.tsv"
     normalize_info "$([[ "$distro" == fedora ]] && echo true || echo false)" \
-        "$EXPORT_DIR/native-info-after.stdout" > "$EXPORT_DIR/native-identity-after.tsv"
+        "$EXPORT_DIR/native-info-after.stdout" "$info_phase" "$info_arch" "$info_evr" > "$EXPORT_DIR/native-identity-after.tsv"
     cmp "$EXPORT_DIR/omg-identity.tsv" "$EXPORT_DIR/omg-identity-after.tsv"
     cmp "$EXPORT_DIR/native-identity.tsv" "$EXPORT_DIR/native-identity-after.tsv"
     if [[ ${#extra_native[@]} -gt 0 ]]; then
         "${extra_native[@]}" > "$EXPORT_DIR/extra-info-after.stdout" 2> "$EXPORT_DIR/extra-info-after.stderr"
         normalize_info "$([[ "$distro" == fedora ]] && echo true || echo false)" \
-            "$EXPORT_DIR/extra-info-after.stdout" > "$EXPORT_DIR/extra-identity-after.tsv"
+            "$EXPORT_DIR/extra-info-after.stdout" "$info_phase" "$info_arch" "$info_evr" > "$EXPORT_DIR/extra-identity-after.tsv"
         cmp "$EXPORT_DIR/extra-identity.tsv" "$EXPORT_DIR/extra-identity-after.tsv"
     fi
     {

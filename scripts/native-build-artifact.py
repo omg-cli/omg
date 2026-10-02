@@ -254,7 +254,7 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
     require(re.fullmatch('[a-f0-9]{40}', source), 'invalid checkout SHA')
     require(command_output(['git', '-C', str(root), 'rev-parse', 'HEAD']) == source, 'checkout identity mismatch')
     event_name = context['GITHUB_EVENT_NAME']
-    require(event_name in ('push', 'pull_request'), 'reuse only applies to automatic source runs')
+    require(event_name in ('push', 'pull_request', 'merge_group'), 'reuse only applies to automatic source runs')
     head = event['pull_request']['head']['sha'] if event_name == 'pull_request' else source
     require(re.fullmatch('[a-f0-9]{40}', head), 'invalid API head SHA')
     workflow = api_json('repos/' + repository + '/actions/workflows/ci.yml')

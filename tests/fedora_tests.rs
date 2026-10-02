@@ -8,6 +8,74 @@ pub mod platform_semantics;
 
 use platform_semantics::{assert_no_arch_terms, assert_no_debian_terms, assert_no_macos_terms};
 
+/// Compare the selected installed identities against RPM's own name/arch/EVR
+/// records. Keep duplicates so multilib and install-only versions cannot vanish.
+fn assert_installed_rpm_selection(
+    installed: &[omg_lib::core::Package],
+    selection: &str,
+) -> Result<()> {
+    let output = std::process::Command::new("/usr/bin/rpm")
+        .args([
+            "-q",
+            "--queryformat",
+            "%{NAME}\t%{ARCH}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\n",
+            selection,
+        ])
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "native RPM selection {selection} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut expected = Vec::new();
+    for line in std::str::from_utf8(&output.stdout)?.lines() {
+        let fields: Vec<_> = line.split('\t').collect();
+        anyhow::ensure!(
+            fields.len() == 5
+                && fields[0] == selection
+                && !fields[1].is_empty()
+                && !fields[3].is_empty()
+                && !fields[4].is_empty(),
+            "invalid native RPM selection record: {line:?}"
+        );
+        let epoch: u32 = fields[2].parse()?;
+        let version = if epoch == 0 {
+            format!("{}-{}", fields[3], fields[4])
+        } else {
+            format!("{epoch}:{}-{}", fields[3], fields[4])
+        };
+        expected.push((format!("{}.{}", fields[0], fields[1]), version, true));
+    }
+    anyhow::ensure!(
+        !expected.is_empty(),
+        "native RPM selection must be installed"
+    );
+    let mut actual: Vec<_> = installed
+        .iter()
+        .filter(|package| {
+            package.name == selection
+                || package
+                    .name
+                    .rsplit_once('.')
+                    .is_some_and(|(name, _)| name == selection)
+        })
+        .map(|package| {
+            (
+                package.name.clone(),
+                package.version.to_string(),
+                package.installed,
+            )
+        })
+        .collect();
+    actual.sort();
+    expected.sort();
+    anyhow::ensure!(
+        actual == expected,
+        "listed RPM selection differs for {selection}: actual={actual:?}, native={expected:?}"
+    );
+    Ok(())
+}
+
 mod dnf_integration {
     use super::*;
 
@@ -731,23 +799,72 @@ mod dnf_integration {
     }
 
     #[tokio::test]
-    async fn test_list_installed_packages() {
+    async fn test_list_installed_packages() -> Result<()> {
         let pm = DnfPackageManager::new();
 
-        let installed = pm.list_installed().await.unwrap();
+        let installed = pm.list_installed().await?;
 
         assert!(
             !installed.is_empty(),
             "Should have installed packages on Fedora system"
         );
-        assert!(
-            installed.iter().any(|package| package.name == "bash"),
-            "RPM inventory must include the installed bash package"
-        );
+        assert_installed_rpm_selection(&installed, "bash")?;
         assert!(
             installed.iter().all(|package| package.installed),
             "installed inventory must not contain available-only packages"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installed_rpm_selection_rejects_inexact_or_noninstalled_records() -> Result<()> {
+        let installed = DnfPackageManager::new().list_installed().await?;
+        assert_installed_rpm_selection(&installed, "bash")?;
+        let selected = installed
+            .iter()
+            .position(|package| {
+                package
+                    .name
+                    .rsplit_once('.')
+                    .is_some_and(|(name, _)| name == "bash")
+            })
+            .expect("independently verified bash identity");
+        let mut unrelated = installed.clone();
+        let mut addon = installed[selected].clone();
+        addon.name = "bash.addon.x86_64".into();
+        unrelated.push(addon);
+        assert_installed_rpm_selection(&unrelated, "bash")?;
+        for mutation in [
+            "bare",
+            "architecture",
+            "version",
+            "available",
+            "missing",
+            "duplicate",
+        ] {
+            let mut changed = installed.clone();
+            match mutation {
+                "bare" => changed[selected].name = "bash".into(),
+                "architecture" => changed[selected].name = "bash.omg_wrong_arch".into(),
+                "version" => {
+                    changed[selected].version = omg_lib::package_managers::parse_version("0")
+                        .expect("valid counterexample version");
+                }
+                "available" => changed[selected].installed = false,
+                "missing" => {
+                    changed.remove(selected);
+                }
+                "duplicate" => changed.push(changed[selected].clone()),
+                _ => unreachable!(),
+            }
+            let error = assert_installed_rpm_selection(&changed, "bash")
+                .expect_err("inexact selected inventory must be rejected");
+            assert!(
+                error.to_string().contains("listed RPM selection differs"),
+                "{mutation}: {error}"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -887,18 +1004,18 @@ mod dnf_rpm_database {
     use super::*;
 
     #[tokio::test]
-    async fn test_rpm_database_query() {
+    async fn test_rpm_database_query() -> Result<()> {
         let pm = DnfPackageManager::new();
 
-        let installed = pm.list_installed().await.unwrap();
+        let installed = pm.list_installed().await?;
 
         assert!(
             !installed.is_empty(),
             "Should read packages from RPM database"
         );
 
-        let has_rpm = installed.iter().any(|p| p.name == "rpm" && p.installed);
-        assert!(has_rpm, "Should find rpm package itself in database");
+        assert_installed_rpm_selection(&installed, "rpm")?;
+        Ok(())
     }
 }
 

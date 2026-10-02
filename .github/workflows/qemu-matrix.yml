@@ -5,7 +5,7 @@
 # - schedule: current default-branch build and inventory in x86_64 guests.
 #   Published artifacts have a separate nightly Release Smoke workflow.
 # - dispatch default: published release guests, x86_64 (no build).
-# - pull_request/main push: verified native CI release pairs are reused per distro
+# - pull_request/main push/merge_group: verified native CI release pairs are reused per distro
 #   and tested via --staged-dir. ARM is excluded because its configurable
 #   runner must never execute untrusted pull-request code.
 # - aarch64 legs are staged workflow-dispatch only; guest runners use OMG_QEMU_ARM_RUNNER
@@ -159,7 +159,7 @@ jobs:
           REQUESTED_RELEASE_TAG: ${{ inputs.tag }}
           REQUESTED_DISTRO: ${{ inputs.distro || 'all' }}
           REQUESTED_ARCH: ${{ inputs.arch || 'all' }}
-          STAGED: ${{ github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.staged) }}
+          STAGED: ${{ github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.staged) }}
           EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.event_name != 'pull_request' && secrets.GITHUB_TOKEN || '' }}
         run: |
@@ -214,7 +214,7 @@ jobs:
       contents: read
       actions: read
     with:
-      reuse-ci: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+      reuse-ci: ${{ github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
       distro: ${{ matrix.distro }}
       staged: ${{ needs.prepare.outputs.staged == 'true' }}
       tag: ${{ needs.prepare.outputs.tag }}
@@ -431,6 +431,9 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
+      - name: Reject Windows drive mounts on the QEMU runner
+        run: python3 scripts/check-qemu-runner-isolation.py
+
       - name: Record evidence provenance
         env:
           ARTIFACT_TAG: ${{ needs.prepare.outputs.tag }}
@@ -471,6 +474,7 @@ jobs:
       - name: Run disposable ARM guest lifecycle + read benchmarks + inventory rows
         # Match x64 staged coverage, including the selected CLI inventory.
         run: |
+          python3 scripts/check-qemu-runner-isolation.py
           ./scripts/benchmark-qemu.sh --arch aarch64 --distro "${{ matrix.distro }}" --benchmark --evidence-dir "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME" \
             --release "${{ needs.prepare.outputs.tag }}" \
             --inventory-policy tests/qemu-inventory-policy.json \

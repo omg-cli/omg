@@ -32,7 +32,7 @@ class CloudInitReadyTests(unittest.TestCase):
 
     def check(self, status, *, result=True, target_ready_after=1, failed_unit="",
               status_exit=0, target_exit=0, diagnostic_exit=0, status_timeout=False,
-              diagnostic_journal_bytes=0):
+              diagnostic_journal_bytes=0, status_resets=0, target_resets=0, timeout_seconds=180):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             (temp / "status.json").write_text(json.dumps(status), encoding="utf-8")
@@ -53,6 +53,10 @@ if [[ "$*" == *'cloud_init_record='* ]]; then
   exit "$MOCK_DIAGNOSTIC_EXIT"
 elif [[ "$*" == *'/run/cloud-init/result.json'* ]]; then
   echo status >> "$MOCK_SSH_CALLS"
+  calls=0
+  [[ ! -e "$MOCK_STATUS_CALLS" ]] || read -r calls < "$MOCK_STATUS_CALLS"
+  printf '%s\\n' "$((calls + 1))" > "$MOCK_STATUS_CALLS"
+  (( calls >= MOCK_STATUS_RESETS )) || exit 255
   if [[ "$MOCK_STATUS_TIMEOUT" == yes ]]; then sleep 5; fi
   if (( MOCK_STATUS_EXIT != 0 )); then
     echo 'cloud-final.service failed before publishing result.json' >&2
@@ -63,6 +67,10 @@ elif [[ "$*" == *'/run/cloud-init/result.json'* ]]; then
 else
   echo target >> "$MOCK_SSH_CALLS"
   if (( MOCK_TARGET_EXIT != 0 )); then exit "$MOCK_TARGET_EXIT"; fi
+  calls=0
+  [[ ! -e "$MOCK_SSH_TARGET_CALLS" ]] || read -r calls < "$MOCK_SSH_TARGET_CALLS"
+  printf '%s\\n' "$((calls + 1))" > "$MOCK_SSH_TARGET_CALLS"
+  (( calls >= MOCK_TARGET_RESETS )) || exit 255
   bash -c "${@: -1}"
 fi
 """, encoding="utf-8")
@@ -112,7 +120,12 @@ exec "{shutil.which("timeout")}" "$@"
                        MOCK_DIAGNOSTIC_EXIT=str(diagnostic_exit),
                        MOCK_CLOUD_INIT_DIR=str(records),
                        MOCK_JOURNAL=str(temp / "journal.txt"),
-                       MOCK_STATUS_TIMEOUT="yes" if status_timeout else "no")
+                       MOCK_STATUS_TIMEOUT="yes" if status_timeout else "no",
+                       MOCK_STATUS_CALLS=str(temp / "status-calls"),
+                       MOCK_SSH_TARGET_CALLS=str(temp / "ssh-target-calls"),
+                       MOCK_STATUS_RESETS=str(status_resets),
+                       MOCK_TARGET_RESETS=str(target_resets),
+                       OMG_QEMU_CLOUD_INIT_TIMEOUT_SECONDS=str(timeout_seconds))
             completed = subprocess.run(["bash", str(CHECK), "bench@127.0.0.1", "-p", "2222"],
                                        env=env, text=True, capture_output=True, timeout=20)
             calls = int((temp / "target-calls").read_text()) if (temp / "target-calls").exists() else 0
@@ -129,6 +142,22 @@ exec "{shutil.which("timeout")}" "$@"
         result, calls = self.check(healthy_status(), target_ready_after=3)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, 3)
+
+    def test_transient_ssh_resets_are_retried_in_both_boot_stages(self):
+        result, _ = self.check(healthy_status(), status_resets=1, target_resets=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verified", result.stdout)
+
+    def test_failed_guest_command_is_not_reported_as_a_timeout(self):
+        result, _ = self.check(healthy_status(), result=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("guest command failed", result.stderr)
+        self.assertNotIn("within 180 seconds", result.stderr)
+
+    def test_transport_retries_obey_the_boot_deadline(self):
+        result, _ = self.check(healthy_status(), status_resets=1000, timeout_seconds=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("within 1 seconds", result.stderr)
 
     def test_legacy_cloud_init_without_recoverable_errors_field_passes(self):
         status = healthy_status()
@@ -189,7 +218,7 @@ exec "{shutil.which("timeout")}" "$@"
             self.assertNotIn("verified", result.stdout)
 
     def test_failed_diagnostic_preserves_primary_failure(self):
-        status, _ = self.check(healthy_status(), status_exit=255, diagnostic_exit=7)
+        status, _ = self.check(healthy_status(), status_exit=255, diagnostic_exit=7, timeout_seconds=1)
         self.assertEqual(status.returncode, 1, status.stderr)
         self.assertIn("timeout_ssh_exit=255", status.stderr)
         self.assertIn("diagnostic_exit=7", status.stderr)
@@ -239,6 +268,7 @@ exec "{shutil.which("timeout")}" "$@"
                      "-o", "StrictHostKeyChecking=yes", "-o",
                      f"UserKnownHostsFile={directory}/known_hosts", "-p",
                      str(port)],
+                    env=dict(os.environ, OMG_QEMU_CLOUD_INIT_TIMEOUT_SECONDS="1"),
                     text=True, capture_output=True, timeout=12)
             finally:
                 server.join(timeout=6)
