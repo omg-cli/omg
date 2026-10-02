@@ -299,10 +299,7 @@ jobs:
             features: fedora,pgp,license
             setup: |
               timeout -k 10s 12m dnf \
-                --setopt=fedora.metalink= \
-                --setopt=fedora.baseurl='https://dl.fedoraproject.org/pub/fedora/linux/releases/$releasever/Everything/$basearch/os/' \
-                --setopt=updates.metalink= \
-                --setopt=updates.baseurl='https://dl.fedoraproject.org/pub/fedora/linux/updates/$releasever/Everything/$basearch/' \
+                --setopt='*.skip_if_unavailable=False' \
                 install -y --setopt=install_weak_deps=False \
                 git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 \
                 rpm dnf sqlite yum-utils fedora-release

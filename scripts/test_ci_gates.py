@@ -82,7 +82,66 @@ class QuickGateOfflineTests(unittest.TestCase):
 
 
 class FedoraSetupSourceTests(unittest.TestCase):
-    def test_fedora_build_setup_uses_bounded_canonical_repositories_once(self) -> None:
+    def test_fedora_setup_preserves_metalinks_and_fails_missing_repositories(self) -> None:
+        commands: list[tuple[str, str]] = []
+        for workflow in [CI_YML, CI_YML.with_name("release.yml")]:
+            source = workflow.read_text(encoding="utf-8")
+            matches = re.findall(r"timeout -k 10s 12m dnf(?:[^\n]*\\\n)*[^\n]*", source)
+            self.assertEqual(len(matches), 1)
+            commands.append((workflow.name, matches[0]))
+        matrix = CI_YML.with_name("qemu-matrix.yml").read_text(encoding="utf-8")
+        for encoded in re.findall(r'"setup":\s*("(?:\\.|[^"\\])*")', matrix):
+            setup = json.loads(encoded)
+            if "12m dnf" in setup:
+                command = re.search(r"timeout -k 10s 12m dnf(?:[^\n]*\\\n)*[^\n]*", setup)
+                self.assertIsNotNone(command)
+                if command is not None:
+                    commands.append(("qemu-matrix.yml", command.group()))
+        self.assertEqual(len(commands), 4)
+        for workflow, command in commands:
+            with self.subTest(workflow=workflow, command=command):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    executable = root / "dnf"
+                    executable.write_text(
+                        f"#!{sys.executable}\n"
+                        "import json,os,sys\n"
+                        "from pathlib import Path\n"
+                        "args=sys.argv[1:]\n"
+                        "Path(os.environ['DNF_CALL']).write_text(json.dumps(args))\n"
+                        "overrides=[arg for arg in args if arg.startswith('--setopt=') and any(name in arg for name in ('.metalink=', '.baseurl='))]\n"
+                        "if overrides or '--setopt=*.skip_if_unavailable=False' not in args:\n"
+                        " print('setup refused: image metalinks and fatal repository failures required',file=sys.stderr)\n"
+                        " sys.exit(42)\n"
+                        "if '--nogpgcheck' in args:\n"
+                        " sys.exit(43)\n",
+                        encoding="utf-8",
+                    )
+                    executable.chmod(0o755)
+                    receipt = root / "call.json"
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", command],
+                        cwd=root,
+                        env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", DNF_CALL=str(receipt)),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    arguments = json.loads(receipt.read_text(encoding="utf-8"))
+                    package_index = arguments.index("--setopt=install_weak_deps=False") + 1
+                    expected = ["git", "clang", "cmake", "openssl-devel", "pkgconfig", "findutils", "curl"]
+                    if workflow != "release.yml":
+                        expected.append("procps-ng")
+                    if workflow == "ci.yml":
+                        expected.append("python3")
+                    expected.extend(["rpm", "dnf", "sqlite", "yum-utils", "fedora-release"])
+                    self.assertEqual(arguments[package_index:], expected)
+                    self.assertEqual(arguments.count("install"), 1)
+                    self.assertEqual(arguments.count("-y"), 1)
+
+    def test_fedora_build_setup_keeps_mirror_policy_and_bounded_install_once(self) -> None:
         workflows = [
             CI_YML,
             CI_YML.with_name("qemu-matrix.yml"),
@@ -92,10 +151,11 @@ class FedoraSetupSourceTests(unittest.TestCase):
             with self.subTest(workflow=workflow.name):
                 source = workflow.read_text(encoding="utf-8")
                 expected = 2 if workflow.name == "qemu-matrix.yml" else 1
-                self.assertEqual(source.count("--setopt=fedora.metalink="), expected)
-                self.assertEqual(source.count("--setopt=updates.metalink="), expected)
-                self.assertEqual(source.count("https://dl.fedoraproject.org/pub/fedora/linux/releases/"), expected)
-                self.assertEqual(source.count("https://dl.fedoraproject.org/pub/fedora/linux/updates/"), expected)
+                self.assertEqual(source.count("--setopt='*.skip_if_unavailable=False'"), expected)
+                self.assertNotIn("--setopt=fedora.metalink=", source)
+                self.assertNotIn("--setopt=updates.metalink=", source)
+                self.assertNotIn("--setopt=fedora.baseurl=", source)
+                self.assertNotIn("--setopt=updates.baseurl=", source)
                 self.assertEqual(source.count("timeout -k 10s 12m dnf"), expected)
                 self.assertNotIn("dnf makecache --refresh", source)
                 self.assertNotIn("--nogpgcheck", source)
