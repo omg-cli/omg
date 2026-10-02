@@ -18,6 +18,34 @@ def step(name):
 
 
 class DockerProvenanceTests(unittest.TestCase):
+    def test_restores_registry_cache_without_granting_fork_write_access(self):
+        workflow = WORKFLOW.read_text(encoding='utf-8')
+        build = step('Build native Arch test image')
+        self.assertRegex(build, r'cache-from: \|\n(?:            [^\n]*\n)*'
+                         r'            type=registry,ref=ghcr.io/omg-cli/omg-buildcache:arch-e2e\n')
+        self.assertNotIn('type=gha', build)
+        fork = workflow.split('  docker-e2e:\n', 1)[1].split('    steps:', 1)[0]
+        self.assertIn("CACHE_EXPORT: ''", fork)
+        self.assertNotIn('packages: write', fork)
+        self.assertNotIn('packages: read', fork)
+        main = workflow.split('  docker-e2e-main:\n', 1)[1]
+        self.assertIn('type=registry,ref=ghcr.io/omg-cli/omg-buildcache:arch-e2e,mode=max', main)
+        self.assertNotIn('type=gha', main)
+
+    def test_unreadable_registry_cache_is_a_fatal_setup_failure(self):
+        self.assertIn('      - name: Require readable registry cache\n',
+                      WORKFLOW.read_text(encoding='utf-8'))
+        block = step('Require readable registry cache')
+        script = textwrap.dedent(re.search(r'        run: \|\n(.*)', block, re.S)[1])
+        for status in (0, 42):
+            with self.subTest(status=status):
+                docker = ('docker() { test "$*" = "buildx imagetools inspect '
+                          'ghcr.io/omg-cli/omg-buildcache:arch-e2e" || return 91; '
+                          f'return {status}; }}\n')
+                result = subprocess.run([self.bash, '-c', docker + script],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, status, result.stderr)
+
     @classmethod
     def setUpClass(cls):
         cls.bash = os.environ.get('OMG_TEST_BASH') or shutil.which('bash')
