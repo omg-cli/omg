@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path, PurePosixPath
 import re
+import ssl
 import stat
 import tarfile
 from types import SimpleNamespace
@@ -138,12 +139,29 @@ def validate_evidence(directory, archive, fixture, distro):
         if "Failed to scan package" not in untrusted_stderr or "No vulnerabilities found" in untrusted_stdout or "Vulnerability scan found" in untrusted_stderr:
             raise ValueError("untrusted TLS did not fail closed")
         events = json.loads(read_text(directory, "fixture-events.json"), object_pairs_hook=unique_object)
-        if not isinstance(events, list) or not events or events[0].get("kind") != "tls-error":
+        if not isinstance(events, list) or not events or any(not isinstance(event, dict) for event in events):
             raise ValueError("missing TLS refusal evidence")
+        for event in events:
+            if event.get("kind") in {"transport-eof", "tls-close"}:
+                expected_error = ssl.SSL_ERROR_EOF if event["kind"] == "transport-eof" else ssl.SSL_ERROR_ZERO_RETURN
+                if (set(event) != {"kind", "ssl_error", "error"}
+                        or type(event["ssl_error"]) is not int or event["ssl_error"] != expected_error
+                        or not isinstance(event["error"], str) or not 0 < len(event["error"]) <= 512):
+                    raise ValueError("invalid TLS closure evidence")
+            elif event.get("kind") == "tls-error":
+                if (set(event) != {"kind", "ssl_error", "reason", "error"}
+                        or type(event["ssl_error"]) is not int or event["ssl_error"] != ssl.SSL_ERROR_SSL
+                        or event["reason"] != "TLSV1_ALERT_UNKNOWN_CA"
+                        or not isinstance(event["error"], str) or not 0 < len(event["error"]) <= 512):
+                    raise ValueError("invalid certificate refusal evidence")
+            elif event.get("kind") != "request":
+                raise ValueError("unknown TLS/request event")
         first_request = next(index for index, event in enumerate(events) if event.get("kind") == "request")
-        if any(event.get("kind") != "tls-error" for event in events[:first_request]) or any(event.get("kind") != "request" for event in events[first_request:]):
+        if not any(event["kind"] == "tls-error" for event in events[:first_request]):
+            raise ValueError("missing native unknown-CA refusal evidence")
+        if any(event["kind"] == "tls-error" for event in events[first_request:]):
             raise ValueError("unexpected TLS/request phase evidence")
-        requests = events[first_request:]
+        requests = [event for event in events if event["kind"] == "request"]
         count = len(identities)
         if len(requests) != 3 * count:
             raise ValueError("incomplete or repeated native source queries")
