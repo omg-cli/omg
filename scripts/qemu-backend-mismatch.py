@@ -132,7 +132,10 @@ def run(binary_name, distro):
     if distro not in DATABASE_PATHS:
         raise RuntimeError("unsupported guest distribution")
     source_id = Path("/etc/os-release").read_text().splitlines()
-    if not any(line == f"ID={distro}" or line == f'ID="{distro}"' for line in source_id):
+    expected_id = "debian" if distro == "debian-trixie" else distro
+    if (not any(line in (f"ID={expected_id}", f'ID="{expected_id}"') for line in source_id)
+            or (distro == "debian-trixie" and not any(
+                line in ("VERSION_ID=13", 'VERSION_ID="13"') for line in source_id))):
         raise RuntimeError("guest /etc/os-release does not match requested distribution")
     tracer = "/opt/omg-qemu-strace/bin/strace" if distro == "debian" else shutil.which("strace")
     if not tracer or not os.access(tracer, os.X_OK) or not shutil.which("mount") or not shutil.which("setpriv"):
