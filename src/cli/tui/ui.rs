@@ -12,7 +12,8 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, Paragraph, Row, Table, Tabs,
+        Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row,
+        Table, TableState, Tabs,
     },
 };
 use std::borrow::Cow;
@@ -874,7 +875,8 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
     .header(header)
     .block(styled_block(" Packages"));
 
-    f.render_widget(table, *list_area);
+    let mut state = TableState::default().with_selected(Some(app.selected_index));
+    f.render_stateful_widget(table, *list_area, &mut state);
 }
 
 fn draw_runtimes(f: &mut Frame, area: Rect, app: &App) {
@@ -1104,7 +1106,8 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
     .block(styled_block(" Activity Log"))
     .style(Style::default().bg(colors::BG_MEDIUM));
 
-    f.render_widget(activity_list, area);
+    let mut state = ListState::default().with_selected(Some(app.selected_index));
+    f.render_stateful_widget(activity_list, area, &mut state);
 }
 
 fn draw_team(f: &mut Frame, area: Rect, app: &App) {
@@ -1442,6 +1445,159 @@ mod tests {
         {
             let _ = raw;
             crate::package_managers::types::DebVersion::new(raw)
+        }
+    }
+
+    fn package_app() -> App {
+        let mut app = app_on(Tab::Packages);
+        app.search_results = (0..50)
+            .map(|index| crate::package_managers::SyncPackage {
+                name: format!("pkg-{index:02}"),
+                version: poisoned_version("1.0"),
+                description: "viewport fixture".to_string(),
+                repo: "core".to_string(),
+                download_size: 0,
+                installed: false,
+            })
+            .collect();
+        app
+    }
+
+    fn visible_name_cells<'a>(
+        terminal: &'a Terminal<TestBackend>,
+        name: &str,
+    ) -> &'a [ratatui::buffer::Cell] {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .windows(name.len())
+            .find(|cells| {
+                cells
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    == name
+            })
+            .expect("selected entry must be visible")
+    }
+
+    fn assert_visible_selection(terminal: &Terminal<TestBackend>, name: &str) {
+        for cell in visible_name_cells(terminal, name) {
+            assert_eq!(cell.bg, colors::BG_HIGHLIGHT);
+            assert!(cell.modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn package_selection_stays_visible_after_navigation_and_resize() {
+        use crate::cli::tui::app::ConfirmationAction;
+        use crossterm::event::KeyCode;
+        let mut app = package_app();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        for _ in 0..40 {
+            app.handle_key(KeyCode::Char('j'));
+        }
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw selection");
+        assert_visible_selection(&terminal, "pkg-40");
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(
+            app.pending_confirmation,
+            Some(ConfirmationAction::InstallPackage("pkg-40".to_string()))
+        );
+        app.handle_key(KeyCode::Esc);
+        terminal.backend_mut().resize(100, 18);
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw resized selection");
+        assert_visible_selection(&terminal, "pkg-40");
+        app.handle_key(KeyCode::Up);
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw previous selection");
+        assert_visible_selection(&terminal, "pkg-39");
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(
+            app.pending_confirmation,
+            Some(ConfirmationAction::InstallPackage("pkg-39".to_string()))
+        );
+    }
+
+    #[test]
+    fn package_viewport_keeps_bounded_first_and_last_selections_visible() {
+        use crossterm::event::KeyCode;
+        let mut app = package_app();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw first selection");
+        assert_visible_selection(&terminal, "pkg-00");
+        for _ in 0..100 {
+            app.handle_key(KeyCode::Down);
+        }
+        assert_eq!(app.selected_index, 49);
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw last selection");
+        assert_visible_selection(&terminal, "pkg-49");
+        for _ in 0..100 {
+            app.handle_key(KeyCode::Char('k'));
+        }
+        assert_eq!(app.selected_index, 0);
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw returned selection");
+        assert_visible_selection(&terminal, "pkg-00");
+    }
+
+    #[test]
+    fn activity_selection_stays_visible_after_navigation_and_resize() {
+        use crate::core::history::{PackageChange, Transaction};
+        use crossterm::event::KeyCode;
+        let mut app = app_on(Tab::Activity);
+        app.history = (0..25)
+            .map(|index| Transaction {
+                id: format!("tx-{index}"),
+                timestamp: jiff::Timestamp::from_second(0).expect("fixture timestamp"),
+                transaction_type: TransactionType::Install,
+                changes: vec![PackageChange {
+                    name: format!("history-{index:02}"),
+                    old_version: None,
+                    new_version: Some("1.0".to_string()),
+                    source: "core".to_string(),
+                }],
+                success: true,
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        for _ in 0..30 {
+            app.handle_key(KeyCode::Down);
+        }
+        assert_eq!(app.selected_index, 19);
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw activity selection");
+        for cell in visible_name_cells(&terminal, "history-19") {
+            assert_eq!(cell.bg, colors::BG_HIGHLIGHT);
+        }
+        terminal.backend_mut().resize(100, 18);
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw resized activity");
+        for cell in visible_name_cells(&terminal, "history-19") {
+            assert_eq!(cell.bg, colors::BG_HIGHLIGHT);
+        }
+        for _ in 0..30 {
+            app.handle_key(KeyCode::Up);
+        }
+        assert_eq!(app.selected_index, 0);
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw first activity");
+        for cell in visible_name_cells(&terminal, "history-00") {
+            assert_eq!(cell.bg, colors::BG_HIGHLIGHT);
         }
     }
 
