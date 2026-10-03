@@ -108,12 +108,16 @@ impl BunManager {
         println!("{} Extracting (pure Rust)...", style::informative("→"));
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_zip(&download_path, staging.path(), 1).await?;
-        complete_staged_install(&staging, &version_dir, &version)?;
+        self.publish_install(&staging, &version)?;
 
         print_installed("Bun", &version);
         self.use_version(&version)?;
 
         Ok(())
+    }
+
+    fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
+        complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
     /// Resolve a partial version request (`1`, `1.0`) to the newest matching
