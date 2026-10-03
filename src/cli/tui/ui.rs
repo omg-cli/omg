@@ -1445,6 +1445,87 @@ mod tests {
         }
     }
 
+    fn package_app() -> App {
+        let mut app = app_on(Tab::Packages);
+        app.search_results = (0..50)
+            .map(|index| crate::package_managers::SyncPackage {
+                name: format!("pkg-{index:02}"),
+                version: poisoned_version("1.0"),
+                description: "viewport fixture".to_string(),
+                repo: "core".to_string(),
+                download_size: 0,
+                installed: false,
+            })
+            .collect();
+        app
+    }
+
+    fn assert_visible_selection(terminal: &Terminal<TestBackend>, name: &str) {
+        let cells = terminal
+            .backend()
+            .buffer()
+            .content()
+            .windows(name.len())
+            .find(|cells| {
+                cells
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .eq(name.as_bytes().iter().map(|byte| {
+                        std::str::from_utf8(std::slice::from_ref(byte)).expect("ASCII fixture")
+                    }))
+            })
+            .expect("selected package must be visible");
+        for cell in cells {
+            assert_eq!(cell.bg, colors::BG_HIGHLIGHT);
+            assert!(cell.modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn package_selection_stays_visible_after_navigation_and_resize() {
+        use crate::cli::tui::app::ConfirmationAction;
+        use crossterm::event::KeyCode;
+        let mut app = package_app();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        for _ in 0..40 {
+            app.handle_key(KeyCode::Char('j'));
+        }
+        terminal.draw(|frame| draw(frame, &app)).expect("draw selection");
+        assert_visible_selection(&terminal, "pkg-40");
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.pending_confirmation, Some(ConfirmationAction::InstallPackage("pkg-40".to_string())));
+        app.handle_key(KeyCode::Esc);
+        terminal.backend_mut().resize(100, 18);
+        terminal.draw(|frame| draw(frame, &app)).expect("draw resized selection");
+        assert_visible_selection(&terminal, "pkg-40");
+        app.handle_key(KeyCode::Up);
+        terminal.draw(|frame| draw(frame, &app)).expect("draw previous selection");
+        assert_visible_selection(&terminal, "pkg-39");
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.pending_confirmation, Some(ConfirmationAction::InstallPackage("pkg-39".to_string())));
+    }
+
+    #[test]
+    fn package_viewport_keeps_bounded_first_and_last_selections_visible() {
+        use crossterm::event::KeyCode;
+        let mut app = package_app();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &app)).expect("draw first selection");
+        assert_visible_selection(&terminal, "pkg-00");
+        for _ in 0..100 {
+            app.handle_key(KeyCode::Down);
+        }
+        assert_eq!(app.selected_index, 49);
+        terminal.draw(|frame| draw(frame, &app)).expect("draw last selection");
+        assert_visible_selection(&terminal, "pkg-49");
+        for _ in 0..100 {
+            app.handle_key(KeyCode::Char('k'));
+        }
+        assert_eq!(app.selected_index, 0);
+        terminal.draw(|frame| draw(frame, &app)).expect("draw returned selection");
+        assert_visible_selection(&terminal, "pkg-00");
+    }
+
     #[test]
     fn packages_rows_render_sanitized_version_strings() {
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
