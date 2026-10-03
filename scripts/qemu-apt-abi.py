@@ -111,6 +111,11 @@ def probe(distro, arch, binaries, output):
         os_release_sha256=hashlib.sha256(release).hexdigest(), loader_sha256=loader_hash,
         probe_sha256=helper_hash, binaries=entries)
     (output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
+    # SCP creates root-owned controller copies. Publish only these completed,
+    # non-secret diagnostics so the ordinary host validator can read them.
+    for name in ('receipt.json', 'os-release', 'omg-loader.log', 'omgd-loader.log'):
+        (output / name).chmod(0o644)
+    output.chmod(0o755)
     return receipt
 
 

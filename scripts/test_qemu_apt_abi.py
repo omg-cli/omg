@@ -125,7 +125,7 @@ class AptAbiTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.probe.release_values('ID=debian\nID=ubuntu\nVERSION_ID=13\n')
 
-    def probe_fixture(self, *, library_hashes=('b' * 64, 'b' * 64), failed=None, oversized=False):
+    def probe_fixture(self, *, library_hashes=('b' * 64, 'b' * 64), failed=None, oversized=False, inspect_output=None):
         original_read = Path.read_bytes
         original_digest = self.probe.digest_file
         original_run = self.probe.subprocess.run
@@ -176,7 +176,48 @@ class AptAbiTests(unittest.TestCase):
                 except ValueError as failure:
                     receipt, error = None, str(failure)
             files = {path.name: path.read_bytes() for path in output.iterdir()}
+            if inspect_output is not None:
+                inspect_output(output)
             return receipt, error, files
+
+    @unittest.skipUnless(sys.platform == 'linux', 'evidence copy permissions require POSIX')
+    def test_complete_evidence_is_readable_after_controller_copy(self):
+        import os
+        import shutil
+        import stat
+
+        def inspect(output):
+            copied = output.parent / 'controller-copy'
+            shutil.copytree(output, copied)
+            self.assertEqual(stat.S_IMODE(copied.stat().st_mode), 0o755,
+                             'root-owned SCP copies must be traversable by the ordinary host validator')
+            for name in ('receipt.json', 'os-release', 'omg-loader.log', 'omgd-loader.log'):
+                self.assertEqual(stat.S_IMODE((copied / name).stat().st_mode), 0o644,
+                                 'public ABI diagnostics must be readable after UID ownership changes')
+        previous = os.umask(0o077)
+        try:
+            receipt, error, _ = self.probe_fixture(inspect_output=inspect)
+        finally:
+            os.umask(previous)
+        self.assertIsNone(error)
+        self.assertTrue(receipt['complete'])
+
+    @unittest.skipUnless(sys.platform == 'linux', 'evidence publication requires POSIX')
+    def test_incomplete_evidence_keeps_private_permissions(self):
+        import os
+        import stat
+
+        def inspect(output):
+            self.assertFalse((output / 'receipt.json').exists())
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+            self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in output.iterdir()))
+        previous = os.umask(0o077)
+        try:
+            receipt, error, _ = self.probe_fixture(failed='omgd', inspect_output=inspect)
+        finally:
+            os.umask(previous)
+        self.assertIsNone(receipt)
+        self.assertIsNotNone(error)
 
     @unittest.skipUnless(sys.platform == 'linux', 'guest probe requires Linux resource limits')
     def test_probe_binds_both_binaries_and_preserves_raw_resolution(self):
