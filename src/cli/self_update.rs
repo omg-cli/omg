@@ -586,7 +586,7 @@ fn extract_update_binary(
     let daemon_flat = std::path::PathBuf::from("omgd");
 
     let cursor = std::io::Cursor::new(bytes);
-    let decoder = flate2::read::GzDecoder::new(cursor);
+    let decoder = flate2::read::MultiGzDecoder::new(cursor);
     let budgeted =
         crate::runtimes::common::BudgetedReader::new(decoder, MAX_UPDATE_DECOMPRESSED_BYTES);
     let mut archive = tar::Archive::new(budgeted);
@@ -657,6 +657,8 @@ fn extract_update_binary(
             found_daemon = Some(dest_path);
         }
     }
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
+        .context("Failed to finalize update gzip archive")?;
     if let (Some(cli), Some(daemon)) = (&found, &found_daemon) {
         anyhow::ensure!(
             cli.parent() == daemon.parent(),

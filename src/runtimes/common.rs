@@ -996,7 +996,7 @@ pub(crate) fn extract_component_tar_gz(
     let file = File::open(archive_path)
         .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
 
-    let decoder = flate2::read::GzDecoder::new(BufReader::new(file));
+    let decoder = flate2::read::MultiGzDecoder::new(BufReader::new(file));
     let bounded = BudgetedReader::new(decoder, budget);
     let mut archive = tar::Archive::new(bounded);
 
@@ -1004,6 +1004,8 @@ pub(crate) fn extract_component_tar_gz(
 
     fs::create_dir_all(dest_dir)?;
     extract_tar_entries(&mut archive, dest_dir, select, &task)?;
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
+        .context("Failed to finalize gzip archive")?;
 
     task.finish(Outcome::Done);
     Ok(())
