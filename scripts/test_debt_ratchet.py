@@ -100,6 +100,58 @@ class DebtRatchetTests(unittest.TestCase):
         self.seed()
         self.assertIn("1 = src/a.rs", self.baseline_text("dead-code-allows"))
 
+    def test_formatted_and_conditional_lint_lists_cannot_hide_new_debt(self):
+        debt = "dead" + "_code"
+        unused = "unused" + "_variables"
+        samples = (
+            f"#[allow(\n    {debt}\n)]",
+            f"#![expect(\n    {unused},\n)]",
+            f"#[allow(clippy::unused_async, {debt})]",
+            f"#[expect(clippy::too_many_lines, {unused}, {debt})]",
+            f"#[cfg_attr(feature = \"arch\", allow(\n {unused},\n))]",
+            f"#[cfg_attr(all(), cfg_attr(any(), expect(\n {debt}\n)))]",
+            f"#[r#allow(r#{debt})]",
+        )
+        self.seed()
+        for attribute in samples:
+            with self.subTest(attribute=attribute):
+                self.write("src/candidate.rs", attribute + "\nfn main() {}\n")
+                result = run(self.root, self.baselines)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("src/candidate.rs = 1", result.stderr)
+                refused = run(self.root, self.baselines, "--refresh")
+                self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                self.assertEqual(self.baseline_text("dead-code-allows"), "")
+
+    def test_multiple_debt_lints_in_one_attribute_count_once(self):
+        debt = "dead" + "_code"
+        unused = "unused" + "_variables"
+        self.write("src/a.rs", f"#[allow({debt}, {unused}, unused_mut)]\nfn main() {{}}\n")
+        self.seed()
+        self.assertEqual(self.baseline_text("dead-code-allows"), "1 = src/a.rs\n")
+        self.write("src/a.rs", f"#[allow(\n {unused},\n {debt},\n unused_mut,\n)]\nfn main() {{}}\n")
+        self.assertEqual(run(self.root, self.baselines).returncode, 0)
+        self.seed()
+        self.assertEqual(self.baseline_text("dead-code-allows"), "1 = src/a.rs\n")
+
+    def test_literal_reason_and_comment_text_are_not_lint_attributes(self):
+        annotation = "#[" + ALLOW + "]"
+        samples = (
+            f"// {annotation}\nfn main() {{}}",
+            f"/* outside /* {annotation} */ comment */\nfn main() {{}}",
+            f'fn main() {{ println!("{annotation}"); }}',
+            f'fn main() {{ println!(r###"{annotation} \\\"quoted\\\""###); }}',
+            f'#[allow(clippy::too_many_lines, reason = "{annotation}")]\nfn main() {{}}',
+            f'#[allow(clippy::too_many_lines, reason = r#"{annotation}"#)]\nfn main() {{}}',
+            '#[allow(clippy::unused_async)]\nfn main() {}',
+        )
+        self.seed()
+        for source in samples:
+            with self.subTest(source=source):
+                self.write("src/candidate.rs", source + "\n")
+                result = run(self.root, self.baselines)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
