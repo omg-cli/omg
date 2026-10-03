@@ -114,6 +114,21 @@ class PositiveEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.admit()
 
+    def test_clean_tls_close_cannot_replace_refusal_or_native_queries(self):
+        close = {"kind": "tls-close", "ssl_error": ssl.SSL_ERROR_ZERO_RETURN, "error": "TLS/SSL connection has been closed (EOF)"}
+        original = copy.deepcopy(self.events)
+        self.events = [close] + original + [close]
+        self.write()
+        self.assertEqual(self.admit(), self.receipt)
+        for events in ([close] + original[1:], original[:-1] + [close],
+                       original + [original[-1]], original + [dict(close, ssl_error=ssl.SSL_ERROR_EOF)],
+                       original + [dict(close, ssl_error=True)], original + [dict(close, error="")],
+                       original + [dict(close, reason=None)]):
+            self.events = events
+            self.write()
+            with self.subTest(events=events), self.assertRaises(ValueError):
+                self.admit()
+
     def test_false_complete_wrong_archive_fixture_binary_and_native_state_are_refused(self):
         original = copy.deepcopy(self.receipt)
         changes = {"accepted": False, "native_archive_sha256": "b" * 64, "fixture_sha256": "b" * 64,
@@ -216,15 +231,28 @@ class NativeTLSClassificationTests(unittest.TestCase):
                 with socket.create_connection(("127.0.0.1", port), timeout=5):
                     pass
                 wait_for(4)
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as stream:
+                    client_context = ssl.create_default_context(cafile=str(certificate))
+                    client_context.maximum_version = ssl.TLSVersion.TLSv1_2
+                    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+                    client = client_context.wrap_bio(incoming, outgoing, server_hostname="localhost")
+                    with self.assertRaises(ssl.SSLWantReadError):
+                        client.do_handshake()
+                    stream.sendall(outgoing.read())
+                    self.assertTrue(stream.recv(65536))
+                    stream.sendall(bytes.fromhex("15030300020100"))
+                wait_for(5)
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=8)
             self.assertFalse(thread.is_alive())
-            self.assertEqual([item["kind"] for item in events], ["transport-eof", "tls-error", "request", "transport-eof"])
+            self.assertEqual(events[4]["ssl_error"], ssl.SSL_ERROR_ZERO_RETURN)
+            self.assertEqual([item["kind"] for item in events], ["transport-eof", "tls-error", "request", "transport-eof", "tls-close"])
             self.assertEqual(events[0]["ssl_error"], ssl.SSL_ERROR_EOF)
             self.assertEqual(events[1]["reason"], "TLSV1_ALERT_UNKNOWN_CA")
             self.assertEqual(events[3]["ssl_error"], ssl.SSL_ERROR_EOF)
+            self.assertEqual(events[4]["ssl_error"], ssl.SSL_ERROR_ZERO_RETURN)
 
 
 if __name__ == "__main__":
