@@ -173,7 +173,7 @@ fn test_missing_dependency_fails_gracefully() -> Result<()> {
 
 #[test]
 #[serial]
-fn test_stale_database_lock_is_reclaimed() -> Result<()> {
+fn test_stale_database_lock_requires_explicit_recovery() -> Result<()> {
     let harness = AlpmHarness::new()?;
     let lock_file = harness.db_path().join("db.lck");
     std::fs::File::create(&lock_file)?;
@@ -190,17 +190,13 @@ fn test_stale_database_lock_is_reclaimed() -> Result<()> {
     let result =
         alpm_ops::execute_transaction(vec!["any-pkg".to_string()], TransactionKind::Install, None);
 
-    assert!(
-        !lock_file.exists(),
-        "an unheld lock file must not survive transaction init"
+    let error = result.expect_err("an existing lock must refuse automatic recovery");
+    assert_eq!(
+        error.downcast_ref::<alpm::Error>(),
+        Some(&alpm::Error::HandleLock)
     );
-    if let Err(error) = result {
-        let message = error.to_string();
-        assert!(
-            !message.contains("Database is locked"),
-            "stale lock must not surface as a live lock, got: {message}"
-        );
-    }
+    assert!(error.to_string().contains("refusing automatic removal"));
+    assert_eq!(std::fs::read(lock_file)?, b"");
 
     Ok(())
 }

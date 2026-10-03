@@ -469,7 +469,7 @@ fn commit_staged_files(
             .context("Pacman database path must be valid UTF-8")?,
     )
     .context("Failed to initialize package database writer")?;
-    crate::package_managers::alpm_ops::reclaim_stale_database_lock(database_root)?;
+    crate::package_managers::alpm_ops::check_database_lock(database_root)?;
     alpm.trans_init(alpm::TransFlag::empty()).with_context(|| {
         format!(
             "Failed to acquire package database lock in {}",
@@ -1010,7 +1010,30 @@ mod tests {
     }
 
     #[test]
-    fn database_publication_reclaims_a_stale_lock_file() {
+    fn database_publication_preserves_unheld_database_lock() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut directory = tempfile::tempdir()?;
+        let live = directory.path().join("core.db");
+        let staged = directory.path().join("core.staged");
+        let lock = directory.path().join("db.lck");
+        std::fs::write(&live, b"old")?;
+        std::fs::write(&staged, b"new")?;
+        std::fs::write(&lock, b"unheld-lock-evidence")?;
+        let inode = std::fs::metadata(&lock)?.ino();
+
+        let error = commit_staged_databases(&[(staged.clone(), live.clone())], 0, &mut directory)
+            .expect_err("publication must refuse an existing unheld database lock");
+        assert!(error.to_string().contains("lock"));
+        assert_eq!(std::fs::read(&live)?, b"old");
+        assert_eq!(std::fs::read(&staged)?, b"new");
+        assert_eq!(std::fs::read(&lock)?, b"unheld-lock-evidence");
+        assert_eq!(std::fs::metadata(&lock)?.ino(), inode);
+        Ok(())
+    }
+
+    #[test]
+    fn database_publication_refuses_a_stale_lock_file() {
         let mut directory = tempfile::tempdir().expect("database root");
         let live = directory.path().join("core.db");
         let staged = directory.path().join("core.staged");
@@ -1019,13 +1042,15 @@ mod tests {
         std::fs::write(&staged, b"new").unwrap();
         std::fs::write(&lock, b"").unwrap();
 
-        commit_staged_databases(&[(staged, live.clone())], 0, &mut directory)
-            .expect("a lock file with no live holder must not block publication");
-        assert_eq!(std::fs::read(live).unwrap(), b"new");
-        assert!(
-            !lock.exists(),
-            "publication must consume the reclaimed lock"
+        let error = commit_staged_databases(&[(staged.clone(), live.clone())], 0, &mut directory)
+            .expect_err("an unheld lock must require deliberate recovery");
+        assert_eq!(
+            error.downcast_ref::<alpm::Error>(),
+            Some(&alpm::Error::HandleLock)
         );
+        assert_eq!(std::fs::read(live).unwrap(), b"old");
+        assert_eq!(std::fs::read(staged).unwrap(), b"new");
+        assert_eq!(std::fs::read(lock).unwrap(), b"");
     }
 
     #[test]
