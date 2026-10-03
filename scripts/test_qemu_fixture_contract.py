@@ -1,5 +1,7 @@
 """Verify real shell command lookup for the missing-Cargo guest fixture."""
 import os
+import json
+import shlex
 from pathlib import Path
 import shutil
 import subprocess
@@ -8,6 +10,69 @@ import unittest
 
 
 class CargoFixtureTests(unittest.TestCase):
+    def test_preparation_health_gates_shutdown_and_snapshot_before_resume(self):
+        source = (Path(__file__).resolve().parent / 'qemu-transactions.sh').read_text()
+        begin = source.index('verify_preparation_health() {')
+        end = source.index('\n: > "$output/boot-ids.txt"', begin)
+        preparation = source[begin:end]
+        for failed_operation, mode in ((None, 'clean'), ('remove', 'crash'), ('install', 'crash'),
+                                       ('remove', 'mismatch'), ('install', 'incomplete'),
+                                       ('remove', 'missing'), ('install', 'transport')):
+            with self.subTest(operation=failed_operation, mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'guest').mkdir()
+                (root / 'transactions').mkdir()
+                (root / 'disks').mkdir()
+                (root / 'guest/serial.log').write_text('Linux version 6.12\n')
+                shutil.copyfile(Path(__file__).with_name('check-qemu-health.py'), root / 'check-qemu-health.py')
+                for operation, digit in (('remove', '5'), ('install', '6')):
+                    boot = '00000000-1111-2222-3333-' + digit * 12
+                    receipt = dict(schema_version=1, complete=True, boot_id=boot, kernel_bytes=100,
+                                   fatal_signatures=[], product_crashes=[])
+                    if operation == failed_operation:
+                        if mode == 'crash': receipt['product_crashes'] = [{'process': 'omg', 'signal': 6}]
+                        if mode == 'mismatch': receipt['boot_id'] = '00000000-1111-2222-3333-777777777777'
+                        if mode == 'incomplete': receipt['complete'] = False
+                    (root / f'{operation}.json').write_text('' if operation == failed_operation and mode == 'missing'
+                                                           else json.dumps(receipt))
+                script = '''set -euo pipefail
+output="$PWD/transactions"
+disks="$PWD/disks"
+boot_args=(bios)
+distro=arch
+active=remove
+remote_argv() {
+  if [[ "$1" == cat ]]; then
+    if [[ "$active" == remove ]]; then printf '00000000-1111-2222-3333-555555555555\\n'
+    else printf '00000000-1111-2222-3333-666666666666\\n'; fi
+  elif [[ "$1" == pacman ]]; then printf 'tree 1.0\\n'
+  else
+    if [[ "$active" == "$failed_operation" && "$mode" == transport ]]; then return 255; fi
+    cat "$active.json"
+  fi
+}
+mask_units() { :; }
+native_change() { :; }
+capture_repository_state() { :; }
+stop_guest() { printf 'stop:%s\\n' "$active" >> events; }
+freeze_base() { printf 'freeze:%s\\n' "$2" >> events; }
+qemu-img() { :; }
+start_clone() { active=install; printf 'Linux version 6.12\\n' > "$3"; }
+''' + f'failed_operation={shlex.quote(failed_operation or "none")}\nmode={shlex.quote(mode)}\n'
+                script += preparation.replace('/work/', str(root) + '/')
+                script += '\nprintf "healthy-resume\\n" >> events\n'
+                result = subprocess.run(['bash', '-c', script], cwd=root,
+                                        capture_output=True, text=True, timeout=10)
+                events = (root / 'events').read_text().splitlines() if (root / 'events').exists() else []
+                if failed_operation is None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(events, ['stop:remove', 'freeze:remove', 'stop:install',
+                                              'freeze:install', 'healthy-resume'])
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(events, [] if failed_operation == 'remove' else
+                                     ['stop:remove', 'freeze:remove'])
+
     def test_native_index_oracle_is_staged_before_controller_upload(self):
         scripts = Path(__file__).resolve().parent
         source = (scripts / 'benchmark-qemu.sh').read_text()

@@ -25,7 +25,7 @@ HOST_FILES = {
     "controller-setup.log", "controller-security.log", "controller-pull.log", "image-setup.log", "boot.log", "boot.diagnostics.log", "guest-check.log",
     "evidence-copy.log", "benchmark-validation.log", "transactions.log",
     "transaction-validation.log", "inventory.log",
-    "guest-health.json", "controller-health.json", "controller-final-state.json", "health-validation.log",
+    "guest-health.json", "guest-boot-id.txt", "controller-health.json", "controller-final-state.json", "health-validation.log",
     "inventory-admission.json",
     "mutation-refusal.json", "mutation-refusal.log", "mutation-refusal-cases.tsv",
     "storage-faults.json", "storage-faults.log",
@@ -188,6 +188,8 @@ def allowed_file(parts):
                         "resume-boot.qemu-startup.log",
                         "resume-boot.diagnostics.log", "prepare-install-boot.diagnostics.log",
                         "prepare-install-boot.qemu-startup.log"} or re.fullmatch(
+            r"prepare-(?:install|remove)-(?:boot-id\.txt|health\.(?:json|log))"
+            r"|"
             r"(?:install|remove)-(?:base-check\.log|base-unchanged\.log|firmware\.sha256|"
             r"repository-state\.(?:log|sha256)|before\.tsv|manual-before\.names)"
             r"|(?:prepare|stop-prepared)-(?:install|remove)(?:-serial|-boot)?\.log", name

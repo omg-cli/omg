@@ -107,8 +107,8 @@ def verify_guest(guest, serial, boot_id=None):
     return 0
 
 
-def verify(guest, serial, controller):
-    verify_guest(guest, serial)
+def verify(guest, serial, controller, boot_id=None):
+    verify_guest(guest, serial, boot_id)
     state = json.loads(bounded_file(controller))
     if (not isinstance(state, dict) or state.get("Running") is not True
             or state.get("OOMKilled") is not False
@@ -117,15 +117,32 @@ def verify(guest, serial, controller):
     return 0
 
 
+def verify_preparations(root):
+    boots = set()
+    for operation in ("remove", "install"):
+        prefix = root / "transactions" / f"prepare-{operation}"
+        boot_id = bounded_file(Path(str(prefix) + "-boot-id.txt")).strip()
+        if not BOOT_ID.fullmatch(boot_id) or boot_id in boots:
+            raise ValueError("invalid or repeated preparation boot identity")
+        boots.add(boot_id)
+        serial = (root / "guest" / "serial.log" if operation == "remove"
+                  else Path(str(prefix) + "-serial.log"))
+        verify_guest(Path(str(prefix) + "-health.json"), serial, boot_id)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("collect")
+    preparations = commands.add_parser("verify-preparations")
+    preparations.add_argument("--root", type=Path, required=True)
     trial = commands.add_parser("verify-trial")
     trial.add_argument("--guest", type=Path, required=True)
     trial.add_argument("--serial", type=Path, required=True)
     trial.add_argument("--boot-id", required=True)
     admission = commands.add_parser("verify")
+    admission.add_argument("--boot-id", required=True)
     for name in ("guest", "serial", "controller"):
         admission.add_argument("--" + name, type=Path, required=True)
     args = parser.parse_args()
@@ -135,7 +152,9 @@ def main():
             return 0
         if args.command == "verify-trial":
             return verify_guest(args.guest, args.serial, args.boot_id)
-        return verify(args.guest, args.serial, args.controller)
+        if args.command == "verify-preparations":
+            return verify_preparations(args.root)
+        return verify(args.guest, args.serial, args.controller, args.boot_id)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"QEMU health evidence failed admission: {error}", file=sys.stderr)
         return 2
