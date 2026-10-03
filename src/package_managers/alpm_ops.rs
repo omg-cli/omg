@@ -1205,13 +1205,12 @@ fn transaction_flags(kind: TransactionKind) -> alpm::TransFlag {
     flags
 }
 
-/// Remove `db.lck` when the file exists but no process has it open.
+/// Diagnose an unheld database lock without changing native lock ownership.
 ///
-/// libalpm treats the file's presence as the lock. A leftover from a killed
-/// transaction blocks every later `trans_init` even though nobody holds it.
-/// A live holder is left in place so the subsequent `trans_init` still fails
-/// with `HandleLock`.
-pub(crate) fn reclaim_stale_database_lock(database_root: &std::path::Path) -> Result<()> {
+/// A process-holder scan is only a snapshot. Unlinking the pathname afterward
+/// could remove a lock newly acquired by another package manager. Existing live
+/// locks remain subject to libalpm's atomic transaction-init refusal.
+pub(crate) fn check_database_lock(database_root: &std::path::Path) -> Result<()> {
     let lock = database_root.join("db.lck");
     match std::fs::symlink_metadata(&lock) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1225,22 +1224,14 @@ pub(crate) fn reclaim_stale_database_lock(database_root: &std::path::Path) -> Re
     if database_lock_has_open_holder(&lock)? {
         return Ok(());
     }
-    match std::fs::remove_file(&lock) {
-        Ok(()) => {
-            tracing::debug!(
-                path = %lock.display(),
-                "removed stale package database lock"
-            );
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "Failed to remove stale package database lock {}",
-                lock.display()
-            )
-        }),
-    }
+    Err(alpm::Error::HandleLock).with_context(|| {
+        format!(
+            "Package database lock {} exists without an observed open holder; refusing automatic removal. \
+             Stop all package managers and verify their transactions have ended before explicitly recovering the lock. \
+             Run `omg doctor` for lock diagnostics.",
+            lock.display()
+        )
+    })
 }
 
 fn database_lock_has_open_holder(lock: &std::path::Path) -> Result<bool> {
@@ -1298,7 +1289,7 @@ fn prepare_alpm_transaction<'a>(
     pacman_config: &crate::core::pacman_conf::PacmanConfig,
 ) -> Result<AlpmTransaction<'a>> {
     validate_transaction_targets(kind, &packages)?;
-    reclaim_stale_database_lock(std::path::Path::new(alpm.dbpath().trim_end_matches('/')))?;
+    check_database_lock(std::path::Path::new(alpm.dbpath().trim_end_matches('/')))?;
     alpm.trans_init(transaction_flags(kind))
         .map_err(|e| match e {
             alpm::Error::HandleLock => {
@@ -1754,11 +1745,11 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        AlpmQuestionRefusals, ForwardedAlpmLogLevel, TransactionKind, classify_alpm_log_level,
-        clean_cache, clean_cache_preview, configure_signature_policy, download_lane_message,
-        ensure_mirror_servers, ensure_removals_not_held, format_trans_prepare_error,
-        is_keyring_related_error, local_package_siglevel, package_base_name,
-        provider_selection_message, question_refusal_error, reclaim_stale_database_lock,
+        AlpmQuestionRefusals, ForwardedAlpmLogLevel, TransactionKind, check_database_lock,
+        classify_alpm_log_level, clean_cache, clean_cache_preview, configure_signature_policy,
+        download_lane_message, ensure_mirror_servers, ensure_removals_not_held,
+        format_trans_prepare_error, is_keyring_related_error, local_package_siglevel,
+        package_base_name, provider_selection_message, question_refusal_error,
         register_configured_syncdbs, repository_siglevel, setup_alpm_callbacks, signature_policy,
         transaction_flags, transaction_overall_percent, validate_aur_artifact_handoffs,
         validate_transaction_targets,
@@ -1829,9 +1820,8 @@ mod tests {
             TransactionKind::Install,
             &crate::core::pacman_conf::PacmanConfig::default(),
         );
-        let error = match result {
-            Ok(_) => anyhow::bail!("transaction must refuse an existing unheld database lock"),
-            Err(error) => error,
+        let Err(error) = result else {
+            anyhow::bail!("transaction must refuse an existing unheld database lock")
         };
         assert!(error.to_string().contains("lock"));
         assert_eq!(std::fs::read(&lock)?, b"unheld-lock-evidence");
@@ -1840,27 +1830,45 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_stale_database_lock_removes_an_unheld_file() {
+    fn database_lock_check_preserves_an_unheld_file() {
         let directory = tempfile::tempdir().expect("database root");
         let lock = directory.path().join("db.lck");
         std::fs::write(&lock, b"").expect("stale lock");
-        reclaim_stale_database_lock(directory.path()).expect("unheld lock must be removable");
-        assert!(!lock.exists(), "stale lock must be gone");
+        let error = check_database_lock(directory.path())
+            .expect_err("unheld lock requires deliberate recovery");
+        assert_eq!(
+            error.downcast_ref::<alpm::Error>(),
+            Some(&alpm::Error::HandleLock)
+        );
+        assert!(error.to_string().contains("refusing automatic removal"));
+        assert_eq!(std::fs::read(&lock).expect("preserved lock"), b"");
     }
 
     #[test]
-    fn reclaim_stale_database_lock_keeps_a_live_lease() {
+    fn database_lock_check_keeps_a_live_lease() {
         let directory = tempfile::tempdir().expect("database root");
         let lease = alpm::Alpm::new("/", directory.path().to_str().expect("utf-8 path"))
             .expect("ALPM handle");
         lease
             .trans_init(alpm::TransFlag::empty())
             .expect("live lease");
-        reclaim_stale_database_lock(directory.path()).expect("live lock must be left in place");
+        check_database_lock(directory.path()).expect("live lock must be left in place");
         assert!(
             directory.path().join("db.lck").exists(),
-            "held lock must survive reclaim"
+            "held lock must survive inspection"
         );
+        let contender = alpm::Alpm::new("/", directory.path().to_str().expect("utf-8 path"))
+            .expect("second ALPM handle");
+        assert_eq!(
+            contender.trans_init(alpm::TransFlag::empty()),
+            Err(alpm::Error::HandleLock),
+            "native lease must exclude another transaction"
+        );
+        drop(lease);
+        check_database_lock(directory.path()).expect("released lock permits another transaction");
+        contender
+            .trans_init(alpm::TransFlag::empty())
+            .expect("second transaction acquires after legitimate release");
     }
 
     #[test]
