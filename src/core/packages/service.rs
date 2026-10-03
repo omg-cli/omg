@@ -334,11 +334,10 @@ impl PackageService {
 
     /// List available updates
     pub async fn list_updates(&self) -> Result<Vec<UpdateInfo>> {
-        #[allow(
-            unused_mut,
-            reason = "mutated only when the Arch AUR branch is compiled"
-        )]
-        let mut updates = self.backend.list_updates().await?;
+        let updates = self.backend.list_updates().await?;
+
+        #[cfg(feature = "arch")]
+        let mut updates = updates;
 
         #[cfg(feature = "arch")]
         if let Some(aur) = &self.aur_client {

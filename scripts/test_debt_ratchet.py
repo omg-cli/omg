@@ -141,6 +141,10 @@ class DebtRatchetTests(unittest.TestCase):
             f"/* outside /* {annotation} */ comment */\nfn main() {{}}",
             f'fn main() {{ println!("{annotation}"); }}',
             f'fn main() {{ println!(r###"{annotation} \\\"quoted\\\""###); }}',
+            f'fn main() {{ let bytes = br##"{annotation}"##; }}',
+            f'fn main() {{ let c_string = cr##"{annotation}"##; }}',
+            f"fn main() {{ let quote = '\"'; /* {annotation} */ }}",
+            f"fn borrow<'a>(value: &'a str) {{ /* {annotation} */ }}",
             f'#[allow(clippy::too_many_lines, reason = "{annotation}")]\nfn main() {{}}',
             f'#[allow(clippy::too_many_lines, reason = r#"{annotation}"#)]\nfn main() {{}}',
             '#[allow(clippy::unused_async)]\nfn main() {}',
@@ -151,6 +155,12 @@ class DebtRatchetTests(unittest.TestCase):
                 self.write("src/candidate.rs", source + "\n")
                 result = run(self.root, self.baselines)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_each_conditional_lint_list_counts_independently(self):
+        debt = "dead" + "_code"
+        self.write("src/a.rs", f'#[cfg_attr(any(), allow({debt}), expect(unused_mut))]\nfn main() {{}}\n')
+        self.seed()
+        self.assertEqual(self.baseline_text("dead-code-allows"), "2 = src/a.rs\n")
 
 
 if __name__ == "__main__":
