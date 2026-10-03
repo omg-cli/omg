@@ -117,6 +117,7 @@ impl BunManager {
     }
 
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
+        super::common::require_regular_file(&staging.path().join("bun"))?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
