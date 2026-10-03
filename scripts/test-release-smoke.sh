@@ -465,6 +465,17 @@ case "$1" in
     printf '%s\n' "$work" > "$FAKE_QEMU_STATE"
     printf 'fixture-controller\n' ;;
   exec)
+      if [[ "${!#}" == /proc/sys/kernel/random/boot_id ]]; then
+        [[ "${*: -2}" == 'cat /proc/sys/kernel/random/boot_id' ]] || exit 99
+        case ${FAKE_QEMU_BOOT_QUERY:-valid} in
+          valid) printf '00000000-1111-2222-3333-444444444444\n' ;;
+          missing) ;;
+          mismatched) printf '99999999-1111-2222-3333-444444444444\n' ;;
+          transport) printf 'fixture boot query transport failure\n' >&2; exit 255 ;;
+          *) exit 99 ;;
+        esac
+        exit 0
+      fi
       if [[ "${!#}" == 'sudo -n unshare --mount --propagation private python3 - --binary '* ]]; then
         cat >/dev/null
         [[ ${FAKE_QEMU_BACKEND_RECEIPT:-valid} != missing ]] || exit 0
@@ -645,13 +656,14 @@ done
 [[ -n "$child_result" ]] || fail 'interrupted QEMU child did not record its exit'
 
 export FAKE_QEMU_INFO_EXIT=0 FAKE_QEMU_STATE="$scratch/qemu-controller"
-for scenario in pass pull-failure product-failure product-exit-three timeout signaled cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-doctor invalid-doctor missing-aur invalid-aur wrong-aur-events missing-arch-advisory invalid-arch-advisory kernel-crash controller-oom missing-health; do
+for scenario in pass pull-failure product-failure product-exit-three timeout signaled cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-doctor invalid-doctor missing-aur invalid-aur wrong-aur-events missing-arch-advisory invalid-arch-advisory kernel-crash controller-oom missing-health missing-boot mismatched-boot boot-transport; do
   export FAKE_QEMU_PULL_EXIT=0
   export FAKE_QEMU_DAEMON_RECEIPT=valid
   export FAKE_QEMU_DOCTOR_RECEIPT=valid
   export FAKE_QEMU_AUR_RECEIPT=valid FAKE_QEMU_ARCH_ADVISORY_RECEIPT=valid
   export FAKE_QEMU_GUEST_EXIT=0 FAKE_QEMU_CLEANUP_FAIL=0 FAKE_QEMU_MISSING_RECEIPT=0
   export FAKE_QEMU_SERIAL='Linux version 6.12 fixture' FAKE_QEMU_OOM=false FAKE_QEMU_HEALTH_MISSING=0
+  export FAKE_QEMU_BOOT_QUERY=valid
   unset FAKE_QEMU_TRANSPORT_EXIT
   expected_rc=0
   expected_result=PASS
@@ -669,6 +681,9 @@ for scenario in pass pull-failure product-failure product-exit-three timeout sig
     kernel-crash) export FAKE_QEMU_SERIAL='Kernel panic - not syncing: fixture'; expected_rc=120; expected_result=HARNESS_ERROR ;;
     controller-oom) export FAKE_QEMU_OOM=true; expected_rc=120; expected_result=HARNESS_ERROR ;;
     missing-health) export FAKE_QEMU_HEALTH_MISSING=1; expected_rc=120; expected_result=HARNESS_ERROR ;;
+    missing-boot) export FAKE_QEMU_BOOT_QUERY=missing; expected_rc=120; expected_result=HARNESS_ERROR ;;
+    mismatched-boot) export FAKE_QEMU_BOOT_QUERY=mismatched; expected_rc=120; expected_result=HARNESS_ERROR ;;
+    boot-transport) export FAKE_QEMU_BOOT_QUERY=transport; expected_rc=120; expected_result=HARNESS_ERROR ;;
     product-failure) export FAKE_QEMU_GUEST_EXIT=1; expected_rc=1; expected_result=PRODUCT_FAIL ;;
     product-exit-three) export FAKE_QEMU_GUEST_EXIT=3; expected_rc=3; expected_result=PRODUCT_FAIL ;;
     timeout) export FAKE_QEMU_GUEST_EXIT=124; expected_rc=124; expected_result=HARNESS_ERROR ;;
@@ -682,6 +697,15 @@ for scenario in pass pull-failure product-failure product-exit-three timeout sig
   qemu_result=$(results_file "$evidence")
   jq -e --arg result "$expected_result" --argjson rc "$expected_rc" 'length == 1 and .[0].result == $result and .[0].exit_code == $rc' "$qemu_result" >/dev/null || fail "QEMU $scenario verdict mismatch"
   work=${qemu_result%/results.json}
+  case "$scenario" in
+    pass)
+      grep -qx '00000000-1111-2222-3333-444444444444' "$work/guest-boot-id.txt" || fail 'QEMU positive control omitted final boot identity'
+      jq -e --rawfile boot "$work/guest-boot-id.txt" '.boot_id == ($boot | rtrimstr("\n"))' "$work/guest-health.json" >/dev/null || fail 'QEMU positive control health belongs to another boot' ;;
+    missing-boot|mismatched-boot)
+      grep -q 'health evidence belongs to a different trial boot' "$work/health-validation.log" || fail 'QEMU boot mismatch diagnostic was lost' ;;
+    boot-transport)
+      grep -q 'fixture boot query transport failure' "$work/health-validation.log" || fail 'QEMU boot query transport failure was lost' ;;
+  esac
   for file in client-key guest-host-key user-data seed.img overlay.qcow2 base.qcow2 vars.fd qemu.pid; do
     if [[ "$scenario" == cleanup-failure ]]; then
       [[ -e "$work/guest/$file" ]] || fail "QEMU deleted $file while controller absence was unverified"
@@ -695,6 +719,7 @@ for scenario in pass pull-failure product-failure product-exit-three timeout sig
 done
 export FAKE_QEMU_GUEST_EXIT=0 FAKE_QEMU_CLEANUP_FAIL=0 FAKE_QEMU_MISSING_RECEIPT=0
 export FAKE_QEMU_SERIAL='Linux version 6.12 fixture' FAKE_QEMU_OOM=false FAKE_QEMU_HEALTH_MISSING=0
+export FAKE_QEMU_BOOT_QUERY=valid
 unset FAKE_QEMU_TRANSPORT_EXIT
 export FAKE_QEMU_BENCHMARK=1
 for shape in missing partial; do

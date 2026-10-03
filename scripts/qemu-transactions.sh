@@ -167,8 +167,20 @@ mask_units() {
     done
   ' bash "$@"
 }
+verify_preparation_health() {
+  local operation=$1 serial=$2 boot_id
+  boot_id=$(<"$output/prepare-$operation-boot-id.txt")
+  remote_argv sudo -n python3 - collect < /work/check-qemu-health.py \
+    > "$output/prepare-$operation-health.json" 2> "$output/prepare-$operation-health.log"
+  python3 /work/check-qemu-health.py verify-trial \
+    --guest "$output/prepare-$operation-health.json" --serial "$serial" \
+    --boot-id "$boot_id" >> "$output/prepare-$operation-health.log" 2>&1
+}
 # Both tools receive the same base for a given operation. Cache state is inherited,
 # not described as cold, and no guest boot or SSH time enters Hyperfine.
+preparation_step=remove-boot-identity
+remote_argv cat /proc/sys/kernel/random/boot_id > "$output/prepare-remove-boot-id.txt"
+preparation_step=automatic-updates
 case "$distro" in
   debian|debian-trixie|ubuntu)
     mask_units apt-daily.service apt-daily-upgrade.service \
@@ -192,6 +204,8 @@ esac
 printf '%s\n' "$version" > "$output/expected-version.txt"
 preparation_step=remove-repository-state
 capture_repository_state remove
+preparation_step=prepare-remove-health
+verify_preparation_health remove /work/guest/serial.log
 preparation_step=stop-prepared-remove
 stop_guest > "$output/stop-prepared-remove.log" 2>&1
 preparation_step=freeze-remove-base
@@ -201,10 +215,14 @@ qemu-img create -f qcow2 -F qcow2 -b "$disks/remove-base.qcow2" "$disks/prepare-
 if [[ "${boot_args[0]}" == uefi ]]; then cp "$disks/remove-vars.fd" "$disks/prepare-vars.fd"; fi
 preparation_step=prepare-install-boot
 start_clone "$disks/prepare-install.qcow2" "$disks/prepare-vars.fd" "$output/prepare-install-serial.log" "$output/prepare-install-boot.log"
+preparation_step=install-boot-identity
+remote_argv cat /proc/sys/kernel/random/boot_id > "$output/prepare-install-boot-id.txt"
 preparation_step=prepare-install
 native_change remove > "$output/prepare-install.log" 2>&1
 preparation_step=install-repository-state
 capture_repository_state install
+preparation_step=prepare-install-health
+verify_preparation_health install "$output/prepare-install-serial.log"
 preparation_step=stop-prepared-install
 stop_guest > "$output/stop-prepared-install.log" 2>&1
 preparation_step=freeze-install-base

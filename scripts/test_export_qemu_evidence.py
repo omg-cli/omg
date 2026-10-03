@@ -341,6 +341,20 @@ class DescriptorTests(unittest.TestCase):
         for neighbor in excluded:
             self.assertFalse((self.destination / neighbor).exists())
 
+    def test_preparation_health_and_boot_identity_survive_export(self):
+        names = {f"run-test/transactions/prepare-{operation}-{suffix}"
+                 for operation in ("remove", "install")
+                 for suffix in ("boot-id.txt", "health.json", "health.log")}
+        names.add("run-test/guest-boot-id.txt")
+        for name in names:
+            self.fixture(name, b"bounded preparation evidence")
+        self.fixture("run-test/transactions/prepare-install-health.json.bak", b"private")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(set(report["copied"]), names)
+        for name in names:
+            self.assertEqual((self.destination / name).read_bytes(), b"bounded preparation evidence")
+
     def test_daemon_ipc_snapshots_survive_export(self):
         prefix = "run-test/guest/evidence/"
         names = (

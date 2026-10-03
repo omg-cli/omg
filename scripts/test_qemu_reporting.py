@@ -380,9 +380,11 @@ class ReportingBoundaryTests(unittest.TestCase):
             ("automatic-updates", "automatic-updates.log"),
             ("prepare-remove", "prepare-remove.log"),
             ("remove-repository-state", "remove-repository-state.log"),
+            ("prepare-remove-health", "prepare-remove-health.log"),
             ("stop-prepared-remove", "stop-prepared-remove.log"),
             ("prepare-install", "prepare-install.log"),
             ("install-repository-state", "install-repository-state.log"),
+            ("prepare-install-health", "prepare-install-health.log"),
             ("stop-prepared-install", "stop-prepared-install.log"),
         ):
             with self.subTest(step=step):

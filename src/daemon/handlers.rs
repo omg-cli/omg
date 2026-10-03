@@ -1496,6 +1496,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_cache_survives_backend_failure_until_cleared() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let backend = Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+            "arch",
+            directory.path(),
+        ));
+        backend.set_installed_version("cached-package", "1")?;
+        let state = Arc::new(DaemonState::new_isolated(
+            directory.path(),
+            PackageIndex::empty(),
+            backend,
+        )?);
+        let Response::Success {
+            id: 91,
+            result: ResponseResult::Explicit(result),
+        } = handle_request(Arc::clone(&state), Request::Explicit { id: 91 }).await
+        else {
+            anyhow::bail!("cold explicit lookup must succeed")
+        };
+        assert_eq!(result.packages, ["cached-package"]);
+
+        let inventory = directory.path().join("mock_state_pacman.json");
+        let broken = b"{invalid mock state";
+        std::fs::write(&inventory, broken)?;
+        let Response::Success {
+            id: 92,
+            result: ResponseResult::Explicit(result),
+        } = handle_request(Arc::clone(&state), Request::Explicit { id: 92 }).await
+        else {
+            anyhow::bail!("warm explicit lookup must use the cached snapshot")
+        };
+        assert_eq!(result.packages, ["cached-package"]);
+        assert_eq!(std::fs::read(&inventory)?, broken);
+
+        assert!(matches!(
+            handle_request(Arc::clone(&state), Request::CacheClear { id: 93 }).await,
+            Response::Success {
+                id: 93,
+                result: ResponseResult::Message(message),
+            } if message == "cleared"
+        ));
+        let Response::Error {
+            id: 94,
+            code: error_codes::INTERNAL_ERROR,
+            message,
+        } = handle_request(state, Request::Explicit { id: 94 }).await
+        else {
+            anyhow::bail!("cache clear must expose the backend failure")
+        };
+        assert!(message.contains("Failed to list explicit packages:"));
+        assert!(message.contains("failed to parse mock state"));
+        assert_eq!(std::fs::read(&inventory)?, broken);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn persisted_status_does_not_restart_memory_ttl() -> anyhow::Result<()> {
         let (directory, initial) = isolated_state();
         let status = super::super::status_policy::status_snapshot(42, 20, 1, 2, vec![], Some(3)).0;
