@@ -12,7 +12,8 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, Paragraph, Row, Table, Tabs,
+        Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, Paragraph, Row, Table,
+        TableState, Tabs,
     },
 };
 use std::borrow::Cow;
@@ -874,7 +875,8 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
     .header(header)
     .block(styled_block(" Packages"));
 
-    f.render_widget(table, *list_area);
+    let mut state = TableState::default().with_selected(Some(app.selected_index));
+    f.render_stateful_widget(table, *list_area, &mut state);
 }
 
 fn draw_runtimes(f: &mut Frame, area: Rect, app: &App) {
@@ -1490,19 +1492,31 @@ mod tests {
         for _ in 0..40 {
             app.handle_key(KeyCode::Char('j'));
         }
-        terminal.draw(|frame| draw(frame, &app)).expect("draw selection");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw selection");
         assert_visible_selection(&terminal, "pkg-40");
         app.handle_key(KeyCode::Enter);
-        assert_eq!(app.pending_confirmation, Some(ConfirmationAction::InstallPackage("pkg-40".to_string())));
+        assert_eq!(
+            app.pending_confirmation,
+            Some(ConfirmationAction::InstallPackage("pkg-40".to_string()))
+        );
         app.handle_key(KeyCode::Esc);
         terminal.backend_mut().resize(100, 18);
-        terminal.draw(|frame| draw(frame, &app)).expect("draw resized selection");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw resized selection");
         assert_visible_selection(&terminal, "pkg-40");
         app.handle_key(KeyCode::Up);
-        terminal.draw(|frame| draw(frame, &app)).expect("draw previous selection");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw previous selection");
         assert_visible_selection(&terminal, "pkg-39");
         app.handle_key(KeyCode::Enter);
-        assert_eq!(app.pending_confirmation, Some(ConfirmationAction::InstallPackage("pkg-39".to_string())));
+        assert_eq!(
+            app.pending_confirmation,
+            Some(ConfirmationAction::InstallPackage("pkg-39".to_string()))
+        );
     }
 
     #[test]
@@ -1510,19 +1524,25 @@ mod tests {
         use crossterm::event::KeyCode;
         let mut app = package_app();
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
-        terminal.draw(|frame| draw(frame, &app)).expect("draw first selection");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw first selection");
         assert_visible_selection(&terminal, "pkg-00");
         for _ in 0..100 {
             app.handle_key(KeyCode::Down);
         }
         assert_eq!(app.selected_index, 49);
-        terminal.draw(|frame| draw(frame, &app)).expect("draw last selection");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw last selection");
         assert_visible_selection(&terminal, "pkg-49");
         for _ in 0..100 {
             app.handle_key(KeyCode::Char('k'));
         }
         assert_eq!(app.selected_index, 0);
-        terminal.draw(|frame| draw(frame, &app)).expect("draw returned selection");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw returned selection");
         assert_visible_selection(&terminal, "pkg-00");
     }
 
