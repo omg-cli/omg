@@ -1219,6 +1219,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn existing_empty_audit_log_starts_a_valid_genesis_chain() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        std::fs::write(&path, b"")?;
+        let mut logger = AuditLogger::new_in(&path)?;
+        assert!(std::fs::read(&path)?.is_empty());
+        logger.log(
+            AuditEventType::PackageInstall,
+            AuditSeverity::Info,
+            "fixture",
+            "first event in an existing empty log",
+        )?;
+        let entries = logger.get_recent(1)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].prev_hash, "genesis");
+        assert!(entries[0].verify());
+        let report = logger.verify_integrity()?;
+        assert!(report.is_valid());
+        assert_eq!(report.total_entries, 1);
+        Ok(())
+    }
+
+    #[test]
     fn append_open_failure_preserves_native_cause_and_target() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let path = root.path().join("audit.jsonl");
