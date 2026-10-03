@@ -2923,11 +2923,41 @@ mod recovery_diagnostic_tests {
         marker: &str,
         value: &std::ffi::OsStr,
     ) -> anyhow::Result<()> {
-        use tokio::io::AsyncReadExt;
-        const MAX_CAPTURE: u64 = 256 * 1024;
-        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+        isolated_child_with_environment(name, marker, value, &[]).await
+    }
+
+    async fn isolated_child_with_environment(
+        name: &str,
+        marker: &str,
+        value: &std::ffi::OsStr,
+        environment: &[(&str, &std::ffi::OsStr)],
+    ) -> anyhow::Result<()> {
+        let mut command = tokio::process::Command::new(std::env::current_exe()?);
+        command
             .args(["--exact", name, "--nocapture", "--color", "never"])
             .env(marker, value)
+            .envs(environment.iter().copied());
+        let (status, stdout, stderr) = capture_owned_command(command).await?;
+        anyhow::ensure!(
+            status.success(),
+            "owned audit child failed: {status}\n{stdout}\n{stderr}"
+        );
+        anyhow::ensure!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+            "owned audit child must execute exactly one test: {stdout}"
+        );
+        println!("AUDIT_RECOVERY_CHILD_BEGIN\n{stdout}\n{stderr}\nAUDIT_RECOVERY_CHILD_END");
+        Ok(())
+    }
+
+    async fn capture_owned_command(
+        mut command: tokio::process::Command,
+    ) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+        use tokio::io::AsyncReadExt;
+        const MAX_CAPTURE: u64 = 256 * 1024;
+        let mut child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -2968,18 +2998,120 @@ mod recovery_diagnostic_tests {
         );
         let stdout = String::from_utf8(stdout)?;
         let stderr = String::from_utf8(stderr)?;
+        Ok((status, stdout, stderr))
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[tokio::test]
+    async fn native_unlock_failure_preserves_append_and_operation_error() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::audit::recovery_diagnostic_tests::native_unlock_failure_preserves_append_and_operation_error";
+        const MARKER: &str = "OMG_AUDIT_NATIVE_UNLOCK_CHILD";
+        if let Some(log_path) = std::env::var_os(MARKER) {
+            let log_path = PathBuf::from(log_path);
+            let marker = PathBuf::from(
+                std::env::var_os("OMG_AUDIT_UNLOCK_MARKER").context("unlock marker")?,
+            );
+            let mut logger = AuditLogger::new_in(&log_path)?;
+            std::fs::write(&marker, b"")?;
+
+            let unrelated = std::fs::File::create_new(log_path.with_file_name("unrelated.lock"))?;
+            unrelated.lock()?;
+            unrelated.unlock()?;
+            assert!(
+                std::fs::read(&marker)?.is_empty(),
+                "unrelated unlock must pass through"
+            );
+
+            let error = logger
+                .log(
+                    AuditEventType::PackageInstall,
+                    AuditSeverity::Info,
+                    "pkg",
+                    "durable append",
+                )
+                .expect_err("native unlock must fail");
+            assert!(matches!(error, AuditError::Unlock { ref path, ref source }
+                if path == &log_path.display().to_string() && source.raw_os_error() == Some(nix::libc::EIO)));
+            assert_eq!(
+                std::fs::read(&marker)?,
+                b"1",
+                "the real unlock fault must fire once"
+            );
+            std::fs::remove_file(&marker)?;
+            let entry: AuditEntry = serde_json::from_str(&std::fs::read_to_string(&log_path)?)?;
+            assert_eq!(entry.description, "durable append");
+            assert!(entry.verify());
+            let lock = std::fs::File::open(log_path.with_extension("lock"))?;
+            lock.try_lock()?;
+            lock.unlock()?;
+
+            std::fs::remove_file(&log_path)?;
+            std::fs::create_dir(&log_path)?;
+            let original = logger
+                .log(
+                    AuditEventType::PackageInstall,
+                    AuditSeverity::Info,
+                    "pkg",
+                    "refused",
+                )
+                .expect_err("directory must be refused");
+            assert!(
+                matches!(original, AuditError::Open { ref source, .. } if source.kind() == io::ErrorKind::InvalidInput)
+            );
+            std::fs::write(&marker, b"")?;
+            let combined = logger
+                .log(
+                    AuditEventType::PackageInstall,
+                    AuditSeverity::Info,
+                    "pkg",
+                    "refused",
+                )
+                .expect_err("operation and unlock both fail");
+            assert!(matches!(combined, AuditError::Open { ref path, ref source }
+                if path == &log_path.display().to_string() && source.kind() == io::ErrorKind::InvalidInput));
+            assert_eq!(combined.to_string(), original.to_string());
+            assert_eq!(
+                std::fs::read(&marker)?,
+                b"1",
+                "operation error must not hide an inactive fixture"
+            );
+            std::fs::remove_file(&marker)?;
+            return Ok(());
+        }
+
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("unlock.c");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/fixtures/audit_unlock_failure.c"),
+        )?;
+        let library = directory.path().join("unlock.so");
+        let mut compiler = tokio::process::Command::new("cc");
+        compiler
+            .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(&library);
+        let (status, stdout, stderr) = capture_owned_command(compiler).await?;
         anyhow::ensure!(
             status.success(),
-            "owned audit child failed: {status}\n{stdout}\n{stderr}"
+            "native fixture compilation failed: {status}\n{stdout}\n{stderr}"
         );
-        anyhow::ensure!(
-            stdout
-                .lines()
-                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
-            "owned audit child must execute exactly one test: {stdout}"
-        );
-        println!("AUDIT_RECOVERY_CHILD_BEGIN\n{stdout}\n{stderr}\nAUDIT_RECOVERY_CHILD_END");
-        Ok(())
+        let log_path = directory.path().join("audit.jsonl");
+        let lock_path = log_path.with_extension("lock");
+        let marker_path = directory.path().join("armed");
+        isolated_child_with_environment(
+            NAME,
+            MARKER,
+            log_path.as_os_str(),
+            &[
+                ("LD_PRELOAD", library.as_os_str()),
+                ("OMG_AUDIT_UNLOCK_FILE", lock_path.as_os_str()),
+                ("OMG_AUDIT_UNLOCK_MARKER", marker_path.as_os_str()),
+            ],
+        )
+        .await
     }
 
     #[derive(Clone, Default)]
@@ -3010,6 +3142,41 @@ mod recovery_diagnostic_tests {
         fn text(&self) -> String {
             String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn debug_event_emits_escaped_trace_and_valid_disk_record() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::audit::recovery_diagnostic_tests::debug_event_emits_escaped_trace_and_valid_disk_record";
+        const MARKER: &str = "OMG_AUDIT_DEBUG_TRACE_CHILD";
+        if std::env::var_os(MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            return isolated_child(NAME, MARKER, std::ffi::OsStr::new("1")).await;
+        }
+        let directory = tempfile::tempdir()?;
+        let log_path = directory.path().join("audit.jsonl");
+        let mut logger = AuditLogger::new_in(&log_path)?;
+        let capture = Plaintext::default();
+        let description = "debug diagnostic\nforged success\r\u{1b}[31m";
+        capture.capture(|| {
+            logger
+                .log(
+                    AuditEventType::SecurityAudit,
+                    AuditSeverity::Debug,
+                    "pkg",
+                    description,
+                )
+                .expect("debug audit record must persist");
+        });
+        let text = capture.text();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("DEBUG"));
+        assert!(text.contains("debug diagnostic\\nforged success\\r\\u{1b}[31m"));
+        assert!(!text.contains('\r') && !text.contains('\u{1b}'));
+        let entry: AuditEntry = serde_json::from_str(&std::fs::read_to_string(&log_path)?)?;
+        assert_eq!(entry.severity, AuditSeverity::Debug);
+        assert_eq!(entry.description, description);
+        assert_eq!(entry.prev_hash, "genesis");
+        assert!(entry.verify());
+        Ok(())
     }
 
     #[tokio::test]
