@@ -1,6 +1,7 @@
 """Real subprocess contracts for the Linux mutation runner observer."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import signal
 import subprocess
@@ -18,6 +19,82 @@ SPEC.loader.exec_module(OBSERVER)
 
 
 class MutationRunnerObserver(unittest.TestCase):
+    def test_process_stat_preserves_parentheses_in_names_and_uses_rss_pages(self):
+        text = '123 (rustc ) worker) S 9 123 123 0 -1 4194304 1 0 0 0 1 0 0 0 20 0 2 0 456 8192 2'
+        self.assertEqual(OBSERVER.process_stat(text, 4096), dict(
+            pid=123, parent_pid=9, process_group=123, session_id=123,
+            start_ticks=456, name='rustc ) worker', rss_bytes=8192))
+
+    def test_process_scan_excludes_other_sessions_and_marks_bounds_and_disappearance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixtures = {
+                123: '123 (cargo-mutants) S 9 123 123 0 -1 4194304 1 0 0 0 1 0 0 0 20 0 2 0 456 8192 2',
+                124: '124 (rustc) S 123 123 123 0 -1 4194304 1 0 0 0 1 0 0 0 20 0 2 0 457 16384 4',
+                125: '125 (unrelated) S 9 125 125 0 -1 4194304 1 0 0 0 1 0 0 0 20 0 2 0 458 999999 999',
+            }
+            for pid, text in fixtures.items():
+                (root / str(pid)).mkdir()
+                (root / str(pid) / 'stat').write_text(text)
+            with patch.object(OBSERVER, 'PROC_ROOT', root):
+                result = OBSERVER.command_processes(123)
+                self.assertEqual(result['process_count'], 2)
+                self.assertEqual([row['pid'] for row in result['largest']], [124, 123])
+                self.assertEqual(result['rss_sum_bytes'], 6 * os.sysconf('SC_PAGE_SIZE'))
+                self.assertEqual(result['availability'], 'observed')
+                with patch.object(OBSERVER, 'MAX_SESSION_PROCESSES', 1):
+                    limited = OBSERVER.command_processes(123)
+                    self.assertEqual(limited['process_count'], 1)
+                    self.assertTrue(limited['scan_limited'])
+                    self.assertEqual(limited['availability'], 'partial')
+                with patch.object(OBSERVER, 'MAX_PROC_ENTRIES', 1):
+                    limited = OBSERVER.command_processes(123)
+                    self.assertEqual(limited['scanned_processes'], 1)
+                    self.assertTrue(limited['scan_limited'])
+                (root / '126').mkdir()
+                partial = OBSERVER.command_processes(123)
+                self.assertEqual(partial['vanished_processes'], 1)
+                self.assertEqual(partial['availability'], 'partial')
+
+    def test_memory_sample_identifies_command_and_resident_descendant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "health.jsonl"
+            marker = Path(directory) / "descendant.json"
+            child_code = (
+                "import json,os,time;from pathlib import Path;"
+                "memory=bytearray(8*1024*1024);"
+                f"Path({str(marker)!r}).write_text(json.dumps(dict(pid=os.getpid(),parent=os.getppid())));"
+                "time.sleep(5)"
+            )
+            code = (
+                "import json,subprocess,sys,time;from pathlib import Path\n"
+                f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}])\n"
+                f"report=Path({str(report)!r});marker=Path({str(marker)!r})\n"
+                "try:\n"
+                " end=time.monotonic()+3\n"
+                " while time.monotonic()<end:\n"
+                "  if marker.exists():\n"
+                "   pid=json.loads(marker.read_text())['pid']\n"
+                "   rows=[json.loads(line) for line in report.read_text().splitlines()]\n"
+                "   if any(any(p['pid']==pid and p['rss_bytes']>=8*1024*1024 for p in row.get('command_processes',{}).get('largest',[])) for row in rows):\n"
+                "    raise SystemExit(0)\n"
+                "  time.sleep(0.01)\n"
+                " raise SystemExit('resident descendant memory was not observed')\n"
+                "finally:\n"
+                " child.terminate();child.wait(timeout=2)\n"
+            )
+            result, rows = self.invoke(directory, code, interval="0.02", report=report)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            identity = json.loads(marker.read_text())
+            samples = [row['command_processes'] for row in rows if row['phase'] == 'sample']
+            observed = next(sample for sample in samples if any(p['pid'] == identity['pid'] for p in sample['largest']))
+            self.assertEqual(observed['session_id'], identity['parent'])
+            self.assertIn(observed['availability'], ('observed', 'partial'))
+            self.assertGreaterEqual(observed['process_count'], 2)
+            self.assertTrue({identity['pid'], identity['parent']} <= {p['pid'] for p in observed['largest']})
+            self.assertTrue(all(p['session_id'] == identity['parent'] for p in observed['largest']))
+            self.assertGreaterEqual(observed['rss_sum_bytes'], sum(p['rss_bytes'] for p in observed['largest']))
+
     def test_cancellation_during_spawn_is_retained_and_forwarded(self):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "health.jsonl"
