@@ -114,6 +114,142 @@ exit 1
             self.assertTrue(staged.is_file(), 'real controllers must receive the live report oracle')
             self.assertEqual(staged.read_bytes(), (ROOT / 'scripts/qemu-doctor-live-oracle.py').read_bytes())
 
+    def live_admission_fixture(self, *, count=1, altered_controller=False):
+        from contextlib import contextmanager
+        import hashlib
+        import importlib.util
+        import shutil
+        from unittest.mock import patch
+        from scripts import test_qemu_output_contracts as output_contracts
+
+        @contextmanager
+        def fixture():
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                controller = root / 'controller'
+                (controller / 'scripts').mkdir(parents=True)
+                (controller / 'tests').mkdir()
+                for source in (ROOT / 'scripts').iterdir():
+                    if source.is_file() and source.suffix in ('.py', '.sh'):
+                        shutil.copyfile(source, controller / 'scripts' / source.name)
+                shutil.copyfile(ROOT / 'tests/man_page_inventory.txt', controller / 'tests/man_page_inventory.txt')
+                if altered_controller:
+                    helper = controller / 'scripts/qemu-doctor-live-oracle.py'
+                    text = helper.read_text(encoding='utf-8')
+                    self.assertEqual(text.count('if count != baseline_count + failed:'), 1)
+                    helper.write_text(text.replace('if count != baseline_count + failed:',
+                                                   'if False and count != baseline_count + failed:'), encoding='utf-8')
+                row = ('doctor-network-live\t["doctor","--network"]\tcontrolled-error\t1\tpass\t-\t'
+                       'network\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tdoctor-network-live-state\ttempdir-drop')
+                product = """[[ "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 ]] || exit 70
+printf '  Internet connectivity (github.com reachable)\\n'
+printf '  PATH resolves a different omg executable first: "%s"\\n' "$(command -v omg)"
+if [[ "$2" == --network ]]; then
+  printf 'Network Diagnostics\\n  ✓ Kernel.org (10 ms)\\n  ✓ GitHub (15 ms)\\n\\n  DNS Resolution:\\n    ✓ kernel.org (2 addresses)\\n    ✓ github.com (2 addresses)\\n'
+  printf 'Error: doctor found COUNT health issue(s)\\n' >&2
+else
+  printf 'Error: doctor found 1 health issue(s)\\n' >&2
+fi
+exit 1
+""".replace('COUNT', str(count))
+                # Copy the actual controller manifest into returned fixture logs;
+                # execute the unchanged receiver with its authenticated stdin.
+                ssh = ('cp "$(dirname "$0")/../inventory/input-sha256.txt" '
+                       '"$(dirname "$0")/../inventory/rows/input-owners.log"\n'
+                       'exec bash -c "${@: -1}"\n')
+                runner = output_contracts.OutputContracts(methodName='runTest')
+                with patch.object(output_contracts, 'ROOT', controller):
+                    result, rows, logs = runner.run_inventory(product, [row], distro='debian',
+                                                           tiers='network', isolation_scope='network', ssh_body=ssh)
+                inventory = root / 'cases.tsv'
+                inventory.write_text('case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup\n' + row + '\n', encoding='utf-8')
+                digest = hashlib.sha256(inventory.read_bytes()).hexdigest()
+                policy = root / 'policy.json'
+                policy_directory = root / 'policy.d'
+                policy_directory.mkdir()
+                registry = json.loads((ROOT / 'tests/qemu-inventory-policy.json').read_bytes())
+                source_snapshot = json.loads((ROOT / 'tests/qemu-inventory-policy.d/a9496dee12123c063780710826a9d2e7dba0a93826e21ca07944e6cacbf7b917.json').read_bytes())
+                case = next(case for case in source_snapshot['cases'] if case['id'] == 'doctor-network-live')
+                snapshot = policy_directory / (digest + '.json')
+                snapshot.write_text(json.dumps({'releases': [], 'cases': [case]}) + '\n', encoding='utf-8')
+                registry['inventories'] = {digest: hashlib.sha256(snapshot.read_bytes()).hexdigest()}
+                registry['profiles']['network'] = ['network']
+                policy.write_text(json.dumps(registry) + '\n', encoding='utf-8')
+                evidence = root / 'inventory'
+                streams = evidence / 'rows'
+                streams.mkdir(parents=True)
+                for suffix in ('stdout', 'stderr'):
+                    (streams / f'doctor-network-live.{suffix}.log').write_text(logs[f'doctor-network-live.{suffix}.log'], encoding='utf-8')
+                (evidence / 'input-sha256.txt').write_text(logs['input-owners.log'], encoding='utf-8')
+                results = evidence / 'results.json'
+                results.write_text(json.dumps(rows) + '\n', encoding='utf-8')
+                summary = evidence / 'summary.json'
+                summary.write_text(json.dumps({'complete': True, 'pass': sum(row['result'] == 'PASS' for row in rows),
+                                               'fail': sum(row['result'] != 'PASS' for row in rows), 'skipped': 0}) + '\n', encoding='utf-8')
+                # The checker stays in the trusted host source tree while only
+                # the staged controller copy can change its executed helper.
+                spec = importlib.util.spec_from_file_location('live_host_checker', ROOT / 'scripts/check-qemu-inventory.py')
+                checker = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(checker)
+                yield result, lambda: checker.admit(policy, inventory, results, summary, 'debian', 'network'), evidence
+        return fixture()
+
+    def test_live_admission_binds_the_executed_controller_helper_to_trusted_source(self):
+        with self.live_admission_fixture() as (result, admit, _):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(admit()['passed'])
+        with self.live_admission_fixture(count=2, altered_controller=True) as (result, admit, _):
+            self.assertEqual(result.returncode, 0, 'control must reproduce the altered helper false PASS')
+            with self.assertRaises(ValueError):
+                admit()
+
+    def test_live_admission_keeps_a_genuine_product_failure(self):
+        with self.live_admission_fixture(count=2) as (result, admit, _):
+            self.assertEqual(result.returncode, 1, result.stderr)
+            receipt = admit()
+            self.assertFalse(receipt['passed'])
+            self.assertEqual(receipt['counts']['failed'], 1)
+            self.assertEqual(receipt['counts']['harness_error'], 0)
+
+    def test_live_admission_rejects_missing_or_inconsistent_provenance(self):
+        with self.live_admission_fixture() as (result, admit, evidence):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(admit()['passed'])
+            manifest = evidence / 'input-sha256.txt'
+            stderr = evidence / 'rows/doctor-network-live.stderr.log'
+            stdout = evidence / 'rows/doctor-network-live.stdout.log'
+            original = {path: path.read_bytes() for path in (manifest, stderr, stdout)}
+            proof_line = next(line for line in original[stderr].decode().splitlines() if line.startswith('{'))
+            proof = json.loads(proof_line)
+            for field, value in [('oracle_sha256', '0' * 64), ('report_sha256', '0' * 64),
+                                 ('distro', 'fedora'), ('network_scope', 'offline'), ('exit_code', 0),
+                                 ('baseline_issues', True), ('health_issues', 2), ('http_positive', 0),
+                                 ('dns_positive', 0), ('mirror_targets', ['Wrong mirror']),
+                                 ('dns_targets', ['wrong.example'])]:
+                with self.subTest(field=field):
+                    changed = dict(proof, **{field: value})
+                    stderr.write_bytes(original[stderr].replace(proof_line.encode(), json.dumps(changed).encode()))
+                    with self.assertRaises(ValueError):
+                        admit()
+                    stderr.write_bytes(original[stderr])
+            for fault in ('missing-manifest', 'missing-owner', 'duplicate-owner', 'wrong-owner',
+                          'missing-proof', 'duplicate-proof', 'duplicate-key', 'coherent-wrong-counts', 'wrong-stream', 'wrong-trailer'):
+                with self.subTest(fault=fault):
+                    if fault == 'missing-manifest': manifest.unlink()
+                    elif fault == 'missing-owner': manifest.write_bytes(b''.join(line for line in original[manifest].splitlines(keepends=True) if b'qemu-doctor-live-oracle.py' not in line))
+                    elif fault == 'duplicate-owner': manifest.write_bytes(original[manifest] + next((line for line in original[manifest].splitlines(keepends=True) if b'qemu-doctor-live-oracle.py' in line), b'0' * 64 + b'  qemu-doctor-live-oracle.py\n'))
+                    elif fault == 'wrong-owner': manifest.write_bytes(original[manifest].replace(b'qemu-doctor-live-oracle.py', b'other-doctor-oracle.py'))
+                    elif fault == 'missing-proof': stderr.write_bytes(original[stderr].replace(proof_line.encode(), b''))
+                    elif fault == 'duplicate-proof': stderr.write_bytes(original[stderr] + proof_line.encode() + b'\n')
+                    elif fault == 'duplicate-key': stderr.write_bytes(original[stderr].replace(proof_line.encode(), proof_line[:-1].encode() + b', "complete": true}'))
+                    elif fault == 'coherent-wrong-counts': stderr.write_bytes(original[stderr].replace(proof_line.encode(), json.dumps(dict(proof, baseline_issues=2, health_issues=2)).encode()))
+                    elif fault == 'wrong-stream': stdout.write_bytes(b'changed\n' + original[stdout])
+                    elif fault == 'wrong-trailer': stdout.write_bytes(original[stdout].replace(b'OMG_QEMU_RECEIPT:product:1:0', b'OMG_QEMU_RECEIPT:product:0:0'))
+                    with self.assertRaises((ValueError, OSError)):
+                        admit()
+                    for path, content in original.items(): path.write_bytes(content)
+
+
 
 if __name__ == '__main__':
     unittest.main()

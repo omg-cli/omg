@@ -476,12 +476,18 @@ def published_inventory_admission(content, distro, policy):
                  "results": f"{root}/inventory/results.json",
                  "summary": f"{root}/inventory/summary.json",
                  "admission": f"{root}/inventory-admission.json"}
-        inputs = {}
-        for key, name in names.items():
+        def read_input(name):
             matches = [member for member in members if member.filename == name]
             if len(matches) != 1 or matches[0].file_size > 1024 * 1024:
                 raise ValueError("published guest lacks bounded CLI evidence")
-            inputs[key] = archive.read(matches[0])
+            return archive.read(matches[0])
+        inputs = {key: read_input(name) for key, name in names.items()}
+        rows = json.loads(inputs["results"], object_pairs_hook=unique_object)
+        if any(row["case_id"] == f"qemu-{distro}-doctor-network-live"
+               and row["result"] == "PASS" for row in rows):
+            for name in ("input-sha256.txt", "rows/doctor-network-live.stdout.log",
+                         "rows/doctor-network-live.stderr.log"):
+                inputs[name] = read_input(f"{root}/inventory/{name}")
         if any(PurePosixPath(member.filename).name == "results.json"
                and PurePosixPath(member.filename).parent.name != "transactions"
                and member.filename not in (names["results"], f"{root}/results.json")
@@ -503,6 +509,12 @@ def published_inventory_admission(content, distro, policy):
         for key in ("inventory", "results", "summary"):
             paths[key] = Path(directory) / key
             paths[key].write_bytes(inputs[key])
+        for name in ("input-sha256.txt", "rows/doctor-network-live.stdout.log",
+                     "rows/doctor-network-live.stderr.log"):
+            if name in inputs:
+                target = Path(directory) / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(inputs[name])
         admitted = checker.admit(policy, paths["inventory"], paths["results"],
                                  paths["summary"], distro, "hermetic,qemu,container,network,pty")
     receipt = json.loads(inputs["admission"], object_pairs_hook=unique_object)

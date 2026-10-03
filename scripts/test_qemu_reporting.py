@@ -49,17 +49,41 @@ def published_inputs(distro, overrides=()):
         "pass": sum(row["result"] == "PASS" for row in rows),
         "skipped": sum(row["result"] == "SKIPPED" for row in rows),
         "fail": sum(row["result"] not in ("PASS", "SKIPPED") for row in rows)})
+    inputs = {"cases.tsv": (ROOT / "tests/cli_behavior_inventory.tsv").read_bytes(),
+              "inventory/results.json": json.dumps(rows).encode(),
+              "inventory/summary.json": json.dumps(summary).encode()}
+    if any(row["case_id"] == f"qemu-{distro}-doctor-network-live"
+           and row["result"] == "PASS" for row in rows):
+        mirrors = ["Arch Linux", "Kernel.org", "GitHub", "AUR"] if distro == "arch" else ["Kernel.org", "GitHub"]
+        hosts = ["archlinux.org", "aur.archlinux.org", "github.com"] if distro == "arch" else ["kernel.org", "github.com"]
+        report = ('  Internet connectivity (kernel.org reachable)\n'
+                  '  PATH resolves a different omg executable first: "/fixture/path-shadow/omg"\n'
+                  'Network Diagnostics\n'
+                  + ''.join(f"  ✓ {name} (12 ms)\n" for name in mirrors)
+                  + 'DNS Resolution:\n'
+                  + ''.join(f"    ✓ {host} (1 addresses)\n" for host in hosts)).encode()
+        helper_hash = hashlib.sha256((ROOT / "scripts/qemu-doctor-live-oracle.py").read_bytes()).hexdigest()
+        proof = dict(schema_version=1, kind="doctor-live-network", complete=True, distro=distro,
+                     network_scope="network", exit_code=1, baseline_exit_code=1, baseline_issues=1,
+                     health_issues=1, network_issues=0, http_positive=len(mirrors), dns_positive=len(hosts),
+                     mirror_targets=mirrors, dns_targets=hosts, oracle_sha256=helper_hash,
+                     report_sha256=hashlib.sha256(report).hexdigest())
+        inputs["inventory/input-sha256.txt"] = f"{helper_hash}  /work/scripts/qemu-doctor-live-oracle.py\n".encode()
+        inputs["inventory/rows/doctor-network-live.stdout.log"] = report + b"\nOMG_QEMU_RECEIPT:product:1:0\n"
+        inputs["inventory/rows/doctor-network-live.stderr.log"] = (
+            b"Error: doctor found 1 health issue(s)\nError: doctor found 1 health issue(s)\n"
+            + json.dumps(proof, sort_keys=True).encode() + b"\n")
     with tempfile.TemporaryDirectory() as directory:
-        paths = {key: Path(directory) / key for key in ("results", "summary")}
-        paths["results"].write_text(json.dumps(rows))
-        paths["summary"].write_text(json.dumps(summary))
+        private = Path(directory)
+        for name, content in inputs.items():
+            target = private / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
         receipt = CHECKER.admit(ROOT / "tests/qemu-inventory-policy.json",
-            ROOT / "tests/cli_behavior_inventory.tsv", paths["results"], paths["summary"],
+            private / "cases.tsv", private / "inventory/results.json", private / "inventory/summary.json",
             distro, "hermetic,qemu,container,network,pty")
-    return {"cases.tsv": (ROOT / "tests/cli_behavior_inventory.tsv").read_bytes(),
-            "inventory/results.json": json.dumps(rows).encode(),
-            "inventory/summary.json": json.dumps(summary).encode(),
-            "inventory-admission.json": json.dumps(receipt).encode()}
+    inputs["inventory-admission.json"] = json.dumps(receipt).encode()
+    return inputs
 
 
 class ReportingBoundaryTests(unittest.TestCase):
@@ -74,6 +98,63 @@ class ReportingBoundaryTests(unittest.TestCase):
             info.external_attr = mode << 16
             archive.writestr(info, content)
         return output.getvalue()
+
+    def published_archive(self, inputs, *, linked=None, duplicate=None):
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            for name, content in inputs.items():
+                info = zipfile.ZipInfo("run-fixture/" + name)
+                if name == linked:
+                    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                archive.writestr(info, content)
+                if name == duplicate:
+                    with self.assertWarns(UserWarning):
+                        archive.writestr(info, content)
+        return output.getvalue()
+
+    def test_published_live_doctor_provenance_survives_archive_handoff(self):
+        for distro in REPORT.DISTROS:
+            with self.subTest(distro=distro):
+                inputs = published_inputs(distro)
+                self.assertTrue(REPORT.published_inventory_admission(
+                    self.published_archive(inputs), distro, ROOT / "tests/qemu-inventory-policy.json"))
+
+    def test_published_live_doctor_missing_or_corrupt_evidence_is_refused(self):
+        original = published_inputs("arch")
+        names = ("inventory/input-sha256.txt", "inventory/rows/doctor-network-live.stdout.log",
+                 "inventory/rows/doctor-network-live.stderr.log")
+        for name in names:
+            for damage in ("missing", "linked", "duplicate", "oversized"):
+                with self.subTest(name=name, damage=damage):
+                    inputs = dict(original)
+                    if damage == "missing":
+                        inputs.pop(name)
+                    elif damage == "oversized":
+                        inputs[name] = b"x" * (1024 * 1024 + 1)
+                    archive = self.published_archive(inputs,
+                        linked=name if damage == "linked" else None,
+                        duplicate=name if damage == "duplicate" else None)
+                    with self.assertRaises((OSError, ValueError)):
+                        REPORT.published_inventory_admission(archive, "arch", ROOT / "tests/qemu-inventory-policy.json")
+        helper_hash = hashlib.sha256((ROOT / "scripts/qemu-doctor-live-oracle.py").read_bytes()).hexdigest().encode()
+        for name, content in ((names[0], original[names[0]].replace(helper_hash, b"0" * 64)),
+                              (names[1], b"changed report" + original[names[1]]),
+                              (names[2], original[names[2]] + next(line for line in original[names[2]].splitlines()
+                                                                if line.startswith(b"{")) + b"\n")):
+            with self.subTest(corrupt=name):
+                inputs = dict(original, **{name: content})
+                with self.assertRaises((OSError, ValueError)):
+                    REPORT.published_inventory_admission(self.published_archive(inputs), "arch",
+                                                         ROOT / "tests/qemu-inventory-policy.json")
+
+    def test_published_doctor_product_failure_needs_no_pass_proof(self):
+        failure = dict(case_id="qemu-arch-doctor-network-live", distro="arch", result="FAIL", exit_code=1)
+        inputs = published_inputs("arch", [failure])
+        self.assertNotIn("inventory/input-sha256.txt", inputs)
+        self.assertNotIn("inventory/rows/doctor-network-live.stdout.log", inputs)
+        self.assertNotIn("inventory/rows/doctor-network-live.stderr.log", inputs)
+        self.assertFalse(REPORT.published_inventory_admission(self.published_archive(inputs), "arch",
+                                                            ROOT / "tests/qemu-inventory-policy.json"))
 
     def test_projection_removes_untrusted_fields_without_extraction(self):
         row = dict(self.row(), command="do not execute", environment={"secret": "private"})
