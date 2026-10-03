@@ -1478,6 +1478,76 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn startup_search_prewarming_survives_explicit_inventory_error() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let data_dir = directory.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let backend = Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+            "macos", &data_dir,
+        ));
+        let state = Arc::new(DaemonState::new_isolated(
+            &data_dir,
+            super::super::index::PackageIndex::from_records(&[(
+                "python-fixture",
+                "1.0",
+                "Search prewarming fixture",
+            )]),
+            backend,
+        )?);
+        std::fs::write(data_dir.join("mock_state_homebrew.json"), b"invalid json")?;
+        let error = state
+            .explicit_packages()
+            .await
+            .expect_err("invalid backend inventory");
+        assert!(error.to_string().contains("failed to parse mock state"));
+        let socket_path = directory.path().join("prewarm-error.sock");
+        let listener = UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(run_with_status_path(
+            listener,
+            Arc::clone(&state),
+            socket_path,
+            directory.path().join("omg.status"),
+        ));
+        let queries = ["", "linux", "python", "node", "firefox", "git"];
+        let warmed = tokio::time::timeout(Duration::from_secs(5), async {
+            while !queries.iter().all(|query| state.cache.get(query).is_some()) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        server.abort();
+        let cancelled = server
+            .await
+            .expect_err("test stops the live isolated server");
+        assert!(cancelled.is_cancelled());
+        warmed.context("search cache warming must continue after explicit inventory failure")?;
+        assert!(state.cache.get_explicit().is_none());
+        assert!(state.cache.get_explicit_count().is_none());
+        let response = handle_request(
+            Arc::clone(&state),
+            Request::Search {
+                id: 1,
+                query: "python".to_string(),
+                limit: Some(10),
+            },
+        )
+        .await;
+        let Response::Success {
+            id: 1,
+            result: ResponseResult::Search(results),
+        } = response
+        else {
+            anyhow::bail!("the prewarmed search must remain usable after inventory failure");
+        };
+        assert_eq!(results.total, 1);
+        assert_eq!(results.packages.len(), 1);
+        assert_eq!(results.packages[0].name, "python-fixture");
+        assert!(state.explicit_packages().await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn startup_prewarms_every_common_search_query() -> Result<()> {
         let names: Vec<_> = (0..120)
             .map(|index| format!("python-package-{index:03}"))

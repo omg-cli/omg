@@ -904,6 +904,14 @@ mod tests {
     }
 
     #[test]
+    fn python_prerelease_compares_below_its_stable_version_directly() {
+        assert_eq!(
+            PythonManager::python_version_cmp("3.15.0rc2", "3.15.0"),
+            std::cmp::Ordering::Less,
+        );
+    }
+
+    #[test]
     fn stable_only_versions_exclude_prereleases_for_partial_resolution() {
         let available = [
             PythonVersion {
