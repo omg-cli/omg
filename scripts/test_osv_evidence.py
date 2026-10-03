@@ -4,9 +4,15 @@ import hashlib
 import importlib.util
 import io
 import json
+import http.client
+import http.server
 from pathlib import Path
+import socket
+import ssl
+import subprocess
 import tarfile
 import tempfile
+import threading
 import unittest
 
 spec = importlib.util.spec_from_file_location("osv_evidence", Path(__file__).with_name("qemu-osv-evidence.py"))
@@ -57,7 +63,8 @@ class PositiveEvidenceTests(unittest.TestCase):
         for phase, count in (("before", 0), ("after", 2)):
             (self.evidence / ("daemon-" + phase + ".stdout")).write_text(f"omg_security_audit_requests_total {count}\n", encoding="utf-8", newline="\n")
             (self.evidence / ("daemon-" + phase + ".stderr")).write_text("", encoding="utf-8", newline="\n")
-        self.events = [{"kind": "tls-error", "error": "certificate verify failed"}]
+        self.events = [{"kind": "tls-error", "error": "certificate verify failed",
+                        "ssl_error": ssl.SSL_ERROR_SSL, "reason": "TLSV1_ALERT_UNKNOWN_CA"}]
         identities = {("glibc", "2.36-9"), ("apt", "2.6.1")}
         for _ in range(3):
             for name, version in sorted(identities):
@@ -86,6 +93,41 @@ class PositiveEvidenceTests(unittest.TestCase):
 
     def test_complete_bound_native_evidence_is_admitted(self):
         self.assertEqual(self.admit(), self.receipt)
+
+    def test_retained_transport_eof_does_not_replace_certificate_refusal_or_requests(self):
+        eof = {"kind": "transport-eof", "ssl_error": ssl.SSL_ERROR_EOF, "error": "TLS/SSL connection has been closed (EOF)"}
+        original = copy.deepcopy(self.events)
+        self.events = [eof] + original + [eof]
+        self.write()
+        self.assertEqual(self.admit(), self.receipt)
+        for events in ([eof] + original[1:], original + [dict(eof, ssl_error=ssl.SSL_ERROR_SSL)],
+                       original + [dict(eof, kind="unknown")], original + [original[0]],
+                       original[:-1] + [eof], original + [original[-1]]):
+            self.events = events
+            self.write()
+            with self.subTest(events=events), self.assertRaises(ValueError):
+                self.admit()
+
+    def test_non_certificate_tls_error_cannot_prove_untrusted_refusal(self):
+        self.events[0]["reason"] = "UNEXPECTED_EOF_WHILE_READING"
+        self.write()
+        with self.assertRaises(ValueError):
+            self.admit()
+
+    def test_clean_tls_close_cannot_replace_refusal_or_native_queries(self):
+        close = {"kind": "tls-close", "ssl_error": ssl.SSL_ERROR_ZERO_RETURN, "error": "TLS/SSL connection has been closed (EOF)"}
+        original = copy.deepcopy(self.events)
+        self.events = [close] + original + [close]
+        self.write()
+        self.assertEqual(self.admit(), self.receipt)
+        for events in ([close] + original[1:], original[:-1] + [close],
+                       original + [original[-1]], original + [dict(close, ssl_error=ssl.SSL_ERROR_EOF)],
+                       original + [dict(close, ssl_error=True)], original + [dict(close, error="")],
+                       original + [dict(close, reason=None)]):
+            self.events = events
+            self.write()
+            with self.subTest(events=events), self.assertRaises(ValueError):
+                self.admit()
 
     def test_false_complete_wrong_archive_fixture_binary_and_native_state_are_refused(self):
         original = copy.deepcopy(self.receipt)
@@ -133,6 +175,84 @@ class PositiveEvidenceTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 self.admit()
             path.write_text(before, encoding="utf-8", newline="\n")
+
+
+class NativeTLSClassificationTests(unittest.TestCase):
+    def test_real_unknown_ca_and_eof_remain_distinct_before_and_after_https(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            certificate, key = root / "cert.pem", root / "key.pem"
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                            "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+                            "-keyout", str(key), "-out", str(certificate)], check=True, capture_output=True, timeout=30)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certificate, key)
+            events = []
+            changed = threading.Condition()
+
+            def event(value):
+                with changed:
+                    events.append(value)
+                    changed.notify_all()
+
+            def wait_for(count):
+                with changed:
+                    self.assertTrue(changed.wait_for(lambda: len(events) >= count, timeout=8), events)
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *args):
+                    return
+
+                def do_GET(self):
+                    event({"kind": "request"})
+                    self.send_response(204)
+                    self.end_headers()
+
+            server = checker.oracle.TLSEvidenceServer(("127.0.0.1", 0), Handler, context, event)
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            port = server.server_address[1]
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=5):
+                    pass
+                wait_for(1)
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as stream:
+                    with self.assertRaises(ssl.SSLCertVerificationError):
+                        ssl.create_default_context().wrap_socket(stream, server_hostname="localhost")
+                wait_for(2)
+                connection = http.client.HTTPSConnection("localhost", port, timeout=5,
+                                                       context=ssl.create_default_context(cafile=str(certificate)))
+                try:
+                    connection.request("GET", "/")
+                    self.assertEqual(connection.getresponse().status, 204)
+                finally:
+                    connection.close()
+                wait_for(3)
+                with socket.create_connection(("127.0.0.1", port), timeout=5):
+                    pass
+                wait_for(4)
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as stream:
+                    client_context = ssl.create_default_context(cafile=str(certificate))
+                    client_context.maximum_version = ssl.TLSVersion.TLSv1_2
+                    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+                    client = client_context.wrap_bio(incoming, outgoing, server_hostname="localhost")
+                    with self.assertRaises(ssl.SSLWantReadError):
+                        client.do_handshake()
+                    stream.sendall(outgoing.read())
+                    self.assertTrue(stream.recv(65536))
+                    stream.sendall(bytes.fromhex("15030300020100"))
+                wait_for(5)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=8)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(events[4]["ssl_error"], ssl.SSL_ERROR_ZERO_RETURN)
+            self.assertEqual([item["kind"] for item in events], ["transport-eof", "tls-error", "request", "transport-eof", "tls-close"])
+            self.assertEqual(events[0]["ssl_error"], ssl.SSL_ERROR_EOF)
+            self.assertEqual(events[1]["reason"], "TLSV1_ALERT_UNKNOWN_CA")
+            self.assertEqual(events[3]["ssl_error"], ssl.SSL_ERROR_EOF)
+            self.assertEqual(events[4]["ssl_error"], ssl.SSL_ERROR_ZERO_RETURN)
 
 
 if __name__ == "__main__":
