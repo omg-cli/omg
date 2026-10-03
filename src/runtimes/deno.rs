@@ -242,15 +242,17 @@ async fn fetch_checksum_sidecar(
     url: &str,
     filename: &str,
 ) -> Result<String> {
+    let source = crate::core::http::redact_url(url);
     let response = crate::core::http::fetch_public_download_with_timeout(
         url,
         GITHUB_USER_AGENT,
         Some(std::time::Duration::from_secs(30)),
     )
     .await
-    .with_context(|| format!("Failed to fetch Deno checksum sidecar from {url}"))?
+    .with_context(|| format!("Failed to fetch Deno checksum sidecar from {source}"))?
     .error_for_status()
-    .with_context(|| format!("Deno checksum sidecar request failed: {url}"))?;
+    .map_err(reqwest::Error::without_url)
+    .with_context(|| format!("Deno checksum sidecar request failed: {source}"))?;
 
     let length = response.content_length().unwrap_or(0);
     anyhow::ensure!(
@@ -265,7 +267,7 @@ async fn fetch_checksum_sidecar(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk =
-            chunk.with_context(|| format!("Failed to read Deno checksum sidecar: {url}"))?;
+            chunk.with_context(|| format!("Failed to read Deno checksum sidecar: {source}"))?;
         let next_len = body
             .len()
             .checked_add(chunk.len())
@@ -278,14 +280,14 @@ async fn fetch_checksum_sidecar(
         body.extend_from_slice(&chunk);
     }
     let text = std::str::from_utf8(&body)
-        .with_context(|| format!("Deno checksum sidecar is not UTF-8: {url}"))?;
+        .with_context(|| format!("Deno checksum sidecar is not UTF-8: {source}"))?;
     let digest_line = text
         .lines()
         .find(|line| line.split_whitespace().nth(1) == Some(filename))
         .ok_or_else(|| {
             anyhow::anyhow!("Checksum not found for {filename} in the official sidecar")
         })?;
-    parse_sha256_digest(digest_line, url)
+    parse_sha256_digest(digest_line, &source)
 }
 
 /// Select one release asset by exact vendor filename.
@@ -362,54 +364,72 @@ mod tests {
 
     #[tokio::test]
     async fn vendor_url_failure_chains_do_not_expose_tokens() -> Result<()> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         const NAME: &str = "runtimes::deno::tests::vendor_url_failure_chains_do_not_expose_tokens";
         const MARKER: &str = "OMG_URL_REDACTION_FIXTURE_CHILD";
         if std::env::var_os(MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
-            let mut child = tokio::process::Command::new(std::env::current_exe()?)
-                .args(["--exact", NAME, "--nocapture", "--color", "never"])
-                .env(MARKER, "1")
-                .env("OMG_TEST_MODE", "1")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()?;
-            let stdout = child.stdout.take().context("child stdout")?;
-            let stderr = child.stderr.take().context("child stderr")?;
-            let mut stdout = stdout.take(256 * 1024 + 1);
-            let mut stderr = stderr.take(256 * 1024 + 1);
-            let capture = async {
-                let mut out = Vec::new();
-                let mut err = Vec::new();
-                let (status, _, _) = tokio::try_join!(
-                    child.wait(),
-                    stdout.read_to_end(&mut out),
-                    stderr.read_to_end(&mut err),
-                )?;
-                Ok::<_, std::io::Error>((status, out, err))
-            };
-            let result = tokio::time::timeout(std::time::Duration::from_secs(20), capture).await;
-            let (status, out, err) = match result {
-                Ok(Ok(output)) => output,
-                failure => {
-                    if child.try_wait()?.is_none() {
-                        child.kill().await?;
-                    }
-                    child.wait().await?;
-                    anyhow::bail!("redaction fixture child did not finish: {failure:?}");
-                }
-            };
-            anyhow::ensure!(out.len() <= 256 * 1024 && err.len() <= 256 * 1024);
-            let out = String::from_utf8(out)?;
-            let err = String::from_utf8(err)?;
-            anyhow::ensure!(status.success(), "redaction child failed:\n{out}\n{err}");
-            anyhow::ensure!(out.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")));
-            println!("URL_REDACTION_CHILD\n{out}\n{err}");
-            return Ok(());
+            return run_redaction_child(NAME, MARKER).await;
         }
         anyhow::ensure!(crate::core::paths::test_mode());
         let mut violations = Vec::new();
+        check_redirected_redaction(&mut violations).await?;
+        check_sidecar_redaction(&mut violations).await?;
+        assert!(
+            violations.is_empty(),
+            "URL secrets exposed by: {violations:?}"
+        );
+        Ok(())
+    }
+
+    async fn run_redaction_child(name: &str, marker: &str) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", name, "--nocapture", "--color", "never"])
+            .env(marker, "1")
+            .env("OMG_TEST_MODE", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdout = child.stdout.take().context("child stdout")?;
+        let stderr = child.stderr.take().context("child stderr")?;
+        let mut stdout = stdout.take(256 * 1024 + 1);
+        let mut stderr = stderr.take(256 * 1024 + 1);
+        let capture = async {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let (status, _, _) = tokio::try_join!(
+                child.wait(),
+                stdout.read_to_end(&mut out),
+                stderr.read_to_end(&mut err),
+            )?;
+            Ok::<_, std::io::Error>((status, out, err))
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), capture).await;
+        let (status, out, err) = match result {
+            Ok(Ok(output)) => output,
+            failure => {
+                if child.try_wait()?.is_none() {
+                    child.kill().await?;
+                }
+                child.wait().await?;
+                anyhow::bail!("redaction fixture child did not finish: {failure:?}");
+            }
+        };
+        anyhow::ensure!(out.len() <= 256 * 1024 && err.len() <= 256 * 1024);
+        let out = String::from_utf8(out)?;
+        let err = String::from_utf8(err)?;
+        anyhow::ensure!(status.success(), "redaction child failed:\n{out}\n{err}");
+        anyhow::ensure!(
+            out.lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"))
+        );
+        println!("URL_REDACTION_CHILD\n{out}\n{err}");
+        Ok(())
+    }
+
+    async fn check_redirected_redaction(violations: &mut Vec<String>) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/start", listener.local_addr()?);
         let server = async {
@@ -444,8 +464,13 @@ mod tests {
             .downcast_ref::<reqwest::Error>()
             .context("typed transport failure")?;
         anyhow::ensure!(transport.is_timeout() && crate::core::http::is_retryable_error(transport));
-        record_redaction_failure("redirected timeout", &error, &mut violations);
+        record_redaction_failure("redirected timeout", &error, violations);
 
+        Ok(())
+    }
+
+    async fn check_sidecar_redaction(violations: &mut Vec<String>) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
         let valid_digest = "ab".repeat(32);
         for (label, status, body, declared) in [
             ("status", "404 Not Found", b"missing".to_vec(), 7),
@@ -499,13 +524,9 @@ mod tests {
                         Some(reqwest::StatusCode::NOT_FOUND)
                     );
                 }
-                record_redaction_failure(label, &error, &mut violations);
+                record_redaction_failure(label, &error, violations);
             }
         }
-        assert!(
-            violations.is_empty(),
-            "URL secrets exposed by: {violations:?}"
-        );
         Ok(())
     }
 
