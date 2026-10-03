@@ -2,6 +2,8 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,6 +15,56 @@ SPEC.loader.exec_module(HEALTH)
 
 
 class HealthTests(unittest.TestCase):
+    def test_final_driver_uses_active_serial_and_expected_boot(self):
+        source = Path(__file__).with_name("benchmark-qemu.sh").read_text()
+        begin = source.index("health_rc=0\n")
+        end = source.index("# Verdict map:", begin)
+        for transactions, serial_fatal, stale_boot, accepted in (
+            (0, False, False, True),
+            (1, False, False, True),
+            (1, True, False, False),
+            (1, False, True, False),
+        ):
+            with self.subTest(transactions=transactions, fatal=serial_fatal, stale=stale_boot):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / "guest").mkdir()
+                    (root / "transactions").mkdir()
+                    (root / "guest/serial.log").write_text("Linux version 6.12\n")
+                    (root / "transactions/resume-serial.log").write_text(
+                        "Kernel panic - not syncing: resumed guest\n" if serial_fatal
+                        else "Linux version 6.12\n"
+                    )
+                    boot = "00000000-1111-2222-3333-555555555555"
+                    observed = "00000000-1111-2222-3333-666666666666" if stale_boot else boot
+                    (root / "receipt.json").write_text(json.dumps(dict(
+                        schema_version=1, complete=True, boot_id=observed,
+                        kernel_bytes=100, fatal_signatures=[], product_crashes=[]
+                    )))
+                    setup = '''set -euo pipefail
+work="$PWD"
+controller=fixture
+rc=0
+timeout() { [[ "$1" == --kill-after=* ]] && shift; shift; "$@"; }
+docker() {
+  if [[ "$1" == inspect ]]; then
+    printf '{"Running":true,"OOMKilled":false,"ExitCode":0}\\n'
+  elif [[ "$*" == *collect* ]]; then
+    cat receipt.json
+  else
+    printf '00000000-1111-2222-3333-555555555555\\n'
+  fi
+}
+'''
+                    import shlex
+                    setup += f"here={shlex.quote(str(Path(__file__).resolve().parent))}\n"
+                    setup += f"transaction_samples={transactions}\n"
+                    result = subprocess.run(
+                        ["bash", "-c", setup + source[begin:end] + '\nexit "$rc"\n'],
+                        cwd=root, capture_output=True, text=True, timeout=10
+                    )
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
