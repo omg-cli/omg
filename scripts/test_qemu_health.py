@@ -271,6 +271,20 @@ docker() {
             self.assertEqual(receipt["product_crashes"], [])
             self.assertEqual(receipt["boot_id"], self.payload["boot_id"])
 
+    def test_invalid_processing_identity_or_state_cannot_pass(self):
+        completed = ("Id=systemd-coredump@1-4098-1046_4712-0.service\n"
+                     "ActiveState=inactive\nSubState=dead\nResult=success\n")
+        for malformed in ("{", completed.replace("Result=success\n", ""),
+                          completed + "Result=success\n",
+                          completed.replace("systemd-coredump@", "unrelated@"),
+                          completed.replace("ActiveState=inactive", "ActiveState=future-state"),
+                          completed.replace("Result=success", "Result=true")):
+            with self.subTest(processor=malformed), \
+                    patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
+                    patch.object(HEALTH, "query", side_effect=self.processing_query([malformed])):
+                with self.assertRaises(ValueError):
+                    HEALTH.collect()
+
     def test_missing_truncated_or_oversized_evidence_fails(self):
         for content in ("", "{", "null", "x" * (HEALTH.LIMIT + 1)):
             with self.subTest(length=len(content)):
