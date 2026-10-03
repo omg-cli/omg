@@ -271,6 +271,20 @@ Working directories and installed runtime state disappear with the guest;
 only cwd-local fixtures are isolated per row, not the guest's home directory
 or package database. Native ARM and macOS results require their own runners.
 
+Failed Fedora package install/remove rows retain native history, RPM identity,
+and kernel output. Before querying history, the runner also samples at most
+24 KiB from the default root DNF5 log, `/var/log/dnf5.log`. It emits only file
+metadata and the count of the fixed pipe-creation error signal. It does not
+export raw log text. Symlinks, hard links, and special files are refused, and
+each probe has a two-second deadline with a one-second kill grace period.
+Missing logs and custom log directories remain unavailable. A zero count
+does not exclude errors outside the sample. The tail is not UUID-correlated
+and does not establish why the failed transaction remained Started.
+Upstream [DNF5 starts history before creating the scriptlet pipe](https://github.com/rpm-software-management/dnf5/blob/5.4.1.0/libdnf5/base/transaction.cpp#L1121)
+and can return without finalization if pipe creation fails. Its CLI uses
+[`dnf5.log`](https://github.com/rpm-software-management/dnf5/blob/5.4.1.0/dnf5/main.cpp#L96)
+under the [configured log directory](https://dnf5.readthedocs.io/en/stable/dnf5.conf.5.html#logdir).
+
 ## Evidence contracts and sources
 
 - [GNU timeout](https://www.gnu.org/software/coreutils/manual/html_node/timeout-invocation.html)
