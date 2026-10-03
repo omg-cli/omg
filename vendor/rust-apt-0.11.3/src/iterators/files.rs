@@ -19,7 +19,16 @@ impl<'a> VersionFile<'a> {
 	}
 
 	/// Return the PkgRecords Parser for the VersionFile
-	pub fn lookup(&self) -> &PackageRecords { self.cache.records().ver_lookup(&self.ptr) }
+	pub fn lookup(&self) -> &PackageRecords {
+		self.cache.records().ver_lookup(&self.ptr)
+	}
+
+	/// Cache-local file identity and uncompressed byte offset of this record.
+	///
+	/// Sort bulk record reads by this key to avoid backwards compressed-file seeks.
+	pub fn record_location(&self) -> (usize, u64) {
+		(self.package_file().ptr.index(), self.ptr.record_offset())
+	}
 
 	/// Return the PackageFile for this VersionFile
 	pub fn package_file(&self) -> PackageFile<'a> {
@@ -52,7 +61,9 @@ impl<'a> PackageFile<'a> {
 	}
 
 	/// The priority of this file as shown in `apt-cache policy`.
-	pub fn priority(&self) -> i32 { self.cache.file_priority(self) }
+	pub fn priority(&self) -> i32 {
+		self.cache.file_priority(self)
+	}
 }
 
 cxx_convert_result!(
@@ -151,6 +162,7 @@ pub(crate) mod raw {
 		unsafe fn package_file(self: &VerFileIterator) -> UniquePtr<PkgFileIterator>;
 
 		pub fn index(self: &VerFileIterator) -> usize;
+		pub fn record_offset(self: &VerFileIterator) -> u64;
 		/// Clone the pointer.
 		///
 		/// # Safety
