@@ -3037,6 +3037,89 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
 
 
     @unittest.skipIf(os.name == 'nt', 'Generated offline launch requires POSIX bash')
+    def test_offline_doctor_launch_admits_only_exact_capability_cleanup(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
+        launch = source[start:source.index('  # Bash SECONDS', start)]
+        defaults = dict(distro='debian', case='doctor-turbo', safety='isolated-write',
+                        assertions='doctor-capability-cleanup', expected_ux='pass',
+                        requires='-', tier='container',
+                        targets='arch:pass,debian:pass,ubuntu:pass,fedora:pass',
+                        cleanup='tempdir-drop', network_scope='offline', ssh_user='fixture',
+                        args_json='["doctor","--turbo"]')
+        variants = [(distro, {'distro': distro}, '0:retained')
+                    for distro in ('arch', 'debian', 'ubuntu', 'fedora')]
+        for key, value in (
+            ('distro', 'other'), ('ssh_user', 'root'), ('case', 'other'),
+            ('safety', 'read'), ('assertions', '-'), ('expected_ux', 'declared'),
+            ('requires', 'help'), ('tier', 'hermetic'), ('targets', 'debian:pass'),
+            ('cleanup', 'none'), ('args_json', '["doctor"]'),
+            ('args_json', '["doctor","--turbo","--yes"]'),
+            ('args_json', '["doctor","--network"]'),
+        ):
+            variants.append((key + '=' + value, {key: value}, '1:dropped'))
+        variants += [('wrong expected exit', {'resolved_exit': '1'}, '1:dropped'),
+                     ('prerequisite chain', {'chain_entry': 'help'}, '1:dropped'),
+                     ('network scope unchanged', {'network_scope': 'network'}, 'unwrapped')]
+        wrappers = r"""
+sudo() { [[ "$1" == -n ]] || return 90; shift; "$@"; }
+unshare() { [[ "$1:$2" == --net:-- ]] || return 91; shift 2; "$@"; }
+setpriv() {
+  local nnp=0 bound=retained uid= gid= clear=0 inh=0 ambient=0
+  while [[ "$1" != env ]]; do
+    case "$1" in
+      --reuid=*) uid=${1#*=} ;; --regid=*) gid=${1#*=} ;;
+      --clear-groups) clear=1 ;; --no-new-privs) nnp=1 ;;
+      --bounding-set=-all) bound=dropped ;; --inh-caps=-all) inh=1 ;;
+      --ambient-caps=-all) ambient=1 ;; *) return 92 ;;
+    esac; shift
+  done
+  [[ "$uid" == "$(id -u)" && "$gid" == "$(id -g)" && "$uid" != 0 && "$clear:$inh:$ambient" == 1:1:1 ]] || return 93
+  export OMG_QEMU_TEST_LAUNCH="$nnp:$bound"
+  "$@"
+}
+export -f sudo unshare setpriv
+"""
+        for label, changes, expected in variants:
+            values = dict(defaults, **{k: v for k, v in changes.items()
+                                      if k not in {'resolved_exit', 'chain_entry'}})
+            assignments = '\n'.join(f'{key}={shlex.quote(value)}' for key, value in values.items())
+            chain = shlex.quote(changes['chain_entry']) if 'chain_entry' in changes else ''
+            setup = (assignments + '\ndeclare -A row_exit=([$case]='
+                     + shlex.quote(changes.get('resolved_exit', '0')) + ')\nchain=(' + chain + ')\n')
+            script = (wrappers + setup
+                      + 'remote=' + shlex.quote('bash -c ' + shlex.quote(
+                          'printf %s "${OMG_QEMU_TEST_LAUNCH:-unwrapped}"')) + '\n'
+                      + launch + '\nbash -c "$remote"\n')
+            with self.subTest(label=label):
+                result = subprocess.run(['bash', '-c', script], capture_output=True,
+                                        text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected, label)
+
+    @unittest.skipIf(os.name == 'nt', 'Generated offline launch requires POSIX bash')
+    def test_offline_doctor_rejects_an_initial_root_user_before_sudo(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
+        launch = source[start:source.index('  # Bash SECONDS', start)]
+        setup = '''
+distro=debian; case=doctor-turbo; safety=isolated-write
+assertions=doctor-capability-cleanup; expected_ux=pass; requires=-
+tier=container; targets=arch:pass,debian:pass,ubuntu:pass,fedora:pass
+cleanup=tempdir-drop; network_scope=offline; ssh_user=fixture
+args_json='["doctor","--turbo"]'
+declare -A row_exit=([doctor-turbo]=0); chain=()
+remote='printf forbidden-product'
+id() { printf 0; }
+sudo() { printf forbidden-sudo; }
+export -f id sudo
+'''
+        result = subprocess.run(['bash', '-c', setup + launch + '\nbash -c "$remote"'],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    @unittest.skipIf(os.name == 'nt', 'Generated offline launch requires POSIX bash')
     def test_offline_preview_launch_admits_only_the_exact_fedora_dry_run(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         start = source.index('  if [[ "$network_scope" == offline ]]; then\n')

@@ -3125,20 +3125,32 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       # Native DNF5 stored-plan resolution requires authenticated root even
       # for a dry run. Admit only this exact validated, prerequisite-free row;
       # keep its initial user/group/capability drop and offline namespace.
-      preview_privilege=false
+      native_privilege=false
       if [[ "$distro" == fedora && "$case" == remove && "$safety" == read
             && "$assertions" == package-dry-run-remove && "${row_exit[$case]}" == 0
             && "$expected_ux" == pass && "$requires" == - && ${#chain[@]} == 0
             && "$tier" == hermetic && "$targets" == hermetic:pass
             && "$cleanup" == tempdir-drop && "$ssh_user" != root ]] \
         && jq -e '. == ["remove", "--dry-run", "jq"]' <<< "$args_json" >/dev/null; then
-        preview_privilege=true
+        native_privilege=true
       fi
-      if [[ "$preview_privilege" == false ]]; then
+      # Doctor must seed and remove a capability on its private exact-copy
+      # executable through authenticated sudo. Keep this exception row-exact;
+      # no_new_privs or a dropped bounding set prevents that native transition.
+      if [[ "$case" == doctor-turbo && "$safety" == isolated-write
+            && "$assertions" == doctor-capability-cleanup && "${row_exit[$case]}" == 0
+            && "$expected_ux" == pass && "$requires" == - && ${#chain[@]} == 0
+            && "$tier" == container && "$targets" == arch:pass,debian:pass,ubuntu:pass,fedora:pass
+            && "$cleanup" == tempdir-drop && "$ssh_user" != root
+            && ( "$distro" == arch || "$distro" == debian || "$distro" == ubuntu || "$distro" == fedora ) ]] \
+        && jq -e '. == ["doctor", "--turbo"]' <<< "$args_json" >/dev/null; then
+        native_privilege=true
+      fi
+      if [[ "$native_privilege" == false ]]; then
         remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
       else
-        # Retain the bounding set solely so sudo can authenticate this native
-        # preview. Refuse an initial root user before any fixture or receipt.
+        # Retain the bounding set solely for the validated temporary native
+        # operation. Refuse an initial root user before any fixture or receipt.
         remote="test \$(id -u) -ne 0 && sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
       fi
     fi
