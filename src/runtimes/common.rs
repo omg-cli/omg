@@ -2182,7 +2182,7 @@ mod tests {
             },
             dest,
         );
-        let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let ((), result) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             tokio::try_join!(server, download)
         })
         .await??;
@@ -2350,7 +2350,7 @@ mod tests {
             .await?;
             assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
             if recover {
-                let (_, (temporary, digest)) = result?;
+                let ((), (temporary, digest)) = result?;
                 assert_eq!(fs::read(&temporary)?, body);
                 assert_eq!(digest, hex::encode(Sha256::digest(body)));
                 drop(temporary);
