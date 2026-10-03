@@ -1472,7 +1472,7 @@ pub fn enable_turbo_mode() -> Result<()> {
         "Sudo credentials are not cached; turbo setup was not completed"
     );
     println!(
-        "  {} No file capabilities remain on this binary",
+        "  {} No file capabilities remain (or none were set)",
         crate::cli::style::positive("✓")
     );
     println!();
@@ -1490,7 +1490,7 @@ pub fn enable_turbo_mode() -> Result<()> {
         crate::cli::style::dim("•")
     );
     println!(
-        "    {} No file capabilities retained on this omg binary",
+        "    {} No permanent privileges granted to any binary",
         crate::cli::style::dim("•")
     );
     println!();
