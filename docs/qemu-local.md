@@ -41,6 +41,36 @@ hosted reporter closes an issue only after a qualifying passing push to
   `OMG_SMOKE_SENTRY_DSN` when no file is configured.
   See [reporter configuration](../scripts/README.md#optional-sentry-reporting).
 
+## Controller cost and transport boundaries
+
+Docker runs the disposable QEMU controller: it supplies QEMU, image tools and
+the SSH client. The distro under test boots inside QEMU. Controller storage,
+guest base images, trial overlays and Rust build caches are separate costs.
+
+The October 3, 2026 audit measured the existing amd64 controller pin
+`debian:trixie@sha256:6788062a1b42ac281f053ac876170b79a3eaed5d61383b8ed7eaca6c6965f3b1`:
+
+| Observation | Measured cost | Limit |
+| --- | --- | --- |
+| Registry layer content | 49,337,828 compressed bytes | Streamed, digest-checked and discarded; excludes Docker unpack/import. |
+| Cached controller setup | 96 added package identities, two version changes; about 26.4 seconds for apt download/install | One local observation; excludes the initial image pull. |
+| Prepared controller writable files | 271,114,240 bytes | Docker file sizes, not allocated filesystem or Windows VHD bytes. |
+
+See the [setup evidence](https://github.com/omg-cli/omg/issues/611#issuecomment-5966012686)
+and [registry measurement](https://github.com/omg-cli/omg/issues/611#issuecomment-5966465545).
+These figures do not establish hosted timings or a prebuilt-image speedup.
+Keep the current controller pin while evaluating that tradeoff; a replacement
+image needs its own provenance, storage budget and measured benefit.
+
+Vsock readiness is still experimental. On the audited WSL runner, vhost device
+ownership, features and CID assignment succeeded both on the host and in the
+controller, but the controller's AF_VSOCK socket creation failed with `EPERM`.
+[Docker's default security policy](https://docs.docker.com/engine/security/seccomp/)
+blocks that socket family. Device mappings alone therefore do not establish a
+working SSH transport. The [capability spike](https://github.com/omg-cli/omg/issues/611#issuecomment-5966386812)
+did not boot a guest or prove clone readiness. Any transport extension must
+account for this policy boundary without silently disabling confinement.
+
 ## What to run
 
 ### ARM runner configuration
