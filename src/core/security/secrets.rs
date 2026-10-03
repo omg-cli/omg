@@ -703,6 +703,34 @@ mod tests {
     }
 
     #[test]
+    fn scan_file_accepts_exact_bounded_read_limit_and_scans_the_tail() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut temp = tempfile::NamedTempFile::new().expect("temporary scan file");
+        let marker = b"\n-----BEGIN RSA PRIVATE KEY-----\n";
+        temp.as_file()
+            .set_len(SecretScanner::MAX_FILE_BYTES)
+            .expect("exact supported file size");
+        let offset = SecretScanner::MAX_FILE_BYTES
+            .checked_sub(u64::try_from(marker.len()).expect("marker length fits u64"))
+            .expect("marker fits inside the supported limit");
+        temp.seek(SeekFrom::Start(offset))
+            .expect("seek to final secret marker");
+        temp.write_all(marker).expect("write final secret marker");
+        assert_eq!(
+            temp.as_file().metadata().expect("fixture metadata").len(),
+            SecretScanner::MAX_FILE_BYTES
+        );
+
+        let findings = SecretScanner::new()
+            .scan_file(temp.path())
+            .expect("a file exactly at the supported limit must be scanned");
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(findings[0].secret_type, SecretType::PrivateKey));
+        assert_eq!(findings[0].line_number, 2);
+    }
+
+    #[test]
     fn scan_file_rejects_files_over_the_bounded_read_limit() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         temp.as_file()

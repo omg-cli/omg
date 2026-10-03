@@ -395,9 +395,11 @@ if [[ "$restrict_egress" == true ]]; then
     > "$work/egress-policy.json" 2> "$work/egress-policy.log"
 fi
 timeout --kill-after=5s 600 docker exec "$controller" sh -c "apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends $qemu_pkg qemu-utils cloud-image-utils openssh-client curl ca-certificates $firmware_pkg jq" > "$work/controller-setup.log" 2>&1
+cp "$here/install-qemu-libslirp.py" "$work/install-qemu-libslirp.py"
+timeout --kill-after=5s 120 docker exec "$controller" python3 /work/install-qemu-libslirp.py "$qemu_pkg" > "$work/controller-security.log" 2>&1
 cp "$here/check-qemu-controller.sh" "$work/check-qemu-controller.sh"
 cp "$here/check-qemu-cloud-init.sh" "$work/check-qemu-cloud-init.sh"
-timeout 30 docker exec "$controller" bash /work/check-qemu-controller.sh "$qemu_pkg" > "$work/controller-security.log" 2>&1
+timeout 30 docker exec "$controller" bash /work/check-qemu-controller.sh "$qemu_pkg" >> "$work/controller-security.log" 2>&1
 # A cache hit is only a transport optimization: copy and hash the bytes before
 # handing them to the controller, then verify again there and against policy.
 cache_file=

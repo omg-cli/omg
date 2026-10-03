@@ -16,3 +16,12 @@ for package in "$1" qemu-system-common qemu-utils; do
     exit 3
   fi
 done
+# libslirp is separately packaged; a patched QEMU does not imply this floor.
+# https://security-tracker.debian.org/tracker/source-package/libslirp
+version=$(dpkg-query -W -f='${Version}' libslirp0)
+[[ -n "$version" && "$version" != *$'\n'* ]] || exit 3
+printf 'libslirp0=%s minimum=4.9.5-1\n' "$version"
+if ! dpkg --compare-versions "$version" ge '4.9.5-1'; then
+  printf 'error: libslirp0 is below the patched controller floor\n' >&2
+  exit 3
+fi
