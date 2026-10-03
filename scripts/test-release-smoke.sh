@@ -625,14 +625,18 @@ qemu_runner="${OMG_QEMU_TEST_RUNNER:-$repo_root/scripts/benchmark-qemu.sh}"
 # This host has no /dev/kvm, so the fixture legs below skip the KVM
 # device probe; dedicated probe tests further down cover it explicitly.
 export OMG_QEMU_ALLOW_NO_KVM=1
-assert_rc 1 "$qemu_runner" --distro all --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-unavailable"
+assert_rc 1 "$qemu_runner" --distro all --arch x86_64 --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-unavailable"
 qemu_result=$(find "$scratch/qemu-unavailable" -mindepth 2 -maxdepth 2 -name results.json -print -quit)
 [[ -n "$qemu_result" ]] || fail 'QEMU suite omitted unavailable-engine results'
-jq -e 'length == 4 and ([.[].distro] | sort) == ["arch", "debian", "fedora", "ubuntu"] and all(.[]; .result == "HARNESS_ERROR" and .exit_code == 3)' "$qemu_result" >/dev/null || fail 'QEMU suite omitted a requested distro or misclassified preflight failure'
+jq -e 'length == 5 and ([.[].distro] | sort) == ["arch", "debian", "debian-trixie", "fedora", "ubuntu"] and all(.[]; .result == "HARNESS_ERROR" and .exit_code == 3)' "$qemu_result" >/dev/null || fail 'QEMU suite omitted a requested distro or misclassified preflight failure'
 
-assert_rc 143 bash -c 'export FAKE_QEMU_SUITE_PID=$$; exec "$@"' _ "$qemu_runner" --distro all --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-interrupted"
+assert_rc 1 "$qemu_runner" --distro all --arch aarch64 --allow-tcg --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-arm-unavailable"
+qemu_result=$(find "$scratch/qemu-arm-unavailable" -mindepth 2 -maxdepth 2 -name results.json -print -quit)
+jq -e 'length == 3 and ([.[].distro] | sort) == ["debian", "fedora", "ubuntu"] and all(.[]; .result == "HARNESS_ERROR" and .exit_code == 3)' "$qemu_result" >/dev/null || fail 'QEMU ARM suite selected unsupported guests or lost preflight failures'
+
+assert_rc 143 bash -c 'export FAKE_QEMU_SUITE_PID=$$; exec "$@"' _ "$qemu_runner" --distro all --arch x86_64 --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-interrupted"
 qemu_result=$(find "$scratch/qemu-interrupted" -mindepth 2 -maxdepth 2 -name results.json -print -quit)
-jq -e 'length == 4 and .[0].result == "INCOMPLETE" and all(.[1:][]; .result == "NOT_RUN")' "$qemu_result" >/dev/null || fail 'interrupted QEMU suite lost target states'
+jq -e 'length == 5 and ([.[].distro] | sort) == ["arch", "debian", "debian-trixie", "fedora", "ubuntu"] and .[0].result == "INCOMPLETE" and all(.[1:][]; .result == "NOT_RUN")' "$qemu_result" >/dev/null || fail 'interrupted QEMU suite lost target states'
 for _attempt in {1..100}; do
   child_result=$(find "$scratch/qemu-interrupted" -mindepth 4 -maxdepth 4 -name results.json -print -quit)
   if [[ -n "$child_result" ]] && jq -e '.[0].result == "HARNESS_ERROR"' "$child_result" >/dev/null 2>&1; then break; fi
