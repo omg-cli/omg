@@ -117,7 +117,7 @@ def run(binary_name, distro):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--distro', required=True, choices=('debian', 'ubuntu'))
+    parser.add_argument('--distro', required=True, choices=('debian', 'debian-trixie', 'ubuntu'))
     parser.add_argument('--binary')
     parser.add_argument('--receipt', type=Path)
     args = parser.parse_args()

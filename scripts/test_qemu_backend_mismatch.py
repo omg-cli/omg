@@ -14,6 +14,16 @@ SPEC.loader.exec_module(PROBE)
 
 
 class BackendMismatchReceiptTests(unittest.TestCase):
+    def test_trixie_mismatch_preserves_guest_identity_and_detects_apt_access(self):
+        receipt = dict(self.receipt(), distro='debian-trixie')
+        PROBE.validate_receipt(receipt, 'debian-trixie')
+        for line in ('openat(AT_FDCWD, "/var/lib/dpkg/status", O_RDONLY) = 3',
+                     'execve("/usr/bin/apt-get", ["apt-get"], 0x0) = 0'):
+            with self.subTest(line=line):
+                self.assertTrue(PROBE.native_db_access(line, 'debian-trixie'))
+        with self.assertRaises(ValueError):
+            PROBE.validate_receipt(dict(receipt, distro='debian'), 'debian-trixie')
+
     def test_probe_inventory_keeps_all_backend_entrypoints(self):
         self.assertEqual(tuple(name for name, _ in PROBE.PROBES), (
             "doctor", "info", "search", "status", "explicit_count",
@@ -60,6 +70,8 @@ class BackendMismatchReceiptTests(unittest.TestCase):
                  "ubuntu": "/var/lib/apt/extended_states", "fedora": "/usr/lib/sysimage/rpm/rpmdb.sqlite"}
         tools = {"arch": "pacman", "debian": "dpkg-query", "ubuntu": "apt-cache",
                  "fedora": "dnf5"}
+        paths['debian-trixie'] = '/var/lib/dpkg/status'
+        tools['debian-trixie'] = 'dpkg-query'
         for distro in PROBE.DATABASE_PATHS:
             with self.subTest(distro=distro):
                 self.assertTrue(PROBE.native_db_access(

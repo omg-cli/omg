@@ -58,6 +58,8 @@ PROBES = (
     ("dash", ("dash",)),
     ("omgd", ()),
 )
+for mapping in (DATABASE_PATHS, TRACE_PATHS, NATIVE_EXECUTABLES, FAKE_ID):
+    mapping["debian-trixie"] = mapping["debian"]
 
 
 def database_snapshot(distro):

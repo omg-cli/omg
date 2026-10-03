@@ -114,9 +114,11 @@ def validate_evidence(directory, archive, fixture, distro):
             raise ValueError("native source/binary mapping incomplete")
         release = dict(line.split("=", 1) for line in read_text(directory, "os-release").splitlines() if "=" in line)
         release = {key: value.strip('"') for key, value in release.items()}
-        if release.get("ID") != distro or not release.get("VERSION_ID"):
+        expected_id = "debian" if distro == "debian-trixie" else distro
+        if (release.get("ID") != expected_id or not release.get("VERSION_ID")
+                or distro == "debian-trixie" and release["VERSION_ID"] != "13"):
             raise ValueError("native distro mismatch")
-        ecosystem = ("Debian:" if distro == "debian" else "Ubuntu:") + release["VERSION_ID"]
+        ecosystem = ("Debian:" if expected_id == "debian" else "Ubuntu:") + release["VERSION_ID"]
         if distro == "ubuntu" and "LTS" in release.get("VERSION", ""):
             ecosystem += ":LTS"
         if receipt.get("ecosystem") != ecosystem:
@@ -168,7 +170,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--archive", required=True, type=Path)
-    parser.add_argument("--distro", required=True, choices=("debian", "ubuntu"))
+    parser.add_argument("--distro", required=True, choices=("debian", "debian-trixie", "ubuntu"))
     args = parser.parse_args()
     try:
         validate_evidence(args.evidence_dir, args.archive, Path(__file__).with_name("qemu-osv-positive-oracle.py"), args.distro)

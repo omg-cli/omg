@@ -23,7 +23,7 @@ def regular(path):
 def native_packages(distro):
     if distro == "arch":
         command = ["pacman", "-Qqe"]
-    elif distro in ("debian", "ubuntu"):
+    elif distro in ("debian", "debian-trixie", "ubuntu"):
         command = ["apt-mark", "showmanual"]
     elif distro == "fedora":
         command = ["dnf", "--cacheonly", "--disable-repo=*",

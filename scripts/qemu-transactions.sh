@@ -5,7 +5,7 @@ set -euo pipefail
 distro=$1; tag=$2; arch=$3; samples=$4
 shift 4
 boot_args=("$@")
-case "$distro" in arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
+case "$distro" in arch|debian|debian-trixie|ubuntu|fedora) ;; *) exit 2 ;; esac
 [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$arch" =~ ^(x86_64|aarch64)$ ]] || exit 2
 [[ "$samples" =~ ^([1-9]|[1-9][0-9]|100)$ ]] || exit 2
 cd /work/guest
@@ -128,8 +128,8 @@ native_change() {
   case "$distro:$operation" in
     arch:install) remote_argv sudo -n pacman -S --noconfirm tree ;;
     arch:remove) remote_argv sudo -n pacman -R --noconfirm tree ;;
-    debian:install|ubuntu:install) remote_argv sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y tree ;;
-    debian:remove|ubuntu:remove) remote_argv sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y tree ;;
+    debian:install|debian-trixie:install|ubuntu:install) remote_argv sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y tree ;;
+    debian:remove|debian-trixie:remove|ubuntu:remove) remote_argv sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y tree ;;
     fedora:install|fedora:remove) remote_argv sudo -n dnf "$operation" -y tree ;;
     *) return 2 ;;
   esac
@@ -141,7 +141,7 @@ capture_repository_state() {
     case "$1" in
       arch) paths=(etc/pacman.conf etc/pacman.d/mirrorlist var/lib/pacman/sync
         var/lib/pacman/local etc/pacman.d/gnupg/pubring.gpg etc/pacman.d/gnupg/trustdb.gpg) ;;
-      debian|ubuntu) paths=(etc/apt/sources.list etc/apt/sources.list.d etc/apt/trusted.gpg.d
+      debian|debian-trixie|ubuntu) paths=(etc/apt/sources.list etc/apt/sources.list.d etc/apt/trusted.gpg.d
         var/lib/apt/lists var/lib/dpkg/status var/lib/apt/extended_states) ;;
       fedora) paths=(etc/yum.repos.d etc/dnf/dnf.conf etc/pki/rpm-gpg
         usr/lib/sysimage/rpm var/lib/rpm var/cache/dnf var/cache/libdnf5) ;;
@@ -170,7 +170,7 @@ mask_units() {
 # Both tools receive the same base for a given operation. Cache state is inherited,
 # not described as cold, and no guest boot or SSH time enters Hyperfine.
 case "$distro" in
-  debian|ubuntu)
+  debian|debian-trixie|ubuntu)
     mask_units apt-daily.service apt-daily-upgrade.service \
       apt-daily.timer apt-daily-upgrade.timer > "$output/automatic-updates.log" 2>&1 ;;
   fedora)
@@ -185,7 +185,7 @@ native_change install > "$output/prepare-remove.log" 2>&1
 preparation_step=query-tree-version
 case "$distro" in
   arch) version=$(remote_argv pacman -Q tree); version=${version#tree } ;;
-  debian|ubuntu) version=$(remote_argv dpkg-query -W '-f=${Version}\n' tree) ;;
+  debian|debian-trixie|ubuntu) version=$(remote_argv dpkg-query -W '-f=${Version}\n' tree) ;;
   fedora) version=$(remote_argv rpm -q --qf '%{VERSION}-%{RELEASE}\n' tree) ;;
 esac
 [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9.:+~_-]*$ ]] || exit 1
@@ -256,7 +256,7 @@ for operation in install remove; do
       if [[ "$code" != 0 ]]; then
         expected_label=OMG
         if [[ "$tool" == native ]]; then
-          case "$distro" in arch) expected_label=pacman ;; debian|ubuntu) expected_label=apt ;; fedora) expected_label=dnf ;; esac
+          case "$distro" in arch) expected_label=pacman ;; debian|debian-trixie|ubuntu) expected_label=apt ;; fedora) expected_label=dnf ;; esac
         fi
         # Only an identified command receipt proves a workload failure. Reserved
         # execution/timeout/signal codes and missing evidence remain harness errors.

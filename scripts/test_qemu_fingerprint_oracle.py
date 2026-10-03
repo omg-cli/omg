@@ -17,6 +17,13 @@ SPEC.loader.exec_module(ORACLE)
 
 
 class FingerprintOracleTests(unittest.TestCase):
+    def test_trixie_fingerprint_uses_the_native_explicit_apt_set(self):
+        with patch.object(ORACLE.subprocess, 'run',
+                          return_value=SimpleNamespace(stdout='curl\ngit\n')) as run:
+            self.assertEqual(ORACLE.native_packages('debian-trixie'), {'curl', 'git'})
+        self.assertEqual(run.call_args.args[0], ['apt-mark', 'showmanual'])
+        self.assertTrue(run.call_args.kwargs['check'])
+
     def test_fedora_native_query_keeps_literal_dnf_format_escape(self):
         with patch.object(ORACLE.subprocess, "run",
                           return_value=SimpleNamespace(stdout="curl\ngit\n")) as run:
