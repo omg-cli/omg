@@ -291,13 +291,22 @@ check_outdated_native_count() {
 
 # BEGIN DOCTOR BACKEND ORACLE
 check_doctor_native_backend() {
-  local distro=$1 output=$2 os_release=${3:-/etc/os-release} exec_receipt=${4:-} restricted_path=${5:-false} index_receipt=${6:-} guest_id expected
+  local distro=$1 output=$2 os_release=${3:-/etc/os-release} exec_receipt=${4:-} restricted_path=${5:-false} index_receipt=${6:-} guest_id guest_version expected_guest expected
   if [[ ! -f "$os_release" ]]; then
     printf 'native doctor reference lacks an os-release file\n' >&2
     return 2
   fi
-  guest_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")
-  if [[ "$guest_id" != "$distro" ]]; then
+  guest_id=$(awk -F= '$1 == "ID" {v=$2; if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v=substr(v,2,length(v)-2); print v}' "$os_release")
+  expected_guest=$distro
+  if [[ "$distro" == debian-trixie ]]; then
+    expected_guest=debian
+    guest_version=$(awk -F= '$1 == "VERSION_ID" {v=$2; if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v=substr(v,2,length(v)-2); print v}' "$os_release")
+    if [[ "$guest_version" != 13 ]]; then
+      printf 'native doctor reference requires Debian 13 for the Trixie guest\n' >&2
+      return 2
+    fi
+  fi
+  if [[ "$guest_id" != "$expected_guest" ]]; then
     printf 'native doctor reference expected %s guest, found %s\n' "$distro" "$guest_id" >&2
     return 2
   fi
