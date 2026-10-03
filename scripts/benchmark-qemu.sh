@@ -1048,6 +1048,7 @@ if [[ "$transaction_samples" != 0 && "$rc" == 0 ]]; then
     fi
   elif ! (
     summary="$work/transactions/summary.json"
+    python3 "$here/check-qemu-health.py" verify-preparations --root "$work" || exit 1
     [[ -f "$summary" && $(wc -c < "$summary") -le 1048576 ]] || exit 1
     jq -e --arg distro "$distro" --argjson count "$transaction_samples" '
       . as $s |
@@ -1276,16 +1277,27 @@ fi
 # Health is an independent admission gate after the selected test work. Query
 # boot-scoped kernel/crash identity only, never raw cores or process environments.
 health_rc=0
+health_serial="$work/guest/serial.log"
+if [[ "$transaction_samples" != 0 ]]; then
+  health_serial="$work/transactions/resume-serial.log"
+fi
+timeout --kill-after=5s 30s docker exec -i -w /work/guest "$controller" \
+  ssh -i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5 \
+    -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+    -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts \
+    bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id \
+  > "$work/guest-boot-id.txt" 2> "$work/health-validation.log" || health_rc=$?
+health_boot_id=$(tr -d '\r\n' < "$work/guest-boot-id.txt")
 timeout --kill-after=5s 60s docker exec -i -w /work/guest "$controller" \
   ssh -i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5 \
     -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
     -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts \
     bench@127.0.0.1 sudo -n python3 - collect \
-  < "$here/check-qemu-health.py" > "$work/guest-health.json" 2> "$work/health-validation.log" || health_rc=$?
+  < "$here/check-qemu-health.py" > "$work/guest-health.json" 2>> "$work/health-validation.log" || health_rc=$?
 timeout 15 docker inspect --format '{{json .State}}' "$controller" > "$work/controller-health.json" 2>> "$work/health-validation.log" || health_rc=120
 if [[ "$health_rc" == 0 ]]; then
   python3 "$here/check-qemu-health.py" verify --guest "$work/guest-health.json" \
-    --serial "$work/guest/serial.log" --controller "$work/controller-health.json" \
+    --serial "$health_serial" --controller "$work/controller-health.json" --boot-id "$health_boot_id" \
     >> "$work/health-validation.log" 2>&1 || health_rc=120
 fi
 if [[ "$health_rc" != 0 ]]; then

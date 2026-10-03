@@ -474,6 +474,15 @@ impl RustManager {
             }
         }
 
+        for component in ["rustc", "cargo"] {
+            if required_components
+                .iter()
+                .any(|required| required == component)
+            {
+                super::common::require_regular_file(&dest_dir.join("bin").join(component))?;
+            }
+        }
+
         let mut metadata = RustToolchainMetadata {
             release: Some(manifest_release(manifest)?),
             ..Default::default()
@@ -919,8 +928,10 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             assert!(crate::core::paths::test_mode());
             return tokio::runtime::Runtime::new()?.block_on(async {
-                install_fixture(false).await?;
-                install_fixture(true).await
+                install_fixture(false, None).await?;
+                install_fixture(true, None).await?;
+                install_fixture(false, Some("cargo")).await?;
+                install_fixture(false, Some("rustc")).await
             });
         }
         // Isolate the existing debug-only loopback policy to this child process.
@@ -948,7 +959,7 @@ mod tests {
         Ok(())
     }
 
-    async fn install_fixture(corrupt: bool) -> Result<()> {
+    async fn install_fixture(corrupt: bool, missing_launcher: Option<&str>) -> Result<()> {
         use sha2::{Digest as _, Sha256};
         use std::fmt::Write as _;
         let toolchain = RustToolchainSpec::parse("1.93.1")?;
@@ -969,6 +980,11 @@ mod tests {
                 false,
             ),
         ] {
+            let file = if missing_launcher == Some(component) {
+                "share/doc/stub"
+            } else {
+                file
+            };
             let tar = component_archive(
                 &format!("{component}-1.93.1-target/{component}/{file}"),
                 EntryType::Regular,
@@ -1029,6 +1045,31 @@ mod tests {
             assert_eq!(
                 archives.finish().await?,
                 ["GET /dist/cargo.tar.gz HTTP/1.1"]
+            );
+            return Ok(());
+        }
+        if let Some(component) = missing_launcher {
+            let error =
+                result.expect_err("missing requested launcher must not publish a toolchain");
+            assert!(format!("{error:#}").contains("Missing required runtime binary"));
+            assert!(format!("{error:#}").contains(&format!("bin/{component}")));
+            assert!(!directory.exists());
+            assert!(!versions.path().join("current").exists());
+            let names: Vec<_> = fs::read_dir(versions.path())?
+                .map(|entry| entry.map(|item| item.file_name()))
+                .collect::<std::io::Result<_>>()?;
+            assert_eq!(names, [".mutation.lock"]);
+            assert_eq!(
+                fixture.finish().await?,
+                ["GET /dist/channel-rust-1.93.1.toml HTTP/1.1"]
+            );
+            assert_eq!(
+                archives.finish().await?,
+                [
+                    "GET /dist/cargo.tar.gz HTTP/1.1",
+                    "GET /dist/rust-std.tar.xz HTTP/1.1",
+                    "GET /dist/rustc.tar.gz HTTP/1.1"
+                ]
             );
             return Ok(());
         }
