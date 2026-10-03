@@ -377,13 +377,15 @@ mod tests {
                 .spawn()?;
             let stdout = child.stdout.take().context("child stdout")?;
             let stderr = child.stderr.take().context("child stderr")?;
+            let mut stdout = stdout.take(256 * 1024 + 1);
+            let mut stderr = stderr.take(256 * 1024 + 1);
             let capture = async {
                 let mut out = Vec::new();
                 let mut err = Vec::new();
                 let (status, _, _) = tokio::try_join!(
                     child.wait(),
-                    stdout.take(256 * 1024 + 1).read_to_end(&mut out),
-                    stderr.take(256 * 1024 + 1).read_to_end(&mut err),
+                    stdout.read_to_end(&mut out),
+                    stderr.read_to_end(&mut err),
                 )?;
                 Ok::<_, std::io::Error>((status, out, err))
             };
