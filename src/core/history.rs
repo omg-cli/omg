@@ -943,38 +943,59 @@ mod tests {
 
     #[test]
     fn concurrent_corrupt_loads_do_not_rename_a_fresh_history() -> Result<()> {
-        use std::sync::{Arc, Barrier};
+        use std::sync::{Arc, Barrier, mpsc};
 
         const WORKERS: usize = 8;
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("history.json");
         fs::write(&path, "not valid JSON")?;
         let barrier = Arc::new(Barrier::new(WORKERS));
+        let (written, persisted): (Vec<_>, Vec<_>) = (1..WORKERS).map(|_| mpsc::channel()).unzip();
         let mut workers = Vec::new();
-        for index in 0..WORKERS {
-            let path = path.clone();
+        let manager = HistoryManager::new_in(&path)?;
+        let writer_barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || -> Result<()> {
+            writer_barrier.wait();
+            let result = manager.add_transaction(
+                TransactionType::Install,
+                vec![PackageChange {
+                    name: "example".to_string(),
+                    old_version: None,
+                    new_version: Some("1.0".to_string()),
+                    source: "official".to_string(),
+                }],
+                true,
+            );
+            for reader in written {
+                reader.send(())?;
+            }
+            result
+        }));
+        for persisted in persisted {
+            let manager = HistoryManager::new_in(&path)?;
             let barrier = Arc::clone(&barrier);
             workers.push(std::thread::spawn(move || -> Result<()> {
-                let manager = HistoryManager::new_in(&path)?;
-                barrier.wait();
-                if index == 0 {
-                    manager.add_transaction(
-                        TransactionType::Install,
-                        vec![PackageChange {
-                            name: "example".to_string(),
-                            old_version: None,
-                            new_version: Some("1.0".to_string()),
-                            source: "official".to_string(),
-                        }],
-                        true,
-                    )
-                } else {
-                    match manager.load() {
+                for phase in 0..3 {
+                    if phase == 1 {
+                        barrier.wait();
+                    } else if phase == 2 {
+                        persisted.recv_timeout(std::time::Duration::from_secs(5))?;
+                    }
+                    let result = manager.load();
+                    if phase == 0 {
+                        assert!(result.is_err(), "initial corrupt history must be reported");
+                    } else if phase == 2 {
+                        assert!(
+                            result.is_ok(),
+                            "fresh history must remain readable after the write"
+                        );
+                    }
+                    match result {
                         Ok(history) => assert_eq!(history.len(), 1),
                         Err(error) => assert!(error.downcast_ref::<serde_json::Error>().is_some()),
                     }
-                    Ok(())
                 }
+                Ok(())
             }));
         }
         for worker in workers {

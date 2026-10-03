@@ -110,24 +110,34 @@ fn retire_system_backend(backends: SystemBackendAccess) {
         alpm_worker: Some(alpm_worker),
     } = backends
     {
-        let mut retained = alpm_worker;
-        loop {
-            match Arc::try_unwrap(retained) {
-                Ok(worker) => {
-                    drop(worker);
-                    break;
-                }
-                Err(shared) => {
-                    // Retain the final owner so an async request releasing its
-                    // lease cannot inherit the native thread's blocking join.
-                    retained = shared;
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
-        }
+        retire_alpm_worker(alpm_worker, pause_native_retirement);
     }
     #[cfg(not(feature = "arch"))]
     let _ = backends;
+}
+
+#[cfg(feature = "arch")]
+fn pause_native_retirement() {
+    std::thread::sleep(std::time::Duration::from_millis(1));
+}
+
+#[cfg(feature = "arch")]
+fn retire_alpm_worker(alpm_worker: Arc<AlpmWorker>, mut wait_for_lease: impl FnMut()) {
+    let mut retained = alpm_worker;
+    loop {
+        match Arc::try_unwrap(retained) {
+            Ok(worker) => {
+                drop(worker);
+                break;
+            }
+            Err(shared) => {
+                // Retain the final owner so an async request releasing its
+                // lease cannot inherit the native thread's blocking join.
+                retained = shared;
+                wait_for_lease();
+            }
+        }
+    }
 }
 
 /// Index contents and their source observation are one publication unit.
@@ -2240,6 +2250,53 @@ mod tests {
                     Ok(())
                 })
         })
+    }
+
+    #[test]
+    #[cfg(feature = "arch")]
+    fn native_retirement_retains_the_owner_while_a_request_lease_is_held() -> anyhow::Result<()> {
+        let (started, shutdown_started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = Arc::new(
+            crate::package_managers::alpm_worker::worker_with_shutdown_gate(
+                started,
+                Arc::new(tokio::sync::Notify::new()),
+                released,
+            ),
+        );
+        let retired = Arc::clone(&worker);
+        let (waiting, waited) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let retirement = std::thread::spawn(move || {
+            retire_alpm_worker(retired, || {
+                waiting.send(()).expect("lease observer is alive");
+                resumed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("request lease is released");
+                pause_native_retirement();
+            });
+        });
+        let observed = waited.recv_timeout(std::time::Duration::from_secs(5));
+        let owners = Arc::strong_count(&worker);
+        let premature_shutdown = shutdown_started.try_recv();
+        // Release both gates before asserting, so a broken retirement path can
+        // fail without stranding either native thread during fixture cleanup.
+        release.send(())?;
+        drop(worker);
+        let resumed = resume.send(());
+        retirement.join().expect("native retirement completed");
+        shutdown_started.recv_timeout(std::time::Duration::from_secs(5))?;
+        observed?;
+        resumed?;
+        assert_eq!(
+            owners, 2,
+            "native retirement must retain its ownership beside the request lease"
+        );
+        assert!(matches!(
+            premature_shutdown,
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        Ok(())
     }
 
     #[test]
