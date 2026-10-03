@@ -24,6 +24,31 @@ FIXTURE_ID = "x_OMG-QEMU-616"
 CVSS_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
 
 
+class TLSEvidenceServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, handler, context, event):
+        self.context = context
+        self.event = event
+        super().__init__(address, handler)
+
+    def get_request(self):
+        stream, address = super().get_request()
+        stream.settimeout(5)
+        try:
+            return self.context.wrap_socket(stream, server_side=True), address
+        except ssl.SSLError as error:
+            if isinstance(error, ssl.SSLEOFError):
+                self.event({'kind': 'transport-eof', 'ssl_error': error.errno, 'error': str(error)})
+            elif isinstance(error, ssl.SSLZeroReturnError):
+                self.event({'kind': 'tls-close', 'ssl_error': error.errno, 'error': str(error)})
+            else:
+                self.event({'kind': 'tls-error', 'ssl_error': error.errno,
+                            'reason': error.reason, 'error': str(error)})
+            stream.close()
+            raise
+
+
 def response_for_query(path, body, identities, ecosystem):
     refusal = (400, {"error": "query does not match a native installed source identity"})
     if path != "/v1/query" or not isinstance(body, dict) or set(body) != {"package", "version"}:
@@ -152,19 +177,6 @@ def main():
         with lock:
             events.append(value)
 
-    class Server(http.server.ThreadingHTTPServer):
-        daemon_threads = True
-
-        def get_request(self):
-            stream, address = super().get_request()
-            stream.settimeout(5)
-            try:
-                return (context.wrap_socket(stream, server_side=True), address)
-            except ssl.SSLError as error:
-                event({'kind': 'tls-error', 'error': str(error)})
-                stream.close()
-                raise
-
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
@@ -184,7 +196,7 @@ def main():
             self.send_header('Content-Length', str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
-    server = Server(('127.0.0.1', 443), Handler)
+    server = TLSEvidenceServer(('127.0.0.1', 443), Handler, context, event)
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     env = {k: v for k, v in os.environ.items() if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy') and k not in ('SSL_CERT_FILE', 'SSL_CERT_DIR')}
