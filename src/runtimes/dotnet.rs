@@ -48,17 +48,19 @@ impl DotnetManager {
 
     /// Fetch a release-metadata JSON document.
     async fn fetch_metadata(&self, url: &str) -> Result<serde_json::Value> {
-        self.client
-            .get(url)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .with_context(|| format!("Failed to fetch .NET release metadata from {url}"))?
-            .error_for_status()
-            .with_context(|| format!(".NET release-metadata request failed: {url}"))?
-            .bounded_json()
-            .await
-            .with_context(|| format!("Failed to parse .NET release metadata from {url}"))
+        let source = crate::core::http::redact_url(url);
+        crate::core::http::fetch_public_download_with_timeout(
+            url,
+            "omg-package-manager",
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .await
+        .with_context(|| format!("Failed to fetch .NET release metadata from {source}"))?
+        .error_for_status()
+        .with_context(|| format!(".NET release-metadata request failed: {source}"))?
+        .bounded_json()
+        .await
+        .with_context(|| format!("Failed to parse .NET release metadata from {source}"))
     }
 
     /// List available SDK versions across supported channels (newest first).
@@ -344,14 +346,11 @@ mod tests {
             .expect("bind metadata connection observer");
         let url = format!("https://{}/releases.json", listener.local_addr().unwrap());
         let manager = DotnetManager::new();
-        let (result, connection) = tokio::join!(
-            manager.fetch_metadata(&url),
-            async {
-                tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
-                    .await
-                    .map(|connection| connection.map(|(stream, _)| drop(stream)))
-            }
-        );
+        let (result, connection) = tokio::join!(manager.fetch_metadata(&url), async {
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+                .await
+                .map(|connection| connection.map(|(stream, _)| drop(stream)))
+        });
         let error = result.expect_err("private release metadata must be refused");
         assert!(
             connection.is_err(),
