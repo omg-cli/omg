@@ -18,6 +18,62 @@ import time
 
 PREFIX = "OMG_MUTATION_HEALTH "
 MAX_REPORT_BYTES = 1024 * 1024
+PROC_ROOT = Path('/proc')
+MAX_PROC_ENTRIES = 8192
+MAX_SESSION_PROCESSES = 256
+MAX_REPORTED_PROCESSES = 8
+
+
+def process_stat(text, page_size):
+    identity, tail = text.rsplit(') ', 1)
+    pid, name = identity.split(' (', 1)
+    fields = tail.split()
+    pid, parent, group, session, started, rss = map(int,
+        (pid, fields[1], fields[2], fields[3], fields[19], fields[21]))
+    if pid <= 0 or min(parent, group, session, started, rss) < 0 or page_size <= 0:
+        raise ValueError('invalid required process metric')
+    return dict(pid=pid, parent_pid=parent, process_group=group, session_id=session,
+                start_ticks=started, name=name[:64], rss_bytes=rss * page_size)
+
+
+def command_processes(session_id):
+    # /proc/PID/stat identifies session membership and RSS pages without reading
+    # command arguments or environments. RSS sums can count shared pages twice.
+    if session_id is None:
+        return dict(session_id=None, availability='not-started', process_count=0,
+                    rss_sum_bytes=0, largest=[])
+    rows = []
+    scanned = vanished = denied = 0
+    limited = False
+    page_size = os.sysconf('SC_PAGE_SIZE')
+    for path in PROC_ROOT.iterdir():
+        if not path.name.isascii() or not path.name.isdecimal():
+            continue
+        if scanned >= MAX_PROC_ENTRIES or len(rows) >= MAX_SESSION_PROCESSES:
+            limited = True
+            break
+        scanned += 1
+        try:
+            with (path / 'stat').open() as source:
+                text = source.read(4097)
+        except (FileNotFoundError, ProcessLookupError):
+            vanished += 1
+            continue
+        except PermissionError:
+            denied += 1
+            continue
+        if len(text) > 4096:
+            raise ValueError('process stat exceeds its byte bound')
+        row = process_stat(text, page_size)
+        if row['pid'] != int(path.name):
+            raise ValueError('process identity differs from proc path')
+        if row['session_id'] == session_id:
+            rows.append(row)
+    return dict(session_id=session_id, availability='partial' if limited or denied or vanished else 'observed',
+                process_count=len(rows), rss_sum_bytes=sum(row['rss_bytes'] for row in rows),
+                largest=sorted(rows, key=lambda row: (-row['rss_bytes'], row['pid']))[:MAX_REPORTED_PROCESSES],
+                scanned_processes=scanned, vanished_processes=vanished,
+                denied_processes=denied, scan_limited=limited)
 
 
 def interval_seconds(value):
@@ -83,7 +139,8 @@ def observe(command, report, interval):
                    "child_pid": child.pid if child else None,
                    "child_returncode": returncode,
                    "cancellation_signal": cancellation["signal"],
-                   "group_signal_error": cancellation["group_signal_error"]}
+                   "group_signal_error": cancellation["group_signal_error"],
+                   "command_processes": command_processes(child.pid if child else None)}
             raw = (json.dumps(row, sort_keys=True) + "\n").encode()
             if written + len(raw) > MAX_REPORT_BYTES:
                 raise ValueError("runner health report exceeds its byte bound")
