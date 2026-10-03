@@ -18,6 +18,101 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipIf(os.name == 'nt', 'native preview assertions require POSIX bash')
 class NativeRemovalContracts(unittest.TestCase):
+    def test_trixie_doctor_backend_reference_preserves_os_and_lane_identity(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        begin = source.index('# BEGIN DOCTOR BACKEND ORACLE')
+        end = source.index('# END DOCTOR BACKEND ORACLE', begin)
+        command = source[begin:end] + '\ncheck_doctor_native_backend "$1" "$2" "$3"\n'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / 'os-release'
+            output = root / 'doctor.out'
+            healthy = ('  Debian/Ubuntu detected (apt backend)\n'
+                       '  Found dependency: apt-get\n'
+                       '  Found dependency: sudo\n'
+                       '  dpkg package database (/var/lib/dpkg/status)\n'
+                       '  APT package indexes (/var/lib/apt/lists)\n')
+            output.write_text(healthy, encoding='utf-8')
+            cases = (
+                ('ID=debian\nVERSION_ID=13\n', 0),
+                ('ID="debian"\nVERSION_ID="13"\n', 0),
+                ("ID='debian'\nVERSION_ID='13'\n", 0),
+                ('ID=debian\nVERSION_ID=12\n', 2),
+                ('ID=ubuntu\nVERSION_ID=13\n', 2),
+                ('ID=debian\n', 2),
+                ('ID=debian\nID=debian\nVERSION_ID=13\n', 2),
+                ('ID=debian\nVERSION_ID=13\nVERSION_ID=13\n', 2),
+            )
+            for identity, expected in cases:
+                with self.subTest(identity=identity):
+                    release.write_text(identity, encoding='utf-8')
+                    result = subprocess.run(
+                        [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                         command, '_', 'debian-trixie', str(output), str(release)],
+                        cwd=root, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+            release.write_text('ID=debian\nVERSION_ID=13\n', encoding='utf-8')
+            output.write_text(healthy.replace('  Found dependency: apt-get\n', ''),
+                              encoding='utf-8')
+            result = subprocess.run(
+                [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                 command, '_', 'debian-trixie', str(output), str(release)],
+                cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1,
+                             'Trixie OS identity must retain trusted apt-get validation')
+
+    def test_trixie_connectivity_setup_requires_debian_13(self):
+        source = (ROOT / 'scripts/qemu-doctor-connectivity-check.sh').read_text(encoding='utf-8')
+        marker = '[[ -d "$evidence" ]] || setup_fail \'evidence directory unavailable\''
+        self.assertIn(marker, source)
+        prefix = source.split(marker, 1)[0] + marker
+        for release, code in (('ID=debian\nVERSION_ID=13\n', 0),
+                              ('ID=debian\nVERSION_ID=12\n', 120),
+                              ('ID=ubuntu\nVERSION_ID=13\n', 120)):
+            with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                os_release = root / 'os-release'
+                os_release.write_text(release)
+                (root / 'qemu-doctor-connectivity-fixture.py').symlink_to(ROOT / 'scripts/qemu-doctor-connectivity-fixture.py')
+                binary = root / 'omg'
+                binary.write_text('#!/bin/sh\nexit 99\n')
+                binary.chmod(0o755)
+                script = root / 'setup.sh'
+                script.write_text(prefix.replace('/etc/os-release', str(os_release)) + '\n')
+                result = subprocess.run(['bash', str(script), str(binary), 'debian-trixie', str(root)],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, code, result.stderr)
+
+    def test_trixie_native_version_and_identity_require_installed_apt_records(self):
+        provider = 'dpkg-query() { printf "%s" "$QUERY_OUT"; }\n'
+        for record, expected, code in (
+            ('install ok installed\t1.2-3\n', '1.2-3', 0),
+            ('deinstall ok config-files\t1.2-3\n', '', 0),
+        ):
+            with self.subTest(record=record):
+                result = subprocess.run(['bash', '-c', provider + self.functions() +
+                    '\nnative_installed_version debian-trixie tree', '_'],
+                    env=dict(os.environ, QUERY_OUT=record), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+        identity = subprocess.run(['bash', '-c', self.functions() +
+            '\nnative_installed_identity debian-trixie tree'], capture_output=True, text=True, timeout=10)
+        self.assertEqual(identity.returncode, 0, identity.stderr)
+        self.assertEqual(identity.stdout.strip(), 'tree')
+
+    def test_trixie_transaction_invokes_exact_native_apt_operations(self):
+        source = (ROOT / 'scripts/qemu-transactions.sh').read_text(encoding='utf-8')
+        function = source[source.index('native_change() {'):source.index('capture_repository_state() {')]
+        for operation in ('install', 'remove'):
+            with self.subTest(operation=operation):
+                result = subprocess.run(['bash', '-c',
+                    'distro=debian-trixie\nremote_argv() { printf "%s\\n" "$@"; }\n' +
+                    function + '\nnative_change "$1"', '_', operation],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ['sudo', '-n', 'env',
+                    'DEBIAN_FRONTEND=noninteractive', 'apt-get', operation, '-y', 'tree'])
+
     @staticmethod
     def functions():
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
@@ -3290,6 +3385,18 @@ printf 'Usage: fixture\\n'
             self.assertTrue(evidence.exists(), result.stdout + result.stderr)
             return result, json.loads(evidence.read_text()), {
                 path.name: path.read_text() for path in (root / 'inventory/rows').glob('*.log')}
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_trixie_runner_selects_apt_targets_and_keeps_guest_identity(self):
+        rows = ['help\t["--help"]\thelp-boundary\tarch:1,debian:0,ubuntu:0,fedora:125\tpass\t-\thermetic\tarch:pending,debian:pass,ubuntu:pass,fedora:pending\t-\ttempdir-drop']
+        result, evidence, logs = self.run_inventory(
+            'printf "Usage: fixture\\n"\n', rows, distro='debian-trixie')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(evidence), 1, logs)
+        self.assertEqual(evidence[0]['case_id'], 'qemu-debian-trixie-help')
+        self.assertEqual(evidence[0]['distro'], 'debian-trixie')
+        self.assertEqual(evidence[0]['result'], 'PASS', logs)
+        self.assertEqual(evidence[0]['exit_code'], 0, logs)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_actual_runner_records_not_applicable_target_without_running_product(self):

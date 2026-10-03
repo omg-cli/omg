@@ -50,7 +50,7 @@ while (($#)); do
     --allow-tcg) allow_tcg=true; shift ;;
     --help)
       cat <<'HELP'
-Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|ubuntu|fedora]
+Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|debian-trixie|ubuntu|fedora]
   [--arch x86_64|aarch64] [--release vVERSION]
   [--staged-dir DIR | --release-dir DIR] [--inventory-file TSV]
   [--evidence-dir DIR] [--benchmark] [--benchmark-transactions COUNT]
@@ -87,7 +87,7 @@ HELP
   esac
 done
 [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
-case "$distro" in all|arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
+case "$distro" in all|arch|debian|debian-trixie|ubuntu|fedora) ;; *) exit 2 ;; esac
 if [[ -z "$arch" ]]; then
   case "$(uname -m)" in
     x86_64|amd64) arch=x86_64 ;;
@@ -153,6 +153,11 @@ pins_for() {
       image_hash=804377dd07318360c39a75e57b326243442a43bae1e12b33d5f490a64713c15c080a0323cb55d52b381139db9187702d38f36b8b142b8ef36da1031d9de41c2d
       hash_tool=sha512sum
       ssh_service=ssh ;;
+    debian-trixie-x86_64)
+      image_url=https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-amd64-20261001-2618.qcow2
+      image_hash=f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d
+      hash_tool=sha512sum
+      ssh_service=ssh ;;
     debian-aarch64)
       image_url=https://cloud.debian.org/images/cloud/bookworm/20260903-2590/debian-12-generic-arm64-20260903-2590.qcow2
       image_hash=b0144c1c8e09b187b54af300c8ffc22f17b318d0aa6f5a2caba13f3102441572badbeb098458e599b6897bc80dad50fd0094d6e4b9da9f4a2bd63a8f4c99dea5
@@ -201,7 +206,7 @@ if [[ "$print_pins" == true ]]; then
   # Audit mode: list every pinned image without booting anything.
   # Honors --distro; always covers both arches so pin reviews see the
   # whole table (unsupported combos like arch/aarch64 print nothing).
-  for pin_distro in arch debian ubuntu fedora; do
+  for pin_distro in arch debian debian-trixie ubuntu fedora; do
     [[ "$distro" == all || "$distro" == "$pin_distro" ]] || continue
     for pin_arch in x86_64 aarch64; do
       if pins_for "$pin_distro" "$pin_arch" 2>/dev/null; then
@@ -212,6 +217,8 @@ if [[ "$print_pins" == true ]]; then
   exit 0
 fi
 if [[ "$distro" == all ]]; then
+  targets=(arch debian debian-trixie ubuntu fedora)
+  [[ "$arch" != aarch64 ]] || targets=(debian ubuntu fedora)
   suite=$(mktemp -d "$root/suite-XXXXXX")
   rc=0
   args=(--release "$tag" --arch "$arch")
@@ -229,8 +236,8 @@ if [[ "$distro" == all ]]; then
   [[ "$storage_faults" == false ]] || args+=(--storage-faults)
   [[ "$restrict_egress" == false ]] || args+=(--restrict-egress)
   [[ "$allow_tcg" == false ]] || args+=(--allow-tcg)
-  jq -n --arg source "$source_kind" --arg suffix "$case_suffix" '["arch", "debian", "ubuntu", "fedora"] | map({case_id:("qemu-"+.+$suffix+"-lifecycle"), distro:., result:"NOT_RUN", artifact_source:$source, exit_code:null, elapsed_seconds:0})' > "$suite/results.json"
-  for target in arch debian ubuntu fedora; do
+  jq -n --arg source "$source_kind" --arg suffix "$case_suffix" --args '$ARGS.positional | map({case_id:("qemu-"+.+$suffix+"-lifecycle"), distro:., result:"NOT_RUN", artifact_source:$source, exit_code:null, elapsed_seconds:0})' "${targets[@]}" > "$suite/results.json"
+  for target in "${targets[@]}"; do
     jq --arg target "$target" 'map(if .distro == $target then .result = "INCOMPLETE" else . end)' "$suite/results.json" > "$suite/results.next.json"
     mv "$suite/results.next.json" "$suite/results.json"
     "$0" --distro "$target" --evidence-dir "$suite/$target" "${args[@]}" || rc=1
@@ -679,10 +686,11 @@ fi
 if [[ "$distro" == arch ]]; then
   cp "$here/qemu-arch-advisory-check.sh" "$here/qemu-arch-advisory-oracle.py" "$work/"
 fi
-if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]]; then
   cp "$here/qemu-osv-check.sh" "$here/qemu-osv-positive-oracle.py" "$work/"
 fi
 cp "$here/qemu-daemon-check.sh" "$work/qemu-daemon-check.sh"
+cp "$here/qemu-apt-abi.py" "$work/qemu-apt-abi.py"
 cp "$here/qemu-aur-check.sh" "$here/qemu-aur-fixture.py" "$work/"
 cp "$here/qemu-doctor-connectivity-check.sh" "$here/qemu-doctor-connectivity-fixture.py" "$work/"
 cp "$here/../tests/daemon_advisory_shutdown.sh" "$work/daemon-advisory-shutdown.sh"
@@ -694,7 +702,13 @@ cd "$HOME"
 distro=$1; tag=$2; digest=$3; benchmark=$4; guest_arch=$5; expected_uname=$6; inventory_tiers=$7; accel=$8
 case "$accel" in kvm) daemon_timeout=240 ;; tcg) daemon_timeout=900 ;; *) exit 120 ;; esac
 actual_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)
-[[ "$actual_id" == "$distro" && $(uname -m) == "$expected_uname" ]] || exit 120
+if [[ "$distro" == debian-trixie ]]; then
+  actual_version=$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)
+  [[ "$actual_id" == debian && "$actual_version" == 13 ]] || exit 120
+else
+  [[ "$actual_id" == "$distro" ]] || exit 120
+fi
+[[ $(uname -m) == "$expected_uname" ]] || exit 120
 mkdir -p evidence
 capture_audit_metadata() {
   timeout --kill-after=2s 5s sudo -n bash -c '
@@ -716,16 +730,21 @@ fi
 printf '%s  release.tar.gz\n' "$digest" | sha256sum -c -
 tar -xzf release.tar.gz
 bin="$HOME/omg-${tag}-${guest_arch}-linux-${distro}/omg"
-[[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 daemon="${bin%/*}/omgd"
 if [[ ! -x "$daemon" ]]; then
   printf 'Release %s for %s is missing executable omgd; publish an archive containing both omg and omgd.\n' "$tag" "$distro" >&2
   exit 1
 fi
+if [[ "$distro" == debian-trixie ]]; then
+  timeout --kill-after=2s 45s python3 "$HOME/qemu-apt-abi.py" \
+    --distro "$distro" --arch "$guest_arch" --omg "$bin" --omgd "$daemon" \
+    --output "$HOME/evidence/apt-abi" || exit 120
+fi
+[[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 [[ $("$daemon" --version | head -1 | tr -d '[:space:]') == "omgd${tag#v}" ]]
 case "$distro" in
   arch) sudo -n pacman -Syu --noconfirm >/dev/null || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
-  debian|ubuntu)
+  debian|debian-trixie|ubuntu)
     sudo -n systemctl stop apt-daily.timer apt-daily-upgrade.timer
     if [[ "$distro" == ubuntu ]]; then
       sudo -n sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
@@ -737,7 +756,7 @@ case "$distro" in
   fedora) sudo -n dnf -y makecache > evidence/index-update.txt 2>&1 || exit 120; native=(rpm -qi tree); version_cmd=(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' tree) ;;
 esac
 installed() {
-  case "$distro" in arch) pacman -Q tree ;; debian|ubuntu) [[ $(dpkg-query -W '-f=${Status}' tree 2>/dev/null) == 'install ok installed' ]] ;; fedora) rpm -q tree ;; esac
+  case "$distro" in arch) pacman -Q tree ;; debian|debian-trixie|ubuntu) [[ $(dpkg-query -W '-f=${Status}' tree 2>/dev/null) == 'install ok installed' ]] ;; fedora) rpm -q tree ;; esac
 }
 if installed >/dev/null 2>&1; then echo 'fixture requires tree absent' >&2; exit 120; fi
 "$bin" search tree > evidence/search.txt
@@ -768,7 +787,7 @@ if [[ "$distro" == arch ]]; then guest_tools+=(python); else guest_tools+=(pytho
 [[ "$benchmark" != true ]] || guest_tools+=(hyperfine)
 case "$distro" in
   arch) sudo -n pacman -S --noconfirm --needed "${guest_tools[@]}" || exit 120 ;;
-  debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${guest_tools[@]}" || exit 120 ;;
+  debian|debian-trixie|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${guest_tools[@]}" || exit 120 ;;
   fedora) sudo -n dnf install -y "${guest_tools[@]}" || exit 120 ;;
 esac
 printf 'daemon lifecycle start accel=%s timeout=%s\n' "$accel" "$daemon_timeout"
@@ -796,7 +815,7 @@ if [[ "$benchmark" == true ]]; then
 fi
 sudo -n "$bin" remove --yes tree
 if installed >/dev/null 2>&1; then echo 'package remains installed' >&2; exit 1; fi
-if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]]; then
   apt-get download tree || exit 120
   packages=("$HOME"/tree_*.deb)
   [[ ${#packages[@]} -eq 1 && -f "${packages[0]}" ]] || exit 120
@@ -814,7 +833,7 @@ sudo -n test -s /var/lib/omg/audit/audit.jsonl
 sudo -n env OMG_DATA_DIR=/var/lib/omg "$bin" audit verify > evidence/system-audit-verify.txt 2>&1
 case "$distro" in
   arch) pacman -Q > evidence/installed-after.txt; sha256sum /var/lib/pacman/sync/*.db > evidence/repository-hashes.txt ;;
-  debian|ubuntu) dpkg-query -W > evidence/installed-after.txt; find /var/lib/apt/lists -maxdepth 1 -type f ! -name lock -exec sha256sum {} + > evidence/repository-hashes.txt ;;
+  debian|debian-trixie|ubuntu) dpkg-query -W > evidence/installed-after.txt; find /var/lib/apt/lists -maxdepth 1 -type f ! -name lock -exec sha256sum {} + > evidence/repository-hashes.txt ;;
   fedora) rpm -qa > evidence/installed-after.txt; find /var/cache/libdnf5 -type f -name repomd.xml -exec sha256sum {} + > evidence/repository-hashes.txt ;;
 esac
 { cat /etc/os-release; uname -a; sha256sum "$bin"; printf 'native_version=%s\n' "$version"; } > evidence/guest-metadata.txt
@@ -823,7 +842,7 @@ esac
 if [[ -n "$inventory_tiers" ]]; then
   case "$distro" in
     arch) sudo -n pacman -S --noconfirm --needed git make curl python strace gcc ;;
-    debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace gcc libc6-dev ;;
+    debian|debian-trixie|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace gcc libc6-dev ;;
     fedora) sudo -n dnf install -y git make curl python3 strace podman rpm-build createrepo_c gcc glibc-devel ;;
   esac > evidence/inventory-setup.txt 2>&1 || exit 120
   if [[ "$distro" == debian ]]; then
@@ -867,7 +886,7 @@ if [[ -n "$inventory_tiers" ]]; then
     if command -v docker >> evidence/container-engine.txt || command -v podman >> evidence/container-engine.txt; then exit 120; fi
   fi
 fi
-if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]]; then
   bash "$HOME/qemu-osv-check.sh" "$bin" "$daemon" "$digest" "$HOME/evidence"
 fi
 if [[ "$distro" == arch ]]; then
@@ -882,9 +901,12 @@ opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHo
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
+if [[ "$distro" == debian-trixie ]]; then
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-apt-abi.py bench@127.0.0.1:qemu-apt-abi.py
+fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
   /work/qemu-doctor-connectivity-check.sh /work/qemu-doctor-connectivity-fixture.py bench@127.0.0.1:
-if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
     /work/qemu-osv-check.sh /work/qemu-osv-positive-oracle.py bench@127.0.0.1:
 fi
@@ -900,7 +922,7 @@ if [[ "$distro" == arch ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-aur-check.sh /work/qemu-aur-fixture.py bench@127.0.0.1:
 fi
 if [[ -n "$inventory_tiers" ]]; then
-  if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+  if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]]; then
     timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-doctor-index-oracle.py bench@127.0.0.1:qemu-doctor-index-oracle.py
   fi
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-arch-update-fixture.sh bench@127.0.0.1:qemu-arch-update-fixture.sh
@@ -971,7 +993,14 @@ if [[ "$rc" == 0 ]]; then
     fi
   fi
 fi
-if [[ "$rc" == 0 && ( "$distro" == debian || "$distro" == ubuntu ) ]]; then
+if [[ "$rc" == 0 && "$distro" == debian-trixie ]]; then
+  if ! python3 "$here/qemu-apt-abi-evidence.py" --evidence-dir "$work/guest/evidence/apt-abi" \
+    --archive "$work/release/$archive" --probe "$here/qemu-apt-abi.py"; then
+    printf 'Missing or incomplete archive-bound Trixie APT ABI evidence\n' >&2
+    exit 1
+  fi
+fi
+if [[ "$rc" == 0 && ( "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ) ]]; then
   if ! python3 "$here/qemu-osv-evidence.py" --evidence-dir "$work/guest/evidence/osv" \
     --archive "$work/release/$archive" --distro "$distro"; then
     printf 'Missing or incomplete archive-bound positive OSV evidence\n' >&2
@@ -995,7 +1024,7 @@ fi
 if [[ "$benchmark" == true && "$rc" == 0 ]]; then
   case "$distro" in
     arch) expected_commands='{"info":["OMG","pacman"],"search":["OMG","pacman"],"explicit":["OMG","pacman"]}' ;;
-    debian|ubuntu) expected_commands='{"info":["OMG","apt-cache","apt"],"search":["OMG","apt-cache","apt"],"explicit":["OMG","apt-mark"]}' ;;
+    debian|debian-trixie|ubuntu) expected_commands='{"info":["OMG","apt-cache","apt"],"search":["OMG","apt-cache","apt"],"explicit":["OMG","apt-mark"]}' ;;
     fedora) expected_commands='{"info":["OMG","rpm","dnf"],"search":["OMG","dnf"],"explicit":["OMG","dnf"]}' ;;
   esac
   benchmark_evidence="$work/guest/evidence/benchmarks"
@@ -1074,7 +1103,7 @@ if [[ "$transaction_samples" != 0 && "$rc" == 0 ]]; then
       for tool in omg native; do
         label_name=OMG
         if [[ "$tool" == native ]]; then
-          case "$distro" in arch) label_name=pacman ;; debian|ubuntu) label_name=apt ;; fedora) label_name=dnf ;; esac
+          case "$distro" in arch) label_name=pacman ;; debian|debian-trixie|ubuntu) label_name=apt ;; fedora) label_name=dnf ;; esac
         fi
         for ((round=1;round<=transaction_samples;round++)); do
           printf -v trial_id '%s-%s-%03d' "$operation" "$tool" "$round"

@@ -159,7 +159,7 @@ def prepare(case):
     write(data / 'fixture-unrelated.txt', 'keep unrelated data\n')
     write(config / 'fixture-unrelated.txt', 'keep unrelated configuration\n')
     if case in {'rollback', 'rollback-yes'}:
-        require(os.environ.get('OMG_QEMU_DISTRO') in {'arch', 'debian', 'ubuntu', 'fedora'}, 'rollback fixture requires the selected backend')
+        require(os.environ.get('OMG_QEMU_DISTRO') in {'arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'}, 'rollback fixture requires the selected backend')
         require(absent(data / 'history.json'), 'rollback fixture must start without private history')
     if case == 'metrics':
         # The harness sets this before execution too; subprocess environment changes
@@ -476,7 +476,7 @@ def audit_contract(case, data, config, stdout):
 def native_packages(distro):
     if distro == 'arch':
         command = ['pacman', '-Qqe']
-    elif distro in {'debian', 'ubuntu'}:
+    elif distro in {'debian', 'debian-trixie', 'ubuntu'}:
         command = ['apt-mark', 'showmanual']
     elif distro == 'fedora':
         command = ['dnf', '--cacheonly', '--disable-repo=*', '--setopt=disable_excludes=*',

@@ -94,6 +94,33 @@ class PositiveEvidenceTests(unittest.TestCase):
     def test_complete_bound_native_evidence_is_admitted(self):
         self.assertEqual(self.admit(), self.receipt)
 
+    def test_trixie_requires_its_archive_and_debian_13_ecosystem(self):
+        with tarfile.open(self.archive, 'w:gz') as archive:
+            for name, data in {'omg': b'native product fixture', 'omgd': b'native daemon fixture'}.items():
+                member = tarfile.TarInfo('omg-v0.1.224-x86_64-linux-debian-trixie/' + name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        self.receipt['native_archive_sha256'] = hashlib.sha256(self.archive.read_bytes()).hexdigest()
+        self.receipt['ecosystem'] = 'Debian:13'
+        identities = {('glibc', '2.36-9'), ('apt', '2.6.1')}
+        for event in self.events:
+            if event['kind'] == 'request':
+                event['body']['package']['ecosystem'] = 'Debian:13'
+                event['status'], event['response'] = checker.oracle.response_for_query(
+                    event['path'], event['body'], identities, 'Debian:13')
+        (self.evidence / 'os-release').write_text('ID=debian\nVERSION_ID="13"\n')
+        self.write()
+        self.assertEqual(checker.validate_evidence(self.evidence, self.archive,
+            self.fixture, 'debian-trixie'), self.receipt)
+        for release in ('ID=debian\nVERSION_ID="12"\n', 'ID=ubuntu\nVERSION_ID="13"\n'):
+            with self.subTest(release=release), self.assertRaises(ValueError):
+                (self.evidence / 'os-release').write_text(release)
+                checker.validate_evidence(self.evidence, self.archive, self.fixture, 'debian-trixie')
+        (self.evidence / 'os-release').write_text('ID=debian\nVERSION_ID="13"\n')
+        self.receipt['ecosystem'] = 'Debian:12'
+        self.write()
+        with self.assertRaises(ValueError):
+            checker.validate_evidence(self.evidence, self.archive, self.fixture, 'debian-trixie')
     def test_retained_transport_eof_does_not_replace_certificate_refusal_or_requests(self):
         eof = {"kind": "transport-eof", "ssl_error": ssl.SSL_ERROR_EOF, "error": "TLS/SSL connection has been closed (EOF)"}
         original = copy.deepcopy(self.events)
