@@ -794,8 +794,55 @@ check_native_apt_orphan_removed() {
   fi
 }
 
+# Pacman returns 1 with empty output for a successful query with no matches.
+# Confirmed on native pacman 7.1; diagnostics or any other exit remain fatal.
+native_arch_orphans() {
+  local output=$1 status=0
+  timeout --kill-after=2s 15s pacman -Qdtq > "$output" 2> "$output.stderr" || status=$?
+  if [[ -s "$output.stderr" ]] \
+    || { [[ "$status" != 0 || ! -s "$output" ]] && [[ "$status" != 1 || -s "$output" ]]; }; then
+    printf 'assertion failed: native Arch orphan query failed (exit %s)\n' "$status" >&2
+    cat "$output.stderr" >&2
+    return 1
+  fi
+}
+
+prepare_native_arch_orphan() {
+  local marked
+  check_native_tree_state arch installed || return 1
+  if ! native_arch_orphans orphan-baseline.log || [[ -s orphan-baseline.log ]] \
+    || ! native_package_snapshot arch > orphan-before.state; then
+    printf 'assertion failed: Arch orphan baseline is unavailable or contains unrelated orphans\n' >&2
+    return 1
+  fi
+  if ! sudo -n pacman -D --asdeps tree > pacman-mark.log 2>&1 \
+    || ! native_arch_orphans orphan-preview.log || [[ $(cat orphan-preview.log) != tree ]]; then
+    printf 'assertion failed: native pacman did not select exactly the tree fixture as an orphan\n' >&2
+    return 1
+  fi
+  marked=$(native_package_snapshot arch) || return 1
+  check_native_tree_only_delta "$(cat orphan-before.state)" "$marked"
+}
+
+check_native_arch_orphan_removed() {
+  local after expected
+  check_native_tree_state arch absent || return 1
+  [[ -s orphan-before.state ]] || return 1
+  expected=$(awk '$1 != "tree" { print }' orphan-before.state) || return 1
+  after=$(native_package_snapshot arch) || return 1
+  if [[ "$after" != "$expected" ]] || ! native_arch_orphans orphan-after.log \
+    || [[ -s orphan-after.log ]]; then
+    printf 'assertion failed: Arch orphan cleanup changed unrelated package versions/reasons or left orphans\n' >&2
+    return 1
+  fi
+}
+
 prepare_native_orphan() {
   local distro=$1 marked
+  if [[ "$distro" == arch ]]; then
+    prepare_native_arch_orphan
+    return $?
+  fi
   if [[ "$distro" != fedora ]]; then
     prepare_native_apt_orphan "$distro"
     return $?
@@ -820,6 +867,10 @@ prepare_native_orphan() {
 
 check_native_orphan_removed() {
   local distro=$1 output=$2 after expected architecture
+  if [[ "$distro" == arch ]]; then
+    check_native_arch_orphan_removed
+    return $?
+  fi
   if [[ "$distro" != fedora ]]; then
     check_native_apt_orphan_removed "$distro" "$output"
     return $?
@@ -2694,7 +2745,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; $(declare -f check_native_tree_state)"
   fi
   if [[ "$case" == clean-orphans-native ]]; then
-    remote+="; $(declare -f native_package_snapshot); $(declare -f check_native_tree_only_delta); $(declare -f prepare_native_apt_orphan); $(declare -f check_native_apt_orphan_removed); $(declare -f prepare_native_orphan); $(declare -f check_native_orphan_removed)"
+    remote+="; $(declare -f native_package_snapshot); $(declare -f check_native_tree_only_delta); $(declare -f prepare_native_apt_orphan); $(declare -f check_native_apt_orphan_removed); $(declare -f native_arch_orphans); $(declare -f prepare_native_arch_orphan); $(declare -f check_native_arch_orphan_removed); $(declare -f prepare_native_orphan); $(declare -f check_native_orphan_removed)"
   fi
   if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree || "$case" == clean-orphans-native ]]; then
     remote+="; if ! check_native_tree_state '$distro' absent; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
