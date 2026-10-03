@@ -75,6 +75,61 @@ class AllowlistTests(unittest.TestCase):
         for name in ("ca.key", "ca.pem", "server.key", "server.pem", "server.csr"):
             self.assertFalse(exporter.allowed_file(("run-test", "guest", "evidence", name)))
 
+    def test_fedora_signed_advisory_exports_public_metadata_without_signing_state(self):
+        prefix = ("run-test", "guest", "evidence", "fedora-advisory")
+        names = {"receipt.json", "native-query.tsv", "os-release", "daemon.log", "worker.log",
+                 "parent-system-before.sha256", "parent-system-after.sha256", "commands.json",
+                 "native-version-comparison.txt", "native-dnf-before.conf", "private-dnf.conf",
+                 "fixture.repo", "fixture-key.asc", "updateinfo.xml", "updateinfo.xml.gz", "repomd.xml", "repomd.xml.asc"}
+        names.update(phase + "." + stream for phase in
+                     ("untrusted-metadata", "direct-plain", "direct-findings", "daemon-plain", "daemon-findings", "daemon-before", "daemon-after",
+                      "native-advisory-list", "native-advisory-info", "native-repository", "verify")
+                     for stream in ("stdout", "stderr"))
+        self.assertTrue(exporter.allowed_directory(prefix))
+        for name in names:
+            with self.subTest(name=name):
+                self.assertTrue(exporter.allowed_file((*prefix, name)))
+                self.assertFalse(exporter.allowed_file(("run-test", name)))
+                self.assertFalse(exporter.allowed_file((*prefix, "private", name)))
+                self.assertFalse(exporter.allowed_file((*prefix, name + ".bak")))
+        for name in ("keys", "user", "private-keys-v1.d", "pubring.kbx", "trustdb.gpg", "secring.gpg", "fixture-key.secret", "keygen.stdout"):
+            self.assertFalse(exporter.allowed_file((*prefix, name)))
+
+    def test_arch_advisory_public_evidence_has_an_exact_export_boundary(self):
+        names = {"receipt.json", "native-query.tsv", "os-release", "fixture-events.json", "daemon.log",
+                 "parent-system-before.sha256", "parent-system-after.sha256", "worker.log",
+                 "native-feed.json", "native-nss-before.conf", "private-nss.conf", "dns-isolation.json"}
+        names.update(phase + "." + stream for phase in
+                     ("untrusted-tls", "direct-plain", "direct-findings", "daemon-plain", "daemon-findings", "daemon-before", "daemon-after")
+                     for stream in ("stdout", "stderr"))
+        prefix = ("run-test", "guest", "evidence", "arch-advisory")
+        self.assertTrue(exporter.allowed_directory(prefix))
+        for name in names:
+            with self.subTest(name=name):
+                self.assertTrue(exporter.allowed_file((*prefix, name)))
+                self.assertFalse(exporter.allowed_file(("run-test", name)))
+                self.assertFalse(exporter.allowed_file((*prefix, "private", name)))
+                self.assertFalse(exporter.allowed_file((*prefix, name + ".bak")))
+        for name in ("ca.key", "server.key", "ca.crt", "trusted-ca-bundle.crt", "user", "server.csr"):
+            self.assertFalse(exporter.allowed_file((*prefix, name)))
+
+    def test_osv_public_evidence_exports_only_from_its_bounded_directory(self):
+        names = {"receipt.json", "native-query.tsv", "os-release", "fixture-events.json", "daemon.log",
+                 "parent-system-before.sha256", "parent-system-after.sha256", "worker.log"}
+        names.update(phase + "." + stream for phase in
+                     ("untrusted-tls", "direct-plain", "direct-findings", "daemon-plain", "daemon-findings", "daemon-before", "daemon-after")
+                     for stream in ("stdout", "stderr"))
+        prefix = ("run-test", "guest", "evidence", "osv")
+        self.assertTrue(exporter.allowed_directory(prefix))
+        for name in names:
+            with self.subTest(name=name):
+                self.assertTrue(exporter.allowed_file((*prefix, name)))
+                self.assertFalse(exporter.allowed_file(("run-test", name)))
+                self.assertFalse(exporter.allowed_file((*prefix, "private", name)))
+                self.assertFalse(exporter.allowed_file((*prefix, name + ".bak")))
+        for name in ("ca.key", "server.key", "ca.crt", "trusted-ca-bundle.crt", "user", "server.csr"):
+            self.assertFalse(exporter.allowed_file((*prefix, name)))
+
     def test_aur_flag_evidence_exports_without_ephemeral_keys(self):
         for name in ("aur-search-flags.json", "aur-fixture-events.jsonl",
                      "aur-detailed.json", "aur-no-aur.json", "aur-basic.json",

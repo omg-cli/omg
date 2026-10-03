@@ -440,6 +440,7 @@ assert_rc 1 "$runner" "${base_args[@]}" --staged-dir "$scratch/valid" --evidence
 unset FAKE_RUN_EXIT FAKE_SENTRY_HTTP OMG_SMOKE_SENTRY_CONFIG FAKE_SENTRY_ENVELOPE
 grep -q '"result":"PRODUCT_FAIL"' "$(results_file "$scratch/reporting-failure")" || fail "reporting failure changed the test verdict"
 
+export FAKE_QEMU_ARCH_FIXTURE_WRITER="$repo_root/scripts/test_arch_advisory_evidence.py"
 cat > "$scratch/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -584,6 +585,19 @@ PY
           invalid) printf '%s\n' '{"schema_version":1,"no_aur_suppressed":false}' > "$work/guest/evidence/aur-search-flags.json" ;;
           missing) ;;
         esac
+        case ${FAKE_QEMU_ARCH_ADVISORY_RECEIPT:-valid} in
+          valid|invalid)
+            native_archive=$(find "$work/release" -maxdepth 1 -name '*.tar.gz' -type f -print -quit)
+            python3 "$FAKE_QEMU_ARCH_FIXTURE_WRITER" --write-release-smoke-fixture \
+              "$work/guest/evidence/arch-advisory" "$native_archive"
+            if [[ ${FAKE_QEMU_ARCH_ADVISORY_RECEIPT:-valid} == invalid ]]; then
+              receipt="$work/guest/evidence/arch-advisory/receipt.json"
+              jq '.native_archive_sha256=("f" * 64)' "$receipt" > "$receipt.invalid"
+              mv "$receipt.invalid" "$receipt"
+            fi ;;
+          missing) ;;
+          *) exit 99 ;;
+        esac
         if [[ ${FAKE_QEMU_BENCHMARK:-0} == 1 ]]; then
           benchmark="$work/guest/evidence/benchmarks"
           mkdir -p "$benchmark"
@@ -627,11 +641,11 @@ done
 [[ -n "$child_result" ]] || fail 'interrupted QEMU child did not record its exit'
 
 export FAKE_QEMU_INFO_EXIT=0 FAKE_QEMU_STATE="$scratch/qemu-controller"
-for scenario in pass pull-failure product-failure product-exit-three timeout signaled cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-doctor invalid-doctor missing-aur invalid-aur wrong-aur-events kernel-crash controller-oom missing-health; do
+for scenario in pass pull-failure product-failure product-exit-three timeout signaled cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-doctor invalid-doctor missing-aur invalid-aur wrong-aur-events missing-arch-advisory invalid-arch-advisory kernel-crash controller-oom missing-health; do
   export FAKE_QEMU_PULL_EXIT=0
   export FAKE_QEMU_DAEMON_RECEIPT=valid
   export FAKE_QEMU_DOCTOR_RECEIPT=valid
-  export FAKE_QEMU_AUR_RECEIPT=valid
+  export FAKE_QEMU_AUR_RECEIPT=valid FAKE_QEMU_ARCH_ADVISORY_RECEIPT=valid
   export FAKE_QEMU_GUEST_EXIT=0 FAKE_QEMU_CLEANUP_FAIL=0 FAKE_QEMU_MISSING_RECEIPT=0
   export FAKE_QEMU_SERIAL='Linux version 6.12 fixture' FAKE_QEMU_OOM=false FAKE_QEMU_HEALTH_MISSING=0
   unset FAKE_QEMU_TRANSPORT_EXIT
@@ -646,6 +660,8 @@ for scenario in pass pull-failure product-failure product-exit-three timeout sig
     missing-aur) export FAKE_QEMU_AUR_RECEIPT=missing; expected_rc=1; expected_result=HARNESS_ERROR ;;
     invalid-aur) export FAKE_QEMU_AUR_RECEIPT=invalid; expected_rc=1; expected_result=HARNESS_ERROR ;;
     wrong-aur-events) export FAKE_QEMU_AUR_RECEIPT=wrong-events; expected_rc=1; expected_result=HARNESS_ERROR ;;
+    missing-arch-advisory) export FAKE_QEMU_ARCH_ADVISORY_RECEIPT=missing; expected_rc=1; expected_result=HARNESS_ERROR ;;
+    invalid-arch-advisory) export FAKE_QEMU_ARCH_ADVISORY_RECEIPT=invalid; expected_rc=1; expected_result=HARNESS_ERROR ;;
     kernel-crash) export FAKE_QEMU_SERIAL='Kernel panic - not syncing: fixture'; expected_rc=120; expected_result=HARNESS_ERROR ;;
     controller-oom) export FAKE_QEMU_OOM=true; expected_rc=120; expected_result=HARNESS_ERROR ;;
     missing-health) export FAKE_QEMU_HEALTH_MISSING=1; expected_rc=120; expected_result=HARNESS_ERROR ;;
