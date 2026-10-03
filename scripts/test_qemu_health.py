@@ -170,11 +170,15 @@ docker() {
 
     def test_collector_binds_optional_boot_argument_and_accepts_no_crashes(self):
         with patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
-                patch.object(HEALTH, "query", side_effect=["Linux version 6.12\n", ""]) as query:
+                patch.object(HEALTH, "query", side_effect=self.processing_query(["", ""], "")) as query:
             receipt = HEALTH.collect()
         self.assertTrue(receipt["complete"])
         self.assertEqual(receipt["product_crashes"], [])
         for call in query.call_args_list:
+            if call.args[0][0] == "systemctl":
+                self.assertIn("--property=Id,ActiveState,SubState,Result", call.args[0])
+                self.assertIn("systemd-coredump@*.service", call.args[0])
+                continue
             self.assertIn("--boot=" + self.payload["boot_id"].replace("-", ""), call.args[0])
             self.assertIn("--quiet", call.args[0])
             self.assertNotIn("--boot", call.args[0])
@@ -207,17 +211,18 @@ docker() {
         core = json.dumps({"COREDUMP_COMM": "tokio-runtime-w", "COREDUMP_EXE": "/home/bench/release/omg",
                            "COREDUMP_SIGNAL": "11", "COREDUMP_ENVIRON": "private"})
         with patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
-                patch.object(HEALTH, "query", side_effect=["Linux version 6.12\n", core]):
+                patch.object(HEALTH, "query", side_effect=self.processing_query(["", ""], core)):
             receipt = HEALTH.collect()
         self.assertEqual(receipt["product_crashes"], [{"process": "omg", "signal": 11}])
         self.assertNotIn("private", json.dumps(receipt))
         self.assertNotIn("/home/bench", json.dumps(receipt))
 
-    def processing_query(self, processors):
+    def processing_query(self, processors, core_rows=None):
         """Return normal journals and successive systemd processing observations."""
         observations = iter(processors)
-        sentinel = json.dumps({"COREDUMP_COMM": "omg-qemu-probe",
-                               "COREDUMP_EXE": "/usr/bin/python3.14", "COREDUMP_SIGNAL": "6"})
+        if core_rows is None:
+            core_rows = json.dumps({"COREDUMP_COMM": "omg-qemu-probe",
+                                    "COREDUMP_EXE": "/usr/bin/python3.14", "COREDUMP_SIGNAL": "6"})
 
         def query(argv):
             if argv[0] == "systemctl":
@@ -225,7 +230,7 @@ docker() {
                 if isinstance(observed, Exception):
                     raise observed
                 return observed
-            return "Linux version 6.12\n" if "--dmesg" in argv else sentinel
+            return "Linux version 6.12\n" if "--dmesg" in argv else core_rows
 
         return query
 
