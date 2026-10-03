@@ -474,6 +474,15 @@ impl RustManager {
             }
         }
 
+        for component in ["rustc", "cargo"] {
+            if required_components
+                .iter()
+                .any(|required| required == component)
+            {
+                super::common::require_regular_file(&dest_dir.join("bin").join(component))?;
+            }
+        }
+
         let mut metadata = RustToolchainMetadata {
             release: Some(manifest_release(manifest)?),
             ..Default::default()
@@ -919,9 +928,10 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             assert!(crate::core::paths::test_mode());
             return tokio::runtime::Runtime::new()?.block_on(async {
-                install_fixture(false, false).await?;
-                install_fixture(true, false).await?;
-                install_fixture(false, true).await
+                install_fixture(false, None).await?;
+                install_fixture(true, None).await?;
+                install_fixture(false, Some("cargo")).await?;
+                install_fixture(false, Some("rustc")).await
             });
         }
         // Isolate the existing debug-only loopback policy to this child process.
@@ -949,7 +959,7 @@ mod tests {
         Ok(())
     }
 
-    async fn install_fixture(corrupt: bool, missing_launcher: bool) -> Result<()> {
+    async fn install_fixture(corrupt: bool, missing_launcher: Option<&str>) -> Result<()> {
         use sha2::{Digest as _, Sha256};
         use std::fmt::Write as _;
         let toolchain = RustToolchainSpec::parse("1.93.1")?;
@@ -970,7 +980,7 @@ mod tests {
                 false,
             ),
         ] {
-            let file = if missing_launcher && component == "rustc" {
+            let file = if missing_launcher == Some(component) {
                 "share/doc/stub"
             } else {
                 file
@@ -1038,9 +1048,11 @@ mod tests {
             );
             return Ok(());
         }
-        if missing_launcher {
-            let error = result.expect_err("missing compiler must not publish a toolchain");
+        if let Some(component) = missing_launcher {
+            let error =
+                result.expect_err("missing requested launcher must not publish a toolchain");
             assert!(format!("{error:#}").contains("Missing required runtime binary"));
+            assert!(format!("{error:#}").contains(&format!("bin/{component}")));
             assert!(!directory.exists());
             assert!(!versions.path().join("current").exists());
             let names: Vec<_> = fs::read_dir(versions.path())?
