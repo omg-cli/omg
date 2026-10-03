@@ -1614,6 +1614,58 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(history_ownership)]
     async fn security_updates_record_one_update_with_rollback_versions() -> Result<()> {
+        const NAME: &str =
+            "cli::security::tests::security_updates_record_one_update_with_rollback_versions";
+        const MARKER: &str = "OMG_SECURITY_UPDATE_HISTORY_CHILD";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        if std::env::var_os(MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            // Explicit history storage does not redirect the durable audit writer.
+            // Scope its data directory in a child process, without mutating the
+            // environment shared by other unit tests or repairing caller state.
+            let directory = tempfile::tempdir()?;
+            let mut command = tokio::process::Command::new(std::env::current_exe()?);
+            command
+                .args(["--exact", NAME, "--nocapture", "--color", "never"])
+                .env(MARKER, "1")
+                .env("OMG_DATA_DIR", directory.path())
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let child = command.output();
+            let output = tokio::time::timeout(std::time::Duration::from_secs(20), child)
+                .await
+                .context("isolated security update fixture timed out")??;
+            let stdout = String::from_utf8(output.stdout)?;
+            let stderr = String::from_utf8(output.stderr)?;
+            anyhow::ensure!(
+                output.status.success(),
+                "isolated security update failed: {}\n{stdout}\n{stderr}",
+                output.status
+            );
+            anyhow::ensure!(
+                stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+                "isolated security update must execute exactly one passing test: {stdout}"
+            );
+            let logger = crate::core::security::audit::AuditLogger::new_in(
+                directory.path().join("audit/audit.jsonl"),
+            )?;
+            let report = logger.verify_integrity()?;
+            assert!(report.is_valid());
+            assert_eq!(report.total_entries, 1);
+            let entries = logger.get_recent(1)?;
+            assert_eq!(
+                entries[0].event_type,
+                crate::core::security::audit::AuditEventType::PackageUpgrade
+            );
+            assert_eq!(entries[0].resource, "example");
+            assert!(
+                entries[0]
+                    .description
+                    .contains("Package operation Update: succeeded")
+            );
+            return Ok(());
+        }
         use crate::core::history::{HistoryManager, TransactionType};
         use crate::core::testing::TestPackageManager;
         use crate::package_managers::types::UpdateInfo;
