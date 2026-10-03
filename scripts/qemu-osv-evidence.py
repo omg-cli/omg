@@ -142,11 +142,12 @@ def validate_evidence(directory, archive, fixture, distro):
         if not isinstance(events, list) or not events or any(not isinstance(event, dict) for event in events):
             raise ValueError("missing TLS refusal evidence")
         for event in events:
-            if event.get("kind") == "transport-eof":
+            if event.get("kind") in {"transport-eof", "tls-close"}:
+                expected_error = ssl.SSL_ERROR_EOF if event["kind"] == "transport-eof" else ssl.SSL_ERROR_ZERO_RETURN
                 if (set(event) != {"kind", "ssl_error", "error"}
-                        or type(event["ssl_error"]) is not int or event["ssl_error"] != ssl.SSL_ERROR_EOF
+                        or type(event["ssl_error"]) is not int or event["ssl_error"] != expected_error
                         or not isinstance(event["error"], str) or not 0 < len(event["error"]) <= 512):
-                    raise ValueError("invalid transport EOF evidence")
+                    raise ValueError("invalid TLS closure evidence")
             elif event.get("kind") == "tls-error":
                 if (set(event) != {"kind", "ssl_error", "reason", "error"}
                         or type(event["ssl_error"]) is not int or event["ssl_error"] != ssl.SSL_ERROR_SSL

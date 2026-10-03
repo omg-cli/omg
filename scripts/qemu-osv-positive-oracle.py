@@ -40,6 +40,8 @@ class TLSEvidenceServer(http.server.ThreadingHTTPServer):
         except ssl.SSLError as error:
             if isinstance(error, ssl.SSLEOFError):
                 self.event({'kind': 'transport-eof', 'ssl_error': error.errno, 'error': str(error)})
+            elif isinstance(error, ssl.SSLZeroReturnError):
+                self.event({'kind': 'tls-close', 'ssl_error': error.errno, 'error': str(error)})
             else:
                 self.event({'kind': 'tls-error', 'ssl_error': error.errno,
                             'reason': error.reason, 'error': str(error)})
