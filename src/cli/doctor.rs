@@ -2340,35 +2340,40 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn fedora_local_db_check_requires_exact_offline_command_and_success() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let fixture = tempfile::TempDir::new().expect("isolated DNF fixture");
         let program = fixture.path().join("dnf5");
         for (name, repo_flag) in [("dnf5", "--disable-repo=*"), ("dnf", "--disablerepo=*")] {
             let program = fixture.path().join(name);
+            let script = fixture.path().join(format!("{name}.sh"));
             std::fs::write(
-                &program,
+                &script,
                 format!(
                     "#!/bin/sh\n[ \"$1\" = --cacheonly ] && [ \"$2\" = '{repo_flag}' ] && [ \"$3\" = check ] && [ \"$#\" = 3 ]\n"
                 ),
             )
             .expect("DNF fixture");
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
-                .expect("executable DNF fixture");
+            symlink("/bin/sh", &program).expect("immutable named fixture interpreter");
+            // Execute the native interpreter, not an inode a concurrent child
+            // may still hold for writing. execve rejects that inode with ETXTBSY.
+            let _writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&script)
+                .expect("retain fixture writer through native launch");
+            let mut command = std::process::Command::new(&program);
+            command.arg(&script);
             assert_eq!(
-                check_fedora_package_db(
-                    std::process::Command::new(&program),
-                    Duration::from_secs(2)
-                )
-                .await,
+                check_fedora_package_db(command, Duration::from_secs(2)).await,
                 0,
                 "{name} should use its documented offline flags"
             );
         }
-        std::fs::write(&program, b"#!/bin/sh\nexit 23\n").expect("failing DNF fixture");
-        let issues =
-            check_fedora_package_db(std::process::Command::new(&program), Duration::from_secs(2))
-                .await;
+        let script = fixture.path().join("dnf5.sh");
+        std::fs::write(&script, b"#!/bin/sh\nexit 23\n").expect("failing DNF fixture");
+        let mut command = std::process::Command::new(&program);
+        command.arg(&script);
+        let issues = check_fedora_package_db(command, Duration::from_secs(2)).await;
         assert_eq!(issues, 1);
         let mut doctor_issues = 0;
         add_native_infra_issues(Distro::Fedora, &mut doctor_issues, async { issues }).await;
