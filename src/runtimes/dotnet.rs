@@ -336,6 +336,29 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn release_metadata_refuses_private_target_before_connecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metadata connection observer");
+        let url = format!("https://{}/releases.json", listener.local_addr().unwrap());
+        let manager = DotnetManager::new();
+        let (result, connection) = tokio::join!(
+            manager.fetch_metadata(&url),
+            async {
+                tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+                    .await
+                    .map(|connection| connection.map(|(stream, _)| drop(stream)))
+            }
+        );
+        let error = result.expect_err("private release metadata must be refused");
+        assert!(
+            connection.is_err(),
+            "metadata-selected private address received a connection"
+        );
+        assert!(format!("{error:#}").contains("private or local address"));
+    }
     use serde_json::json;
 
     fn fixture_channel() -> serde_json::Value {
