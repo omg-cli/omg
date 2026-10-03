@@ -2115,6 +2115,115 @@ pub(crate) fn harden_untrusted_runtime_command(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
+    async fn runtime_status_download_fixture(
+        statuses: &[u16],
+        dest: &Path,
+        requests: &std::sync::atomic::AtomicUsize,
+    ) -> anyhow::Result<(tempfile::TempPath, String)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/archive", listener.local_addr()?);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()?;
+        let server = async {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().await?;
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    anyhow::ensure!(header.len() < 4096, "fixture request header too large");
+                    header.push(stream.read_u8().await?);
+                }
+                anyhow::ensure!(header.starts_with(b"GET /archive HTTP/1.1\r\n"));
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body: &[u8] = if *status == 200 {
+                    b"verified runtime archive fixture"
+                } else {
+                    b"upstream error body must not enter the archive"
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                stream.write_all(body).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let download = stream_runtime_download_to_temp::<Sha256, _, _>(
+            "127.0.0.1",
+            |resume| {
+                assert!(resume.is_none());
+                let client = &client;
+                let url = &url;
+                async move { Ok(client.get(url).send().await?) }
+            },
+            dest,
+        );
+        let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::try_join!(server, download)
+        })
+        .await??;
+        Ok(result)
+    }
+
+    #[tokio::test]
+    async fn runtime_download_recovers_from_transient_status_without_error_body()
+    -> anyhow::Result<()> {
+        for status in [408, 429, 500, 502, 503, 504] {
+            let directory = tempfile::tempdir()?;
+            let dest = directory.path().join("archive.tar.gz");
+            let requests = std::sync::atomic::AtomicUsize::new(0);
+            let result = runtime_status_download_fixture(&[status, 200], &dest, &requests).await;
+            assert!(result.is_ok(), "HTTP {status} must recover: {result:?}");
+            let (temporary, actual) = result?;
+            let expected = b"verified runtime archive fixture";
+            assert_eq!(actual, hex::encode(Sha256::digest(expected)));
+            assert_eq!(fs::read(&temporary)?, expected);
+            assert!(
+                !dest.exists(),
+                "unverified downloads must remain unpublished"
+            );
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+            drop(temporary);
+            assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_download_status_budget_preserves_refusals_and_destination()
+    -> anyhow::Result<()> {
+        for (statuses, expected_requests, diagnostic) in [
+            (vec![502, 502, 502, 200], 3, "HTTP 502"),
+            (vec![403, 200], 1, "HTTP 403"),
+            (vec![404, 200], 1, "Version not found (404)"),
+            (vec![416, 200], 1, "HTTP 416"),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let dest = directory.path().join("archive.tar.gz");
+            fs::write(&dest, b"existing verified archive")?;
+            let requests = std::sync::atomic::AtomicUsize::new(0);
+            let error = runtime_status_download_fixture(&statuses, &dest, &requests)
+                .await
+                .expect_err("persistent errors and permanent refusals must remain failures");
+            assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                expected_requests
+            );
+            assert_eq!(fs::read(&dest)?, b"existing verified archive");
+            assert_eq!(fs::read_dir(directory.path())?.count(), 1);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn runtime_download_request_recovers_once_and_preserves_http_refusals()
     -> anyhow::Result<()> {
