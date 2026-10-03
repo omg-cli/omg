@@ -732,8 +732,7 @@ fn draw_recent_activity(f: &mut Frame, area: Rect, app: &App) {
     .block(styled_block(" Recent"))
     .style(Style::default().bg(colors::BG_MEDIUM));
 
-    let mut state = ListState::default().with_selected(Some(app.selected_index));
-    f.render_stateful_widget(activity_list, area, &mut state);
+    f.render_widget(activity_list, area);
 }
 
 fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
@@ -1107,7 +1106,8 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
     .block(styled_block(" Activity Log"))
     .style(Style::default().bg(colors::BG_MEDIUM));
 
-    f.render_widget(activity_list, area);
+    let mut state = ListState::default().with_selected(Some(app.selected_index));
+    f.render_stateful_widget(activity_list, area, &mut state);
 }
 
 fn draw_team(f: &mut Frame, area: Rect, app: &App) {
