@@ -1762,7 +1762,7 @@ mod tests {
     }
 
     // Independent baseline concatenation and UTF-8 fixtures, checked with Python hashlib.
-    const HISTORICAL: &str = concat!(
+    pub(super) const HISTORICAL: &str = concat!(
         r#"{"id":"legacy-1","timestamp":"2026-01-16T00:00:00Z","event_type":"package_install","severity":"info","user":"test","resource":"ab","description":"","prev_hash":"genesis","hash":"0c1d6273c4d0c09be7a190c6bf7f76e62ce3ebe4c16f08f11fa9b6d5cd57113b"}"#,
         "\n",
         r#"{"id":"legacy-2","timestamp":"2026-01-16T00:00:00Z","event_type":"package_install","severity":"info","user":"test","resource":"café","description":"line\nx","prev_hash":"0c1d6273c4d0c09be7a190c6bf7f76e62ce3ebe4c16f08f11fa9b6d5cd57113b","hash":"c2c9a3b5fad8ec6f962ceae36d69be6f375d3b9b1d6eeeebdc0edc585920023d","metadata":{"ok":true}}"#,
@@ -2665,20 +2665,18 @@ mod completeness_tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
-    #[tokio::test]
-    async fn tracing_message_escapes_newlines_from_caller_description() -> anyhow::Result<()> {
+    async fn capture_in_isolated_child(test_name: &str) -> anyhow::Result<bool> {
         use anyhow::Context;
 
         const CHILD_MARKER: &str = "OMG_AUDIT_CAPTURE_ISOLATED_CHILD";
-        const TEST_NAME: &str = "core::security::audit::completeness_tests::tracing_message_escapes_newlines_from_caller_description";
-        if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new(test_name)) {
             // A temporary subscriber shares callsite registration with parallel
             // tests. Run this same real logging oracle in a fresh test process.
             use tokio::io::AsyncReadExt;
             const MAX_CAPTURE: u64 = 256 * 1024;
             let mut child = tokio::process::Command::new(std::env::current_exe()?)
-                .args(["--exact", TEST_NAME, "--nocapture", "--color", "never"])
-                .env(CHILD_MARKER, "1")
+                .args(["--exact", test_name, "--nocapture", "--color", "never"])
+                .env(CHILD_MARKER, test_name)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -2726,6 +2724,14 @@ mod completeness_tests {
             );
             anyhow::ensure!(stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")), "isolated audit capture must execute exactly one passing test: {stdout}");
             println!("AUDIT_CAPTURE_CHILD_BEGIN\n{stdout}\n{stderr}\nAUDIT_CAPTURE_CHILD_END");
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    #[tokio::test]
+    async fn tracing_message_escapes_newlines_from_caller_description() -> anyhow::Result<()> {
+        if capture_in_isolated_child("core::security::audit::completeness_tests::tracing_message_escapes_newlines_from_caller_description").await? {
             return Ok(());
         }
         assert_eq!(
@@ -2767,6 +2773,86 @@ mod completeness_tests {
         let disk = std::fs::read_to_string(&log_path)?;
         assert_eq!(disk.lines().count(), 1, "disk record must be one line");
         assert!(disk.contains("Installed pkg\\nInjected: fake success"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verification_warns_only_for_valid_legacy_hashes_without_rewriting()
+    -> anyhow::Result<()> {
+        if capture_in_isolated_child("core::security::audit::completeness_tests::verification_warns_only_for_valid_legacy_hashes_without_rewriting").await? {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let mut logger = super::AuditLogger::new_in(&path)?;
+        logger.log(
+            super::AuditEventType::PackageInstall,
+            super::AuditSeverity::Info,
+            "pkg",
+            "Installed pkg",
+        )?;
+        let capture = MessageCapture::default();
+        let modern_bytes = std::fs::read(&path)?;
+        let report =
+            tracing::subscriber::with_default(capture.clone(), || logger.verify_integrity())?;
+        assert_eq!(report.valid_entries, 1);
+        assert!(report.chain_valid);
+        assert!(
+            capture.0.lock().unwrap().is_empty(),
+            "modern hashes need no legacy warning"
+        );
+        assert_eq!(std::fs::read(&path)?, modern_bytes);
+
+        std::fs::write(&path, super::tests::HISTORICAL)?;
+        let mut logger = super::AuditLogger::new_in(&path)?;
+        let capture = MessageCapture::default();
+        let report =
+            tracing::subscriber::with_default(capture.clone(), || logger.verify_integrity())?;
+        assert_eq!(report.total_entries, 2);
+        assert_eq!(report.valid_entries, 2);
+        assert!(report.chain_valid);
+        assert_eq!(std::fs::read(&path)?, super::tests::HISTORICAL.as_bytes());
+        let expected_warning = "Audit log retains 2 record(s) with legacy hash encoding; field boundaries are not protected";
+        assert_eq!(*capture.0.lock().unwrap(), [expected_warning]);
+
+        logger.log(
+            super::AuditEventType::PackageInstall,
+            super::AuditSeverity::Info,
+            "pkg",
+            "Installed pkg",
+        )?;
+        capture.0.lock().unwrap().clear();
+        let mixed_bytes = std::fs::read(&path)?;
+        let report =
+            tracing::subscriber::with_default(capture.clone(), || logger.verify_integrity())?;
+        assert_eq!(report.total_entries, 3);
+        assert_eq!(report.valid_entries, 3);
+        assert!(report.chain_valid);
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            [expected_warning],
+            "count only the two legacy records"
+        );
+        assert_eq!(std::fs::read(&path)?, mixed_bytes);
+
+        let damaged = super::tests::HISTORICAL
+            .lines()
+            .next()
+            .unwrap()
+            .replace("\"resource\":\"ab\"", "\"resource\":\"changed\"");
+        std::fs::write(&path, format!("{damaged}\n"))?;
+        let logger = super::AuditLogger::new_in(&path)?;
+        capture.0.lock().unwrap().clear();
+        let report =
+            tracing::subscriber::with_default(capture.clone(), || logger.verify_integrity())?;
+        assert_eq!(report.total_entries, 1);
+        assert_eq!(report.valid_entries, 0);
+        assert_eq!(report.first_invalid_entry.as_deref(), Some("legacy-1"));
+        assert!(
+            capture.0.lock().unwrap().is_empty(),
+            "invalid hashes must not be counted as verified legacy records"
+        );
+        assert_eq!(std::fs::read_to_string(&path)?, format!("{damaged}\n"));
         Ok(())
     }
 
