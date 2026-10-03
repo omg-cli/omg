@@ -2225,6 +2225,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_download_status_retry_retains_range_and_shares_body_budget()
+    -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for recover in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/archive", listener.local_addr()?);
+            let body = b"runtime archive with a retained prefix";
+            let directory = tempfile::tempdir()?;
+            let dest = directory.path().join("archive.tar.gz");
+            let requests = std::sync::atomic::AtomicUsize::new(0);
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .read_timeout(std::time::Duration::from_secs(1))
+                .build()?;
+            let server = async {
+                async fn read_request(
+                    stream: &mut tokio::net::TcpStream,
+                ) -> anyhow::Result<String> {
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        anyhow::ensure!(header.len() < 4096, "fixture request header too large");
+                        header.push(stream.read_u8().await?);
+                    }
+                    Ok(String::from_utf8(header)?.to_ascii_lowercase())
+                }
+                let (mut stream, _) = listener.accept().await?;
+                assert!(
+                    read_request(&mut stream)
+                        .await?
+                        .starts_with("get /archive http/1.1\r\n")
+                );
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                stream.write_all(&body[..8]).await?;
+                let _stalled_body = stream;
+                let mut retained_range = None;
+                for attempt in 2..=3 {
+                    let (mut stream, _) = listener.accept().await?;
+                    let header = read_request(&mut stream).await?;
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let range = header
+                        .lines()
+                        .find_map(|line| line.strip_prefix("range: bytes="))
+                        .context("retained-prefix range header")?;
+                    assert!(header.contains("if-range: \"stable\"\r\n"));
+                    let offset = range
+                        .strip_suffix('-')
+                        .context("range suffix")?
+                        .parse::<usize>()?;
+                    assert!(offset > 0 && offset <= 8);
+                    if let Some(previous) = &retained_range {
+                        assert_eq!(
+                            range, previous,
+                            "HTTP 502 must preserve the validated prefix"
+                        );
+                    } else {
+                        retained_range = Some(range.to_string());
+                    }
+                    if recover && attempt == 3 {
+                        stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {offset}-{}/{}\r\nETag: \"stable\"\r\nConnection: close\r\n\r\n",
+                                    body.len() - offset,
+                                    body.len() - 1,
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
+                        stream.write_all(&body[offset..]).await?;
+                    } else {
+                        stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 5\r\nConnection: close\r\n\r\nerror").await?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            let download = stream_runtime_download_to_temp::<Sha256, _, _>(
+                "127.0.0.1",
+                |resume| {
+                    let client = &client;
+                    let url = &url;
+                    async move {
+                        let mut request = client.get(url);
+                        if let Some(resume) = resume {
+                            request = request
+                                .header(reqwest::header::RANGE, format!("bytes={}-", resume.offset))
+                                .header(reqwest::header::IF_RANGE, resume.validator);
+                        }
+                        Ok(request.send().await?)
+                    }
+                },
+                &dest,
+            );
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::try_join!(server, download)
+            })
+            .await?;
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
+            if recover {
+                let (_, (temporary, digest)) = result?;
+                assert_eq!(fs::read(&temporary)?, body);
+                assert_eq!(digest, hex::encode(Sha256::digest(body)));
+                drop(temporary);
+            } else {
+                assert!(
+                    format!(
+                        "{:#}",
+                        result.expect_err("three attempts exhaust the shared budget")
+                    )
+                    .contains("HTTP 502")
+                );
+            }
+            assert!(!dest.exists());
+            assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runtime_download_request_recovers_once_and_preserves_http_refusals()
     -> anyhow::Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
