@@ -348,12 +348,194 @@ mod tests {
     async fn checksum_sidecar_rejects_plain_http_before_request() {
         let error = fetch_checksum_sidecar(
             download_client(),
-            "http://192.0.2.1/checksums.sha256sum",
+            "http://192.0.2.1/checksums.sha256sum?token=sidecar_query_secret#sidecar_fragment_secret",
             "deno.zip",
         )
         .await
         .expect_err("plain HTTP sidecar must be rejected");
         assert!(format!("{error:#}").contains("HTTPS"));
+        for rendered in [format!("{error:#}"), format!("{error:?}")] {
+            assert!(!rendered.contains("sidecar_query_secret"));
+            assert!(!rendered.contains("sidecar_fragment_secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn vendor_url_failure_chains_do_not_expose_tokens() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const NAME: &str = "runtimes::deno::tests::vendor_url_failure_chains_do_not_expose_tokens";
+        const MARKER: &str = "OMG_URL_REDACTION_FIXTURE_CHILD";
+        if std::env::var_os(MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = tokio::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", NAME, "--nocapture", "--color", "never"])
+                .env(MARKER, "1")
+                .env("OMG_TEST_MODE", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let stdout = child.stdout.take().context("child stdout")?;
+            let stderr = child.stderr.take().context("child stderr")?;
+            let capture = async {
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let (status, _, _) = tokio::try_join!(
+                    child.wait(),
+                    stdout.take(256 * 1024 + 1).read_to_end(&mut out),
+                    stderr.take(256 * 1024 + 1).read_to_end(&mut err),
+                )?;
+                Ok::<_, std::io::Error>((status, out, err))
+            };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(20), capture).await;
+            let (status, out, err) = match result {
+                Ok(Ok(output)) => output,
+                failure => {
+                    if child.try_wait()?.is_none() {
+                        child.kill().await?;
+                    }
+                    child.wait().await?;
+                    anyhow::bail!("redaction fixture child did not finish: {failure:?}");
+                }
+            };
+            anyhow::ensure!(out.len() <= 256 * 1024 && err.len() <= 256 * 1024);
+            let out = String::from_utf8(out)?;
+            let err = String::from_utf8(err)?;
+            anyhow::ensure!(status.success(), "redaction child failed:\n{out}\n{err}");
+            anyhow::ensure!(out.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")));
+            println!("URL_REDACTION_CHILD\n{out}\n{err}");
+            return Ok(());
+        }
+        anyhow::ensure!(crate::core::paths::test_mode());
+        let mut violations = Vec::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/start", listener.local_addr()?);
+        let server = async {
+            for step in 0..2 {
+                let (mut stream, _) = listener.accept().await?;
+                let request = read_redaction_request(&mut stream).await?;
+                if step == 0 {
+                    anyhow::ensure!(request.starts_with("GET /start HTTP/1.1"));
+                    stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /hang?token=redirect_query_secret#redirect_fragment_secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+                } else {
+                    anyhow::ensure!(
+                        request.starts_with("GET /hang?token=redirect_query_secret HTTP/1.1")
+                    );
+                    let mut end = [0];
+                    anyhow::ensure!(stream.read(&mut end).await? == 0);
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let fetch = crate::core::http::fetch_public_download_with_timeout(
+            &url,
+            GITHUB_USER_AGENT,
+            Some(std::time::Duration::from_secs(1)),
+        );
+        let (server, result) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(server, fetch)
+        })
+        .await?;
+        server?;
+        let error = result.expect_err("observed redirected request must time out");
+        let transport = error
+            .downcast_ref::<reqwest::Error>()
+            .context("typed transport failure")?;
+        anyhow::ensure!(transport.is_timeout() && crate::core::http::is_retryable_error(transport));
+        record_redaction_failure("redirected timeout", &error, &mut violations);
+
+        let valid_digest = "ab".repeat(32);
+        for (label, status, body, declared) in [
+            ("status", "404 Not Found", b"missing".to_vec(), 7),
+            ("digest", "200 OK", b"bad-digest  deno.zip\n".to_vec(), 21),
+            ("utf8", "200 OK", vec![255], 1),
+            ("body", "200 OK", b"partial".to_vec(), 100),
+            (
+                "valid",
+                "200 OK",
+                format!("{valid_digest}  deno.zip\n").into_bytes(),
+                75,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!(
+                "http://{}/checksums?token=sidecar_query_secret#sidecar_fragment_secret",
+                listener.local_addr()?
+            );
+            let server = async {
+                let (mut stream, _) = listener.accept().await?;
+                let request = read_redaction_request(&mut stream).await?;
+                anyhow::ensure!(
+                    request.starts_with("GET /checksums?token=sidecar_query_secret HTTP/1.1")
+                );
+                let mut response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                stream.write_all(&response).await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            let (server, result) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    server,
+                    fetch_checksum_sidecar(download_client(), &url, "deno.zip")
+                )
+            })
+            .await?;
+            server?;
+            if label == "valid" {
+                assert_eq!(result?, valid_digest);
+            } else {
+                let error = result.expect_err("sidecar fault must remain a failure");
+                if label == "status" {
+                    assert_eq!(
+                        error
+                            .downcast_ref::<reqwest::Error>()
+                            .context("typed HTTP status")?
+                            .status(),
+                        Some(reqwest::StatusCode::NOT_FOUND)
+                    );
+                }
+                record_redaction_failure(label, &error, &mut violations);
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "URL secrets exposed by: {violations:?}"
+        );
+        Ok(())
+    }
+
+    async fn read_redaction_request(stream: &mut tokio::net::TcpStream) -> Result<String> {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            anyhow::ensure!(
+                stream.read(&mut byte).await? == 1,
+                "incomplete request headers"
+            );
+            request.push(byte[0]);
+            anyhow::ensure!(request.len() <= 8192, "request header fixture bound");
+        }
+        Ok(String::from_utf8(request)?)
+    }
+
+    fn record_redaction_failure(label: &str, error: &anyhow::Error, violations: &mut Vec<String>) {
+        for rendered in [format!("{error:#}"), format!("{error:?}")] {
+            if [
+                "redirect_query_secret",
+                "redirect_fragment_secret",
+                "sidecar_query_secret",
+                "sidecar_fragment_secret",
+            ]
+            .iter()
+            .any(|secret| rendered.contains(secret))
+            {
+                violations.push(label.to_owned());
+            }
+        }
     }
 
     fn ver(version: &str, prerelease: bool) -> DenoVersion {
