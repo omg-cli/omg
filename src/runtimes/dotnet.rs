@@ -57,6 +57,7 @@ impl DotnetManager {
         .await
         .with_context(|| format!("Failed to fetch .NET release metadata from {source}"))?
         .error_for_status()
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!(".NET release-metadata request failed: {source}"))?
         .bounded_json()
         .await

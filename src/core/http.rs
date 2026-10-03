@@ -215,7 +215,7 @@ async fn fetch_public_download_with_options(
                 .header(reqwest::header::RANGE, format!("bytes={offset}-"))
                 .header(reqwest::header::IF_RANGE, validator.clone());
         }
-        let response = request.send().await?;
+        let response = request.send().await.map_err(reqwest::Error::without_url)?;
         if !response.status().is_redirection() {
             return Ok(response);
         }
