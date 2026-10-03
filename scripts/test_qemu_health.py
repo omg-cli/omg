@@ -2,6 +2,8 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -37,6 +39,74 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(HEALTH.verify_guest(self.guest, self.serial, self.payload["boot_id"]), 0)
         with self.assertRaises(ValueError):
             HEALTH.verify_guest(self.guest, self.serial, "00000000-1111-2222-3333-555555555555")
+
+    def preparation_fixtures(self):
+        transactions = self.root / "transactions"
+        transactions.mkdir()
+        (self.root / "guest").mkdir()
+        (self.root / "guest/serial.log").write_text("Linux version 6.12\n")
+        (transactions / "prepare-install-serial.log").write_text("Linux version 6.12\n")
+        for operation, digit in (("remove", "5"), ("install", "6")):
+            boot = "00000000-1111-2222-3333-" + digit * 12
+            prefix = transactions / f"prepare-{operation}"
+            Path(str(prefix) + "-boot-id.txt").write_text(boot + "\n")
+            Path(str(prefix) + "-health.json").write_text(json.dumps(dict(self.payload, boot_id=boot)))
+
+    def test_clean_distinct_preparation_boots_pass(self):
+        self.preparation_fixtures()
+        self.assertEqual(HEALTH.verify_preparations(self.root), 0)
+
+    def test_preparation_admission_command_fails_closed(self):
+        self.preparation_fixtures()
+        command = [sys.executable, str(Path(__file__).with_name("check-qemu-health.py")),
+                   "verify-preparations", "--root", str(self.root)]
+        accepted = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        (self.root / "transactions/prepare-remove-health.json").unlink()
+        self.assertEqual(self.verify(), 0)
+        rejected = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        self.assertEqual(rejected.returncode, 2, rejected.stderr)
+        self.assertIn("health evidence failed admission", rejected.stderr)
+
+    def test_healthy_resumed_guest_cannot_hide_invalid_preparation(self):
+        self.preparation_fixtures()
+        for operation in ("remove", "install"):
+            receipt = self.root / "transactions" / f"prepare-{operation}-health.json"
+            original = receipt.read_text()
+            clean = json.loads(original)
+            variants = [None, "", "{", json.dumps(dict(clean, complete=False)),
+                        json.dumps(dict(clean, boot_id=self.payload["boot_id"])),
+                        json.dumps(dict(clean, product_crashes=[{"process": "omg", "signal": 6}])),
+                        json.dumps(dict(clean, fatal_signatures=["Oops:"]))]
+            for invalid in variants:
+                with self.subTest(operation=operation, invalid=invalid):
+                    if invalid is None:
+                        receipt.unlink()
+                    else:
+                        receipt.write_text(invalid)
+                    self.assertEqual(self.verify(), 0)  # Resume boot remains healthy.
+                    with self.assertRaises((OSError, ValueError)):
+                        HEALTH.verify_preparations(self.root)
+                    receipt.write_text(original)
+
+    def test_preparations_require_identity_and_serial_for_each_distinct_boot(self):
+        self.preparation_fixtures()
+        for relative in ("transactions/prepare-remove-boot-id.txt",
+                         "transactions/prepare-install-boot-id.txt", "guest/serial.log",
+                         "transactions/prepare-install-serial.log"):
+            path = self.root / relative
+            original = path.read_text()
+            path.unlink()
+            with self.subTest(missing=relative), self.assertRaises(OSError):
+                HEALTH.verify_preparations(self.root)
+            path.write_text(original)
+        transactions = self.root / "transactions"
+        (transactions / "prepare-install-boot-id.txt").write_text(
+            (transactions / "prepare-remove-boot-id.txt").read_text())
+        (transactions / "prepare-install-health.json").write_text(
+            (transactions / "prepare-remove-health.json").read_text())
+        with self.assertRaisesRegex(ValueError, "repeated preparation boot"):
+            HEALTH.verify_preparations(self.root)
 
     @unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0
                          and shutil.which("journalctl"), "Native root journal query runs in Linux QEMU preparation")

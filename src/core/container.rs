@@ -374,9 +374,9 @@ impl ContainerManager {
     /// All interpolated inputs are validated against allowlist charsets
     /// before any formatting: `base_image` must be a plain image reference,
     /// runtime names must pass [`validate_package_name`], and versions must
-    /// pass [`validate_version`]. Invalid values never reach the generated
-    /// text; they are replaced with safe fallbacks (or the runtime entry is
-    /// skipped) and reported via `tracing::warn!`.
+    /// pass [`validate_version`]. Invalid values never reach executable text.
+    /// Unsupported version requests are recorded in the result and emit a
+    /// failing build step; the CLI refuses them before writing a Dockerfile.
     pub fn generate_dockerfile(
         &self,
         base_image: &str,
@@ -391,6 +391,7 @@ impl ContainerManager {
         dockerfile.push_str("# OMG Development Environment\n");
         dockerfile.push_str("LABEL maintainer=\"OMG Team\"\n\n");
         let mut unpinned_urls = Vec::new();
+        let mut runtime_errors = Vec::new();
 
         // Install common dependencies based on base image
         if base_image.contains("ubuntu") || base_image.contains("debian") {
@@ -409,36 +410,76 @@ impl ContainerManager {
         for (runtime, version) in runtimes {
             if let Err(error) = crate::core::security::validate_package_name(runtime) {
                 tracing::warn!("Skipping runtime {runtime:?} in generated Dockerfile: {error}");
+                runtime_errors.push(format!("Invalid runtime name {runtime:?}: {error}"));
+                dockerfile
+                    .push_str("RUN printf '%s\\n' 'OMG invalid runtime request' >&2; exit 1\n\n");
                 continue;
             }
+            let version = version
+                .strip_prefix('v')
+                .or_else(|| version.strip_prefix('V'))
+                .filter(|numeric| {
+                    numeric.split('.').all(|part| {
+                        !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                })
+                .unwrap_or(version);
             let version = if version.is_empty() {
                 String::new()
             } else if let Err(error) = crate::core::security::validate_version(version) {
-                tracing::warn!(
-                    "Replacing unsafe version {version:?} for runtime {runtime}: {error}"
-                );
-                "latest".to_string()
+                runtime_errors.push(format!(
+                    "{runtime}: unsupported version request {version:?}: {error}; use a numeric pin or system"
+                ));
+                push_runtime_request_failure(&mut dockerfile, runtime);
+                String::new()
             } else {
-                (*version).to_string()
+                version.to_string()
             };
             let version = version.as_str();
+            let version_check = match runtime_version_check(runtime, version) {
+                Ok(check) => check,
+                Err(error) => {
+                    runtime_errors.push(error.to_string());
+                    push_runtime_request_failure(&mut dockerfile, runtime);
+                    continue;
+                }
+            };
+            if version == "system"
+                && let Some(package) = runtime_system_package(base_image, runtime, version)
+            {
+                let _ = writeln!(
+                    dockerfile,
+                    "# {runtime}: distribution default (no version pin)"
+                );
+                push_package_install(&mut dockerfile, base_image, &package);
+                continue;
+            }
             if !is_debian_base(base_image)
                 && let Some(package) = runtime_system_package(base_image, runtime, version)
             {
+                let _ = writeln!(
+                    dockerfile,
+                    "# {runtime}: distribution default; required version {version}"
+                );
                 push_package_install(&mut dockerfile, base_image, &package);
+                if let Some(check) = &version_check {
+                    let _ = writeln!(dockerfile, "{check}\n");
+                }
                 continue;
             }
             match *runtime {
                 "node" => {
                     dockerfile.push_str("# Install Node.js\n");
                     dockerfile.push_str("ENV NODE_VERSION=");
-                    // The NodeSource setup script only accepts a numeric major
-                    // version; alias symbolic requests to the supported LTS
-                    // major. https://github.com/nodesource/distributions
+                    // NodeSource accepts numeric majors. Only an unspecified
+                    // legacy request uses the fixed fallback; unresolved aliases
+                    // have already been refused above.
                     let node_major = version
                         .split('.')
                         .next()
-                        .filter(|major| major.chars().all(|c| c.is_ascii_digit()))
+                        .filter(|major| {
+                            !major.is_empty() && major.chars().all(|c| c.is_ascii_digit())
+                        })
                         .unwrap_or("20");
                     dockerfile.push_str(node_major);
                     dockerfile.push('\n');
@@ -465,10 +506,8 @@ impl ContainerManager {
                     dockerfile.push_str("    && rm -rf /var/lib/apt/lists/*\n\n");
                 }
                 "python" => {
-                    dockerfile.push_str("# Install Python\n");
-                    dockerfile.push_str("ENV PYTHON_VERSION=");
-                    dockerfile.push_str(version);
-                    dockerfile.push('\n');
+                    dockerfile.push_str("# Install Python (distribution default)\n");
+                    let _ = writeln!(dockerfile, "# Required Python version: {version}");
                     dockerfile.push_str("RUN apt-get update && apt-get install -y \\\n");
                     dockerfile.push_str("    python3 python3-pip python3-venv \\\n");
                     dockerfile.push_str("    && rm -rf /var/lib/apt/lists/* \\\n");
@@ -512,6 +551,7 @@ impl ContainerManager {
                 }
                 "go" => {
                     dockerfile.push_str("# Install Go\n");
+                    dockerfile.push_str("RUN arch=\"$(dpkg --print-architecture)\" && test \"$arch\" = amd64 || { printf '%s\\n' 'OMG Go archive requires Debian amd64; use a system provider or custom Dockerfile' >&2; exit 1; }\n");
                     // The tarball URL embeds the version, so it must be a real
                     // release number, never empty or "latest".
                     // https://go.dev/doc/install
@@ -614,6 +654,9 @@ impl ContainerManager {
                     }
                 }
             }
+            if let Some(check) = version_check {
+                let _ = writeln!(dockerfile, "{check}\n");
+            }
         }
 
         dockerfile.push_str("WORKDIR /app\n\n");
@@ -624,6 +667,7 @@ impl ContainerManager {
         GeneratedDockerfile {
             content: dockerfile,
             unpinned_urls,
+            runtime_errors,
         }
     }
 }
@@ -638,6 +682,74 @@ pub struct GeneratedDockerfile {
     /// digest was supplied. `omg container init` resolves these and
     /// regenerates; a non-empty list after regeneration is refused.
     pub unpinned_urls: Vec<String>,
+    /// Version requests that the generated installation cannot enforce.
+    /// The CLI refuses output containing these; direct callers also receive
+    /// an explicit failing build step.
+    pub runtime_errors: Vec<String>,
+}
+
+fn push_runtime_request_failure(dockerfile: &mut String, runtime: &str) {
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        dockerfile,
+        "RUN printf '%s\\n' 'OMG cannot satisfy runtime version request for {runtime}; use a numeric pin or system' >&2; exit 1\n"
+    );
+}
+
+fn runtime_version_check(runtime: &str, version: &str) -> Result<Option<String>> {
+    anyhow::ensure!(
+        version != "default",
+        "{runtime}: unresolved container default; choose an explicit version or system"
+    );
+    anyhow::ensure!(
+        runtime != "rust" || version != "system",
+        "Rust container system requests are unsupported; choose an explicit toolchain or a custom Dockerfile"
+    );
+    if version.is_empty() || version == "system" || runtime == "rust" {
+        return Ok(None);
+    }
+    let command = match runtime {
+        "node" => "node -p 'process.versions.node'",
+        "python" => "python3 -c 'import platform; print(platform.python_version())'",
+        "go" => {
+            "raw=\"$(go version)\" && printf '%s\\n' \"$raw\" | awk '{sub(/^go/, \"\", $3); print $3}'"
+        }
+        "ruby" => "ruby -e 'puts RUBY_VERSION'",
+        "bun" => "bun --version",
+        "java" => {
+            "raw=\"$(java -version 2>&1)\" && printf '%s\\n' \"$raw\" | awk 'NR == 1 {gsub(/\"/, \"\", $3); sub(/^1\\./, \"\", $3); print $3}'"
+        }
+        _ if version == "latest" => return Ok(None),
+        _ => anyhow::bail!(
+            "Cannot verify container runtime {runtime} version {version}; use a custom Dockerfile or system"
+        ),
+    };
+    let version = version
+        .strip_prefix('v')
+        .or_else(|| version.strip_prefix('V'))
+        .unwrap_or(version);
+    let components: Vec<_> = version.split('.').collect();
+    anyhow::ensure!(
+        (1..=3).contains(&components.len())
+            && components
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        "{runtime}: unsupported version request {version:?}; use a numeric pin or system"
+    );
+    if runtime == "go" {
+        anyhow::ensure!(
+            components.len() == 3,
+            "Go container pins require an exact X.Y.Z release, found {version}; use an exact pin or system"
+        );
+    }
+    let pattern = if components.len() == 3 {
+        version.to_string()
+    } else {
+        format!("{version}|{version}.*")
+    };
+    Ok(Some(format!(
+        "RUN actual=\"$({command})\" && case \"$actual\" in {pattern}) ;; *) printf '%s\\n' 'OMG runtime version mismatch: {runtime} must satisfy {version}' >&2; exit 1 ;; esac"
+    )))
 }
 
 /// SHA-256 digests for remote installer content a generated Dockerfile
@@ -778,6 +890,13 @@ fn runtime_system_package(base_image: &str, runtime: &str, version: &str) -> Opt
         "node" => Some("nodejs".to_string()),
         "python" if base_image.contains("arch") => Some("python".to_string()),
         "python" => Some("python3".to_string()),
+        "go" if version == "system" && is_debian_base(base_image) => Some("golang-go".to_string()),
+        "go" if version == "system"
+            && (base_image.contains("arch") || base_image.contains("alpine")) =>
+        {
+            Some("go".to_string())
+        }
+        "go" if version == "system" => Some("golang".to_string()),
         "java" if base_image.contains("arch") => Some("jdk-openjdk".to_string()),
         "java" if base_image.contains("alpine") => {
             let major = version.split('.').next().filter(|part| {
@@ -796,6 +915,7 @@ fn runtime_system_package(base_image: &str, runtime: &str, version: &str) -> Opt
             });
             Some(format!("java-{}-openjdk-devel", major.unwrap_or("21")))
         }
+        "java" if is_debian_base(base_image) => Some("default-jdk".to_string()),
         "java" => Some("java".to_string()),
         "ruby" => Some("ruby".to_string()),
         _ => None,
@@ -976,6 +1096,311 @@ mod tests {
         assert!(dockerfile.contains("Install Node.js") || dockerfile.contains("NODE_VERSION"));
     }
 
+    #[test]
+    fn python_distro_install_does_not_claim_the_requested_version_is_installed() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated = manager.generate_dockerfile(
+            "ubuntu:24.04",
+            &[("python", "3.13.2")],
+            &InstallerDigests::new(),
+        );
+
+        assert!(
+            !generated.content.contains("ENV PYTHON_VERSION="),
+            "{}",
+            generated.content
+        );
+        assert!(
+            generated.content.contains("distribution default"),
+            "{}",
+            generated.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_python_version_check_rejects_a_different_distro_interpreter() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated = manager.generate_dockerfile(
+            "ubuntu:24.04",
+            &[("python", "3.13.2")],
+            &InstallerDigests::new(),
+        );
+        let check = generated
+            .content
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("RUN ")
+                    .filter(|command| command.contains("OMG runtime version mismatch"))
+            })
+            .expect("generated Python installation must verify its request");
+        let directory = tempfile::tempdir()?;
+        let python = directory.path().join("python3");
+        fs::write(&python, "#!/bin/sh\nprintf '3.12.9\\n'\n")?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+        let output = std::process::Command::new("sh")
+            .args(["-c", check])
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", directory.path().display()),
+            )
+            .output()?;
+
+        assert!(!output.status.success(), "wrong Python provider must fail");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("OMG runtime version mismatch"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_python_version_check_accepts_matching_exact_and_partial_pins() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let directory = tempfile::tempdir()?;
+        let python = directory.path().join("python3");
+        fs::write(&python, "#!/bin/sh\nprintf '3.13.2\\n'\n")?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+        for version in ["3.13.2", "3.13", "3"] {
+            let generated = manager.generate_dockerfile(
+                "ubuntu:24.04",
+                &[("python", version)],
+                &InstallerDigests::new(),
+            );
+            let check = generated
+                .content
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("RUN ")
+                        .filter(|command| command.contains("OMG runtime version mismatch"))
+                })
+                .expect("generated installation must verify its request");
+            let output = std::process::Command::new("sh")
+                .args(["-c", check])
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", directory.path().display()),
+                )
+                .output()?;
+            assert!(
+                output.status.success(),
+                "matching Python {version} must pass: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_runtime_constraints_make_direct_generated_builds_fail_closed() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated = manager.generate_dockerfile(
+            "ubuntu:24.04",
+            &[("python", ">=3.13")],
+            &InstallerDigests::new(),
+        );
+        assert!(!generated.runtime_errors.is_empty());
+        assert!(
+            generated
+                .content
+                .contains("OMG cannot satisfy runtime version request for python")
+        );
+        assert!(!generated.content.contains("ENV PYTHON_VERSION="));
+    }
+
+    #[test]
+    fn container_request_node_prefix_selects_the_requested_provider() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated = manager.generate_dockerfile(
+            "ubuntu:24.04",
+            &[("node", "v22.13.1")],
+            &InstallerDigests::new(),
+        );
+        assert!(generated.runtime_errors.is_empty());
+        assert!(
+            generated
+                .content
+                .contains("https://deb.nodesource.com/setup_22.x")
+        );
+        assert!(!generated.content.contains("setup_20.x"));
+    }
+
+    #[test]
+    fn container_review_unspecified_node_uses_a_nonempty_provider() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated =
+            manager.generate_dockerfile("ubuntu:24.04", &[("node", "")], &InstallerDigests::new());
+        assert!(generated.runtime_errors.is_empty());
+        assert!(generated.content.contains("setup_20.x"));
+        assert!(!generated.content.contains("setup_.x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_review_version_guards_preserve_provider_failure() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let directory = tempfile::tempdir()?;
+        for (runtime, version, output_text) in [
+            ("go", "1.23.5", "go version go1.23.5 linux/amd64"),
+            ("java", "21.0.5", "openjdk version \"21.0.5\""),
+        ] {
+            let executable = directory.path().join(runtime);
+            let generated = manager.generate_dockerfile(
+                "ubuntu:24.04",
+                &[(runtime, version)],
+                &InstallerDigests::new(),
+            );
+            assert!(generated.runtime_errors.is_empty());
+            let check = generated
+                .content
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("RUN ")
+                        .filter(|command| command.contains("OMG runtime version mismatch"))
+                })
+                .expect("runtime request must have a version guard");
+            for provider_status in [17, 0] {
+                fs::write(
+                    &executable,
+                    format!("#!/bin/sh\nprintf '%s\\n' '{output_text}'\nexit {provider_status}\n"),
+                )?;
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+                let output = std::process::Command::new("sh")
+                    .args(["-c", check])
+                    .env(
+                        "PATH",
+                        format!("{}:/usr/bin:/bin", directory.path().display()),
+                    )
+                    .output()?;
+                assert_eq!(
+                    output.status.success(),
+                    provider_status == 0,
+                    "{runtime} provider status {provider_status}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_review_go_archive_refuses_a_foreign_platform() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated = manager.generate_dockerfile(
+            "arm64v8/ubuntu:24.04",
+            &[("go", "")],
+            &InstallerDigests::new(),
+        );
+        let guard = generated
+            .content
+            .find("dpkg --print-architecture")
+            .expect("hardcoded amd64 archive must guard target architecture");
+        let archive = generated
+            .content
+            .find("curl -fsSL -o /tmp/omg-go.tar.gz")
+            .expect("archive install");
+        assert!(guard < archive);
+        assert!(generated.content.contains("amd64"));
+        let check = generated
+            .content
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("RUN ")
+                    .filter(|command| command.contains("dpkg --print-architecture"))
+            })
+            .expect("platform guard");
+        let directory = tempfile::tempdir()?;
+        let dpkg = directory.path().join("dpkg");
+        for (architecture, provider_status) in [("arm64", 0), ("amd64", 0), ("amd64", 17)] {
+            fs::write(
+                &dpkg,
+                format!("#!/bin/sh\nprintf '%s\\n' '{architecture}'\nexit {provider_status}\n"),
+            )?;
+            fs::set_permissions(&dpkg, fs::Permissions::from_mode(0o755))?;
+            let output = std::process::Command::new("sh")
+                .args(["-c", check])
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", directory.path().display()),
+                )
+                .output()?;
+            assert_eq!(
+                output.status.success(),
+                architecture == "amd64" && provider_status == 0,
+                "{architecture}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn container_request_go_prefix_selects_a_valid_release_url() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated = manager.generate_dockerfile(
+            "ubuntu:24.04",
+            &[("go", "v1.23.5")],
+            &InstallerDigests::new(),
+        );
+        assert!(generated.runtime_errors.is_empty());
+        assert!(
+            generated
+                .content
+                .contains("https://go.dev/dl/go1.23.5.linux-amd64.tar.gz")
+        );
+        assert!(!generated.content.contains("gov1.23.5"));
+    }
+
+    #[test]
+    fn container_request_java_system_uses_the_debian_jdk_provider() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated = manager.generate_dockerfile(
+            "ubuntu:24.04",
+            &[("java", "system")],
+            &InstallerDigests::new(),
+        );
+        assert!(generated.runtime_errors.is_empty());
+        assert!(generated.content.contains("apt-get install -y default-jdk"));
+    }
+
+    #[test]
+    fn container_request_rust_system_refuses_an_unsupported_provider() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated = manager.generate_dockerfile(
+            "ubuntu:24.04",
+            &[("rust", "system")],
+            &InstallerDigests::new(),
+        );
+        assert!(!generated.runtime_errors.is_empty());
+        assert!(!generated.content.contains("--default-toolchain system"));
+    }
+
+    #[test]
+    fn unresolved_runtime_aliases_are_refused_before_installer_generation() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        for (runtime, version) in [
+            ("node", "lts"),
+            ("go", "latest"),
+            ("bun", "latest"),
+            ("rust", "default"),
+            ("go", "default"),
+        ] {
+            let generated = manager.generate_dockerfile(
+                "ubuntu:24.04",
+                &[(runtime, version)],
+                &InstallerDigests::new(),
+            );
+            assert!(!generated.runtime_errors.is_empty(), "{runtime} {version}");
+            assert!(generated.unpinned_urls.is_empty(), "{runtime} {version}");
+            assert!(
+                generated
+                    .content
+                    .contains("OMG cannot satisfy runtime version request")
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn failed_container_command_is_not_reported_as_an_empty_result() {
@@ -994,18 +1419,18 @@ mod tests {
     #[test]
     fn non_debian_runtime_installs_use_the_base_image_package_manager() {
         let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
-        let dockerfile = manager
-            .generate_dockerfile(
-                "archlinux:latest",
-                &[
-                    ("node", "lts"),
-                    ("python", "3.12"),
-                    ("java", "21"),
-                    ("ruby", "3.3"),
-                ],
-                &InstallerDigests::new(),
-            )
-            .content;
+        let generated = manager.generate_dockerfile(
+            "archlinux:latest",
+            &[
+                ("node", "22"),
+                ("python", "3.12"),
+                ("java", "21"),
+                ("ruby", "3.3"),
+            ],
+            &InstallerDigests::new(),
+        );
+        assert!(generated.runtime_errors.is_empty(), "{generated:?}");
+        let dockerfile = generated.content;
 
         assert!(!dockerfile.contains("apt-get"), "{dockerfile}");
         for package in ["nodejs", "python", "jdk-openjdk", "ruby"] {
@@ -1128,9 +1553,10 @@ mod tests {
         let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
         let url = "https://go.dev/dl/go1.22.0.linux-amd64.tar.gz";
         let digests = InstallerDigests::from([(url.to_string(), "a".repeat(64))]);
-        for version in ["", "latest"] {
+        for version in ["", "1.22.0"] {
             let generated =
                 manager.generate_dockerfile("ubuntu:24.04", &[("go", version)], &digests);
+            assert!(generated.runtime_errors.is_empty(), "{generated:?}");
             assert!(generated.unpinned_urls.is_empty());
             assert!(generated.content.contains(url));
             assert!(generated.content.contains("ENV GO_VERSION=1.22.0\n"));
@@ -1174,12 +1600,14 @@ mod tests {
             "ubuntu:24.04",
             &[
                 ("rust", "stable"),
-                ("bun", "latest"),
+                ("bun", "1.2.0"),
                 ("node", "20.10.0"),
                 ("go", "1.22.5"),
             ],
             &digests,
         );
+
+        assert!(generated.runtime_errors.is_empty(), "{generated:?}");
 
         assert!(
             generated.unpinned_urls.is_empty(),

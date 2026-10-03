@@ -162,6 +162,25 @@ impl Drop for AlpmWorker {
 }
 
 #[cfg(test)]
+pub(crate) fn worker_with_shutdown_gate(
+    started: std_mpsc::Sender<()>,
+    shutdown_started: std::sync::Arc<tokio::sync::Notify>,
+    release: std_mpsc::Receiver<()>,
+) -> AlpmWorker {
+    let (tx, mut rx) = request_channel();
+    let thread = thread::spawn(move || {
+        while rx.blocking_recv().is_some() {}
+        started.send(()).expect("fixture controller is alive");
+        shutdown_started.notify_one();
+        release.recv().expect("fixture releases native shutdown");
+    });
+    AlpmWorker {
+        tx: Some(tx),
+        thread: Some(thread),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{AlpmRequest, AlpmWorker, request_channel};
     use std::sync::Arc;

@@ -1538,7 +1538,7 @@ mod sbom_audit {
 
         let hash = entry.compute_hash();
         assert!(!hash.is_empty());
-        assert_eq!(hash.len(), 64); // SHA-256
+        assert_eq!(hash.strip_prefix("v2:").unwrap().len(), 64); // SHA-256
 
         // Hash should be deterministic
         assert_eq!(hash, entry.compute_hash());

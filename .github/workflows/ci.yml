@@ -856,7 +856,7 @@ jobs:
   qemu:
     name: QEMU behavioral verification
     needs: [quick-gate, linux-matrix, ubuntu]
-    if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true'
+    if: github.event_name == 'merge_group' || ((github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true')
     uses: ./.github/workflows/qemu-matrix.yml
     permissions:
       contents: read
@@ -901,7 +901,7 @@ jobs:
           MACOS: ${{ needs.macos.result }}
           UBUNTU: ${{ needs.ubuntu.result }}
           QEMU: ${{ needs.qemu.result }}
-          QEMU_REQUIRED: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true' }}
+          QEMU_REQUIRED: ${{ github.event_name == 'merge_group' || ((github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true') }}
           DOCS_AUDIT: ${{ needs.docs-audit.result }}
         run: |
           echo "## CI Results Summary" >> $GITHUB_STEP_SUMMARY

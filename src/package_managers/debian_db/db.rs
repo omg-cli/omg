@@ -29,6 +29,7 @@ use std::sync::RwLock;
 
 use crate::core::paths;
 use crate::core::{Package, PackageSource};
+use crate::runtimes::common::{BudgetedWriter, decode_xz_to};
 
 /// TTL for cache eviction safety net (30 minutes)
 const CACHE_TTL_SECS: u64 = 30 * 60;
@@ -146,8 +147,10 @@ struct DpkgStatusCache {
     installed_set: Arc<AHashSet<String>>,
     status_mtime: std::time::SystemTime,
     extended_states_mtime: Option<std::time::SystemTime>,
-    /// Last access time for TTL-based eviction (unix seconds; `0` = never).
-    /// Atomic so cache HITS only need the read lock.
+    status_identity: Option<DpkgFileIdentity>,
+    extended_states_identity: Option<DpkgFileIdentity>,
+    loaded_at: Option<std::time::Instant>,
+    /// Publication time for TTL eviction; cache hits do not extend its age.
     last_accessed: AtomicU64,
 }
 
@@ -158,8 +161,52 @@ impl Default for DpkgStatusCache {
             installed_set: Arc::new(AHashSet::new()),
             status_mtime: std::time::UNIX_EPOCH,
             extended_states_mtime: None,
+            status_identity: None,
+            extended_states_identity: None,
+            loaded_at: None,
             last_accessed: AtomicU64::new(0),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DpkgFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    size: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl DpkgFileIdentity {
+    fn read(path: &Path) -> Result<Option<Self>> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to inspect {}", path.display()));
+            }
+        };
+        anyhow::ensure!(
+            metadata.is_file(),
+            "dpkg cache input must be a regular file: {}",
+            path.display()
+        );
+        Ok(Some(Self {
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }))
     }
 }
 
@@ -171,7 +218,22 @@ fn installed_cache_is_current(
     !cache.packages.is_empty()
         && cache.status_mtime == status_mtime
         && cache.extended_states_mtime == extended_states_mtime
-        && !is_access_expired(cache.last_accessed.load(Ordering::Relaxed))
+        && cache
+            .loaded_at
+            .is_some_and(|loaded| loaded.elapsed().as_secs() <= CACHE_TTL_SECS)
+}
+
+fn installed_cache_matches_sources(
+    cache: &DpkgStatusCache,
+    status: DpkgFileIdentity,
+    extended_states: Option<DpkgFileIdentity>,
+) -> bool {
+    installed_cache_is_current(
+        cache,
+        status.modified,
+        extended_states.map(|file| file.modified),
+    ) && cache.status_identity == Some(status)
+        && cache.extended_states_identity == extended_states
 }
 
 /// Names of all installed packages from the dpkg-status cache.
@@ -181,15 +243,12 @@ fn installed_cache_is_current(
 /// deep-cloning every installed entry and re-hashing N names.
 fn installed_names() -> Result<Arc<AHashSet<String>>> {
     let status_path = Path::new("/var/lib/dpkg/status");
-    let status_mtime = required_mtime(status_path)?;
-    let extended_states_mtime = optional_mtime(Path::new("/var/lib/apt/extended_states"))?;
+    let status = DpkgFileIdentity::read(status_path)?.context("dpkg status file is missing")?;
+    let extended_states = DpkgFileIdentity::read(Path::new("/var/lib/apt/extended_states"))?;
 
     {
         let cache = crate::core::sync::read_cache(&DPKG_STATUS_CACHE);
-        if installed_cache_is_current(&cache, status_mtime, extended_states_mtime) {
-            cache
-                .last_accessed
-                .store(unix_now_secs(), Ordering::Relaxed);
+        if installed_cache_matches_sources(&cache, status, extended_states) {
             return Ok(Arc::clone(&cache.installed_set));
         }
     }
@@ -628,6 +687,7 @@ fn required_mtime(path: &Path) -> Result<std::time::SystemTime> {
         .with_context(|| format!("Failed to read mtime {}", path.display()))
 }
 
+#[cfg(test)]
 fn optional_mtime(path: &Path) -> Result<Option<std::time::SystemTime>> {
     match fs::metadata(path) {
         Ok(meta) => {
@@ -1052,9 +1112,9 @@ fn read_packages_file_content(path: &Path) -> Result<String> {
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("xz"))
     {
-        let mut decompressed = Vec::new();
-        lzma_rs::xz_decompress(&mut reader, &mut decompressed)?;
-        buf = String::from_utf8(decompressed)
+        let mut decompressed = BudgetedWriter::new(Vec::new(), MAX_INDEX_SNAPSHOT_BYTES);
+        decode_xz_to(&mut reader, &mut decompressed)?;
+        buf = String::from_utf8(decompressed.into_inner())
             .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in xz-compressed Packages file: {e}"))?;
     } else {
         reader.read_to_string(&mut buf)?;
@@ -1818,9 +1878,46 @@ fn parse_security_inventory(
             identities.insert((name.clone(), architecture.clone())),
             "Duplicate installed dpkg identity: {name}:{architecture}"
         );
+        let mut source_fields = paragraph.lines().filter_map(|line| {
+            line.split_once(':')
+                .filter(|(key, _)| key.eq_ignore_ascii_case("Source"))
+                .map(|(_, value)| value.trim())
+        });
+        let advisory_source = if let Some(source) = source_fields.next() {
+            anyhow::ensure!(
+                source_fields.next().is_none(),
+                "Installed dpkg entry '{name}' has duplicate Source fields"
+            );
+            let (source_name, source_version) =
+                if let Some((source_name, suffix)) = source.split_once(" (") {
+                    let source_version = suffix
+                        .strip_suffix(')')
+                        .context("Invalid dpkg Source version")?;
+                    (source_name, source_version)
+                } else {
+                    (source, version.as_str())
+                };
+            anyhow::ensure!(
+                source_name.len() >= 2
+                    && source_name.as_bytes()[0].is_ascii_alphanumeric()
+                    && source_name.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'+' | b'-' | b'.'))
+                    && !source_version.is_empty()
+                    && !source_version
+                        .bytes()
+                        .any(|byte| byte.is_ascii_whitespace() || byte == b')'),
+                "Invalid dpkg Source identity for '{name}'"
+            );
+            (source_name != name || source_version != version)
+                .then(|| (source_name.to_owned(), source_version.to_owned()))
+        } else {
+            None
+        };
         packages.push(crate::package_managers::types::SecurityPackage {
             name,
             version,
+            advisory_source,
             description,
             architecture: Some(architecture),
             licenses: Vec::new(),
@@ -1834,12 +1931,16 @@ mod security_inventory_tests {
     use super::parse_security_inventory;
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "dpkg-query field syntax uses literal ${source:Package} and ${source:Version}"
+    )]
     fn security_inventory_matches_native_dpkg_identities() {
         let output = crate::core::privilege::system_command("dpkg-query")
             .unwrap()
             .args([
                 "--show",
-                "--showformat=${Package}\t${Architecture}\t${Version}\t${db:Status-Status}\n",
+                "--showformat=${Package}\t${Architecture}\t${Version}\t${source:Package}\t${source:Version}\t${db:Status-Status}\n",
             ])
             .output()
             .unwrap();
@@ -1860,11 +1961,14 @@ mod security_inventory_tests {
             .unwrap()
             .into_iter()
             .map(|package| {
+                let (advisory_name, advisory_version) = package.advisory_identity();
                 format!(
-                    "{}\t{}\t{}",
-                    package.name,
-                    package.architecture.unwrap(),
-                    package.version
+                    "{}\t{}\t{}\t{}\t{}",
+                    &package.name,
+                    package.architecture.as_deref().unwrap(),
+                    &package.version,
+                    advisory_name,
+                    advisory_version
                 )
             })
             .collect();
@@ -1963,6 +2067,39 @@ mod security_inventory_tests {
             .is_empty()
         );
     }
+
+    #[test]
+    fn security_inventory_uses_source_identity_only_for_advisory_lookups() {
+        let status = "Status: install ok installed\nArchitecture: amd64\nDescription: fixture\n";
+        let fixture = format!(
+            "Package: libacl1\nVersion: 2.3.2-2+b1\nSource: acl (2.3.2-2)\n{status}\n\
+             Package: libssl3t64\nVersion: 3.5.5-1ubuntu3.5\nSource: openssl\n{status}\n\
+             Package: native\nVersion: 1:2.0-3\n{status}\n\
+             Package: native-bnmu\nVersion: 2.0+b1\nSource: native-bnmu (2.0)\n{status}"
+        );
+        let packages = parse_security_inventory(&fixture).unwrap();
+        assert_eq!(packages[0].name, "libacl1");
+        assert_eq!(packages[0].version, "2.3.2-2+b1");
+        assert_eq!(packages[0].advisory_identity(), ("acl", "2.3.2-2"));
+        assert_eq!(
+            packages[1].advisory_identity(),
+            ("openssl", "3.5.5-1ubuntu3.5")
+        );
+        assert_eq!(packages[2].advisory_identity(), ("native", "1:2.0-3"));
+        assert_eq!(packages[3].advisory_identity(), ("native-bnmu", "2.0"));
+        for source in [
+            "Source: acl (2.3.2-2\n",
+            "Source: acl ()\n",
+            "Source: acl (2.3.2-2)\nSource: spoofed\n",
+            "Source: BadName\n",
+        ] {
+            let entry = format!("Package: libacl1\nVersion: 2.3.2-2+b1\n{source}{status}");
+            assert!(
+                parse_security_inventory(&entry).is_err(),
+                "accepted {source:?}"
+            );
+        }
+    }
 }
 
 pub fn list_installed_fast() -> Result<Vec<DpkgPackageEntry>> {
@@ -1976,29 +2113,30 @@ pub fn list_installed_fast() -> Result<Vec<DpkgPackageEntry>> {
         }]);
     }
 
-    let status_path = Path::new("/var/lib/dpkg/status");
+    list_installed_from_paths(
+        Path::new("/var/lib/dpkg/status"),
+        Path::new("/var/lib/apt/extended_states"),
+    )
+}
+
+fn list_installed_from_paths(
+    status_path: &Path,
+    extended_states_path: &Path,
+) -> Result<Vec<DpkgPackageEntry>> {
     if !status_path.exists() {
         anyhow::bail!("dpkg status file not found: {}", status_path.display());
     }
 
-    let extended_states_path = Path::new("/var/lib/apt/extended_states");
+    let status_identity =
+        DpkgFileIdentity::read(status_path)?.context("dpkg status file is missing")?;
+    let extended_states_identity = DpkgFileIdentity::read(extended_states_path)?;
+    let status_mtime = status_identity.modified;
+    let extended_states_mtime = extended_states_identity.map(|file| file.modified);
 
-    let status_mtime = required_mtime(status_path)?;
-    let extended_states_mtime = optional_mtime(extended_states_path)?;
-
-    // Check cache first. Hits take the READ lock only: `last_accessed` is
-    // atomic, and the returned Vec is cloned under the read guard.
+    // Hits take only the read lock and never extend the snapshot's lifetime.
     {
         let cache = crate::core::sync::read_cache(&DPKG_STATUS_CACHE);
-        if !is_access_expired(cache.last_accessed.load(Ordering::Relaxed))
-            && cache.status_mtime == status_mtime
-            && cache.extended_states_mtime == extended_states_mtime
-            && !cache.packages.is_empty()
-        {
-            // Cache hit! Update last accessed without writer contention.
-            cache
-                .last_accessed
-                .store(unix_now_secs(), Ordering::Relaxed);
+        if installed_cache_matches_sources(&cache, status_identity, extended_states_identity) {
             return Ok(cache.packages.clone());
         }
     }
@@ -2019,7 +2157,8 @@ pub fn list_installed_fast() -> Result<Vec<DpkgPackageEntry>> {
         }
 
         if let Some((name, version, description, arch)) = parse_status_paragraph(paragraph) {
-            let is_explicit = !auto_installed.contains(&name);
+            let is_explicit = !auto_installed.contains(&format!("{name}:{arch}"))
+                && !auto_installed.contains(&name);
             installed_set.insert(name.clone());
             packages.push(DpkgPackageEntry {
                 name,
@@ -2032,6 +2171,11 @@ pub fn list_installed_fast() -> Result<Vec<DpkgPackageEntry>> {
     }
 
     // Update cache
+    anyhow::ensure!(
+        DpkgFileIdentity::read(status_path)? == Some(status_identity)
+            && DpkgFileIdentity::read(extended_states_path)? == extended_states_identity,
+        "dpkg status or APT extended_states changed while reading the installed inventory"
+    );
     {
         let mut cache = crate::core::sync::write_cache(&DPKG_STATUS_CACHE);
         // Clear stale entries when the TTL safety net has lapsed so the
@@ -2043,6 +2187,9 @@ pub fn list_installed_fast() -> Result<Vec<DpkgPackageEntry>> {
         cache.installed_set = Arc::new(installed_set);
         cache.status_mtime = status_mtime;
         cache.extended_states_mtime = extended_states_mtime;
+        cache.status_identity = Some(status_identity);
+        cache.extended_states_identity = extended_states_identity;
+        cache.loaded_at = Some(std::time::Instant::now());
         cache
             .last_accessed
             .store(unix_now_secs(), Ordering::Relaxed);
@@ -2286,15 +2433,16 @@ fn dependencies_from_status(content: &str, package_name: &str) -> (Vec<String>, 
 }
 
 /// Extract dependency package names from a `Depends:`/`Pre-Depends:` value,
-/// stripping version constraints and multi-arch qualifiers and taking the
-/// first alternative of `|` groups.
+/// stripping version constraints and multi-arch qualifiers. Retaining every
+/// alternative makes pure orphan reachability conservative without a solver.
 fn append_dependency_names(value: &str, out: &mut Vec<String>) {
     for dep in value.split(',') {
-        let dep = dep.split('|').next().unwrap_or("");
-        if let Some(dep_name) = dep.split_whitespace().next() {
-            let dep_name = dep_name.split(':').next().unwrap_or(dep_name);
-            if !dep_name.is_empty() {
-                out.push(dep_name.to_string());
+        for alternative in dep.split('|') {
+            if let Some(dep_name) = alternative.split_whitespace().next() {
+                let dep_name = dep_name.split(':').next().unwrap_or(dep_name);
+                if !dep_name.is_empty() {
+                    out.push(dep_name.to_string());
+                }
             }
         }
     }
@@ -2457,12 +2605,22 @@ fn read_auto_installed_names(path: &Path) -> Result<AHashSet<String>> {
 
 fn auto_installed_names_from_extended_states(content: &str) -> AHashSet<String> {
     let mut auto_installed = AHashSet::new();
-    let mut current_pkg = String::new();
-    for line in content.lines() {
-        if let Some(name) = line.strip_prefix("Package: ") {
-            current_pkg = name.trim().to_string();
-        } else if line.starts_with("Auto-Installed: 1") && !current_pkg.is_empty() {
-            auto_installed.insert(std::mem::take(&mut current_pkg));
+    for paragraph in status_paragraphs(content) {
+        let field = |name: &str| {
+            paragraph.lines().find_map(|line| {
+                line.split_once(':')
+                    .filter(|(key, _)| *key == name)
+                    .map(|(_, value)| value.trim())
+            })
+        };
+        if let Some(name) = field("Package").filter(|name| !name.is_empty())
+            && field("Auto-Installed") == Some("1")
+        {
+            auto_installed.insert(
+                field("Architecture")
+                    .filter(|arch| !arch.is_empty())
+                    .map_or_else(|| name.to_owned(), |arch| format!("{name}:{arch}")),
+            );
         }
     }
     auto_installed
@@ -2476,7 +2634,12 @@ pub fn is_package_auto_installed(package_name: &str) -> Result<bool> {
     }
 
     let auto_installed = read_auto_installed_names(Path::new("/var/lib/apt/extended_states"))?;
-    Ok(auto_installed.contains(package_name))
+    let qualified = if package_name.contains(':') {
+        package_name.to_owned()
+    } else {
+        format!("{package_name}:{}", debian_arch())
+    };
+    Ok(auto_installed.contains(&qualified) || auto_installed.contains(package_name))
 }
 
 /// List orphaned packages on Debian/Ubuntu systems
@@ -2495,6 +2658,18 @@ pub fn list_orphans_fast() -> Result<Vec<String>> {
         return Ok(vec!["libunused1".to_string()]);
     }
 
+    #[cfg(feature = "debian")]
+    {
+        crate::package_managers::apt::list_orphans()
+    }
+    #[cfg(not(feature = "debian"))]
+    {
+        list_orphans_from_status()
+    }
+}
+
+#[cfg(not(feature = "debian"))]
+fn list_orphans_from_status() -> Result<Vec<String>> {
     // Get all installed packages with their auto-install status
     let installed = list_installed_fast()?;
 
@@ -2544,6 +2719,7 @@ pub fn list_orphans_fast() -> Result<Vec<String>> {
 
 /// Build a dependency map from all installed packages
 /// Returns `HashMap<package_name, Vec<dependency_names>>`
+#[cfg(any(test, not(feature = "debian")))]
 fn build_dependency_map() -> Result<HashMap<String, Vec<String>>> {
     let status_path = Path::new("/var/lib/dpkg/status");
     if !status_path.exists() {
@@ -2554,8 +2730,31 @@ fn build_dependency_map() -> Result<HashMap<String, Vec<String>>> {
     Ok(dependency_map_from_status(&content))
 }
 
+#[cfg(any(test, not(feature = "debian")))]
 fn dependency_map_from_status(content: &str) -> HashMap<String, Vec<String>> {
     let mut dep_map = HashMap::new();
+    let mut providers: HashMap<String, Vec<String>> = HashMap::new();
+    for paragraph in
+        status_paragraphs(content).filter(|paragraph| status_paragraph_is_installed(paragraph))
+    {
+        let Some(name) = paragraph
+            .lines()
+            .find_map(|line| line.strip_prefix("Package: "))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        for line in paragraph
+            .lines()
+            .filter_map(|line| line.strip_prefix("Provides: "))
+        {
+            let mut names = Vec::new();
+            append_dependency_names(line, &mut names);
+            for provided in names {
+                providers.entry(provided).or_default().push(name.to_owned());
+            }
+        }
+    }
 
     for paragraph in status_paragraphs(content) {
         let mut current_pkg = String::new();
@@ -2566,6 +2765,7 @@ fn dependency_map_from_status(content: &str) -> HashMap<String, Vec<String>> {
             } else if let Some(deps_str) = line
                 .strip_prefix("Depends: ")
                 .or_else(|| line.strip_prefix("Pre-Depends: "))
+                .or_else(|| line.strip_prefix("Recommends: "))
             {
                 append_dependency_names(deps_str, &mut current_deps);
             }
@@ -2575,6 +2775,13 @@ fn dependency_map_from_status(content: &str) -> HashMap<String, Vec<String>> {
             && !current_pkg.is_empty()
             && !current_deps.is_empty()
         {
+            let concrete: Vec<_> = current_deps
+                .iter()
+                .filter_map(|name| providers.get(name))
+                .flatten()
+                .cloned()
+                .collect();
+            current_deps.extend(concrete);
             dep_map.insert(current_pkg, current_deps);
         }
     }
@@ -3736,6 +3943,77 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn installed_auto_flags_preserve_multilib_architecture() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = directory.path().join("status");
+        let extended = directory.path().join("extended_states");
+        fs::write(&status, "Package: libexample\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n\nPackage: libexample\nStatus: install ok installed\nVersion: 1\nArchitecture: i386\n").unwrap();
+        fs::write(
+            &extended,
+            "Package: libexample\nArchitecture: i386\nAuto-Installed: 1\n",
+        )
+        .unwrap();
+        let installed = list_installed_from_paths(&status, &extended).unwrap();
+        assert!(
+            installed
+                .iter()
+                .find(|package| package.architecture == "amd64")
+                .unwrap()
+                .is_explicit
+        );
+        assert!(
+            !installed
+                .iter()
+                .find(|package| package.architecture == "i386")
+                .unwrap()
+                .is_explicit
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn installed_snapshot_observes_replacement_preserving_mtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = directory.path().join("status");
+        let extended = directory.path().join("extended_states");
+        fs::write(
+            &status,
+            "Package: before\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n",
+        )
+        .unwrap();
+        assert_eq!(
+            list_installed_from_paths(&status, &extended).unwrap()[0].name,
+            "before"
+        );
+        let mtime = fs::metadata(&status).unwrap().modified().unwrap();
+        let replacement = directory.path().join("replacement");
+        fs::write(
+            &replacement,
+            "Package: afterx\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n",
+        )
+        .unwrap();
+        fs::File::open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        fs::rename(&replacement, &status).unwrap();
+        assert_eq!(
+            list_installed_from_paths(&status, &extended).unwrap()[0].name,
+            "afterx"
+        );
+    }
+
+    #[test]
+    fn orphan_graph_reaches_installed_alternatives_virtual_providers_and_recommends() {
+        let content = "Package: application\nStatus: install ok installed\nDepends: absent | actual-library, virtual-service\nRecommends: recommended\n\nPackage: actual-library\nStatus: install ok installed\n\nPackage: provider\nStatus: install ok installed\nProvides: virtual-service\n\nPackage: recommended\nStatus: install ok installed\n";
+        let graph = dependency_map_from_status(content);
+        assert!(graph["application"].contains(&"actual-library".to_owned()));
+        assert!(graph["application"].contains(&"provider".to_owned()));
+        assert!(graph["application"].contains(&"recommended".to_owned()));
+    }
+
+    #[test]
     fn read_auto_installed_names_unreadable_file_is_error() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let path = dir.path().join("extended_states");
@@ -3879,6 +4157,20 @@ mod tests {
         assert_eq!(packages.len(), 2);
         assert_eq!(packages[0].name, "vim");
         assert_eq!(packages[1].name, "bash");
+    }
+
+    #[test]
+    fn parse_packages_file_sync_accepts_sha256_checked_xz() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("fixture_Packages.xz");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../tests/data/xz-subset/apt-packages-sha256.xz"),
+        )
+        .expect("write APT Packages index");
+        let packages = parse_packages_file_sync(&path).expect("decode SHA-256 checked index");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "fixture");
     }
 
     #[test]
@@ -4036,11 +4328,43 @@ mod tests {
             }],
             status_mtime: cached_mtime,
             last_accessed: AtomicU64::new(unix_now_secs()),
+            loaded_at: Some(std::time::Instant::now()),
             ..DpkgStatusCache::default()
         };
 
         assert!(installed_cache_is_current(&cache, cached_mtime, None));
         assert!(!installed_cache_is_current(&cache, current_mtime, None));
+    }
+
+    #[test]
+    fn installed_snapshot_lifetime_cannot_be_extended_by_hot_accesses() {
+        let mut cache = DpkgStatusCache {
+            packages: vec![DpkgPackageEntry {
+                name: "fixture".into(),
+                version: "1".into(),
+                description: String::new(),
+                architecture: "amd64".into(),
+                is_explicit: true,
+            }],
+            loaded_at: Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(CACHE_TTL_SECS + 1))
+                    .expect("fixture snapshot age must be representable"),
+            ),
+            ..DpkgStatusCache::default()
+        };
+        for _ in 0..20 {
+            cache
+                .last_accessed
+                .store(unix_now_secs(), Ordering::Relaxed);
+            assert!(!installed_cache_is_current(
+                &cache,
+                cache.status_mtime,
+                None
+            ));
+        }
+        cache.loaded_at = Some(std::time::Instant::now());
+        assert!(installed_cache_is_current(&cache, cache.status_mtime, None));
     }
 
     #[test]

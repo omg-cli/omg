@@ -22,12 +22,26 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual({case["id"] for case in cases}, expected)
         self.assertEqual(len(cases), len(expected))
 
+    def test_fedora_fingerprint_rows_require_real_success(self):
+        with (ROOT / "tests/cli_behavior_inventory.tsv").open(newline="") as source:
+            rows = {row["case"]: row for row in csv.DictReader(source, delimiter="\t")}
+        for case in (
+            "snapshot-create", "migrate-export", "migrate-import", "env-capture",
+            "env-check", "team-status", "team-push", "team-pull",
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(rows[case]["expected_exit"], "0")
+                self.assertEqual(rows[case]["targets"], "hermetic:pass")
+                self.assertEqual(rows[case]["assertions"], f"fingerprint:{case}")
+        self.assertEqual(rows["team-status"]["requires"], "team-push")
+        self.assertEqual(rows["team-pull"]["requires"], "team-push")
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.inventory = self.root / "cases.tsv"
-        self.inventory.write_bytes(b"fixture inventory\n")
+        self.inventory.write_text("case\texpected_exit\nrequired\t0\noptional\t-\n")
         self.policy = self.root / "policy.json"
         self.policy.write_text(json.dumps({"profiles": {"hermetic": ["hermetic"]}, "inventories": {
             hashlib.sha256(self.inventory.read_bytes()).hexdigest(): {"cases": [
@@ -51,6 +65,25 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(receipt["passed"])
         self.assertEqual(receipt["counts"], dict(selected=2, executed=1, passed=1, failed=0,
                                                blocked=0, harness_error=0, skipped=1))
+
+    def test_pass_with_an_exit_contradicting_the_inventory_is_rejected(self):
+        for code in (1, 255):
+            with self.subTest(code=code):
+                self.rows[0]["exit_code"] = code
+                with self.assertRaisesRegex(ValueError, "expected exit"):
+                    self.admit()
+
+    def test_expected_refusal_is_admitted_for_the_selected_distro_only(self):
+        self.inventory.write_text("case\texpected_exit\nrequired\tarch:1,debian:0,ubuntu:0,fedora:1\noptional\t0\n")
+        rules = json.loads(self.policy.read_text())
+        rules["inventories"] = {hashlib.sha256(self.inventory.read_bytes()).hexdigest():
+                               next(iter(rules["inventories"].values()))}
+        self.policy.write_text(json.dumps(rules))
+        self.rows[0]["exit_code"] = 1
+        self.assertTrue(self.admit()["passed"])
+        self.rows[0]["exit_code"] = 0
+        with self.assertRaisesRegex(ValueError, "expected exit"):
+            self.admit()
 
     def test_missing_duplicate_substituted_and_unapproved_skip_fail(self):
         original = self.rows[:]
@@ -86,6 +119,16 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(cases['update-turbo']['network_scope'], 'network')
         self.assertTrue(cases['update-turbo']['network_reason'])
         self.assertEqual(cases['daemon-foreground']['network_scope'], 'offline')
+        self.assertEqual(cases['doctor-network']['network_scope'], 'offline')
+        self.assertEqual(cases['doctor-network']['tiers'], ['container'])
+        self.assertEqual(cases['doctor-network']['allowed_skips'], {})
+        self.assertIn('container', rules['profiles']['hermetic,container'])
+        self.assertEqual(cases['audit-secrets']['network_scope'], 'offline')
+        self.assertEqual(cases['audit-secrets-critical']['tiers'], ['hermetic'])
+        self.assertEqual(cases['audit-secrets-critical']['allowed_skips'], {})
+        self.assertEqual(cases['audit-eol']['tiers'], ['hermetic'])
+        self.assertEqual(cases['audit-eol']['network_scope'], 'offline')
+        self.assertEqual(cases['audit-eol']['allowed_skips'], {})
         for inventory in rules["inventories"].values():
             cases = {case["id"]: case for case in inventory["cases"]}
             for identity in ("doctor", "update", "runtime-python-install", "container-list"):
@@ -123,8 +166,26 @@ class PolicyTests(unittest.TestCase):
         cases = rules["inventories"][hashlib.sha256(content).hexdigest()]["cases"]
         self.assertEqual(len(cases), len(content.splitlines()) - 1)
         self.assertEqual(len({case["id"] for case in cases}), len(cases))
+        by_id = {case["id"]: case for case in cases}
+        self.assertEqual(by_id["doctor-eol"], {
+            "id": "doctor-eol", "tiers": ["container"],
+            "allowed_skips": {}, "network_scope": "offline",
+        })
+        for runtime in ("node", "python", "go"):
+            with self.subTest(runtime=runtime):
+                self.assertEqual(by_id[f"runtime-{runtime}-uninstall"], {
+                    "id": f"runtime-{runtime}-uninstall", "tiers": ["container"],
+                    "allowed_skips": {}, "network_scope": "offline",
+                })
+                for operation in ("list", "switch"):
+                    case_id = f"runtime-{runtime}-{operation}-installed"
+                    self.assertEqual(by_id[case_id], {
+                        "id": case_id, "tiers": ["container"],
+                        "allowed_skips": {}, "network_scope": "offline",
+                    })
         workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
         self.assertEqual(workflow.count("--inventory-policy tests/qemu-inventory-policy.json"), 2)
+        self.assertIn('--inventory-tiers "hermetic,container"', workflow)
 
 
 if __name__ == "__main__":

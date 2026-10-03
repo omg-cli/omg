@@ -144,6 +144,81 @@ fn maybe_check_baseline(report: &BenchReport) {
 }
 
 #[cfg(any(feature = "debian", feature = "debian-pure"))]
+fn validate_search_sample(
+    response: &omg_lib::daemon::protocol::Response,
+    expected_id: u64,
+) -> Result<(), &'static str> {
+    use omg_lib::daemon::protocol::{Response, ResponseResult};
+    match response {
+        Response::Success {
+            id,
+            result: ResponseResult::DebianSearch(packages),
+        } if *id == expected_id
+            && packages
+                .iter()
+                .any(|package| package.name == "apt" && !package.version.is_empty()) =>
+        {
+            Ok(())
+        }
+        _ => {
+            Err("Benchmark search must return the matching request's Debian results including apt")
+        }
+    }
+}
+
+#[cfg(any(feature = "debian", feature = "debian-pure"))]
+#[test]
+fn benchmark_search_samples_accept_matching_apt_results() {
+    use omg_lib::daemon::protocol::{PackageInfo, Response, ResponseResult, WirePackageSource};
+    let response = Response::Success {
+        id: 42,
+        result: ResponseResult::DebianSearch(vec![PackageInfo {
+            name: "apt".into(),
+            version: "2.9".into(),
+            description: "fixture".into(),
+            source: WirePackageSource::Official,
+        }]),
+    };
+    assert!(validate_search_sample(&response, 42).is_ok());
+}
+
+#[cfg(any(feature = "debian", feature = "debian-pure"))]
+#[test]
+fn benchmark_search_samples_reject_errors_empty_and_wrong_identity() {
+    use omg_lib::daemon::protocol::{PackageInfo, Response, ResponseResult, WirePackageSource};
+    let invalid = [
+        Response::Error {
+            id: 1,
+            code: -32603,
+            message: "fixture error".into(),
+        },
+        Response::Success {
+            id: 1,
+            result: ResponseResult::DebianSearch(vec![]),
+        },
+        Response::Success {
+            id: 2,
+            result: ResponseResult::DebianSearch(vec![PackageInfo {
+                name: "apt".into(),
+                version: "2.9".into(),
+                description: "fixture".into(),
+                source: WirePackageSource::Official,
+            }]),
+        },
+        Response::Success {
+            id: 1,
+            result: ResponseResult::Ping("pong".into()),
+        },
+    ];
+    for response in invalid {
+        assert!(
+            validate_search_sample(&response, 1).is_err(),
+            "Accepted {response:?}"
+        );
+    }
+}
+
+#[cfg(any(feature = "debian", feature = "debian-pure"))]
 #[test]
 #[serial]
 fn bench_debian_deterministic_matrix() {
@@ -184,8 +259,11 @@ fn bench_debian_deterministic_matrix() {
                     query: "apt".to_string(),
                     limit: Some(10),
                 };
-                let _ = handle_request(state.clone(), req).await;
-                cold_search.push(start.elapsed().as_secs_f64() * 1000.0);
+                let response = handle_request(state.clone(), req).await;
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                validate_search_sample(&response, 1)
+                    .expect("Cold search sample failed its output contract");
+                cold_search.push(elapsed);
 
                 for i in 0..WARM_ITERS {
                     let start = Instant::now();
@@ -194,8 +272,11 @@ fn bench_debian_deterministic_matrix() {
                         query: "apt".to_string(),
                         limit: Some(10),
                     };
-                    let _ = handle_request(state.clone(), req).await;
-                    warm_search.push(start.elapsed().as_secs_f64() * 1000.0);
+                    let response = handle_request(state.clone(), req).await;
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    validate_search_sample(&response, 1000 + u64::from(i))
+                        .expect("Warm search sample failed its output contract");
+                    warm_search.push(elapsed);
                 }
 
                 let start = Instant::now();

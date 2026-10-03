@@ -63,7 +63,14 @@ uninstall_package() {
     local pkg=$1
     if pacman -Q "$pkg" &>/dev/null; then
         echo "  Uninstalling $pkg..." >&2
-        sudo pacman -Rns --noconfirm "$pkg" 2>/dev/null || true
+        if ! sudo pacman -Rns --noconfirm "$pkg" >&2; then
+            echo "error: failed to remove $pkg; refusing an invalid benchmark" >&2
+            return 1
+        fi
+    fi
+    if pacman -Q "$pkg" &>/dev/null; then
+        echo "error: $pkg is still installed; refusing an invalid benchmark" >&2
+        return 1
     fi
 }
 
@@ -75,17 +82,17 @@ benchmark_install() {
     echo -e "${YELLOW}Testing $tool: $package${NC}" >&2
 
     # Ensure package is not installed
-    uninstall_package "$package"
+    uninstall_package "$package" || return 1
 
     # Time the installation
     local start=$(date +%s.%N)
 
     if [ "$tool" = "omg" ]; then
-        if ! ./target/release/omg install "$package" --yes; then
+        if ! ./target/release/omg install "$package" --yes >&2; then
             echo "error: OMG install failed for $package" >&2
             return 1
         fi
-    elif ! yay -S --noconfirm "$package"; then
+    elif ! yay -S --noconfirm "$package" >&2; then
         echo "error: yay install failed for $package" >&2
         return 1
     fi
@@ -102,7 +109,7 @@ benchmark_install() {
     esac
 
     # Uninstall after test
-    uninstall_package "$package"
+    uninstall_package "$package" || return 1
 
     echo "$duration"
 }

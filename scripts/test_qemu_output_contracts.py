@@ -13,6 +13,975 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OutputContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_invalid_runtime_uninstall_reaches_runtime_dispatch(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('use-uninstall\t'))
+        product = '''if [[ "$*" == 'use --uninstall invalid-runtime 1.0.0' ]]; then
+echo "Error: Unsupported runtime 'invalid-runtime'" >&2
+else
+echo 'Error: --uninstall requires a version: omg use <runtime> <version> --uninstall' >&2
+fi
+exit 1
+'''
+        result, evidence, logs = self.run_inventory(product, [row])
+        self.assertEqual(evidence[0]['result'], 'PASS', f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @staticmethod
+    def local_fixture_product():
+        source = (ROOT / 'src/cli/tool.rs').read_text()
+        start = source.index('const TOOL_REGISTRY:')
+        records = re.findall(r'\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,?\s*\)', source[start:source.index('];', start)])
+        return 'python3 - "$@" <<\'PY\'\nREGISTRY = ' + repr(records) + '\n' + r'''
+import datetime, hashlib, json, os, pathlib, pwd, subprocess, time, tomllib
+mutant = 'none'
+before = json.loads(pathlib.Path('.qemu-local-before.json').read_text())
+case = before['case']
+data, config, home = (pathlib.Path(os.environ[name]) for name in ('OMG_DATA_DIR','OMG_CONFIG_DIR','HOME'))
+def text(path): return pathlib.Path(path).read_text()
+def save(path, value): pathlib.Path(path).write_text(value)
+def golden(items):
+    lines=[]
+    for item in items:
+        lines += ['[[templates]]', 'name = '+json.dumps(item['name']), 'created_at = '+str(item['created_at']), 'packages = '+json.dumps(item['packages']), '[templates.runtimes]']
+        lines += [key+' = '+json.dumps(value) for key,value in item['runtimes'].items()]
+    save(config/'golden-paths.toml','\n'.join(lines)+'\n')
+missing_account='No dashboard account linked. Run `omg account link --token-stdin` to sync usage to the dashboard.'
+refusals={'diff':'Failed to inspect lockfile missing.lock','diff-from':'Failed to inspect lockfile missing.lock',
+    'audit-export':'Absolute paths not allowed','audit-export-flags':'Absolute paths not allowed',
+    'enterprise-audit-export':'Absolute paths not allowed','rollback':'No history entries available for rollback',
+    'rollback-yes':'No history entries available for rollback','env-export-missing-lock':'Failed to inspect lockfile omg.lock',
+    'account-link-stdin':'Dashboard token is empty','workspace-run':"1 project(s) failed to run 'true'",
+    'workspace-check':'1 project(s) need attention, 0 failed to check (of 1 total)',
+    'team-compliance-export':"No compliance data is available to export to '"+str(pathlib.Path.cwd()/'compliance.json')+"'; compliance evidence requires an evaluated report"}
+for name in ['team-members','team-activity','fleet-status','enterprise-reports','enterprise-reports-type','enterprise-policy-show','enterprise-policy-scope']: refusals[name]=missing_account
+if case == 'metrics':
+    print('Error: Daemon not running. Performance metrics require the daemon (start it with: omg daemon): Failed to connect to daemon at '+os.environ['OMG_SOCKET_PATH'],file=__import__('sys').stderr); raise SystemExit(1)
+if case in refusals:
+    if case == 'workspace-run': print("'omg run true' in '.' exited with code 1")
+    if case == 'workspace-check': print('→ fixture\n  ⚠ needs attention')
+    prefix='Failed to fetch team members for enterprise report: ' if case.startswith('enterprise-reports') else ''
+    print('Error: '+prefix+refusals[case],file=__import__('sys').stderr); raise SystemExit(1)
+if case == 'snapshot-list':
+    rows=json.loads(text(data/'snapshots/index.json'))['snapshots']
+    print('OMG Snapshots')
+    for item in reversed(rows): print(item['id'],datetime.datetime.fromtimestamp(item['created_at'],datetime.timezone.utc).strftime('%Y-%m-%d %H:%M'),item['hash'][:8],item['message'])
+    print(('99' if mutant=='count' else '2')+' snapshots total')
+elif case in ('list','list-available','which','hook-env'):
+    version='99.0.0' if mutant=='version' else '24.21.0'
+    if case=='which': print('node '+version)
+    elif case=='hook-env': print("export PATH='"+str(data/'versions/node'/version/'bin')+"':\"${_OMG_PATH_BASE:-$PATH}\"")
+    elif case=='list': print('OMG Installed runtime versions\n  • node 22.16.0\n  • node '+version+' (active)\n  • python 3.12.14 (active)')
+    else: print('OMG Installed runtime versions\n  • Node.js '+version+'\n  • Python 3.12.14')
+elif case=='hooks-status':
+    print('OMG Git Hooks Status\n  ● pre-commit - installed (unrecognized or modified)')
+    for name in ['post-checkout','post-merge']: print('  ○ '+name+' - not installed')
+    print('Hooks directory:',pathlib.Path.cwd()/'.git/hooks')
+elif case=='hooks-run':
+    if mutant!='noop': subprocess.run(['.git/hooks/pre-commit'],check=True)
+    print('OMG Running pre-commit hook...\n✓ Hook completed successfully')
+elif case=='hook-uninstall':
+    rc=home/'.bashrc'
+    if mutant!='noop':
+        save(home/'.bashrc.omg-backup',text(rc));save(rc,'alias keep="echo preserved"\nexport KEEP_VALUE=42\n')
+    print('Shell integration removed (rc file backed up with .omg-backup)')
+elif case=='workspace-diff': print('OMG Comparing workspace environments vs main\n→ fixture\n  No omg.lock file')
+elif case=='config':
+    print('OMG Configuration\ntelemetry.enabled = false\naur.build_concurrency = '+('99' if mutant=='count' else '3')+'\naur.enable_ccache = false\nconfig_file = '+str(config/'config.toml')+'\ndata_dir = '+str(data))
+elif case=='privacy': print('OMG Privacy Settings\nTelemetry: '+('Enabled' if mutant=='count' else 'Disabled'))
+elif case=='account-status': print('OMG Dashboard account\nStatus: '+('Linked' if mutant=='count' else 'Not linked'))
+elif case=='account-unlink':
+    if mutant!='noop': (data/'license.json').unlink()
+    print('Dashboard account unlinked.\nLocal commands are unchanged.')
+elif case=='team-init':
+    member=pwd.getpwuid(os.getuid()).pw_name; now=int(time.time())
+    team={'team_id':'smoke/team','name':'Wrong Team' if mutant=='identity' else 'Smoke Team','member_id':member,'auto_push':False}
+    pathlib.Path('.omg').mkdir(exist_ok=True)
+    save('.omg/team.toml','\n'.join(key+' = '+('false' if value is False else json.dumps(value)) for key,value in team.items())+'\n')
+    status={'format_version':1,'config':dict(team,remote_url=None),'lock_hash':'','members':[{'id':member,'name':member,'env_hash':'','last_sync':now,'in_sync':True,'drift_summary':None}],'updated_at':now}
+    save('.omg/team-status.json',json.dumps(status))
+    for name in ['post-checkout','post-merge']:
+        path=pathlib.Path('.git/hooks')/name;save(path,'#!/bin/sh\n# OMG Team Sync Hook\nif [ -f omg.lock ]; then\n  \"'+os.environ['OMG_QEMU_EXECUTABLE']+'\" env check 2>/dev/null || true\nfi\n');path.chmod(0o755)
+    print('Team workspace initialized!\nTeam ID: smoke/team\nName: Smoke Team')
+elif case=='team-roles-list':
+    print('Team Roles\nAvailable roles\nadmin - Full access (push, policy, members)\nlead - Can push to team lock, manage policies\ndeveloper - Can pull, cannot push without approval\nreadonly - Can only view status')
+elif case.startswith('team-golden-'):
+    items=tomllib.loads(text(config/'golden-paths.toml'))['templates']
+    if case=='team-golden-list':
+        print('Golden Path Templates\n'+str(len(items))+' custom template(s)')
+        for item in items: print(item['name']+' - runtimes: '+json.dumps(list(item['runtimes']))+', packages: '+str(len(item['packages'])))
+    elif case=='team-golden-delete':
+        if mutant!='noop': golden([item for item in items if item['name']!='smoke'])
+        print("Deleted template 'smoke'")
+    else:
+        selected='flagged' if case.endswith('flags') else 'smoke'
+        item={'name':selected,'created_at':int(time.time()),'packages':['ripgrep'] if selected=='flagged' else [],'runtimes':{'node':'20','python':'3.12'} if selected=='flagged' else {}}
+        if mutant=='version': item['runtimes']['node']='99'
+        golden([value for value in items if value['name']!=selected]+[item]);print("Golden path '"+selected+"' created!")
+elif case.startswith('team-compliance'):
+    print('Compliance Status\nNo local data\nCompliance scoring is not computed locally; view evaluated results on the dashboard')
+    if case.endswith('enforce'): print('Enforcement mode requested, but no compliance evaluation engine exists locally; nothing can be enforced yet')
+elif case.startswith('tool-'):
+    if case=='tool-list':
+        print('OMG Installed Tools:')
+        for link in sorted((data/'bin').iterdir()):
+            if link.is_symlink(): print('  '+link.name+' points to -> '+os.readlink(link))
+    elif case=='tool-search':
+        print("Searching for 'rip'...\nFound "+('99' if mutant=='count' else '5')+" tools:")
+        for name,source,description,category in REGISTRY:
+            if any('rip' in value.lower() for value in (name,description,category)): print(name+' ['+category+'] via '+source.split(':')[0]+'\n'+description)
+    else:
+        print('OMG Tool Registry')
+        for category in sorted({item[3] for item in REGISTRY}):
+            rows=[item for item in REGISTRY if item[3]==category];print('  ['+category+'] ('+str(len(rows))+' tools)')
+            for name,source,description,_ in rows: print('    '+name+' ('+('wrong' if mutant=='manager' else source.split(':')[0])+') - '+description)
+        print('Total: 59 tools available')
+elif case.startswith('audit-'):
+    if case=='audit-policy': print('OMG Security Policy Status\nMinimum Grade: VERIFIED (PGP/Checksum)\nAUR Allowed: No\nPGP Required: '+('No' if mutant=='count' else 'Yes')+'\nBanned Packages: fixture-banned\nAllowed Licenses: MIT Apache-2.0')
+    elif case=='audit-verify': print('Local audit chain consistency verified\nTotal: '+('99' if mutant=='count' else '4')+' entries\nValid: 4 entries\nChain: Internally consistent; not authenticated\nThis check does not prove authenticity or completeness.\nLog Path: '+str(data/'audit/audit.jsonl'))
+    else:
+        entries=[json.loads(line) for line in text(data/'audit/audit.jsonl').splitlines()]
+        entries.reverse()
+        if case=='audit-log-flags':
+            selected=entries if mutant=='filter' else [entry for entry in entries if entry['severity'] in ('error','critical')][:3]
+            path=pathlib.Path('audit-log-export.json');save(path,json.dumps(selected));path.chmod(0o600);print('OMG Exporting audit log to '+str(pathlib.Path.cwd()/path)+'...\n✓ Export successful')
+        else:
+            entries=entries if mutant=='filter' else entries[:3]
+            print('OMG Security Audit Log')
+            for entry in entries: print(entry['timestamp']+' ['+entry['severity'].upper()+'] PackageInstall - '+entry['description']+'\nResource: '+entry['resource'])
+            print('Showing '+str(len(entries))+' of '+str(len(entries))+' entries')
+elif case.startswith('history'):
+    entries=list(reversed(json.loads(text(data/'history.json'))))
+    if case=='history-flags' and mutant!='filter': entries=[entry for entry in entries if entry['transaction_type']=='Install' and 'pacman' in entry['changes'][0]['name'] and entry['timestamp'].startswith('2025')]
+    print('OMG Transaction History ('+('filtered' if case=='history-flags' else 'last 3')+')')
+    for entry in entries[:3]:
+        print('✓ '+entry['timestamp']+' ['+entry['id'][:8]+'] - '+entry['transaction_type']+' (1 changes)')
+        for change in entry['changes']: print('→ '+change['name']+' '+change['old_version']+' → '+change['new_version'])
+elif case=='stats': print('OMG Usage Statistics\nTime Saved: 1.0min\nTotal Commands: '+('99' if mutant=='count' else '37')+'\nQueries Today: 3\nQueries This Month: 9\nMost Used Commands:\n→ search (21x)\n→ list (16x)')
+elif case=='init':
+    if mutant!='skipped':
+        packages=before['packages']; runtimes={'node':'24.21.0','python':'3.12.14'}
+        payload=''.join(name+':'+version+';' for name,version in sorted(runtimes.items()))+''.join(name+';' for name in packages)
+        save('omg.lock','schema_version = 1\npackages = '+json.dumps(packages)+'\ntimestamp = '+str(int(time.time()))+'\nhash = "'+hashlib.sha256(payload.encode()).hexdigest()+'"\n[runtimes]\nnode = "24.21.0"\npython = "3.12.14"\n')
+    print('OMG Setting up with defaults...\n→ Shell hook: skipped\n→ Daemon setup: skipped\n→ Capturing environment... '+('(skipped: unrelated permission denied)' if mutant=='skipped' else '✓')+'\n✓ Setup complete!')
+''' + '\nPY\n'
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_local_family_contracts_accept_matching_output_and_state(self):
+        rows = []
+        for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()[1:]:
+            fields = line.split('\t')
+            if fields[8] == 'local:' + fields[0]:
+                fields[5] = '-'
+                rows.append('\t'.join(fields))
+        self.assertEqual(len(rows), 52)
+        result, evidence, logs = self.run_inventory(self.local_fixture_product(), rows, native_commands={'pacman': 'printf "fixture-package\\n"\n'})
+        self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows),
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_local_family_contracts_reject_wrong_values_and_noop_mutations(self):
+        mutations = {'snapshot-list': 'count', 'list': 'version', 'list-available': 'version',
+                     'which': 'version', 'hook-env': 'version', 'hooks-run': 'noop',
+                     'hook-uninstall': 'noop', 'config': 'count', 'privacy': 'count',
+                     'account-status': 'count', 'account-unlink': 'noop', 'team-init': 'identity',
+                     'team-golden-delete': 'noop', 'team-golden-create-flags': 'version',
+                     'tool-search': 'count', 'tool-registry': 'manager', 'audit-policy': 'count',
+                     'audit-verify': 'count', 'audit-log': 'filter', 'audit-log-flags': 'filter',
+                     'history-flags': 'filter', 'stats': 'count', 'init': 'skipped'}
+        source_rows = {line.split('\t')[0]: line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()[1:]}
+        for case, mutant in mutations.items():
+            with self.subTest(case=case, mutant=mutant):
+                fields = source_rows[case].split('\t'); fields[5] = '-'
+                product = self.local_fixture_product().replace("mutant = 'none'", 'mutant = ' + repr(mutant))
+                result, evidence, logs = self.run_inventory(product, ['\t'.join(fields)], native_commands={'pacman': 'printf "fixture-package\\n"\n'})
+                self.assertEqual(evidence[0]['result'], 'FAIL', f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_local_review_counterexamples_are_rejected(self):
+        source_rows = {line.split('\t')[0]: line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()[1:]}
+        product = self.local_fixture_product()
+        comment_hooks = product + '''for name in post-checkout post-merge; do
+printf '#!/bin/sh\n# OMG Team Sync Hook\n# %s env check\nexit 0\n' "$OMG_QEMU_EXECUTABLE" > ".git/hooks/$name"
+done
+'''
+        wrong_date = product.replace("datetime.datetime.fromtimestamp(item['created_at'],datetime.timezone.utc).strftime('%Y-%m-%d %H:%M')", "'1900-01-01 00:00'")
+        for case, producer in [('team-init', comment_hooks), ('snapshot-list', wrong_date),
+                               ('audit-log', product.replace("mutant = 'none'", "mutant = 'filter'")),
+                               ('init', product.replace("mutant = 'none'", "mutant = 'skipped'"))]:
+            with self.subTest(case=case):
+                fields = source_rows[case].split('\t'); fields[5] = '-'
+                result, evidence, logs = self.run_inventory(producer, ['\t'.join(fields)], native_commands={'pacman': 'printf "fixture-package\\n"\n'})
+                self.assertEqual(evidence[0]['result'], 'FAIL', f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_additional_local_refusals_bind_the_cause_and_artifact_boundary(self):
+        ids = {'diff', 'diff-from', 'audit-export', 'audit-export-flags',
+               'rollback', 'rollback-yes', 'env-export-missing-lock', 'metrics'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        valid = '''case "$1" in
+diff) echo 'Error: Failed to inspect lockfile missing.lock' >&2 ;;
+audit) echo 'Error: Absolute paths not allowed' >&2 ;;
+rollback) echo 'Error: No history entries available for rollback' >&2 ;;
+env) echo 'Error: Failed to inspect lockfile omg.lock' >&2 ;;
+metrics) echo 'Error: Daemon not running. Performance metrics require the daemon (start it with: omg daemon)' >&2; echo "Failed to connect to daemon at $OMG_SOCKET_PATH" >&2 ;;
+esac
+exit 1
+'''
+        for product, expected, label in (
+            ('echo unrelated permission error >&2\nexit 1\n', 'FAIL', 'wrong cause'),
+            ('touch omg.lock\n' + valid, 'FAIL', 'created a forbidden lock'),
+            ('mkdir -p audit-evidence\n' + valid, 'FAIL', 'wrote an export directory'),
+            (valid, 'PASS', 'specific cause and preserved artifact boundary'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], [expected] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_remaining_local_families_reject_generic_success_and_refusal(self):
+        ids = {'snapshot-list','list','hooks-status','hooks-run','workspace-diff','hook-env','config','privacy','which',
+               'audit-log','audit-verify','audit-policy','tool-list','tool-search','tool-registry','team-init',
+               'team-roles-list','team-golden-create','team-golden-list','team-golden-delete','team-compliance',
+               'account-status','account-unlink','history','stats','init','list-available','hook-uninstall',
+               'audit-log-flags','team-golden-create-flags','team-compliance-enforce','history-flags',
+               'workspace-run','workspace-check','team-members','team-activity','account-link-stdin','fleet-status',
+               'enterprise-reports','enterprise-policy-show','enterprise-audit-export','team-compliance-export',
+               'enterprise-reports-type','enterprise-policy-scope'}
+        rows = []
+        for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()[1:]:
+            fields = line.split('\t')
+            if fields[0] in ids:
+                # This isolates each output oracle; real dependency transitions are exercised
+                # by the persisted-state and receipt-bound product runs separately.
+                fields[5] = '-'
+                rows.append('\t'.join(fields))
+        self.assertEqual(len(rows), len(ids))
+        for expected_code in (0, 1):
+            selected = [row for row in rows if row.split('\t')[3] == str(expected_code)]
+            product = 'echo unrelated output\necho unrelated permission error >&2\nexit ' + str(expected_code) + '\n'
+            result, evidence, logs = self.run_inventory(product, selected, native_commands={'pacman': 'printf "fixture-package\\n"\n'})
+            self.assertEqual([row['result'] for row in evidence], ['FAIL'] * len(selected),
+                             f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @staticmethod
+    def workspace_fixture_product():
+        return "python3 - \"$@\" <<'PY'\n" + r'''
+import datetime, json, pathlib, sys, tomllib
+args = sys.argv[1:]
+path = pathlib.Path('omg-workspace.toml')
+action = args[1]
+if action == 'init':
+    state = {'name': args[2], 'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'projects': {}}
+else:
+    state = tomllib.loads(path.read_text())
+if action == 'add':
+    state['projects'][args[4]] = {'path': args[2], 'depends_on': [], 'commands': {'build': 'make build', 'test': 'make test'}}
+elif action == 'remove':
+    del state['projects'][args[2]]
+if action in ('init', 'add', 'remove'):
+    lines = ['name = ' + json.dumps(state['name']), 'created_at = ' + json.dumps(state['created_at']), '[projects]']
+    for name, project in state['projects'].items():
+        lines += ['[projects.' + name + ']', 'path = ' + json.dumps(project['path']), 'depends_on = []', '[projects.' + name + '.commands]']
+        lines += [key + ' = ' + json.dumps(value) for key, value in project['commands'].items()]
+    path.write_text('\n'.join(lines) + '\n')
+if action == 'init':
+    print("OMG Initializing workspace 'smoke'\n✓ Created omg-workspace.toml")
+elif action == 'add':
+    print("✓ Added project '" + args[4] + "' (" + args[2] + ")")
+elif action == 'remove':
+    print("✓ Removed project 'fixture'")
+elif action == 'list':
+    print('OMG Workspace: smoke\n  1. fixture → .\n     commands: test, build')
+elif action == 'status':
+    print('OMG Workspace Status: smoke\n  Projects: 1 projects\n    ○ fixture - no omg.lock\n  ⚠ 0 healthy, 1 need attention')
+''' + '\nPY\n'
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_workspace_rows_require_persisted_fixture_state(self):
+        ids = {'workspace-init', 'workspace-add', 'workspace-list', 'workspace-status',
+               'workspace-remove', 'workspace-readd-after-remove', 'workspace-add-second'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        for product, valid, label in (
+            ('exit 0\n', False, 'silent no-op'),
+            ("printf 'OMG Workspace: smoke\\n  1. fixture → .\\n'\n", False, 'forged output'),
+            (self.workspace_fixture_product(), True, 'persisted state and matching output'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows)
+                if valid:
+                    self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows),
+                                     f'{result.stdout}\n{result.stderr}\n{logs}')
+                else:
+                    self.assertNotIn('PASS', [row['result'] for row in evidence],
+                                     f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if valid else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_workspace_rows_reject_wrong_state_and_display(self):
+        ids = {'workspace-init', 'workspace-add', 'workspace-list', 'workspace-status', 'workspace-remove'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        valid = self.workspace_fixture_product()
+        for label, original, replacement, failed in (
+            ('wrong project path', "'path': args[2]", "'path': 'elsewhere'", 'workspace-add'),
+            ('wrong detected command', "'test': 'make test'", "'test': 'ignored'", 'workspace-add'),
+            ('remove keeps project', "del state['projects'][args[2]]", 'pass', 'workspace-remove'),
+            ('list names missing project', '1. fixture → .', '1. imaginary → .', 'workspace-list'),
+            ('status claims healthy', '0 healthy, 1 need attention', '1 healthy, 0 need attention', 'workspace-status'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(valid.replace(original, replacement), rows)
+                by_id = {row['case_id'].removeprefix('qemu-arch-'): row for row in evidence}
+                self.assertEqual(by_id[failed]['result'], 'FAIL',
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_bash_completion_artifacts_must_complete_commands(self):
+        ids = {'completions', 'completions-install'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        completion = (ROOT / 'src/hooks/completions/bash.sh').read_text(encoding='utf-8')
+        for content, expected, label in (
+            ('', 'FAIL', 'empty artifact'),
+            ('# plausible completion file\ntrue\n', 'FAIL', 'valid shell with no completion'),
+            (completion.replace('search s install', 'unrelated s install'), 'FAIL', 'wrong command candidates'),
+            (completion, 'PASS', 'registered completion with real candidates'),
+        ):
+            product = ('if [[ "$*" == *--stdout* ]]; then printf %s ' + shlex.quote(content) + '; else\n'
+                       'mkdir -p "$HOME/.local/share/bash-completion/completions"\n'
+                       'printf %s ' + shlex.quote(content) + ' > "$HOME/.local/share/bash-completion/completions/omg"\n'
+                       'echo "Installed bash completions"\nfi\n')
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], [expected] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_man_generation_requires_command_documentation(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('generate-man\t'))
+        valid = '''mkdir -p "$3"
+for page in omg search workspace init; do
+  case "$page" in omg) file=omg ;; search) file=omg-search ;; workspace) file=omg-workspace ;; init) file=omg-workspace-init ;; esac
+  printf '.TH %s 1\n.SH NAME\n%s \\- command documentation\n.SH SYNOPSIS\n%s [options]\n.SH DESCRIPTION\nDocumented command\n' "$page" "$page" "$page" > "$3/$file.1"
+done
+printf '✓ Generated 4 man pages\n'
+'''
+        for product, expected, label in (
+            ('exit 0\n', 'FAIL', 'no artifacts'),
+            (valid.replace('.SH SYNOPSIS', '.SH UNRELATED'), 'FAIL', 'not command reference pages'),
+            (valid.replace('omg-workspace-init', 'unrelated-init'), 'FAIL', 'missing nested command'),
+            (valid.replace('Generated 4', 'Generated 99'), 'FAIL', 'false page count'),
+            (valid, 'PASS', 'documented root and command pages'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_dynamic_completion_returns_the_requested_env_candidate(self):
+        ids = {'complete', 'complete-full'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        for output, expected in (('', 'FAIL'), ('check\n', 'FAIL'),
+                                 ('capture\ncapture\n', 'FAIL'), ('capture\n', 'PASS')):
+            with self.subTest(output=output):
+                product = 'printf %s ' + shlex.quote(output) + '\n'
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], [expected] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_ci_cache_returns_the_documented_paths_and_key(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('ci-cache\t'))
+        valid = ('OMG CI Cache Paths\n  ~/.local/share/omg/\n  ~/.local/share/omg/versions/\n'
+                 '  ~/.cargo/registry/\n  ~/.cargo/git/\n  ~/.npm/\n'
+                 "  omg-${{ runner.os }}-${{ hashFiles('omg.lock') }}\n")
+        for output, expected in (('', 'FAIL'), ('OMG CI Cache Paths\n', 'FAIL'),
+                                 (valid.replace('omg.lock', 'wrong.lock'), 'FAIL'), (valid, 'PASS')):
+            with self.subTest(output=output):
+                result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(output) + '\n', [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_bash_hook_preserves_prompt_array_and_sigint_behavior(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('hook\t'))
+        source = (ROOT / 'src/hooks/mod.rs').read_text(encoding='utf-8')
+        hook = re.search(r'const BASH_HOOK: &str = r#"(.*?)"#;', source, re.S).group(1)
+        for content, expected, label in (
+            ('', 'FAIL', 'no hook'),
+            ('# OMG Bash hook\ntrue\n', 'FAIL', 'plausible text'),
+            (hook.replace('eval "$previous_int_trap"', 'trap - SIGINT'), 'FAIL', 'lost SIGINT handler'),
+            (hook, 'PASS', 'registered and executed hook'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(content) + '\n', [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_container_init_requires_build_recipe_and_ignore_protection(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('container-init\t'))
+        ignore = ('!*\n# qemu-preserve\n# added by omg container init\n.git\n.env\n.env.*\n'
+                  '!.env.example\n*.pem\n*.key\nid_rsa*\n.omg/\n')
+        dockerfile = ('FROM debian:bookworm\nLABEL maintainer="OMG Team"\n'
+                      'RUN apt-get update && apt-get install -y curl wget git build-essential ca-certificates\n'
+                      'WORKDIR /app\nCOPY . .\nCMD ["/bin/bash"]\n')
+        valid = ('printf %s ' + shlex.quote(dockerfile) + ' > Dockerfile.omg\n'
+                 'for file in .dockerignore Dockerfile.omg.dockerignore .containerignore; do\n'
+                 '  printf %s ' + shlex.quote(ignore) + ' > "$file"\ndone\n'
+                 "printf 'Created Dockerfile.omg\\nBase image: debian:bookworm\\n'\n")
+        for product, expected, label in (
+            ('exit 0\n', 'FAIL', 'no artifacts'),
+            (valid.replace('FROM debian:bookworm', 'FROM unrelated:latest'), 'FAIL', 'wrong requested base'),
+            (valid.replace('.env.*', '# omitted credential pattern'), 'FAIL', 'unprotected build context'),
+            (valid.replace('# qemu-preserve', '# lost custom rule'), 'FAIL', 'discarded existing ignore file'),
+            (valid, 'PASS', 'recipe and protected existing ignore files'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_local_refusals_require_the_specific_cause_and_preserve_fixtures(self):
+        ids = {'ci-validate', 'snapshot-restore', 'snapshot-restore-yes', 'snapshot-delete',
+               'use', 'use-uninstall', 'env-plan-missing-manifest'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        valid = '''case "$1" in
+ci) echo "Error: No omg.lock found; run 'omg env capture' before CI validation" >&2 ;;
+snapshot) echo "Error: Snapshot 'missing' not found" >&2 ;;
+use) echo "Error: Unsupported runtime 'invalid-runtime'" >&2 ;;
+env) echo "Error: Cannot read .omg.toml for environment planning" >&2 ;;
+esac
+exit 1
+'''
+        for product, expected, label in (
+            ('echo unrelated permission error >&2\nexit 1\n', 'FAIL', 'unrelated error'),
+            ('touch omg.lock\n' + valid, 'FAIL', 'creates forbidden lock'),
+            ('echo changed >> Makefile\n' + valid, 'FAIL', 'changes existing fixture'),
+            (valid, 'PASS', 'specific refusal without state changes'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], [expected] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_daemon_status_reports_the_isolated_missing_socket(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('daemon-status\t'))
+        valid = '''printf 'OMG Daemon Status\n  ✗ Daemon socket not found\n    Path: %s\n' "$OMG_SOCKET_PATH"
+'''
+        for product, expected, label in (
+            ('exit 0\n', 'FAIL', 'silent success'),
+            (valid.replace('Daemon socket not found', 'Daemon running'), 'FAIL', 'wrong socket state'),
+            (valid.replace('"$OMG_SOCKET_PATH"', 'unrelated.sock'), 'FAIL', 'wrong selected socket'),
+            ('touch "$OMG_SOCKET_PATH"\n' + valid, 'FAIL', 'claims absent socket after creating one'),
+            (valid, 'PASS', 'missing private socket identified'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_search_queries_require_an_official_firefox_result(self):
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ('search', 'search-quiet')]
+        self.assertEqual(len(rows), 2)
+        for output, expected in (
+            ('', 'FAIL'),
+            ('  | Search\n    firefox\n', 'FAIL'),
+            ('  | Search\n    firefox\n  unrelated 1.0  Official\n', 'FAIL'),
+            ('  | Search\n    firefox\n  firefox 130.0  AUR\n', 'FAIL'),
+            ('  | Search\n    firefox\n  firefox 130.0  Official\n', 'PASS'),
+        ):
+            with self.subTest(output=output):
+                product = 'printf %s ' + shlex.quote(output) + '\n'
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], [expected] * len(rows),
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_run_requires_the_make_task_to_execute(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('run\t'))
+        self.assertEqual(row.split('\t')[8], 'task-executed')
+        for product, expected, explanation in (
+            ('exit 0\n', 'FAIL', 'silent success'),
+            ("printf 'smoke-task-ok\\n'\n", 'FAIL', 'forged stdout'),
+            ('make smoke\n', 'PASS', 'executed task'),
+        ):
+            with self.subTest(explanation=explanation):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_run_parallel_requires_two_overlapping_tasks(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('run-parallel\t'))
+        self.assertEqual(row.split('\t')[8], 'parallel-tasks-executed')
+        concurrent = ('make parallel-one & first=$!\n'
+                      'make parallel-two & second=$!\n'
+                      'wait "$first" && wait "$second"\n')
+        for product, expected, explanation in (
+            ('exit 0\n', 'FAIL', 'silent success'),
+            ("printf 'parallel-one-ok\\nparallel-two-ok\\n'\n", 'FAIL', 'forged stdout'),
+            ('make parallel-one; make parallel-two; exit 0\n', 'FAIL', 'serial execution'),
+            (concurrent, 'PASS', 'overlapping execution'),
+        ):
+            with self.subTest(explanation=explanation):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_run_all_requires_make_and_node_task_dispatch(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('run-all\t'))
+        self.assertEqual(row.split('\t')[8], 'all-tasks-executed')
+        for product, expected, explanation in (
+            ('exit 0\n', 'FAIL', 'silent success'),
+            ('make smoke\n', 'FAIL', 'make only'),
+            ('npm run smoke\n', 'FAIL', 'npm only'),
+            ('make smoke && npm run smoke\n', 'PASS', 'both ecosystems'),
+        ):
+            with self.subTest(explanation=explanation):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_package_dry_runs_reject_success_without_a_preview(self):
+        release = Path('/etc/os-release').read_text(encoding='utf-8')
+        match = re.search(r'^ID=(\S+)$', release, re.MULTILINE)
+        distro = {'arch': 'arch', 'archlinux': 'arch', 'debian': 'debian',
+                  'ubuntu': 'ubuntu', 'fedora': 'fedora'}.get(match.group(1).strip('"') if match else '')
+        if distro is None:
+            self.skipTest('requires one supported native package database')
+        ids = {'install', 'remove', 'install-flags', 'remove-flags'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        result, evidence, logs = self.run_inventory('exit 0\n', rows, distro=distro)
+        self.assertEqual([row['result'] for row in evidence], ['FAIL'] * len(rows),
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_package_dry_run_rejects_native_state_mutation(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('install\t'))
+        native = {'pacman': 'case "$1" in\n'
+                            '  -Q) if [[ -f native-state-changed ]]; then echo "pacman 8"; '
+                            'else echo "pacman 7"; fi ;;\n'
+                            '  -Qqe) if [[ -f native-reason-changed ]]; then echo changed; '
+                            'else echo pacman; fi ;;\n'
+                            '  *) exit 2 ;;\n'
+                            'esac\n'}
+        preview = "printf '%s\\n' '  | Install Preview' '    dry run' " \
+                  "'│ pacman  ┆ 7.1 ┆ 1 MB ┆ Official │' " \
+                  "'  ℹ • No changes will be made (dry run)'\n"
+        result, evidence, logs = self.run_inventory(preview, [row],
+                                                     distro='arch', native_commands=native)
+        self.assertEqual([item['result'] for item in evidence], ['PASS'],
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        result, evidence, logs = self.run_inventory('touch native-state-changed\n' + preview,
+                                                     [row], distro='arch', native_commands=native)
+        self.assertEqual([item['result'] for item in evidence], ['FAIL'],
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertIn('dry run changed native installed-package state or reasons', logs['install.log'])
+        result, evidence, logs = self.run_inventory('touch native-reason-changed\n' + preview,
+                                                     [row], distro='arch', native_commands=native)
+        self.assertEqual(evidence[0]['result'], 'FAIL',
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertIn('dry run changed native installed-package state or reasons', logs['install.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_fedora_remove_requires_the_installed_rpm_version(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('remove\t'))
+        native = {'rpm': 'case "$1" in\n'
+                         '  -qa) printf "bash\\t5.3-1\\n" ;;\n'
+                         '  -q) printf "5.3-1\\n" ;;\n'
+                         '  *) exit 2 ;;\n'
+                         'esac\n',
+                  'dnf': 'printf "bash\\tUser\\n"\n'}
+        preview = "printf '%s\\n' '  | Remove Preview' '    dry run' " \
+                  "'  → The following packages would be removed:' " \
+                  "'    ✗ bash 5.3-1' '  ℹ No changes made (dry run)'\n"
+        result, evidence, logs = self.run_inventory(preview, [row],
+                                                     distro='fedora', native_commands=native)
+        self.assertEqual(evidence[0]['result'], 'PASS',
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        result, evidence, logs = self.run_inventory(
+            preview.replace('bash 5.3-1', 'bash (feature-specific info unavailable)'),
+            [row], distro='fedora', native_commands=native)
+        self.assertEqual(evidence[0]['result'], 'FAIL',
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertIn('lacks the native installed bash version', logs['remove.log'])
+        result, evidence, logs = self.run_inventory(
+            preview.replace('✗ bash 5.3-1', '✗ bash 0.0-1')
+            + "printf '%s\\n' 'unrelated bash 5.3-1 diagnostic'\n",
+            [row], distro='fedora', native_commands=native)
+        self.assertEqual(evidence[0]['result'], 'FAIL',
+                         f'{result.stdout}\n{result.stderr}\n{logs}')
+        self.assertIn('lacks the native installed bash version', logs['remove.log'])
+
+    def test_recursive_remove_requires_the_backend_specific_refusal(self):
+        for distro, explanation in (
+            ('debian', 'Recursive removal is not supported by the Debian backend'),
+            ('ubuntu', 'Recursive removal is not supported by the Debian backend'),
+            ('fedora', 'Recursive removal is not supported by this package backend'),
+        ):
+            with self.subTest(distro=distro):
+                refusal = f'Error: {explanation}\n'
+                self.assertEqual(self.run_oracle(assertion='package-dry-run-recursive',
+                                                code=1, stderr=refusal, distro=distro).returncode, 0)
+                self.assertNotEqual(self.run_oracle(assertion='package-dry-run-recursive',
+                                                   code=1, stderr='Error: arbitrary failure\n',
+                                                   distro=distro).returncode, 0)
+                self.assertNotEqual(self.run_oracle(assertion='package-dry-run-recursive',
+                                                   code=1, stderr=refusal,
+                                                   stdout='  | Remove Preview\n',
+                                                   distro=distro).returncode, 0)
+
+    @unittest.skipIf(os.name == 'nt', 'Doctor guest oracle requires a POSIX shell')
+    def test_doctor_backend_oracle_rejects_wrong_guest_and_false_health(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        begin = source.index('# BEGIN DOCTOR BACKEND ORACLE')
+        end = source.index('# END DOCTOR BACKEND ORACLE', begin)
+        oracle = source[begin:end]
+        expected = {
+            'arch': ('Arch Linux detected', 'ALPM local package database (/var/lib/pacman/local)'),
+            'debian': ('Debian/Ubuntu detected (apt backend)',
+                       'dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)'),
+            'ubuntu': ('Debian/Ubuntu detected (apt backend)',
+                       'dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)'),
+            'fedora': ('Fedora/RHEL detected (dnf backend)', ''),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / 'os-release'
+            output = root / 'doctor.out'
+            for distro, (identity, health) in expected.items():
+                with self.subTest(distro=distro):
+                    release.write_text(f'ID={distro}\n', encoding='utf-8')
+                    healthy = f'  {identity}\n'
+                    if health:
+                        healthy += f'  {health}\n'
+                    output.write_text(healthy, encoding='utf-8')
+                    command = oracle + '\ncheck_doctor_native_backend "$1" "$2" "$3"\n'
+                    def probe():
+                        return subprocess.run(
+                            [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                             command, '_', distro, str(output), str(release)],
+                            cwd=root, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(probe().returncode, 0)
+                    output.write_text('  Arch Linux detected\n' if distro != 'arch'
+                                      else '  Fedora/RHEL detected (dnf backend)\n', encoding='utf-8')
+                    self.assertEqual(probe().returncode, 1)
+                    output.write_text(healthy.replace(health, 'backend check absent')
+                                      if health else healthy + '  Arch Linux detected\n', encoding='utf-8')
+                    self.assertEqual(probe().returncode, 1)
+                    output.write_text(healthy, encoding='utf-8')
+                    release.write_text('ID=other\n', encoding='utf-8')
+                    self.assertEqual(probe().returncode, 2)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_actual_runner_requires_doctor_backend_evidence(self):
+        release = Path('/etc/os-release').read_text(encoding='utf-8')
+        distro = next((line.split('=', 1)[1].strip('"') for line in release.splitlines()
+                       if line.startswith('ID=')), '')
+        if distro not in ('arch', 'debian', 'ubuntu', 'fedora'):
+            self.skipTest('not a supported Linux guest')
+        rows = ['doctor\t["doctor"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tdoctor-native-backend\ttempdir-drop']
+        identity = {'arch': 'Arch Linux detected',
+                    'debian': 'Debian/Ubuntu detected (apt backend)',
+                    'ubuntu': 'Debian/Ubuntu detected (apt backend)',
+                    'fedora': 'Fedora/RHEL detected (dnf backend)'}[distro]
+        health = {'arch': '  ALPM local package database (/var/lib/pacman/local)\n',
+                  'debian': '  dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)\n',
+                  'ubuntu': '  dpkg package database (/var/lib/dpkg/status)\n  APT package indexes (/var/lib/apt/lists)\n',
+                  'fedora': ''}[distro]
+        healthy = f'  {identity}\n{health}'
+        product = 'printf %s ' + shlex.quote(healthy) + '\n'
+        result, evidence, _ = self.run_inventory(product, rows, distro=distro)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'PASS')
+        result, evidence, logs = self.run_inventory('printf "Doctor is healthy\\n"\n', rows, distro=distro)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'FAIL')
+        self.assertIn('doctor did not identify', logs['doctor.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_ci_init_requires_a_generated_workflow_and_advanced_security_job(self):
+        rows = [
+            'ci-init\t["ci","init","github"]\tisolated-write\t0\tpass\t-\t'
+            'hermetic\thermetic:pass\tci-github-workflow\ttempdir-drop',
+            'ci-init-advanced\t["ci","init","github","--advanced"]\tisolated-write\t0\tpass\t-\t'
+            'hermetic\thermetic:pass\tci-github-workflow-advanced\ttempdir-drop',
+        ]
+        basic = '''mkdir -p .github/workflows
+cat > .github/workflows/ci.yml <<'WORKFLOW'
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install release
+        run: |
+          OMG_VERSION=v0.1.224 bash omg-install.sh
+      - name: Build
+        run: omg run build
+      - name: Test
+        run: omg run test
+WORKFLOW
+'''
+        advanced = '''if [[ "${4:-}" == --advanced ]]; then
+cat >> .github/workflows/ci.yml <<'WORKFLOW'
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Audit
+        run: |
+          cargo audit
+          cargo cyclonedx --format json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-dependencies-sbom
+WORKFLOW
+fi
+'''
+        for product, expected in (
+            (basic + advanced, ['PASS', 'PASS']),
+            (basic, ['PASS', 'FAIL']),
+            (basic.replace('        run: omg run test\n', '# omg run test\n') + advanced,
+             ['FAIL', 'FAIL']),
+            (basic + advanced.replace('          cargo audit\n', '# cargo audit\n'),
+             ['PASS', 'FAIL']),
+            ('echo generated\n', ['FAIL', 'FAIL']),
+        ):
+            with self.subTest(expected=expected):
+                result, evidence, logs = self.run_inventory(product, rows)
+                self.assertEqual([row['result'] for row in evidence], expected,
+                                 f'{result.stdout}\n{result.stderr}\n{logs}')
+                self.assertEqual(result.returncode, int('FAIL' in expected), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_doctor_eol_requires_confined_runtime_and_both_classifications(self):
+        row = ('doctor-eol\t["doctor","--eol"]\tcontrolled-error\t1\tpass\t-\t'
+               'container\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tdoctor-eol-state\ttempdir-drop')
+        preflight = ('[[ $(id -u) != 0 && "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 '
+                     '&& -d "$OMG_DATA_DIR/versions/node/16.20.2" '
+                     '&& $(readlink "$OMG_DATA_DIR/versions/node/current") == 16.20.2 '
+                     '&& -d "$OMG_DATA_DIR/versions/python/3.12.14" '
+                     '&& $(readlink "$OMG_DATA_DIR/versions/python/current") == 3.12.14 ]] '
+                     '|| exit 70\n')
+        good = ('printf "Runtime EOL Status\\n  ⚠ node 16.20.2 - EOL since 2023-09-11\\n'
+                '  ✓ python 3.12.14\\n"\n')
+        for output, eol_count, expected in (
+            (good, 2, 'PASS'),
+            (good, 1, 'FAIL'),
+            (good.replace('EOL since 2023-09-11', 'healthy'), 2, 'FAIL'),
+            (good.replace('  ✓ python 3.12.14\\n', ''), 2, 'FAIL'),
+            ('printf "Runtime EOL Status\\n  ⚠ node 16.20.2 - EOL since 2023-09-11\\n'
+             '  ⚠ python 3.12.14 - EOL since 2023-09-11\\n"\n', 2, 'FAIL'),
+        ):
+            with self.subTest(expected=expected, output=output, eol_count=eol_count):
+                product = (preflight
+                           + 'if [[ "$2" != --eol ]]; then echo "Error: doctor found 1 health issue(s)" >&2; exit 1; fi\n'
+                           + output
+                           + f'echo "Error: doctor found {eol_count} health issue(s)" >&2\nexit 1\n')
+                result, evidence, logs = self.run_inventory(product, [row], tiers='container')
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_audit_eol_requires_private_runtime_classifications_and_issue_count(self):
+        row = ('audit-eol\t["audit","eol"]\tread\t0\tpass\t-\t'
+               'hermetic\thermetic:pass\taudit-eol-state\ttempdir-drop')
+        preflight = ('[[ $(id -u) != 0 && "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 '
+                     '&& -d "$OMG_DATA_DIR/versions/node/16.20.2" '
+                     '&& $(readlink "$OMG_DATA_DIR/versions/node/current") == 16.20.2 '
+                     '&& -d "$OMG_DATA_DIR/versions/python/3.12.14" '
+                     '&& $(readlink "$OMG_DATA_DIR/versions/python/current") == 3.12.14 ]] '
+                     '|| exit 70\n')
+        good = ('  ✗ node v16.20.2 - EOL (EOL: 2023-09-11)\n'
+                '  ✓ python v3.12.14 - Active (EOL: 2028-10-31)\n'
+                '⚠ 1 runtime(s) need attention. Consider upgrading to supported versions.\n')
+        for output, expected in (
+            (good, 'PASS'),
+            (good.replace('EOL (EOL: 2023-09-11)', 'Active (EOL: 2023-09-11)'), 'FAIL'),
+            (good.replace('  ✓ python v3.12.14 - Active (EOL: 2028-10-31)\n', ''), 'FAIL'),
+            (good.replace('1 runtime(s) need attention', '0 runtime(s) need attention'), 'FAIL'),
+            (good.replace('1 runtime(s) need attention', '11 runtime(s) need attention'), 'FAIL'),
+            (good + '  ✗ node v16.20.2 - EOL (EOL: 2023-09-11)\n', 'FAIL'),
+        ):
+            with self.subTest(expected=expected, output=output):
+                product = preflight + 'printf %s ' + shlex.quote(output) + '\n'
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_doctor_network_requires_backend_probes_and_counted_failures(self):
+        row = ('doctor-network\t["doctor","--network"]\tcontrolled-error\t1\tpass\t-\t'
+               'container\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tdoctor-network-state\ttempdir-drop')
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            mirrors = ((('Arch Linux', 'https://archlinux.org'), ('Kernel.org', 'https://kernel.org'),
+                        ('GitHub', 'https://github.com'), ('AUR', 'https://aur.archlinux.org'))
+                       if distro == 'arch' else (('Kernel.org', 'https://kernel.org'),
+                                                ('GitHub', 'https://github.com')))
+            hosts = (('archlinux.org', 'aur.archlinux.org', 'github.com') if distro == 'arch'
+                     else ('kernel.org', 'github.com'))
+            mirror_lines = ''.join(f'  ✗ {name} (request failed for {url})\n' for name, url in mirrors)
+            dns_lines = f'    ✓ {hosts[0]} (2 addresses)\n'
+            dns_lines += ''.join(f'    ✗ {host} (resolver unavailable)\n' for host in hosts[1:])
+            correct = f'Network Diagnostics\n{mirror_lines}\n  DNS Resolution:\n{dns_lines}'
+            expected_count = 1 + len(mirrors) + len(hosts) - 1
+            variants = (
+                (correct, expected_count, 'PASS'),
+                (correct, expected_count - 1, 'FAIL'),
+                (correct.replace(f'  ✗ {mirrors[0][0]}', f'  ✓ {mirrors[0][0]}'), expected_count, 'FAIL'),
+                (correct.replace(mirrors[0][1], 'https://wrong.example'), expected_count, 'FAIL'),
+                (correct.replace(f'    ✗ {hosts[-1]}', '    ✗ wrong.example'), expected_count, 'FAIL'),
+            )
+            for output, count, expected in variants:
+                with self.subTest(distro=distro, expected=expected, count=count, output=output):
+                    product = (
+                        '[[ "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 ]] || exit 70\n'
+                        'if [[ "$2" != --network ]]; then echo "Error: doctor found 1 health issue(s)" >&2; exit 1; fi\n'
+                        + 'printf %s ' + shlex.quote(output) + '\n'
+                        + f'echo "Error: doctor found {count} health issue(s)" >&2\nexit 1\n'
+                    )
+                    result, evidence, logs = self.run_inventory(product, [row], tiers='container', distro=distro)
+                    self.assertEqual(evidence[0]['result'], expected, logs)
+                    self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_audit_secrets_requires_scoped_redacted_finding(self):
+        row = ('audit-secrets\t["audit","secrets","--path","project"]\tread\t0\tpass\t-\t'
+               'hermetic\thermetic:pass\taudit-secret-scoped\ttempdir-drop')
+        good = ('⚠ Found 1 potential secrets:\n  ● 1 MEDIUM\n'
+                '  [MEDIUM] Password in project/config.txt:1\n      pass**********...7429\n')
+        for output, expected in (
+            (good, 'PASS'),
+            ('✓ No secrets detected.\n', 'FAIL'),
+            (good.replace('project/config.txt', 'outside.txt'), 'FAIL'),
+            (good + '  [MEDIUM] Password in project/config.txt:1\n', 'FAIL'),
+            (good + 'password=qemuSecret7429\n', 'FAIL'),
+        ):
+            with self.subTest(expected=expected, output=output):
+                product = ('[[ -f project/config.txt && -f outside.txt ]] || exit 70\n'
+                           + 'printf %s ' + shlex.quote(output) + '\n')
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_audit_secrets_critical_requires_failure_and_redaction(self):
+        row = ('audit-secrets-critical\t["audit","secrets","--path","project/critical"]\t'
+               'controlled-error\t1\tpass\t-\thermetic\thermetic:pass\t'
+               'audit-secret-critical\ttempdir-drop')
+        good = ('⚠ Found 1 potential secrets:\n  ● 1 CRITICAL\n'
+                '  [CRITICAL] Private Key in project/critical/key.pem:1\n'
+                '      ----**********...----\n')
+        error = 'Error: Secret scan failed: 1 critical secret finding(s) require remediation'
+        raw_marker = '-----BEGIN ' + 'PRIVATE KEY-----'
+        for output, stderr, code, expected in (
+            (good, error, 1, 'PASS'),
+            (good, '', 1, 'FAIL'),
+            (good, error, 0, 'FAIL'),
+            (good + '  [CRITICAL] Private Key in project/critical/key.pem:1\n', error, 1, 'FAIL'),
+            (good + raw_marker + '\n', error, 1, 'FAIL'),
+            (good, error + '\n' + raw_marker, 1, 'FAIL'),
+        ):
+            with self.subTest(expected=expected, code=code, output=output):
+                product = ('[[ -f project/critical/key.pem ]] || exit 70\n'
+                           + 'printf %s ' + shlex.quote(output) + '\n'
+                           + 'printf %s ' + shlex.quote(stderr + '\n') + ' >&2\n'
+                           + f'exit {code}\n')
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_info_row_compares_version_and_source_to_native_catalog(self):
+        row = ('info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass'
+               '\tinfo-native-package\ttempdir-drop')
+        references = {
+            'arch': ('pacman', 'Repository : core\nVersion : 1.2-3\n', 'Official repository (core)'),
+            'debian': ('apt-cache', 'pacman:\n  Candidate: 1.2-3\n', 'Official repository (apt)'),
+            'ubuntu': ('apt-cache', 'pacman:\n  Candidate: 1.2-3\n', 'Official repository (apt)'),
+            'fedora': ('dnf', '1.2-3\n', 'Official repository (dnf)'),
+        }
+        for distro, (tool, native_output, source) in references.items():
+            with self.subTest(distro=distro):
+                native = {tool: 'printf %s ' + shlex.quote(native_output) + '\n'}
+                def product(version):
+                    return 'printf %s ' + shlex.quote(
+                        f'  | Info\n    pacman\n          Name: pacman\n'
+                        f'       Version: {version}\n        Source: {source}\n') + '\n'
+                result, evidence, _ = self.run_inventory(
+                    product('1.2-3'), [row], distro=distro, native_commands=native)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'PASS')
+                result, evidence, logs = self.run_inventory(
+                    product('9.9-9'), [row], distro=distro, native_commands=native)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(evidence[0]['result'], 'FAIL')
+                self.assertIn('info disagrees with the native', logs['info.log'])
+                result, evidence, _ = self.run_inventory(
+                    product('1.2-3'), [row], distro=distro,
+                    native_commands={tool: 'exit 7\n'})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(evidence[0]['result'], 'BLOCKED')
+
     @staticmethod
     def runtime_usage_fixture(runtime):
         usage = json.dumps({'runtime_usage_counts': {runtime: 1},
@@ -49,6 +1018,246 @@ class OutputContracts(unittest.TestCase):
                     self.assertIn('assertion failed: runtime usage', logs['runtime-node-install.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_runtime_uninstall_removes_only_inactive_version(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if re.match(r'^runtime-(node|python|go)-uninstall\t', line)]
+        self.assertEqual(len(rows), 3)
+        checks = ('[[ "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 '
+                  '&& -f "$OMG_DATA_DIR/versions/$2/$3/sentinel" '
+                  '&& -L "$OMG_DATA_DIR/versions/$2/current" '
+                  '&& -f "$OMG_DATA_DIR/versions/$2/9.9.9/sentinel" '
+                  '&& -f "$OMG_DATA_DIR/versions/other-guard/1.0.0/sentinel" '
+                  '&& -L "$OMG_DATA_DIR/versions/$2/$3/external-link" ]] || exit 70\n')
+        product = checks + 'rm -rf -- "$OMG_DATA_DIR/versions/$2/$3"\n'
+        for row in rows:
+            case = row.split('\t')[0]
+            with self.subTest(case=case):
+                result, evidence, logs = self.run_inventory(product, [row], tiers='container')
+                self.assertEqual(evidence[0]['result'], 'PASS', logs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                mutations = {
+                    'no-removal': checks + ':\n',
+                    'sibling': product + 'rm -rf -- "$OMG_DATA_DIR/versions/$2/9.9.9"\n',
+                    'active-pointer': product + 'ln -sfn /missing "$OMG_DATA_DIR/versions/$2/current"\n',
+                    'external-target': checks + 'rm -rf -- "$(readlink "$OMG_DATA_DIR/versions/$2/$3/external-link")"\n' + product,
+                    'other-runtime': product + 'rm -rf -- "$OMG_DATA_DIR/versions/other-guard"\n',
+                }
+                for fault, broken in mutations.items():
+                    with self.subTest(case=case, fault=fault):
+                        result, evidence, logs = self.run_inventory(broken, [row], tiers='container')
+                        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn('assertion failed: runtime uninstall', logs[case + '.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_runtime_list_and_switch_require_exact_private_state(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if re.match(r'^runtime-(node|python|go)-(list|switch)-installed\t', line)]
+        self.assertEqual(len(rows), 6)
+        versions = {'node': ('24.21.0', '22.21.0'),
+                    'python': ('3.12.14', '3.11.14'),
+                    'go': ('1.27.1', '1.26.0')}
+        for row in rows:
+            case = row.split('\t')[0]
+            runtime = case.split('-')[1]
+            operation = case.split('-')[2]
+            selected, active = versions[runtime]
+            base = f'"$OMG_DATA_DIR/versions/{runtime}"'
+            checks = (f'[[ "$OMG_DISABLE_DAEMON" == 1 && "$OMG_TEST_MODE" == 0 '
+                      f'&& -f "$OMG_DATA_DIR/versions/{runtime}/{selected}/sentinel" '
+                      f'&& -f "$OMG_DATA_DIR/versions/{runtime}/{active}/sentinel" '
+                      f'&& -f "$OMG_DATA_DIR/versions/{runtime}/8.8.8/.omg-installing" '
+                      f'&& -L "$OMG_DATA_DIR/versions/{runtime}/7.7.7" '
+                      f'&& -L "$OMG_DATA_DIR/versions/{runtime}/current" ]] || exit 70\n')
+            if operation == 'list':
+                payload = {'runtime': runtime, 'current': active,
+                           'installed': [selected, active]}
+                output = 'printf %s ' + shlex.quote(json.dumps(payload)) + '\n'
+                product = checks + output
+                mutants = {
+                    'silent': checks + ':\n',
+                    'wrong-current': checks + 'printf %s ' + shlex.quote(
+                        json.dumps({**payload, 'current': selected})) + '\n',
+                    'missing-version': checks + 'printf %s ' + shlex.quote(
+                        json.dumps({**payload, 'installed': [selected]})) + '\n',
+                    'leaked-pending': checks + 'printf %s ' + shlex.quote(
+                        json.dumps({**payload, 'installed': [selected, active, '8.8.8']})) + '\n',
+                    'leaked-symlink': checks + 'printf %s ' + shlex.quote(
+                        json.dumps({**payload, 'installed': [selected, active, '7.7.7']})) + '\n',
+                    'extra-document': product + output,
+                    'changed-pointer': checks + f'rm {base}/current; ln -s {base}/{selected} {base}/current\n' + output,
+                    'lost-pending': checks + f'rm {base}/8.8.8/.omg-installing\n' + output,
+                    'lost-external': checks + 'rm "$(dirname "$OMG_DATA_DIR")/external-runtime/sentinel"\n' + output,
+                }
+            else:
+                switch = f'rm {base}/current; ln -s {base}/{selected} {base}/current\n'
+                usage = self.runtime_usage_fixture(runtime)
+                product = checks + switch + usage
+                mutants = {
+                    'no-switch': checks + usage,
+                    'missing-usage': checks + switch,
+                    'lost-active': product + f'rm -rf {base}/{active}\n',
+                    'lost-pending': product + f'rm {base}/8.8.8/.omg-installing\n',
+                    'lost-external': product + 'rm "$(dirname "$OMG_DATA_DIR")/external-runtime/sentinel"\n',
+                }
+            with self.subTest(case=case):
+                result, evidence, logs = self.run_inventory(product, [row], tiers='container')
+                self.assertEqual(evidence[0]['result'], 'PASS', logs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for fault, broken in mutants.items():
+                    with self.subTest(case=case, fault=fault):
+                        result, evidence, logs = self.run_inventory(broken, [row], tiers='container')
+                        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn('assertion failed: runtime', logs[case + '.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_config_rows_require_private_persisted_state(self):
+        rows = [
+            'config-set\t["config","set","telemetry.enabled","true"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\tconfig-set-persisted\ttempdir-drop',
+            'config-get\t["config","get","telemetry.enabled"]\tread\t0\tpass\tconfig-set\thermetic\thermetic:pass\tconfig-get-persisted\ttempdir-drop',
+            'config-list\t["config","list"]\tread\t0\tpass\tconfig-set\thermetic\thermetic:pass\tconfig-list-persisted\ttempdir-drop',
+            'config-validate\t["config","validate"]\tread\t0\tpass\tconfig-set\thermetic\thermetic:pass\tconfig-validate-persisted\ttempdir-drop',
+            'config-path\t["config","path"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tconfig-path-isolated\ttempdir-drop',
+            'config-reset\t["config","reset","--yes"]\tisolated-write\t0\tpass\tconfig-set\thermetic\thermetic:pass\tconfig-reset-defaults\ttempdir-drop',
+        ]
+        product = r'''file="$OMG_CONFIG_DIR/config.toml"
+case "$1:$2" in
+  config:set) mkdir -p "$OMG_CONFIG_DIR"; printf 'telemetry_enabled = true\n' > "$file"; echo 'Set telemetry.enabled = true' ;;
+  config:get) echo true ;;
+  config:list) echo 'telemetry.enabled = true' ;;
+  config:validate) echo 'Configuration is valid!' ;;
+  config:path) printf '%s\n' "$file" ;;
+  config:reset) cp "$file" "$file.backup"; printf 'telemetry_enabled = false\n' > "$file"; echo 'Configuration reset to defaults' ;;
+  *) exit 77 ;;
+esac
+'''
+        result, evidence, logs = self.run_inventory(product, rows)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows), logs)
+
+        faults = (
+            ("printf 'telemetry_enabled = true\\n' > \"$file\"", ':', 'config-set'),
+            ("printf 'telemetry_enabled = true\\n' > \"$file\"", "printf 'telemetry_enabled = true\\ntelemetry_enabled=false\\n' > \"$file\"", 'config-set'),
+            ('config:get) echo true', 'config:get) echo false', 'config-get'),
+            ("config:list) echo 'telemetry.enabled = true'", "config:list) echo 'telemetry.enabled = false'", 'config-list'),
+            ("config:validate) echo 'Configuration is valid!'", "config:validate) echo 'Validation skipped'", 'config-validate'),
+            ("config:path) printf '%s\\n' \"$file\"", 'config:path) echo /tmp/wrong', 'config-path'),
+            ("printf 'telemetry_enabled = false\\n' > \"$file\"", "printf 'telemetry_enabled = true\\n' > \"$file\"", 'config-reset'),
+        )
+        for old, new, case in faults:
+            with self.subTest(case=case):
+                self.assertIn(old, product)
+                result, evidence, logs = self.run_inventory(product.replace(old, new, 1), rows)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                observed = {row['case_id'].removeprefix('qemu-arch-'): row['result'] for row in evidence}
+                self.assertEqual(observed[case], 'FAIL', logs)
+                self.assertIn('assertion failed: config', logs[case + '.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_privacy_rows_require_persisted_state_and_queue_purge(self):
+        rows = [
+            'privacy-opt-out\t["privacy","opt-out"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\tprivacy-opted-out\ttempdir-drop',
+            'privacy-status\t["privacy","status"]\tread\t0\tpass\tprivacy-opt-out\thermetic\thermetic:pass\tprivacy-status-disabled\ttempdir-drop',
+            'privacy-opt-in\t["privacy","opt-in"]\tisolated-write\t0\tpass\tprivacy-opt-out\thermetic\thermetic:pass\tprivacy-opted-in\ttempdir-drop',
+            'privacy-status-enabled\t["privacy","status"]\tread\t0\tpass\tprivacy-opt-in\tcontainer\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tprivacy-status-enabled\ttempdir-drop',
+        ]
+        product = r'''file="$OMG_CONFIG_DIR/config.toml"
+case "$1:$2" in
+  privacy:opt-out) mkdir -p "$OMG_CONFIG_DIR"; rm "$OMG_DATA_DIR/telemetry_queue.json"; printf 'telemetry_enabled = false\n' > "$file"; echo 'Telemetry disabled locally' ;;
+  privacy:status) if grep -Fxq 'telemetry_enabled = true' "$file"; then echo '  Telemetry: Enabled'; else echo '  Telemetry: Disabled'; fi ;;
+  privacy:opt-in) printf 'telemetry_enabled = true\n' > "$file"; echo 'Telemetry enabled locally' ;;
+  *) exit 77 ;;
+esac
+'''
+        result, evidence, logs = self.run_inventory(product, rows, tiers='hermetic,container')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row['result'] for row in evidence], ['PASS'] * len(rows), logs)
+
+        faults = (
+            ("printf 'telemetry_enabled = false\\n' > \"$file\"", ':', 'privacy-opt-out'),
+            ('rm "$OMG_DATA_DIR/telemetry_queue.json"', ':', 'privacy-opt-out'),
+            ("else echo '  Telemetry: Disabled'", "else echo '  Telemetry: Enabled'", 'privacy-status'),
+            ("printf 'telemetry_enabled = true\\n' > \"$file\"", ':', 'privacy-opt-in'),
+            ("then echo '  Telemetry: Enabled'", "then echo '  Telemetry: Disabled'", 'privacy-status-enabled'),
+        )
+        for old, new, case in faults:
+            with self.subTest(case=case, mutation=old):
+                self.assertIn(old, product)
+                result, evidence, logs = self.run_inventory(product.replace(old, new, 1), rows, tiers='hermetic,container')
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                observed = {row['case_id'].removeprefix('qemu-arch-'): row['result'] for row in evidence}
+                self.assertEqual(observed[case], 'FAIL', logs)
+                self.assertIn('assertion failed: privacy', logs[case + '.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_privacy_export_requires_private_complete_redacted_local_data(self):
+        row = ('privacy-export\t["privacy","export","--output","${ROOT}/privacy.json"]'
+               '\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass'
+               '\tartifact:privacy.json\ttempdir-drop')
+        payload = {
+            'exported_at': '2026-09-26T00:00:00Z', 'scope': 'local',
+            'local': {
+                'usage.json': {'fixture': 'usage', 'total_commands': 7},
+                'config.toml': 'telemetry_enabled = false\n',
+                'license.json': {
+                    'tier': 'pro', 'features': ['sbom'],
+                    'customer': 'fixture@example.invalid', 'expires_at': None,
+                    'validated_at': 1700000000, 'machine_id': 'fixture-machine',
+                },
+            },
+        }
+        preflight = ('[[ "$OMG_DISABLE_DAEMON" == 1 && '
+                     '-f "$OMG_DATA_DIR/usage.json" && '
+                     '-f "$OMG_DATA_DIR/license.json" && '
+                     '-f "$OMG_CONFIG_DIR/config.toml" && '
+                     '$(stat -c %a "$4") == 644 ]] || exit 70\n'
+                     'jq -e \'.fixture == "usage" and .total_commands == 7\' '
+                     '"$OMG_DATA_DIR/usage.json" >/dev/null || exit 70\n'
+                     'jq -e \'.key == "qemu-secret-license-key" and '
+                     '.token == "qemu-secret-license-token"\' '
+                     '"$OMG_DATA_DIR/license.json" >/dev/null || exit 70\n'
+                     'grep -Fxq "telemetry_enabled = false" '
+                     '"$OMG_CONFIG_DIR/config.toml" || exit 70\n')
+
+        def product(data, *, mode=600, write=True):
+            command = preflight
+            if write:
+                command += 'printf "%s\\n" ' + shlex.quote(json.dumps(data)) + ' > "$4"\n'
+                command += f'chmod {mode} "$4"\n'
+            command += 'printf "Data exported to: %s\\n" "$4"\n'
+            return command
+
+        result, evidence, logs = self.run_inventory(product(payload), [row])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'PASS', logs)
+
+        faults = {
+            'wrong-usage': {**payload, 'local': {**payload['local'],
+                'usage.json': {'fixture': 'usage', 'total_commands': 0}}},
+            'missing-config': {**payload, 'local': {key: value for key, value in
+                payload['local'].items() if key != 'config.toml'}},
+            'leaked-license-key': {**payload, 'local': {**payload['local'],
+                'license.json': {**payload['local']['license.json'], 'key': 'qemu-secret-license-key'}}},
+            'wrong-scope': {**payload, 'scope': 'remote'},
+            'extra-remote': {**payload, 'remote': {}},
+        }
+        for fault, data in faults.items():
+            with self.subTest(fault=fault):
+                result, evidence, logs = self.run_inventory(product(data), [row])
+                self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('assertion failed: privacy export', logs['privacy-export.log'])
+        for fault, command in [('permissive-mode', product(payload, mode=644)),
+                               ('unchanged-stale-file', product(payload, write=False))]:
+            with self.subTest(fault=fault):
+                result, evidence, logs = self.run_inventory(command, [row])
+                self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_counter_rows_require_native_counts_and_block_failed_references(self):
         cases = {'ec': 'explicit-shortcut', 'tc': 'total-shortcut',
                  'oc': 'orphan-shortcut', 'uc': 'updates-shortcut'}
@@ -63,7 +1272,7 @@ class OutputContracts(unittest.TestCase):
         }
         for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
             for command, case in cases.items():
-                rows = [f'{case}\t["{command}"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+                rows = [f'{case}\t["{command}"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tnative-count\ttempdir-drop']
                 for value, verdict in [('2', 'PASS'), ('0', 'FAIL')]:
                     with self.subTest(distro=distro, command=command, value=value):
                         result, evidence, logs = self.run_inventory(
@@ -71,13 +1280,20 @@ class OutputContracts(unittest.TestCase):
                         self.assertEqual(evidence[0]['result'], verdict, logs)
                         self.assertEqual(result.returncode, int(verdict == 'FAIL'), result.stderr)
                         self.assertIn(f'native counter {command} expected=2 actual={value}', logs[case + '.log'])
+            explicit = ['explicit\t["explicit","--count"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tnative-count\ttempdir-drop']
+            for value, verdict in [('2', 'PASS'), ('0', 'FAIL')]:
+                with self.subTest(distro=distro, case='explicit', value=value):
+                    result, evidence, _ = self.run_inventory(
+                        f'printf "{value}\\n"\n', explicit, native_commands=native, distro=distro)
+                    self.assertEqual(evidence[0]['result'], verdict)
+                    self.assertEqual(result.returncode, int(verdict == 'FAIL'))
             broken = {name: 'echo native-reference-failed >&2\nexit 17\n' for name in native}
             result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
                                                        native_commands=broken, distro=distro)
             self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('native counter reference failed', logs[case + '.log'])
-        rows = ['explicit-shortcut\t["ec"]\tread\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        rows = ['explicit-shortcut\t["ec"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tnative-count\ttempdir-drop']
         result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
             native_commands=dict(native, sort='exit 17\n'))
         self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
@@ -93,6 +1309,100 @@ class OutputContracts(unittest.TestCase):
                 native_commands={'pacman': diagnostic + 'exit 1\n'})
             self.assertEqual(evidence[0]['result'], verdict)
             self.assertEqual(result.returncode, int(verdict != 'PASS'))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_status_rows_require_distro_native_counts_instead_of_only_exit_zero(self):
+        native = {
+            'pacman': 'case "$1" in -Qq) printf "a\\nb\\nc\\n" ;; -Qqe) printf "a\\nb\\n" ;; -Qdtq|-Quq) printf "c\\n" ;; *) exit 17 ;; esac\n',
+            'dpkg-query': 'printf "installed\\nconfig-files\\ninstalled\\ninstalled\\n"\n',
+            'apt-mark': 'printf "a\\nb\\n"\n',
+            'apt-get': 'printf "Remv c [1.0]\\n"\n',
+            'apt': 'printf "c/stable 2 amd64 [upgradable from: 1]\\n"\n',
+            'rpm': 'printf "a.x86_64\\nb.x86_64\\nc.x86_64\\n"\n',
+            'dnf': 'case " $* " in *--userinstalled*) printf "a\\nb\\n" ;; *--unneeded*|*--upgrades*) printf "c\\n" ;; *) exit 17 ;; esac\n',
+        }
+        rows = (
+            'status\t["status","--fast"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tstatus-native-fast\ttempdir-drop',
+            'status-verbose\t["--verbose","status"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tstatus-native-full\ttempdir-drop',
+        )
+        product = (
+            'printf "Status\\n\\n  3 packages installed · 2 explicit\\n"\n'
+            'if [[ "$1" == status ]]; then\n'
+            '  printf "  Updates and orphans not checked. Run omg status for a full check.\\n"\n'
+            'else\n'
+            '  printf "  Updates    1\\n  Orphans    1\\n"\n'
+            'fi\n'
+        )
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            with self.subTest(distro=distro, case='correct'):
+                result, evidence, logs = self.run_inventory(product, rows, native_commands=native, distro=distro)
+                self.assertEqual(result.returncode, 0, logs)
+                self.assertEqual([item['result'] for item in evidence], ['PASS', 'PASS'])
+                self.assertIn('native counter tc expected=3 actual=3', logs['status.log'])
+                self.assertIn('native counter oc expected=1 actual=1', logs['status-verbose.log'])
+            with self.subTest(distro=distro, case='false-green-total'):
+                wrong = product.replace('3 packages installed', '4 packages installed')
+                result, evidence, logs = self.run_inventory(wrong, rows, native_commands=native, distro=distro)
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'])
+                self.assertIn('assertion failed: status tc', logs['status.log'])
+        for case, mutation in (
+            ('explicit', ('2 explicit', '9 explicit')),
+            ('updates', ('Updates    1', 'Updates    9')),
+            ('orphans', ('Orphans    1', 'Orphans    9')),
+            ('fast-marker', ('Updates and orphans not checked.', 'All checks complete.')),
+        ):
+            with self.subTest(case=case):
+                result, evidence, _ = self.run_inventory(
+                    product.replace(*mutation), rows, native_commands=native)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('FAIL', [item['result'] for item in evidence])
+        broken = dict(native, pacman='echo native-reference-failed >&2\nexit 17\n')
+        result, evidence, _ = self.run_inventory(product, rows, native_commands=broken)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([item['result'] for item in evidence], ['BLOCKED', 'BLOCKED'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_outdated_rows_compare_reported_updates_to_native_queries(self):
+        native = {
+            'pacman': '[[ "$1" == -Quq ]] || exit 17\nprintf "c\\n"\n',
+            'apt': 'printf "c/stable 2 amd64 [upgradable from: 1]\\n"\n',
+            'dnf': '[[ " $* " == *--upgrades* ]] || exit 17\nprintf "c.x86_64\\n"\n',
+        }
+        rows = (
+            'outdated\t["outdated"]\tread\t0\tpass\t-\thermetic\thermetic:pass\toutdated-native-count\ttempdir-drop',
+            'outdated-json\t["--json","outdated"]\tread\t0\tpass\t-\thermetic\thermetic:pass\toutdated-json-native-count\ttempdir-drop',
+        )
+        item = '{"name":"c","current_version":"1","new_version":"2"}'
+        product = (
+            'if [[ "$1" == --json ]]; then\n'
+            f'  printf "%s\\n" \'[{item}]\'\n'
+            'else\n'
+            '  printf "[Available Updates] 1 packages total\\n"\n'
+            'fi\n'
+        )
+        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+            with self.subTest(distro=distro, case='correct'):
+                result, evidence, logs = self.run_inventory(product, rows, native_commands=native, distro=distro)
+                self.assertEqual(result.returncode, 0, logs)
+                self.assertEqual([item['result'] for item in evidence], ['PASS', 'PASS'])
+                self.assertIn('native counter uc expected=1 actual=1', logs['outdated.log'])
+            with self.subTest(distro=distro, case='false-zero'):
+                wrong = product.replace('1 packages total', '2 packages total').replace(f'[{item}]', '[]')
+                result, evidence, logs = self.run_inventory(wrong, rows, native_commands=native, distro=distro)
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertEqual([item['result'] for item in evidence], ['FAIL', 'FAIL'])
+        for case, mutation in (
+            ('missing-version', (item, '{"name":"c","current_version":"1","new_version":""}')),
+            ('no-summary', ('[Available Updates] 1 packages total', 'Updates may be available')),
+            ('conflicting-zero', ('[Available Updates] 1 packages total',
+                                  '[Available Updates] 1 packages total\\nEverything is up to date!')),
+        ):
+            with self.subTest(case=case):
+                result, evidence, _ = self.run_inventory(product.replace(*mutation), rows,
+                                                          native_commands=native)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('FAIL', [item['result'] for item in evidence])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_python_install_requires_active_executable_and_exact_version(self):
@@ -363,7 +1673,7 @@ class OutputContracts(unittest.TestCase):
                 command.append('--allow-mutations')
             result = subprocess.run(
                 command,
-                env=env, capture_output=True, text=True, timeout=30)
+                env=env, capture_output=True, text=True, timeout=120)
             evidence = root / 'inventory/results.json'
             self.assertTrue(evidence.exists(), result.stdout + result.stderr)
             return result, json.loads(evidence.read_text()), {
@@ -429,6 +1739,39 @@ class OutputContracts(unittest.TestCase):
                                     code=0, stderr=refusal).returncode,
                     0,
                 )
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_license_rows_require_the_backend_refusal_without_an_export(self):
+        ids = {'audit-licenses', 'audit-licenses-filter-policy', 'audit-licenses-export',
+               'enterprise-license-scan', 'enterprise-license-scan-export'}
+        rows = [line for line in
+                (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                if line.split('\t', 1)[0] in ids]
+        self.assertEqual(len(rows), len(ids))
+        refusal = ('if [[ "$1" == audit ]]; then\n'
+                   '  echo "Error: License scanning of installed packages is not available without the Arch backend" >&2\n'
+                   'else\n'
+                   '  echo "Error: Enterprise license scan requires the Arch package backend" >&2\n'
+                   'fi\nexit 1\n')
+        leaked_export = ('if [[ "$*" == *--export* ]]; then\n'
+                         '  if [[ "$1" == audit ]]; then printf partial > licenses-export.csv;\n'
+                         '  else printf partial > license-scan-fixture.json; fi\n'
+                         'fi\n' + refusal)
+        for distro in ('debian', 'ubuntu', 'fedora'):
+            for label, product, rejected in (
+                ('wrong cause', 'echo unrelated permission error >&2\nexit 1\n', ids),
+                ('explicit refusal', refusal, set()),
+                ('report despite refusal', 'echo "[]"\n' + refusal, ids),
+                ('partial export', leaked_export,
+                 {'audit-licenses-export', 'enterprise-license-scan-export'}),
+            ):
+                with self.subTest(distro=distro, label=label):
+                    result, evidence, logs = self.run_inventory(product, rows, distro=distro)
+                    for row in evidence:
+                        case = row['case_id'].removeprefix(f'qemu-{distro}-')
+                        self.assertEqual(row['result'], 'FAIL' if case in rejected else 'PASS',
+                                         f'{result.stdout}\n{result.stderr}\n{logs}')
+                    self.assertEqual(result.returncode, 1 if rejected else 0)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_actual_runner_executes_offline_refusals(self):

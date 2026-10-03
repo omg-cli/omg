@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 mod catalog;
 
 use super::common::{
-    GithubRelease, activate_version_with_linked_binary, begin_staged_install,
+    GithubRelease, activate_version_with_linked_binary, begin_download, begin_staged_install,
     complete_staged_install, download_with_progress, extract_tar_gz, fetch_github_releases,
     normalize_version, parse_sha256_digest, print_already_installed, print_installed, print_using,
-    remove_file_best_effort, validate_download_filename, version_cmp,
+    validate_download_filename, version_cmp,
 };
 use crate::{cli::style, core::http::download_client};
 
@@ -274,7 +274,8 @@ impl PythonManager {
         fs::create_dir_all(&self.versions_dir)?;
 
         println!("{} Downloading {}...", style::informative("→"), asset_name);
-        let download_path = self.versions_dir.join(asset_name);
+        let download_owner = begin_download(&self.versions_dir)?;
+        let download_path = download_owner.path().join(asset_name);
         download_with_progress(
             self.client,
             &download.url,
@@ -287,8 +288,6 @@ impl PythonManager {
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(&download_path, staging.path(), 1).await?;
         self.publish_install(&staging, &version)?;
-
-        remove_file_best_effort(&download_path, "runtime archive");
 
         print_installed("Python", &version);
         self.use_version(&version)?;

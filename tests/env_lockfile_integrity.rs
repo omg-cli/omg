@@ -323,10 +323,19 @@ git = "git"
 #[test]
 #[cfg(all(
     unix,
-    any(feature = "arch", feature = "debian", feature = "debian-pure")
+    any(
+        feature = "arch",
+        feature = "debian",
+        feature = "debian-pure",
+        feature = "fedora"
+    )
 ))]
 fn capture_records_every_registered_runtime_and_check_detects_its_drift() {
-    let project = TestProject::new();
+    let project = if cfg!(feature = "fedora") {
+        TestProject::for_distro("fedora")
+    } else {
+        TestProject::new()
+    };
     let names = omg_lib::cli::runtimes::known_runtimes().unwrap();
     assert_eq!(
         names.len(),
@@ -533,14 +542,19 @@ fn snapshot_restores_installed_php_offline_without_replacing_its_payload() {
 }
 
 #[test]
-#[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
+#[cfg(not(any(
+    feature = "arch",
+    feature = "debian",
+    feature = "debian-pure",
+    feature = "fedora"
+)))]
 fn capture_without_package_backend_refuses_without_creating_or_overwriting_lockfile() {
     let project = TestProject::new();
     let path = project.path().join("omg.lock");
     let absent = project.run(&["env", "capture"]);
     absent.assert_failure();
     assert!(absent.combined_output().contains(
-        "Environment fingerprinting is not available without an Arch or Debian package backend"
+        "Environment fingerprinting is not available without an Arch, Debian, or Fedora package backend"
     ));
     assert!(
         std::fs::symlink_metadata(&path)
@@ -551,7 +565,7 @@ fn capture_without_package_backend_refuses_without_creating_or_overwriting_lockf
     let existing = project.run(&["env", "capture"]);
     existing.assert_failure();
     assert!(existing.combined_output().contains(
-        "Environment fingerprinting is not available without an Arch or Debian package backend"
+        "Environment fingerprinting is not available without an Arch, Debian, or Fedora package backend"
     ));
     assert_eq!(std::fs::read(&path).unwrap(), before);
     project.close_checked();

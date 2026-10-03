@@ -27,16 +27,25 @@ class CloudInitReadyTests(unittest.TestCase):
             if not shutil.which(command):
                 raise RuntimeError(f"{command} is required for cloud-init readiness tests")
 
-    def check(self, status, *, result=True, target_ready_after=1, failed_unit=""):
+    def check(self, status, *, result=True, target_ready_after=1, failed_unit="",
+              status_resets=0, target_resets=0, timeout_seconds=180):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             (temp / "status.json").write_text(json.dumps(status), encoding="utf-8")
             ssh = temp / "ssh"
             ssh.write_text("""#!/usr/bin/env bash
 if [[ "$*" == *'/run/cloud-init/result.json'* ]]; then
+  calls=0
+  [[ ! -e "$MOCK_STATUS_CALLS" ]] || read -r calls < "$MOCK_STATUS_CALLS"
+  printf '%s\\n' "$((calls + 1))" > "$MOCK_STATUS_CALLS"
+  (( calls >= MOCK_STATUS_RESETS )) || exit 255
   [[ "$MOCK_RESULT" == present ]] || exit 1
   cat "$MOCK_STATUS"
 else
+  calls=0
+  [[ ! -e "$MOCK_SSH_TARGET_CALLS" ]] || read -r calls < "$MOCK_SSH_TARGET_CALLS"
+  printf '%s\\n' "$((calls + 1))" > "$MOCK_SSH_TARGET_CALLS"
+  (( calls >= MOCK_TARGET_RESETS )) || exit 255
   bash -c "${@: -1}"
 fi
 """, encoding="utf-8")
@@ -61,7 +70,12 @@ fi
                        MOCK_RESULT="present" if result else "missing",
                        MOCK_TARGET_CALLS=str(temp / "target-calls"),
                        MOCK_TARGET_READY_AFTER=str(target_ready_after),
-                       MOCK_FAILED_UNIT=failed_unit)
+                       MOCK_FAILED_UNIT=failed_unit,
+                       MOCK_STATUS_CALLS=str(temp / "status-calls"),
+                       MOCK_SSH_TARGET_CALLS=str(temp / "ssh-target-calls"),
+                       MOCK_STATUS_RESETS=str(status_resets),
+                       MOCK_TARGET_RESETS=str(target_resets),
+                       OMG_QEMU_CLOUD_INIT_TIMEOUT_SECONDS=str(timeout_seconds))
             completed = subprocess.run(["bash", str(CHECK), "bench@127.0.0.1", "-p", "2222"],
                                        env=env, text=True, capture_output=True, timeout=20)
             calls = int((temp / "target-calls").read_text()) if (temp / "target-calls").exists() else 0
@@ -76,6 +90,22 @@ fi
         result, calls = self.check(healthy_status(), target_ready_after=3)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, 3)
+
+    def test_transient_ssh_resets_are_retried_in_both_boot_stages(self):
+        result, _ = self.check(healthy_status(), status_resets=1, target_resets=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verified", result.stdout)
+
+    def test_failed_guest_command_is_not_reported_as_a_timeout(self):
+        result, _ = self.check(healthy_status(), result=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("guest command failed", result.stderr)
+        self.assertNotIn("within 180 seconds", result.stderr)
+
+    def test_transport_retries_obey_the_boot_deadline(self):
+        result, _ = self.check(healthy_status(), status_resets=1000, timeout_seconds=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("within 1 seconds", result.stderr)
 
     def test_legacy_cloud_init_without_recoverable_errors_field_passes(self):
         status = healthy_status()

@@ -15,9 +15,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::common::{
-    activate_version, begin_staged_install, complete_staged_install, download_with_progress,
-    extract_tar_xz, normalize_version, parse_sha256_digest, print_already_installed,
-    print_installed, print_using, remove_file_best_effort,
+    activate_version, begin_download, begin_staged_install, complete_staged_install,
+    download_with_progress, extract_tar_xz, normalize_version, parse_sha256_digest,
+    print_already_installed, print_installed, print_using,
 };
 use crate::{cli::style, core::http::download_client};
 
@@ -172,15 +172,14 @@ impl NodeManager {
         let checksum = self.fetch_checksum(&version, &filename).await?;
 
         println!("{} Downloading {}...", style::informative("→"), filename);
-        let download_path = self.versions_dir.join(&filename);
+        let download = begin_download(&self.versions_dir)?;
+        let download_path = download.path().join(&filename);
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_xz(&download_path, staging.path(), 1).await?;
         self.publish_install(&staging, &version)?;
-
-        remove_file_best_effort(&download_path, "runtime archive");
 
         print_installed("Node.js", &version);
         self.use_version(&version)?;

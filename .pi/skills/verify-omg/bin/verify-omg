@@ -33,14 +33,37 @@ require_run_id() {
   fi
 }
 
+build_input_paths() {
+  local input
+  for input in src vendor .cargo Cargo.toml Cargo.lock build.rs; do
+    [[ ! -e "$REPO_ROOT/$input" ]] || printf '%s\0' "$REPO_ROOT/$input"
+  done
+}
+
+source_digest() {
+  local -a inputs=()
+  mapfile -d '' -t inputs < <(build_input_paths)
+  find "${inputs[@]}" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
+}
+
+build_receipt() {
+  local source_sha=${1:-$(source_digest)}
+  printf 'version=1\nsource_inputs_sha256=%s\nbinary_sha256=%s\n' \
+    "$source_sha" "$(sha256sum "$OMG_BIN" | awk '{print $1}')"
+}
+
 require_fresh_binary() {
   if [[ ! -x $OMG_BIN ]]; then
     echo "error: $OMG_BIN does not exist; run 'verify-omg build' first" >&2
     exit 1
   fi
-  if find "$REPO_ROOT/src" "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cargo.lock" \
+  if find "$REPO_ROOT/src" "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cargo.lock" "$REPO_ROOT/vendor" \
     -type f -newer "$OMG_BIN" -print -quit | grep -q .; then
     echo "error: checkout sources are newer than $OMG_BIN; rebuild before driving" >&2
+    exit 1
+  fi
+  if [[ ! -f "$OMG_BIN.source-sha256" ]] || [[ $(cat "$OMG_BIN.source-sha256") != "$(build_receipt)" ]]; then
+    echo "error: checkout build inputs or binary do not match the build receipt; rebuild before driving" >&2
     exit 1
   fi
 }
@@ -103,10 +126,15 @@ expected_version() {
 
 build() {
   mkdir -p "$TARGET_DIR"
+  local before after
+  before=$(source_digest)
   (
     cd "$REPO_ROOT"
     CARGO_TARGET_DIR="$TARGET_DIR" cargo build -j 2 --locked --bin omg
   )
+  after=$(source_digest)
+  [[ $before == "$after" ]] || { echo "error: build inputs changed during compilation; rebuild" >&2; return 1; }
+  build_receipt "$after" > "$OMG_BIN.source-sha256"
   "$OMG_BIN" --version
 }
 
@@ -133,6 +161,8 @@ doctor() {
 
   {
     printf 'source_head: %s\n' "$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    printf 'source_inputs_sha256: %s\n' "$(source_digest)"
+    printf 'binary_sha256: %s\n' "$(sha256sum "$OMG_BIN" | awk '{print $1}')"
     printf 'binary: %s\n' "$OMG_BIN"
     printf 'version: %s\n' "$actual"
     printf 'sandbox: %s\n' "$(sandbox_dir)"
@@ -185,6 +215,8 @@ drive() {
   {
     printf 'feature: %s\n' "$feature"
     printf 'source_head: %s\n' "$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    printf 'source_inputs_sha256: %s\n' "$(source_digest)"
+    printf 'binary_sha256: %s\n' "$(sha256sum "$OMG_BIN" | awk '{print $1}')"
     printf 'command:'
     printf ' %q' "$OMG_BIN" "$@"
     printf '\n'

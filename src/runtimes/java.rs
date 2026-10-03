@@ -16,9 +16,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use super::common::{
-    activate_version, begin_staged_install, complete_staged_install, download_with_progress,
-    extract_tar_gz, normalize_version, parse_sha256_digest, print_already_installed,
-    print_installed, remove_file_best_effort, validate_download_filename,
+    activate_version, begin_download, begin_staged_install, complete_staged_install,
+    download_with_progress, extract_tar_gz, normalize_version, parse_sha256_digest,
+    print_already_installed, print_installed, validate_download_filename,
 };
 use crate::{cli::style, core::http::download_client};
 
@@ -145,7 +145,8 @@ impl JavaManager {
             style::informative("→"),
             archive_name
         );
-        let download_path = self.versions_dir.join(archive_name);
+        let download = begin_download(&self.versions_dir)?;
+        let download_path = download.path().join(archive_name);
         let checksum = parse_sha256_digest(&binary.package.checksum, "Adoptium")?;
         download_with_progress(self.client, &binary.package.link, &download_path, &checksum)
             .await?;
@@ -153,12 +154,16 @@ impl JavaManager {
         println!("{} Extracting (pure Rust)...", style::informative("→"));
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(&download_path, staging.path(), 1).await?;
-        complete_staged_install(&staging, &version_dir, &version)?;
-
-        remove_file_best_effort(&download_path, "runtime archive");
+        self.publish_install(&staging, &version)?;
 
         print_installed("Java", &version);
         self.use_version(&version)
+    }
+
+    fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
+        normalize_java_home(staging.path())?;
+        super::common::require_regular_file(&staging.path().join("bin/java"))?;
+        complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
     /// Switch to a specific version
@@ -183,6 +188,61 @@ impl JavaManager {
         let version = java_feature_number(version)?;
         super::common::uninstall_version(&self.versions_dir, &version)
     }
+}
+
+fn normalize_java_home(staging: &Path) -> Result<()> {
+    let home = staging.join("Contents/Home");
+    match fs::symlink_metadata(&home) {
+        Ok(metadata) => anyhow::ensure!(metadata.is_dir(), "Java bundle home must be a directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("Failed to inspect Java bundle home"),
+    }
+
+    let canonical_home = home.canonicalize()?;
+    anyhow::ensure!(
+        canonical_home.starts_with(staging.canonicalize()?),
+        "Java bundle home escapes the staging directory"
+    );
+    // Flattening moves the symlink base. Links must remain inside Home,
+    // even when the original archive's larger bundle would contain them.
+    let mut directories = vec![home.clone()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else if file_type.is_symlink() {
+                super::common::validate_relative_symlink_target(
+                    entry.path().strip_prefix(&home)?,
+                    &fs::read_link(entry.path())?,
+                )?;
+                anyhow::ensure!(
+                    entry.path().canonicalize()?.starts_with(&canonical_home),
+                    "Java bundle link escapes the runtime home: {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+
+    for entry in fs::read_dir(&home)? {
+        let entry = entry?;
+        let destination = staging.join(entry.file_name());
+        match fs::symlink_metadata(&destination) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => anyhow::bail!("Java bundle home conflicts with {}", destination.display()),
+            Err(error) => return Err(error).context("Failed to inspect normalized Java home"),
+        }
+        fs::rename(entry.path(), &destination).with_context(|| {
+            format!(
+                "Failed to normalize Java bundle entry at {}",
+                destination.display()
+            )
+        })?;
+    }
+    fs::remove_dir(home).context("Failed to remove the empty Java bundle home")?;
+    Ok(())
 }
 
 /// Resolve a Java request to the Adoptium feature number it names.
@@ -221,6 +281,161 @@ fn java_platform() -> Result<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    async fn stage_java_archive(
+        versions_dir: &Path,
+        runtime_home: &str,
+    ) -> Result<tempfile::TempDir> {
+        let archive_dir = tempfile::tempdir()?;
+        let archive_path = archive_dir.path().join("jdk.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive_path)?,
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        for (relative, content) in [("bin/java", b"java".as_slice()), ("bin/javac", b"javac")] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive.append_data(
+                &mut header,
+                format!("jdk-21/{runtime_home}{relative}"),
+                content,
+            )?;
+        }
+        archive.into_inner()?.finish()?;
+        let staging = begin_staged_install(versions_dir)?;
+        extract_tar_gz(&archive_path, staging.path(), 1).await?;
+        Ok(staging)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_normalizes_mac_bundle_home_before_activation() -> Result<()> {
+        let versions = tempfile::tempdir()?;
+        let manager = JavaManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: download_client(),
+        };
+        let staging = stage_java_archive(versions.path(), "Contents/Home/").await?;
+
+        manager.publish_install(&staging, "21")?;
+        manager.use_version("21")?;
+
+        assert_eq!(fs::read(versions.path().join("21/bin/java"))?, b"java");
+        assert_eq!(
+            fs::read(versions.path().join("current/bin/javac"))?,
+            b"javac"
+        );
+        assert_eq!(
+            fs::read_link(versions.path().join("current"))?,
+            versions.path().join("21")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_keeps_linux_home_at_the_runtime_root() -> Result<()> {
+        let versions = tempfile::tempdir()?;
+        let manager = JavaManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: download_client(),
+        };
+        let staging = stage_java_archive(versions.path(), "").await?;
+
+        manager.publish_install(&staging, "21")?;
+        manager.use_version("21")?;
+
+        assert_eq!(fs::read(versions.path().join("current/bin/java"))?, b"java");
+        Ok(())
+    }
+
+    #[test]
+    fn publication_refuses_a_home_without_java_before_creating_a_version() -> Result<()> {
+        let versions = tempfile::tempdir()?;
+        let manager = JavaManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: download_client(),
+        };
+        let staging = begin_staged_install(versions.path())?;
+
+        assert!(manager.publish_install(&staging, "21").is_err());
+        assert!(!versions.path().join("21").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_refuses_bundle_links_that_would_escape_the_normalized_home() -> Result<()> {
+        let versions = tempfile::tempdir()?;
+        let manager = JavaManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: download_client(),
+        };
+        let staging = begin_staged_install(versions.path())?;
+        fs::create_dir_all(staging.path().join("Contents/Home/bin"))?;
+        fs::create_dir_all(staging.path().join("Contents/Resources"))?;
+        fs::write(staging.path().join("Contents/Home/bin/java"), b"java")?;
+        fs::write(staging.path().join("Contents/Resources/config"), b"config")?;
+        std::os::unix::fs::symlink(
+            "../../Resources/config",
+            staging.path().join("Contents/Home/bin/config"),
+        )?;
+
+        assert!(manager.publish_install(&staging, "21").is_err());
+        assert!(!versions.path().join("21").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_preserves_internal_bundle_links_after_normalizing_the_home() -> Result<()> {
+        let versions = tempfile::tempdir()?;
+        let manager = JavaManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: download_client(),
+        };
+        let staging = begin_staged_install(versions.path())?;
+        fs::create_dir_all(staging.path().join("Contents/Home/bin"))?;
+        fs::create_dir_all(staging.path().join("Contents/Home/lib/server"))?;
+        fs::write(staging.path().join("Contents/Home/bin/java"), b"java")?;
+        fs::write(staging.path().join("Contents/Home/lib/server/jvm"), b"jvm")?;
+        std::os::unix::fs::symlink("server", staging.path().join("Contents/Home/lib/current"))?;
+
+        manager.publish_install(&staging, "21")?;
+
+        assert_eq!(
+            fs::read(versions.path().join("21/lib/current/jvm"))?,
+            b"jvm"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_refuses_home_links_that_leave_and_reenter_before_flattening() -> Result<()> {
+        let versions = tempfile::tempdir()?;
+        let manager = JavaManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: download_client(),
+        };
+        let staging = begin_staged_install(versions.path())?;
+        fs::create_dir_all(staging.path().join("Contents/Home/bin"))?;
+        fs::create_dir_all(staging.path().join("Contents/Home/lib"))?;
+        fs::write(staging.path().join("Contents/Home/bin/java"), b"java")?;
+        fs::write(staging.path().join("Contents/Home/lib/jvm"), b"jvm")?;
+        std::os::unix::fs::symlink(
+            "../../Home/lib/jvm",
+            staging.path().join("Contents/Home/bin/config"),
+        )?;
+
+        assert!(manager.publish_install(&staging, "21").is_err());
+        assert!(!versions.path().join("21").exists());
+        Ok(())
+    }
 
     #[test]
     fn test_java_manager_new() {

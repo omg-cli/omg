@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Admit an exact inventory selection against a separately reviewed skip policy."""
 import argparse
+import csv
 import hashlib
+import io
 import json
 from pathlib import Path
 
@@ -29,11 +31,32 @@ def read(path):
 
 def admit(policy, inventory, results, summary, distro, tiers):
     rules = json.loads(read(policy), object_pairs_hook=unique_object)
-    digest = hashlib.sha256(read(inventory)).hexdigest()
+    inventory_bytes = read(inventory)
+    digest = hashlib.sha256(inventory_bytes).hexdigest()
     selection = rules["inventories"][digest]
     profile = rules["profiles"][tiers]
     expected = {"qemu-" + distro + "-" + row["id"]: row
                 for row in selection["cases"] if set(row["tiers"]) & set(profile)}
+    expected_exits = {}
+    for row in csv.DictReader(io.StringIO(inventory_bytes.decode("utf-8")), delimiter="\t"):
+        case = "qemu-" + distro + "-" + row["case"]
+        if case in expected_exits:
+            raise ValueError("duplicate inventory case")
+        value = row["expected_exit"]
+        if value == "-":
+            expected_exits[case] = None
+            continue
+        if ":" in value:
+            by_distro = {}
+            for pair in value.split(","):
+                name, code = pair.split(":")
+                if name in by_distro or name not in ("arch", "debian", "ubuntu", "fedora"):
+                    raise ValueError("invalid inventory expected exit")
+                by_distro[name] = code
+            value = by_distro[distro]
+        if not value.isascii() or not value.isdecimal() or not 0 <= int(value) <= 255:
+            raise ValueError("invalid inventory expected exit")
+        expected_exits[case] = int(value)
     rows = json.loads(read(results), object_pairs_hook=unique_object)
     completion = json.loads(read(summary), object_pairs_hook=unique_object)
     if not isinstance(rows, list) or not rows or len(rows) != len(expected):
@@ -64,6 +87,8 @@ def admit(policy, inventory, results, summary, distro, tiers):
         elif verdict in ("PASS", "FAIL"):
             if code < 0:
                 raise ValueError("executed case lacks an exit code")
+            if verdict == "PASS" and code != expected_exits[case]:
+                raise ValueError("PASS case contradicts inventory expected exit")
             scope = expected[case]["network_scope"]
             if scope not in ("offline", "network") or row.get("network_scope") != scope:
                 raise ValueError("case did not run in its required network scope")

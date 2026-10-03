@@ -561,6 +561,9 @@ fn select_daemon_startup(stdout: &mut io::Stdout) -> Result<DaemonStartup> {
 }
 
 fn select_build_config(stdout: &mut io::Stdout) -> Result<Option<BuildRecommendation>> {
+    if !supports_aur_build_config(crate::core::env::distro::detect_distro()) {
+        return Ok(None);
+    }
     let sysinfo = SystemInfo::detect()?;
     let recommendation = sysinfo.recommend();
 
@@ -627,6 +630,10 @@ fn select_build_config(stdout: &mut io::Stdout) -> Result<Option<BuildRecommenda
     let applies = select_binary_menu(stdout, "Apply recommended settings", "Skip (use defaults)")?;
 
     Ok(select_build_recommendation(recommendation, applies))
+}
+
+fn supports_aur_build_config(distro: crate::core::env::distro::Distro) -> bool {
+    distro == crate::core::env::distro::Distro::Arch
 }
 
 fn select_build_recommendation(
@@ -1002,6 +1009,20 @@ fn print_completion(stdout: &mut io::Stdout, state: &WizardState) -> Result<()> 
 #[expect(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_init_skips_linux_aur_hardware_detection() {
+        assert!(!supports_aur_build_config(
+            crate::core::env::distro::Distro::MacOS
+        ));
+    }
+
+    #[test]
+    fn arch_init_keeps_aur_build_configuration() {
+        assert!(supports_aur_build_config(
+            crate::core::env::distro::Distro::Arch
+        ));
+    }
 
     #[test]
     fn raw_mode_menu_recognizes_interrupt_keys() {

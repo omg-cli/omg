@@ -28,6 +28,7 @@ pub trait PackageManager: Send + Sync {
                 .map(|package| super::types::SecurityPackage {
                     name: package.name,
                     version: package.version.to_string(),
+                    advisory_source: None,
                     architecture: None,
                     description: package.description,
                     licenses: Vec::new(),
@@ -94,6 +95,20 @@ pub trait PackageManager: Send + Sync {
 
     /// Remove packages
     fn remove(&self, packages: &[String]) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Resolve the complete native removal set without committing a transaction.
+    /// Unsupported backends refuse instead of guessing from requested operands.
+    fn removal_plan<'a>(
+        &'a self,
+        _packages: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::RemovalPackage>>> + Send + 'a>> {
+        Box::pin(async move {
+            anyhow::bail!(
+                "{} cannot simulate a complete native removal transaction",
+                self.name()
+            )
+        })
+    }
 
     /// Update all packages (upgrade system)
     fn update(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;

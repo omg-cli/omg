@@ -117,10 +117,26 @@ def verify(guest, serial, controller):
     return 0
 
 
+def verify_preparations(root):
+    boots = set()
+    for operation in ("remove", "install"):
+        prefix = root / "transactions" / f"prepare-{operation}"
+        boot_id = bounded_file(Path(str(prefix) + "-boot-id.txt")).strip()
+        if not BOOT_ID.fullmatch(boot_id) or boot_id in boots:
+            raise ValueError("invalid or repeated preparation boot identity")
+        boots.add(boot_id)
+        serial = (root / "guest" / "serial.log" if operation == "remove"
+                  else Path(str(prefix) + "-serial.log"))
+        verify_guest(Path(str(prefix) + "-health.json"), serial, boot_id)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("collect")
+    preparations = commands.add_parser("verify-preparations")
+    preparations.add_argument("--root", type=Path, required=True)
     trial = commands.add_parser("verify-trial")
     trial.add_argument("--guest", type=Path, required=True)
     trial.add_argument("--serial", type=Path, required=True)
@@ -135,6 +151,8 @@ def main():
             return 0
         if args.command == "verify-trial":
             return verify_guest(args.guest, args.serial, args.boot_id)
+        if args.command == "verify-preparations":
+            return verify_preparations(args.root)
         return verify(args.guest, args.serial, args.controller)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"QEMU health evidence failed admission: {error}", file=sys.stderr)

@@ -1,6 +1,6 @@
 17 = src/cli/chrome.rs
-3 = src/cli/progress.rs
 2 = src/cli/commands.rs
+2 = src/cli/progress.rs
 1 = src/bin/omg.rs
 1 = src/cli/mod.rs
 1 = src/cli/modern_ui.rs

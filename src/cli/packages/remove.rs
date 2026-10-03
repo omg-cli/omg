@@ -8,10 +8,7 @@ use super::dispatch_backend;
 mod arch;
 #[cfg(any(feature = "debian", feature = "debian-pure"))]
 mod debian;
-#[cfg(all(
-    not(feature = "arch"),
-    not(any(feature = "debian", feature = "debian-pure"))
-))]
+#[cfg(any(not(feature = "arch"), feature = "debian", feature = "debian-pure"))]
 mod generic;
 
 /// Remove packages.
@@ -35,15 +32,26 @@ pub async fn remove(packages: &[String], recursive: bool, yes: bool, dry_run: bo
     validate_removal_mode(recursive)?;
 
     if dry_run {
-        return remove_dry_run(packages, recursive);
+        return remove_dry_run(packages, recursive).await;
     }
 
-    if !super::common::confirm_package_mutation("removal", packages.len(), yes).await? {
+    let removal_count = removal_confirmation_count(packages).await?;
+    if !super::common::confirm_package_mutation("removal", removal_count, yes).await? {
         crate::cli::modern_ui::print_warning("Removal cancelled");
         return Ok(());
     }
 
     remove_packages(packages, recursive).await
+}
+
+#[cfg_attr(feature = "arch", allow(clippy::unused_async))]
+#[cfg_attr(feature = "arch", allow(clippy::unnecessary_wraps))]
+async fn removal_confirmation_count(packages: &[String]) -> Result<usize> {
+    dispatch_backend! {
+        debian: { generic::confirmation_count(packages).await },
+        arch: { Ok(packages.len()) },
+        generic: { generic::confirmation_count(packages).await },
+    }
 }
 
 // The Arch-only build cannot fail this check, while Debian/generic builds
@@ -92,17 +100,24 @@ async fn remove_packages(packages: &[String], recursive: bool) -> Result<()> {
     reason = "backend feature dispatch may select fallible implementations"
 )]
 #[cfg_attr(
+    feature = "arch",
+    allow(
+        clippy::unused_async,
+        reason = "the Arch backend previews synchronously"
+    )
+)]
+#[cfg_attr(
     not(feature = "arch"),
     allow(
         unused_variables,
         reason = "only the Arch dry run states recursion truthfully; other backends never recurse"
     )
 )]
-fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> {
+async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> {
     dispatch_backend! {
-        debian: { debian::remove_dry_run(packages); Ok(()) },
+        debian: { debian::remove_dry_run(packages).await },
         arch: { arch::remove_dry_run(packages, recursive) },
-        generic: { generic::remove_dry_run(packages) },
+        generic: { generic::remove_dry_run(packages).await },
     }
 }
 

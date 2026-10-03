@@ -43,7 +43,9 @@ use crate::config::{AurBuildMethod, Settings};
 use crate::core::http::shared_client;
 use crate::core::{Package, PackageSource, paths};
 use crate::package_managers::{get_potential_aur_packages, pacman_db};
-use crate::runtimes::common::{BudgetedReader, BudgetedWriter, MAX_DECOMPRESSED_BYTES};
+use crate::runtimes::common::{
+    BudgetedReader, BudgetedWriter, MAX_DECOMPRESSED_BYTES, decode_xz_to,
+};
 
 use crate::core::security::artifact::ArchiveSnapshot;
 const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc";
@@ -2686,7 +2688,7 @@ impl AurClient {
     }
 
     fn archive_architecture_approved(srcinfo: &str, architecture: &str) -> bool {
-        (architecture == "any" || architecture == std::env::consts::ARCH)
+        super::utils::package_architecture_matches(std::env::consts::ARCH, architecture)
             && srcinfo
                 .lines()
                 .filter_map(|line| line.split_once('='))
@@ -3216,7 +3218,7 @@ impl AurClient {
             let temporary = tempfile::NamedTempFile::new()
                 .context("Failed to create temporary AUR package metadata spool")?;
             let mut output = BudgetedWriter::new(temporary, budget);
-            lzma_rs::xz_decompress(&mut BufReader::new(file), &mut output)
+            decode_xz_to(BufReader::new(file), &mut output)
                 .map_err(|error| anyhow::anyhow!("xz: {error}"))?;
             let mut output = output.into_inner().into_file();
             output.rewind()?;
@@ -6475,7 +6477,8 @@ mod tests {
             b"pkgname=fixture\npkgver=1.0\npkgrel=1\n",
         )?;
         let archive = root.join("fixture.pkg.tar.gz");
-        let host = std::env::consts::ARCH;
+        let host_architecture = super::super::utils::current_arch().unwrap().to_string();
+        let host = host_architecture.as_str();
         for (declared, actual, expected) in [
             ("any", None, false),
             ("any", Some("any"), true),

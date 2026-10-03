@@ -1,14 +1,35 @@
 //! Shared package manager types
 
+/// One installed package selected by a native removal solver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalPackage {
+    pub name: String,
+    pub version: String,
+}
+
 /// Installed identity for security exports. Native versions are opaque strings;
 /// absent metadata remains absent rather than being inferred from the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityPackage {
     pub name: String,
     pub version: String,
+    /// Debian/Ubuntu source identity used by OSV, when distinct from the
+    /// installed binary identity retained above for exports and attribution.
+    pub advisory_source: Option<(String, String)>,
     pub architecture: Option<String>,
     pub description: String,
     pub licenses: Vec<String>,
+}
+
+impl SecurityPackage {
+    #[must_use]
+    pub fn advisory_identity(&self) -> (&str, &str) {
+        self.advisory_source
+            .as_ref()
+            .map_or((&self.name, &self.version), |(name, version)| {
+                (name.as_str(), version.as_str())
+            })
+    }
 }
 
 /// Canonical orphan rule for pacman-based systems (`pacman -Qdt` semantics).

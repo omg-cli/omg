@@ -345,6 +345,28 @@ impl PackageIndex {
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     fn new_apt() -> Result<Self> {
+        #[cfg(feature = "debian")]
+        if !crate::core::paths::test_mode() {
+            let packages = crate::package_managers::apt::candidate_index_packages()?;
+            let mut index = Self::with_capacity(packages.len());
+            for pkg in packages {
+                index.push(
+                    &pkg.name,
+                    &pkg.version.to_string(),
+                    &pkg.description,
+                    "",
+                    pkg.install_size
+                        .and_then(|size| u64::try_from(size).ok())
+                        .unwrap_or(0),
+                    pkg.download_size.unwrap_or(0),
+                    "apt",
+                    &pkg.depends,
+                    &pkg.licenses,
+                );
+            }
+            return Ok(index);
+        }
+
         use crate::package_managers::debian_db;
         debian_db::ensure_index_loaded()?;
 

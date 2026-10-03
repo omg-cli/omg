@@ -134,8 +134,8 @@ execute a release binary on the host. Follow the commands in
 Full QEMU guests (needs KVM + Docker):
 
 ```bash
-./scripts/benchmark-qemu.sh --distro all --release vX.Y.Z --staged-dir <dir> --inventory-tiers hermetic,container --inventory-allow-mutations
-./scripts/benchmark-qemu.sh --arch aarch64 --distro debian --release vX.Y.Z --staged-dir <arm-dir> --inventory-tiers hermetic,container --inventory-allow-mutations  # ARM host only
+./scripts/benchmark-qemu.sh --distro all --release vX.Y.Z --staged-dir <dir> --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,container --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress --benchmark --benchmark-transactions 1 --storage-faults
+./scripts/benchmark-qemu.sh --arch aarch64 --distro debian --release vX.Y.Z --staged-dir <arm-dir> --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,container --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress --benchmark --benchmark-transactions 1 --storage-faults  # ARM host only
 ```
 
 Nightly-equivalent (published release + all safe tiers, x86_64 KVM host):
@@ -143,9 +143,18 @@ Nightly-equivalent (published release + all safe tiers, x86_64 KVM host):
 ```bash
 for distro in arch debian ubuntu fedora; do
   python3 scripts/prepare-qemu-release.py --tag vX.Y.Z --distro "$distro" --destination "published-$distro"
-  ./scripts/benchmark-qemu.sh --distro "$distro" --release vX.Y.Z --release-dir "published-$distro" --inventory-file "published-$distro/cases.tsv" --inventory-tiers hermetic,qemu,container,network,pty --inventory-allow-mutations
+  ./scripts/benchmark-qemu.sh --distro "$distro" --release vX.Y.Z --release-dir "published-$distro" --inventory-file "published-$distro/cases.tsv" --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,qemu,container,network,pty --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress
 done
 ```
+
+Use the isolation options when judging parity with hosted CI. Without
+`--inventory-isolate-hermetic`, an Arch `audit` row can fetch live advisories
+and fail its intentionally offline-source oracle even though the product is
+working; the hosted matrix runs that row in a separate network namespace.
+Hosted CI also runs `scripts/check-qemu-runner-isolation.py` before booting a
+guest. A WSL session with the Windows drive visible at `/mnt/c` fails that
+host-isolation check, so local guest results from such a session do not certify
+the hosted runner's filesystem containment.
 
 Published runs use the inventory from the release tag's resolved commit, with its
 revision and SHA-256 recorded in provenance. Staged builds use the current source
@@ -159,8 +168,9 @@ under guest evidence. See [Linux audit storage and migration](security.md#audit-
 
 ## What inventory results prove
 
-The current inventory has 196 rows: 176 hermetic-tier contracts, nine
-container-tier contracts, and 11 rows in other or combined tiers. The `hermetic`
+The current inventory has 211 rows: 169 hermetic-tier contracts, 34
+container-tier contracts, and 8 rows in other or combined tiers. Eight rows
+are declared scenarios without executable guest proof. The `hermetic`
 tier names the fixture-based Rust test contracts. Running these rows in a
 real guest is not hermetic: runtime downloads and other network operations
 still need network access. Guest images are pinned, but package index refreshes
@@ -168,6 +178,23 @@ use live repositories. Saved repository hashes and package versions identify the
 observed run, not a promise of identical future repository contents.
 Do not report all commands tested when declared,
 credentialed, or otherwise gated rows were skipped.
+
+The inventory is a scenario list, not a behavioral-coverage percentage. A
+successful exit, a help response, or syntactically valid JSON does not establish
+the result of a package transaction. For package and status rows, compare OMG
+with the guest's [pacman](https://man.archlinux.org/man/pacman.8.en),
+[dpkg-query](https://manpages.debian.org/bookworm/dpkg/dpkg-query.1.en.html),
+[APT candidate selection](https://manpages.debian.org/bookworm/apt/apt-cache.8.en.html),
+or [DNF5 repoquery](https://dnf5.readthedocs.io/en/latest/commands/repoquery.8.html),
+and inspect the resulting native database after mutations. The `info pacman`
+row compares version and source with each guest's native catalog. The `doctor` row
+also binds its backend identity to the guest's `/etc/os-release`;
+[the os-release specification](https://www.freedesktop.org/software/systemd/man/latest/os-release.html)
+allows that file to be a relative symlink. Current QEMU guests exercise Arch,
+Debian 12, Ubuntu 24.04 and Fedora 44. The documented Debian 13 and Ubuntu
+26.04 APT 7 targets, many runtime managers beyond Node/Python/Go, positive
+advisory fetch/scoring, and declared network/interactive rows still require
+guest evidence. They receive no credit from a passing four-distro matrix.
 
 The runner validates the inventory before executing commands. It replays
 per-row prerequisite chains in fresh working directories, expands `${ROOT}`
@@ -190,11 +217,23 @@ cannot satisfy its version-2 oracle.
 Gated or failed prerequisites block their dependents. Missing receipts,
 transport failures, and empty execution selections fail the harness.
 
+The five license rows use distro-specific checks. On Arch, the oracle reads
+the documented [ALPM local database fields](https://man.archlinux.org/man/alpm-db-desc.5.en)
+and cross-checks installed names and versions with `pacman -Q`. It compares
+audit JSON/CSV package identities and licenses, known license categories,
+enterprise assignment counts, and export permissions. The MIT-filtered row
+uses an allowlist that admits no installed license: it must still report policy
+violations for the entire installed inventory, including packages hidden by
+the filter. Complex license expressions do not yet have complete independent
+category checks. On Debian, Ubuntu, and Fedora, these commands must give the
+specific unsupported-backend error and leave no license report or export.
+Those passes prove refusal behavior, not license-scanning support.
+
 A guest-side supervisor records completed CLI exits separately from executor
 exits. A CLI returning 125 is not a timeout-tool failure. Guest-side deadlines
 terminate commands independently of SSH. Each row
 retains stdout, stderr, prerequisite output, and a completion receipt under
-`inventory/rows/`. `inventory/input-sha256.txt` identifies the runner and TSV.
+`inventory/rows/`. `inventory/input-sha256.txt` identifies the runner, TSV, and license oracle.
 `inventory/metadata.json` records the binary path, tiers, deadlines, and opt-ins. Existing inventory evidence cannot be overwritten.
 Working directories and installed runtime state disappear with the guest;
 only cwd-local fixtures are isolated per row, not the guest's home directory
@@ -311,6 +350,74 @@ of that pushed commit closes it. A local pass does not.
 
 Bring that output back: it is the input to the code/command audit —
 no pending-row flips, no expectation edits, just errors.
+
+## Why the timing limits, runners and defect rules are set this way
+
+Every limit in this pipeline comes from a documented property of the software it
+runs. This section lists the sources. Change a number only with a new source or
+a new evidence run.
+
+### The pipeline needs KVM, not an emulator
+
+KVM is a virtualization system for Linux on Intel VT or AMD-V hardware
+([KVM project](https://www.linux-kvm.org/page/Main_Page)). QEMU only uses it when
+it is told to: `-machine accel=` selects an accelerator, and QEMU states that
+"By default, `tcg` is used", which is a software emulator
+([QEMU invocation manual](https://www.qemu.org/docs/master/system/invocation.html)).
+A guest without the accelerator is far slower, so each lane records `accel=kvm`
+in `metadata.txt` and a fallback is visible instead of silently slow.
+
+Nested virtualization is not supported on GitHub-hosted runners. GitHub
+documents that Linux runners are Azure virtual machines and that nested VMs are
+"not officially supported ... no guarantees regarding stability, performance, or
+compatibility"
+([GitHub-hosted runners reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)).
+QEMU lanes therefore run on self-hosted runners that own `/dev/kvm`, and a
+health job checks the device before any guest starts.
+
+### Guest timeouts are sized for slow disks, not for network waits
+
+The Python case installs pip with `ensurepip`. CPython documents that this module
+"does not access the internet" and that "all of the components needed to
+bootstrap pip are included as internal parts of the package"
+([ensurepip](https://docs.python.org/3/library/ensurepip.html)). Its runtime is
+local CPU and disk work only, which on a cold, busy, emulated disk can take much
+longer than on a laptop. The step's allowance and the run that set it are
+recorded next to the probe in `scripts/qemu-inventory.sh`. The oracle still fails
+the row when any attempt fails, so a crash cannot become a green retry.
+
+The user-visible command timeout for the runtime install rows is three times the
+row timeout, because those rows download official archives inside a fresh guest.
+
+### A declared defect is never rewritten
+
+A row whose per-distro target is `known-defect` is still executed. A failure is
+recorded as `FAIL` and fails the lane; a pass is recorded as `PASS`. The inventory
+runner and its tests pin that rule, because an expectation must never rewrite an
+observation.
+
+The Fedora `remove` failures have a documented cause. libdnf5 inserts a
+transaction as `STARTED` when it begins, and only replaces that state from
+`finish(OK|ERROR)`
+([transaction.hpp](https://github.com/rpm-software-management/dnf5/blob/main/include/libdnf5/transaction/transaction.hpp):
+`TransactionState { STARTED = 1, OK = 2, ERROR = 3 }`). dnf5 also notes that
+`history redo` "is useful to finish interrupted transactions"
+([dnf5 history](https://dnf5.readthedocs.io/en/stable/commands/history.8.html)).
+A row that is still `STARTED` therefore means the run was interrupted, not
+refused. OMG reports the recorded transaction id, status, action count and
+command line so that state is readable from the lane log, and the remaining
+Fedora defect is tracked in
+[issue #626](https://github.com/omg-cli/omg/issues/626).
+
+### Failures report how a process ended
+
+Rust documents that `ExitStatus::code` "will return `None` if the process was
+terminated by a signal", and that `ExitStatusExt::signal` reports that signal
+([ExitStatus](https://doc.rust-lang.org/std/process/struct.ExitStatus.html)).
+`Stdio::inherit` means a child's output is not captured by OMG
+([Stdio](https://doc.rust-lang.org/std/process/struct.Stdio.html)). A killed
+`dnf`, `apt` or `pacman` is therefore reported as signal termination instead of a
+made-up exit code, and dnf failures carry the recorded history row as well.
 
 ## Where to go next
 

@@ -855,6 +855,7 @@ fi
 zmodload zsh/datetime
 
 _omg_hook() {
+  setopt localoptions localtraps
   trap -- '' SIGINT
   if [[ -z "${_OMG_PATH_BASE+x}" ]]; then _OMG_PATH_BASE=$PATH; fi
   eval "${_OMG_ENV_RESTORE:-}"
@@ -967,13 +968,19 @@ fi
 
 _omg_hook() {
   local previous_exit_status=$?
+  local previous_int_trap
+  previous_int_trap=$(trap -p SIGINT)
   trap -- '' SIGINT
   if [[ -z "${_OMG_PATH_BASE+x}" ]]; then _OMG_PATH_BASE=$PATH; fi
   eval "${_OMG_ENV_RESTORE:-}"
   unset _OMG_ENV_RESTORE
   export PATH="$_OMG_PATH_BASE"
   eval "$(\command omg hook-env -s bash)"
-  trap - SIGINT
+  if [[ -n "$previous_int_trap" ]]; then
+    eval "$previous_int_trap"
+  else
+    trap - SIGINT
+  fi
   return $previous_exit_status
 }
 

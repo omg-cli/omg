@@ -4,6 +4,9 @@
 //! modification of retained entries. The local chain alone cannot prove that
 //! an attacker with filesystem access did not truncate, delete, or rewrite and
 //! rehash the entire history. It is not authenticity or completeness evidence.
+//! Unprefixed historical hashes remain readable using their original ambiguous
+//! field encoding. New `v2:` hashes bind field boundaries; retaining legacy
+//! history does not retroactively strengthen its evidence.
 
 #[cfg(unix)]
 use nix::libc;
@@ -201,9 +204,35 @@ pub struct AuditEntry {
 }
 
 impl AuditEntry {
-    /// Compute the hash of this entry (excluding the hash field itself)
+    /// Compute a versioned hash of this entry (excluding the hash field itself).
+    ///
+    /// Length prefixes and an optional-metadata tag bind every field boundary.
     #[must_use]
     pub fn compute_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"omg-audit-entry\0v2\0");
+        for field in [
+            self.id.as_str(),
+            self.timestamp.as_str(),
+            &self.event_type.to_string(),
+            &self.severity.to_string(),
+            self.user.as_str(),
+            self.resource.as_str(),
+            self.description.as_str(),
+        ] {
+            hash_framed_field(&mut hasher, field);
+        }
+        if let Some(metadata) = &self.metadata {
+            hasher.update([1]);
+            hash_framed_field(&mut hasher, &metadata.to_string());
+        } else {
+            hasher.update([0]);
+        }
+        hash_framed_field(&mut hasher, &self.prev_hash);
+        format!("v2:{}", hex::encode(hasher.finalize()))
+    }
+
+    fn compute_legacy_hash(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.id.as_bytes());
         hasher.update(self.timestamp.as_bytes());
@@ -223,11 +252,20 @@ impl AuditEntry {
     #[must_use]
     pub fn verify(&self) -> bool {
         if let Some(hash) = &self.hash {
-            &self.compute_hash() == hash
+            if hash.starts_with("v2:") {
+                &self.compute_hash() == hash
+            } else {
+                hash.len() == 64 && &self.compute_legacy_hash() == hash
+            }
         } else {
             false
         }
     }
+}
+
+fn hash_framed_field(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
 }
 
 /// Enterprise-grade audit logger with tamper detection
@@ -503,6 +541,7 @@ impl AuditLogger {
 
         let mut total_entries = 0;
         let mut valid_entries = 0;
+        let mut legacy_entries = 0;
         let mut chain_valid = true;
         let mut expected_prev_hash = "genesis".to_string();
         let mut first_invalid: Option<String> = None;
@@ -517,6 +556,13 @@ impl AuditLogger {
             if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
                 if entry.verify() {
                     valid_entries += 1;
+                    if entry
+                        .hash
+                        .as_ref()
+                        .is_some_and(|hash| !hash.starts_with("v2:"))
+                    {
+                        legacy_entries += 1;
+                    }
                 } else if first_invalid.is_none() {
                     first_invalid = Some(entry.id.clone());
                 }
@@ -539,6 +585,12 @@ impl AuditLogger {
             }
         }
 
+        if legacy_entries > 0 {
+            tracing::warn!(
+                legacy_entries,
+                "Audit log contains records using the ambiguous legacy hash encoding"
+            );
+        }
         Ok(AuditIntegrityReport {
             total_entries,
             valid_entries,
@@ -1496,6 +1548,97 @@ mod tests {
     }
 
     #[test]
+    fn appending_versioned_entries_preserves_a_legacy_chain() -> anyhow::Result<()> {
+        const LEGACY_ENTRY: &str = r#"{"id":"test-id","timestamp":"2026-01-16T00:00:00Z","event_type":"package_install","severity":"info","user":"test","resource":"firefox","description":"Installed firefox","prev_hash":"genesis","hash":"54aefc927964a09158ffecf2756e858a43ab0bceaa2a671af4718169f9cfe583"}"#;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        std::fs::write(&path, format!("{LEGACY_ENTRY}\n"))?;
+        let original = std::fs::read(&path)?;
+        let mut logger = AuditLogger::new_in(&path)?;
+        logger.log(
+            AuditEventType::PackageInstall,
+            AuditSeverity::Info,
+            "openssl",
+            "new entry",
+        )?;
+        assert!(std::fs::read(&path)?.starts_with(&original));
+        let report = logger.verify_integrity()?;
+        assert!(report.is_valid(), "legacy records must remain verifiable");
+        assert_eq!(report.total_entries, 2);
+        let entries = read_all_entries(&path)?;
+        assert_eq!(entries[1].prev_hash, entries[0].hash.as_deref().unwrap());
+        assert!(entries[1].hash.as_deref().unwrap().starts_with("v2:"));
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_audit_hashes_reject_unknown_or_removed_version_prefixes() {
+        let mut entry = AuditEntry {
+            id: "prefix-test".into(),
+            timestamp: "2026-01-16T00:00:00Z".into(),
+            event_type: AuditEventType::PackageInstall,
+            severity: AuditSeverity::Info,
+            user: "bob".into(),
+            resource: "openssl".into(),
+            description: "update".into(),
+            metadata: None,
+            prev_hash: "genesis".into(),
+            hash: None,
+        };
+        let hash = entry.compute_hash();
+        entry.hash = Some(hash.replacen("v2:", "v3:", 1));
+        assert!(
+            !entry.verify(),
+            "unknown encodings must not fall back to legacy"
+        );
+        entry.hash = Some(hash.trim_start_matches("v2:").to_string());
+        assert!(
+            !entry.verify(),
+            "removing version must not reinterpret a new digest"
+        );
+    }
+
+    #[test]
+    fn retained_hash_detects_resource_description_boundary_changes() {
+        let mut entry = AuditEntry {
+            id: "boundary-test".into(),
+            timestamp: "2026-01-16T00:00:00Z".into(),
+            event_type: AuditEventType::PackageInstall,
+            severity: AuditSeverity::Info,
+            user: "bob".into(),
+            resource: "openssl".into(),
+            description: " update".into(),
+            metadata: None,
+            prev_hash: "genesis".into(),
+            hash: None,
+        };
+        entry.hash = Some(entry.compute_hash());
+        entry.resource.push(' ');
+        entry.description.remove(0);
+        assert!(!entry.verify(), "retained hash must bind field boundaries");
+    }
+
+    #[test]
+    fn retained_hash_detects_user_resource_boundary_changes() {
+        let mut entry = AuditEntry {
+            id: "boundary-test".into(),
+            timestamp: "2026-01-16T00:00:00Z".into(),
+            event_type: AuditEventType::PackageInstall,
+            severity: AuditSeverity::Info,
+            user: "bob".into(),
+            resource: "openssl".into(),
+            description: "update".into(),
+            metadata: None,
+            prev_hash: "genesis".into(),
+            hash: None,
+        };
+        entry.hash = Some(entry.compute_hash());
+        entry.user.pop();
+        entry.resource.insert(0, 'b');
+        assert!(!entry.verify(), "retained hash must bind caller identity");
+    }
+
+    #[test]
     fn test_audit_entry_hash() {
         let entry = AuditEntry {
             id: "test-id".to_string(),
@@ -1512,7 +1655,7 @@ mod tests {
 
         let hash = entry.compute_hash();
         assert!(!hash.is_empty());
-        assert_eq!(hash.len(), 64); // SHA-256 hex
+        assert_eq!(hash.strip_prefix("v2:").unwrap().len(), 64); // SHA-256 hex
     }
 
     #[test]

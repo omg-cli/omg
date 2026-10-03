@@ -1,4 +1,5 @@
 """Run workflow selection and failure gates locally with Bash and jq (no guests)."""
+import hashlib
 import itertools
 import json
 import os
@@ -31,6 +32,127 @@ def step(name):
 
 
 class QemuWorkflowTests(unittest.TestCase):
+    def copy_inventory_to_controller(self, root):
+        repository = WORKFLOW.parents[2]
+        source = (repository / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        anchor = source.index('  # The inventory executor runs inside the controller')
+        begin = source.rfind('if [[ -n "$inventory_tiers" ]]; then\n', 0, anchor)
+        end = source.index('\nif [[ "$benchmark" == true ]]; then\n', anchor)
+        self.assertGreaterEqual(begin, 0)
+        controller = root / 'controller'
+        controller.mkdir()
+        result = subprocess.run(
+            [self.bash, '--noprofile', '--norc', '-euo', 'pipefail', '-c', source[begin:end]],
+            env=dict(os.environ, here=str(repository / 'scripts'), work=str(controller),
+                     tsv=str(repository / 'tests/cli_behavior_inventory.tsv'),
+                     inventory_policy=str(repository / 'tests/qemu-inventory-policy.json'),
+                     inventory_tiers='hermetic', inventory_isolation='true'),
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return controller
+
+    @unittest.skipIf(os.name == 'nt', 'Controller packaging needs POSIX shell paths')
+    def test_controller_ships_exact_executed_inventory_helpers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self.copy_inventory_to_controller(Path(directory))
+            for name in ('qemu-inventory.sh', 'qemu-local-oracle.py', 'qemu-license-oracle.py',
+                         'qemu-fingerprint-oracle.py', 'qemu-fedora-update-fixture.sh',
+                         'workspace-overlap-fixture.sh'):
+                with self.subTest(helper=name):
+                    copied = controller / name
+                    self.assertTrue(copied.is_file() and not copied.is_symlink(),
+                                    f'Controller is missing executed helper {name}')
+                    self.assertEqual(copied.read_bytes(),
+                                     (WORKFLOW.parents[2] / 'scripts' / name).read_bytes())
+
+    def run_relocated_inventory(self, root, controller):
+        home, tools, guest = (root / name for name in ('home', 'bin', 'guest'))
+        for path in (home, tools, guest):
+            path.mkdir()
+        product = root / 'product'
+        product.write_text('#!/bin/sh\nprintf "Usage: relocated fixture\\n"\n', encoding='utf-8')
+        product.chmod(0o755)
+        ssh = tools / 'ssh'
+        ssh.write_text('#!/usr/bin/env bash\nexec bash -c "${@: -1}"\n', encoding='utf-8')
+        ssh.chmod(0o755)
+        cases = controller / 'cases.tsv'
+        cases.write_text(
+            'case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup\n'
+            'help\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop\n',
+            encoding='utf-8')
+        result = subprocess.run(
+            [self.bash, str(controller / 'qemu-inventory.sh'), '--work', str(root),
+             '--binary', str(product), '--tsv', str(cases), '--distro', 'arch',
+             '--tiers', 'hermetic', '--tag', 'fixture'],
+            cwd=controller, env=dict(os.environ, HOME=str(home),
+                                    PATH=str(tools) + os.pathsep + os.environ['PATH']),
+            capture_output=True, text=True, timeout=30)
+        return result, root / 'inventory'
+
+    @unittest.skipIf(os.name == 'nt', 'Relocated controller needs POSIX shell descriptors')
+    def test_relocated_controller_executes_rows_and_receipts_local_oracle_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self.copy_inventory_to_controller(root)
+            result, evidence = self.run_relocated_inventory(root, controller)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = json.loads((evidence / 'results.json').read_text())
+            self.assertEqual([row['result'] for row in rows], ['PASS'])
+            receipts = {
+                Path(filename).name: digest
+                for digest, filename in (
+                    line.split('  ', 1)
+                    for line in (evidence / 'input-sha256.txt').read_text().splitlines())}
+            self.assertEqual(receipts.get('qemu-local-oracle.py'),
+                             hashlib.sha256((controller / 'qemu-local-oracle.py').read_bytes()).hexdigest(),
+                             'Executed local oracle bytes are absent from controller input receipts')
+
+    @unittest.skipIf(os.name == 'nt', 'Relocated controller needs POSIX shell descriptors')
+    def test_relocated_controller_missing_local_oracle_cannot_record_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self.copy_inventory_to_controller(root)
+            (controller / 'qemu-local-oracle.py').unlink(missing_ok=True)
+            result, evidence = self.run_relocated_inventory(root, controller)
+            self.assertNotEqual(result.returncode, 0)
+            results = evidence / 'results.json'
+            self.assertEqual(json.loads(results.read_text()) if results.exists() else [], [])
+
+    def test_merge_group_requires_current_candidate_guests_and_native_reuse(self):
+        ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
+        automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  docs-audit:', 1)[0]
+        expressions = {
+            'producer': re.search(r'^    if: (.+)$', automatic, re.M)[1],
+            'required': re.search(r'^          QEMU_REQUIRED: \$\{\{ (.+) \}\}$', ci, re.M)[1],
+            'staged': re.search(r'^          STAGED: \$\{\{ (.+) \}\}$', PARENT, re.M)[1],
+            'reuse': re.search(r'^      reuse-ci: \$\{\{ (.+) \}\}$', PARENT, re.M)[1],
+        }
+        for name, expression in expressions.items():
+            with self.subTest(boundary=name):
+                expression = expression.replace('github.event_name', "'merge_group'").replace(
+                    'needs.quick-gate.outputs.should-build', "'false'").replace('inputs.staged', 'false')
+                result = subprocess.run([self.bash, '-c', '[[ ' + expression + ' ]]'],
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, values = self.selection(Path(tmp), True, 'all', 'all', event_name='merge_group')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((values['x64'], values['arm64']), ('true', 'false'))
+
+    def test_arm_guests_reject_windows_drives_before_preparation_and_launch(self):
+        arm = PARENT.split('\n  guest-arm:\n', 1)[1].split('\n  #', 1)[0]
+        guard = 'python3 scripts/check-qemu-runner-isolation.py'
+        self.assertEqual(arm.count(guard), 2)
+        self.assertLess(arm.index(guard), arm.index('name: Download staged arm64 binaries'))
+        launch = arm.split('      - name: Run disposable ARM guest lifecycle + read benchmarks + inventory rows\n', 1)[1]
+        script = literal(launch, 'run', 8).replace('${{ matrix.distro }}', 'debian').replace(
+            '${{ needs.prepare.outputs.tag }}', 'v1.2.3')
+        script = script.replace('./scripts/benchmark-qemu.sh', 'printf launched')
+        result = subprocess.run([self.bash, '-e', '-c', 'python3() { return 1; }\n' + script],
+                                text=True, capture_output=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('launched', result.stdout)
+
     def test_all_qa_reporting_harnesses_gate_guest_builds(self):
         reporting = step('Verify harness and reporting fixtures before guest builds')
         for name in ('qa-file-issue', 'qa-audit', 'qa-open-pr'):
@@ -96,6 +218,8 @@ class QemuWorkflowTests(unittest.TestCase):
             self.assertEqual(values['tag'], 'v1.2.3')
 
     def test_guest_uses_resolved_artifact_mode_for_every_event(self):
+        selection = step('Resolve selection')
+        self.assertIn("github.event_name == 'schedule'", selection.split('STAGED:', 1)[1].split('\n', 1)[0])
         download = step('Download staged binaries')
         self.assertIn("if: inputs.staged", download)
         guest = step('Run disposable guest lifecycle + read benchmarks + inventory rows')
@@ -112,7 +236,7 @@ class QemuWorkflowTests(unittest.TestCase):
         script = script.replace('./scripts/benchmark-qemu.sh', 'printf "%s\\n"')
         for event, staged in [('push', True), ('pull_request', True),
                               ('workflow_dispatch', True), ('workflow_dispatch', False),
-                              ('schedule', False)]:
+                              ('schedule', True)]:
             with self.subTest(event=event, staged=staged), tempfile.TemporaryDirectory() as tmp:
                 result, _ = self.run_script(script, {'STAGED': str(staged).lower(),
                     'RUNNER_TEMP': tmp, 'GITHUB_EVENT_NAME': event,
@@ -122,6 +246,31 @@ class QemuWorkflowTests(unittest.TestCase):
                 self.assertEqual('--staged-dir' in args, staged)
                 self.assertEqual('--release-dir' in args, not staged)
                 self.assertEqual('--inventory-file' in args, not staged)
+
+    def test_nightly_builds_restore_native_caches_without_extra_saves(self):
+        ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
+        container_build = LANE.split('\n  build-staged:\n', 1)[1].split('\n  build-staged-ubuntu:\n', 1)[0]
+        ubuntu_build = LANE.split('\n  build-staged-ubuntu:\n', 1)[1].split('\n  guest:\n', 1)[0]
+        for build in (container_build, ubuntu_build):
+            for variable in ('CARGO_NET_RETRY: 10', 'RUSTUP_MAX_RETRIES: 10',
+                             'RUST_BACKTRACE: short', 'CARGO_PROFILE_DEV_LTO: "off"',
+                             'CARGO_PROFILE_TEST_LTO: "off"'):
+                self.assertIn(variable, ci)
+                self.assertIn(variable, build)
+        self.assertIn('20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c', container_build)
+        self.assertNotIn('dtolnay/rust-toolchain@', container_build)
+        native_identity = ci.split('      - name: Compute native cache identity\n', 1)[1].split('      - name: Cache Rust dependencies\n', 1)[0]
+        staged_identity = LANE.split('      - name: Compute native cache identity\n', 1)[1].split('      - name: Restore native compiled dependencies\n', 1)[0]
+        self.assertEqual(staged_identity, native_identity.replace('matrix.platform', 'inputs.distro').replace('matrix.image', 'inputs.image').replace('matrix.features', 'inputs.features'))
+        native_cache = LANE.split('      - name: Restore native compiled dependencies\n', 1)[1].split('      - name: Run library and binary unit tests', 1)[0]
+        ubuntu_cache = LANE.split('      - name: Restore native compiled dependencies\n', 2)[2].split('      - name: Run library and binary unit tests', 1)[0]
+        self.assertIn('prefix-key: v2-platform-dependencies', native_cache)
+        self.assertIn('shared-key: ${{ steps.cache-key.outputs.key }}', native_cache)
+        self.assertIn('prefix-key: v1-ubuntu-debian', ubuntu_cache)
+        self.assertIn('shared-key: ubuntu', ubuntu_cache)
+        for cache in (native_cache, ubuntu_cache):
+            self.assertIn('save-if: false', cache)
+            self.assertNotIn('qemu-staged-v1', cache)
 
     def test_pull_request_never_selects_configurable_arm_runner(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::runtimes::common::{BudgetedReader, BudgetedWriter};
+use crate::runtimes::common::{BudgetedReader, BudgetedWriter, decode_xz_to};
 
 const MAX_DECLARED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_MEMBERS: u64 = 100_000;
@@ -134,7 +134,7 @@ fn archive_reader_with_limit(path: &Path, limit: u64) -> Result<Box<dyn Read>> {
     } else if magic.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
         let temporary = tempfile::tempfile()?;
         let mut output = BudgetedWriter::new(std::io::BufWriter::new(temporary), limit);
-        lzma_rs::xz_decompress(&mut BufReader::new(file), &mut output)
+        decode_xz_to(BufReader::new(file), &mut output)
             .map_err(|error| anyhow::anyhow!("invalid or oversized xz AUR archive: {error}"))?;
         let mut output = output.into_inner().into_inner()?;
         output.rewind()?;
@@ -407,6 +407,27 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aur_archive_reader_accepts_sha256_checked_xz() -> Result<()> {
+        let compressed = include_bytes!("../../../tests/data/xz-subset/single-block-sha256.tar.xz");
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), compressed)?;
+        let reader = archive_reader_with_limit(file.path(), 51200)?;
+        let mut archive = tar::Archive::new(reader);
+        let mut files = 0;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            if entry.header().entry_type().is_file() {
+                let mut content = String::new();
+                entry.read_to_string(&mut content)?;
+                assert!(content.starts_with("omg xz fixture file"));
+                files += 1;
+            }
+        }
+        assert_eq!(files, 3);
+        Ok(())
+    }
 
     #[test]
     fn archive_reader_bounds_expansion_for_each_compression_format() -> Result<()> {

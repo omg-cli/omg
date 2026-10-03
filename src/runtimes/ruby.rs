@@ -12,10 +12,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::common::{
-    GITHUB_USER_AGENT, GithubRelease, activate_version, begin_staged_install,
+    GITHUB_USER_AGENT, GithubRelease, activate_version, begin_download, begin_staged_install,
     complete_staged_install, download_with_progress, extract_tar_gz, normalize_version,
     parse_sha256_digest, print_already_installed, print_installed, print_using,
-    remove_file_best_effort, validate_download_filename, version_cmp,
+    validate_download_filename, version_cmp,
 };
 use crate::{cli::style, core::http::download_client};
 
@@ -130,7 +130,8 @@ impl RubyManager {
             style::informative("→")
         );
         let archive_name = validate_download_filename(&asset.name)?;
-        let download_path = self.versions_dir.join(archive_name);
+        let download = begin_download(&self.versions_dir)?;
+        let download_path = download.path().join(archive_name);
 
         let download_url = asset
             .browser_download_url
@@ -151,8 +152,6 @@ impl RubyManager {
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(&download_path, staging.path(), 1).await?;
         complete_staged_install(&staging, &version_dir, &version)?;
-
-        remove_file_best_effort(&download_path, "runtime archive");
 
         print_installed("Ruby", &version);
         self.use_version(&version)?;

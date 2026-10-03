@@ -112,7 +112,6 @@ fn meter_template(accent: Accent, figures: &str, colored: bool) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn spinner_style(accent: Accent) -> ProgressStyle {
     spinner_base(&spinner_template(accent, style::colors_enabled()))
 }

@@ -147,6 +147,7 @@ mod tests {
         let installed = [SecurityPackage {
             name: "fixture".into(),
             version: "3.0-1".into(),
+            advisory_source: None,
             architecture: Some("x86_64".into()),
             description: String::new(),
             licenses: vec![],
@@ -189,6 +190,7 @@ mod tests {
         let package = |version: &str| SecurityPackage {
             name: "fixture".into(),
             version: version.into(),
+            advisory_source: None,
             architecture: Some("x86_64".into()),
             description: String::new(),
             licenses: vec![],

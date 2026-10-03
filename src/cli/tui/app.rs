@@ -389,53 +389,20 @@ impl App {
                 .collect());
         }
 
-        let permit = DIRECT_SEARCH_GATE
+        let _permit = DIRECT_SEARCH_GATE
             .acquire()
             .await
             .context("direct search gate closed")?;
-        let query = query.to_string();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            Self::search_packages_direct(&query)
-        })
-        .await
-        .context("package search worker failed")?
+        Self::search_packages_direct_async(query).await
     }
 
-    fn search_packages_direct(query: &str) -> Result<Vec<crate::package_managers::SyncPackage>> {
-        #[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
-        let _ = query;
-
-        #[cfg(any(feature = "debian", feature = "debian-pure"))]
-        if crate::core::env::distro::is_debian_like() {
-            return Ok(crate::package_managers::debian_db::search_fast(query)
-                .context("Failed to search official packages")?
-                .into_iter()
-                .map(|package| crate::package_managers::SyncPackage {
-                    name: package.name,
-                    version: package.version,
-                    description: package.description,
-                    repo: "official".to_string(),
-                    download_size: 0,
-                    installed: package.installed,
-                })
-                .collect());
-        }
-
-        #[cfg(feature = "arch")]
-        return crate::package_managers::search_sync(query)
-            .context("Failed to search official packages");
-
-        #[cfg(all(feature = "debian", not(feature = "arch")))]
-        return crate::package_managers::apt_search_sync(query)
-            .context("Failed to search official packages");
-
-        #[cfg(all(
-            feature = "debian-pure",
-            not(feature = "arch"),
-            not(feature = "debian")
-        ))]
-        return Ok(crate::package_managers::apt_search_fast(query)
+    async fn search_packages_direct_async(
+        query: &str,
+    ) -> Result<Vec<crate::package_managers::SyncPackage>> {
+        let backend = crate::package_managers::get_package_manager()?;
+        Ok(backend
+            .search(query)
+            .await
             .context("Failed to search official packages")?
             .into_iter()
             .map(|package| crate::package_managers::SyncPackage {
@@ -446,10 +413,7 @@ impl App {
                 download_size: 0,
                 installed: package.installed,
             })
-            .collect());
-
-        #[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
-        anyhow::bail!("Failed to search official packages: no package manager backend enabled")
+            .collect())
     }
 
     // Long-running actions are associated functions (they never read model
@@ -465,62 +429,14 @@ impl App {
 
     pub async fn clean_cache() -> Result<()> {
         // TUI button press is the confirmation; skip the CLI prompt.
-        crate::cli::packages::clean(true, true, true, false, false, true).await
+        let backend = crate::package_managers::get_package_manager()?;
+        let (orphans, cache, aur) =
+            dashboard_cleanup_selection(backend.name(), cfg!(feature = "debian-pure"));
+        crate::cli::packages::clean(orphans, cache, aur, false, false, true).await
     }
 
-    #[allow(
-        clippy::unused_async,
-        reason = "feature-gated implementations await while fallback builds do not"
-    )]
     pub async fn remove_orphans() -> Result<()> {
-        #[cfg(any(feature = "debian", feature = "debian-pure"))]
-        if crate::core::env::distro::is_debian_like() {
-            #[cfg(feature = "debian-pure")]
-            {
-                let orphan_list = crate::package_managers::debian_db::list_orphans_fast()
-                    .context("Failed to list orphan packages")?;
-                if orphan_list.is_empty() {
-                    return Ok(());
-                }
-                let pm = crate::package_managers::get_package_manager()?;
-                return pm.remove(&orphan_list).await;
-            }
-            #[cfg(all(feature = "debian", not(feature = "debian-pure")))]
-            {
-                return crate::package_managers::apt_remove_orphans()
-                    .await
-                    .map(|_| ());
-            }
-        }
-
-        #[cfg(feature = "arch")]
-        {
-            crate::package_managers::remove_orphans().await
-        }
-        #[cfg(all(feature = "debian", not(feature = "arch")))]
-        {
-            crate::package_managers::apt_remove_orphans()
-                .await
-                .map(|_| ())
-        }
-        #[cfg(all(
-            feature = "debian-pure",
-            not(feature = "arch"),
-            not(feature = "debian")
-        ))]
-        {
-            let orphan_list = crate::package_managers::debian_db::list_orphans_fast()
-                .context("Failed to list orphan packages")?;
-            if orphan_list.is_empty() {
-                return Ok(());
-            }
-            let pm = crate::package_managers::get_package_manager()?;
-            pm.remove(&orphan_list).await
-        }
-        #[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
-        {
-            anyhow::bail!("Cannot remove orphans: no package manager backend enabled");
-        }
+        crate::cli::packages::clean(true, false, false, false, false, true).await
     }
 
     pub async fn run_security_audit() -> Result<usize> {
@@ -739,9 +655,67 @@ impl App {
     }
 }
 
+fn dashboard_cleanup_selection(backend: &str, pure_debian: bool) -> (bool, bool, bool) {
+    match backend {
+        "pacman" => (true, true, true),
+        "apt" => (true, pure_debian, false),
+        "dnf" => (true, true, false),
+        _ => (true, false, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_fedora_cleanup_does_not_request_aur() {
+        assert_eq!(
+            dashboard_cleanup_selection("dnf", false),
+            (true, true, false)
+        );
+    }
+
+    #[test]
+    fn dashboard_apt_cleanup_requests_only_supported_orphans() {
+        assert_eq!(
+            dashboard_cleanup_selection("apt", false),
+            (true, false, false)
+        );
+    }
+
+    #[test]
+    fn fedora_dashboard_search_uses_the_selected_backend() {
+        if std::env::var_os("OMG_TUI_FEDORA_SEARCH_CHILD").is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fixture runtime");
+            let results = runtime
+                .block_on(App::search_packages_direct_async("vim-enhanced"))
+                .expect("Fedora search must have a backend");
+            assert!(results.iter().any(|package| package.name == "vim-enhanced"));
+            return;
+        }
+        let directory = tempfile::tempdir().expect("isolated backend data");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "cli::tui::app::tests::fedora_dashboard_search_uses_the_selected_backend",
+                "--nocapture",
+            ])
+            .env("OMG_TUI_FEDORA_SEARCH_CHILD", "1")
+            .env("OMG_TEST_MODE", "1")
+            .env("OMG_TEST_DISTRO", "fedora")
+            .env("OMG_DATA_DIR", directory.path())
+            .output()
+            .expect("isolated Fedora adapter");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 
     fn test_app() -> App {
         let mut app = App::new_detached().with_tab(Tab::Packages);
