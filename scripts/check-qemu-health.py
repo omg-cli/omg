@@ -56,12 +56,35 @@ def crash_signatures(text):
     return sorted(set(match.group(0) for match in FATAL.finditer(text)))
 
 
+def refuse_pending_crash_processing():
+    properties = {"Id", "ActiveState", "SubState", "Result"}
+    evidence = query(["systemctl", "show", "--all",
+                      "--property=Id,ActiveState,SubState,Result", "systemd-coredump@*.service"])
+    for block in evidence.strip().split("\n\n"):
+        if not block:
+            continue
+        fields = {}
+        for line in block.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or key not in properties or key in fields:
+                raise ValueError("invalid coredump processing evidence")
+            fields[key] = value
+        if (set(fields) != properties
+                or not fields["Id"].startswith("systemd-coredump@")
+                or not fields["Id"].endswith(".service")
+                or not fields["SubState"]):
+            raise ValueError("invalid coredump processing evidence")
+        if fields["ActiveState"] != "inactive" or fields["Result"] != "success":
+            raise ValueError("coredump processor is active or failed")
+
+
 def collect():
     boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     if not BOOT_ID.fullmatch(boot_id):
         raise ValueError("invalid guest boot identity")
     # /proc uses UUID hyphens; journalctl's boot descriptor requires 32 hex digits.
     journal_boot = boot_id.replace("-", "")
+    refuse_pending_crash_processing()
     kernel = query(["journalctl", "--boot=" + journal_boot, "--dmesg", "--quiet", "--no-pager", "--output=cat"])
     if not kernel.strip() or kernel.strip() == "-- No entries --":
         raise ValueError("missing boot kernel evidence")
@@ -80,6 +103,7 @@ def collect():
             if not isinstance(signal, str) or not re.fullmatch(r"[0-9]{1,3}", signal):
                 raise ValueError("invalid crash signal")
             crashes.append({"process": process, "signal": int(signal)})
+    refuse_pending_crash_processing()
     return {"schema_version": 1, "complete": True, "boot_id": boot_id,
             "kernel_bytes": len(kernel.encode()), "fatal_signatures": crash_signatures(kernel),
             "product_crashes": crashes}
