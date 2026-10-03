@@ -485,6 +485,7 @@ write_files:
       ExecStart=-/usr/bin/env ip -brief address
       ExecStart=-/usr/bin/env ip -statistics -statistics link
       ExecStart=-/usr/bin/env ip -4 route
+      ExecStart=-/usr/bin/journalctl --boot --dmesg --lines=80 --no-pager
       ExecStart=-/usr/bin/journalctl --boot --unit=systemd-networkd --unit=NetworkManager --lines=80 --no-pager
       StandardOutput=tty
       StandardError=tty
