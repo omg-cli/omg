@@ -12,8 +12,8 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, Paragraph, Row, Table,
-        TableState, Tabs,
+        Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row,
+        Table, TableState, Tabs,
     },
 };
 use std::borrow::Cow;
@@ -732,7 +732,8 @@ fn draw_recent_activity(f: &mut Frame, area: Rect, app: &App) {
     .block(styled_block(" Recent"))
     .style(Style::default().bg(colors::BG_MEDIUM));
 
-    f.render_widget(activity_list, area);
+    let mut state = ListState::default().with_selected(Some(app.selected_index));
+    f.render_stateful_widget(activity_list, area, &mut state);
 }
 
 fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
