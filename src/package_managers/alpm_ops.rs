@@ -1815,6 +1815,31 @@ mod tests {
     }
 
     #[test]
+    fn transaction_preparation_preserves_unheld_database_lock() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir()?;
+        let lock = directory.path().join("db.lck");
+        std::fs::write(&lock, b"unheld-lock-evidence")?;
+        let inode = std::fs::metadata(&lock)?.ino();
+        let mut alpm = alpm::Alpm::new("/", directory.path().to_str().expect("utf-8 path"))?;
+        let result = super::prepare_alpm_transaction(
+            &mut alpm,
+            vec![],
+            TransactionKind::Install,
+            &crate::core::pacman_conf::PacmanConfig::default(),
+        );
+        let error = match result {
+            Ok(_) => anyhow::bail!("transaction must refuse an existing unheld database lock"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("lock"));
+        assert_eq!(std::fs::read(&lock)?, b"unheld-lock-evidence");
+        assert_eq!(std::fs::metadata(&lock)?.ino(), inode);
+        Ok(())
+    }
+
+    #[test]
     fn reclaim_stale_database_lock_removes_an_unheld_file() {
         let directory = tempfile::tempdir().expect("database root");
         let lock = directory.path().join("db.lck");

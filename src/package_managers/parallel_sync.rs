@@ -1010,6 +1010,29 @@ mod tests {
     }
 
     #[test]
+    fn database_publication_preserves_unheld_database_lock() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut directory = tempfile::tempdir()?;
+        let live = directory.path().join("core.db");
+        let staged = directory.path().join("core.staged");
+        let lock = directory.path().join("db.lck");
+        std::fs::write(&live, b"old")?;
+        std::fs::write(&staged, b"new")?;
+        std::fs::write(&lock, b"unheld-lock-evidence")?;
+        let inode = std::fs::metadata(&lock)?.ino();
+
+        let error = commit_staged_databases(&[(staged.clone(), live.clone())], 0, &mut directory)
+            .expect_err("publication must refuse an existing unheld database lock");
+        assert!(error.to_string().contains("lock"));
+        assert_eq!(std::fs::read(&live)?, b"old");
+        assert_eq!(std::fs::read(&staged)?, b"new");
+        assert_eq!(std::fs::read(&lock)?, b"unheld-lock-evidence");
+        assert_eq!(std::fs::metadata(&lock)?.ino(), inode);
+        Ok(())
+    }
+
+    #[test]
     fn database_publication_reclaims_a_stale_lock_file() {
         let mut directory = tempfile::tempdir().expect("database root");
         let live = directory.path().join("core.db");
