@@ -2,6 +2,7 @@
 from pathlib import Path
 import os
 import signal
+import shlex
 import socket
 import subprocess
 import tempfile
@@ -11,6 +12,21 @@ SCRIPT = Path(__file__).with_name("qemu-boot-diagnostics.sh")
 
 
 class BootDiagnostics(unittest.TestCase):
+    def test_serial_network_observer_emits_native_packet_counters(self):
+        launcher = SCRIPT.with_name("benchmark-qemu.sh").read_text()
+        unit = launcher.split("  - path: /etc/systemd/system/omg-boot-network.service\n", 1)[1]
+        unit = unit.split("  - path:", 1)[0]
+        output = []
+        for line in unit.splitlines():
+            if line.strip().startswith("ExecStart="):
+                command = line.strip().split("=", 1)[1].removeprefix("-")
+                result = subprocess.run(shlex.split(command), capture_output=True,
+                                        text=True, timeout=5, check=False)
+                output.append(result.stdout)
+        observed = "\n".join(output)
+        self.assertRegex(observed, r"(?m)^\s+RX:\s+bytes\s+packets\s+errors\s+dropped")
+        self.assertRegex(observed, r"(?m)^\s+TX:\s+bytes\s+packets\s+errors\s+dropped\s+carrier")
+
     def observe(self, directory):
         result = subprocess.run(["timeout", "--kill-after=2s", "3s", "bash", str(SCRIPT), str(directory)],
                                 capture_output=True, text=True, timeout=6, check=False)
