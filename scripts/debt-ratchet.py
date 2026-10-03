@@ -35,10 +35,116 @@ ALLOWED_SUFFIXES = frozenset({
 })
 ALLOWED_NAMES = frozenset({'Makefile', 'Dockerfile'})
 MAX_FILE_BYTES = 2 * 1024 * 1024
+RAW_LITERAL = re.compile(r'(?:br|cr|r)(#*)"')
+CHAR_LITERAL = re.compile(r"'(?:[^'\\\n]|\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|[^\n]))'")
+ATTRIBUTE_START = re.compile(r'#\s*!?\s*\[')
+
+def rust_code(text):
+    """Mask comments and literals while retaining token boundaries and newlines."""
+    masked = list(text)
+    index = 0
+    while index < len(text):
+        end = index
+        if text.startswith('//', index):
+            end = text.find('\n', index)
+            if end == -1:
+                end = len(text)
+        elif text.startswith('/*', index):
+            depth = 1
+            end = index + 2
+            while end < len(text) and depth:
+                if text.startswith('/*', end):
+                    depth += 1
+                    end += 2
+                elif text.startswith('*/', end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+        else:
+            raw = RAW_LITERAL.match(text, index) if text[index] in 'bcr' else None
+            if raw:
+                delimiter = '"' + raw.group(1)
+                closing = text.find(delimiter, raw.end())
+                end = len(text) if closing == -1 else closing + len(delimiter)
+            elif text[index] == '"':
+                end = index + 1
+                while end < len(text):
+                    if text[end] == '\\':
+                        end = min(end + 2, len(text))
+                    elif text[end] == '"':
+                        end += 1
+                        break
+                    else:
+                        end += 1
+            elif text[index] == "'":
+                # Lifetimes remain code; only a complete character literal is masked.
+                char = CHAR_LITERAL.match(text, index)
+                if char:
+                    end = char.end()
+        if end > index:
+            masked[index:end] = ['\n' if char == '\n' else ' ' for char in text[index:end]]
+            index = end
+        else:
+            index += 1
+    return ''.join(masked)
+
+
+def meta_arguments(text):
+    """Split a Rust metadata list at commas outside nested token groups."""
+    depth = 0
+    start = 0
+    for index, char in enumerate(text):
+        if char in '([{':
+            depth += 1
+        elif char in ')]}':
+            depth -= 1
+        elif char == ',' and depth == 0:
+            yield text[start:index].strip()
+            start = index + 1
+    yield text[start:].strip()
+
+
+def count_rust_lint_attributes(text):
+    """Count physical core debt lint lists, including conditional attributes.
+
+    Each allow/expect list counts once. Tool lints and expanded macros are
+    outside this ratchet; feature predicates do not hide physical annotations.
+    """
+    code = rust_code(text)
+    count = 0
+    offset = 0
+    while attribute := ATTRIBUTE_START.search(code, offset):
+        start = attribute.end()
+        end = start
+        depth = 1
+        while end < len(code) and depth:
+            if code[end] == '[':
+                depth += 1
+            elif code[end] == ']':
+                depth -= 1
+            end += 1
+        if depth:
+            break
+        pending = [code[start:end - 1].strip()]
+        while pending:
+            meta = pending.pop()
+            match = re.fullmatch(r'(?:r#)?(allow|expect|cfg_attr)\s*\((.*)\)', meta, re.DOTALL)
+            if not match:
+                continue
+            arguments = list(meta_arguments(match.group(2)))
+            if match.group(1) == 'cfg_attr':
+                pending.extend(arguments[1:])
+            elif any(re.fullmatch(r'(?:r#)?(?:dead_code|unused(?:_[a-z0-9_]+)?)', arg)
+                     for arg in arguments):
+                count += 1
+        offset = end
+    return count
+
 
 RATCHETS = {
     'todo-markers': re.compile(r'\b(?:TODO|FIXME|HACK|XXX)\b'),
-    'dead-code-allows': re.compile(r'\b(?:allow|expect)\((?:dead_code|unused[_a-z]*)'),
+    'dead-code-allows': count_rust_lint_attributes,
 }
 
 
@@ -64,11 +170,13 @@ def candidate_files(root):
 def count_matches(root, pattern):
     counts = {}
     for relative in candidate_files(root):
+        if pattern is count_rust_lint_attributes and relative.suffix != '.rs':
+            continue
         try:
             text = (root / relative).read_text(encoding='utf-8')
         except (OSError, UnicodeDecodeError):
             continue
-        found = len(pattern.findall(text))
+        found = pattern(text) if callable(pattern) else len(pattern.findall(text))
         if found:
             counts[relative.as_posix()] = found
     return counts

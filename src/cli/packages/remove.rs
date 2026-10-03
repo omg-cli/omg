@@ -31,7 +31,12 @@ pub async fn remove(packages: &[String], recursive: bool, yes: bool, dry_run: bo
     validate_removal_mode(recursive)?;
 
     if dry_run {
-        return remove_dry_run(packages, recursive).await;
+        return remove_dry_run(
+            packages,
+            #[cfg(feature = "arch")]
+            recursive,
+        )
+        .await;
     }
 
     let removal_count = removal_confirmation_count(packages).await?;
@@ -107,14 +112,10 @@ async fn remove_packages(packages: &[String], recursive: bool) -> Result<()> {
         reason = "the Arch backend previews synchronously"
     )
 )]
-#[cfg_attr(
-    not(feature = "arch"),
-    allow(
-        unused_variables,
-        reason = "only the Arch dry run states recursion truthfully; other backends never recurse"
-    )
-)]
-async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> {
+async fn remove_dry_run(
+    packages: &[String],
+    #[cfg(feature = "arch")] recursive: bool,
+) -> Result<()> {
     #[cfg(feature = "arch")]
     if super::mock_arch_backend()? {
         return arch::remove_dry_run(packages, recursive);

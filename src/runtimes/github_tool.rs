@@ -492,6 +492,7 @@ impl GenericToolManager {
         .await
         .with_context(|| format!("Failed to fetch checksum sidecar {sidecar_name}"))?
         .error_for_status()
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("Checksum sidecar request failed: {sidecar_name}"))?
         .bounded_text()
         .await
