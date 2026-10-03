@@ -146,6 +146,53 @@ fn daemon_shutdown_result(internal_failure: Option<String>) -> Result<()> {
     }
 }
 
+/// Pre-compute caches for instant first queries.
+///
+/// Independent of status publication while the daemon is active:
+/// a failed scan must not prevent cache warming. Shutdown stops new work.
+async fn prewarm_caches(state: &Arc<DaemonState>, shutdown: &CancellationToken) {
+    if shutdown.is_cancelled() {
+        return;
+    }
+    // Pre-compute explicit package list for instant first query.
+    // The state owns the backend choice so isolated daemons never
+    // fall through to a host package database.
+    let explicit_index = state.index_snapshot();
+    match state.explicit_packages().await {
+        Ok(packages) => {
+            state.with_current_index(&explicit_index, || {
+                state.cache.update_explicit(packages);
+            });
+            tracing::debug!("Pre-warmed explicit package cache");
+        }
+        Err(error) => {
+            tracing::warn!("Failed to pre-warm explicit package cache: {error}");
+        }
+    }
+
+    let index = state.index_snapshot();
+    for query in ["", "linux", "python", "node", "firefox", "git"] {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        let results =
+            match super::handlers::search_index_blocking(Arc::clone(&index), query.to_string())
+                .await
+            {
+                Ok(results) => Arc::new(results),
+                Err(error) => {
+                    tracing::warn!("Search cache pre-warm failed: {error}");
+                    return;
+                }
+            };
+        if !state.with_current_index(&index, || {
+            state.cache.insert_arc(query.to_string(), results);
+        }) {
+            return;
+        }
+    }
+}
+
 async fn run_with_status_path(
     listener: UnixListener,
     state: Arc<DaemonState>,
@@ -283,55 +330,6 @@ async fn run_with_status_path(
                 }
                 state.cache.update_status(res_arc);
             });
-        }
-
-        /// Pre-compute caches for instant first queries.
-        ///
-        /// Independent of status publication while the daemon is active:
-        /// a failed scan must not prevent cache warming. Shutdown stops new work.
-        async fn prewarm_caches(state: &Arc<DaemonState>, shutdown: &CancellationToken) {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            // Pre-compute explicit package list for instant first query.
-            // The state owns the backend choice so isolated daemons never
-            // fall through to a host package database.
-            let explicit_index = state.index_snapshot();
-            match state.explicit_packages().await {
-                Ok(packages) => {
-                    state.with_current_index(&explicit_index, || {
-                        state.cache.update_explicit(packages);
-                    });
-                    tracing::debug!("Pre-warmed explicit package cache");
-                }
-                Err(error) => {
-                    tracing::warn!("Failed to pre-warm explicit package cache: {error}");
-                }
-            }
-
-            let index = state.index_snapshot();
-            for query in ["", "linux", "python", "node", "firefox", "git"] {
-                if shutdown.is_cancelled() {
-                    return;
-                }
-                let results = match super::handlers::search_index_blocking(
-                    Arc::clone(&index),
-                    query.to_string(),
-                )
-                .await
-                {
-                    Ok(results) => Arc::new(results),
-                    Err(error) => {
-                        tracing::warn!("Search cache pre-warm failed: {error}");
-                        return;
-                    }
-                };
-                if !state.with_current_index(&index, || {
-                    state.cache.insert_arc(query.to_string(), results);
-                }) {
-                    return;
-                }
-            }
         }
 
         async fn maintain(
@@ -1473,6 +1471,39 @@ mod tests {
             .await
             .context("shutdown did not close the idle connection")???;
         assert_eq!(GLOBAL_METRICS.snapshot().active_connections, baseline);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_prewarm_keeps_caches_cold() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let backend = Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+            "arch",
+            directory.path(),
+        ));
+        backend.set_installed_version("git", "1")?;
+        let state = Arc::new(DaemonState::new_isolated(
+            directory.path(),
+            super::super::index::PackageIndex::from_records(&[("git", "1", "Git fixture")]),
+            backend,
+        )?);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        prewarm_caches(&state, &cancellation).await;
+        assert!(state.cache.get_explicit().is_none());
+        for query in ["", "linux", "python", "node", "firefox", "git"] {
+            assert!(
+                state.cache.get(query).is_none(),
+                "cancelled query {query} warmed"
+            );
+        }
+
+        prewarm_caches(&state, &CancellationToken::new()).await;
+        assert_eq!(
+            state.cache.get_explicit().as_deref().map(Vec::as_slice),
+            Some(["git".to_string()].as_slice())
+        );
+        assert!(state.cache.get("git").is_some());
         Ok(())
     }
 
