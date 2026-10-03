@@ -12,7 +12,14 @@ SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 CASE_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,120}\Z")
 TIERS = {"hermetic", "container", "qemu", "network", "credentialed", "pty", "nested-container"}
 DISTROS = {"arch", "debian", "ubuntu", "fedora"}
+GUEST_DISTROS = DISTROS | {"debian-trixie"}
 HEADER = "case\targs_json\tsafety\texpected_exit\texpected_ux\trequires\ttier\ttargets\tassertions\tcleanup"
+
+
+def backend_family(distro):
+    if distro not in GUEST_DISTROS:
+        raise ValueError("unsupported inventory guest")
+    return "debian" if distro == "debian-trixie" else distro
 
 
 def unique_object(pairs):

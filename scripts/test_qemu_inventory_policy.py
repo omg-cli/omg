@@ -301,6 +301,38 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.admit()
 
+    def test_trixie_uses_apt_policy_without_accepting_bookworm_receipts(self):
+        mapping = "arch:1,debian:0,ubuntu:0,fedora:125"
+        self.repolicy_inventory(self.inventory.read_text().replace("\t0\tpass\t", f"\t{mapping}\tpass\t", 1))
+        self.selection["cases"][1]["allowed_skips"] = {"debian": "declared-cli-shape-only"}
+        self.write_policy()
+        for row in self.rows:
+            row["case_id"] = row["case_id"].replace("qemu-arch-", "qemu-debian-trixie-")
+            row["distro"] = "debian-trixie"
+        self.assertTrue(self.admit("debian-trixie")["passed"])
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/check-qemu-inventory.py"),
+            "--policy", str(self.policy), "--inventory", str(self.inventory),
+            "--results", str(self.results), "--summary", str(self.summary),
+            "--distro", "debian-trixie", "--tiers", "hermetic"],
+            capture_output=True, text=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.rows[0]["exit_code"] = 1
+        with self.assertRaises(ValueError):
+            self.admit("debian-trixie")
+        self.rows[0]["exit_code"] = 0
+        self.rows[0]["distro"] = "debian"
+        with self.assertRaises(ValueError):
+            self.admit("debian-trixie")
+        self.rows[0]["distro"] = "debian-trixie"
+        self.rows[0]["case_id"] = "qemu-debian-required"
+        with self.assertRaises(ValueError):
+            self.admit("debian-trixie")
+
+    def test_inventory_rejects_unknown_guest_even_for_scalar_exits(self):
+        for distro in ("debian-13", "trixie", "debian-trixie-arm64"):
+            with self.subTest(distro=distro), self.assertRaises(ValueError):
+                POLICY.inventory_exits(self.inventory.read_bytes(), distro)
+
     def test_pass_accepts_intentional_nonzero_scalar_and_mapped_exits(self):
         content = self.inventory.read_text().replace("\t0\tpass\t", "\t2\tpass\t", 1)
         self.repolicy_inventory(content)
