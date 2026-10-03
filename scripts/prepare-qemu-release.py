@@ -21,7 +21,7 @@ def prepare(tag, distro, destination):
         raise ValueError('Invalid release tag')
     signer = ('PyRo1121/omg' if tuple(map(int, tag[1:].split('.'))) <= (0, 1, 221)
               else REPOSITORY)
-    if distro not in ('arch', 'debian', 'ubuntu', 'fedora'):
+    if distro not in ('arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'):
         raise ValueError('Unsupported published distro')
     revision = api(f'commits/{tag}')['sha']
     if not re.fullmatch(r'[0-9a-f]{40}', revision):

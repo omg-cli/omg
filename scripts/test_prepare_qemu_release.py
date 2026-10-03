@@ -16,6 +16,37 @@ spec.loader.exec_module(release)
 
 
 class ReleaseContractTests(unittest.TestCase):
+    def test_published_trixie_archive_preserves_attestation_and_tag_contract(self):
+        data = (release.HEADER + '\nrelease-case\t[]\tread\t0\tpass\t-\thermetic\t-\t-\t-\n').encode()
+        revision = 'a' * 40
+        blob = {'encoding': 'base64', 'size': len(data), 'content': base64.b64encode(data).decode()}
+        for verified in (True, False):
+            with self.subTest(verified=verified), tempfile.TemporaryDirectory() as tmp:
+                destination = Path(tmp)
+                outcomes = [None, None if verified else subprocess.CalledProcessError(1, 'verify')]
+                with patch.object(release, 'api', side_effect=[{'sha': revision}, blob, {'sha': revision}]), patch.object(release.subprocess, 'run', side_effect=outcomes) as calls:
+                    if verified:
+                        release.prepare('v0.1.224', 'debian-trixie', destination)
+                        self.assertEqual((destination / 'cases.tsv').read_bytes(), data)
+                        provenance = json.loads((destination / 'inventory-provenance.json').read_text())
+                        self.assertEqual(provenance['inventory_revision'], revision)
+                        self.assertTrue(provenance['artifact_attestation_verified'])
+                    else:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            release.prepare('v0.1.224', 'debian-trixie', destination)
+                        self.assertFalse((destination / 'cases.tsv').exists())
+                        self.assertFalse((destination / 'inventory-provenance.json').exists())
+                archive = 'omg-v0.1.224-x86_64-linux-debian-trixie.tar.gz'
+                self.assertIn(archive, calls.call_args_list[0].args[0])
+                self.assertIn(archive + '.sha256', calls.call_args_list[0].args[0])
+                self.assertEqual(calls.call_args_list[1].args[0], [
+                    'gh', 'attestation', 'verify', str(destination / archive),
+                    '--repo', 'omg-cli/omg', '--source-digest', revision,
+                    '--source-ref', 'refs/tags/v0.1.224',
+                    '--signer-workflow', 'omg-cli/omg/.github/workflows/release.yml',
+                ])
+                self.assertTrue(calls.call_args_list[1].kwargs['check'])
+
     def test_installer_uses_same_release_signer_cutover(self):
         bash = os.environ.get('OMG_TEST_BASH') or (shutil.which('bash') if os.name != 'nt' else None)
         if not bash:
