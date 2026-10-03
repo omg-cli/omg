@@ -96,6 +96,8 @@ class QemuWorkflowTests(unittest.TestCase):
             self.assertEqual(values['tag'], 'v1.2.3')
 
     def test_guest_uses_resolved_artifact_mode_for_every_event(self):
+        selection = step('Resolve selection')
+        self.assertIn("github.event_name == 'schedule'", selection.split('STAGED:', 1)[1].split('\n', 1)[0])
         download = step('Download staged binaries')
         self.assertIn("if: inputs.staged", download)
         guest = step('Run disposable guest lifecycle + read benchmarks + inventory rows')
@@ -112,7 +114,7 @@ class QemuWorkflowTests(unittest.TestCase):
         script = script.replace('./scripts/benchmark-qemu.sh', 'printf "%s\\n"')
         for event, staged in [('push', True), ('pull_request', True),
                               ('workflow_dispatch', True), ('workflow_dispatch', False),
-                              ('schedule', False)]:
+                              ('schedule', True)]:
             with self.subTest(event=event, staged=staged), tempfile.TemporaryDirectory() as tmp:
                 result, _ = self.run_script(script, {'STAGED': str(staged).lower(),
                     'RUNNER_TEMP': tmp, 'GITHUB_EVENT_NAME': event,
@@ -122,6 +124,31 @@ class QemuWorkflowTests(unittest.TestCase):
                 self.assertEqual('--staged-dir' in args, staged)
                 self.assertEqual('--release-dir' in args, not staged)
                 self.assertEqual('--inventory-file' in args, not staged)
+
+    def test_nightly_builds_restore_native_caches_without_extra_saves(self):
+        ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
+        container_build = LANE.split('\n  build-staged:\n', 1)[1].split('\n  build-staged-ubuntu:\n', 1)[0]
+        ubuntu_build = LANE.split('\n  build-staged-ubuntu:\n', 1)[1].split('\n  guest:\n', 1)[0]
+        for build in (container_build, ubuntu_build):
+            for variable in ('CARGO_NET_RETRY: 10', 'RUSTUP_MAX_RETRIES: 10',
+                             'RUST_BACKTRACE: short', 'CARGO_PROFILE_DEV_LTO: "off"',
+                             'CARGO_PROFILE_TEST_LTO: "off"'):
+                self.assertIn(variable, ci)
+                self.assertIn(variable, build)
+        self.assertIn('20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c', container_build)
+        self.assertNotIn('dtolnay/rust-toolchain@', container_build)
+        native_identity = ci.split('      - name: Compute native cache identity\n', 1)[1].split('      - name: Cache Rust dependencies\n', 1)[0]
+        staged_identity = LANE.split('      - name: Compute native cache identity\n', 1)[1].split('      - name: Restore native compiled dependencies\n', 1)[0]
+        self.assertEqual(staged_identity, native_identity.replace('matrix.platform', 'inputs.distro').replace('matrix.image', 'inputs.image').replace('matrix.features', 'inputs.features'))
+        native_cache = LANE.split('      - name: Restore native compiled dependencies\n', 1)[1].split('      - name: Run library and binary unit tests', 1)[0]
+        ubuntu_cache = LANE.split('      - name: Restore native compiled dependencies\n', 2)[2].split('      - name: Run library and binary unit tests', 1)[0]
+        self.assertIn('prefix-key: v2-platform-dependencies', native_cache)
+        self.assertIn('shared-key: ${{ steps.cache-key.outputs.key }}', native_cache)
+        self.assertIn('prefix-key: v1-ubuntu-debian', ubuntu_cache)
+        self.assertIn('shared-key: ubuntu', ubuntu_cache)
+        for cache in (native_cache, ubuntu_cache):
+            self.assertIn('save-if: false', cache)
+            self.assertNotIn('qemu-staged-v1', cache)
 
     def test_pull_request_never_selects_configurable_arm_runner(self):
         with tempfile.TemporaryDirectory() as tmp:

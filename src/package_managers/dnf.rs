@@ -209,6 +209,10 @@ struct NativeTransaction {
     id: u64,
     comment: String,
     status: String,
+    /// `dnf5 history info --json` records the command line that started the
+    /// transaction as `description` (dnf5 history(8), JSON Output).
+    #[serde(default)]
+    description: String,
     packages: Vec<NativeTransactionPackage>,
 }
 
@@ -476,8 +480,13 @@ impl DnfPackageManager {
     const USER_INSTALLED_QUERY_FORMAT: &str = "%{name}\\n";
 
     pub(crate) fn read_user_installed_names() -> Result<HashSet<String>> {
+        // Installation reasons are local DNF state. Keep this read offline and
+        // include packages hidden by repository exclude rules.
         let output = crate::core::privilege::system_command("dnf")?
             .args([
+                "--cacheonly",
+                "--disable-repo=*",
+                "--setopt=disable_excludes=*",
                 "repoquery",
                 "--userinstalled",
                 "--qf",
@@ -1057,7 +1066,26 @@ impl DnfPackageManager {
                 &transaction.packages,
             )?)),
             "Error" => Ok(NativeOutcome::Failed),
-            status => anyhow::bail!("DNF transaction has unresolved status '{status}'"),
+            status => {
+                // libdnf5 inserts a transaction row as STARTED and only replaces
+                // that state from finish(OK|ERROR)
+                // (libdnf5/transaction/transaction.hpp: TransactionState
+                // { STARTED = 1, OK = 2, ERROR = 3 }, start(), finish()).
+                // A row still marked STARTED was interrupted before it could
+                // finish, so report the recorded identity and command line
+                // instead of only the status word. dnf5 history(8) documents the
+                // same shape: redo "is useful to finish interrupted transactions".
+                let command = if transaction.description.is_empty() {
+                    "not recorded"
+                } else {
+                    transaction.description.as_str()
+                };
+                anyhow::bail!(
+                    "DNF transaction {} has unresolved status '{status}' for {} package action(s); recorded command: {command}",
+                    transaction.id,
+                    transaction.packages.len()
+                )
+            }
         }
     }
 
@@ -1367,6 +1395,7 @@ impl PackageManager for DnfPackageManager {
                 .map(|package| super::types::SecurityPackage {
                     name: package.name,
                     version: package.version,
+                    advisory_source: None,
                     architecture: Some(package.architecture),
                     description: String::new(),
                     licenses: Vec::new(),
@@ -1705,6 +1734,7 @@ mod tests {
         let package = |version: &str, architecture: &str| super::super::types::SecurityPackage {
             name: "fixture".into(),
             version: version.into(),
+            advisory_source: None,
             architecture: Some(architecture.into()),
             description: String::new(),
             licenses: Vec::new(),
@@ -2262,6 +2292,35 @@ mod tests {
         ] {
             assert!(DnfPackageManager::native_changes(&[package]).is_err());
         }
+    }
+
+    #[test]
+    fn native_unresolved_transaction_reports_recorded_identity() {
+        // libdnf5 marks a transaction STARTED when it is inserted and only
+        // updates it from finish(OK|ERROR); the observed Fedora failure left
+        // such a row behind (run 36204199869). The error must carry the
+        // recorded identity instead of only the status word.
+        let transactions: Vec<NativeTransaction> = serde_json::from_str(r#"[{"id":41,"comment":"omg-fixture","status":"Started","description":"/usr/bin/dnf5 --comment=omg-fixture remove --yes tree-2.2.1-4.fc44","packages":[{"nevra":"tree-0:2.2.1-4.fc44.x86_64","action":"Remove"}]}]"#).expect("native history fixture");
+        let error = DnfPackageManager::native_outcome(&transactions, "omg-fixture")
+            .expect_err("an unfinished transaction is neither committed nor failed");
+        let message = error.to_string();
+        assert!(message.contains("transaction 41"), "{message}");
+        assert!(message.contains("status 'Started'"), "{message}");
+        assert!(message.contains("1 package action"), "{message}");
+        assert!(
+            message.contains("remove --yes tree-2.2.1-4.fc44"),
+            "{message}"
+        );
+        let without_command: Vec<NativeTransaction> = serde_json::from_str(
+            r#"[{"id":7,"comment":"omg-fixture","status":"Started","packages":[]}]"#,
+        )
+        .expect("fixture without description");
+        let error = DnfPackageManager::native_outcome(&without_command, "omg-fixture")
+            .expect_err("missing description must not hide the failure");
+        assert!(
+            error.to_string().contains("recorded command: not recorded"),
+            "{error}"
+        );
     }
 
     #[test]

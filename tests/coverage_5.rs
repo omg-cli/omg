@@ -389,7 +389,12 @@ fn corrupted_lockfile_fails_pull_loudly_instead_of_reporting_state() {
 /// publishing an empty environment or changing the durable team state.
 #[test]
 #[serial]
-#[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
+#[cfg(not(any(
+    feature = "arch",
+    feature = "debian",
+    feature = "debian-pure",
+    feature = "fedora"
+)))]
 fn team_fingerprint_operations_without_backend_preserve_workspace() {
     for operation in ["status", "push", "pull"] {
         let project = TestProject::new();
@@ -401,7 +406,7 @@ fn team_fingerprint_operations_without_backend_preserve_workspace() {
         let result = project.run(&["team", operation]);
         result.assert_failure();
         result.assert_stderr_contains(
-            "Environment fingerprinting is not available without an Arch or Debian package backend",
+            "Environment fingerprinting is not available without an Arch, Debian, or Fedora package backend",
         );
         assert!(!project.path().join("omg.lock").exists());
         assert_eq!(fs::read(&status_path).unwrap(), original_status);

@@ -2,19 +2,30 @@
 set -euo pipefail
 
 if [[ ${1:-} == --help ]]; then
-  printf 'Usage: scripts/report-smoke-sentry.sh RESULTS_JSON\nSends sanitized failure summaries after a smoke run.\nConfiguration: OMG_SMOKE_SENTRY_CONFIG or ~/.config/omg-smoke/sentry.json\nOptional release tag: OMG_SMOKE_RELEASE. Missing configuration disables reporting.\n'
+  printf 'Usage: scripts/report-smoke-sentry.sh RESULTS_JSON\nSends sanitized failure summaries after a smoke run.\nConfiguration: OMG_SMOKE_SENTRY_CONFIG, ~/.config/omg-smoke/sentry.json, or OMG_SMOKE_SENTRY_DSN when no file exists.\nOptional release tag: OMG_SMOKE_RELEASE. Missing configuration disables reporting.\n'
   exit 0
 fi
 [[ $# == 1 ]] || { printf 'error: expected one results.json path\n' >&2; exit 2; }
 config="${OMG_SMOKE_SENTRY_CONFIG:-$HOME/.config/omg-smoke/sentry.json}"
-[[ -f "$config" ]] || { printf 'Sentry reporting disabled: no configuration\n'; exit 0; }
+if [[ ! -f "$config" && -z "${OMG_SMOKE_SENTRY_DSN:-}" ]]; then
+  printf 'Sentry reporting disabled: no configuration\n'
+  exit 0
+fi
 [[ -f "$1" && $(wc -c < "$1") -le 1048576 ]] || { printf 'Sentry input missing or exceeds 1 MiB\n' >&2; exit 2; }
 environment=${OMG_SMOKE_ENVIRONMENT:-release-smoke}
 case "$environment" in release-smoke|qemu-matrix) ;; *) printf 'Unsupported Sentry environment\n' >&2; exit 2 ;; esac
 for tool in jq curl; do
   command -v "$tool" >/dev/null || { printf 'reporting unavailable: missing %s\n' "$tool" >&2; exit 3; }
 done
-endpoint="$(jq -er '.dsn | capture("^https://[A-Za-z0-9]+@(?<host>[a-z0-9.-]+\\.sentry\\.io)/(?<project>[0-9]+)$") | "https://\(.host)/api/\(.project)/envelope/"' "$config")"
+if [[ -f "$config" ]]; then
+  # A maintainer-provided file takes precedence over the workflow secret.
+  OMG_SMOKE_SENTRY_DSN="$(jq -er '.dsn | strings' "$config")" || exit 2
+  export OMG_SMOKE_SENTRY_DSN
+fi
+if ! endpoint="$(jq -ner 'env.OMG_SMOKE_SENTRY_DSN | capture("^https://[A-Za-z0-9]+@(?<host>[a-z0-9.-]+\\.sentry\\.io)/(?<project>[0-9]+)$") | "https://\(.host)/api/\(.project)/envelope/"')"; then
+  printf 'Sentry reporting disabled: DSN has an unexpected shape\n' >&2
+  exit 2
+fi
 release="${OMG_SMOKE_RELEASE:-unknown}"
 [[ "$release" == unknown || "$release" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
 run_id="$(basename "$(dirname "$1")")"
@@ -26,7 +37,10 @@ failures="$(jq -ce '
   if length > 10000 then error("too many results") else . end |
   if all(.[];
     (.case_id | identifier) and
-    (.distro | IN("arch", "debian", "ubuntu", "fedora", "macos")) and
+    ((.distro | IN("arch", "debian", "ubuntu", "fedora", "macos")) or
+     (.distro == "matrix" and
+      (.case_id | IN("qemu-matrix-workflow", "qemu-matrix-x86-workflow",
+                     "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow")))) and
     (.result | IN("PASS", "SKIPPED", "EXPECTED_REJECTION", "PRODUCT_FAIL", "HARNESS_ERROR", "FAIL", "BLOCKED")) and
     (.exit_code | type == "number" and floor == . and . >= -1 and . <= 255) and
     (.elapsed_seconds | type == "number" and . >= 0 and . <= 86400))
@@ -43,7 +57,7 @@ else
 fi
 printf 'Sentry sending event %s for run %s\n' "$event_id" "$run_id"
 http_code="$({
-  jq -cn --slurpfile config "$config" --arg id "$event_id" '{event_id:$id,dsn:$config[0].dsn}'
+  jq -cn --arg id "$event_id" '{event_id:$id,dsn:env.OMG_SMOKE_SENTRY_DSN}'
   printf '{"type":"event"}\n'
   jq -cn --arg id "$event_id" --arg release "$release" --arg run_id "$run_id" \
     --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson failures "$failures" \

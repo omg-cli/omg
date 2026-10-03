@@ -37,6 +37,7 @@ def identity(event, live, repository):
             or live["head_sha"] != run["head_sha"]
             or live["workflow_id"] != run["workflow_id"]
             or not trusted_workflow
+            or live.get("head_branch") != "main"
             or live["status"] != "completed"
             or live["event"] not in ("push", "workflow_dispatch", "schedule")
             or not re.fullmatch(r"[0-9a-f]{40}", live["head_sha"])):
@@ -93,7 +94,7 @@ def diagnostic_excerpt(raw):
     return text.encode("utf-8")[-1300:].decode("utf-8", errors="ignore")
 
 
-def archive_rows(content, allowed_cases, diagnostics=None):
+def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revision=None):
     if len(content) > MAX_DOWNLOAD:
         raise ValueError("artifact download exceeds limit")
     rows = []
@@ -134,8 +135,36 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                         or type(row.get("elapsed_seconds")) not in (int, float)
                         or not 0 <= row["elapsed_seconds"] <= 86400):
                     raise ValueError("invalid result row")
-                rows.append({key: row[key] for key in ("case_id", "distro", "result", "exit_code", "elapsed_seconds")})
+                if guest is not None and row["distro"] != guest[0]:
+                    raise ValueError("guest result distro differs from artifact identity")
+                if guest is not None and "arch" in row and row["arch"] != guest[1]:
+                    raise ValueError("guest result architecture differs from artifact identity")
+                admitted = {key: row[key] for key in (
+                    "case_id", "distro", "result", "exit_code", "elapsed_seconds")}
+                if guest is not None:
+                    admitted["arch"] = guest[1]
+                rows.append(admitted)
                 row_sources.append((row, path.parent))
+        if guest is not None:
+            provenance_members = [member for member in members if member.filename == "provenance.json"]
+            if provenance_members:
+                if len(provenance_members) != 1 or provenance_members[0].file_size > 4096:
+                    raise ValueError("invalid guest provenance")
+                provenance = json.loads(archive.read(provenance_members[0]),
+                                        object_pairs_hook=unique_object)
+                if (not isinstance(provenance, dict)
+                        or provenance.get("distro") != guest[0]
+                        or provenance.get("arch") != guest[1]
+                        or provenance.get("harness_revision") != revision):
+                    raise ValueError("guest artifact provenance mismatch")
+            else:
+                lifecycle = (f"qemu-{guest[0]}-lifecycle" if guest[1] == "x86_64"
+                             else f"qemu-{guest[0]}-aarch64-lifecycle")
+                if not row_sources or any(
+                        row["case_id"] != lifecycle or row["result"] not in FAILURES
+                        or not parent.name.startswith("run-setup-")
+                        for row, parent in row_sources):
+                    raise ValueError("guest artifact lacks provenance outside setup failure")
         # Admission above validates every archive member before any diagnostic
         # is consumed. Read only logs named by a validated failing case; never
         # extract files or execute artifact content. The issue helper applies
@@ -145,22 +174,25 @@ def archive_rows(content, allowed_cases, diagnostics=None):
             for row, parent in row_sources:
                 if row["result"] not in FAILURES or row["case_id"] == "qemu-matrix-workflow":
                     continue
-                key = row["case_id"], row["distro"]
+                key = (row["case_id"], row["distro"], guest[1]) if guest else (
+                    row["case_id"], row["distro"])
                 diagnostics.pop(key, None)
                 case = row["case_id"].removeprefix(f"qemu-{row['distro']}-")
                 if parent.name == "inventory":
                     candidates = [parent / "rows" / f"{case}{suffix}.log"
-                                  for suffix in (".stderr", "", ".stdout")]
+                                  for suffix in (".stderr", ".stdout")]
                 elif case in ("lifecycle", "aarch64-lifecycle"):
                     candidates = [parent / name for name in (
                         "kvm-probe.log", "health-validation.log", "transactions.log",
                         "transaction-validation.log", "guest-check.log", "boot.log",
+                        "guest/evidence/index-update.txt",
                         "guest/evidence/daemon-direct.log",
                         "guest/evidence/daemon-advisory-shutdown.log")]
                 else:
                     candidates = []
                 excerpts = []
                 if case in ("lifecycle", "aarch64-lifecycle"):
+                    receipt = None
                     summary = members_by_name.get(str(parent / "transactions/summary.json"))
                     if summary is not None and summary.file_size <= 1024 * 1024:
                         try:
@@ -178,25 +210,80 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                                 if not isinstance(trial_id, str) or not re.fullmatch(
                                         r"(?:install|remove)-(?:native|omg)-[0-9]{3}", trial_id):
                                     continue
-                                serial_name = f"transactions/trials/{trial_id}/serial.log"
-                                serial = members_by_name.get(str(parent / serial_name))
-                                if serial is not None and serial.file_size <= 8 * 1024 * 1024:
-                                    lines = archive.read(serial).decode("utf-8", errors="replace").splitlines()
-                                    signals = [line for line in lines if re.search(
-                                        r"fail|error|panic|timed out|lost carrier|gained carrier|DHCP|fe80::",
-                                        line, flags=re.IGNORECASE)]
-                                    if signals:
-                                        priority = [line for line in signals if re.search(
-                                            r"fail|error|panic|timed out|lost carrier|fe80::",
+                                if trial["result"] == "FAIL":
+                                    for stream in ("stderr", "stdout"):
+                                        name = (f"transactions/trials/{trial_id}/transaction-trial/"
+                                                f"transaction.{stream}")
+                                        member = members_by_name.get(str(parent / name))
+                                        if member is not None and member.file_size <= 8 * 1024 * 1024:
+                                            raw = archive.read(member)
+                                            if raw.strip():
+                                                excerpts.append((name, diagnostic_excerpt(raw)))
+                                if trial["result"] == "HARNESS_ERROR":
+                                    for boot_name in ("boot.qemu-startup.log", "boot.log"):
+                                        name = f"transactions/trials/{trial_id}/{boot_name}"
+                                        member = members_by_name.get(str(parent / name))
+                                        if member is not None and member.file_size <= 8 * 1024 * 1024:
+                                            raw = archive.read(member)
+                                            if raw.strip():
+                                                excerpts.append((name, diagnostic_excerpt(raw)))
+                                                break
+                                if not excerpts or trial["result"] == "HARNESS_ERROR":
+                                    serial_name = f"transactions/trials/{trial_id}/serial.log"
+                                    serial = members_by_name.get(str(parent / serial_name))
+                                    if serial is not None and serial.file_size <= 8 * 1024 * 1024:
+                                        lines = archive.read(serial).decode("utf-8", errors="replace").splitlines()
+                                        signals = [line for line in lines if re.search(
+                                            r"fail|error|panic|timed out|lost carrier|gained carrier|DHCP|fe80::",
                                             line, flags=re.IGNORECASE)]
-                                        excerpts.append((serial_name, diagnostic_excerpt(
-                                            "\n".join(signals[-4:] + priority[-4:]).encode("utf-8"))))
+                                        if signals:
+                                            priority = [line for line in signals if re.search(
+                                                r"fail|error|panic|timed out|lost carrier|fe80::",
+                                                line, flags=re.IGNORECASE)]
+                                            excerpts.append((serial_name, diagnostic_excerpt(
+                                                "\n".join(signals[-4:] + priority[-4:]).encode("utf-8"))))
                                 break
+                    if not excerpts and isinstance(receipt, dict):
+                        preparation_logs = {
+                            "automatic-updates": "automatic-updates.log",
+                            "prepare-remove": "prepare-remove.log",
+                            "remove-repository-state": "remove-repository-state.log",
+                            "stop-prepared-remove": "stop-prepared-remove.log",
+                            "prepare-install-boot": "prepare-install-boot.qemu-startup.log",
+                            "prepare-install": "prepare-install.log",
+                            "install-repository-state": "install-repository-state.log",
+                            "stop-prepared-install": "stop-prepared-install.log",
+                        }
+                        phase = receipt.get("phase")
+                        if not isinstance(phase, str):
+                            phase = None
+                        if phase == "preparation" and "preparation_step" in receipt:
+                            step = receipt["preparation_step"]
+                            selected = preparation_logs.get(step) if isinstance(step, str) else None
+                        else:
+                            selected = {"preparation": "prepare-install-boot.qemu-startup.log",
+                                        "restore": "resume-boot.qemu-startup.log"}.get(phase)
+                        if selected:
+                            names = [selected]
+                            if selected.endswith("boot.qemu-startup.log"):
+                                names.append(selected.removesuffix(".qemu-startup.log") + ".log")
+                            for boot_name in names:
+                                name = f"transactions/{boot_name}"
+                                member = members_by_name.get(str(parent / name))
+                                if member is not None and member.file_size <= 8 * 1024 * 1024:
+                                    raw = archive.read(member)
+                                    if raw.strip():
+                                        excerpts.append((name, diagnostic_excerpt(raw)))
+                                        break
                 if excerpts:
-                    # When a clone failed, earlier successful guest probes are
-                    # less useful than its serial transcript and final health.
-                    candidates = [parent / name for name in
-                                  ("health-validation.log", "transactions.log")]
+                    # A measured command failure has a more precise cause than
+                    # earlier guest probes. Preserve the full excerpt budget.
+                    if any(name.endswith(("/transaction.stderr", "/transaction.stdout"))
+                           for name, _ in excerpts):
+                        candidates = []
+                    else:
+                        candidates = [parent / name for name in
+                                      ("health-validation.log", "transactions.log")]
                 for candidate in candidates:
                     member = members_by_name.get(str(candidate))
                     if member is None or member.file_size > 8 * 1024 * 1024:
@@ -205,8 +292,13 @@ def archive_rows(content, allowed_cases, diagnostics=None):
                     if not raw.strip():
                         continue
                     excerpts.append((candidate.name, diagnostic_excerpt(raw)))
-                    if parent.name == "inventory":
-                        break
+                if parent.name == "inventory" and not excerpts:
+                    candidate = parent / "rows" / f"{case}.log"
+                    member = members_by_name.get(str(candidate))
+                    if member is not None and member.file_size <= 8 * 1024 * 1024:
+                        raw = archive.read(member)
+                        if raw.strip():
+                            excerpts.append((candidate.name, diagnostic_excerpt(raw)))
                 if not excerpts and case in ("lifecycle", "aarch64-lifecycle"):
                     # A setup failure can occur before boot.log or any guest
                     # case log exists. Report the latest available setup stage
@@ -233,7 +325,7 @@ def archive_rows(content, allowed_cases, diagnostics=None):
 
 
 def unexecuted_inventory_distros(rows):
-    """Distros whose inventory rows were never started.
+    """Guest identities whose inventory rows were never started.
 
     A guest that dies before inventory writes one BLOCKED placeholder per
     requested case. Those placeholders are not separate failures. Promoting
@@ -243,17 +335,18 @@ def unexecuted_inventory_distros(rows):
     failed_lifecycle = set()
     for row in rows:
         distro = row["distro"]
+        guest = distro, row.get("arch", "x86_64")
         case_id = row["case_id"]
         if case_id in (f"qemu-{distro}-lifecycle", f"qemu-{distro}-aarch64-lifecycle"):
             if row["result"] in FAILURES:
-                failed_lifecycle.add(distro)
+                failed_lifecycle.add(guest)
             continue
         if case_id == "qemu-matrix-workflow" or case_id.startswith("qemu-matrix-"):
             continue
-        grouped.setdefault(distro, []).append(row)
+        grouped.setdefault(guest, []).append(row)
     return {
-        distro for distro, group in grouped.items()
-        if distro in failed_lifecycle and all(
+        guest for guest, group in grouped.items()
+        if guest in failed_lifecycle and all(
             item["result"] == "BLOCKED" and item["exit_code"] == -1 and item["elapsed_seconds"] == 0
             for item in group
         )
@@ -264,10 +357,11 @@ def projection(rows, verified_published):
     placeholders = unexecuted_inventory_distros(rows)
     selected = {}
     for row in rows:
-        if (row["distro"] in placeholders and row["result"] == "BLOCKED"
+        if ((row["distro"], row.get("arch", "x86_64")) in placeholders
+                and row["result"] == "BLOCKED"
                 and row["exit_code"] == -1 and row["elapsed_seconds"] == 0):
             continue
-        key = row["case_id"], row["distro"]
+        key = row["case_id"], row["distro"], row.get("arch", "x86_64")
         if row["result"] in FAILURES:
             # The existing issue helper treats BLOCKED as context rather than
             # an issue. A failed prerequisite still needs a tracked diagnosis.
@@ -324,11 +418,20 @@ def workflow_receipt(jobs, conclusion):
     arm_health = None
     x86_selected = False
     arm_selected = False
+    failed_lane_distros = set()
     for job in jobs:
         if not isinstance(job, dict) or not isinstance(job.get("name"), str):
             raise ValueError("invalid workflow job")
         name = job["name"]
         job_conclusion = job.get("conclusion")
+        if job_conclusion in ("failure", "timed_out", "cancelled", "action_required"):
+            lane = re.search(r"(?:^|/)\s*Distro lane \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
+            if lane:
+                failed_lane_distros.add(lane.group(1))
+            else:
+                arm_guest = re.search(r"QEMU guest arm64 \((arch|debian|ubuntu|fedora)\)", name)
+                if arm_guest:
+                    failed_lane_distros.add(arm_guest.group(1))
         if name == "ARM guest runner KVM health":
             arm_health = job_conclusion
             arm_selected = job_conclusion != "skipped"
@@ -341,9 +444,33 @@ def workflow_receipt(jobs, conclusion):
                     result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
     scope = "all" if arm_selected and x86_selected else "arm" if arm_selected else "x86"
     passed = conclusion == "success"
-    return dict(case_id=f"qemu-matrix-{scope}-workflow", distro="ubuntu",
+    distro = next(iter(failed_lane_distros)) if len(failed_lane_distros) == 1 else "matrix"
+    return dict(case_id=f"qemu-matrix-{scope}-workflow", distro=distro,
                 result="PASS" if passed else "HARNESS_ERROR",
                 exit_code=0 if passed else 1, elapsed_seconds=0)
+
+
+def ci_non_qemu_failure(run, jobs):
+    """Keep failed CI jobs distinct from the QEMU job's result."""
+    return (run["path"] == ".github/workflows/ci.yml"
+            and run["conclusion"] != "success"
+            and (any(isinstance(job.get("name"), str)
+                     and not job["name"].startswith("QEMU behavioral verification")
+                     and job["name"] != "CI Success"
+                     and job.get("conclusion") in ("failure", "timed_out", "cancelled", "action_required")
+                     for job in jobs)
+                 or (not qemu_job_failed(run, jobs)
+                     and any(job.get("name") == "CI Success"
+                             and job.get("conclusion") in ("failure", "timed_out", "action_required")
+                             for job in jobs))))
+
+
+def qemu_job_failed(run, jobs):
+    return (run["path"] == ".github/workflows/qemu-matrix.yml"
+            or any(isinstance(job.get("name"), str)
+                   and job["name"].startswith("QEMU behavioral verification")
+                   and job.get("conclusion") in ("failure", "timed_out", "cancelled", "action_required")
+                   for job in jobs))
 
 
 def bound_issue_updates(selected):
@@ -351,11 +478,12 @@ def bound_issue_updates(selected):
     failures = [row for row in selected if row["result"] in FAILURES]
     if len(failures) <= 25:
         return selected, failures
-    aggregate = dict(case_id="qemu-matrix-workflow", distro="ubuntu",
+    aggregate = dict(case_id="qemu-matrix-workflow", distro="matrix",
                      result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)
     passes = [row for row in selected
               if row["result"] == "PASS" and row["case_id"] != "qemu-matrix-workflow"]
-    return [aggregate, *passes], failures
+    ci = [row for row in selected if row["case_id"] == "ci-non-qemu-workflow"]
+    return [aggregate, *ci, *passes], failures
 
 
 def write_failure_catalog(directory, run, repository, failures, evidence_error):
@@ -364,6 +492,29 @@ def write_failure_catalog(directory, run, repository, failures, evidence_error):
                    attempt=run["run_attempt"], source_sha=run["head_sha"],
                    evidence_invalid_or_unavailable=evidence_error, failures=failures)
     directory.joinpath("failures.json").write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
+
+
+def retained_guest_artifact(artifact, run, jobs):
+    """Admit old evidence only for a successful guest job carried into a rerun."""
+    name = artifact["name"]
+    guest = re.fullmatch(r"qemu-(arm-)?evidence-(arch|debian|ubuntu|fedora)", name)
+    if guest is None:
+        return False
+    label = (f"QEMU guest arm64 ({guest.group(2)})" if guest.group(1)
+             else f"QEMU guest ({guest.group(2)})")
+    owners = [job for job in jobs if job.get("name", "").endswith(label)
+              and job.get("conclusion") == "success"
+              and job.get("started_at", "") < run["run_started_at"]
+              and job.get("started_at", "") <= artifact["created_at"]
+              <= job.get("completed_at", "")]
+    return len(owners) == 1
+
+
+def artifact_guest_identity(name):
+    match = re.fullmatch(r"qemu-(arm-)?evidence-(arch|debian|ubuntu|fedora)", name)
+    if match is None:
+        return None
+    return match.group(2), "aarch64" if match.group(1) else "x86_64"
 
 
 def main():
@@ -382,6 +533,8 @@ def main():
     if run["conclusion"] in ("cancelled", "skipped"):
         print("Cancelled/skipped run retained in Actions; no failure issue generated")
         return 0
+    jobs = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100"))
+    job_rows = jobs.get("jobs")
     published_candidate = (run["conclusion"] == "success"
                            and run["path"] == ".github/workflows/qemu-matrix.yml"
                            and run["event"] in ("schedule", "workflow_dispatch")
@@ -401,14 +554,29 @@ def main():
         for artifact in listing["artifacts"]:
             if not re.fullmatch(r"qemu-(?:arm-)?evidence-(?:arch|debian|ubuntu|fedora)|qemu-workflow-report", artifact["name"]):
                 continue
-            # Reruns keep their run ID. Reject older-attempt artifacts rather
-            # than using stale success to close a current failure.
-            if artifact["created_at"] < run["run_started_at"] or artifact["expired"]:
-                raise ValueError("stale or expired artifact")
+            # Re-run failed jobs retains successful jobs and their artifacts.
+            # Carry those guests forward only when the latest job receipt still
+            # owns the artifact; a replaced failed job cannot supply evidence.
+            if (artifact["created_at"] < run["run_started_at"]
+                    and not retained_guest_artifact(artifact, run, job_rows)):
+                continue
+            if artifact["expired"]:
+                raise ValueError("expired artifact")
             if type(artifact["id"]) is not int or artifact["size_in_bytes"] > MAX_DOWNLOAD:
                 raise ValueError("invalid artifact identity or size")
+            guest = artifact_guest_identity(artifact["name"])
+            if guest is not None and artifact["name"] in guest_artifacts:
+                raise ValueError("duplicate guest artifact identity")
             content = api(f"repos/{repository}/actions/artifacts/{artifact['id']}/zip", MAX_DOWNLOAD)
-            rows.extend(archive_rows(content, allowed_cases, diagnostics))
+            artifact_rows = archive_rows(content, allowed_cases, diagnostics,
+                                         guest=guest, revision=run["head_sha"])
+            if guest is not None and any(row["case_id"] == "qemu-matrix-workflow"
+                                         for row in artifact_rows):
+                raise ValueError("guest artifact contains workflow result")
+            if guest is None and any(row["case_id"] != "qemu-matrix-workflow"
+                                     for row in artifact_rows):
+                raise ValueError("workflow report contains guest results")
+            rows.extend(artifact_rows)
             guest_artifacts.add(artifact["name"])
             if published_candidate and artifact["name"].startswith("qemu-evidence-"):
                 if artifact["name"] in published_artifacts:
@@ -441,14 +609,19 @@ def main():
     except (ValueError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError):
         selected = []
         evidence_error = True
-    jobs = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100"))
-    job_rows = jobs.get("jobs")
+    ci_failed = ci_non_qemu_failure(run, job_rows)
+    qemu_failed = qemu_job_failed(run, job_rows)
     receipt = workflow_receipt(job_rows, run["conclusion"])
     selected = [receipt if row["case_id"] == "qemu-matrix-workflow" else row for row in selected]
     if evidence_error:
-        selected.append(workflow_receipt(job_rows, "failure"))
+        if qemu_failed or not ci_failed:
+            selected.append(workflow_receipt(job_rows, "failure"))
     elif run["conclusion"] != "success" and not any(row["result"] in FAILURES for row in selected):
-        selected.append(receipt)
+        if qemu_failed or not ci_failed:
+            selected.append(receipt)
+    if ci_failed:
+        selected.append(dict(case_id="ci-non-qemu-workflow", distro="matrix",
+                             result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0))
     if not selected:
         print("No authoritative case updates to report")
         return 0
@@ -468,15 +641,17 @@ def main():
     if not selected:
         print("No authoritative case updates to report")
         return 0
-    details = []
+    details = {"ci": [], "qemu-matrix": []}
     for job in jobs["jobs"][:100]:
         if job["conclusion"] not in ("success", "skipped"):
+            source = ("qemu-matrix" if run["path"] == ".github/workflows/qemu-matrix.yml"
+                      or job["name"].startswith("QEMU behavioral verification") else "ci")
             name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", job["name"])[:120]
-            details.append(f"Job {job['id']}: {name} ({job['conclusion']})")
+            details[source].append(f"Job {job['id']}: {name} ({job['conclusion']})")
             for step in job.get("steps", [])[:100]:
                 if step["conclusion"] not in ("success", "skipped"):
                     name = re.sub(r"[^A-Za-z0-9 ._()/:-]", "?", step["name"])[:120]
-                    details.append(f"  Step {step['number']}: {name} ({step['conclusion']})")
+                    details[source].append(f"  Step {step['number']}: {name} ({step['conclusion']})")
     selected, failure_catalog = bound_issue_updates(selected)
     report_directory = Path(os.environ["RUNNER_TEMP"]) / "qemu-issue-report"
     write_failure_catalog(report_directory, run, repository, failure_catalog, evidence_error)
@@ -492,28 +667,41 @@ def main():
     if len(failure_catalog) > 25:
         catalog_note += "More than 25 cases failed; this aggregate bounds issue creation without discarding case evidence.\n"
     with tempfile.TemporaryDirectory() as directory:
-        results = Path(directory) / "results.json"
-        results.write_text(json.dumps(selected) + "\n")
         for row in selected:
             if row["result"] in FAILURES:
-                evidence = Path(directory) / f"{row['distro']}-{row['case_id']}"
+                arch = row.get("arch", "x86_64")
+                evidence_name = (f"{row['distro']}-{row['case_id']}" if arch == "x86_64"
+                                 else f"{row['distro']}-{arch}-{row['case_id']}")
+                evidence = Path(directory) / evidence_name
                 evidence.mkdir()
                 evidence.joinpath("transcript.txt").write_text(
                     f"Commit: {run['head_sha']}\nEvent: {run['event']}\nAttempt: {run['run_attempt']}\n"
+                    f"Guest architecture: {arch}\n"
                     f"Observed: {row['result']}, exit {row['exit_code']}, elapsed {row['elapsed_seconds']}s\n"
                     f"Evidence invalid/unavailable: {evidence_error}\n"
                     "Exit status alone does not establish the root cause. Inspect the linked run's logs and artifacts.\n"
-                    + "\n".join(details[:6]) + "\n"
+                     + "\n".join(details["ci" if row["case_id"] == "ci-non-qemu-workflow"
+                                         else "qemu-matrix"][:6]) + "\n"
                     + "Case diagnostic (untrusted log excerpt, redacted by issue helper):\n"
-                    + diagnostics.get((row["case_id"], row["distro"]), "No case log available; inspect linked artifacts.")
+                    + diagnostics.get((row["case_id"], row["distro"], arch),
+                                      "No case log available; inspect linked artifacts.")
                     + "\n" + catalog_note)
         run_url = f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}"
-        helper = ["bash", "scripts/qa-file-issue.sh", str(results), "--repo", repository,
-                  "--source", "qemu-matrix", "--run-url", run_url]
-        if not verified_published:
-            helper.append("--failures-only")
-        subprocess.run(helper, check=True, timeout=180)
+        for source in ("qemu-matrix", "ci"):
+            source_rows = [row for row in selected
+                           if (row["case_id"] == "ci-non-qemu-workflow") == (source == "ci")]
+            if not source_rows:
+                continue
+            results = Path(directory) / f"results-{source}.json"
+            results.write_text(json.dumps(source_rows) + "\n")
+            helper = ["bash", "scripts/qa-file-issue.sh", str(results), "--repo", repository,
+                      "--source", source, "--run-url", run_url]
+            if not verified_published:
+                helper.append("--failures-only")
+            subprocess.run(helper, check=True, timeout=180)
         if run["event"] == "pull_request" or evidence_error:
+            results = Path(directory) / "results-all.json"
+            results.write_text(json.dumps(selected) + "\n")
             subprocess.run(["bash", "scripts/report-smoke-sentry.sh", str(results)], check=True, timeout=20)
     print(f"Reported run {run_id}, attempt {run['run_attempt']}, commit {run['head_sha']}")
     return 0

@@ -408,6 +408,11 @@ impl App {
 
         #[cfg(any(feature = "debian", feature = "debian-pure"))]
         if crate::core::env::distro::is_debian_like() {
+            #[cfg(feature = "debian")]
+            if !crate::core::paths::test_mode() {
+                return crate::package_managers::apt_search_sync(query)
+                    .context("Failed to search official packages");
+            }
             return Ok(crate::package_managers::debian_db::search_fast(query)
                 .context("Failed to search official packages")?
                 .into_iter()

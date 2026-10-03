@@ -589,7 +589,12 @@ mod environment_management {
     use super::*;
 
     #[test]
-    #[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
+    #[cfg(not(any(
+        feature = "arch",
+        feature = "debian",
+        feature = "debian-pure",
+        feature = "fedora"
+    )))]
     fn capture_without_backend_refuses_without_writing_or_replacing_lock() {
         let project = TempDir::new().unwrap();
         let lock = project.path().join("omg.lock");
@@ -600,7 +605,7 @@ mod environment_management {
             let result = run_omg_in_dir(&["env", "capture"], project.path());
             result.assert_failure();
             assert!(result.stderr.contains(
-                "Environment fingerprinting is not available without an Arch or Debian package backend"
+                "Environment fingerprinting is not available without an Arch, Debian, or Fedora package backend"
             ), "unexpected refusal: {}", result.combined_output());
             if existing {
                 assert_eq!(fs::read(&lock).unwrap(), b"existing lock must survive");

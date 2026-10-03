@@ -32,6 +32,52 @@ class CargoFixtureTests(unittest.TestCase):
                 evidence = (root / 'evidence/rust-toolchain.txt').read_text()
                 self.assertEqual(bool(evidence.strip()), present)
 
+    def test_failed_clone_keeps_its_own_qemu_startup_log_without_stale_reuse(self):
+        source = (Path(__file__).resolve().parent / 'qemu-transactions.sh').read_text()
+        begin = source.index('start_clone() {')
+        end = source.index('\nfreeze_base() {', begin)
+        function = source[begin:end]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'first').mkdir()
+            (root / 'second').mkdir()
+            script = '''set -euo pipefail
+boot_args=()
+timeout() {
+  if [[ "$5" == first-disk ]]; then
+    printf 'first clone QEMU failure\\n' > qemu-startup.log
+  fi
+  return 124
+}
+''' + function + '''
+first=0
+start_clone first-disk vars first/serial.log first/boot.log || first=$?
+second=0
+start_clone second-disk vars second/serial.log second/boot.log || second=$?
+printf '%s %s\\n' "$first" "$second"
+'''
+            result = subprocess.run(['bash', '-c', script], cwd=root,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), '124 124')
+            self.assertEqual((root / 'first/boot.qemu-startup.log').read_text(),
+                             'first clone QEMU failure\n')
+            self.assertFalse((root / 'second/boot.qemu-startup.log').exists())
+
+    def test_timeout_or_killed_guest_is_not_reported_as_product_failure(self):
+        source = (Path(__file__).resolve().parent / 'benchmark-qemu.sh').read_text()
+        begin = source.index('case "$rc" in 0) result=PASS')
+        end = source.index('\n[[ "$inventory_harness_error"', begin)
+        verdict = source[begin:end]
+        for code, expected in ((0, 'PASS'), (1, 'PRODUCT_FAIL'), (120, 'HARNESS_ERROR'),
+                               (124, 'HARNESS_ERROR'), (137, 'HARNESS_ERROR')):
+            with self.subTest(code=code):
+                script = f'rc={code}\n{verdict}\nprintf "%s\\n" "$result"\n'
+                result = subprocess.run(['bash', '-c', script], capture_output=True,
+                                        text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
 
 if __name__ == '__main__':
     unittest.main()

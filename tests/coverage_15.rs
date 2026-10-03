@@ -245,7 +245,11 @@ fn init_is_idempotent_second_run_reports_already_installed() {
 /// init --defaults captures a fingerprint only when a package backend exists.
 #[test]
 fn init_defaults_respects_fingerprint_backend_availability() {
-    let project = TestProject::new();
+    let project = if cfg!(feature = "fedora") {
+        TestProject::for_distro("fedora")
+    } else {
+        TestProject::new()
+    };
     let home = tempfile::TempDir::new().expect("home tempdir");
     let result = project.run_with_env(
         &["init", "--defaults"],
@@ -259,7 +263,12 @@ fn init_defaults_respects_fingerprint_backend_availability() {
     result.assert_success();
     result.assert_stdout_contains("Capturing environment...");
 
-    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
+    #[cfg(any(
+        feature = "arch",
+        feature = "debian",
+        feature = "debian-pure",
+        feature = "fedora"
+    ))]
     {
         let lock = project.read_file("omg.lock").expect("omg.lock captured");
         assert!(
@@ -271,10 +280,15 @@ fn init_defaults_respects_fingerprint_backend_availability() {
             "lockfile must carry a state hash\ncontent: {lock}"
         );
     }
-    #[cfg(not(any(feature = "arch", feature = "debian", feature = "debian-pure")))]
+    #[cfg(not(any(
+        feature = "arch",
+        feature = "debian",
+        feature = "debian-pure",
+        feature = "fedora"
+    )))]
     {
         result.assert_stdout_contains(
-            "Environment fingerprinting is not available without an Arch or Debian package backend",
+            "Environment fingerprinting is not available without an Arch, Debian, or Fedora package backend",
         );
         assert!(!project.file_exists("omg.lock"));
     }

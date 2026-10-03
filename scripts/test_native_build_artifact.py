@@ -58,6 +58,29 @@ def bundle(provenance, payload, extra=None):
 
 
 class NativeBuildAdmission(unittest.TestCase):
+    def test_artifact_download_retries_only_a_transport_timeout(self):
+        path = 'repos/omg-cli/omg/actions/artifacts/123/zip'
+        timeout = subprocess.TimeoutExpired(['gh', 'api', path], 90)
+        with patch.object(BUILD, 'api', side_effect=[timeout, b'verified bundle']) as request, \
+                patch.object(BUILD.time, 'sleep') as sleep:
+            self.assertEqual(BUILD.download_artifact(path), b'verified bundle')
+        self.assertEqual(request.call_count, 2)
+        request.assert_any_call(path, BUILD.MAX_DOWNLOAD)
+        sleep.assert_called_once_with(1)
+
+        with patch.object(BUILD, 'api', side_effect=timeout) as request, \
+                patch.object(BUILD.time, 'sleep') as sleep:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                BUILD.download_artifact(path)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,)])
+
+        rejected = subprocess.CalledProcessError(22, ['gh', 'api', path])
+        with patch.object(BUILD, 'api', side_effect=rejected) as request:
+            with self.assertRaises(subprocess.CalledProcessError):
+                BUILD.download_artifact(path)
+        request.assert_called_once_with(path, BUILD.MAX_DOWNLOAD)
+
     def test_trixie_pair_retains_its_native_abi_recipe_identity(self):
         expected, provenance, payload = fixture('debian-trixie')
         argv, environment = BUILD.build_command('debian-trixie', 'debian,pgp,license', {})

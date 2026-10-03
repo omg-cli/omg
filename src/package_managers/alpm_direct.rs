@@ -248,6 +248,7 @@ pub fn security_inventory() -> Result<Vec<crate::package_managers::types::Securi
                 Ok(crate::package_managers::types::SecurityPackage {
                     name,
                     version,
+                    advisory_source: None,
                     architecture: Some(architecture),
                     description: package.desc().unwrap_or("").to_owned(),
                     licenses: package.licenses().into_iter().map(str::to_owned).collect(),

@@ -30,20 +30,8 @@ pub fn info_sync(package: &str) -> Result<bool> {
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if is_debian_like() {
-        if let Some(pkg) = crate::package_managers::debian_db::get_info_fast(package)? {
-            let version = pkg.version.version_string();
-            let source = format!("Official repository ({})", style::info("apt"));
-            ui::print_package_info(
-                &ui::InfoCore {
-                    name: &pkg.name,
-                    version: &version,
-                    source: &source,
-                    installed: pkg.installed,
-                    description: &pkg.description,
-                },
-                &ui::InfoExtras::none(),
-            );
-            return Ok(true);
+        if crate::core::paths::test_mode() {
+            return display_debian_fixture_info(package);
         }
         #[cfg(feature = "debian")]
         {
@@ -51,8 +39,12 @@ pub fn info_sync(package: &str) -> Result<bool> {
                 display_package_info(&info);
                 return Ok(true);
             }
+            return Ok(false);
         }
-        return Ok(false);
+        #[cfg(all(not(feature = "debian"), feature = "debian-pure"))]
+        {
+            return display_debian_fixture_info(package);
+        }
     }
 
     // Try daemon first (ULTRA FAST - <1ms)
@@ -87,6 +79,26 @@ pub fn info_sync(package: &str) -> Result<bool> {
         }
     }
 
+    Ok(false)
+}
+
+#[cfg(any(feature = "debian", feature = "debian-pure"))]
+fn display_debian_fixture_info(package: &str) -> Result<bool> {
+    if let Some(pkg) = crate::package_managers::debian_db::get_info_fast(package)? {
+        let version = pkg.version.version_string();
+        let source = format!("Official repository ({})", style::info("apt"));
+        ui::print_package_info(
+            &ui::InfoCore {
+                name: &pkg.name,
+                version: &version,
+                source: &source,
+                installed: pkg.installed,
+                description: &pkg.description,
+            },
+            &ui::InfoExtras::none(),
+        );
+        return Ok(true);
+    }
     Ok(false)
 }
 
@@ -178,18 +190,27 @@ async fn info_json(package: &str) -> Result<()> {
 
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if is_debian_like() {
-        let Some(pkg) =
-            crate::package_managers::debian_db::get_info_fast(package).with_context(|| {
-                format!("Failed to look up {package} in the Debian package database")
-            })?
-        else {
-            anyhow::bail!("Package '{package}' not found");
+        #[cfg(feature = "debian")]
+        let (name, version, description, installed) = if crate::core::paths::test_mode() {
+            let pkg = crate::package_managers::debian_db::get_info_fast(package)?
+                .with_context(|| format!("Package '{package}' not found"))?;
+            (pkg.name, pkg.version, pkg.description, pkg.installed)
+        } else {
+            let info = crate::package_managers::apt_get_sync_pkg_info(package)?
+                .with_context(|| format!("Package '{package}' not found"))?;
+            (info.name, info.version, info.description, info.installed)
+        };
+        #[cfg(all(not(feature = "debian"), feature = "debian-pure"))]
+        let (name, version, description, installed) = {
+            let pkg = crate::package_managers::debian_db::get_info_fast(package)?
+                .with_context(|| format!("Package '{package}' not found"))?;
+            (pkg.name, pkg.version, pkg.description, pkg.installed)
         };
         let json_obj = serde_json::json!({
-            "name": pkg.name,
-            "version": pkg.version,
-            "description": pkg.description,
-            "installed": pkg.installed,
+            "name": name,
+            "version": version,
+            "description": description,
+            "installed": installed,
         });
         println!(
             "{}",

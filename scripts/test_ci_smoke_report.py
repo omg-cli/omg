@@ -1,9 +1,11 @@
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("ci_smoke_report", Path(__file__).with_name("ci-smoke-report.py"))
@@ -36,7 +38,10 @@ class ReportingTests(unittest.TestCase):
                 run.return_value.returncode = 1
                 run.return_value.stdout = "Sentry rejected report with HTTP 429\n"
                 run.return_value.stderr = ""
-                self.assertEqual(REPORT.status("arch", "qemu-arch-build", "failure", Path(directory)), 0)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(REPORT.status("arch", "qemu-arch-build", "failure", Path(directory)), 0)
+                self.assertIn("::warning::Sentry delivery failed", output.getvalue())
             result = json.loads((Path(directory) / "results.json").read_text())
             self.assertEqual(result, [{"case_id": "qemu-arch-build", "distro": "arch", "result": "HARNESS_ERROR", "exit_code": 1, "elapsed_seconds": 0}])
             self.assertIn("429", (Path(directory) / "reporting.log").read_text())
@@ -57,7 +62,10 @@ class ReportingTests(unittest.TestCase):
     def test_missing_secret_is_visible_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(os.environ, {"RUNNER_TEMP": directory, "OMG_SMOKE_SENTRY_DSN": ""}):
-                self.assertEqual(REPORT.configure(), 0)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(REPORT.configure(), 0)
+                self.assertIn("Sentry reporting disabled", output.getvalue())
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_existing_config_is_not_overwritten(self):
@@ -84,18 +92,27 @@ class ReportingTests(unittest.TestCase):
     def test_verify_rejects_failed_or_missing_delivery_receipts(self):
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory)
-            self.assertNotEqual(REPORT.verify(evidence), 0)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertNotEqual(REPORT.verify(evidence), 0)
+            self.assertIn("::error::Sentry delivery receipt is missing", output.getvalue())
             run = evidence / "run-failed"
             run.mkdir()
             (run / "reporting-status.json").write_text(
                 json.dumps({"exit_code": 1}) + "\n", encoding="utf-8"
             )
-            self.assertNotEqual(REPORT.verify(evidence), 0)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertNotEqual(REPORT.verify(evidence), 0)
+            self.assertIn("::error::Sentry delivery failed: run-failed=exit-1", output.getvalue())
 
     def test_missing_bash_preserves_failure_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(REPORT.subprocess, "run", side_effect=FileNotFoundError):
-                self.assertEqual(REPORT.status("ubuntu", "qemu-ubuntu-preflight", "cancelled", Path(directory)), 0)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(REPORT.status("ubuntu", "qemu-ubuntu-preflight", "cancelled", Path(directory)), 0)
+                self.assertIn("::warning::Sentry delivery failed", output.getvalue())
             self.assertEqual(json.loads((Path(directory) / "results.json").read_text())[0]["exit_code"], 130)
             self.assertEqual(json.loads((Path(directory) / "reporting-status.json").read_text())["exit_code"], 255)
 
@@ -122,7 +139,10 @@ class ReportingTests(unittest.TestCase):
                 original.mkdir()
                 (original / "results.json").write_text(candidate)
                 with patch.object(REPORT.subprocess, "run", side_effect=FileNotFoundError):
-                    REPORT.ensure_failure("arch", "qemu-arch-lifecycle", "cancelled", root)
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        REPORT.ensure_failure("arch", "qemu-arch-lifecycle", "cancelled", root)
+                    self.assertIn("::warning::Sentry delivery failed", output.getvalue())
                 reports = list(root.glob("run-setup-*/results.json"))
                 self.assertEqual(len(reports), 1)
                 self.assertEqual(json.loads(reports[0].read_text())[0]["exit_code"], 130)
@@ -148,7 +168,10 @@ class ReportingTests(unittest.TestCase):
             good.mkdir()
             (good / "reporting-status.json").write_text('{"exit_code": 0}')
             (evidence / "run-missing").mkdir()
-            self.assertNotEqual(REPORT.verify(evidence), 0)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertNotEqual(REPORT.verify(evidence), 0)
+            self.assertIn("::error::Invalid Sentry delivery receipt", output.getvalue())
 
 
 if __name__ == "__main__":

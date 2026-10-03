@@ -155,6 +155,19 @@ def api_json(path):
     return json.loads(api(path), object_pairs_hook=unique_object, parse_constant=reject_constant)
 
 
+def download_artifact(path):
+    # Each request obtains a new short-lived redirect from GitHub. Never reuse a
+    # partial response after a transport timeout; admission still checks the
+    # server digest and the complete bundle below.
+    for attempt in range(3):
+        try:
+            return api(path, MAX_DOWNLOAD)
+        except subprocess.TimeoutExpired:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+
+
 class ArtifactUnavailable(ValueError):
     """Scheduling absence; each guest must still enforce full admission."""
 
@@ -319,7 +332,7 @@ def reuse(root, distro, image, features, destination, context, event, timeout=15
         'toolchain': tomllib.loads((root / 'rust-toolchain.toml').read_text(encoding='utf-8'))['toolchain']['channel'],
         'version': tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version'],
     }
-    content = api(f'repos/{repository}/actions/artifacts/{artifact["id"]}/zip', MAX_DOWNLOAD)
+    content = download_artifact(f'repos/{repository}/actions/artifacts/{artifact["id"]}/zip')
     provenance, files = validate_bundle(content, artifact.get('digest'), expected)
     refreshed = api_json(f'repos/{repository}/actions/runs/{selected_id}')
     validate_producer_run(refreshed, expected_run)

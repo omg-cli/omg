@@ -35,7 +35,7 @@ pub async fn remove(packages: &[String], recursive: bool, yes: bool, dry_run: bo
     validate_removal_mode(recursive)?;
 
     if dry_run {
-        return remove_dry_run(packages, recursive);
+        return remove_dry_run(packages, recursive).await;
     }
 
     if !super::common::confirm_package_mutation("removal", packages.len(), yes).await? {
@@ -92,17 +92,24 @@ async fn remove_packages(packages: &[String], recursive: bool) -> Result<()> {
     reason = "backend feature dispatch may select fallible implementations"
 )]
 #[cfg_attr(
+    any(feature = "arch", feature = "debian", feature = "debian-pure"),
+    allow(
+        clippy::unused_async,
+        reason = "the generic backend awaits native package lookup; selected native backends preview synchronously"
+    )
+)]
+#[cfg_attr(
     not(feature = "arch"),
     allow(
         unused_variables,
         reason = "only the Arch dry run states recursion truthfully; other backends never recurse"
     )
 )]
-fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> {
+async fn remove_dry_run(packages: &[String], recursive: bool) -> Result<()> {
     dispatch_backend! {
         debian: { debian::remove_dry_run(packages); Ok(()) },
         arch: { arch::remove_dry_run(packages, recursive) },
-        generic: { generic::remove_dry_run(packages) },
+        generic: { generic::remove_dry_run(packages).await },
     }
 }
 

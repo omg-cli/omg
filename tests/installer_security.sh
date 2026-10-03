@@ -31,7 +31,9 @@ for scenario in missing rejected wrong_tag accepted loader_error wrong_version m
     mkdir -p "$scenario_dir"
     INSTALL_DIR="$scenario_dir/bin"
     OMG_VERSION=v1.2.3
-    MAX_VERSION_PROBE_SECONDS=1
+    # Bash SECONDS has one-second resolution; a one-second deadline can expire
+    # before a loaded runner starts the probe and writes its process receipt.
+    MAX_VERSION_PROBE_SECONDS=2
     case "$scenario" in
       loader_error | wrong_version | missing_daemon | daemon_loader_error | hung_probe | forked_probe | second_install_failure)
         mkdir -p "$INSTALL_DIR"

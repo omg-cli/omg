@@ -7,6 +7,7 @@ scratch_root="$HOME/.cache/build-targets"
 mkdir -p "$scratch_root"
 scratch="$(mktemp -d "$scratch_root/omg-release-smoke-tests.XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
+unset OMG_SMOKE_SENTRY_DSN
 mkdir -p "$scratch/bin" "$scratch/tmp"
 
 fail() {
@@ -375,6 +376,24 @@ jq -se '.[2].extra.failures | length == 2 and .[0].result == "PRODUCT_FAIL" and 
 rm "$FAKE_SENTRY_ENVELOPE"
 assert_rc 0 "$reporter" "$result"
 [[ ! -f "$FAKE_SENTRY_ENVELOPE" ]] || fail "passing run sent an error report"
+export OMG_SMOKE_SENTRY_DSN='https://envonlykey@o123.ingest.us.sentry.io/456'
+assert_rc 0 "$reporter" "$scratch/sentry-run/results.json"
+jq -se '.[0].dsn == "https://fixturekey@o123.ingest.us.sentry.io/123"' "$FAKE_SENTRY_ENVELOPE" >/dev/null || fail "configured file did not win over environment DSN"
+if grep -Fq 'envonlykey' "$scratch/command.out"; then fail "Sentry log printed environment DSN"; fi
+export OMG_SMOKE_SENTRY_CONFIG="$scratch/sentry-run/missing-sentry.json"
+rm "$FAKE_SENTRY_ENVELOPE"
+assert_rc 0 "$reporter" "$scratch/sentry-run/results.json"
+jq -se '.[0].dsn == "https://envonlykey@o123.ingest.us.sentry.io/456"' "$FAKE_SENTRY_ENVELOPE" >/dev/null || fail "workflow DSN did not reach Sentry"
+if grep -Fq 'envonlykey' "$scratch/command.out"; then fail "Sentry log printed workflow DSN"; fi
+export OMG_SMOKE_SENTRY_DSN='https://not-a-dsn'
+rm "$FAKE_SENTRY_ENVELOPE"
+assert_rc 2 "$reporter" "$scratch/sentry-run/results.json"
+[[ ! -f "$FAKE_SENTRY_ENVELOPE" ]] || fail "malformed DSN reached Sentry"
+if grep -Fq 'not-a-dsn' "$scratch/command.out"; then fail "malformed DSN was printed"; fi
+unset OMG_SMOKE_SENTRY_DSN
+assert_rc 0 "$reporter" "$scratch/sentry-run/results.json"
+grep -q 'Sentry reporting disabled: no configuration' "$scratch/command.out" || fail "missing DSN did not disable reporting"
+export OMG_SMOKE_SENTRY_CONFIG="$scratch/sentry-config.json"
 export OMG_SMOKE_ENVIRONMENT=fixture-private-token
 assert_rc 2 "$reporter" "$scratch/sentry-run/results.json"
 [[ ! -f "$FAKE_SENTRY_ENVELOPE" ]] || fail 'unsupported environment reached Sentry'
@@ -518,7 +537,7 @@ done
 [[ -n "$child_result" ]] || fail 'interrupted QEMU child did not record its exit'
 
 export FAKE_QEMU_INFO_EXIT=0 FAKE_QEMU_STATE="$scratch/qemu-controller"
-for scenario in pass pull-failure product-failure product-exit-three timeout cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-aur invalid-aur wrong-aur-events kernel-crash controller-oom missing-health; do
+for scenario in pass pull-failure product-failure product-exit-three timeout signaled cleanup-failure transport-failure missing-receipt missing-daemon invalid-daemon missing-aur invalid-aur wrong-aur-events kernel-crash controller-oom missing-health; do
   export FAKE_QEMU_PULL_EXIT=0
   export FAKE_QEMU_DAEMON_RECEIPT=valid
   export FAKE_QEMU_AUR_RECEIPT=valid
@@ -539,7 +558,8 @@ for scenario in pass pull-failure product-failure product-exit-three timeout cle
     missing-health) export FAKE_QEMU_HEALTH_MISSING=1; expected_rc=120; expected_result=HARNESS_ERROR ;;
     product-failure) export FAKE_QEMU_GUEST_EXIT=1; expected_rc=1; expected_result=PRODUCT_FAIL ;;
     product-exit-three) export FAKE_QEMU_GUEST_EXIT=3; expected_rc=3; expected_result=PRODUCT_FAIL ;;
-    timeout) export FAKE_QEMU_GUEST_EXIT=124; expected_rc=124; expected_result=PRODUCT_FAIL ;;
+    timeout) export FAKE_QEMU_GUEST_EXIT=124; expected_rc=124; expected_result=HARNESS_ERROR ;;
+    signaled) export FAKE_QEMU_GUEST_EXIT=137; expected_rc=137; expected_result=HARNESS_ERROR ;;
     cleanup-failure) export FAKE_QEMU_CLEANUP_FAIL=1; expected_rc=3; expected_result=HARNESS_ERROR ;;
     transport-failure) export FAKE_QEMU_TRANSPORT_EXIT=1; expected_rc=3; expected_result=HARNESS_ERROR ;;
     missing-receipt) export FAKE_QEMU_MISSING_RECEIPT=1; expected_rc=3; expected_result=HARNESS_ERROR ;;

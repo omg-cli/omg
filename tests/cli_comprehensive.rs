@@ -347,13 +347,17 @@ fn behavior_inventory_keeps_offline_refusal_assertions() {
 /// Rows that need their own empty project directory.
 ///
 /// The shared fixture captures an `omg.lock` (env-capture) and other state
-/// early in the run, so a row whose contract is a missing-input refusal must
-/// not inherit it - `env share` would otherwise pass the lock check and fail
-/// the assertion instead of refusing.
+/// early in the run, so missing-input refusals must not inherit it. CI init
+/// variants also need separate destinations because the command deliberately
+/// preserves an existing workflow instead of replacing it.
 fn needs_isolated_fixture(case: &BehaviorCase) -> bool {
     matches!(
         case.id.as_str(),
-        "env-export-missing-lock" | "env-plan-missing-manifest" | "env-share-missing-lock"
+        "env-export-missing-lock"
+            | "env-plan-missing-manifest"
+            | "env-share-missing-lock"
+            | "ci-init"
+            | "ci-init-advanced"
     )
 }
 
@@ -557,12 +561,26 @@ impl TargetExpectations {
 enum Assertion {
     AuditSourceFailure,
     AuditFixRefusal,
+    AuditSecretScoped,
+    AuditSecretCritical,
+    AuditEolState,
+    LicenseAuditJson,
+    LicenseAuditMitJson,
+    LicenseAuditCsv,
+    LicenseEnterpriseText,
+    LicenseEnterpriseJson,
     SbomSourceFailure,
     SbomInventoryOnly,
     JsonStdout,
     Artifact(String),
+    Fingerprint(String),
     WorkspaceFilteredOutput,
     WorkspaceAllOutput,
+    CiGithubWorkflow,
+    CiGithubWorkflowAdvanced,
+    PackageDryRunInstall,
+    PackageDryRunRemove,
+    PackageDryRunRecursive,
     HooksInstalled,
     HooksAbsent,
     UpdateFastOutput,
@@ -575,18 +593,73 @@ enum Assertion {
     NativeAptOrphanRemoved,
     SelfUpdateDowngradeRefusal,
     EnvShareMissingLock,
+    NativeCount,
+    StatusNativeFast,
+    StatusNativeFull,
+    OutdatedNativeCount,
+    OutdatedJsonNativeCount,
+    DoctorNativeBackend,
+    DoctorEolState,
+    DoctorNetworkState,
+    InfoNativePackage,
+    ConfigSetPersisted,
+    ConfigGetPersisted,
+    ConfigListPersisted,
+    ConfigValidatePersisted,
+    ConfigPathIsolated,
+    ConfigResetDefaults,
+    PrivacyOptedOut,
+    PrivacyStatusDisabled,
+    PrivacyOptedIn,
+    PrivacyStatusEnabled,
+    RuntimeVersionRemoved,
+    RuntimeListState,
+    RuntimeSwitchState,
+    TaskExecuted,
+    ParallelTasksExecuted,
+    AllTasksExecuted,
 }
 
 impl Assertion {
     fn parse(raw: &str, line_number: usize) -> Self {
+        if let Some(case) = raw.strip_prefix("fingerprint:") {
+            assert!(
+                matches!(
+                    case,
+                    "snapshot-create"
+                        | "migrate-export"
+                        | "migrate-import"
+                        | "env-capture"
+                        | "env-check"
+                        | "team-status"
+                        | "team-push"
+                        | "team-pull"
+                ),
+                "unknown fingerprint assertion on inventory line {line_number}: {raw}"
+            );
+            return Self::Fingerprint(case.to_string());
+        }
         match raw {
             "audit-source-failure" => Self::AuditSourceFailure,
             "audit-fix-refusal" => Self::AuditFixRefusal,
+            "audit-secret-scoped" => Self::AuditSecretScoped,
+            "audit-secret-critical" => Self::AuditSecretCritical,
+            "audit-eol-state" => Self::AuditEolState,
+            "license-audit-json" => Self::LicenseAuditJson,
+            "license-audit-mit-json" => Self::LicenseAuditMitJson,
+            "license-audit-csv" => Self::LicenseAuditCsv,
+            "license-enterprise-text" => Self::LicenseEnterpriseText,
+            "license-enterprise-json" => Self::LicenseEnterpriseJson,
             "sbom-source-failure" => Self::SbomSourceFailure,
             "sbom-inventory-only" => Self::SbomInventoryOnly,
             "json-stdout" => Self::JsonStdout,
             "workspace-filtered-output" => Self::WorkspaceFilteredOutput,
             "workspace-all-output" => Self::WorkspaceAllOutput,
+            "ci-github-workflow" => Self::CiGithubWorkflow,
+            "ci-github-workflow-advanced" => Self::CiGithubWorkflowAdvanced,
+            "package-dry-run-install" => Self::PackageDryRunInstall,
+            "package-dry-run-remove" => Self::PackageDryRunRemove,
+            "package-dry-run-recursive" => Self::PackageDryRunRecursive,
             "hooks-installed" => Self::HooksInstalled,
             "hooks-absent" => Self::HooksAbsent,
             "update-fast-output" => Self::UpdateFastOutput,
@@ -599,6 +672,31 @@ impl Assertion {
             "native-apt-orphan-removed" => Self::NativeAptOrphanRemoved,
             "self-update-downgrade-refusal" => Self::SelfUpdateDowngradeRefusal,
             "env-share-missing-lock" => Self::EnvShareMissingLock,
+            "native-count" => Self::NativeCount,
+            "status-native-fast" => Self::StatusNativeFast,
+            "status-native-full" => Self::StatusNativeFull,
+            "outdated-native-count" => Self::OutdatedNativeCount,
+            "outdated-json-native-count" => Self::OutdatedJsonNativeCount,
+            "doctor-native-backend" => Self::DoctorNativeBackend,
+            "doctor-eol-state" => Self::DoctorEolState,
+            "doctor-network-state" => Self::DoctorNetworkState,
+            "info-native-package" => Self::InfoNativePackage,
+            "config-set-persisted" => Self::ConfigSetPersisted,
+            "config-get-persisted" => Self::ConfigGetPersisted,
+            "config-list-persisted" => Self::ConfigListPersisted,
+            "config-validate-persisted" => Self::ConfigValidatePersisted,
+            "config-path-isolated" => Self::ConfigPathIsolated,
+            "config-reset-defaults" => Self::ConfigResetDefaults,
+            "privacy-opted-out" => Self::PrivacyOptedOut,
+            "privacy-status-disabled" => Self::PrivacyStatusDisabled,
+            "privacy-opted-in" => Self::PrivacyOptedIn,
+            "privacy-status-enabled" => Self::PrivacyStatusEnabled,
+            "runtime-version-removed" => Self::RuntimeVersionRemoved,
+            "runtime-list-state" => Self::RuntimeListState,
+            "runtime-switch-state" => Self::RuntimeSwitchState,
+            "task-executed" => Self::TaskExecuted,
+            "parallel-tasks-executed" => Self::ParallelTasksExecuted,
+            "all-tasks-executed" => Self::AllTasksExecuted,
             _ => match Self::parse_artifact_path(raw) {
                 Ok(relative) => Self::Artifact(relative),
                 Err(reason) => panic!(
@@ -1091,7 +1189,7 @@ fn prepare_behavior_fixture(project: &TestProject) -> (String, String) {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
 
-    project.create_file("Makefile", ".PHONY: smoke overlap\nsmoke:\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\n");
+    project.create_file("Makefile", ".PHONY: smoke overlap parallel-one parallel-two\nsmoke:\n\t@printf omg-qemu-smoke-task > smoke-task.marker\n\t@echo smoke-task-ok\noverlap:\n\t@sh workspace-overlap.sh . primary\nparallel-one:\n\t@touch parallel-one.started\n\t@timeout 15 sh -c 'until test -e parallel-two.started; do sleep 0.05; done'\n\t@printf parallel-one > parallel-one.done\n\t@echo parallel-one-ok\nparallel-two:\n\t@touch parallel-two.started\n\t@timeout 15 sh -c 'until test -e parallel-one.started; do sleep 0.05; done'\n\t@printf parallel-two > parallel-two.done\n\t@echo parallel-two-ok\n");
     project.create_file(
         "workspace-overlap.sh",
         include_str!("../scripts/workspace-overlap-fixture.sh"),
@@ -1190,6 +1288,7 @@ fn has_ansi(text: &str) -> bool {
 #[cfg(feature = "arch")] // This inventory fixture explicitly seeds a pacman database.
 fn behavior_inventory_runs_in_hermetic_state() {
     use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::time::Instant;
 
     let project = TestProject::for_distro("arch");
@@ -1280,20 +1379,133 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .exit_for(Distro::Arch)
         };
         let args: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
-        let started = Instant::now();
-        let result = project.run_with_env(
-            &args,
-            &[
-                ("HOME", &home),
-                ("PATH", &path),
-                ("SHELL", "/bin/bash"),
-                ("NO_COLOR", "1"),
-                ("TERM", "dumb"),
-                ("GIT_CONFIG_GLOBAL", "/dev/null"),
-                ("GIT_CONFIG_NOSYSTEM", "1"),
-                ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
-            ],
+        if case.id == "run-all" {
+            let prior_marker = project.path().join("smoke-task.marker");
+            if prior_marker.exists() {
+                std::fs::remove_file(prior_marker).expect("remove earlier run marker");
+            }
+            project.create_file(
+                "package.json",
+                "{\"scripts\":{\"smoke\":\"echo npm-task-ok\"}}\n",
+            );
+            for (name, body) in [
+                (
+                    "npm",
+                    "#!/bin/sh\ncase $1:$2 in\n  --version:) echo 9.0.0 ;;\n  run:smoke) printf npm-smoke-task > npm-task.marker; echo npm-task-ok ;;\n  *) exit 96 ;;\nesac\n",
+                ),
+                ("node", "#!/bin/sh\necho v24.0.0\n"),
+            ] {
+                let stub = project.path().join("bin").join(name);
+                std::fs::write(&stub, body).expect("write isolated task-runner stub");
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700))
+                    .expect("make task-runner stub executable");
+            }
+        }
+        let privacy_case = matches!(
+            case.id.as_str(),
+            "privacy-opt-out" | "privacy-status" | "privacy-opt-in"
         );
+        let config_dir = project.path().join(if privacy_case {
+            "privacy-state"
+        } else if case.id == "config-path" {
+            "config-path-only"
+        } else {
+            "config-state"
+        });
+        let privacy_data_dir = project.path().join("privacy-data");
+        let fingerprint_data_dir = project.path().join("fingerprint-data");
+        let eol_data_dir = project.path().join("eol-data");
+        let mut command_env = vec![
+            ("HOME", home.as_str()),
+            ("PATH", path.as_str()),
+            ("SHELL", "/bin/bash"),
+            ("NO_COLOR", "1"),
+            ("TERM", "dumb"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
+        ];
+        if case.id.starts_with("config-") || privacy_case {
+            command_env.push((
+                "OMG_CONFIG_DIR",
+                config_dir.to_str().expect("UTF-8 config path"),
+            ));
+        }
+        let license_policy_dir = project.path().join("license-policy-state");
+        if case.assertions.contains(&Assertion::LicenseAuditMitJson) {
+            std::fs::create_dir_all(&license_policy_dir)
+                .expect("create isolated license policy directory");
+            std::fs::write(
+                license_policy_dir.join("policy.toml"),
+                "allowed_licenses = [\"LicenseRef-QemuNoInstalledLicense\"]\n",
+            )
+            .expect("seed license policy that rejects the installed pacman fixture");
+            command_env.push((
+                "OMG_CONFIG_DIR",
+                license_policy_dir
+                    .to_str()
+                    .expect("UTF-8 license policy path"),
+            ));
+        }
+        if privacy_case {
+            command_env.push((
+                "OMG_DATA_DIR",
+                privacy_data_dir.to_str().expect("UTF-8 privacy data path"),
+            ));
+        }
+        if case.id == "snapshot-create" {
+            command_env.push((
+                "OMG_DATA_DIR",
+                fingerprint_data_dir
+                    .to_str()
+                    .expect("UTF-8 fingerprint data path"),
+            ));
+        }
+        if case.id == "audit-eol" {
+            command_env.push((
+                "OMG_DATA_DIR",
+                eol_data_dir.to_str().expect("UTF-8 EOL data path"),
+            ));
+            command_env.push(("OMG_DISABLE_DAEMON", "1"));
+            command_env.push(("OMG_TEST_MODE", "0"));
+            for (runtime, version) in [("node", "16.20.2"), ("python", "3.12.14")] {
+                let runtime_dir = eol_data_dir.join("versions").join(runtime);
+                std::fs::create_dir_all(runtime_dir.join(version))
+                    .expect("create private EOL runtime version");
+                std::os::unix::fs::symlink(version, runtime_dir.join("current"))
+                    .expect("point private EOL runtime at version");
+            }
+        }
+        if case.id == "privacy-opt-out" {
+            std::fs::create_dir_all(&privacy_data_dir).expect("create privacy data directory");
+            std::fs::write(privacy_data_dir.join("telemetry_queue.json"), b"queued")
+                .expect("seed queued telemetry");
+        }
+        if case.id == "audit-secrets" {
+            project.create_file(
+                "project/config.txt",
+                &format!("password={}{}\n", "qemuSecret", "7429"),
+            );
+            project.create_file(
+                "outside.txt",
+                &format!("password={}{}\n", "outsideSecret", "9031"),
+            );
+        } else if case.id == "audit-secrets-critical" {
+            project.create_file(
+                "project/critical/key.pem",
+                &format!("{}{}\n", "-----BEGIN ", "PRIVATE KEY-----"),
+            );
+        }
+        let remove_data_dir = matches!(case.id.as_str(), "remove" | "remove-flags")
+            .then(|| project.path().join("remove-state"));
+        if let Some(path) = &remove_data_dir {
+            let mock = omg_lib::package_managers::mock::MockPackageManager::new_in("arch", path);
+            mock.set_installed_version("bash", "5.3.20-1")
+                .expect("seed isolated bash package");
+            command_env.push(("OMG_DATA_DIR", path.to_str().expect("UTF-8 mock path")));
+        }
+        let started = Instant::now();
+        let result = project.run_with_env(&args, &command_env);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut issues = Vec::new();
         if result.exit_code != expected_exit {
@@ -1327,8 +1539,135 @@ fn behavior_inventory_runs_in_hermetic_state() {
         {
             issues.push("empty-inventory audit did not report its completed scan".to_string());
         }
+        let config_file = config_dir.join("config.toml");
+        let config_value_is = |file: &std::path::Path, expected: &str| {
+            file.symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                && std::fs::read_to_string(file).is_ok_and(|contents| {
+                    let assignments: Vec<_> = contents
+                        .lines()
+                        .filter(|line| {
+                            line.trim_start()
+                                .strip_prefix("telemetry_enabled")
+                                .is_some_and(|rest| rest.trim_start().starts_with('='))
+                        })
+                        .collect();
+                    assignments.len() == 1
+                        && assignments[0] == format!("telemetry_enabled = {expected}")
+                })
+        };
         for assertion in &case.assertions {
             match assertion {
+                Assertion::TaskExecuted => {
+                    if !std::fs::read_to_string(project.path().join("smoke-task.marker"))
+                        .is_ok_and(|contents| contents == "omg-qemu-smoke-task")
+                        || !result.stdout.lines().any(|line| line == "smoke-task-ok")
+                    {
+                        issues.push("run did not execute its Make task".to_string());
+                    }
+                }
+                Assertion::ParallelTasksExecuted => {
+                    if [("parallel-one.done", "parallel-one"),
+                        ("parallel-two.done", "parallel-two")]
+                        .iter().any(|(file, expected)|
+                            !std::fs::read_to_string(project.path().join(file))
+                                .is_ok_and(|contents| contents == *expected))
+                        || !result.stdout.lines().any(|line| line == "parallel-one-ok")
+                        || !result.stdout.lines().any(|line| line == "parallel-two-ok")
+                    {
+                        issues.push("parallel tasks did not overlap and finish".to_string());
+                    }
+                }
+                Assertion::AllTasksExecuted => {
+                    if !std::fs::read_to_string(project.path().join("smoke-task.marker"))
+                        .is_ok_and(|contents| contents == "omg-qemu-smoke-task")
+                        || !std::fs::read_to_string(project.path().join("npm-task.marker"))
+                            .is_ok_and(|contents| contents == "npm-smoke-task")
+                        || !result.stdout.lines().any(|line| line == "smoke-task-ok")
+                        || !result.stdout.lines().any(|line| line == "npm-task-ok")
+                    {
+                        issues.push("run --all missed a Make or npm task".to_string());
+                    }
+                }
+                Assertion::PrivacyOptedOut => {
+                    if !config_value_is(&config_file, "false")
+                        || !privacy_data_dir
+                            .join("telemetry_queue.json")
+                            .symlink_metadata()
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        || !result.stdout.contains("Telemetry disabled locally")
+                    {
+                        issues.push(
+                            "privacy opt-out did not persist disabled and purge queue".to_string(),
+                        );
+                    }
+                }
+                Assertion::PrivacyStatusDisabled => {
+                    if !config_value_is(&config_file, "false")
+                        || !result
+                            .stdout
+                            .lines()
+                            .any(|line| line.trim() == "Telemetry: Disabled")
+                    {
+                        issues
+                            .push("privacy status did not reflect disabled telemetry".to_string());
+                    }
+                }
+                Assertion::PrivacyOptedIn => {
+                    if !config_value_is(&config_file, "true")
+                        || !result.stdout.contains("Telemetry enabled locally")
+                    {
+                        issues.push("privacy opt-in did not persist enabled telemetry".to_string());
+                    }
+                }
+                Assertion::ConfigSetPersisted => {
+                    if !config_value_is(&config_file, "true")
+                        || !result.stdout.contains("Set telemetry.enabled = true")
+                    {
+                        issues.push("config set did not persist true".to_string());
+                    }
+                }
+                Assertion::ConfigGetPersisted => {
+                    if !config_value_is(&config_file, "true")
+                        || result.stdout.trim_end_matches('\n') != "true"
+                    {
+                        issues.push("config get disagrees with persisted true".to_string());
+                    }
+                }
+                Assertion::ConfigListPersisted => {
+                    if !config_value_is(&config_file, "true")
+                        || !result
+                            .stdout
+                            .lines()
+                            .any(|line| line.trim() == "telemetry.enabled = true")
+                    {
+                        issues.push("config list omits persisted telemetry value".to_string());
+                    }
+                }
+                Assertion::ConfigValidatePersisted => {
+                    if !config_value_is(&config_file, "true")
+                        || !result.stdout.contains("Configuration is valid!")
+                    {
+                        issues.push("config validate did not check persisted config".to_string());
+                    }
+                }
+                Assertion::ConfigPathIsolated => {
+                    if result.stdout.trim_end_matches('\n') != config_file.to_string_lossy()
+                        || !config_file
+                            .symlink_metadata()
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        issues.push("config path did not name isolated config file".to_string());
+                    }
+                }
+                Assertion::ConfigResetDefaults => {
+                    if !config_value_is(&config_file, "false")
+                        || !config_value_is(&config_file.with_extension("toml.backup"), "true")
+                        || !result.stdout.contains("Configuration reset to defaults")
+                    {
+                        issues.push("config reset did not restore defaults and backup".to_string());
+                    }
+                }
                 Assertion::SbomSourceFailure => {
                     let report = std::fs::read_to_string(project.path().join("sbom.json"))
                         .ok()
@@ -1377,6 +1716,46 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         "audit assertion requires an explicit empty-inventory oracle"
                     );
                 }
+                Assertion::AuditSecretScoped => {
+                    if !result.stdout.contains("⚠ Found 1 potential secrets:")
+                        || !result.stdout.contains("  ● 1 MEDIUM")
+                        || !result.stdout.contains("  [MEDIUM] Password in project/config.txt:1")
+                        || !result.stdout.contains("      pass**********...7429")
+                        || result.stdout.contains("No secrets detected")
+                        || result.stdout.contains("outside.txt")
+                        || result.stdout.contains("outsideSecret9031")
+                        || result.stdout.contains("qemuSecret7429")
+                        || result.stderr.contains("qemuSecret7429")
+                        || result.stdout.matches("  [MEDIUM] Password in ").count() != 1
+                    {
+                        issues.push("scoped secret scan did not report one redacted medium finding".to_string());
+                    }
+                }
+                Assertion::AuditSecretCritical => {
+                    let raw_marker = format!("{}{}", "-----BEGIN ", "PRIVATE KEY-----");
+                    if !result.stdout.contains("⚠ Found 1 potential secrets:")
+                        || !result.stdout.contains("  ● 1 CRITICAL")
+                        || !result.stdout.contains("  [CRITICAL] Private Key in project/critical/key.pem:1")
+                        || !result.stdout.contains("      ----**********...----")
+                        || result.stdout.contains(&raw_marker)
+                        || result.stderr.contains(&raw_marker)
+                        || result.stdout.matches("  [CRITICAL] Private Key in ").count() != 1
+                        || !result.stderr.contains("Secret scan failed: 1 critical secret finding(s) require remediation")
+                    {
+                        issues.push("critical secret scan did not fail and redact the key fixture".to_string());
+                    }
+                }
+                Assertion::AuditEolState => {
+                    if !result.stdout.contains("  ✗ node v16.20.2 - EOL (EOL: 2023-09-11)")
+                        || !result.stdout.contains("  ✓ python v3.12.14 - Active (EOL: 2028-10-31)")
+                        || !result.stdout.lines().any(|line| line == "⚠ 1 runtime(s) need attention. Consider upgrading to supported versions.")
+                        || result.stdout.contains("All runtimes are within support period")
+                        || result.stdout.matches("node v16.20.2").count() != 1
+                        || result.stdout.matches("python v3.12.14").count() != 1
+                    {
+                        issues.push("audit EOL did not classify both private runtimes and count one issue".to_string());
+                    }
+                }
                 Assertion::HooksInstalled | Assertion::HooksAbsent => {
                     use std::os::unix::fs::PermissionsExt as _;
                     for (name, label) in [
@@ -1422,9 +1801,142 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         issues.push(format!("workspace task counts primary={primary} nested={nested}; expected primary=1 nested={expected_nested}"));
                     }
                 }
+                Assertion::PackageDryRunInstall
+                | Assertion::PackageDryRunRemove
+                | Assertion::PackageDryRunRecursive => {
+                    let install = matches!(assertion, Assertion::PackageDryRunInstall);
+                    let preview = if install {
+                        "  | Install Preview"
+                    } else {
+                        "  | Remove Preview"
+                    };
+                    let no_changes = if install {
+                        "  ℹ • No changes will be made (dry run)"
+                    } else {
+                        "  ℹ No changes made (dry run)"
+                    };
+                    let package_line = if install {
+                        "│ pacman  ┆"
+                    } else {
+                        "    ✗ bash "
+                    };
+                    if !result.stdout.lines().any(|line| line == preview)
+                        || !result.stdout.lines().any(|line| line == "    dry run")
+                        || !result.stdout.contains(package_line)
+                        || !result.stdout.lines().any(|line| line == no_changes)
+                        || (matches!(assertion, Assertion::PackageDryRunRecursive)
+                            && !result
+                                .stdout
+                                .contains("Additional unneeded dependencies would also be removed"))
+                    {
+                        issues.push(format!("{} did not prove a target-specific dry-run preview", case.id));
+                    }
+                }
+                Assertion::CiGithubWorkflow | Assertion::CiGithubWorkflowAdvanced => {
+                    let path = project.path().join(".github/workflows/ci.yml");
+                    let regular = path.symlink_metadata().is_ok_and(|metadata| {
+                        metadata.is_file() && !metadata.file_type().is_symlink()
+                    });
+                    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+                    let lines: Vec<_> = contents.lines().collect();
+                    let has_line = |expected: &str| lines.contains(&expected);
+                    let advanced = matches!(assertion, Assertion::CiGithubWorkflowAdvanced);
+                    let common = [
+                        "name: CI",
+                        "on: [push, pull_request]",
+                        "  contents: read",
+                        "  build-and-test:",
+                        "        run: omg run build",
+                        "        run: omg run test",
+                    ];
+                    let advanced_lines = ["          cargo audit", "          name: rust-dependencies-sbom"];
+                    if !regular
+                        || !common.iter().all(|line| has_line(line))
+                        || !lines
+                            .iter()
+                            .any(|line| line.starts_with("          OMG_VERSION=v"))
+                        || has_line("  security:") != advanced
+                        || (advanced
+                            && (!advanced_lines.iter().all(|line| has_line(line))
+                                || !lines
+                                    .iter()
+                                    .any(|line| line.starts_with("          cargo cyclonedx "))))
+                    {
+                        issues.push("ci init did not generate the expected GitHub workflow".to_string());
+                    }
+                }
                 Assertion::JsonStdout => {
                     if serde_json::from_str::<serde_json::Value>(&result.stdout).is_err() {
                         issues.push("JSON output did not parse".to_string());
+                    }
+                }
+                Assertion::LicenseAuditJson => {
+                    let expected = serde_json::json!([{
+                        "name": "pacman",
+                        "version": "7.0.0-1",
+                        "license": "GPL-2.0-or-later",
+                        "category": "Copyleft"
+                    }]);
+                    if serde_json::from_str::<serde_json::Value>(&result.stdout).ok()
+                        != Some(expected)
+                    {
+                        issues.push("license JSON did not match the isolated installed pacman package".to_string());
+                    }
+                }
+                Assertion::LicenseAuditMitJson => {
+                    if serde_json::from_str::<serde_json::Value>(&result.stdout).ok()
+                        != Some(serde_json::json!([]))
+                        || !result.stderr.contains("License policy check found 1 violation(s)")
+                    {
+                        issues.push("MIT display filter concealed a full-inventory license violation or returned an unexpected package".to_string());
+                    }
+                }
+                Assertion::LicenseAuditCsv => {
+                    let path = project.path().join("licenses-export.csv");
+                    let expected = "Package,Version,License,Category\npacman,7.0.0-1,GPL-2.0-or-later,Copyleft\n";
+                    let actual = std::fs::read_to_string(path)
+                        .ok()
+                        .map(|content| content.replace("\r\n", "\n"));
+                    if actual.as_deref() != Some(expected) {
+                        issues.push("license CSV export did not match the isolated installed pacman package".to_string());
+                    }
+                }
+                Assertion::LicenseEnterpriseText => {
+                    for expected in [
+                        "License Compliance Scan",
+                        "1 total packages",
+                        "GPL-2.0-or-later: 1 assignments (100%)",
+                        "pacman - Copyleft license (GPL) requires legal review",
+                    ] {
+                        if !result.stdout.contains(expected) {
+                            issues.push(format!("enterprise license scan omitted {expected:?}"));
+                        }
+                    }
+                }
+                Assertion::LicenseEnterpriseJson => {
+                    let exports: Vec<_> = std::fs::read_dir(project.path())
+                        .expect("list isolated enterprise exports")
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry.file_name().to_string_lossy().starts_with("license-scan-")
+                                && entry.path().extension().is_some_and(|ext| ext == "json")
+                        })
+                        .collect();
+                    let expected = serde_json::json!({
+                        "total": 1,
+                        "by_license": {"GPL-2.0-or-later": 1},
+                        "violations": [{
+                            "package": "pacman",
+                            "license": "GPL-2.0-or-later",
+                            "reason": "Copyleft license (GPL) requires legal review"
+                        }],
+                        "unknown": []
+                    });
+                    let actual = exports.first().and_then(|entry| {
+                        std::fs::read_to_string(entry.path()).ok()
+                    }).and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+                    if exports.len() != 1 || actual != Some(expected) {
+                        issues.push("enterprise license export did not match the isolated installed pacman package".to_string());
                     }
                 }
                 Assertion::Artifact(relative) => {
@@ -1437,6 +1949,17 @@ fn behavior_inventory_runs_in_hermetic_state() {
                             "artifact {relative} was not written as valid JSON at {}",
                             path.display()
                         ));
+                    }
+                }
+                Assertion::Fingerprint(fingerprint_case) => {
+                    let artifact = match fingerprint_case.as_str() {
+                        "snapshot-create" => fingerprint_data_dir.join("snapshots/index.json"),
+                        "migrate-export" | "migrate-import" => project.path().join("manifest.json"),
+                        "team-status" => project.path().join(".omg/team-status.json"),
+                        _ => project.path().join("omg.lock"),
+                    };
+                    if !artifact.is_file() {
+                        issues.push(format!("fingerprint artifact missing: {}", artifact.display()));
                     }
                 }
                 Assertion::SelfUpdateDowngradeRefusal => {
@@ -1456,9 +1979,34 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::SearchOfficialTreeOutput
                 | Assertion::NativeTreeInstalled
                 | Assertion::NativeTreeAbsent
-                | Assertion::NativeAptOrphanRemoved => {
+                | Assertion::NativeAptOrphanRemoved
+                | Assertion::NativeCount
+                | Assertion::StatusNativeFast
+                | Assertion::StatusNativeFull
+                | Assertion::OutdatedNativeCount
+                | Assertion::OutdatedJsonNativeCount
+                | Assertion::DoctorNativeBackend
+                | Assertion::DoctorEolState
+                | Assertion::DoctorNetworkState
+                | Assertion::InfoNativePackage
+                | Assertion::RuntimeVersionRemoved
+                | Assertion::RuntimeListState
+                | Assertion::RuntimeSwitchState
+                // Test mode always opts out, so only the real guest can prove
+                // enabled privacy status after opt-in.
+                | Assertion::PrivacyStatusEnabled => {
                     unreachable!("QEMU-only assertion executed in the hermetic portable lane")
                 }
+            }
+        }
+
+        for path in match case.id.as_str() {
+            "audit-secrets" => &["project/config.txt", "outside.txt"][..],
+            "audit-secrets-critical" => &["project/critical/key.pem"][..],
+            _ => &[][..],
+        } {
+            if let Err(error) = std::fs::remove_file(project.path().join(path)) {
+                issues.push(format!("failed to remove secret fixture {path}: {error}"));
             }
         }
 

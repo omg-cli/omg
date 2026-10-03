@@ -4,8 +4,18 @@ use crate::cli::{style, ui};
 
 /// Generic dry run: this backend never cleans orphaned dependencies, so no
 /// recursion claim is printed.
-pub fn remove_dry_run(packages: &[String]) -> Result<()> {
+pub async fn remove_dry_run(packages: &[String]) -> Result<()> {
     crate::core::security::validate_package_names(packages)?;
+    let manager = crate::package_managers::get_package_manager()?;
+    let installed = manager.list_installed().await?;
+    let mut selected = Vec::with_capacity(packages.len());
+    for name in packages {
+        let package = installed
+            .iter()
+            .find(|package| package.name == *name)
+            .ok_or_else(|| anyhow::anyhow!("Package '{name}' is not installed"))?;
+        selected.push(package);
+    }
 
     crate::cli::modern_ui::print_phase_header("🗑️", "Remove Preview", "dry run");
     println!();
@@ -14,11 +24,12 @@ pub fn remove_dry_run(packages: &[String]) -> Result<()> {
         style::info("→")
     );
 
-    for pkg_name in packages {
+    for package in selected {
         println!(
-            "    {} {} (feature-specific info unavailable)",
-            style::dim("○"),
-            style::package(pkg_name)
+            "    {} {} {}",
+            style::error("✗"),
+            style::package(&package.name),
+            style::version(&package.version.to_string())
         );
     }
 

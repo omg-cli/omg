@@ -180,6 +180,18 @@ impl EnvironmentState {
     reason = "backend builds await a blocking package probe while backend-free builds fail directly"
 )]
 async fn explicit_packages_for_fingerprint() -> Result<Vec<String>> {
+    #[cfg(feature = "fedora")]
+    if matches!(
+        crate::core::env::distro::detect_distro(),
+        crate::core::env::distro::Distro::Fedora
+    ) {
+        // Keep fingerprinting aligned with status/list-explicit. DNF owns
+        // installation reasons; RPM's installed set alone cannot recover them.
+        return crate::package_managers::get_package_manager()?
+            .list_explicit()
+            .await;
+    }
+
     #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
     {
         tokio::task::spawn_blocking(crate::package_managers::list_explicit_fast)
@@ -197,7 +209,7 @@ async fn explicit_packages_for_fingerprint() -> Result<Vec<String>> {
 ))]
 fn fingerprint_requires_backend() -> Result<Vec<String>> {
     anyhow::bail!(
-        "Environment fingerprinting is not available without an Arch or Debian package backend"
+        "Environment fingerprinting is not available without an Arch, Debian, or Fedora package backend"
     )
 }
 
@@ -602,7 +614,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("not available without an Arch or Debian package backend"),
+                .contains("not available without an Arch, Debian, or Fedora package backend"),
             "got: {error}"
         );
     }

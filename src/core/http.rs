@@ -138,13 +138,34 @@ pub(crate) async fn fetch_public_download(
     raw: &str,
     user_agent: &str,
 ) -> anyhow::Result<reqwest::Response> {
-    fetch_public_download_with_timeout(raw, user_agent, None).await
+    fetch_public_download_with_options(raw, user_agent, None, None, true).await
 }
 
 pub(crate) async fn fetch_public_download_with_timeout(
     raw: &str,
     user_agent: &str,
     total_timeout: Option<Duration>,
+) -> anyhow::Result<reqwest::Response> {
+    fetch_public_download_with_options(raw, user_agent, total_timeout, None, false).await
+}
+
+/// Request the remaining bytes of a public archive using a strong entity tag.
+/// The range headers are carried across every independently validated redirect.
+pub(crate) async fn fetch_public_download_with_range(
+    raw: &str,
+    user_agent: &str,
+    offset: u64,
+    validator: reqwest::header::HeaderValue,
+) -> anyhow::Result<reqwest::Response> {
+    fetch_public_download_with_options(raw, user_agent, None, Some((offset, validator)), true).await
+}
+
+async fn fetch_public_download_with_options(
+    raw: &str,
+    user_agent: &str,
+    total_timeout: Option<Duration>,
+    range: Option<(u64, reqwest::header::HeaderValue)>,
+    binary_transfer: bool,
 ) -> anyhow::Result<reqwest::Response> {
     let mut url = Url::parse(raw).map_err(|_| anyhow::anyhow!("Invalid download URL"))?;
     for hop in 0..=MAX_REDIRECTS {
@@ -176,15 +197,25 @@ pub(crate) async fn fetch_public_download_with_timeout(
             .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
             .read_timeout(DOWNLOAD_READ_TIMEOUT)
             .resolve_to_addrs(&host, &addresses);
+        if binary_transfer {
+            builder = builder.no_gzip().no_brotli().no_zstd();
+        }
         if let Some(timeout) = total_timeout {
             builder = builder.timeout(timeout);
         }
         let client = builder.build()?;
-        let response = client
+        let mut request = client
             .get(url.clone())
-            .header(reqwest::header::USER_AGENT, user_agent)
-            .send()
-            .await?;
+            .header(reqwest::header::USER_AGENT, user_agent);
+        if binary_transfer {
+            request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+        }
+        if let Some((offset, validator)) = &range {
+            request = request
+                .header(reqwest::header::RANGE, format!("bytes={offset}-"))
+                .header(reqwest::header::IF_RANGE, validator.clone());
+        }
+        let response = request.send().await?;
         if !response.status().is_redirection() {
             return Ok(response);
         }

@@ -311,6 +311,7 @@ mod tests {
         let package = SecurityPackage {
             name: "fixture+tools".into(),
             version: "2:1.0-3".into(),
+            advisory_source: None,
             architecture: Some("amd64".into()),
             description: "Installed component".into(),
             licenses: vec!["custom license".into()],
@@ -357,6 +358,11 @@ mod tests {
             );
             assert!(report.dependencies.is_empty());
         }
+        let mut sourced = package.clone();
+        sourced.advisory_source = Some(("different-source".into(), "1.0".into()));
+        let report = compose(&[sourced], None, Distro::Debian).unwrap();
+        assert_eq!(report.components[0].name, "fixture+tools");
+        assert_eq!(report.components[0].version, "2:1.0-3");
         assert!(compose(&[], None, Distro::Unknown).is_err());
         assert!(compose(&[package.clone(), package], None, Distro::Debian).is_err());
     }
@@ -366,6 +372,7 @@ mod tests {
         let old = SecurityPackage {
             name: "fixture".into(),
             version: "1:1.0-1".into(),
+            advisory_source: None,
             architecture: Some("x86_64".into()),
             description: String::new(),
             licenses: vec![],

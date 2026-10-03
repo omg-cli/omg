@@ -43,7 +43,9 @@ use crate::config::{AurBuildMethod, Settings};
 use crate::core::http::shared_client;
 use crate::core::{Package, PackageSource, paths};
 use crate::package_managers::{get_potential_aur_packages, pacman_db};
-use crate::runtimes::common::{BudgetedReader, BudgetedWriter, MAX_DECOMPRESSED_BYTES};
+use crate::runtimes::common::{
+    BudgetedReader, BudgetedWriter, MAX_DECOMPRESSED_BYTES, decode_xz_to,
+};
 
 use crate::core::security::artifact::ArchiveSnapshot;
 const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc";
@@ -3216,7 +3218,7 @@ impl AurClient {
             let temporary = tempfile::NamedTempFile::new()
                 .context("Failed to create temporary AUR package metadata spool")?;
             let mut output = BudgetedWriter::new(temporary, budget);
-            lzma_rs::xz_decompress(&mut BufReader::new(file), &mut output)
+            decode_xz_to(BufReader::new(file), &mut output)
                 .map_err(|error| anyhow::anyhow!("xz: {error}"))?;
             let mut output = output.into_inner().into_file();
             output.rewind()?;

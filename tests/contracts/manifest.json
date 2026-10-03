@@ -1343,7 +1343,8 @@
         "debian",
         "debian-trixie",
         "ubuntu",
-        "debian-pure"
+        "debian-pure",
+        "fedora"
       ],
       "requires": [
         "success",
@@ -1478,7 +1479,6 @@
       "surface": "omg env capture",
       "platforms": [
         "portable",
-        "fedora",
         "macos"
       ],
       "requires": [

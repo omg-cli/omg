@@ -27,7 +27,7 @@ use std::time::SystemTime;
 use tracing::instrument;
 
 use crate::core::paths;
-use crate::runtimes::common::{BudgetedReader, BudgetedSink, BudgetedWriter};
+use crate::runtimes::common::{BudgetedReader, BudgetedSink, BudgetedWriter, decode_xz_to};
 
 /// TTL for cache eviction safety net (30 minutes)
 const CACHE_TTL_SECS: u64 = 30 * 60;
@@ -241,7 +241,7 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
             Box::new(BudgetedReader::new(decoder, BudgetedSink::max_budget()))
         } else if probe.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
             let mut output = BudgetedWriter::new(Vec::new(), BudgetedSink::max_budget());
-            lzma_rs::xz_decompress(&mut BufReader::new(file), &mut output)
+            decode_xz_to(BufReader::new(file), &mut output)
                 .context("Failed to decompress xz pacman database")?;
             Box::new(Cursor::new(output.into_inner()))
         } else if probe.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
@@ -1539,6 +1539,20 @@ mod tests {
                 .to_string()
                 .contains("Unsupported pacman database compression")
         );
+    }
+
+    #[test]
+    fn parse_sync_db_accepts_sha256_checked_xz() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("fixture.db");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../tests/data/xz-subset/pacman-sync-sha256.db.xz"),
+        )
+        .expect("write repository database");
+        let packages = parse_sync_db(&path, "fixture").expect("decode SHA-256 checked database");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages["fixture"].name, "fixture");
     }
 
     #[test]

@@ -75,8 +75,9 @@ impl crate::package_managers::PackageManager for AptPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Package>>> + Send + '_>> {
         let query = query.to_string();
         Box::pin(async move {
-            // Try fast path first (index/mmap loading does disk I/O; keep it
-            // off the executor thread)
+            // The FST finds names quickly, but its version ranking does not
+            // model APT pins or backports. Resolve all hits against one native
+            // cache so displayed versions match the install candidate.
             let fast_query = query.clone();
             let fast_results =
                 tokio::task::spawn_blocking(move || super::debian_db::search_fast(&fast_query))
@@ -85,7 +86,13 @@ impl crate::package_managers::PackageManager for AptPackageManager {
             if let Ok(results) = fast_results
                 && !results.is_empty()
             {
-                return Ok(results);
+                let candidates =
+                    tokio::task::spawn_blocking(move || candidate_packages_for_names(results))
+                        .await
+                        .context("APT candidate task failed")??;
+                if !candidates.is_empty() {
+                    return Ok(candidates);
+                }
             }
 
             let results = tokio::task::spawn_blocking(move || search_sync(&query))
@@ -165,16 +172,6 @@ impl crate::package_managers::PackageManager for AptPackageManager {
         Box::pin(async move {
             // SECURITY: Validate package name
             crate::core::security::validate_package_name(&package)?;
-
-            // Try fast path first
-            let fast_package = package.clone();
-            if let Ok(Some(pkg)) =
-                tokio::task::spawn_blocking(move || super::debian_db::get_info_fast(&fast_package))
-                    .await
-                    .context("Debian info task failed")?
-            {
-                return Ok(Some(pkg));
-            }
 
             let info = tokio::task::spawn_blocking(move || get_sync_pkg_info(&package))
                 .await
@@ -304,10 +301,11 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
     for pkg in cache.packages(&PackageSort::default()) {
         let name = pkg.name();
         let matched = name.contains(&query_lower)
-            || pkg
-                .candidate()
-                .and_then(|c| c.summary())
-                .is_some_and(|s| s.to_lowercase().contains(&query_lower));
+            || pkg.candidate().is_some_and(|candidate| {
+                selected_summary(&candidate)
+                    .to_lowercase()
+                    .contains(&query_lower)
+            });
 
         if matched {
             let candidate = pkg.candidate();
@@ -323,7 +321,7 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
                 .as_ref()
                 .map_or(0, |v| i64::try_from(v.size()).unwrap_or(i64::MAX));
 
-            let description = candidate.and_then(|c| c.summary()).unwrap_or_default();
+            let description = candidate.as_ref().map(selected_summary).unwrap_or_default();
 
             results.push(SyncPackage {
                 name: name.to_string(),
@@ -343,21 +341,68 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
     Ok(results)
 }
 
+/// APT's translated description can point at another version when several
+/// suites publish the same name. Read the selected version's own Packages
+/// record first; its first Description line is the short summary.
+fn selected_summary(version: &rust_apt::Version<'_>) -> String {
+    version
+        .get_record("Description")
+        .and_then(|description| {
+            description
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|summary| !summary.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| version.summary())
+        .unwrap_or_default()
+}
+
 /// Detailed metadata for one package from the APT cache, if present.
 pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
+    get_sync_pkg_info_selected(name, None, true)
+}
+
+/// Resolve either APT's selected candidate or one explicitly requested
+/// version. The caller must never grade a different version from the target
+/// passed to apt-get.
+pub fn get_sync_pkg_info_for_version(
+    name: &str,
+    requested_version: Option<&str>,
+) -> Result<Option<PackageInfo>> {
+    get_sync_pkg_info_selected(name, requested_version, false)
+}
+
+fn get_sync_pkg_info_selected(
+    name: &str,
+    requested_version: Option<&str>,
+    allow_installed_fallback: bool,
+) -> Result<Option<PackageInfo>> {
     let (_apt_guard, cache) = open_cache(&[])?;
     let Some(pkg) = cache.get(name) else {
         return Ok(None);
     };
 
-    let Some(version) = pkg.candidate().or_else(|| pkg.installed()) else {
+    let version = if let Some(requested) = requested_version {
+        pkg.get_version(requested)
+    } else {
+        pkg.candidate().or_else(|| {
+            if allow_installed_fallback {
+                pkg.installed()
+            } else {
+                None
+            }
+        })
+    };
+    let Some(version) = version else {
         return Ok(None);
     };
 
     Ok(Some(PackageInfo {
         name: pkg.name().to_string(),
         version: parse_version_or_zero(version.version()),
-        description: version.summary().unwrap_or_default(),
+        description: selected_summary(&version),
         url: None,
         size: version.size(),
         install_size: Some(i64::try_from(version.installed_size()).unwrap_or(i64::MAX)),
@@ -367,6 +412,52 @@ pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
         licenses: Vec::new(),
         installed: pkg.is_installed(),
     }))
+}
+
+fn candidate_packages_for_names(matches: Vec<Package>) -> Result<Vec<Package>> {
+    let (_apt_guard, cache) = open_cache(&[])?;
+    Ok(matches
+        .into_iter()
+        .filter_map(|matched| {
+            let pkg = cache.get(&matched.name)?;
+            let version = pkg.candidate().or_else(|| pkg.installed())?;
+            Some(Package {
+                name: pkg.name().to_string(),
+                version: parse_version_or_zero(version.version()),
+                description: selected_summary(&version),
+                source: PackageSource::Official,
+                installed: pkg.is_installed(),
+            })
+        })
+        .collect())
+}
+
+/// Build the warm daemon catalog from the same APT-selected versions used by
+/// live installs. Index-ranked package metadata can belong to another suite,
+/// so its dependencies and sizes must not be paired with a native candidate.
+pub(crate) fn candidate_index_packages() -> Result<Vec<PackageInfo>> {
+    let (_apt_guard, cache) = open_cache(&[])?;
+    let packages: Vec<_> = cache
+        .packages(&PackageSort::default())
+        .filter_map(|pkg| {
+            let version = pkg.candidate().or_else(|| pkg.installed())?;
+            Some(PackageInfo {
+                name: pkg.name().to_string(),
+                version: parse_version_or_zero(version.version()),
+                description: selected_summary(&version),
+                url: None,
+                size: version.size(),
+                install_size: Some(i64::try_from(version.installed_size()).unwrap_or(i64::MAX)),
+                download_size: Some(version.size()),
+                repo: "apt".to_string(),
+                depends: collect_depends(&version),
+                licenses: Vec::new(),
+                installed: pkg.is_installed(),
+            })
+        })
+        .collect();
+    anyhow::ensure!(!packages.is_empty(), "APT candidate catalog is empty");
+    Ok(packages)
 }
 
 /// Installed packages from the APT cache (`rust-apt` FFI path).
