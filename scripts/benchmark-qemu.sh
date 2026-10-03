@@ -217,6 +217,8 @@ if [[ "$print_pins" == true ]]; then
   exit 0
 fi
 if [[ "$distro" == all ]]; then
+  targets=(arch debian debian-trixie ubuntu fedora)
+  [[ "$arch" != aarch64 ]] || targets=(debian ubuntu fedora)
   suite=$(mktemp -d "$root/suite-XXXXXX")
   rc=0
   args=(--release "$tag" --arch "$arch")
@@ -234,8 +236,8 @@ if [[ "$distro" == all ]]; then
   [[ "$storage_faults" == false ]] || args+=(--storage-faults)
   [[ "$restrict_egress" == false ]] || args+=(--restrict-egress)
   [[ "$allow_tcg" == false ]] || args+=(--allow-tcg)
-  jq -n --arg source "$source_kind" --arg suffix "$case_suffix" '["arch", "debian", "ubuntu", "fedora"] | map({case_id:("qemu-"+.+$suffix+"-lifecycle"), distro:., result:"NOT_RUN", artifact_source:$source, exit_code:null, elapsed_seconds:0})' > "$suite/results.json"
-  for target in arch debian ubuntu fedora; do
+  jq -n --arg source "$source_kind" --arg suffix "$case_suffix" --args '$ARGS.positional | map({case_id:("qemu-"+.+$suffix+"-lifecycle"), distro:., result:"NOT_RUN", artifact_source:$source, exit_code:null, elapsed_seconds:0})' "${targets[@]}" > "$suite/results.json"
+  for target in "${targets[@]}"; do
     jq --arg target "$target" 'map(if .distro == $target then .result = "INCOMPLETE" else . end)' "$suite/results.json" > "$suite/results.next.json"
     mv "$suite/results.next.json" "$suite/results.json"
     "$0" --distro "$target" --evidence-dir "$suite/$target" "${args[@]}" || rc=1
