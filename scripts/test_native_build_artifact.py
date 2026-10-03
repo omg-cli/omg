@@ -58,6 +58,102 @@ def bundle(provenance, payload, extra=None):
 
 
 class NativeBuildAdmission(unittest.TestCase):
+    @staticmethod
+    def metadata_response(responses):
+        responses = iter(responses)
+
+        def request(argv, *, stdout, check, timeout):
+            response = next(responses)
+            if isinstance(response, subprocess.TimeoutExpired):
+                stdout.write(b'partial response, never reusable')
+                raise response
+            status, body = response
+            if '--include' in argv:
+                stdout.write(f'HTTP/2.0 {status}\r\nContent-Type: application/json\r\n\r\n'.encode())
+            stdout.write(body)
+            if status >= 400:
+                raise subprocess.CalledProcessError(1, argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        return request
+
+    def test_metadata_recovers_from_gateway_failure_without_reusing_error_body(self):
+        path = 'repos/omg-cli/omg/actions/workflows/ci.yml'
+        for status in (502, 503, 504):
+            with self.subTest(status=status), \
+                    patch.object(BUILD.subprocess, 'run', side_effect=self.metadata_response(
+                        [(status, b'{"id":999}'), (200, b'{"id":42}')])) as request, \
+                    patch.object(BUILD.time, 'sleep') as sleep:
+                try:
+                    actual = BUILD.api_json(path)
+                except subprocess.CalledProcessError as error:
+                    self.fail(f'metadata status {status} stopped before recovery: {error}')
+                self.assertEqual(actual, {'id': 42})
+                self.assertEqual(request.call_count, 2)
+                sleep.assert_called_once_with(1)
+
+    def test_metadata_timeouts_and_gateway_failures_share_three_attempt_budget(self):
+        path = 'repos/omg-cli/omg/actions/workflows/ci.yml'
+        timeout = subprocess.TimeoutExpired(['gh', 'api', path], 90)
+        with patch.object(BUILD.subprocess, 'run', side_effect=self.metadata_response(
+                [timeout, (503, b'{"id":999}'), (200, b'{"id":42}')])) as request, \
+                patch.object(BUILD.time, 'sleep') as sleep:
+            try:
+                actual = BUILD.api_json(path)
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+                self.fail(f'metadata transport stopped before bounded recovery: {error}')
+            self.assertEqual(actual, {'id': 42})
+            self.assertEqual(request.call_count, 3)
+            self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,)])
+
+        for responses, exception in (
+            ([timeout, timeout, timeout, (200, b'{}')], subprocess.TimeoutExpired),
+            ([(503, b'{}')] * 3 + [(200, b'{}')], subprocess.CalledProcessError),
+        ):
+            with self.subTest(exception=exception.__name__), \
+                    patch.object(BUILD.subprocess, 'run', side_effect=self.metadata_response(responses)) as request, \
+                    patch.object(BUILD.time, 'sleep') as sleep:
+                with self.assertRaises(exception):
+                    BUILD.api_json(path)
+                self.assertEqual(request.call_count, 3)
+                self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,)])
+
+    def test_metadata_retries_never_clear_refusals_or_invalid_json(self):
+        path = 'repos/omg-cli/omg/actions/workflows/ci.yml'
+        for status in (401, 403, 404, 429, 500, 501):
+            with self.subTest(status=status), \
+                    patch.object(BUILD.subprocess, 'run', side_effect=self.metadata_response(
+                        [(status, b'{}'), (200, b'{}')])) as request, \
+                    patch.object(BUILD.time, 'sleep') as sleep:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    BUILD.api_json(path)
+                self.assertEqual(request.call_count, 1)
+                sleep.assert_not_called()
+        for body in (b'{"id":1,"id":2}', b'{"id":NaN}', b'not json', b' ' * (1024 * 1024 + 1)):
+            with self.subTest(body=body[:25]), \
+                    patch.object(BUILD.subprocess, 'run', side_effect=self.metadata_response(
+                        [(200, body), (200, b'{}')])) as request, \
+                    patch.object(BUILD.time, 'sleep') as sleep:
+                with self.assertRaises(ValueError):
+                    BUILD.api_json(path)
+                self.assertEqual(request.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_metadata_process_errors_and_server_delays_remain_failures(self):
+        path = 'repos/omg-cli/omg/actions/workflows/ci.yml'
+        for data in (b'', b'HTTP/2.0 200 OK\nContent-Type: application/json\r\n\r\n{}',
+                     b'HTTP/2.0 503 Unavailable\nRetry-After: 60\r\n\r\n{}'):
+            def failed_process(argv, *, stdout, check, timeout):
+                stdout.write(data)
+                raise subprocess.CalledProcessError(1, argv)
+
+            with self.subTest(data=data), patch.object(BUILD.subprocess, 'run', side_effect=failed_process) as request, \
+                    patch.object(BUILD.time, 'sleep') as sleep:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    BUILD.api_json(path)
+                request.assert_called_once()
+                sleep.assert_not_called()
+
     def test_merge_group_admits_only_the_exact_candidate_native_owner(self):
         run = dict(id=123, run_attempt=1, repository={'full_name': 'omg-cli/omg'},
                    path='.github/workflows/ci.yml', workflow_id=42, event='merge_group',
