@@ -1741,6 +1741,43 @@ mod tests {
         encoder.finish().expect("finish gzip")
     }
 
+    #[test]
+    fn gzip_finalization_rejects_invalid_update_streams() {
+        let mut raw = update_test_tar(&[("omg", b"cli"), ("omgd", b"daemon")]);
+        raw.resize(raw.len() + 64 * 1024, 0);
+        let valid = gzip_bytes(&raw);
+        let control = tempfile::tempdir().expect("control directory");
+        extract_update_binary(&valid, control.path(), "update.tar.gz")
+            .expect("valid gzip stages the update");
+        assert_eq!(fs::read(control.path().join("omg")).expect("cli"), b"cli");
+        assert_eq!(
+            fs::read(control.path().join("omgd")).expect("daemon"),
+            b"daemon"
+        );
+        let mut crc = valid.clone();
+        let crc_offset = crc.len() - 8;
+        crc[crc_offset] ^= 1;
+        let mut size = valid.clone();
+        let size_offset = size.len() - 1;
+        size[size_offset] ^= 1;
+        let mut truncated = valid.clone();
+        truncated.truncate(truncated.len() - 8);
+        let mut extra_member = valid;
+        extra_member.extend_from_slice(&crc);
+        for (name, bytes) in [
+            ("crc", crc),
+            ("size", size),
+            ("truncated", truncated),
+            ("extra-member", extra_member),
+        ] {
+            let stage = tempfile::tempdir().expect("private stage");
+            assert!(
+                extract_update_binary(&bytes, stage.path(), "update.tar.gz").is_err(),
+                "invalid update gzip {name} must be rejected"
+            );
+        }
+    }
+
     fn update_test_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
         gzip_bytes(&update_test_tar(entries))
     }

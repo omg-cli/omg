@@ -3386,6 +3386,79 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn gzip_finalization_rejects_invalid_streams() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let mut raw = tar_archive(tar::EntryType::Regular);
+        raw.resize(raw.len() + 64 * 1024, 0);
+        let encode = |bytes: &[u8]| -> anyhow::Result<Vec<u8>> {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::Write::write_all(&mut encoder, bytes)?;
+            Ok(encoder.finish()?)
+        };
+        let valid = encode(&raw)?;
+        let archive_path = temp.path().join("runtime.tar.gz");
+        fs::write(&archive_path, &valid)?;
+        extract_component_tar_gz(
+            &archive_path,
+            &temp.path().join("valid"),
+            MAX_DECOMPRESSED_BYTES,
+            &|path| stripped_archive_path(path, 1),
+        )?;
+        assert_eq!(fs::read(temp.path().join("valid/bin/tool"))?, b"tool");
+
+        let mut crc = valid.clone();
+        let crc_offset = crc.len() - 8;
+        crc[crc_offset] ^= 1;
+        let mut size = valid.clone();
+        let size_offset = size.len() - 1;
+        size[size_offset] ^= 1;
+        let mut truncated = valid.clone();
+        truncated.truncate(truncated.len() - 8);
+        let mut extra_member = valid;
+        extra_member.extend_from_slice(&crc);
+        for (name, bytes) in [
+            ("crc", crc),
+            ("size", size),
+            ("truncated", truncated),
+            ("extra-member", extra_member),
+        ] {
+            fs::write(&archive_path, bytes)?;
+            assert!(
+                extract_component_tar_gz(
+                    &archive_path,
+                    &temp.path().join(name),
+                    MAX_DECOMPRESSED_BYTES,
+                    &|path| stripped_archive_path(path, 1),
+                )
+                .is_err(),
+                "invalid gzip {name} must be rejected"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_finalization_charges_post_tar_output_to_budget() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let mut raw = tar_archive(tar::EntryType::Regular);
+        let budget = u64::try_from(raw.len() + 512)?;
+        raw.resize(raw.len() + 64 * 1024, 0);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &raw)?;
+        let archive_path = temp.path().join("runtime.tar.gz");
+        fs::write(&archive_path, encoder.finish()?)?;
+        assert!(
+            extract_component_tar_gz(&archive_path, &temp.path().join("out"), budget, &|path| {
+                stripped_archive_path(path, 1)
+            },)
+            .is_err(),
+            "output after TAR termination must still consume the decompression budget"
+        );
+        Ok(())
+    }
+
     fn tar_archive_with_symlink(target: &str) -> anyhow::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         let mut builder = tar::Builder::new(&mut bytes);
