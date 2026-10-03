@@ -71,6 +71,19 @@ working SSH transport. The [capability spike](https://github.com/omg-cli/omg/iss
 did not boot a guest or prove clone readiness. Any transport extension must
 account for this policy boundary without silently disabling confinement.
 
+A separate local namespace probe also found a seccomp boundary for
+`unshare(CLONE_NEWUSER | CLONE_NEWNET)`. The actual kernel filter from Docker
+29.8.1's builtin profile returned `SECCOMP_RET_ERRNO | EPERM` for that call.
+Replaying the captured filter in a short-lived native process reproduced the
+refusal while preserving an allowed control syscall. See the
+[filter read-back and kernel replay](https://github.com/omg-cli/omg/issues/611#issuecomment-5973676486).
+This is evidence for the audited WSL controller, not a claim about every runner
+or the older passt startup failure. Installing passt or mapping a device alone
+does not resolve this syscall boundary. Keep transport adoption pending a
+reviewed confinement design and real guest/egress checks. The
+[kernel seccomp contract](https://docs.kernel.org/userspace-api/seccomp_filter.html)
+defines the returned action; it is separate from guest network readiness.
+
 ## What to run
 
 The x86-64 QEMU `all` profile selects Arch, Debian 12, Debian 13 (Trixie),
