@@ -1244,6 +1244,13 @@ pub(crate) fn reclaim_stale_database_lock(database_root: &std::path::Path) -> Re
 }
 
 fn database_lock_has_open_holder(lock: &std::path::Path) -> Result<bool> {
+    database_lock_has_open_holder_in_proc(lock, std::path::Path::new("/proc"))
+}
+
+fn database_lock_has_open_holder_in_proc(
+    lock: &std::path::Path,
+    proc_root: &std::path::Path,
+) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
     let lock_meta = match std::fs::metadata(lock) {
@@ -1257,7 +1264,7 @@ fn database_lock_has_open_holder(lock: &std::path::Path) -> Result<bool> {
     };
     let lock_dev = lock_meta.dev();
     let lock_ino = lock_meta.ino();
-    let Ok(proc) = std::fs::read_dir("/proc") else {
+    let Ok(proc) = std::fs::read_dir(proc_root) else {
         return Ok(true);
     };
     for entry in proc.flatten() {
@@ -1757,6 +1764,55 @@ mod tests {
         validate_transaction_targets,
     };
     use crate::core::paths;
+
+    #[test]
+    fn lock_scan_skips_a_vanished_descriptor() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let lock = directory.path().join("db.lck");
+        std::fs::write(&lock, b"")?;
+        let proc_root = directory.path().join("proc");
+        let descriptors = proc_root.join("123/fd");
+        std::fs::create_dir_all(&descriptors)?;
+        std::os::unix::fs::symlink(directory.path().join("vanished"), descriptors.join("3"))?;
+        assert!(!super::database_lock_has_open_holder_in_proc(
+            &lock, &proc_root
+        )?);
+        assert!(lock.exists(), "holder inspection must not remove the lock");
+        Ok(())
+    }
+
+    #[test]
+    fn lock_scan_does_not_hide_a_holder_after_an_unavailable_descriptor() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let lock = directory.path().join("db.lck");
+        std::fs::write(&lock, b"")?;
+        let proc_root = directory.path().join("proc");
+        let descriptors = proc_root.join("123/fd");
+        std::fs::create_dir_all(&descriptors)?;
+        std::os::unix::fs::symlink(directory.path().join("vanished"), descriptors.join("3"))?;
+        std::os::unix::fs::symlink(&lock, descriptors.join("4"))?;
+        assert!(super::database_lock_has_open_holder_in_proc(
+            &lock, &proc_root
+        )?);
+        assert!(lock.exists(), "live holder must retain its lock");
+        Ok(())
+    }
+
+    #[test]
+    fn lock_scan_keeps_a_lock_when_process_inspection_is_unavailable() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let lock = directory.path().join("db.lck");
+        std::fs::write(&lock, b"")?;
+        assert!(super::database_lock_has_open_holder_in_proc(
+            &lock,
+            &directory.path().join("missing-proc")
+        )?);
+        assert!(
+            lock.exists(),
+            "unavailable process data must not reclaim a lock"
+        );
+        Ok(())
+    }
 
     #[test]
     fn reclaim_stale_database_lock_removes_an_unheld_file() {
