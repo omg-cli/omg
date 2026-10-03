@@ -453,6 +453,20 @@ made-up exit code, and dnf failures carry the recorded history row as well.
 
 ## Where to go next
 
+`doctor --turbo` runs in the container profile against a private copy of the
+guest's exact executable. The row seeds `cap_net_bind_service=ep` on that copy,
+requires the actual command to remove its `security.capability` xattr, and
+checks unchanged executable bytes and unchanged original file state. It also
+requires the matching cleanup result and explanation that no permanent binary
+privileges are granted. A warning or zero exit without removal fails. An empty
+capability set also fails: libcap distinguishes it from removal
+([setcap](https://man7.org/linux/man-pages/man8/setcap.8.html),
+[getcap](https://man7.org/linux/man-pages/man8/getcap.8.html)).
+The private directory permits only its owner to access the copy; cleanup removes
+it on normal completion or a failed row. Missing trusted tools or unavailable
+capability setup produces BLOCKED. This row tests unattended cleanup, not the
+attended confirmation dialog or interactive sudo credential caching.
+
 - [QA issue loop](./qa-loop.md) explains when an issue opens or closes.
 - [QEMU image review](./qemu-image-renewal.md) covers image provenance expiry.
 - [Release readiness](./release-readiness.md) lists the publication gates.

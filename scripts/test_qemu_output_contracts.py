@@ -190,6 +190,41 @@ trap 'printf "exit-trap\\n"' EXIT
 
 
 class OutputContracts(unittest.TestCase):
+    def test_historical_declared_doctor_turbo_remains_explicit_skip(self):
+        rows = ['help\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop',
+                'doctor-turbo\t["doctor","--turbo"]\tread\t-\tdeclared\t-\tqemu\tarch:pending,debian:pending,ubuntu:pending,fedora:pending\t-\tnone']
+        result, evidence, logs = self.run_inventory('printf "Usage: fixture\\n"\n', rows, tiers='hermetic,qemu')
+        self.assertEqual(result.returncode, 0, logs)
+        self.assertEqual([item['result'] for item in evidence], ['PASS', 'SKIPPED'], logs)
+
+    def test_doctor_turbo_requires_real_capability_removal(self):
+        rows = ['doctor-turbo\t["doctor","--turbo"]\tisolated-write\t0\tpass\t-\tcontainer\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tdoctor-capability-cleanup\ttempdir-drop']
+        for defect in ('none', 'no-op', 'empty-set', 'changed-copy', 'wrong-output', 'command-failure', 'timeout'):
+            with self.subTest(defect=defect):
+                product = '''[[ "$*" == 'doctor --turbo' ]] || exit 70
+printf '%s\\n' 'No file capabilities remain (or none were set)' 'No permanent privileges granted to any binary'
+'''
+                if defect in ('none', 'wrong-output', 'command-failure'):
+                    product += '/usr/bin/sudo -n -- /usr/sbin/setcap -r "$0" || /usr/bin/sudo -n -- /usr/bin/setcap -r "$0"\n'
+                elif defect == 'empty-set':
+                    product += '/usr/bin/sudo -n -- /usr/sbin/setcap = "$0" || /usr/bin/sudo -n -- /usr/bin/setcap = "$0"\n'
+                elif defect == 'changed-copy':
+                    product += 'printf "# changed\\n" >> "$0"\n'
+                if defect == 'wrong-output':
+                    product = product.replace('No permanent privileges granted to any binary', 'permanent privileges are fine')
+                if defect == 'command-failure':
+                    product += 'exit 1\n'
+                if defect == 'timeout':
+                    product += 'sleep 3\n'
+                result, evidence, logs = self.run_inventory(
+                    product, rows, tiers='container', allow_mutations=True,
+                    row_timeout=1 if defect == 'timeout' else None)
+                self.assertEqual(result.returncode, int(defect != 'none'), logs)
+                self.assertEqual(evidence[0]['result'], 'PASS' if defect == 'none' else 'FAIL', logs)
+                if defect == 'none':
+                    self.assertIn('"original_unchanged": true', logs['doctor-turbo.stdout.log'])
+                    self.assertIn('"capabilities_removed": true', logs['doctor-turbo.stdout.log'])
+
     def test_run_watch_row_uses_bounded_source_edit_and_receipt(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         row = next(line for line in inventory.splitlines() if line.startswith('run-watch\t'))
