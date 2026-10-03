@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from qemu_inventory_policy import HEADER, network_scopes, read_bounded, selected_snapshot, unique_object
+from qemu_inventory_policy import GUEST_DISTROS, HEADER, backend_family, network_scopes, read_bounded, selected_snapshot, unique_object
 
 DISTROS = {"arch", "debian", "ubuntu", "fedora"}
 EXIT = re.compile(r"(?:0|[1-9][0-9]{0,2})\Z")
@@ -16,6 +16,7 @@ MAPPED_EXIT = re.compile(r"(arch|debian|ubuntu|fedora):(0|[1-9][0-9]{0,2})\Z")
 
 
 def resolve_exit(cell, distro):
+    family = backend_family(distro)
     if EXIT.fullmatch(cell):
         value = int(cell)
         if value <= 255:
@@ -31,10 +32,11 @@ def resolve_exit(cell, distro):
         values[match[1]] = int(match[2])
     if set(values) != DISTROS:
         raise ValueError("incomplete per-distro expected exit")
-    return values[distro]
+    return values[family]
 
 
 def inventory_exits(content, distro):
+    backend_family(distro)
     lines = content.decode("utf-8").replace("\r\n", "\n").split("\n")
     if lines[-1] == "":
         lines.pop()
@@ -151,7 +153,7 @@ def admit(policy, inventory, results, summary, distro, tiers):
         if type(code) is not int or not -1 <= code <= 255:
             raise ValueError("invalid exit code")
         if verdict == "SKIPPED":
-            reason = expected[case]["allowed_skips"].get(distro)
+            reason = expected[case]["allowed_skips"].get(backend_family(distro))
             if not reason or code != -1:
                 raise ValueError("unapproved skip")
             skips[case] = reason
@@ -189,7 +191,7 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     for name in ("results", "summary"):
         parser.add_argument("--" + name, type=Path)
-    parser.add_argument("--distro", choices=("arch", "debian", "ubuntu", "fedora"))
+    parser.add_argument("--distro", choices=sorted(GUEST_DISTROS))
     parser.add_argument("--tiers")
     parser.add_argument("--network-scopes", action="store_true")
     args = parser.parse_args()

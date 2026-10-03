@@ -25,6 +25,7 @@ on:
       - scripts/test_mutation_reports.py
       - scripts/observe-mutation-runner.py
       - scripts/test_mutation_runner_observer.py
+      - scripts/test_mutation_build_budget.py
       - .github/workflows/mutation.yml
   workflow_dispatch:
     inputs:
@@ -49,6 +50,10 @@ jobs:
     name: Mutation shard (${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      # Two mutation workers must not each inherit build.jobs=5.
+      # https://doc.rust-lang.org/cargo/reference/config.html#buildjobs
+      CARGO_BUILD_JOBS: "2"
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -86,6 +91,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_mutation_reports.py
           python3 -m unittest discover -s scripts -p test_mutation_runner_observer.py
+          python3 -m unittest discover -s scripts -p test_mutation_build_budget.py
 
       - name: Validate portable mutation baseline
         if: github.event_name == 'pull_request' || inputs.baseline-only == true
@@ -102,6 +108,7 @@ jobs:
         env:
           SHARD_INDEX: ${{ matrix.shard }}
         run: |
+          printf 'Mutation Cargo build jobs: %s\n' "$CARGO_BUILD_JOBS"
           # Use the same complete discovery arguments for every shard.
           # https://mutants.rs/shards.html
           common=(
