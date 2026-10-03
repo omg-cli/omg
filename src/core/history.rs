@@ -686,21 +686,40 @@ mod tests {
     fn retired_transactions_are_archived_not_dropped() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = HistoryManager::new_in(directory.path().join("history.json"))?;
-        for index in 0..(MAX_HISTORY_TRANSACTIONS + 5) {
-            manager.add_transaction(
-                TransactionType::Install,
-                vec![PackageChange {
-                    name: format!("pkg-{index}"),
-                    old_version: None,
-                    new_version: Some("1.0".to_string()),
-                    source: "official".to_string(),
-                }],
-                true,
-            )?;
+        let package_change = |index| PackageChange {
+            name: format!("pkg-{index}"),
+            old_version: None,
+            new_version: Some("1.0".to_string()),
+            source: "official".to_string(),
+        };
+        let seeded = (0..MAX_HISTORY_TRANSACTIONS - 1)
+            .map(|index| Transaction {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: Timestamp::now(),
+                transaction_type: TransactionType::Install,
+                changes: vec![package_change(index)],
+                success: true,
+            })
+            .collect::<Vec<_>>();
+        manager.save(&seeded)?;
+        for index in (MAX_HISTORY_TRANSACTIONS - 1)..(MAX_HISTORY_TRANSACTIONS + 5) {
+            manager.add_transaction(TransactionType::Install, vec![package_change(index)], true)?;
+            if index == MAX_HISTORY_TRANSACTIONS - 1 {
+                assert_eq!(manager.load()?.len(), MAX_HISTORY_TRANSACTIONS);
+                assert!(!manager.archive_path().exists());
+            }
         }
         let live: Vec<Transaction> = serde_json::from_slice(&fs::read(&manager.log_path)?)?;
         assert_eq!(live.len(), MAX_HISTORY_TRANSACTIONS);
-        assert_eq!(manager.load()?.len(), MAX_HISTORY_TRANSACTIONS + 5);
+        let combined = manager.load()?;
+        assert_eq!(combined.len(), MAX_HISTORY_TRANSACTIONS + 5);
+        assert_eq!(&combined[..seeded.len()], seeded.as_slice());
+        for (index, transaction) in combined.iter().enumerate() {
+            assert_eq!(transaction.changes, vec![package_change(index)]);
+            assert_eq!(transaction.transaction_type, TransactionType::Install);
+            assert!(transaction.success);
+            assert!(uuid::Uuid::parse_str(&transaction.id).is_ok());
+        }
         let archive = std::fs::read_to_string(directory.path().join("history.json.archive.jsonl"))?;
         let archived: Vec<Transaction> = archive
             .lines()
