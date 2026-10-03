@@ -71,7 +71,7 @@ def snapshot():
 
 def observe(command, report, interval):
     started = time.monotonic()
-    cancellation = {"signal": None, "group_signal_error": None}
+    cancellation = {"signal": None, "group_signal_error": None, "pending": False}
     child = None
     previous = {}
     written = 0
@@ -94,6 +94,7 @@ def observe(command, report, interval):
 
         def cancel(signum, _frame):
             cancellation["signal"] = signum
+            cancellation["pending"] = child is None
             if child is not None and child.poll() is None:
                 try:
                     os.killpg(child.pid, signum)
@@ -102,9 +103,11 @@ def observe(command, report, interval):
 
         emit("start")
         try:
-            child = subprocess.Popen(command, start_new_session=True)
             for signum in (signal.SIGTERM, signal.SIGINT):
                 previous[signum] = signal.signal(signum, cancel)
+            child = subprocess.Popen(command, start_new_session=True)
+            if cancellation["pending"]:
+                cancel(cancellation["signal"], None)
             emit("spawn")
             while True:
                 try:

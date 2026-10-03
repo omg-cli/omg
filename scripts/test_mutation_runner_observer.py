@@ -18,6 +18,27 @@ SPEC.loader.exec_module(OBSERVER)
 
 
 class MutationRunnerObserver(unittest.TestCase):
+    def test_cancellation_during_spawn_is_retained_and_forwarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "health.jsonl"
+            code = (
+                "import importlib.util,os,signal,sys;from pathlib import Path\n"
+                f"spec=importlib.util.spec_from_file_location('observer',{str(SCRIPT)!r})\n"
+                "module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)\n"
+                "original=module.subprocess.Popen\n"
+                "def start(*args,**kwargs):\n"
+                " os.kill(os.getpid(),signal.SIGTERM)\n"
+                " return original(*args,**kwargs)\n"
+                "module.subprocess.Popen=start\n"
+                f"raise SystemExit(module.observe([sys.executable,'-c','import time;time.sleep(10)'],Path({str(report)!r}),0.02))\n"
+            )
+            result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 143, result.stderr)
+            rows = [json.loads(line) for line in report.read_text().splitlines()]
+            self.assertEqual(rows[-1]["phase"], "finish")
+            self.assertEqual(rows[-1]["cancellation_signal"], signal.SIGTERM)
+            self.assertEqual(rows[-1]["child_returncode"], -signal.SIGTERM)
+
     def test_report_byte_limit_refuses_before_starting_the_command(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "child-ran"
