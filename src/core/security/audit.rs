@@ -319,17 +319,28 @@ impl AuditLogger {
             source,
         })?;
 
-        Self::new_in_with_limits(log_path, DEFAULT_MAX_AUDIT_BYTES, DEFAULT_AUDIT_ARCHIVES)
+        Self::new_in_with_limits(&log_path, DEFAULT_MAX_AUDIT_BYTES, DEFAULT_AUDIT_ARCHIVES)
     }
 
     fn new_in_with_limits(
-        log_path: PathBuf,
+        log_path: &Path,
         max_bytes: u64,
         max_archives: usize,
     ) -> Result<Self, AuditError> {
-        let last_hash = get_last_hash(&log_path)?;
+        with_audit_read_lock(log_path, || {
+            Self::new_in_with_limits_unlocked(log_path, max_bytes, max_archives)
+        })
+    }
+
+    /// The caller must hold a cooperating read or append lock throughout this read.
+    fn new_in_with_limits_unlocked(
+        log_path: &Path,
+        max_bytes: u64,
+        max_archives: usize,
+    ) -> Result<Self, AuditError> {
+        let last_hash = get_last_hash(log_path)?;
         Ok(Self {
-            log_path,
+            log_path: log_path.to_path_buf(),
             last_hash,
             max_bytes,
             max_archives,
@@ -975,7 +986,11 @@ fn recover_audit_logger(log_path: &Path) -> Result<AuditLogger, AuditError> {
         source,
     })?;
     let result = (|| {
-        match AuditLogger::new_in(log_path) {
+        match AuditLogger::new_in_with_limits_unlocked(
+            log_path,
+            DEFAULT_MAX_AUDIT_BYTES,
+            DEFAULT_AUDIT_ARCHIVES,
+        ) {
             Ok(logger) => Ok(logger),
             Err(AuditError::CorruptLine { .. } | AuditError::MissingHash { .. }) => {
                 // Publish the known history gap before removing active history.
@@ -988,7 +1003,11 @@ fn recover_audit_logger(log_path: &Path) -> Result<AuditLogger, AuditError> {
                 sync_audit_directory(parent)?;
                 let quarantined = quarantine_corrupt_audit_log(log_path)?;
                 sync_audit_directory(parent)?;
-                let logger = AuditLogger::new_in(log_path)?;
+                let logger = AuditLogger::new_in_with_limits_unlocked(
+                    log_path,
+                    DEFAULT_MAX_AUDIT_BYTES,
+                    DEFAULT_AUDIT_ARCHIVES,
+                )?;
                 let path = tracing_safe_audit_text(&quarantined.display().to_string());
                 tracing::warn!(
                     "Audit log was corrupt; quarantined to {path} and started fresh log"
@@ -2080,7 +2099,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary audit directory");
         let log_path = temp.path().join("audit.jsonl");
         let mut logger =
-            AuditLogger::new_in_with_limits(log_path.clone(), 1, 2).expect("create bounded logger");
+            AuditLogger::new_in_with_limits(&log_path, 1, 2).expect("create bounded logger");
 
         logger
             .log(
@@ -3123,6 +3142,82 @@ mod recovery_diagnostic_tests {
             "marker error plus logger warning: {text:?}"
         );
         clear_global();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn constructor_waits_for_cross_process_partial_append() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::audit::recovery_diagnostic_tests::constructor_waits_for_cross_process_partial_append";
+        const MARKER: &str = "OMG_AUDIT_CONSTRUCTOR_PARTIAL_APPEND_CHILD";
+        if let Some(path) = std::env::var_os(MARKER) {
+            let path = PathBuf::from(path);
+            std::fs::write(path.with_extension("ready"), b"ready")?;
+            let mut logger = AuditLogger::new_in(&path)?;
+            logger.log(
+                AuditEventType::SecurityAudit,
+                AuditSeverity::Info,
+                "second",
+                "after constructor waited for writer",
+            )?;
+            let report = logger.verify_integrity()?;
+            assert!(report.is_valid());
+            assert_eq!(report.total_entries, 2);
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let mut logger = AuditLogger::new_in(&path)?;
+        logger.log(
+            AuditEventType::SecurityAudit,
+            AuditSeverity::Info,
+            "first",
+            "writer in progress",
+        )?;
+        let original = std::fs::read(&path)?;
+        let lock = open_lock_file(&path.with_extension("lock"))?;
+        lock.lock()?;
+        std::fs::write(&path, &original[..original.len() / 2])?;
+        let child = isolated_child(NAME, MARKER, path.as_os_str());
+        tokio::pin!(child);
+        let mut early_child = None;
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut child => {
+                        early_child = Some(result);
+                        anyhow::bail!("constructor completed while writer held a partial record");
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if path.with_extension("ready").exists() { break; }
+                    }
+                }
+            }
+            tokio::select! {
+                result = &mut child => {
+                    early_child = Some(result);
+                    anyhow::bail!("constructor failed to wait for writer lock");
+                }
+                () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        let restored =
+            std::fs::write(&path, &original).and_then(|()| File::open(&path)?.sync_all());
+        lock.unlock()?;
+        let child_result = match early_child {
+            Some(result) => result,
+            None => child.await,
+        };
+        restored?;
+        observed.context("constructor child readiness deadline")??;
+        child_result?;
+        assert!(std::fs::read(&path)?.starts_with(&original));
+        let report = AuditLogger::new_in(&path)?.verify_integrity()?;
+        assert!(report.is_valid());
+        assert_eq!(report.total_entries, 2);
+        assert!(quarantines(directory.path())?.is_empty());
+        assert!(!path.with_file_name("incomplete").exists());
         Ok(())
     }
 
