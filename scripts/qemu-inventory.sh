@@ -1509,6 +1509,30 @@ check_workspace_failure() {
     *) return 2 ;;
   esac || { printf 'assertion failed: workspace refusal did not prove the intended missing input\n' >&2; return 1; }
 }
+capture_fedora_failure_context() {
+  case "$1" in release-package-install-tree|release-package-remove-tree) ;; *) return 0 ;; esac
+  [[ "$2" != 0 || "$3" != 0 ]] || return 0
+  (
+    set -o pipefail
+    native_failure_probe() {
+      local label=$1
+      shift
+      local codes=(0 0)
+      printf '\nOMG_QEMU_NATIVE_FAILURE_BEGIN %s output_limit_bytes=24576\n' "$label"
+      timeout --kill-after=1s 2s "$@" 2>&1 | head -c 24576 || codes=("${PIPESTATUS[@]}")
+      printf '\nOMG_QEMU_NATIVE_FAILURE_END %s command_exit=%s reader_exit=%s\n' \
+        "$label" "${codes[0]}" "${codes[1]}"
+    }
+    printf '\nOMG_QEMU_NATIVE_FAILURE_CONTEXT boot_id=%s history_selection=last\n' \
+      "$(cat /proc/sys/kernel/random/boot_id)"
+    # Latest history is an observation; its comment must establish correlation.
+    # https://dnf5.readthedocs.io/en/latest/commands/history.8.html
+    native_failure_probe dnf-history sudo -n dnf history info --json last
+    native_failure_probe rpm-tree rpm -q --qf '%{NEVRA}\n' tree
+    native_failure_probe kernel sudo -n journalctl --boot --dmesg --lines=80 --no-pager
+  )
+}
+
 check_product_output() {
   local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
   if [[ "$assertion" == local:* ]]; then
@@ -2754,6 +2778,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree ]]; then
     remote+="; $(declare -f native_package_snapshot); $(declare -f check_native_tree_only_delta); $(declare -f cleanup_native_tree_fixture)"
+    if [[ "$distro" == fedora ]]; then
+      remote+="; $(declare -f capture_fedora_failure_context)"
+    fi
     remote+="; tree_before=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package baseline is unavailable\n' >&2; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; }"
     remote+="; tree_owned=1; tree_exit_cleanup() { local original=\$?; if [[ \"\$tree_owned\" == 1 ]] && ! cleanup_native_tree_fixture '$distro'; then printf 'assertion failed: native tree cleanup failed on exit\n' >&2; exit 71; fi; rm -f \"\$status_file\"; exit \"\$original\"; }; trap tree_exit_cleanup EXIT"
   fi
@@ -2921,6 +2948,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree ]]; then
     remote+="; tree_after=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package after-state is unavailable\n' >&2; assertion=1; tree_after=missing; }"
     remote+="; tree_delta_ok=1; if ! check_native_tree_only_delta \"\$tree_before\" \"\$tree_after\"; then tree_delta_ok=0; assertion=1; fi"
+    if [[ "$distro" == fedora ]]; then
+      remote+="; capture_fedora_failure_context '$case' \"\$rc\" \"\$assertion\" >&2 || printf 'Native failure diagnostics unavailable\\n' >&2"
+    fi
     remote+="; if ! cleanup_native_tree_fixture '$distro'; then printf 'assertion failed: native tree fixture cleanup failed\n' >&2; execution_phase=dependency; rc=2; assertion=1; else tree_owned=0; fi"
     remote+="; tree_final=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package cleanup after-state is unavailable\n' >&2; execution_phase=dependency; rc=2; assertion=1; tree_final=missing; }"
     remote+="; if [[ \"\$tree_before\" != \"\$tree_final\" ]]; then printf 'assertion failed: native tree row did not restore its package/reason baseline\n' >&2; assertion=1; if [[ \"\$tree_delta_ok\" == 1 ]]; then execution_phase=dependency; rc=2; fi; fi"
