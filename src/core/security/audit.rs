@@ -578,6 +578,7 @@ impl AuditLogger {
 
         let mut total_entries = 0;
         let mut valid_entries = 0;
+        let mut legacy_entries = 0;
         let mut chain_valid = true;
         let mut expected_prev_hash = "genesis".to_string();
         let mut first_invalid: Option<String> = None;
@@ -592,6 +593,9 @@ impl AuditLogger {
             if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
                 if entry.verify() {
                     valid_entries += 1;
+                    if entry.hash_version == HASH_VERSION_LEGACY {
+                        legacy_entries += 1;
+                    }
                 } else if first_invalid.is_none() {
                     first_invalid = Some(entry.id.clone());
                 }
@@ -612,6 +616,12 @@ impl AuditLogger {
                     first_invalid = Some(format!("line_{total_entries}"));
                 }
             }
+        }
+
+        if legacy_entries > 0 {
+            tracing::warn!(
+                "Audit log retains {legacy_entries} record(s) with legacy hash encoding; field boundaries are not protected"
+            );
         }
 
         Ok(AuditIntegrityReport {
