@@ -23,6 +23,8 @@ on:
       - src/core/security/**
       - scripts/check-mutation-results.py
       - scripts/test_mutation_reports.py
+      - scripts/observe-mutation-runner.py
+      - scripts/test_mutation_runner_observer.py
       - .github/workflows/mutation.yml
   workflow_dispatch:
     inputs:
@@ -81,7 +83,9 @@ jobs:
           save-if: false
 
       - name: Test complete mutation report admission
-        run: python3 -m unittest discover -s scripts -p test_mutation_reports.py
+        run: |
+          python3 -m unittest discover -s scripts -p test_mutation_reports.py
+          python3 -m unittest discover -s scripts -p test_mutation_runner_observer.py
 
       - name: Validate portable mutation baseline
         if: github.event_name == 'pull_request' || inputs.baseline-only == true
@@ -120,7 +124,9 @@ jobs:
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --shards 16 --record-shard "$SHARD_INDEX"
           set +e
-          cargo mutants "${common[@]}" \
+          python3 scripts/observe-mutation-runner.py \
+            --report mutants-report/runner-health.jsonl --interval 30 -- \
+            cargo mutants "${common[@]}" \
             --baseline run --shard "$SHARD_INDEX/16" --sharding slice \
             --timeout 60 --jobs 2 --output mutants-report
           mutants_exit=$?
