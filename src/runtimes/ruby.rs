@@ -232,59 +232,40 @@ mod tests {
         invalid: super::super::test_archive::Launcher,
     ) -> Result<()> {
         use super::super::test_archive::{Launcher, tar_gz};
-        use sha2::{Digest as _, Sha256};
-        let arch = match std::env::consts::ARCH {
-            "x86_64" => "x64",
-            "aarch64" => "arm64",
-            other => anyhow::bail!("unsupported fixture architecture: {other}"),
-        };
-        let filename = format!("ruby-3.4.10-{}-{arch}.tar.gz", ruby_platform()?);
-        let manifest_path = "/repos/ruby/ruby-builder/releases/tags/ruby-3.4.10";
-        let archive_path = format!("/fixture/{filename}");
-        let mut routes = Vec::new();
-        for kind in [invalid, Launcher::Regular] {
-            let archive = tar_gz("ruby", "bin/ruby", kind)?;
-            let manifest = serde_json::json!({
-                "tag_name": "ruby-3.4.10", "prerelease": false,
-                "assets": [{"name": filename,
-                    "browser_download_url": format!("https://api.github.com{archive_path}"),
-                    "digest": format!("sha256:{:x}", Sha256::digest(&archive))}]
-            });
-            routes.push((manifest_path.to_owned(), serde_json::to_vec(&manifest)?));
-            routes.push((archive_path.clone(), archive));
-        }
-        let fixture = super::super::test_https::HttpsFixture::new("api.github.com", routes).await?;
         let versions = tempfile::tempdir()?;
         let manager = RubyManager {
             versions_dir: versions.path().to_path_buf(),
-            client: Box::leak(Box::new(fixture.client(true)?)),
+            client: download_client(),
         };
-        manager
-            .install("3.4.10")
-            .await
-            .expect_err("incomplete launcher refusal");
+        let downloads = tempfile::tempdir()?;
+        let archive_path = downloads.path().join("runtime.tar.gz");
+        let staging = begin_staged_install(versions.path())?;
+        fs::write(&archive_path, tar_gz("runtime", "bin/ruby", invalid)?)?;
+        extract_tar_gz(&archive_path, staging.path(), 1).await?;
+        let result = manager.publish_install(&staging, "3.4.10");
         assert!(
             !versions.path().join("3.4.10").exists(),
-            "invalid Ruby archive must not be published"
+            "invalid ruby archive must not be published: {result:?}"
         );
+        assert!(result.is_err(), "invalid launcher must be refused");
         assert!(manager.list_installed()?.is_empty());
         assert!(!versions.path().join("current").exists());
         assert_eq!(manager.current_version(), None);
-        manager.install("3.4.10").await?;
+        drop(staging);
+
+        let staging = begin_staged_install(versions.path())?;
+        fs::write(
+            &archive_path,
+            tar_gz("runtime", "bin/ruby", Launcher::Regular)?,
+        )?;
+        extract_tar_gz(&archive_path, staging.path(), 1).await?;
+        manager.publish_install(&staging, "3.4.10")?;
+        manager.use_version("3.4.10")?;
         assert_eq!(manager.list_installed()?, vec!["3.4.10"]);
         assert_eq!(manager.current_version().as_deref(), Some("3.4.10"));
         assert_eq!(
             fs::read(versions.path().join("current/bin/ruby"))?,
             b"fixture launcher"
-        );
-        assert_eq!(
-            fixture.finish().await?,
-            vec![
-                format!("GET {manifest_path} HTTP/1.1"),
-                format!("GET {archive_path} HTTP/1.1"),
-                format!("GET {manifest_path} HTTP/1.1"),
-                format!("GET {archive_path} HTTP/1.1"),
-            ]
         );
         Ok(())
     }

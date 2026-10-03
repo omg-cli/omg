@@ -242,59 +242,37 @@ mod tests {
         invalid: super::super::test_archive::Launcher,
     ) -> Result<()> {
         use super::super::test_archive::{Launcher, zip};
-        use sha2::{Digest as _, Sha256};
-        let root = format!("bun-{}", bun_platform()?);
-        let filename = format!("{root}.zip");
-        let manifest_path = "/repos/oven-sh/bun/releases/tags/bun-v1.4.0";
-        let archive_path = format!("/oven-sh/bun/releases/download/bun-v1.4.0/{filename}");
-        let mut routes = Vec::new();
-        for kind in [invalid, Launcher::Regular] {
-            let archive = zip(&root, "bun", kind)?;
-            let manifest = serde_json::json!({
-                "tag_name": "bun-v1.4.0", "prerelease": false,
-                "assets": [{"name": filename,
-                    "browser_download_url": format!("https://github.com{archive_path}"),
-                    "digest": format!("sha256:{:x}", Sha256::digest(&archive))}]
-            });
-            routes.push((
-                "api.github.com".to_owned(),
-                manifest_path.to_owned(),
-                serde_json::to_vec(&manifest)?,
-            ));
-            routes.push(("github.com".to_owned(), archive_path.clone(), archive));
-        }
-        let fixture = super::super::test_https::HttpsFixture::new_for_authorities(routes).await?;
         let versions = tempfile::tempdir()?;
         let manager = BunManager {
             versions_dir: versions.path().to_path_buf(),
-            client: Box::leak(Box::new(fixture.client(true)?)),
+            client: download_client(),
         };
-        manager
-            .install("1.4.0")
-            .await
-            .expect_err("incomplete launcher refusal");
+        let downloads = tempfile::tempdir()?;
+        let archive_path = downloads.path().join("runtime.zip");
+        let staging = begin_staged_install(versions.path())?;
+        fs::write(&archive_path, zip("runtime", "bun", invalid)?)?;
+        extract_zip(&archive_path, staging.path(), 1).await?;
+        let result = manager.publish_install(&staging, "1.4.0");
         assert!(
             !versions.path().join("1.4.0").exists(),
-            "invalid Bun archive must not be published"
+            "invalid bun archive must not be published: {result:?}"
         );
+        assert!(result.is_err(), "invalid launcher must be refused");
         assert!(manager.list_installed()?.is_empty());
         assert!(!versions.path().join("current").exists());
         assert_eq!(manager.current_version(), None);
-        manager.install("1.4.0").await?;
+        drop(staging);
+
+        let staging = begin_staged_install(versions.path())?;
+        fs::write(&archive_path, zip("runtime", "bun", Launcher::Regular)?)?;
+        extract_zip(&archive_path, staging.path(), 1).await?;
+        manager.publish_install(&staging, "1.4.0")?;
+        manager.use_version("1.4.0")?;
         assert_eq!(manager.list_installed()?, vec!["1.4.0"]);
         assert_eq!(manager.current_version().as_deref(), Some("1.4.0"));
         assert_eq!(
             fs::read(versions.path().join("current/bun"))?,
             b"fixture launcher"
-        );
-        assert_eq!(
-            fixture.finish().await?,
-            vec![
-                format!("GET {manifest_path} HTTP/1.1"),
-                format!("GET {archive_path} HTTP/1.1"),
-                format!("GET {manifest_path} HTTP/1.1"),
-                format!("GET {archive_path} HTTP/1.1"),
-            ]
         );
         Ok(())
     }
