@@ -103,7 +103,8 @@ def main():
     elif case == "migrate-export":
         manifest = json.loads(regular(root / "manifest.json").read_text())
         packages = manifest.get("packages")
-        require(manifest.get("version") == "1.0" and manifest.get("source_distro") == distro,
+        native_distro = "debian" if distro == "debian-trixie" else distro
+        require(manifest.get("version") == "1.0" and manifest.get("source_distro") == native_distro,
                 "migration source/version mismatch")
         require(isinstance(packages, list) and
                 {item["original_name"] for item in packages} == expected and

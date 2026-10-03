@@ -53,9 +53,9 @@ class FingerprintOracleTests(unittest.TestCase):
         self.write("omg.lock", 'schema_version = 1\npackages = ["curl", "git"]\n'
                    f'timestamp = 1700000000\nhash = "{self.state["hash"]}"\n[runtimes]\n')
 
-    def run_case(self, case):
+    def run_case(self, case, distro="fedora"):
         with patch.object(ORACLE, "native_packages", return_value=self.names), \
-             patch.object(ORACLE.sys, "argv", ["oracle", case, "fedora", str(self.root),
+             patch.object(ORACLE.sys, "argv", ["oracle", case, distro, str(self.root),
                                             str(self.output)]), \
              patch.dict(ORACLE.os.environ, {"OMG_DATA_DIR": str(self.data)}):
             ORACLE.main()
@@ -100,6 +100,24 @@ class FingerprintOracleTests(unittest.TestCase):
         self.write("manifest.json", json.dumps(manifest))
         with self.assertRaises(AssertionError):
             self.run_case("migrate-export")
+
+    def test_trixie_migration_requires_debian_backend_and_complete_native_packages(self):
+        self.output.write_text("Exported to manifest.json Packages: 2")
+        manifest = {"version": "1.0", "source_distro": "debian", "packages": [
+            {"original_name": "curl"}, {"original_name": "git"}]}
+        self.write("manifest.json", json.dumps(manifest))
+        self.run_case("migrate-export", "debian-trixie")
+        for source in ("debian-trixie", "ubuntu", "fedora"):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                self.write("manifest.json", json.dumps(dict(manifest, source_distro=source)))
+                self.run_case("migrate-export", "debian-trixie")
+        for version in ("13", "0.9", "2.0"):
+            with self.subTest(version=version), self.assertRaises(AssertionError):
+                self.write("manifest.json", json.dumps(dict(manifest, version=version)))
+                self.run_case("migrate-export", "debian-trixie")
+        self.write("manifest.json", json.dumps(dict(manifest, packages=[])))
+        with self.assertRaises(AssertionError):
+            self.run_case("migrate-export", "debian-trixie")
 
     def test_team_push_requires_persisted_lock_and_matching_status(self):
         self.lock()

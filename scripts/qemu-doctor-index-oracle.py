@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -63,7 +64,23 @@ def run(binary_name, distro):
             or os.readlink('/proc/self/ns/mnt') == os.readlink('/proc/1/ns/mnt')):
         raise RuntimeError('requires a disposable QEMU guest and a private root mount namespace')
     release = Path('/etc/os-release').read_text().splitlines()
-    if not any(line in (f'ID={distro}', f'ID="{distro}"') for line in release):
+    identity = {}
+    for line in release:
+        key, separator, value = line.partition('=')
+        if not separator or key not in ('ID', 'VERSION_ID'):
+            continue
+        if key in identity:
+            raise RuntimeError('ambiguous native guest distribution')
+        try:
+            fields = shlex.split(value)
+        except ValueError as error:
+            raise RuntimeError('invalid native guest distribution') from error
+        if len(fields) != 1:
+            raise RuntimeError('invalid native guest distribution')
+        identity[key] = fields[0]
+    native_distro = 'debian' if distro == 'debian-trixie' else distro
+    if (identity.get('ID') != native_distro
+            or (distro == 'debian-trixie' and identity.get('VERSION_ID') != '13')):
         raise RuntimeError('native guest distribution mismatch')
     account = pwd.getpwnam('bench')
     binary = Path(binary_name).resolve(strict=True)
