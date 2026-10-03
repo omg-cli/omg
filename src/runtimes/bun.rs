@@ -228,6 +228,77 @@ fn bun_platform() -> Result<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn incomplete_bun_archive_is_not_published_and_can_be_retried() -> Result<()> {
+        check_archive_publication(super::super::test_archive::Launcher::Missing).await
+    }
+
+    #[tokio::test]
+    async fn directory_bun_launcher_is_not_published_and_can_be_retried() -> Result<()> {
+        check_archive_publication(super::super::test_archive::Launcher::Directory).await
+    }
+
+    async fn check_archive_publication(
+        invalid: super::super::test_archive::Launcher,
+    ) -> Result<()> {
+        use super::super::test_archive::{Launcher, zip};
+        use sha2::{Digest as _, Sha256};
+        let root = format!("bun-{}", bun_platform()?);
+        let filename = format!("{root}.zip");
+        let manifest_path = "/repos/oven-sh/bun/releases/tags/bun-v1.4.0";
+        let archive_path = format!("/oven-sh/bun/releases/download/bun-v1.4.0/{filename}");
+        let mut routes = Vec::new();
+        for kind in [invalid, Launcher::Regular] {
+            let archive = zip(&root, "bun", kind)?;
+            let manifest = serde_json::json!({
+                "tag_name": "bun-v1.4.0", "prerelease": false,
+                "assets": [{"name": filename,
+                    "browser_download_url": format!("https://github.com{archive_path}"),
+                    "digest": format!("sha256:{:x}", Sha256::digest(&archive))}]
+            });
+            routes.push((
+                "api.github.com".to_owned(),
+                manifest_path.to_owned(),
+                serde_json::to_vec(&manifest)?,
+            ));
+            routes.push(("github.com".to_owned(), archive_path.clone(), archive));
+        }
+        let fixture = super::super::test_https::HttpsFixture::new_for_authorities(routes).await?;
+        let versions = tempfile::tempdir()?;
+        let manager = BunManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        manager
+            .install("1.4.0")
+            .await
+            .expect_err("incomplete launcher refusal");
+        assert!(
+            !versions.path().join("1.4.0").exists(),
+            "invalid Bun archive must not be published"
+        );
+        assert!(manager.list_installed()?.is_empty());
+        assert!(!versions.path().join("current").exists());
+        assert_eq!(manager.current_version(), None);
+        manager.install("1.4.0").await?;
+        assert_eq!(manager.list_installed()?, vec!["1.4.0"]);
+        assert_eq!(manager.current_version().as_deref(), Some("1.4.0"));
+        assert_eq!(
+            fs::read(versions.path().join("current/bun"))?,
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fixture.finish().await?,
+            vec![
+                format!("GET {manifest_path} HTTP/1.1"),
+                format!("GET {archive_path} HTTP/1.1"),
+                format!("GET {manifest_path} HTTP/1.1"),
+                format!("GET {archive_path} HTTP/1.1"),
+            ]
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_bun_manager_new() {
         let mgr = BunManager::new();

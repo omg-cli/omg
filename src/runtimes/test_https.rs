@@ -23,7 +23,22 @@ async fn headers(stream: &mut (impl AsyncRead + Unpin)) -> Result<String> {
 
 impl HttpsFixture {
     pub(super) async fn new(host: &str, routes: Vec<(String, Vec<u8>)>) -> Result<Self> {
-        let signed = rcgen::generate_simple_self_signed(vec![host.to_owned()])?;
+        Self::new_for_authorities(
+            routes
+                .into_iter()
+                .map(|(path, body)| (host.to_owned(), path, body))
+                .collect(),
+        )
+        .await
+    }
+
+    pub(super) async fn new_for_authorities(
+        routes: Vec<(String, String, Vec<u8>)>,
+    ) -> Result<Self> {
+        let mut hosts: Vec<_> = routes.iter().map(|(host, _, _)| host.clone()).collect();
+        hosts.sort();
+        hosts.dedup();
+        let signed = rcgen::generate_simple_self_signed(hosts)?;
         let certificate = reqwest::Certificate::from_der(signed.cert.der())?;
         // Reqwest installs its normal provider; the fixture adds no crypto provider feature.
         let _client = reqwest::Client::builder().build()?;
@@ -34,10 +49,9 @@ impl HttpsFixture {
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let proxy = reqwest::Proxy::all(format!("http://{}", listener.local_addr()?))?;
-        let host = host.to_owned();
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for (path, body) in routes {
+            for (host, path, body) in routes {
                 let (mut stream, _) =
                     tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
                 let connect =

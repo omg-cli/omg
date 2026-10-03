@@ -196,6 +196,70 @@ fn go_platform() -> Result<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn incomplete_go_archive_is_not_published_and_can_be_retried() -> Result<()> {
+        check_archive_publication(super::super::test_archive::Launcher::Missing).await
+    }
+
+    #[tokio::test]
+    async fn directory_go_launcher_is_not_published_and_can_be_retried() -> Result<()> {
+        check_archive_publication(super::super::test_archive::Launcher::Directory).await
+    }
+
+    async fn check_archive_publication(
+        invalid: super::super::test_archive::Launcher,
+    ) -> Result<()> {
+        use super::super::test_archive::{Launcher, tar_gz};
+        use sha2::{Digest as _, Sha256};
+        let filename = format!("go1.27.0.{}.tar.gz", go_platform()?);
+        let manifest_path = "/dl/?mode=json&include=all";
+        let archive_path = format!("/dl/{filename}");
+        let mut routes = Vec::new();
+        for kind in [invalid, Launcher::Regular] {
+            let archive = tar_gz("go", "bin/go", kind)?;
+            let manifest = serde_json::json!([{
+                "version": "go1.27.0", "stable": true,
+                "files": [{"filename": filename, "sha256": format!("{:x}", Sha256::digest(&archive))}]
+            }]);
+            routes.push((manifest_path.to_owned(), serde_json::to_vec(&manifest)?));
+            routes.push((archive_path.clone(), archive));
+        }
+        let fixture = super::super::test_https::HttpsFixture::new("go.dev", routes).await?;
+        let versions = tempfile::tempdir()?;
+        let manager = GoManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        manager
+            .install("1.27.0")
+            .await
+            .expect_err("incomplete launcher refusal");
+        assert!(
+            !versions.path().join("1.27.0").exists(),
+            "invalid Go archive must not be published"
+        );
+        assert!(manager.list_installed()?.is_empty());
+        assert!(!versions.path().join("current").exists());
+        assert_eq!(manager.current_version(), None);
+        manager.install("1.27.0").await?;
+        assert_eq!(manager.list_installed()?, vec!["1.27.0"]);
+        assert_eq!(manager.current_version().as_deref(), Some("1.27.0"));
+        assert_eq!(
+            fs::read(versions.path().join("current/bin/go"))?,
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fixture.finish().await?,
+            vec![
+                format!("GET {manifest_path} HTTP/1.1"),
+                format!("GET {archive_path} HTTP/1.1"),
+                format!("GET {manifest_path} HTTP/1.1"),
+                format!("GET {archive_path} HTTP/1.1"),
+            ]
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_go_manager_new() {
         let mgr = GoManager::new();
