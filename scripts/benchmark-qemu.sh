@@ -483,6 +483,7 @@ write_files:
       Type=oneshot
       TimeoutStartSec=15
       ExecStart=-/usr/bin/env ip -brief address
+      ExecStart=-/usr/bin/env ip -statistics -statistics link
       ExecStart=-/usr/bin/env ip -4 route
       ExecStart=-/usr/bin/journalctl --boot --unit=systemd-networkd --unit=NetworkManager --lines=80 --no-pager
       StandardOutput=tty
