@@ -86,6 +86,18 @@ impl SystemBackendAccess {
         matches!(self, Self::Production { .. })
     }
 
+    fn retire(self) {
+        #[cfg(feature = "arch")]
+        if let Self::Production {
+            alpm_worker: Some(alpm_worker),
+        } = self
+        {
+            retire_alpm_worker(alpm_worker, pause_native_retirement);
+        }
+        #[cfg(not(feature = "arch"))]
+        let _ = self;
+    }
+
     #[cfg(feature = "arch")]
     fn has_alpm_worker(&self) -> bool {
         matches!(
@@ -95,25 +107,6 @@ impl SystemBackendAccess {
             }
         )
     }
-}
-
-#[cfg_attr(
-    not(feature = "arch"),
-    allow(
-        clippy::needless_pass_by_value,
-        reason = "native retirement must consume backend ownership on Arch"
-    )
-)]
-fn retire_system_backend(backends: SystemBackendAccess) {
-    #[cfg(feature = "arch")]
-    if let SystemBackendAccess::Production {
-        alpm_worker: Some(alpm_worker),
-    } = backends
-    {
-        retire_alpm_worker(alpm_worker, pause_native_retirement);
-    }
-    #[cfg(not(feature = "arch"))]
-    let _ = backends;
 }
 
 #[cfg(feature = "arch")]
@@ -267,7 +260,7 @@ impl DaemonState {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     std::mem::replace(&mut *current, replacement)
                 };
-                retire_system_backend(retired);
+                retired.retire();
                 Ok(refresh_guard)
             })
             .await
@@ -291,7 +284,7 @@ impl DaemonState {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     std::mem::replace(&mut *current, SystemBackendAccess::Isolated)
                 };
-                retire_system_backend(retired);
+                retired.retire();
                 drop(refresh_guard);
             }).await.context("Native backend retirement task panicked")?;
             self.native_tasks.wait().await;
