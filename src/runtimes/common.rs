@@ -426,7 +426,7 @@ where
 }
 
 /// Number of attempts for one runtime artifact download: the initial try plus
-/// two bounded retries cover transient mid-stream stalls without turning a
+/// two bounded retries cover transient status, connection and body failures without turning a
 /// persistent failure into an unbounded loop.
 const MAX_DOWNLOAD_ATTEMPTS: usize = 3;
 
@@ -538,6 +538,22 @@ where
 
         if !response.status().is_success() {
             let status = response.status();
+            if attempt + 1 < MAX_DOWNLOAD_ATTEMPTS && crate::core::http::is_retryable_status(status)
+            {
+                drop(response);
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    host,
+                    %status,
+                    "Runtime download status failed; retrying bounded download"
+                );
+                tokio::time::sleep(crate::core::http::retry_backoff(
+                    std::time::Duration::from_millis(100),
+                    u32::try_from(attempt).unwrap_or(u32::MAX),
+                ))
+                .await;
+                continue;
+            }
             if status.as_u16() == 404 {
                 anyhow::bail!(
                     "Version not found (404). Check available versions with: omg list --available"
