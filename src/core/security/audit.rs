@@ -578,7 +578,7 @@ impl AuditLogger {
 
         let mut total_entries = 0;
         let mut valid_entries = 0;
-        let mut legacy_entries = 0;
+        let mut legacy_entries = 0usize;
         let mut chain_valid = true;
         let mut expected_prev_hash = "genesis".to_string();
         let mut first_invalid: Option<String> = None;
