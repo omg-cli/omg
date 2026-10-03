@@ -139,6 +139,21 @@ class NativeBuildAdmission(unittest.TestCase):
                 self.assertEqual(request.call_count, 1)
                 sleep.assert_not_called()
 
+    def test_metadata_process_errors_and_server_delays_remain_failures(self):
+        path = 'repos/omg-cli/omg/actions/workflows/ci.yml'
+        for data in (b'', b'HTTP/2.0 200 OK\nContent-Type: application/json\r\n\r\n{}',
+                     b'HTTP/2.0 503 Unavailable\nRetry-After: 60\r\n\r\n{}'):
+            def failed_process(argv, *, stdout, check, timeout):
+                stdout.write(data)
+                raise subprocess.CalledProcessError(1, argv)
+
+            with self.subTest(data=data), patch.object(BUILD.subprocess, 'run', side_effect=failed_process) as request, \
+                    patch.object(BUILD.time, 'sleep') as sleep:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    BUILD.api_json(path)
+                request.assert_called_once()
+                sleep.assert_not_called()
+
     def test_merge_group_admits_only_the_exact_candidate_native_owner(self):
         run = dict(id=123, run_attempt=1, repository={'full_name': 'omg-cli/omg'},
                    path='.github/workflows/ci.yml', workflow_id=42, event='merge_group',
