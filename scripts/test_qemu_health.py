@@ -213,6 +213,64 @@ docker() {
         self.assertNotIn("private", json.dumps(receipt))
         self.assertNotIn("/home/bench", json.dumps(receipt))
 
+    def processing_query(self, processors):
+        """Return normal journals and successive systemd processing observations."""
+        observations = iter(processors)
+        sentinel = json.dumps({"COREDUMP_COMM": "omg-qemu-probe",
+                               "COREDUMP_EXE": "/usr/bin/python3.14", "COREDUMP_SIGNAL": "6"})
+
+        def query(argv):
+            if argv[0] == "systemctl":
+                observed = next(observations)
+                if isinstance(observed, Exception):
+                    raise observed
+                return observed
+            return "Linux version 6.12\n" if "--dmesg" in argv else sentinel
+
+        return query
+
+    def test_pending_or_failed_processor_cannot_admit_clean_journals(self):
+        for state, substate, result in (("activating", "start-pre", "success"),
+                                       ("active", "running", "success"),
+                                       ("deactivating", "stop-sigterm", "success"),
+                                       ("failed", "failed", "exit-code")):
+            processor = ("Id=systemd-coredump@1-4098-1046_4712-0.service\n"
+                         f"ActiveState={state}\nSubState={substate}\nResult={result}\n")
+            with self.subTest(state=state), \
+                    patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
+                    patch.object(HEALTH, "query", side_effect=self.processing_query([processor])):
+                with self.assertRaisesRegex(ValueError, "coredump|crash"):
+                    HEALTH.collect()
+
+    def test_processor_starting_during_collection_cannot_pass(self):
+        processor = ("Id=systemd-coredump@1-4098-1046_4712-0.service\n"
+                     "ActiveState=activating\nSubState=start-pre\nResult=success\n")
+        with patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
+                patch.object(HEALTH, "query", side_effect=self.processing_query(["", processor])):
+            with self.assertRaisesRegex(ValueError, "coredump|crash"):
+                HEALTH.collect()
+
+    def test_unavailable_processing_query_cannot_pass(self):
+        for error in (ValueError("crash health query failed"),
+                      subprocess.TimeoutExpired(["systemctl", "show"], 15)):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
+                    patch.object(HEALTH, "query", side_effect=self.processing_query([error])):
+                with self.assertRaises(type(error)):
+                    HEALTH.collect()
+
+    def test_completed_processor_and_empty_controls_preserve_clean_collection(self):
+        completed = ("Id=systemd-coredump@1-4098-1046_4712-0.service\n"
+                     "ActiveState=inactive\nSubState=dead\nResult=success\n")
+        for processors in (["", ""], [completed, completed]):
+            with self.subTest(processors=processors), \
+                    patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
+                    patch.object(HEALTH, "query", side_effect=self.processing_query(processors)):
+                receipt = HEALTH.collect()
+            self.assertTrue(receipt["complete"])
+            self.assertEqual(receipt["product_crashes"], [])
+            self.assertEqual(receipt["boot_id"], self.payload["boot_id"])
+
     def test_missing_truncated_or_oversized_evidence_fails(self):
         for content in ("", "{", "null", "x" * (HEALTH.LIMIT + 1)):
             with self.subTest(length=len(content)):
