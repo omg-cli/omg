@@ -952,6 +952,7 @@ enum Assertion {
     OutdatedNativeCount,
     OutdatedJsonNativeCount,
     DoctorNativeBackend,
+    DoctorCapabilityCleanup,
     DoctorEolState,
     DoctorNetworkState,
     DoctorNetworkLiveState,
@@ -1084,6 +1085,7 @@ impl Assertion {
             "outdated-native-count" => Self::OutdatedNativeCount,
             "outdated-json-native-count" => Self::OutdatedJsonNativeCount,
             "doctor-native-backend" => Self::DoctorNativeBackend,
+            "doctor-capability-cleanup" => Self::DoctorCapabilityCleanup,
             "doctor-eol-state" => Self::DoctorEolState,
             "doctor-network-state" => Self::DoctorNetworkState,
             "doctor-network-live-state" => Self::DoctorNetworkLiveState,
@@ -1575,8 +1577,13 @@ fn behavior_inventory_doctor_turbo_retains_guest_capability_contract() {
     assert_eq!(case.safety, Safety::IsolatedWrite);
     assert_eq!(case.tiers, [Tier::Container]);
     assert_eq!(case.expected_ux, UxState::Pass);
-    assert_eq!(case.expected_exit.expect("zero guest exit").exit_for(Distro::Arch), 0);
-    assert_eq!(case.assertions, [Assertion::parse("doctor-capability-cleanup", case.line)]);
+    assert_eq!(
+        case.expected_exit
+            .expect("zero guest exit")
+            .exit_for(Distro::Arch),
+        0
+    );
+    assert_eq!(case.assertions, [Assertion::DoctorCapabilityCleanup]);
     assert_eq!(case.cleanup, Cleanup::TempdirDrop);
     assert!(!case.runs_hermetically());
 }
@@ -3570,6 +3577,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 | Assertion::OutdatedNativeCount
                 | Assertion::OutdatedJsonNativeCount
                 | Assertion::DoctorNativeBackend
+                | Assertion::DoctorCapabilityCleanup
                 | Assertion::DoctorEolState
                 | Assertion::DoctorNetworkState
                 | Assertion::DoctorNetworkLiveState
