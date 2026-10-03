@@ -151,7 +151,7 @@ def allowed_directory(parts):
         return False
     rest = parts[1:]
     return rest in ((), ("guest",), ("guest", "evidence"),
-                    ("guest", "evidence", "benchmarks"), ("guest", "evidence", "osv"), ("guest", "evidence", "arch-advisory"), ("guest", "evidence", "fedora-advisory"), ("inventory",),
+                    ("guest", "evidence", "benchmarks"), ("guest", "evidence", "apt-abi"), ("guest", "evidence", "osv"), ("guest", "evidence", "arch-advisory"), ("guest", "evidence", "fedora-advisory"), ("inventory",),
                     ("inventory", "rows"), ("transactions",), ("transactions", "trials")) or (
         len(rest) in (3, 4) and rest[:2] == ("transactions", "trials")
         and re.fullmatch(NAME, rest[2]) is not None
@@ -171,6 +171,8 @@ def allowed_file(parts):
         return name == "serial.log"
     if parent == ("guest", "evidence"):
         return name in GUEST_FILES
+    if parent == ("guest", "evidence", "apt-abi"):
+        return name in {"receipt.json", "os-release", "omg-loader.log", "omgd-loader.log"}
     if parent == ("guest", "evidence", "osv"):
         return name in OSV_FILES
     if parent == ("guest", "evidence", "arch-advisory"):

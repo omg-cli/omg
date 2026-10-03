@@ -97,6 +97,9 @@ jobs:
           python3 -m unittest discover -s tests -p test_qemu_verdict.py
           python3 -m unittest discover -s scripts -p test_prepare_qemu_release.py
           python3 -m unittest discover -s scripts -p test_qemu_daemon_contract.py
+          python3 -m unittest discover -s scripts -p test_qemu_apt_abi.py
+          python3 -m unittest discover -s scripts -p test_qemu_apt_abi_evidence.py
+          python3 -m unittest discover -s scripts -p test_qemu_image_provenance.py
           python3 -m unittest discover -s scripts -p test_qemu_image_cache.py
           python3 -m unittest discover -s scripts -p test_qemu_process_isolation.py
           python3 -m unittest discover -s scripts -p test_qemu_runner_isolation.py

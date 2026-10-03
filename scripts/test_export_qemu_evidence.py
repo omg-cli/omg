@@ -32,6 +32,17 @@ TRANSACTION_PRIVATE = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_apt_abi_exports_only_its_bound_guest_receipt_and_raw_inputs(self):
+        prefix = ('run-test', 'guest', 'evidence', 'apt-abi')
+        for name in ('receipt.json', 'os-release', 'omg-loader.log', 'omgd-loader.log'):
+            with self.subTest(name=name):
+                self.assertTrue(exporter.allowed_file((*prefix, name)))
+                self.assertFalse(exporter.allowed_file((*prefix, 'private', name)))
+                self.assertFalse(exporter.allowed_file((*prefix, name + '.bak')))
+                self.assertFalse(exporter.allowed_file(('run-test', name)))
+        for name in ('omg', 'omgd', 'client-key', 'overlay.qcow2', 'cache.json'):
+            self.assertFalse(exporter.allowed_file((*prefix, name)))
+
     def test_native_benchmark_identity_queries_stay_at_benchmark_roots(self):
         names = ("native-identity-query.stdout", "native-identity-query.stderr", "native-identity-query-before.stdout", "native-identity-query-before.stderr", "native-identity-query-after.stdout", "native-identity-query-after.stderr", "native-architecture.stdout", "native-architecture.stderr")
         roots = (("run-test", "guest", "evidence", "benchmarks"),
