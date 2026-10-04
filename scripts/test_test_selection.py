@@ -1,8 +1,12 @@
 """Execution reconciliation fixtures, not product coverage receipts."""
 import copy
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 
 SPEC = importlib.util.spec_from_file_location(
     'test_selection', Path(__file__).with_name('check-test-selection.py'))
@@ -26,6 +30,70 @@ def junit(contents='<testcase name="parser" classname="omg::cli_surface" time="0
 
 
 class TestSelection(unittest.TestCase):
+    def test_debian_like_refusal_has_no_execution_credit(self):
+        """Execute repository macro/reporter; host predicates are controlled doubles.
+
+        This is a reporting regression, not a native backend or guest receipt.
+        Removing report_skip from the refusal path must fail this test.
+        """
+        root = Path(__file__).resolve().parents[1]
+        source = (root / 'tests/debian_tests.rs').read_text(encoding='utf-8')
+        macro = source.split('#[macro_export]\nmacro_rules! require_debian_like {', 1)[1]
+        macro = '#[macro_export]\nmacro_rules! require_debian_like {' + macro.split(
+            '\n// ═', 1)[0]
+        common = (root / 'tests/common/mod.rs').read_text(encoding='utf-8')
+        reporter = 'pub fn report_skip' + common.split('pub fn report_skip', 1)[1].split(
+            '\n}', 1)[0] + '\n}'
+        probe = '''
+mod common {
+    pub struct TestConfig(String);
+    impl Default for TestConfig {
+        fn default() -> Self {
+            Self(std::env::var("OMG_TEST_DISTRO").expect("controlled host predicate"))
+        }
+    }
+    impl TestConfig {
+        pub fn is_debian(&self) -> bool { self.0 == "debian" }
+        pub fn is_ubuntu(&self) -> bool { self.0 == "ubuntu" }
+    }
+''' + reporter + '\n}\n' + macro + '''
+#[test]
+fn probe() {
+    require_debian_like!();
+    println!("behavior reached");
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / 'probe.rs').write_text(probe, encoding='utf-8')
+            binary = path / ('probe.exe' if os.name == 'nt' else 'probe')
+            subprocess.run(['rustc', '--edition=2024', '--test', str(path / 'probe.rs'),
+                            '-o', str(binary)], check=True, capture_output=True, text=True)
+            for distro in ('arch', 'debian', 'ubuntu'):
+                with self.subTest(distro=distro):
+                    output = subprocess.run([str(binary), '--exact', 'probe', '--nocapture'],
+                                            env=dict(os.environ, OMG_TEST_DISTRO=distro),
+                                            check=True, capture_output=True, text=True)
+                    case = ET.Element('testcase', name='parser',
+                                      classname='omg::cli_surface', time='0.001')
+                    ET.SubElement(case, 'system-out').text = output.stdout
+                    ET.SubElement(case, 'system-err').text = output.stderr
+                    report = SELECTION.reconcile(listing(), junit(ET.tostring(
+                        case, encoding='unicode')), ['omg::cli_surface'])
+                    if distro == 'arch':
+                        self.assertNotIn('behavior reached', output.stdout)
+                        self.assertEqual(report['counts']['executed'], 0)
+                        self.assertEqual(report['counts']['passed'], 0)
+                        self.assertEqual(report['counts']['skipped'], 2)
+                        self.assertFalse(report['executed_required_binaries'])
+                        self.assertEqual(report['tests']['omg::cli_surface::parser'][
+                            'runtime_skip_reason'], 'requires Debian or Ubuntu')
+                    else:
+                        self.assertIn('behavior reached', output.stdout)
+                        self.assertEqual(report['counts']['executed'], 1)
+                        self.assertEqual(report['counts']['passed'], 1)
+                        self.assertNotIn('[omg-skip]', output.stderr)
+
     def test_nonempty_selection_preserves_ignored_denominator(self):
         report = SELECTION.reconcile(listing(), junit(), ['omg::cli_surface'])
         self.assertEqual(report['counts'], dict(discovered=2, selected=1, executed=1,
