@@ -55,7 +55,7 @@ def crash_channel_capability(boot_id):
     pattern = query(["cat", "/proc/sys/kernel/core_pattern"]).strip()
     match = CORE_PATTERN.fullmatch(pattern)
     if not match:
-        raise ValueError("unsupported kernel crash handler")
+        raise ValueError(f"unsupported kernel crash handler: core_pattern={pattern[:256]!r}")
     # Check executable availability without invoking the handler or reading cores.
     query(["test", "-x", match[1]])
     channel = {"kind": "systemd-coredump-pipe", "boot_id": boot_id,

@@ -332,6 +332,16 @@ docker() {
                 with self.assertRaises(ValueError):
                     HEALTH.collect()
 
+    def test_unsupported_handler_failure_retains_bounded_routing_evidence(self):
+        for pattern in ('core', '|/unsupported/collector %p', 'x' * 1024):
+            with self.subTest(pattern=pattern), patch.object(HEALTH, 'query', return_value=pattern):
+                with self.assertRaises(ValueError) as raised:
+                    HEALTH.crash_channel_capability(self.payload['boot_id'])
+                message = str(raised.exception)
+                self.assertIn('unsupported kernel crash handler', message)
+                self.assertIn(repr(pattern[:256]), message)
+                self.assertLess(len(message), 350)
+
     def test_capability_loss_or_boot_change_during_collection_cannot_admit(self):
         for changed_boot in (False, True):
             original = self.processing_query(["", ""], "")
