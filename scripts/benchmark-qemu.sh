@@ -744,7 +744,7 @@ fi
 [[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 [[ $("$daemon" --version | head -1 | tr -d '[:space:]') == "omgd${tag#v}" ]]
 case "$distro" in
-  arch) sudo -n pacman -Syu --noconfirm >/dev/null || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
+  arch) sudo -n pacman -Syu --noconfirm >evidence/arch-system-upgrade.txt 2>&1 || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
   debian|debian-trixie|ubuntu)
     sudo -n systemctl stop apt-daily.timer apt-daily-upgrade.timer
     if [[ "$distro" == ubuntu ]]; then
