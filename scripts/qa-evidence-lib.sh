@@ -9,7 +9,7 @@ set -euo pipefail
 qa_result_rows() {
   jq -ce '
   def identifier: type == "string" and test("^[a-z0-9][a-z0-9-]{0,127}$");
-  def distro: type == "string" and IN("arch", "debian", "ubuntu", "fedora", "macos");
+  def distro: type == "string" and IN("arch", "debian", "debian-trixie", "ubuntu", "fedora", "macos");
   def matrix_case: IN("qemu-matrix-workflow", "qemu-matrix-x86-workflow", "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow", "ci-non-qemu-workflow");
   if type != "array" then error("results must be an array") else . end |
   if length > 10000 then error("too many results") else . end |
@@ -46,7 +46,7 @@ qa_transaction_rows() {
     if type != "object" or ($raw | length) != 1 or ($raw[0] | type) != "array"
     then error("invalid transaction document") else . end |
     if .schema_version != 2 or .kind != "transaction-suite"
-       or (.distro | IN("arch", "debian", "ubuntu", "fedora") | not)
+       or (.distro | IN("arch", "debian", "debian-trixie", "ubuntu", "fedora") | not)
        or .complete != true or .phase != "complete"
        or (.samples_per_tool | type) != "number" or (.samples_per_tool | floor) != .samples_per_tool
        or .samples_per_tool < 1 or .samples_per_tool > 100
