@@ -1373,6 +1373,24 @@ fn check_shell_hook() -> bool {
     crate::cli::init::shell_from_env().is_some_and(crate::cli::init::shell_rc_has_hook)
 }
 
+/// Inspect the actual file capability attribute, including an empty set.
+#[cfg(target_os = "linux")]
+fn file_has_capability_xattr(exe: &std::path::Path) -> Result<bool> {
+    // A zero-length buffer asks for the attribute length without reading it.
+    // Even a zero-length attribute is present and needs explicit cleanup.
+    let mut empty = [0_u8; 0];
+    match rustix::fs::getxattr(exe, "security.capability", &mut empty) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if error == rustix::io::Errno::NODATA || error == rustix::io::Errno::OPNOTSUPP =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("Could not inspect file capabilities on {}", exe.display())),
+    }
+}
+
 /// Enable turbo mode — SECURE REDESIGN (audit F-01, CRITICAL).
 ///
 /// The old implementation ran `sudo setcap` on the omg binary, granting
@@ -1393,65 +1411,78 @@ pub fn enable_turbo_mode() -> Result<()> {
 
     crate::cli::modern_ui::print_phase_header("⚡", "TURBO MODE", "Fast package operations");
 
-    // Strip capabilities an older omg version may have granted. This runs
-    // a privileged command, so ask first in an attended terminal.
-    println!(
-        "  {} Removing legacy file capabilities from {}...",
-        crate::cli::style::accent("→"),
-        exe_path
-    );
-    let cleanup_done = if console::user_attended()
-        && !dialoguer::Confirm::new()
-            .with_prompt("Run `sudo setcap -r` on the omg binary?")
-            .default(true)
-            .interact()?
-    {
+    // An empty capability set is still an xattr and must be removed.
+    let had_capabilities = file_has_capability_xattr(&exe)?;
+    if had_capabilities {
         println!(
-            "  {} Skipped capability cleanup",
-            crate::cli::style::info("ℹ")
+            "  {} Removing legacy file capabilities from {}...",
+            crate::cli::style::accent("→"),
+            exe_path
         );
-        false
-    } else {
-        true
-    };
-    if cleanup_done {
+        if console::user_attended()
+            && !dialoguer::Confirm::new()
+                .with_prompt("Run `sudo setcap -r` on the omg binary?")
+                .default(true)
+                .interact()?
+        {
+            anyhow::bail!("Legacy file capabilities remain; turbo setup was not completed");
+        }
+    }
+
+    // `sudo -v` is the documented validation operation. Cleanup alone does
+    // not prove that credentials were warmed, and it may legitimately be
+    // unnecessary when no legacy capability xattr exists.
+    let attended = console::user_attended();
+    let mut validate = crate::core::privilege::system_command("sudo")?;
+    if !attended {
+        validate.arg("-n").stdin(std::process::Stdio::null());
+    }
+    let status = validate
+        .arg("-v")
+        .status()
+        .context("Could not run sudo credential validation")?;
+    anyhow::ensure!(
+        status.success(),
+        "sudo credential validation failed; turbo setup was not completed"
+    );
+
+    if had_capabilities {
         let setcap = crate::core::privilege::root_controlled_program_path("setcap")?;
-        let remove = crate::core::privilege::system_command("sudo")?
+        let status = crate::core::privilege::system_command("sudo")?
+            .arg("-n")
             .arg("--")
             .arg(setcap)
             .arg("-r")
             .arg(&exe)
-            .status();
-        match remove {
-            Ok(status) if status.success() => {
-                println!(
-                    "  {} No file capabilities remain (or none were set)",
-                    crate::cli::style::positive("✓")
-                );
-            }
-            Ok(status) => {
-                println!(
-                    "  {} `setcap -r` exited with code {}",
-                    crate::cli::style::caution("⚠"),
-                    status.code().unwrap_or(-1)
-                );
-            }
-            Err(error) => {
-                println!(
-                    "  {} Could not run `setcap -r`: {error}",
-                    crate::cli::style::caution("⚠")
-                );
-            }
-        }
+            .status()
+            .context("Could not run legacy capability cleanup")?;
+        anyhow::ensure!(status.success(), "Legacy capability cleanup failed");
     }
+    anyhow::ensure!(
+        !file_has_capability_xattr(&exe)?,
+        "Legacy file capabilities remain after cleanup"
+    );
+    let cached = crate::core::privilege::system_command("sudo")?
+        .args(["-N", "-n", "-v"])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .context("Could not inspect the sudo credential cache")?;
+    anyhow::ensure!(
+        cached.success(),
+        "Sudo credentials are not cached; turbo setup was not completed"
+    );
+    println!(
+        "  {} No file capabilities remain (or none were set)",
+        crate::cli::style::positive("✓")
+    );
     println!();
 
-    // Warm the sudo credential cache so subsequent operations are
-    // prompt-free for the timestamp window; sudoloop keeps it alive during
-    // long AUR builds.
-    println!("  {} Turbo now means:", crate::cli::style::accent("→"));
     println!(
-        "    {} Sudo credential caching (sudoloop) — one prompt per session",
+        "  {} Sudo credentials validated for this session",
+        crate::cli::style::accent("→")
+    );
+    println!(
+        "    {} Sudo credential caching follows your administrator's timeout policy",
         crate::cli::style::dim("•")
     );
     println!(
@@ -1488,6 +1519,14 @@ pub fn enable_turbo_mode() -> Result<()> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capability_probe_distinguishes_absent_attribute_from_missing_file() {
+        let file = tempfile::NamedTempFile::new().expect("temporary executable");
+        assert!(!file_has_capability_xattr(file.path()).expect("file without capabilities"));
+        assert!(file_has_capability_xattr(&file.path().with_extension("missing")).is_err());
+    }
 
     #[test]
     fn doctor_network_targets_match_selected_backend() {
