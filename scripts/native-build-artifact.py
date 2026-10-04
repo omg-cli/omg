@@ -143,13 +143,13 @@ def validate_producer_run(run, expected):
             'producer was cancelled or did not complete normally')
 
 
-def api(path, limit=1024 * 1024, *, include_status=False):
+def api(path, limit=1024 * 1024, *, include_status=False, timeout=90):
     command = ['gh', 'api', path]
     if include_status:
         command.append('--include')
     with tempfile.TemporaryFile() as output:
         try:
-            subprocess.run(command, stdout=output, check=True, timeout=90)
+            subprocess.run(command, stdout=output, check=True, timeout=timeout)
         except subprocess.CalledProcessError as error:
             if include_status:
                 require(output.tell() <= limit, 'GitHub response exceeds limit')
@@ -174,11 +174,14 @@ def metadata_response(data):
 
 
 def api_json(path):
-    # Metadata GETs share one budget for timeouts and transient gateway responses.
+    # Metadata GETs share one deadline and attempt budget across transport failures.
     # A fresh temporary output prevents partial/error bodies from entering admission.
+    deadline = time.monotonic() + 90
     for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, 'GitHub metadata request deadline exhausted')
         try:
-            data = api(path, 1024 * 1024 + 64 * 1024, include_status=True)
+            data = api(path, 1024 * 1024 + 64 * 1024, include_status=True, timeout=remaining)
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
             if isinstance(error, subprocess.CalledProcessError):
                 if not error.output or not error.output.startswith(b'HTTP/'):
@@ -187,9 +190,10 @@ def api_json(path):
                 # Leave rate limits and server-directed delays as explicit failures.
                 if status not in (502, 503, 504) or retry_after:
                     raise
-            if attempt == 2:
+            delay = 2 ** attempt
+            if attempt == 2 or deadline - time.monotonic() <= delay:
                 raise
-            time.sleep(2 ** attempt)
+            time.sleep(delay)
         else:
             status, body, _ = metadata_response(data)
             require(200 <= status < 300, 'unsuccessful GitHub metadata response')
