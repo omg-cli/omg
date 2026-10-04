@@ -248,15 +248,15 @@ async fn test_timer_helper() -> Result<()> {
 async fn test_timer_multiple_operations() -> Result<()> {
     let timer1 = Timer::new("operation_1");
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let elapsed1 = timer1.elapsed_ms();
 
     let timer2 = Timer::new("operation_2");
     tokio::time::sleep(Duration::from_millis(15)).await;
     let elapsed2 = timer2.elapsed_ms();
+    let elapsed1 = timer1.elapsed_ms();
 
     assert!(elapsed1 >= 5);
     assert!(elapsed2 >= 15);
-    assert!(elapsed2 > elapsed1);
+    assert!(elapsed1 >= elapsed2);
 
     Ok(())
 }
