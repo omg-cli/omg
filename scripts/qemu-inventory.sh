@@ -1534,6 +1534,39 @@ capture_fedora_failure_context() {
     }
     printf '\nOMG_QEMU_NATIVE_FAILURE_CONTEXT boot_id=%s history_selection=last\n' \
       "$(cat /proc/sys/kernel/random/boot_id)"
+    # Observe the default log before history adds new entries. Do not export raw text.
+    # DNF5 5.4.1.0 transaction.cpp:1121-1126 starts history before creating this pipe.
+    native_failure_probe dnf-log-summary sudo -n python3 - /var/log/dnf5.log <<'PY_DNF_LOG'
+import json
+import os
+import stat
+import sys
+
+summary = {'available': False, 'selection': 'default-log-tail-not-uuid-correlated'}
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as log:
+        metadata = os.fstat(log.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            summary['reason'] = 'unsafe-file-type-or-links'
+        else:
+            limit = 24576
+            offset = max(0, metadata.st_size - limit)
+            log.seek(offset)
+            sample = log.read(limit)
+            # A partial first line cannot establish an intact native log record.
+            if offset:
+                sample = sample.partition(b'\n')[2]
+            summary.update(available=True, file_bytes=metadata.st_size,
+                           mtime_ns=metadata.st_mtime_ns, sample_bytes=len(sample),
+                           truncated=bool(offset),
+                           pipe_creation_failure_count=sample.count(
+                               b'Transaction::Run: Cannot create pipe:'))
+except OSError as error:
+    summary.update(reason='read-unavailable', errno=error.errno)
+print('OMG_QEMU_DNF_LOG_SUMMARY ' + json.dumps(summary, sort_keys=True))
+sys.exit(0 if summary['available'] else 1)
+PY_DNF_LOG
     # Latest history is an observation; its comment must establish correlation.
     # https://dnf5.readthedocs.io/en/latest/commands/history.8.html
     native_failure_probe dnf-history sudo -n dnf history info --json last
