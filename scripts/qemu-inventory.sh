@@ -3153,7 +3153,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
             && "$expected_ux" == pass && "$requires" == - && ${#chain[@]} == 0
             && "$tier" == container && "$targets" == arch:pass,debian:pass,ubuntu:pass,fedora:pass
             && "$cleanup" == tempdir-drop && "$ssh_user" != root
-            && ( "$distro" == arch || "$distro" == debian || "$distro" == ubuntu || "$distro" == fedora ) ]] \
+            && ( "$distro" == arch || "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu || "$distro" == fedora ) ]] \
         && jq -e '. == ["doctor", "--turbo"]' <<< "$args_json" >/dev/null; then
         native_privilege=true
       fi
