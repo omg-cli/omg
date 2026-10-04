@@ -697,8 +697,11 @@ impl SpdxParser {
     }
 
     fn parse_and(&mut self) -> Option<SpdxExpr> {
+        let start = self.pos;
         let mut expr = self.parse_atom()?;
+        self.require_progress(start)?;
         loop {
+            let start = self.pos;
             if self.eat(&SpdxToken::And) {
                 let right = self.parse_atom()?;
                 expr = SpdxExpr::And(Box::new(expr), Box::new(right));
@@ -709,8 +712,13 @@ impl SpdxParser {
             } else {
                 break;
             }
+            self.require_progress(start)?;
         }
         Some(expr)
+    }
+
+    fn require_progress(&self, start: usize) -> Option<()> {
+        (self.pos > start).then_some(())
     }
 
     fn parse_atom(&mut self) -> Option<SpdxExpr> {
@@ -1141,6 +1149,36 @@ mod tests {
                 "{expression}"
             );
         }
+    }
+
+    #[test]
+    fn expression_parser_refuses_stationary_and_backward_cursors() {
+        let mut parser = SpdxParser {
+            tokens: spdx_tokenize("MIT Apache-2.0").expect("valid tokens"),
+            pos: 1,
+        };
+        assert!(parser.require_progress(0).is_some());
+        assert!(parser.require_progress(1).is_none());
+        assert!(parser.require_progress(2).is_none());
+        parser.pos = 0;
+        assert!(parser.require_progress(0).is_none());
+        assert!(parser.require_progress(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn expression_parser_consumes_every_implicit_or_operand() {
+        let expression = SpdxParser::parse_expression("MIT Apache-2.0 BSD-3-Clause")
+            .expect("every identifier must be consumed");
+        assert_eq!(
+            expression,
+            SpdxExpr::Or(
+                Box::new(SpdxExpr::Or(
+                    Box::new(SpdxExpr::Id("mit".into())),
+                    Box::new(SpdxExpr::Id("apache-2.0".into()))
+                )),
+                Box::new(SpdxExpr::Id("bsd-3-clause".into()))
+            )
+        );
     }
 
     #[test]
