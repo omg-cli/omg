@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MutationRefusalTests(unittest.TestCase):
-    def run_probe(self, fault=None):
+    def run_probe(self, fault=None, *, distro='debian'):
         script = ROOT / 'scripts/qemu-mutation-refusal.py'
         self.assertTrue(script.is_file(), 'the native refusal probe is missing')
         with tempfile.TemporaryDirectory() as directory:
@@ -69,7 +69,7 @@ else:
 ''')
             ssh.chmod(0o755)
             receipt = work / 'mutation-refusal.json'
-            args = ['--distro', 'debian', '--tag', 'fixture', '--binary', '/fixture/omg',
+            args = ['--distro', distro, '--tag', 'fixture', '--binary', '/fixture/omg',
                     '--tsv', str(ROOT / 'tests/cli_behavior_inventory.tsv')]
             result = subprocess.run(['python3', str(scripts / script.name), 'collect',
                                      '--work', str(work), '--receipt', str(receipt), *args],
@@ -92,6 +92,16 @@ else:
         self.assertEqual(sum('OMG_QEMU_RECEIPT' in call for call in calls), 1)
         self.assertEqual(receipt['state_before_sha256'], receipt['state_after_sha256'])
         self.assertEqual([row['result'] for row in receipt['results']], ['PASS', 'SKIPPED', 'SKIPPED'])
+        self.assertFalse(receipt['metadata']['allow_mutations'])
+
+    def test_trixie_executor_refuses_mutations_with_distinct_receipt_identity(self):
+        result, verification, receipt, calls = self.run_probe(distro='debian-trixie')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verification.returncode, 0, verification.stderr)
+        self.assertEqual(receipt['metadata']['distro'], 'debian-trixie')
+        self.assertEqual([row['result'] for row in receipt['results']], ['PASS', 'SKIPPED', 'SKIPPED'])
+        self.assertTrue(all(row['distro'] == 'debian-trixie' for row in receipt['results']))
+        self.assertEqual(len(calls), 3)
         self.assertFalse(receipt['metadata']['allow_mutations'])
 
     def test_enabled_gate_and_changed_native_state_cannot_prove_refusal(self):

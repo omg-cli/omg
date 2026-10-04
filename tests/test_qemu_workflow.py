@@ -32,6 +32,60 @@ def step(name):
 
 
 class QemuWorkflowTests(unittest.TestCase):
+    def test_benchmark_all_runs_complete_arch_specific_profile(self):
+        source = (WORKFLOW.parents[2] / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        defaults = source[:source.index('here=$(cd')]
+        begin = source.index('if [[ "$distro" == all ]]; then')
+        end = source.index('case_id="qemu-${distro}${case_suffix}-lifecycle"', begin)
+        child = '''#!/usr/bin/env bash
+set -euo pipefail
+while (($#)); do
+  case "$1" in --distro) target=$2; shift 2 ;; --evidence-dir) output=$2; shift 2 ;; *) shift ;; esac
+done
+[[ "$target" != "${OMIT_GUEST:-}" ]] || exit 1
+mkdir -p "$output/run-control"
+result=PASS; rc=0
+if [[ "$target" == "${FAIL_GUEST:-}" ]]; then result=FAIL; rc=1; fi
+jq -n --arg target "$target" --arg result "$result" --argjson rc "$rc" '[{case_id:("qemu-"+$target+"-lifecycle"),distro:$target,result:$result,exit_code:$rc}]' > "$output/run-control/results.json"
+exit "$rc"
+'''
+        for arch, failed, omitted, expected in (
+            ('x86_64', '', '', ['arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora']),
+            ('aarch64', '', '', ['debian', 'ubuntu', 'fedora']),
+            ('x86_64', 'debian-trixie', '', ['arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora']),
+            ('x86_64', '', 'debian-trixie', ['arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'])):
+            with self.subTest(arch=arch, failed=failed, omitted=omitted), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                script = root / 'guest-control.sh'
+                script.write_text(child)
+                script.chmod(0o755)
+                command = defaults + '\nroot="$SUITE_ROOT"; arch="$SUITE_ARCH"; source_kind=staged; case_suffix=\n' + source[begin:end]
+                result = subprocess.run([self.bash, '-c', command, str(script)], capture_output=True, text=True,
+                    env=dict(os.environ, SUITE_ROOT=str(root), SUITE_ARCH=arch, FAIL_GUEST=failed, OMIT_GUEST=omitted), timeout=15)
+                self.assertEqual(result.returncode, 1 if failed or omitted else 0, result.stderr)
+                rows = json.loads(next(root.glob('suite-*/results.json')).read_text())
+                self.assertEqual([row['distro'] for row in rows], expected)
+                for row in rows:
+                    self.assertEqual(row['result'], 'FAIL' if row['distro'] == failed else
+                                     'INCOMPLETE' if row['distro'] == omitted else 'PASS')
+
+    def test_trixie_recipe_executes_only_native_package_arguments(self):
+        recipes = json.loads(literal(TEXT, 'BUILD_X64', 10))
+        recipe = next(row for row in recipes if row['distro'] == 'debian-trixie')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tool = root / 'apt-get'
+            tool.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$CAPTURE"\n')
+            tool.chmod(0o755)
+            result = subprocess.run([self.bash, '-e', '-c', recipe['setup']],
+                env=dict(os.environ, PATH=directory + ':' + os.environ['PATH'], CAPTURE=str(root / 'args')),
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            arguments = (root / 'args').read_text().splitlines()
+            self.assertNotIn('+', arguments, 'diff markers became native package arguments')
+            self.assertIn('libapt-pkg-dev', arguments)
+            self.assertIn('python3-apt', arguments)
+
     def copy_inventory_to_controller(self, root):
         repository = WORKFLOW.parents[2]
         source = (repository / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
@@ -210,19 +264,19 @@ class QemuWorkflowTests(unittest.TestCase):
         return self.run_script('gh() { printf "v9.8.7\\n"; }\n' + literal(block, 'run', 8), env, directory)
 
     def test_dispatch_cross_product(self):
-        for staged, distro, arch in itertools.product([False, True], ['all', 'arch', 'debian', 'ubuntu', 'fedora'], ['all', 'x64', 'arm64']):
+        for staged, distro, arch in itertools.product([False, True], ['all', 'arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'], ['all', 'x64', 'arm64']):
             with self.subTest(staged=staged, distro=distro, arch=arch), tempfile.TemporaryDirectory() as tmp:
                 result, values = self.selection(Path(tmp), staged, distro, arch)
-                invalid = arch == 'arm64' and (not staged or distro == 'arch')
+                invalid = arch == 'arm64' and (not staged or distro in ('arch', 'debian-trixie'))
                 self.assertEqual(result.returncode != 0, invalid, result.stderr)
                 if invalid:
                     continue
                 self.assertEqual(values['x64'], str(arch != 'arm64').lower())
-                self.assertEqual(values['arm64'], str(staged and arch != 'x64' and distro != 'arch').lower())
-                self.assertEqual(json.loads(values['distros']), ['arch', 'debian', 'ubuntu', 'fedora'] if distro == 'all' else [distro])
+                self.assertEqual(values['arm64'], str(staged and arch != 'x64' and distro not in ('arch', 'debian-trixie')).lower())
+                self.assertEqual(json.loads(values['distros']), ['arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'] if distro == 'all' else [distro])
                 self.assertEqual(sorted(row['distro'] for row in json.loads(values['lanes'])),
                                  sorted(json.loads(values['distros'])))
-                for key, allowed in [('build-x64', ['arch', 'debian', 'fedora']), ('build-arm64', ['debian', 'fedora'])]:
+                for key, allowed in [('build-x64', ['arch', 'debian', 'debian-trixie', 'fedora']), ('build-arm64', ['debian', 'fedora'])]:
                     self.assertEqual([row['distro'] for row in json.loads(values[key])], allowed if distro == 'all' else [distro] if distro in allowed else [])
                 self.assertEqual(values['tag'], 'v' + re.search(r'^version = "([^"]+)"', (WORKFLOW.parents[2] / 'Cargo.toml').read_text(), re.M)[1] if staged else 'v9.8.7')
 
@@ -231,6 +285,29 @@ class QemuWorkflowTests(unittest.TestCase):
             with self.subTest(staged=staged, tag=tag), tempfile.TemporaryDirectory() as tmp:
                 result, _ = self.selection(Path(tmp), staged, 'all', 'all', tag)
                 self.assertNotEqual(result.returncode, 0)
+
+    def test_trixie_selects_its_apt7_native_recipe_without_enabling_arm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, values = self.selection(Path(tmp), True, 'debian-trixie', 'all')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lanes = json.loads(values['lanes'])
+            self.assertEqual([row['distro'] for row in lanes], ['debian-trixie'])
+            self.assertEqual(lanes[0]['features'], 'debian,pgp,license')
+            self.assertTrue(lanes[0]['image'].startswith('debian:trixie@sha256:'))
+            self.assertEqual((values['x64'], values['arm64']), ('true', 'false'))
+        with tempfile.TemporaryDirectory() as tmp:
+            result, values = self.selection(Path(tmp), True, 'debian-trixie', 'arm64')
+            self.assertNotEqual(result.returncode, 0, 'Trixie ARM has no verified native build recipe')
+            self.assertEqual(values, {}, 'unsupported ARM selection must fail before publishing outputs')
+
+    def test_automatic_all_keeps_bookworm_and_adds_a_distinct_trixie_guest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, values = self.selection(Path(tmp), True, 'all', 'all', event_name='pull_request')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(values['distros']), ['arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'])
+            self.assertEqual(sorted(row['distro'] for row in json.loads(values['lanes'])),
+                             ['arch', 'debian', 'debian-trixie', 'fedora', 'ubuntu'])
+            self.assertEqual((values['x64'], values['arm64']), ('true', 'false'))
 
     def test_explicit_release_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
