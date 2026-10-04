@@ -3,6 +3,8 @@
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
 import socket
 import struct
@@ -241,9 +243,29 @@ exec "{shutil.which("timeout")}" "$@"
         if not ssh:
             raise RuntimeError("ssh is required for the native transport fixture")
         with socket.socket() as listener, tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock = root / "boot-seconds"
+            clock.write_text("0\n")
+            # Real SSH and timeout still execute. Advance only the helper's
+            # private clock after SSH exits so host scheduling cannot skip it.
+            source, replacements = re.subn(
+                r"^boot_seconds\(\) \{[^\n]*\}$",
+                lambda _: 'boot_seconds() { cat "$OMG_QEMU_TEST_CLOCK"; }',
+                CHECK.read_text(), flags=re.M)
+            self.assertEqual(replacements, 1, "one helper clock must be controlled")
+            check = root / "check.sh"
+            check.write_text(source)
+            wrapper = root / "ssh"
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                f"{shlex.quote(ssh)} \"$@\"\n"
+                "code=$?\n"
+                'printf "5\\n" > "$OMG_QEMU_TEST_CLOCK"\n'
+                'exit "$code"\n')
+            wrapper.chmod(0o700)
             listener.bind(("127.0.0.1", 0))
             listener.listen()
-            listener.settimeout(5)
+            listener.settimeout(10)
             port = listener.getsockname()[1]
             accepted = []
             errors = []
@@ -263,13 +285,15 @@ exec "{shutil.which("timeout")}" "$@"
             server.start()
             try:
                 result = subprocess.run(
-                    ["bash", str(CHECK), "bench@127.0.0.1", "-F", "/dev/null",
+                    ["bash", str(check), "bench@127.0.0.1", "-F", "/dev/null",
                      "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
                      "-o", "StrictHostKeyChecking=yes", "-o",
                      f"UserKnownHostsFile={directory}/known_hosts", "-p",
                      str(port)],
-                    env=dict(os.environ, OMG_QEMU_CLOUD_INIT_TIMEOUT_SECONDS="1"),
-                    text=True, capture_output=True, timeout=12)
+                    env=dict(os.environ, OMG_QEMU_CLOUD_INIT_TIMEOUT_SECONDS="5",
+                             OMG_QEMU_TEST_CLOCK=str(clock),
+                             PATH=str(root) + os.pathsep + os.environ["PATH"]),
+                    text=True, capture_output=True, timeout=15)
             finally:
                 server.join(timeout=6)
             self.assertFalse(server.is_alive())
