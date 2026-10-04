@@ -66,6 +66,20 @@ fn env_path(var: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Infallible persistent-path resolvers reject CWD-dependent overrides.
+/// Checked pacman resolvers use `env_path` directly to preserve their errors.
+fn absolute_env_path(var: &str) -> Option<PathBuf> {
+    let path = env_path(var)?;
+    if path.is_absolute() {
+        return Some(path);
+    }
+    tracing::warn!(
+        "Ignoring relative {var} {}: must be an absolute path; using defaults",
+        path.display()
+    );
+    None
+}
+
 /// Environment variables that may never select a root process's state location.
 ///
 /// Kept next to [`env_path`] so a new override cannot be added without deciding
@@ -153,7 +167,7 @@ pub fn data_dir() -> PathBuf {
         }
         return PathBuf::from("/var/lib/omg");
     }
-    env_path("OMG_DATA_DIR").unwrap_or_else(|| {
+    absolute_env_path("OMG_DATA_DIR").unwrap_or_else(|| {
         dirs::data_dir().map_or_else(|| fallback_home_dir().join(".omg"), |d| d.join("omg"))
     })
 }
@@ -242,7 +256,7 @@ pub fn daemon_data_dir() -> PathBuf {
     if crate::core::is_root() {
         return data_dir();
     }
-    env_path("OMG_DAEMON_DATA_DIR").unwrap_or_else(|| {
+    absolute_env_path("OMG_DAEMON_DATA_DIR").unwrap_or_else(|| {
         dirs::data_dir().map_or_else(|| PathBuf::from("/var/lib/omg"), |d| d.join("omg"))
     })
 }
@@ -254,14 +268,8 @@ pub fn daemon_data_dir() -> PathBuf {
 /// state must never depend on the caller's current directory.
 #[must_use]
 pub fn config_dir() -> PathBuf {
-    if let Some(dir) = env_path("OMG_CONFIG_DIR") {
-        if dir.is_absolute() {
-            return dir;
-        }
-        tracing::warn!(
-            "Ignoring relative OMG_CONFIG_DIR {}: must be an absolute path; using defaults",
-            dir.display()
-        );
+    if let Some(dir) = absolute_env_path("OMG_CONFIG_DIR") {
+        return dir;
     }
     elevated_user_home().map_or_else(
         || {
@@ -290,7 +298,7 @@ pub fn cache_dir() -> PathBuf {
     if crate::core::is_root() {
         return PathBuf::from("/var/cache/omg");
     }
-    env_path("OMG_CACHE_DIR").unwrap_or_else(|| {
+    absolute_env_path("OMG_CACHE_DIR").unwrap_or_else(|| {
         dirs::cache_dir().map_or_else(|| fallback_home_dir().join(".cache/omg"), |d| d.join("omg"))
     })
 }
@@ -318,16 +326,15 @@ fn pacman_root_overridden() -> bool {
 }
 
 /// Pacman root directory (default: /). Honors [`set_test_overrides`] in test
-/// and debug builds only.
+/// and debug builds only. Relative environment overrides warn and use the default.
+/// Call `pacman_root_result` on Arch to surface configuration errors.
 #[must_use]
 pub fn pacman_root() -> PathBuf {
     #[cfg(any(test, debug_assertions))]
     if let Some(root) = overridden_pacman_root() {
         return root;
     }
-    env_path("OMG_PACMAN_ROOT")
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| PathBuf::from("/"))
+    absolute_env_path("OMG_PACMAN_ROOT").unwrap_or_else(|| PathBuf::from("/"))
 }
 
 #[cfg(feature = "arch")]

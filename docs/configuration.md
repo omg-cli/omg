@@ -102,6 +102,8 @@ See [security policy](./security.md#security-policy) and [enterprise limits](./e
 
 The usual data root is `~/.local/share/omg/`. It includes runtime versions and transaction history, not only caches. The daemon's persistent snapshot is `status-cache.json`; the old `cache.redb` description is obsolete. Consult [cache](./cache.md), [history](./history.md), and [daemon](./daemon.md) for their distinct owners and formats.
 
+For unprivileged processes, `OMG_DATA_DIR`, `OMG_DAEMON_DATA_DIR`, and `OMG_CACHE_DIR` overrides must be absolute paths. Relative values produce a warning and use the default location, so persistent state does not depend on the working directory. Empty values also use defaults. The legacy `OMG_PACMAN_ROOT` resolver follows the same fallback policy; checked Arch package operations report relative overrides as errors. Root processes retain their protected state locations.
+
 Do not delete the data root, rewrite malformed history, or reset audit chains to repair configuration. Preserve original bytes and resolve failures explicitly.
 
 ## Telemetry and credentials
