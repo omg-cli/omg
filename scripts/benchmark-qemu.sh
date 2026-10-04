@@ -645,6 +645,7 @@ if [[ -n "$inventory_tiers" ]]; then
   # guest); /work is bind-mounted there.
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
   cp "$here/qemu-doctor-live-oracle.py" "$work/qemu-doctor-live-oracle.py"
+  cp "$here/qemu-doctor-turbo-oracle.py" "$work/qemu-doctor-turbo-oracle.py"
   cp "$here/qemu-mutation-refusal.py" "$work/qemu-mutation-refusal.py"
   cp "$here/../tests/cli_behavior_inventory.tsv" "$work/mutation-refusal-cases.tsv"
   cp "$here/qemu-container-fake-engine.sh" "$work/qemu-container-fake-engine.sh"
@@ -782,6 +783,10 @@ fi
 # Exercise both direct daemon startup and the actual CLI foreground launcher
 # while the package databases and installed fixture are available.
 guest_tools=(jq openssl)
+case "$distro" in
+  arch|fedora) guest_tools+=(libcap) ;;
+  debian|ubuntu) guest_tools+=(libcap2-bin) ;;
+esac
 [[ "$distro" != fedora ]] || guest_tools+=(createrepo_c gnupg2)
 if [[ "$distro" == arch ]]; then guest_tools+=(python); else guest_tools+=(python3); fi
 [[ "$benchmark" != true ]] || guest_tools+=(hyperfine)
