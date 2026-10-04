@@ -808,5 +808,75 @@ class FedoraBenchmarkIdentityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "tree\t2.2.1-4\n")
 
+class TrixieBenchmarkIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1]
+        self.directory = tempfile.TemporaryDirectory(prefix="trixie-benchmark-identity-")
+        self.addCleanup(self.directory.cleanup)
+        self.output = Path(self.directory.name)
+        self.guest = (self.root / "benchmark-hyperfine.sh").read_text()
+        self.host = (self.root / "scripts/benchmark-qemu.sh").read_text()
+
+    def bash(self, body):
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail"], input=body, text=True,
+            capture_output=True, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout
+
+    def identity_setup(self, os_id="debian", version="13"):
+        release = self.output / "os-release"
+        release.write_text(f'ID={os_id}\nVERSION_ID="{version}"\n')
+        fragment = self.guest.split('    distro=$(awk', 1)[1].split('    extra_native=()', 1)[0]
+        return 'distro=$(awk' + fragment.replace('/etc/os-release', shlex.quote(str(release)))
+
+    def test_guest_identity_distinguishes_debian_13_from_other_backends(self):
+        for os_id, version, expected in (
+            ("debian", "13", "debian-trixie"), ("debian", "12", "debian"),
+            ("ubuntu", "24.04", "ubuntu"), ("fedora", "44", "fedora"),
+            ("arch", "", "arch"),
+        ):
+            with self.subTest(os_id=os_id, version=version):
+                result = self.bash(self.identity_setup(os_id, version) +
+                    'printf "%s\\n%s\\n" "$distro" "$evidence_distro"\n')
+                self.assertEqual(result.splitlines(), [os_id, expected])
+
+    def receipt(self, transaction):
+        for name in ("command", "info.commands", "search.commands", "explicit.commands"):
+            (self.output / f"{name}.json").write_text('[]')
+        (self.output / "boot-id.txt").write_text('fixture-boot\n')
+        start = 'jq -n --arg distro "$distro" --arg ' + (
+            'operation "$GUEST_TRANSACTION"' if transaction else 'json search_equivalent'
+        )
+        if not transaction:
+            start = 'jq -n --arg distro "$distro" --argjson search_equivalent'
+        # Both old and repaired fragments are executable with the same fixtures.
+        if start not in self.guest:
+            start = start.replace('"$distro"', '"$evidence_distro"')
+        fragment = start + self.guest.split(start, 1)[1].split('> "$EXPORT_DIR/summary.json"', 1)[0]
+        setup = f'EXPORT_DIR={shlex.quote(str(self.output))}\n'
+        setup += 'GUEST_TRANSACTION=install\nGUEST_TOOL=omg\nexpected_version=2\n'
+        setup += 'search_equivalent=false\nWARMUP=3\nMIN_RUNS=20\nMAX_RUNS=50\n'
+        return json.loads(self.bash(self.identity_setup() + setup + fragment))
+
+    def test_read_receipt_preserves_trixie_identity(self):
+        self.assertEqual(self.receipt(False)["distro"], "debian-trixie")
+
+    def test_transaction_receipt_preserves_trixie_identity(self):
+        self.assertEqual(self.receipt(True)["distro"], "debian-trixie")
+
+    def test_host_selects_apt_labels_for_trixie(self):
+        gate = self.host.split('if [[ "$benchmark" == true && "$rc" == 0 ]]; then', 1)[1]
+        fragment = gate.split('  case "$distro" in', 1)[1].split('  esac', 1)[0]
+        labels = json.loads(self.bash('distro=debian-trixie\ncase "$distro" in' +
+            fragment + 'esac\nprintf "%s" "$expected_commands"\n'))
+        self.assertEqual(labels, {
+            "info": ["OMG", "apt-cache", "apt"],
+            "search": ["OMG", "apt-cache", "apt"],
+            "explicit": ["OMG", "apt-mark"],
+        })
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,25 @@ class SentryResultAdmissionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Sentry accepted event", result.stdout)
 
+    def test_trixie_failure_reaches_sender_without_identity_rewrite(self):
+        rows = [dict(case_id="qemu-debian-trixie-lifecycle", distro="debian-trixie",
+                     result="HARNESS_ERROR", exit_code=120, elapsed_seconds=2)]
+        result, envelope = self.run_rows(rows)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(envelope[2]["extra"], {"failures": rows})
+        self.assertEqual(envelope[2]["fingerprint"],
+                         ["omg-smoke", "unknown", "debian-trixie:qemu-debian-trixie-lifecycle:HARNESS_ERROR"])
+
+    def test_unreviewed_trixie_neighbor_distros_are_rejected_before_transport(self):
+        for distro in ("trixie", "debian-trixie-extra", "debian-13", "ubuntu-2604"):
+            with self.subTest(distro=distro):
+                result, envelope = self.run_rows([
+                    dict(case_id="qemu-debian-trixie-lifecycle", distro=distro,
+                         result="HARNESS_ERROR", exit_code=120, elapsed_seconds=2)])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid result fields", result.stderr)
+                self.assertIsNone(envelope)
+
     def test_unrecognized_matrix_case_is_rejected(self):
         result = self.run_report("qemu-matrix-untrusted")
         self.assertNotEqual(result.returncode, 0)

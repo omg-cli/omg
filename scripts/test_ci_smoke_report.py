@@ -14,6 +14,17 @@ SPEC.loader.exec_module(REPORT)
 
 
 class ReportingTests(unittest.TestCase):
+    def test_trixie_failure_keeps_its_identity_and_delivery_receipt(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(REPORT.subprocess, 'run') as run:
+            run.return_value = type('Delivery', (), dict(returncode=1, stdout='', stderr='HTTP 429\n'))()
+            root = Path(directory)
+            self.assertEqual(REPORT.status('debian-trixie', 'qemu-debian-trixie-lifecycle', 'failure', root), 0)
+            row = json.loads((root / 'results.json').read_text())[0]
+            self.assertEqual(row['distro'], 'debian-trixie')
+            self.assertEqual(row['case_id'], 'qemu-debian-trixie-lifecycle')
+            self.assertEqual(json.loads((root / 'reporting-status.json').read_text()), {'exit_code': 1})
+            self.assertIn('429', (root / 'reporting.log').read_text())
+
     def test_secure_config_and_no_secret_export(self):
         with tempfile.TemporaryDirectory() as directory:
             export = Path(directory) / "env"
