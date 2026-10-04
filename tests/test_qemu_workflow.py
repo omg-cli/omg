@@ -111,6 +111,7 @@ exit "$rc"
             controller = self.copy_inventory_to_controller(Path(directory))
             for name in ('qemu-inventory.sh', 'qemu-local-oracle.py', 'qemu-license-oracle.py',
                          'qemu-fingerprint-oracle.py', 'qemu-fedora-update-fixture.sh',
+                         'qemu-doctor-turbo-oracle.py',
                          'workspace-overlap-fixture.sh'):
                 with self.subTest(helper=name):
                     copied = controller / name
