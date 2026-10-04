@@ -1856,6 +1856,45 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn mirror_check_counts_outer_deadline_after_request_delivery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local stalled mirror listener");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (delivered, delivery) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "mirror request ended before headers");
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 8192);
+            }
+            delivered.send(()).unwrap();
+            released.await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("local stalled mirror client");
+        let deadline = Duration::from_secs(5);
+        let check = check_mirror(&client, "local stalled mirror", &url, false, deadline);
+        tokio::pin!(check);
+        tokio::select! {
+            arrived = delivery => { arrived.expect("complete mirror request delivered"); }
+            result = &mut check => panic!("mirror finished before the outer deadline: {result}"),
+        }
+        tokio::time::advance(deadline).await;
+        assert_eq!(check.await, 1, "outer deadline must count one Doctor issue");
+        release.send(()).unwrap();
+        finish_probe_server(server).await;
+    }
+
     #[tokio::test]
     async fn connectivity_probe_distinguishes_http_status_and_transport_failures() {
         let client = reqwest::Client::builder()
