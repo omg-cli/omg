@@ -35,7 +35,7 @@ def configure():
 
 
 def status(distro, case_id, state, evidence):
-    if distro not in ("arch", "debian", "ubuntu", "fedora", "macos"):
+    if distro not in ("arch", "debian", "debian-trixie", "ubuntu", "fedora", "macos"):
         raise ValueError("unsupported distro")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", case_id):
         raise ValueError("invalid case identifier")

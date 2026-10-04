@@ -22,7 +22,6 @@ use omg_lib::core::container::{
     ContainerConfig, ContainerManager, ContainerRuntime, GeneratedDockerfile, dev_container_config,
 };
 use std::fs;
-use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -34,25 +33,6 @@ use std::path::{Path, PathBuf};
 const FAKE_LOG_ENV: &str = "OMG_FAKE_RUNTIME_LOG";
 const FAKE_EXIT_ENV: &str = "OMG_FAKE_RUNTIME_EXIT";
 const FAKE_STDERR_ENV: &str = "OMG_FAKE_RUNTIME_STDERR";
-
-const FAKE_SCRIPT: &str = r#"#!/bin/sh
-printf '%s\n' "$@" >> "$OMG_FAKE_RUNTIME_LOG"
-if [ -n "$OMG_FAKE_RUNTIME_STDERR" ]; then
-  printf '%s\n' "$OMG_FAKE_RUNTIME_STDERR" >&2
-fi
-if [ -n "$OMG_FAKE_RUNTIME_EXIT" ]; then
-  exit "$OMG_FAKE_RUNTIME_EXIT"
-fi
-case "$1" in
-  ps)
-    printf 'abc123def\tweb-server\tubuntu:24.04\tUp 2 minutes\n'
-    ;;
-  images)
-    printf 'ubuntu\t24.04\tsha256:def456\t120MB\n'
-    ;;
-esac
-exit 0
-"#;
 
 struct FakeRuntime {
     _dir: tempfile::TempDir,
@@ -66,13 +46,11 @@ impl FakeRuntime {
         let tmp = tempfile::tempdir().expect("fake runtime tempdir");
         let bin_dir = tmp.path().to_path_buf();
         let log_path = tmp.path().join("argv.log");
+        // Forked children can retain a writer after the parent closes it (#785).
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-runtime.sh");
         for command in ["docker", "podman"] {
             let script_path = tmp.path().join(command);
-            let mut file = fs::File::create(&script_path).expect("create fake script");
-            file.write_all(FAKE_SCRIPT.as_bytes()).unwrap();
-            let mut perms = fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script_path, perms).unwrap();
+            std::os::unix::fs::symlink(&script, &script_path).expect("link fake runtime fixture");
         }
         Self {
             _dir: tmp,
