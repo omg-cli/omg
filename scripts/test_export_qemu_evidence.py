@@ -341,6 +341,35 @@ class DescriptorTests(unittest.TestCase):
         for neighbor in excluded:
             self.assertFalse((self.destination / neighbor).exists())
 
+    def test_arch_upgrade_logs_export_exactly_without_private_neighbors(self):
+        expected = {
+            "run-success/guest/evidence/arch-system-upgrade.txt":
+                b"upgrading linux\nwarning: diagnostic on stderr\n",
+            "run-failure/guest/evidence/arch-system-upgrade.txt":
+                b"starting full system upgrade\nerror: transaction failed\n",
+            "run-success/guest/evidence/index-update.txt": b"index updated\n",
+        }
+        for name, content in expected.items():
+            self.fixture(name, content)
+        excluded = (
+            "run-success/arch-system-upgrade.txt",
+            "run-success/guest/evidence/arch-system-upgrade.txt.bak",
+            "run-success/guest/evidence/cache/arch-system-upgrade.txt",
+            "run-success/guest/evidence/benchmarks/arch-system-upgrade.txt",
+            "run-success/guest/evidence/client-key",
+        )
+        for name in excluded:
+            self.fixture(name, b"private-neighbor")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertIn("run-success/guest/evidence/index-update.txt", report["copied"])
+        self.assertEqual(set(report["copied"]), set(expected))
+        self.assertEqual(report["bytes"], sum(map(len, expected.values())))
+        for name, content in expected.items():
+            self.assertEqual((self.destination / name).read_bytes(), content)
+        for name in excluded:
+            self.assertFalse((self.destination / name).exists())
+
     def test_preparation_health_and_boot_identity_survive_export(self):
         names = {f"run-test/transactions/prepare-{operation}-{suffix}"
                  for operation in ("remove", "install")
