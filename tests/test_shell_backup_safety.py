@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ShellBackupSafety(unittest.TestCase):
-    def check_backup(self, action, shape):
+    def check_backup(self, action, shape, platform="native"):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             install = home / "bin with ' quote"
@@ -27,7 +27,7 @@ class ShellBackupSafety(unittest.TestCase):
                 backup.symlink_to(home / "absent")
             elif shape == "hardlink":
                 os.link(target, backup)
-            elif shape == "regular":
+            elif shape in {"regular", "copy_failure", "rename_failure"}:
                 backup.write_text("previous backup\n")
             elif shape == "directory":
                 backup.mkdir()
@@ -50,19 +50,41 @@ cp() {
             elif shape == "copy_failure":
                 injection = "cp() { return 42; }\n"
             elif shape == "rename_failure":
-                injection = "mv() { return 42; }\n"
-            script = 'source <(sed \'$d\' "$INSTALLER")\n' + injection + action
+                # Remove the staged source after a successful copy. Both GNU
+                # mv and Darwin's absolute Perl rename must really fail.
+                injection = '''
+cp() {
+  command cp "$@" || return
+  case "$3" in
+    "$HOME"/*.omg-backup-stage.*/backup) rm "$3" ;;
+    *) return 98 ;;
+  esac
+}
+'''
+            if platform == "darwin":
+                injection = "uname() { printf 'Darwin\\n'; }\n" + injection
+            # Complete the file before sourcing it: the hosted macOS fixture
+            # did not load functions through process substitution.
+            functions = home / "installer-functions.sh"
+            functions.write_text("".join((ROOT / "install.sh").read_text().splitlines(keepends=True)[:-1]))
+            script = ('source "$INSTALLER"\n'
+                      'declare -F setup_shell uninstall_omg >/dev/null || exit 99\n'
+                      + injection + action)
             result = subprocess.run(["bash", "-c", script], text=True,
                                     capture_output=True, timeout=10,
                                     env={**os.environ, "HOME": directory,
                                          "SHELL": "/bin/bash", "INSTALL_DIR": str(install),
-                                         "INSTALLER": str(ROOT / "install.sh"), "SHAPE": shape})
+                                         "INSTALLER": str(functions), "SHAPE": shape})
             self.assertEqual(target.read_text(), "untouched\n", result.stdout + result.stderr)
             failure = shape in {"symlink", "dangling", "directory", "race_directory",
                                 "copy_failure", "rename_failure"}
             if failure:
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(rc.read_text(), original)
+                if shape in {"copy_failure", "rename_failure"}:
+                    self.assertEqual(backup.read_text(), "previous backup\n")
+                    diagnostic = "Failed to copy shell backup" if shape == "copy_failure" else "Failed to publish shell backup"
+                    self.assertIn(diagnostic, result.stdout + result.stderr)
                 if shape in {"directory", "race_directory"}:
                     self.assertTrue(backup.is_dir())
                     self.assertEqual((backup / ".bashrc").read_text(), "untouched child\n")
@@ -94,6 +116,13 @@ cp() {
                       "race_symlink", "race_hardlink", "race_directory", "copy_failure", "rename_failure"):
             with self.subTest(shape=shape):
                 self.check_backup("uninstall_omg", shape)
+
+    def test_darwin_backup_safety(self):
+        for action in ("setup_shell", "uninstall_omg"):
+            for shape in ("absent", "regular", "symlink", "dangling", "hardlink", "directory",
+                          "race_symlink", "race_hardlink", "race_directory", "copy_failure", "rename_failure"):
+                with self.subTest(action=action, shape=shape):
+                    self.check_backup(action, shape, "darwin")
 
 
 if __name__ == "__main__":
