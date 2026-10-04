@@ -1021,6 +1021,62 @@ struct BuildLog {
     limit: u64,
 }
 
+#[derive(Clone, Copy)]
+enum BuildIsolation {
+    ProcessGroup,
+    NativeSession,
+}
+
+struct BuildProcess {
+    child: Option<tokio::process::Child>,
+    group: u32,
+    reaper: tokio::runtime::Handle,
+}
+
+impl BuildProcess {
+    fn terminate(&mut self) -> Result<()> {
+        // Stop the launcher first: native setsid may not have established the
+        // session yet. Once killed, it cannot create descendants after killpg.
+        let launcher_result = self.child.as_mut().map_or(Ok(()), |child| {
+            child
+                .start_kill()
+                .context("Failed to stop AUR build launcher")
+        });
+        let group_result = terminate_build_group(self.group);
+        launcher_result?;
+        group_result
+    }
+
+    async fn terminate_and_reap(&mut self) -> Result<()> {
+        self.terminate()?;
+        if let Some(child) = &mut self.child {
+            child.wait().await.context("Failed to reap AUR build")?;
+        }
+        self.child = None;
+        Ok(())
+    }
+}
+
+impl Drop for BuildProcess {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+        if let Err(error) = self.terminate() {
+            tracing::warn!(%error, "Failed to terminate cancelled AUR build");
+        }
+        if let Some(mut child) = self.child.take() {
+            // Caller cancellation cannot await here. Keep the Child owned by a
+            // reap task instead of relying only on Tokio's best-effort Drop.
+            self.reaper.spawn(async move {
+                if let Err(error) = child.wait().await {
+                    tracing::warn!(%error, "Failed to reap cancelled AUR build");
+                }
+            });
+        }
+    }
+}
+
 fn terminate_build_group(group: u32) -> Result<()> {
     use nix::errno::Errno;
     use nix::sys::signal::{Signal, killpg};
@@ -3736,7 +3792,7 @@ impl AurClient {
             cmd.args(makepkg_args);
 
             cmd.stdin(Stdio::null());
-            self.run_logged_build_command(&mut cmd, package)
+            self.run_logged_build_command(&mut cmd, package, BuildIsolation::ProcessGroup)
                 .await
                 .context("Failed to run sandboxed makepkg")
         } else {
@@ -3783,7 +3839,7 @@ impl AurClient {
         }
 
         cmd.current_dir(pkg_dir).stdin(Stdio::null());
-        self.run_logged_build_command(&mut cmd, package)
+        self.run_logged_build_command(&mut cmd, package, BuildIsolation::NativeSession)
             .await
             .context("Failed to run makepkg")
     }
@@ -3841,7 +3897,7 @@ impl AurClient {
             cmd.env(key, value);
         }
 
-        self.run_logged_build_command(&mut cmd, package)
+        self.run_logged_build_command(&mut cmd, package, BuildIsolation::ProcessGroup)
             .await
             .context("Failed to run chroot build")
     }
@@ -3854,12 +3910,14 @@ impl AurClient {
         &self,
         command: &mut Command,
         package: &str,
+        isolation: BuildIsolation,
     ) -> Result<std::process::ExitStatus> {
         self.run_logged_build_command_with_limits(
             command,
             package,
             MAX_AUR_BUILD_LOG_BYTES,
             MAX_AUR_BUILD_DURATION,
+            isolation,
         )
         .await
     }
@@ -3870,6 +3928,7 @@ impl AurClient {
         package: &str,
         max_log_bytes: u64,
         max_duration: Duration,
+        isolation: BuildIsolation,
     ) -> Result<std::process::ExitStatus> {
         let log_path = self.build_log_path(package);
         let log_dir = log_path
@@ -3903,11 +3962,30 @@ impl AurClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        command.process_group(0);
-        let mut child = command
+        match isolation {
+            BuildIsolation::ProcessGroup => {
+                command.process_group(0);
+            }
+            BuildIsolation::NativeSession => {
+                // A group leader makes util-linux setsid fork, losing the PID
+                // tracked below. Inherit our group so setsid execs in-place;
+                // makepkg then owns a detached session whose PGID is child.id().
+                command.process_group(nix::unistd::getpgrp().as_raw());
+            }
+        }
+        let child = command
             .spawn()
             .with_context(|| format!("Failed to start AUR build for '{package}'"))?;
         let process_group = child.id().context("AUR build has no process ID")?;
+        let mut build = BuildProcess {
+            child: Some(child),
+            group: process_group,
+            reaper: tokio::runtime::Handle::current(),
+        };
+        let child = build
+            .child
+            .as_mut()
+            .context("AUR build child was not available")?;
         let stdout = child
             .stdout
             .take()
@@ -3937,20 +4015,12 @@ impl AurClient {
         let status = match result {
             Ok(Ok((status, (), ()))) => status,
             Ok(Err(error)) => {
-                terminate_build_group(process_group)?;
-                child
-                    .wait()
-                    .await
-                    .context("Failed to reap AUR build after output error")?;
+                build.terminate_and_reap().await?;
                 progress.finish(false);
                 return Err(error).context("AUR build output capture failed");
             }
             Err(_) => {
-                terminate_build_group(process_group)?;
-                child
-                    .wait()
-                    .await
-                    .context("Failed to reap timed-out AUR build")?;
+                build.terminate_and_reap().await?;
                 progress.finish(false);
                 anyhow::bail!(
                     "AUR build exceeded the {}-second duration limit",
@@ -3958,6 +4028,7 @@ impl AurClient {
                 );
             }
         };
+        build.child = None;
         let capture_result: Result<()> = async {
             log.lock()
                 .await
@@ -5128,7 +5199,7 @@ mod tests {
         command.arg("build").arg(port).stdin(Stdio::null());
         let mut runner = tokio::spawn(async move {
             client
-                .run_logged_build_command(&mut command, "fixture")
+                .run_logged_build_command(&mut command, "fixture", BuildIsolation::ProcessGroup)
                 .await
         });
         let _abort_runner = scopeguard::guard(runner.abort_handle(), |handle| handle.abort());
@@ -5698,6 +5769,7 @@ mod tests {
                 "noisy",
                 64,
                 Duration::from_secs(1),
+                BuildIsolation::ProcessGroup,
             ),
         )
         .await
@@ -5720,12 +5792,141 @@ mod tests {
                 "stalled",
                 64,
                 Duration::from_millis(50),
+                BuildIsolation::ProcessGroup,
             ),
         )
         .await
         .expect("stalled build must stop promptly")
         .expect_err("stalled build must fail");
         assert!(format!("{error:#}").contains("duration limit"));
+    }
+
+    // These probes use the production native launcher and logged runner. Only
+    // makepkg is replaced, with a disposable shell that starts a real child.
+    async fn native_build_cleanup_probe(mode: &'static str) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir()?;
+        let fixture = directory.path().join("makepkg");
+        std::fs::write(
+            &fixture,
+            "#!/bin/sh\nif [ \"$1\" = status ]; then exit 23; fi\nsleep 5 &\nchild=$!\ncat /proc/$$/stat > session\ncat /proc/$$/status > status\nprintf '%s %s\\n' $$ $child > identities\nif [ \"$1\" = capture ]; then head -c 4096 /dev/zero; fi\nwait\n",
+        )?;
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))?;
+        let path = directory.path().to_path_buf();
+        let task_path = path.clone();
+        let worker = tokio::spawn(async move {
+            let client = AurClient {
+                build_dir: task_path.clone(),
+                settings: Settings::default(),
+                package_base_locks: Arc::new(dashmap::DashMap::new()),
+            };
+            let mut command = native_build_command()?;
+            command
+                .env("PATH", format!("{}:/usr/bin", task_path.display()))
+                .current_dir(&task_path)
+                .arg(mode);
+            client
+                .run_logged_build_command_with_limits(
+                    &mut command,
+                    "native-probe",
+                    64,
+                    if mode == "timeout" {
+                        Duration::from_millis(300)
+                    } else {
+                        Duration::from_secs(3)
+                    },
+                    BuildIsolation::NativeSession,
+                )
+                .await
+        });
+        if mode == "status" {
+            assert_eq!(worker.await??.code(), Some(23));
+            return Ok(());
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !path.join("identities").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let identities = std::fs::read_to_string(path.join("identities"))?;
+        let pids = identities
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(pids.len(), 2);
+        let leader_stat = std::fs::read_to_string(path.join("session"))?;
+        if mode == "cancel" {
+            worker.abort();
+            assert!(worker.await.expect_err("worker aborted").is_cancelled());
+        } else {
+            let error = worker.await?.expect_err("bounded native build must fail");
+            assert!(format!("{error:#}").contains(if mode == "timeout" {
+                "duration limit"
+            } else {
+                "log exceeded its byte limit"
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let running: Vec<_> = pids
+            .iter()
+            .copied()
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|stat| stat.split_whitespace().nth(2) != Some("Z"))
+            })
+            .collect();
+        // Clean up the known disposable session even when the regression fails.
+        terminate_build_group(pids[0])?;
+        assert!(
+            running.is_empty(),
+            "native {mode} left running PIDs {running:?}; initial identity {leader_stat:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pids
+                .iter()
+                .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("native build processes must be reaped, including adopted descendants")?;
+        let fields: Vec<_> = leader_stat.split_whitespace().collect();
+        assert_eq!(
+            fields[3],
+            std::process::id().to_string(),
+            "no forked launcher intermediary"
+        );
+        assert_eq!(
+            fields[4],
+            pids[0].to_string(),
+            "build owns its process group"
+        );
+        assert_eq!(fields[5], pids[0].to_string(), "build owns its session");
+        assert_eq!(fields[6], "0", "build has no controlling TTY");
+        assert!(std::fs::read_to_string(path.join("status"))?.contains("NoNewPrivs:\t1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_build_timeout_terminates_descendants() -> Result<()> {
+        native_build_cleanup_probe("timeout").await
+    }
+
+    #[tokio::test]
+    async fn native_build_capture_failure_terminates_descendants() -> Result<()> {
+        native_build_cleanup_probe("capture").await
+    }
+
+    #[tokio::test]
+    async fn native_build_cancellation_terminates_descendants() -> Result<()> {
+        native_build_cleanup_probe("cancel").await
+    }
+
+    #[tokio::test]
+    async fn native_build_preserves_exit_status() -> Result<()> {
+        native_build_cleanup_probe("status").await
     }
 
     #[test]
