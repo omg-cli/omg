@@ -5805,6 +5805,35 @@ mod tests {
     // makepkg is replaced, with a disposable shell that starts a real child.
     async fn native_build_cleanup_probe(mode: &'static str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
+
+        // Subreaper state is process-wide. Run one probe in a fresh test process
+        // so adoption cannot steal children from concurrently running tests.
+        const PROBE_MODE: &str = "OMG_NATIVE_BUILD_PROBE_MODE";
+        if std::env::var(PROBE_MODE).as_deref() != Ok(mode) {
+            let test_name = match mode {
+                "timeout" => "native_build_timeout_terminates_descendants",
+                "capture" => "native_build_capture_failure_terminates_descendants",
+                "cancel" => "native_build_cancellation_terminates_descendants",
+                "status" => "native_build_preserves_exit_status",
+                _ => anyhow::bail!("unknown native probe mode: {mode}"),
+            };
+            let status = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    &format!("package_managers::aur::client::tests::{test_name}"),
+                    "--nocapture",
+                ])
+                .env(PROBE_MODE, mode)
+                .kill_on_drop(true)
+                .status()
+                .await?;
+            anyhow::ensure!(
+                status.success(),
+                "isolated native {mode} probe failed: {status}"
+            );
+            return Ok(());
+        }
+        nix::sys::prctl::set_child_subreaper(true)?;
         let directory = tempfile::tempdir()?;
         let fixture = directory.path().join("makepkg");
         std::fs::write(
@@ -5878,6 +5907,34 @@ mod tests {
             .collect();
         // Clean up the known disposable session even when the regression fails.
         terminate_build_group(pids[0])?;
+        // The runner owns and reaps makepkg; this isolated fixture owns the
+        // orphaned sleep child. Only wait for that PID, never Tokio's child.
+        let descendant = nix::unistd::Pid::from_raw(i32::try_from(pids[1])?);
+        let reaped = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match nix::sys::wait::waitpid(
+                    descendant,
+                    Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                ) {
+                    // Adoption can lag the parent's kill signal. ECHILD is
+                    // transient until the kernel reparents this known PID.
+                    Ok(nix::sys::wait::WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    status => return status,
+                }
+            }
+        })
+        .await??;
+        assert_eq!(
+            reaped,
+            nix::sys::wait::WaitStatus::Signaled(
+                descendant,
+                nix::sys::signal::Signal::SIGKILL,
+                false
+            ),
+            "fixture must adopt and reap its terminated descendant"
+        );
         assert!(
             running.is_empty(),
             "native {mode} left running PIDs {running:?}; initial identity {leader_stat:?}"
