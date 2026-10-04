@@ -127,6 +127,33 @@ class EventIdentityTests(unittest.TestCase):
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_source_identity_is_retained_before_refusing_mismatched_merge(self):
+        expected, run, commit = EventIdentityTests().pr_fixture()
+        variants = [dict(commit, parents=[dict(sha='a' * 40), commit['parents'][1]]),
+                    dict(commit, parents=[commit['parents'][0], dict(sha='a' * 40)]),
+                    dict(commit, parents=list(reversed(commit['parents']))),
+                    dict(commit, tree=dict(sha='a' * 40))]
+        for observed in variants:
+            with self.subTest(observed=observed), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                (state / 'evidence').mkdir()
+                (state / 'bin').mkdir()
+                with patch.object(USAGE, 'checked_state', return_value=expected), \
+                        patch.object(USAGE.native, 'command_output', side_effect=[expected['source'], EventIdentityTests.TREE]), \
+                        patch.object(USAGE.native, 'api_json', side_effect=[run, dict(observed, secret='excluded')]):
+                    with self.assertRaises(ValueError):
+                        USAGE.admit(state, {'GH_TOKEN': 'excluded'})
+                receipt = state / 'evidence/source-identity.json'
+                self.assertTrue(receipt.is_file(), 'failed admission must retain expected and observed source identity')
+                evidence = json.loads(receipt.read_text())
+                self.assertEqual(evidence['expected'], expected)
+                self.assertEqual(evidence['observed'], dict(source=observed['sha'],
+                                 tree=observed['tree']['sha'],
+                                 parents=[parent['sha'] for parent in observed['parents']]))
+                self.assertEqual(evidence['checkout_tree'], EventIdentityTests.TREE)
+                self.assertNotIn('excluded', receipt.read_text())
+                self.assertEqual(list((state / 'bin').iterdir()), [])
+
     def test_current_run_owner_and_artifact_accept_without_whole_workflow_completion(self):
         USAGE.validate_run(RUN, EXPECTED)
         self.assertEqual(USAGE.select_artifact([ARTIFACT], [JOB], EXPECTED), ARTIFACT)
@@ -173,6 +200,7 @@ class AdmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             (state / 'bin').mkdir()
+            (state / 'evidence').mkdir()
             responses = [RUN, dict(sha='a' * 40, tree=dict(sha='a' * 40)),
                          dict(jobs=[JOB]), dict(artifacts=[ARTIFACT]), dict(RUN, run_attempt=2)]
             provenance = dict(archive='subject.tar.gz')

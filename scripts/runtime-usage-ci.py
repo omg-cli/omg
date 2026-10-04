@@ -185,6 +185,15 @@ def admit(state, context):
     validate_run(run, expected)
     commit = native.api_json('repos/' + expected['repository'] + '/git/commits/' + expected['source'])
     checkout_tree = native.command_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD^{tree}'])
+    # Retain public source facts before refusal, not the event payload or env.
+    source_identity = {key: expected[key] for key in
+                       ('repository', 'source', 'api_head', 'event', 'run', 'attempt')}
+    if expected['event'] == 'pull_request':
+        source_identity['pr'] = expected['pr']
+    write_json(state / 'evidence/source-identity.json',
+               dict(expected=source_identity, checkout_tree=checkout_tree,
+                    observed=dict(source=commit.get('sha'), tree=commit.get('tree', {}).get('sha'),
+                                  parents=[parent.get('sha') for parent in commit.get('parents', [])])))
     validate_commit(commit, expected, checkout_tree)
     jobs = fetch_pages(path + '/attempts/' + str(expected['attempt']) + '/jobs', 'jobs')
     artifacts = fetch_pages(path + '/artifacts', 'artifacts')
