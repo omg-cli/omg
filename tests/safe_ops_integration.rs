@@ -7,6 +7,155 @@ use omg_lib::core::safe_ops::*;
 use tempfile::TempDir;
 use tokio::fs;
 
+#[cfg(target_os = "linux")]
+fn assert_failed_write_is_retryable(test_name: &str, executable: bool, restrictive_umask: bool) {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    use std::os::unix::fs::PermissionsExt;
+
+    // Resource limits affect the whole process. Re-exec only this test with
+    // SIGXFSZ ignored so the kernel returns EFBIG instead of killing the suite.
+    if std::env::var("OMG_SAFE_OPS_FAULT_CHILD").as_deref() != Ok(test_name) {
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                if restrictive_umask {
+                    "umask 077; trap '' XFSZ; exec \"$@\""
+                } else {
+                    "umask 022; trap '' XFSZ; exec \"$@\""
+                },
+                "sh",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env("OMG_SAFE_OPS_FAULT_CHILD", test_name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fault subprocess failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("destination");
+    let contents = b"complete contents";
+    let write = || {
+        if executable {
+            write_executable(&path, contents, false)
+        } else {
+            create_private_marker(&path, contents)
+        }
+    };
+    let original = getrlimit(Resource::Fsize);
+    setrlimit(
+        Resource::Fsize,
+        Rlimit {
+            current: Some(4),
+            maximum: original.maximum,
+        },
+    )
+    .unwrap();
+    let first = write();
+    setrlimit(Resource::Fsize, original).unwrap();
+
+    let error = first.expect_err("the file-size limit must cause a real write failure");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(nix::libc::EFBIG)
+    );
+    assert!(
+        !path.try_exists().unwrap(),
+        "failed write published a partial destination"
+    );
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    assert!(write().unwrap(), "retry must create the complete file");
+    assert_eq!(std::fs::read(&path).unwrap(), contents);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        if executable {
+            if restrictive_umask { 0o700 } else { 0o755 }
+        } else {
+            0o600
+        }
+    );
+    assert!(
+        !write().unwrap(),
+        "an existing file must not be overwritten"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), contents);
+    temp.close().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn executable_write_failure_preserves_retryability() {
+    assert_failed_write_is_retryable(
+        "executable_write_failure_preserves_retryability",
+        true,
+        false,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_marker_write_failure_preserves_retryability() {
+    assert_failed_write_is_retryable(
+        "private_marker_write_failure_preserves_retryability",
+        false,
+        false,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn executable_retry_respects_restrictive_umask() {
+    assert_failed_write_is_retryable("executable_retry_respects_restrictive_umask", true, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_noclobber_writers_publish_one_complete_file() {
+    for executable in [true, false] {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("destination");
+        let barrier = std::sync::Barrier::new(8);
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0_u8..8)
+                .map(|index| {
+                    let barrier = &barrier;
+                    let path = &path;
+                    scope.spawn(move || {
+                        let contents = vec![index; 65536];
+                        barrier.wait();
+                        let created = if executable {
+                            write_executable(path, &contents, false)
+                        } else {
+                            create_private_marker(path, &contents)
+                        }
+                        .unwrap();
+                        (index, created)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let winners: Vec<_> = outcomes.iter().filter(|(_, created)| *created).collect();
+        assert_eq!(winners.len(), 1, "exactly one writer must claim the path");
+        assert_eq!(std::fs::read(&path).unwrap(), vec![winners[0].0; 65536]);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        temp.close().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn test_safe_file_operations_integration() {
     let temp_dir = TempDir::new().unwrap();
