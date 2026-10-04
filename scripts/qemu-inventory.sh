@@ -2244,7 +2244,7 @@ out="$root/inventory"
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
 local_oracle_path="$(dirname "${BASH_SOURCE[0]}")/qemu-local-oracle.py"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$local_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$(dirname "$0")/qemu-enterprise-export-oracle.py" "$(dirname "$0")/qemu-audit-log-oracle.py" "$(dirname "$0")/qemu-rust-install-oracle.py" "$(dirname "$0")/qemu-doctor-live-oracle.py" > "$out/input-sha256.txt"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$local_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$(dirname "$0")/qemu-enterprise-export-oracle.py" "$(dirname "$0")/qemu-audit-log-oracle.py" "$(dirname "$0")/qemu-rust-install-oracle.py" "$(dirname "$0")/qemu-doctor-live-oracle.py" "$(dirname "$0")/qemu-doctor-turbo-oracle.py" > "$out/input-sha256.txt"
 if [[ "$man_page_mode" == exact ]]; then sha256sum "$man_page_inventory" >> "$out/input-sha256.txt"; fi
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" --arg man_page_mode "$man_page_mode" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
@@ -2340,7 +2340,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock|local:*|missing-lock-ci-refusal|missing-snapshot-refusal|invalid-runtime-refusal|missing-env-manifest-refusal|daemon-status-missing-socket|bash-hook-behavior|ci-cache-paths|container-init-artifacts|completion-env-capture|workspace-init-state|workspace-add-state|workspace-second-state|workspace-remove-state|workspace-list-state|workspace-status-state|bash-completion-stdout|bash-completion-installed|man-command-artifacts|search-firefox-results) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-capability-cleanup|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock|local:*|missing-lock-ci-refusal|missing-snapshot-refusal|invalid-runtime-refusal|missing-env-manifest-refusal|daemon-status-missing-socket|bash-hook-behavior|ci-cache-paths|container-init-artifacts|completion-env-capture|workspace-init-state|workspace-add-state|workspace-second-state|workspace-remove-state|workspace-list-state|workspace-status-state|bash-completion-stdout|bash-completion-installed|man-command-artifacts|search-firefox-results) ;; *) exit 2 ;; esac
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-list:workspace-list-state|workspace-remove:workspace-project-removed|workspace-remove:workspace-remove-state|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
@@ -2502,6 +2502,17 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
     [[ "$a" == doctor-native-backend ]] || exit 2
     jq -e '. == ["doctor"]' <<< "$aj" >/dev/null || exit 2
   elif [[ "$a" == doctor-native-backend ]]; then
+    exit 2
+  fi
+  if [[ "$id" == doctor-turbo ]]; then
+    [[ "$r" == - ]] || exit 2
+    if [[ "$u" == declared ]]; then
+      [[ "$a" == - && "$s" == read && "$e" == - && "$t" == qemu && "$cleanup" == none && "$tg" == arch:pending,debian:pending,ubuntu:pending,fedora:pending ]] || exit 2
+    else
+      [[ "$a" == doctor-capability-cleanup && "$s" == isolated-write && "$resolved" == 0 && "$t" == container && "$cleanup" == tempdir-drop && "$tg" == arch:pass,debian:pass,ubuntu:pass,fedora:pass ]] || exit 2
+    fi
+    jq -e '. == ["doctor", "--turbo"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == doctor-capability-cleanup ]]; then
     exit 2
   fi
   if [[ "$id" == doctor-eol ]]; then
@@ -2979,6 +2990,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == run-watch ]]; then
     remote+="; run_omg '$command_timeout' python3 \"\$HOME/qemu-run-watch-check.py\" $quoted_binary \"\$rowdir\" > command.stdout.log 2> command.stderr.log; assertion=0"
+  elif [[ "$case" == doctor-turbo ]]; then
+    capability_oracle=$(jq -rn --rawfile fixture "$(dirname "$0")/qemu-doctor-turbo-oracle.py" '$fixture | @sh')
+    remote+="; printf '%s' $capability_oracle > qemu-doctor-turbo-oracle.py"
+    remote+="; doctor_capability_cleanup() { local cleanup_rc=0; python3 qemu-doctor-turbo-oracle.py cleanup --source $quoted_binary --root \"\$rowdir\" || cleanup_rc=\$?; rm -f \"\$status_file\" || cleanup_rc=\$?; return \"\$cleanup_rc\"; }; trap doctor_capability_cleanup EXIT"
+    remote+="; if ! python3 qemu-doctor-turbo-oracle.py prepare --source $quoted_binary --root \"\$rowdir\"; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+    remote+="; run_omg '$command_timeout' \"\$rowdir/doctor-turbo-private/omg\" $arg_string </dev/null > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$distro" == fedora && "$case" == doctor ]]; then
     remote+="; if ! command -v strace >/dev/null || ! strace --seccomp-bpf -f -qq -e trace=execve -o doctor.preflight.log true; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve -o doctor.exec.log $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
@@ -2987,6 +3004,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
+  if [[ "$case" == doctor-turbo ]]; then
+    remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]]; then if ! python3 qemu-doctor-turbo-oracle.py verify --source $quoted_binary --root \"\$rowdir\" --output command.stdout.log; then assertion=1; fi; fi"
+    remote+="; if ! doctor_capability_cleanup; then printf 'assertion failed: capability fixture cleanup failed\n' >&2; assertion=1; fi; trap - EXIT"
+  fi
   if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree ]]; then
     remote+="; tree_after=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package after-state is unavailable\n' >&2; assertion=1; tree_after=missing; }"
     remote+="; tree_delta_ok=1; if ! check_native_tree_only_delta \"\$tree_before\" \"\$tree_after\"; then tree_delta_ok=0; assertion=1; fi"
@@ -3148,20 +3169,32 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       # Native DNF5 stored-plan resolution requires authenticated root even
       # for a dry run. Admit only this exact validated, prerequisite-free row;
       # keep its initial user/group/capability drop and offline namespace.
-      preview_privilege=false
+      native_privilege=false
       if [[ "$distro" == fedora && "$case" == remove && "$safety" == read
             && "$assertions" == package-dry-run-remove && "${row_exit[$case]}" == 0
             && "$expected_ux" == pass && "$requires" == - && ${#chain[@]} == 0
             && "$tier" == hermetic && "$targets" == hermetic:pass
             && "$cleanup" == tempdir-drop && "$ssh_user" != root ]] \
         && jq -e '. == ["remove", "--dry-run", "jq"]' <<< "$args_json" >/dev/null; then
-        preview_privilege=true
+        native_privilege=true
       fi
-      if [[ "$preview_privilege" == false ]]; then
+      # Doctor must seed and remove a capability on its private exact-copy
+      # executable through authenticated sudo. Keep this exception row-exact;
+      # no_new_privs or a dropped bounding set prevents that native transition.
+      if [[ "$case" == doctor-turbo && "$safety" == isolated-write
+            && "$assertions" == doctor-capability-cleanup && "${row_exit[$case]}" == 0
+            && "$expected_ux" == pass && "$requires" == - && ${#chain[@]} == 0
+            && "$tier" == container && "$targets" == arch:pass,debian:pass,ubuntu:pass,fedora:pass
+            && "$cleanup" == tempdir-drop && "$ssh_user" != root
+            && ( "$distro" == arch || "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu || "$distro" == fedora ) ]] \
+        && jq -e '. == ["doctor", "--turbo"]' <<< "$args_json" >/dev/null; then
+        native_privilege=true
+      fi
+      if [[ "$native_privilege" == false ]]; then
         remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
       else
-        # Retain the bounding set solely so sudo can authenticate this native
-        # preview. Refuse an initial root user before any fixture or receipt.
+        # Retain the bounding set solely for the validated temporary native
+        # operation. Refuse an initial root user before any fixture or receipt.
         remote="test \$(id -u) -ne 0 && sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
       fi
     fi
@@ -3173,6 +3206,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   start_centis=${uptime/./}
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
+  # Two trusted setcap operations have independent 10-second setup deadlines.
+  # Preserve the actual Doctor command's original row deadline.
+  if [[ "$case" == doctor-turbo ]]; then budget=$((budget + 25)); fi
   if [[ "$case" == runtime-rust-install ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state || "$assertions" == doctor-network-live-state ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ "$assertions" == doctor-native-backend ]]; then
