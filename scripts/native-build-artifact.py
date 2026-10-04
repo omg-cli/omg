@@ -144,11 +144,30 @@ def validate_producer_run(run, expected):
 
 
 def api(path, limit=1024 * 1024):
-    with tempfile.TemporaryFile() as output:
-        subprocess.run(['gh', 'api', path], stdout=output, check=True, timeout=90)
-        require(output.tell() <= limit, 'GitHub response exceeds limit')
-        output.seek(0)
-        return output.read(limit + 1)
+    deadline = time.monotonic() + 90
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, 'GitHub request deadline exhausted')
+        with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as diagnostic:
+            try:
+                subprocess.run(['gh', 'api', path], stdout=output, stderr=diagnostic,
+                               check=True, timeout=remaining)
+            except subprocess.CalledProcessError as error:
+                diagnostic.seek(0)
+                details = diagnostic.read(8193)
+                status = (re.search(rb'\(HTTP ([0-9]{3})\)\s*\Z', details)
+                          if len(details) <= 8192 else None)
+                code = int(status[1]) if status else None
+                print('GitHub API request failed: ' +
+                      (f'HTTP {code}' if code else f'exit {error.returncode}'), file=sys.stderr)
+                delay = 2 ** attempt
+                if code != 503 or attempt == 2 or deadline - time.monotonic() <= delay:
+                    raise
+                time.sleep(delay)
+                continue
+            require(output.tell() <= limit, 'GitHub response exceeds limit')
+            output.seek(0)
+            return output.read(limit + 1)
 
 
 def api_json(path):

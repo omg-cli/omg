@@ -58,6 +58,92 @@ def bundle(provenance, payload, extra=None):
 
 
 class NativeBuildAdmission(unittest.TestCase):
+    def test_api_recovers_from_503_without_reusing_partial_response(self):
+        clock = [0.0]
+        calls = []
+        def request(argv, **kwargs):
+            calls.append(kwargs['timeout'])
+            if len(calls) == 1:
+                kwargs['stdout'].write(b'partial failed response')
+                if 'stderr' in kwargs:
+                    kwargs['stderr'].write(b'gh: service unavailable (HTTP 503)\n')
+                clock[0] = 60.0
+                raise subprocess.CalledProcessError(1, argv)
+            kwargs['stdout'].write(b'{"id":123}')
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch.object(BUILD.subprocess, 'run', side_effect=request), \
+                patch.object(BUILD.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(BUILD.time, 'sleep', side_effect=sleep) as backoff:
+            self.assertEqual(BUILD.api_json('repos/omg-cli/omg/actions/runs/123'), {'id': 123})
+        self.assertEqual(calls, [90.0, 29.0])
+        backoff.assert_called_once_with(1)
+
+    def test_api_503_retry_budget_stops_persistent_service_failure(self):
+        def request(argv, **kwargs):
+            if 'stderr' in kwargs:
+                kwargs['stderr'].write(b'gh: service unavailable (HTTP 503)\n')
+            raise subprocess.CalledProcessError(1, argv)
+        with patch.object(BUILD.subprocess, 'run', side_effect=request) as calls, \
+                patch.object(BUILD.time, 'sleep') as backoff:
+            with self.assertRaises(subprocess.CalledProcessError):
+                BUILD.api('repos/omg-cli/omg/actions/runs/123')
+        self.assertEqual(calls.call_count, 3)
+        self.assertEqual([call.args for call in backoff.call_args_list], [(1,), (2,)])
+
+    def test_api_refuses_permanent_errors_and_forged_service_error_text(self):
+        for diagnostic in (b'gh: bad credentials (HTTP 401)\n',
+                           b'gh: says (HTTP 503), forbidden (HTTP 403)\n',
+                           b'gh: not found (HTTP 404)\n', b'gh: rate limited (HTTP 429)\n',
+                           b'gh: unknown service failure\n', b'x' * 8192 + b' (HTTP 503)\n'):
+            with self.subTest(diagnostic=diagnostic[:80]):
+                def request(argv, **kwargs):
+                    if 'stderr' in kwargs:
+                        kwargs['stderr'].write(diagnostic)
+                    raise subprocess.CalledProcessError(1, argv)
+                with patch.object(BUILD.subprocess, 'run', side_effect=request) as calls, \
+                        patch.object(BUILD.time, 'sleep') as backoff:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        BUILD.api('repos/omg-cli/omg/actions/runs/123')
+                calls.assert_called_once()
+                backoff.assert_not_called()
+
+    def test_api_503_cannot_reset_the_shared_request_deadline(self):
+        clock = [0.0]
+        def request(argv, **kwargs):
+            if 'stderr' in kwargs:
+                kwargs['stderr'].write(b'gh: service unavailable (HTTP 503)\n')
+            clock[0] = 90.0
+            raise subprocess.CalledProcessError(1, argv)
+        with patch.object(BUILD.subprocess, 'run', side_effect=request) as calls, \
+                patch.object(BUILD.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(BUILD.time, 'sleep') as backoff:
+            with self.assertRaises(subprocess.CalledProcessError):
+                BUILD.api('repos/omg-cli/omg/actions/runs/123')
+        calls.assert_called_once()
+        backoff.assert_not_called()
+
+    def test_api_503_recovery_keeps_response_size_and_json_refusals(self):
+        for response, limit, expected in ((b'oversized', 2, 'response exceeds limit'),
+                                         (b'{"id":1,"id":2}', None, 'duplicate provenance key')):
+            with self.subTest(response=response):
+                count = [0]
+                def request(argv, **kwargs):
+                    count[0] += 1
+                    if count[0] == 1:
+                        kwargs['stderr'].write(b'gh: unavailable (HTTP 503)\n')
+                        raise subprocess.CalledProcessError(1, argv)
+                    kwargs['stdout'].write(response)
+                with patch.object(BUILD.subprocess, 'run', side_effect=request), \
+                        patch.object(BUILD.time, 'sleep') as backoff:
+                    with self.assertRaisesRegex(ValueError, expected):
+                        if limit is None:
+                            BUILD.api_json('repos/omg-cli/omg/actions/runs/123')
+                        else:
+                            BUILD.api('repos/omg-cli/omg/actions/runs/123', limit)
+                self.assertEqual(count[0], 2)
+                backoff.assert_called_once_with(1)
+
     def test_merge_group_admits_only_the_exact_candidate_native_owner(self):
         run = dict(id=123, run_attempt=1, repository={'full_name': 'omg-cli/omg'},
                    path='.github/workflows/ci.yml', workflow_id=42, event='merge_group',
