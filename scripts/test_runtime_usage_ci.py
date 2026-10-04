@@ -127,6 +127,53 @@ class EventIdentityTests(unittest.TestCase):
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_rejected_merge_retains_identity_tree_and_ordered_parents_without_secrets(self):
+        expected, run, commit = EventIdentityTests().pr_fixture()
+        wrong = dict(commit, parents=[dict(sha='c' * 40), commit['parents'][1]],
+                     message='fixture-secret', verification={'signature': 'fixture-secret'})
+        run = dict(run, token='fixture-secret', body='fixture-secret')
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / 'evidence').mkdir()
+            (state / 'bin').mkdir()
+            with patch.object(USAGE, 'checked_state', return_value=expected), \
+                    patch.object(USAGE.native, 'command_output', side_effect=[expected['source'], EventIdentityTests.TREE]), \
+                    patch.object(USAGE.native, 'api_json', side_effect=[run, wrong]), \
+                    patch.object(USAGE.native, 'download_artifact') as download:
+                with self.assertRaisesRegex(ValueError, 'exact PR base and head'):
+                    USAGE.admit(state, {'GH_TOKEN': 'fixture-secret'})
+            receipt_path = state / 'evidence/admission-inputs.json'
+            self.assertTrue(receipt_path.is_file(), 'rejected merge must retain admission inputs')
+            receipt = json.loads(receipt_path.read_text())
+            self.assertEqual(receipt['trustedIdentity'], expected)
+            self.assertEqual(receipt['checkoutSource'], expected['source'])
+            self.assertEqual(receipt['checkoutTree'], EventIdentityTests.TREE)
+            self.assertEqual(receipt['sourceCommit']['parents'], wrong['parents'])
+            self.assertEqual(receipt['sourceCommit']['tree'], commit['tree'])
+            self.assertEqual(receipt['producer']['pull_requests'], run['pull_requests'])
+            self.assertNotIn('fixture-secret', receipt_path.read_text())
+            self.assertFalse((state / 'evidence/admission.json').exists())
+            self.assertEqual(list((state / 'bin').iterdir()), [])
+            download.assert_not_called()
+
+    def test_rejected_checkout_or_producer_retains_available_inputs(self):
+        for source, run, message in [('b' * 40, RUN, 'checkout source'),
+                                      (EXPECTED['source'], dict(RUN, run_attempt=2), 'superseded')]:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                (state / 'evidence').mkdir()
+                with patch.object(USAGE, 'checked_state', return_value=EXPECTED), \
+                        patch.object(USAGE.native, 'command_output', return_value=source), \
+                        patch.object(USAGE.native, 'api_json', return_value=run):
+                    with self.assertRaisesRegex(ValueError, message):
+                        USAGE.admit(state, {})
+                receipt = json.loads((state / 'evidence/admission-inputs.json').read_text())
+                self.assertEqual(receipt['trustedIdentity'], EXPECTED)
+                self.assertEqual(receipt['checkoutSource'], source)
+                if source == EXPECTED['source']:
+                    self.assertEqual(receipt['producer']['run_attempt'], 2)
+                self.assertNotIn('sourceCommit', receipt)
+
     def test_current_run_owner_and_artifact_accept_without_whole_workflow_completion(self):
         USAGE.validate_run(RUN, EXPECTED)
         self.assertEqual(USAGE.select_artifact([ARTIFACT], [JOB], EXPECTED), ARTIFACT)
@@ -173,6 +220,7 @@ class AdmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             (state / 'bin').mkdir()
+            (state / 'evidence').mkdir()
             responses = [RUN, dict(sha='a' * 40, tree=dict(sha='a' * 40)),
                          dict(jobs=[JOB]), dict(artifacts=[ARTIFACT]), dict(RUN, run_attempt=2)]
             provenance = dict(archive='subject.tar.gz')
@@ -209,12 +257,17 @@ class AdmissionTests(unittest.TestCase):
             parent = Path(directory).resolve()
             context = dict(RUNNER_TEMP=str(parent), GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1',
                            GITHUB_REPOSITORY='omg-cli/omg', GITHUB_SHA='a' * 40,
-                           GITHUB_EVENT_NAME='push', GITHUB_EVENT_PATH=str(parent / 'event.json'))
-            (parent / 'event.json').write_text(json.dumps(dict(repository={'full_name': 'omg-cli/omg'}, after='a' * 40)))
+                           GITHUB_EVENT_NAME='push', GITHUB_EVENT_PATH=str(parent / 'event.json'),
+                           GH_TOKEN='fixture-secret')
+            (parent / 'event.json').write_text(json.dumps(dict(repository={'full_name': 'omg-cli/omg'},
+                                                             after='a' * 40, body='fixture-secret')))
             state = parent / 'runtime-usage-123-1'
             self.assertNotEqual(os.getuid(), 0, 'run lifecycle checks as an actual ordinary user')
             USAGE.initialize(state, context)
             self.assertEqual(USAGE.checked_state(state, context)['run'], 123)
+            self.assertEqual(json.loads((state / 'evidence/identity.json').read_text()),
+                             json.loads((state / 'ownership.json').read_text()))
+            self.assertNotIn('fixture-secret', (state / 'evidence/identity.json').read_text())
             home = state / 'home'
             home.rmdir()
             protected = parent / 'protected'
