@@ -1,5 +1,15 @@
 # PER-471: audited checkout attribution candidate
 
+**RETIRED — historical evidence only.** The authenticated board direction on
+2026-10-04 superseded this candidate with native issue-scoped routines and
+explicitly prohibited accepting missing source context. Do not publish or
+integrate this transformer as a repair. The installed security guard was never
+changed. Source and regression assertions are preserved for audit history;
+candidate-mode passes below establish only the abandoned candidate's behavior.
+Current operational verification is recorded on
+[PER-471](/PER/issues/PER-471#document-scoped-routing-verification). GitHub identity
+recovery on PER-477 is separate and no longer blocks that verification.
+
 This explicit local runtime addon is staged for independent security review. It
 does not load automatically, install packages, or write the running server.
 Paperclip task: [PER-471](/PER/issues/PER-471). Publication identity restoration:
