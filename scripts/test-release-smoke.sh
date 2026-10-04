@@ -636,14 +636,18 @@ qemu_runner="${OMG_QEMU_TEST_RUNNER:-$repo_root/scripts/benchmark-qemu.sh}"
 # This host has no /dev/kvm, so the fixture legs below skip the KVM
 # device probe; dedicated probe tests further down cover it explicitly.
 export OMG_QEMU_ALLOW_NO_KVM=1
-assert_rc 1 "$qemu_runner" --distro all --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-unavailable"
+assert_rc 1 "$qemu_runner" --distro all --arch x86_64 --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-unavailable"
 qemu_result=$(find "$scratch/qemu-unavailable" -mindepth 2 -maxdepth 2 -name results.json -print -quit)
 [[ -n "$qemu_result" ]] || fail 'QEMU suite omitted unavailable-engine results'
-jq -e 'length == 4 and ([.[].distro] | sort) == ["arch", "debian", "fedora", "ubuntu"] and all(.[]; .result == "HARNESS_ERROR" and .exit_code == 3)' "$qemu_result" >/dev/null || fail 'QEMU suite omitted a requested distro or misclassified preflight failure'
+jq -e 'length == 5 and ([.[].distro] | sort) == ["arch", "debian", "debian-trixie", "fedora", "ubuntu"] and all(.[]; .result == "HARNESS_ERROR" and .exit_code == 3)' "$qemu_result" >/dev/null || fail 'QEMU suite omitted a requested distro or misclassified preflight failure'
 
-assert_rc 143 bash -c 'export FAKE_QEMU_SUITE_PID=$$; exec "$@"' _ "$qemu_runner" --distro all --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-interrupted"
+assert_rc 1 "$qemu_runner" --distro all --arch aarch64 --allow-tcg --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-arm-unavailable"
+qemu_result=$(find "$scratch/qemu-arm-unavailable" -mindepth 2 -maxdepth 2 -name results.json -print -quit)
+jq -e 'length == 3 and ([.[].distro] | sort) == ["debian", "fedora", "ubuntu"] and all(.[]; .result == "HARNESS_ERROR" and .exit_code == 3)' "$qemu_result" >/dev/null || fail 'QEMU ARM suite selected unsupported guests or lost preflight failures'
+
+assert_rc 143 bash -c 'export FAKE_QEMU_SUITE_PID=$$; exec "$@"' _ "$qemu_runner" --distro all --arch x86_64 --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-interrupted"
 qemu_result=$(find "$scratch/qemu-interrupted" -mindepth 2 -maxdepth 2 -name results.json -print -quit)
-jq -e 'length == 4 and .[0].result == "INCOMPLETE" and all(.[1:][]; .result == "NOT_RUN")' "$qemu_result" >/dev/null || fail 'interrupted QEMU suite lost target states'
+jq -e 'length == 5 and ([.[].distro] | sort) == ["arch", "debian", "debian-trixie", "fedora", "ubuntu"] and .[0].result == "INCOMPLETE" and all(.[1:][]; .result == "NOT_RUN")' "$qemu_result" >/dev/null || fail 'interrupted QEMU suite lost target states'
 for _attempt in {1..100}; do
   child_result=$(find "$scratch/qemu-interrupted" -mindepth 4 -maxdepth 4 -name results.json -print -quit)
   if [[ -n "$child_result" ]] && jq -e '.[0].result == "HARNESS_ERROR"' "$child_result" >/dev/null 2>&1; then break; fi
@@ -833,7 +837,10 @@ assert_rc 3 "$qemu_runner" --distro arch --arch aarch64 --release v9.9.9 --stage
 jq -e 'length == 1 and .[0].result == "HARNESS_ERROR" and .[0].exit_code == 3' "$(results_file "$scratch/qemu-arch-nopin")" >/dev/null || fail "unpinned arch/aarch64 was not a harness error"
 # Pin audit: exact publisher hashes, both arches, arch/aarch64 absent.
 pins="$("$qemu_runner" --print-pins)"
-[[ "$(printf '%s\n' "$pins" | wc -l)" -eq 7 ]] || fail "pin table lost a row"
+expected_pin_keys=$(printf '%s\n' arch-x86_64 debian-x86_64 debian-aarch64 debian-trixie-x86_64 ubuntu-x86_64 ubuntu-aarch64 fedora-x86_64 fedora-aarch64 | LC_ALL=C sort)
+actual_pin_keys=$(printf '%s\n' "$pins" | awk -F '\t' '{print $1 "-" $2}' | LC_ALL=C sort)
+[[ "$actual_pin_keys" == "$expected_pin_keys" ]] || fail "pin table differs from the supported guest profiles"
+printf '%s\n' "$pins" | awk -F '\t' '$1 == "debian-trixie" && $2 == "x86_64" && $3 == "https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-amd64-20261001-2618.qcow2" && $4 == "f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d" && $5 == "sha512sum" {found++} END {exit found != 1}' || fail "Trixie x86_64 publisher pin mismatch"
 printf '%s\n' "$pins" | grep -Fq 'debian	aarch64	https://cloud.debian.org/images/cloud/bookworm/20260903-2590/debian-12-generic-arm64-20260903-2590.qcow2	b0144c1c8e09b187b54af300c8ffc22f17b318d0aa6f5a2caba13f3102441572badbeb098458e599b6897bc80dad50fd0094d6e4b9da9f4a2bd63a8f4c99dea5' || fail "debian aarch64 pin mismatch"
 printf '%s\n' "$pins" | grep -Fq 'ubuntu	aarch64	https://cloud-images.ubuntu.com/noble/20260826/noble-server-cloudimg-arm64.img	afa139bac6f2629c1e1f2f8f34215f3a9ad9779801bcb945521ba1a45016743f' || fail "ubuntu aarch64 pin mismatch"
 printf '%s\n' "$pins" | grep -Fq 'fedora	aarch64	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2	55c60a3b80d3616a08705afd0459e75fe9f03c54aba7a46e4002a41a72fa0d5b' || fail "fedora aarch64 pin mismatch"

@@ -14,6 +14,7 @@ TARGETS = {
                ['kernel.org', 'github.com'], ['github.com', 'kernel.org']),
 }
 TARGETS['ubuntu'] = TARGETS['debian']
+TARGETS['debian-trixie'] = TARGETS['debian']
 TARGETS['fedora'] = TARGETS['debian']
 
 
