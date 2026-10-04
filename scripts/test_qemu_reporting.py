@@ -1427,9 +1427,11 @@ class ReportingBoundaryTests(unittest.TestCase):
             jobs=jobs)
         self.assertEqual(len(catalog["failures"]), 1)
         self.assertEqual(catalog["failures"][0]["case_id"], "ci-non-qemu-workflow")
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][1][0]["case_id"], "ci-non-qemu-workflow")
         self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "ci")
+        self.assertEqual(calls[1][0], "scripts/report-smoke-sentry.sh")
+        self.assertEqual(calls[1][1], catalog["failures"])
 
     def test_failed_native_ci_with_unavailable_artifacts_does_not_invent_qemu_failure(self):
         jobs = [
@@ -1485,8 +1487,10 @@ class ReportingBoundaryTests(unittest.TestCase):
             [self.row("PASS")], workflow_path=".github/workflows/ci.yml", jobs=jobs)
         self.assertEqual([row["case_id"] for row in catalog["failures"]],
                          ["ci-non-qemu-workflow"])
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "ci")
+        self.assertEqual(calls[1][0], "scripts/report-smoke-sentry.sh")
+        self.assertEqual(calls[1][1], catalog["failures"])
 
     def test_parallel_ci_and_qemu_failures_keep_both_identities(self):
         jobs = [
@@ -1499,8 +1503,12 @@ class ReportingBoundaryTests(unittest.TestCase):
             [self.row()], workflow_path=".github/workflows/ci.yml", jobs=jobs)
         self.assertEqual({row["case_id"] for row in catalog["failures"]},
                          {"qemu-arch-search", "ci-non-qemu-workflow"})
-        self.assertEqual({call[3][call[3].index("--source") + 1] for call in calls},
+        self.assertEqual(len(calls), 3)
+        self.assertEqual({call[3][call[3].index("--source") + 1] for call in calls
+                          if call[0] == "scripts/qa-file-issue.sh"},
                          {"qemu-matrix", "ci"})
+        self.assertEqual(calls[2][0], "scripts/report-smoke-sentry.sh")
+        self.assertEqual([row["case_id"] for row in calls[2][1]], ["ci-non-qemu-workflow"])
         qemu_transcript = calls[0][2]["arch-qemu-arch-search"]
         ci_transcript = calls[0][2]["matrix-ci-non-qemu-workflow"]
         self.assertIn("QEMU guest (arch)", qemu_transcript)
