@@ -14,11 +14,15 @@ evidence=$(realpath "$3") || setup_fail 'evidence path'
 fixture=$(realpath "${BASH_SOURCE[0]%/*}/qemu-doctor-connectivity-fixture.py") || setup_fail 'fixture path'
 case "$distro" in
   arch) primary=archlinux.org ;;
-  debian|ubuntu|fedora) primary=github.com ;;
+  debian|debian-trixie|ubuntu|fedora) primary=github.com ;;
   *) setup_fail 'unsupported distro' ;;
 esac
 source /etc/os-release || setup_fail 'os-release unavailable'
-[[ "$ID" == "$distro" ]] || setup_fail 'guest distro mismatch'
+if [[ "$distro" == debian-trixie ]]; then
+  [[ "$ID" == debian && "${VERSION_ID:-}" == 13 ]] || setup_fail 'guest distro mismatch'
+else
+  [[ "$ID" == "$distro" ]] || setup_fail 'guest distro mismatch'
+fi
 [[ -x "$bin" ]] || setup_fail 'binary unavailable'
 [[ -d "$evidence" ]] || setup_fail 'evidence directory unavailable'
 [[ -f "$fixture" ]] || setup_fail 'proxy fixture unavailable'

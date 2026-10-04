@@ -37,7 +37,7 @@ failures="$(jq -ce '
   if length > 10000 then error("too many results") else . end |
   if all(.[];
     (.case_id | identifier) and
-    ((.distro | IN("arch", "debian", "ubuntu", "fedora", "macos")) or
+    ((.distro | IN("arch", "debian", "debian-trixie", "ubuntu", "fedora", "macos")) or
      (.distro == "matrix" and
       (.case_id | IN("qemu-matrix-workflow", "qemu-matrix-x86-workflow",
                      "qemu-matrix-arm-workflow", "qemu-matrix-all-workflow",

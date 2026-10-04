@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +15,47 @@ SPEC.loader.exec_module(PROBE)
 
 
 class BackendMismatchReceiptTests(unittest.TestCase):
+    def assert_guest_identity_preflight(self, release, distro, expected_error):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "omg"
+            binary.touch()
+            binary.with_name("omgd").touch()
+            account = SimpleNamespace(pw_dir=directory)
+            virt = SimpleNamespace(returncode=0, stdout="qemu\n")
+            with patch.object(PROBE.os, "geteuid", return_value=0, create=True), \
+                    patch.object(PROBE.subprocess, "run", return_value=virt), \
+                    patch.object(PROBE.pwd, "getpwnam", return_value=account), \
+                    patch.object(PROBE.os, "access", return_value=True), \
+                    patch.object(PROBE.Path, "read_text", return_value=release), \
+                    patch.object(PROBE.shutil, "which", side_effect=RuntimeError("tracer boundary")):
+                with self.assertRaisesRegex(RuntimeError, expected_error):
+                    PROBE.run(str(binary), distro)
+
+    def test_trixie_guest_preflight_accepts_debian_13_identity(self):
+        for release in ('ID=debian\nVERSION_ID=13\n', 'ID="debian"\nVERSION_ID="13"\n'):
+            with self.subTest(release=release):
+                self.assert_guest_identity_preflight(release, "debian-trixie", "tracer boundary")
+
+    def test_trixie_guest_preflight_rejects_other_or_missing_versions(self):
+        for release in ('ID=debian\nVERSION_ID=12\n', 'ID=debian\n',
+                        'ID=ubuntu\nVERSION_ID=13\n', 'ID=debian-trixie\nVERSION_ID=13\n'):
+            with self.subTest(release=release):
+                self.assert_guest_identity_preflight(
+                    release, "debian-trixie", "does not match requested distribution")
+
+    def test_generic_debian_guest_preflight_keeps_existing_identity(self):
+        self.assert_guest_identity_preflight("ID=debian\nVERSION_ID=12\n", "debian", "tracer boundary")
+
+    def test_trixie_mismatch_preserves_guest_identity_and_detects_apt_access(self):
+        receipt = dict(self.receipt(), distro='debian-trixie')
+        PROBE.validate_receipt(receipt, 'debian-trixie')
+        for line in ('openat(AT_FDCWD, "/var/lib/dpkg/status", O_RDONLY) = 3',
+                     'execve("/usr/bin/apt-get", ["apt-get"], 0x0) = 0'):
+            with self.subTest(line=line):
+                self.assertTrue(PROBE.native_db_access(line, 'debian-trixie'))
+        with self.assertRaises(ValueError):
+            PROBE.validate_receipt(dict(receipt, distro='debian'), 'debian-trixie')
+
     def test_probe_inventory_keeps_all_backend_entrypoints(self):
         self.assertEqual(tuple(name for name, _ in PROBE.PROBES), (
             "doctor", "info", "search", "status", "explicit_count",
@@ -60,6 +102,8 @@ class BackendMismatchReceiptTests(unittest.TestCase):
                  "ubuntu": "/var/lib/apt/extended_states", "fedora": "/usr/lib/sysimage/rpm/rpmdb.sqlite"}
         tools = {"arch": "pacman", "debian": "dpkg-query", "ubuntu": "apt-cache",
                  "fedora": "dnf5"}
+        paths['debian-trixie'] = '/var/lib/dpkg/status'
+        tools['debian-trixie'] = 'dpkg-query'
         for distro in PROBE.DATABASE_PATHS:
             with self.subTest(distro=distro):
                 self.assertTrue(PROBE.native_db_access(
