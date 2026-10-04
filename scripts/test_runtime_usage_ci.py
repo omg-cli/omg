@@ -266,7 +266,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('RUNTIME_USAGE: ${{ needs.runtime-usage.result }}', body)
         script = body.split('        run: |\n', 1)[1].split('\n  #', 1)[0]
         script = '\n'.join(line[10:] for line in script.splitlines())
-        keys = ['QUICK_GATE', 'PORTABLE', 'LINUX_MATRIX', 'SANDBOX_CANCELLATION',
+        keys = ['QUICK_GATE', 'STANDALONE_SUITES', 'PORTABLE', 'LINUX_MATRIX', 'SANDBOX_CANCELLATION',
                 'FEATURE_INTERSECTIONS', 'MACOS', 'MACOS_NEXTEST_SOURCE', 'UBUNTU', 'QEMU', 'DOCS_AUDIT']
         for required, status, accepted in [('true', 'success', True), ('true', 'failure', False),
                                             ('true', 'cancelled', False), ('true', 'skipped', False),
