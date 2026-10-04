@@ -496,7 +496,18 @@ case "$1" in
       if [[ "${!#}" == collect ]]; then
         cat >/dev/null
         [[ "${FAKE_QEMU_HEALTH_MISSING:-0}" == 0 ]] || exit 1
-        printf '{"schema_version":1,"complete":true,"boot_id":"00000000-1111-2222-3333-444444444444","kernel_bytes":100,"fatal_signatures":[],"product_crashes":[]}\n'
+        python3 - <<'PY'
+import json
+boot = '00000000-1111-2222-3333-444444444444'
+socket = dict(Id='systemd-coredump.socket', LoadState='loaded', ActiveState='active',
+              SubState='listening', Result='success', UnitFileState='static')
+processor = dict(socket, Id='systemd-coredump@omg-health.service', ActiveState='inactive', SubState='dead')
+channel = dict(kind='systemd-coredump-pipe', boot_id=boot, handler_executable=True,
+               core_pattern='|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h',
+               socket=socket, processor=processor)
+print(json.dumps(dict(schema_version=2, complete=True, boot_id=boot, kernel_bytes=100,
+                     fatal_signatures=[], product_crashes=[], crash_channel=channel)))
+PY
         exit 0
       fi
     for argument in "$@"; do
