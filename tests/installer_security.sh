@@ -359,4 +359,5 @@ fi
   cmp "$CONFIG_DIR/config.toml" "$task_dir/config-before"
   cmp "$CONFIG_DIR/policy.toml" "$task_dir/policy-before"
 )
+python3 tests/test_shell_backup_safety.py
 printf 'Installer security scenarios passed\n'
