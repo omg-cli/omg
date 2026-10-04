@@ -23,16 +23,20 @@ on:
     types: [checks_requested]
   workflow_dispatch:
     inputs:
+      host-diagnostics:
+        description: "Collect isolated Ubuntu host diagnostics; not product admission"
+        type: boolean
+        default: false
       skip-cache:
         description: "Skip cache restoration"
         type: boolean
         default: false
 
 concurrency:
-  group: ci-${{ github.head_ref || github.ref }}
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true && format('host-diagnostics-{0}-{1}', github.ref, github.run_id) || format('ci-{0}', github.head_ref || github.ref) }}
   # PRs cancel superseded runs; main never cancels so queued main runs
   # (e.g. #175 behind #172) still complete instead of being dropped.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) && github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -102,7 +106,7 @@ jobs:
   portable:
     name: "Portable Rust"
     needs: quick-gate
-    if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) && (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -202,7 +206,7 @@ jobs:
   linux-matrix:
     name: "Linux (${{ matrix.platform }})"
     needs: quick-gate
-    if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) && (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -507,7 +511,7 @@ jobs:
   sandbox-cancellation:
     name: "AUR sandbox security regressions"
     needs: [quick-gate, linux-matrix]
-    if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) && (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -655,7 +659,7 @@ jobs:
   feature-intersections:
     name: "Intersections (${{ matrix.platform }})"
     needs: quick-gate
-    if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) && (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -731,7 +735,7 @@ jobs:
     needs: quick-gate
     # `!github.event.act` skips this leg during local act runs (no macOS
     # containers exist); the condition is always true on GitHub.
-    if: (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) && ((needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act) }}
     runs-on: macos-14
     timeout-minutes: 30
     env:
@@ -830,7 +834,7 @@ jobs:
   macos-nextest-source:
     name: "macOS nextest source contract"
     needs: quick-gate
-    if: (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) && ((needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act) }}
     runs-on: macos-14
     timeout-minutes: 15
     permissions:
@@ -1056,10 +1060,8 @@ jobs:
     name: QEMU behavioral verification
     needs: [quick-gate, linux-matrix, ubuntu]
     if: >-
-      !cancelled() &&
-      (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
-      needs.quick-gate.result == 'success' &&
-      (github.event_name == 'merge_group' || needs.quick-gate.outputs.should-build == 'true')
+      ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) &&
+      (!cancelled() && (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.quick-gate.result == 'success' && (github.event_name == 'merge_group' || needs.quick-gate.outputs.should-build == 'true')) }}
     uses: ./.github/workflows/qemu-matrix.yml
     permissions:
       contents: read
@@ -1068,6 +1070,7 @@ jobs:
       OMG_SMOKE_SENTRY_DSN: ${{ github.event_name != 'pull_request' && secrets.OMG_SMOKE_SENTRY_DSN || '' }}
 
   docs-audit:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) }}
     name: Docs audit
     # Unconditional: doc-only changes must not be able to introduce broken
     # links, phantom flags, or unknown commands in fenced code blocks.
@@ -1123,10 +1126,49 @@ jobs:
         if: always() && steps.upload-runtime-evidence.outcome == 'success'
         run: timeout --kill-after=5s 10s python3 scripts/runtime-usage-ci.py cleanup --state "$RUNTIME_USAGE_STATE"
 
+  native-health-diagnostics:
+    name: Ubuntu native health diagnostics (not admission)
+    if: github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true
+    needs: quick-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run full native health suite
+        shell: bash
+        env:
+          HOST_DIAGNOSTICS: ${{ runner.temp }}/host-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -m 700 "$HOST_DIAGNOSTICS"
+          printf 'HOST_DIAGNOSTICS=%s\n' "$HOST_DIAGNOSTICS" >> "$GITHUB_ENV"
+          set +e
+          timeout --kill-after=5s 30s python3 scripts/capture-qemu-host-diagnostics.py > "$HOST_DIAGNOSTICS/host.json" 2> "$HOST_DIAGNOSTICS/capture.stderr"
+          capture_status=$?
+          sudo -n timeout --kill-after=5s 120s python3 -m unittest discover -s scripts -p test_qemu_health.py -v > "$HOST_DIAGNOSTICS/health.stdout" 2> "$HOST_DIAGNOSTICS/health.stderr"
+          status=$?
+          set -e
+          printf '{"capture_exit":%s,"native_health_exit":%s}\n' "$capture_status" "$status" > "$HOST_DIAGNOSTICS/outcome.json"
+          if [[ "$status" != 0 ]]; then
+            exit "$status"
+          fi
+          exit "$capture_status"
+      - name: Upload host diagnostics even on refusal
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ubuntu-host-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.HOST_DIAGNOSTICS }}/
+          if-no-files-found: error
+          retention-days: 14
+
   ci-success:
     name: "CI Success"
     needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
-    if: always()
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) && (always()) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -1213,7 +1255,7 @@ jobs:
   release-tag:
     name: "Tag Release"
     needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, ubuntu, ci-success]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.host-diagnostics == true) && (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     permissions:
