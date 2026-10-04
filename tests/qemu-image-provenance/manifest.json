@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "reviewed_on": "2026-09-15",
+  "reviewed_on": "2026-10-03",
   "review_expires": "2026-10-15",
   "images": {
     "arch-x86_64": {
@@ -23,6 +23,15 @@
       "signature_policy": "publisher-unsigned-cloud-checksums",
       "rationale": "Debian documents TLS-distributed checksums for current cloud images; its CD signature policy does not cover these images.",
       "source": "https://cloud.debian.org/images/cloud/"
+    },
+    "debian-trixie-x86_64": {
+      "publisher": "debian",
+      "url": "https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-amd64-20261001-2618.qcow2",
+      "digest": "f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d",
+      "algorithm": "sha512",
+      "signature_policy": "publisher-unsigned-cloud-checksums",
+      "rationale": "Debian publishes this versioned cloud image with TLS-distributed SHA512SUMS and no detached checksum signature; do not claim OpenPGP authentication.",
+      "source": "https://cloud.debian.org/images/cloud/trixie/20261001-2618/SHA512SUMS"
     },
     "debian-aarch64": {
       "publisher": "debian",

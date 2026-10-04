@@ -16,6 +16,7 @@ SNAPSHOTS = {
     'ubuntu': "dpkg-query -W '-f=${Package}\\t${Version}\\t${Status}\\t${Architecture}\\n'; printf '\\ninstall reasons\\n'; apt-mark showmanual",
     'fedora': "rpm -qa --qf '%{NAME}\\t%{EPOCHNUM}\\t%{VERSION}\\t%{RELEASE}\\t%{ARCH}\\n'; printf '\\ninstall reasons\\n'; dnf --cacheonly --disable-repo='*' repoquery --installed --queryformat '%{name} %{arch} %{reason}\\n'",
 }
+SNAPSHOTS['debian-trixie'] = SNAPSHOTS['debian']
 
 
 def digest(data):

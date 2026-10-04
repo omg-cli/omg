@@ -275,6 +275,11 @@ fi
 if [[ "$GUEST_MODE" == true ]]; then
     export LC_ALL=C NO_COLOR=1
     distro=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)
+    version_id=$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)
+    evidence_distro="$distro"
+    if [[ "$distro" == debian && "$version_id" == 13 ]]; then
+        evidence_distro=debian-trixie
+    fi
     extra_native=()
     extra_name=""
     case "$distro" in
@@ -574,7 +579,7 @@ if [[ "$GUEST_MODE" == true ]]; then
         else
             [[ ! -e /usr/bin/tree ]]
         fi
-        jq -n --arg distro "$distro" --arg operation "$GUEST_TRANSACTION" --arg tool "$GUEST_TOOL" \
+        jq -n --arg distro "$evidence_distro" --arg operation "$GUEST_TRANSACTION" --arg tool "$GUEST_TOOL" \
             --arg version "$expected_version" --slurpfile command "$EXPORT_DIR/command.json" \
             --rawfile boot_id "$EXPORT_DIR/boot-id.txt" '
           {schema_version:2,kind:"transaction-trial",complete:true,distro:$distro,
@@ -772,7 +777,7 @@ COUNT
     capture_explicit after
     cmp "$EXPORT_DIR/explicit-omg-before.names" "$EXPORT_DIR/explicit-omg-after.names"
     cmp "$EXPORT_DIR/explicit-native-before.names" "$EXPORT_DIR/explicit-native-after.names"
-    jq -n --arg distro "$distro" --argjson search_equivalent "$search_equivalent" \
+    jq -n --arg distro "$evidence_distro" --argjson search_equivalent "$search_equivalent" \
         --slurpfile info "$EXPORT_DIR/info.commands.json" \
         --slurpfile search "$EXPORT_DIR/search.commands.json" \
         --slurpfile explicit "$EXPORT_DIR/explicit.commands.json" \

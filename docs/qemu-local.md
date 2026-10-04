@@ -86,6 +86,23 @@ defines the returned action; it is separate from guest network readiness.
 
 ## What to run
 
+The x86-64 QEMU `all` profile selects Arch, Debian 12, Debian 13 (Trixie),
+Ubuntu and Fedora. The ARM `all` profile selects Debian 12, Ubuntu and Fedora;
+Arch and Trixie ARM are unsupported. The suite creates one result row for
+every selected guest before running it. A failed guest or missing result
+keeps the suite unsuccessful. The
+[workflow selection and suite regressions](../tests/test_qemu_workflow.py)
+exercise those boundaries without downloading images or booting guests.
+
+Trixie requires native APT 7 for both `omg` and `omgd`. Before either product
+entrypoint executes, the ordinary guest user records the trusted dynamic
+loader's [`--list` output](https://man7.org/linux/man-pages/man8/ld.so.8.html).
+The [host evidence validator](../scripts/qemu-apt-abi-evidence.py) checks the
+two binary hashes against the native archive and binds the raw dependency
+logs and Debian 13 identity to the selected probe source. This dependency
+check is one prerequisite; passing it does not establish the lifecycle,
+inventory, advisory, fault or reset-transaction results.
+
 ### ARM runner configuration
 
 The workflow repository variable `OMG_QEMU_ARM_RUNNER` selects a single runner

@@ -1,13 +1,45 @@
 """Doctor index evidence must distinguish empty, corrupt and unreadable state."""
 import json
+import importlib.util
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 
 class DoctorIndexReceiptTests(unittest.TestCase):
+    def guest_identity(self, distro, release):
+        source = Path(__file__).with_name('qemu-doctor-index-oracle.py')
+        spec = importlib.util.spec_from_file_location('doctor_guest_identity', source)
+        oracle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(oracle)
+        # Execute the actual admission guard before any privileged mount changes.
+        guard = source.read_text().split('    release = ', 1)[1].split('\n', 1)[1]
+        guard = guard.split('    account = ', 1)[0]
+        namespace = dict(vars(oracle), distro=distro, release=release.splitlines())
+        exec(compile(textwrap.dedent(guard), str(source), 'exec'), namespace)
+
+    def test_debian_13_guest_keeps_trixie_lane_identity(self):
+        for release in ('ID=debian\nVERSION_ID=13\n', "ID='debian'\nVERSION_ID=\"13\"\n"):
+            with self.subTest(release=release):
+                self.guest_identity('debian-trixie', release)
+
+    def test_trixie_refuses_foreign_version_missing_or_ambiguous_identity(self):
+        for release in ('ID=debian\nVERSION_ID=12\n', 'ID=ubuntu\nVERSION_ID=13\n',
+                        'ID=debian\n', 'VERSION_ID=13\n',
+                        'ID=debian\nID=ubuntu\nVERSION_ID=13\n',
+                        'ID=debian\nVERSION_ID=13\nVERSION_ID=12\n'):
+            with self.subTest(release=release), self.assertRaises(RuntimeError):
+                self.guest_identity('debian-trixie', release)
+
+    def test_existing_guest_backend_id_checks_remain_strict(self):
+        for distro in ('debian', 'ubuntu'):
+            self.guest_identity(distro, f'ID="{distro}"\nVERSION_ID=12\n')
+            with self.assertRaises(RuntimeError):
+                self.guest_identity(distro, 'ID=fedora\nVERSION_ID=44\n')
+
     def check(self, receipt):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'receipt.json'
