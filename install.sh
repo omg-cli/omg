@@ -1110,10 +1110,13 @@ validate_install_dir_path() {
 # an unrelated file. The rename also handles links/directories swapped in after
 # the pre-check without following them (including on macOS).
 backup_shell_config() (
-  local rc_file="$1" staging_dir
+  local rc_file="$1" staging_dir cleanup_command
   [[ ! -L "$rc_file.omg-backup" ]] || error "Refusing symlink shell backup: $rc_file.omg-backup"
   staging_dir=$(mktemp -d "${rc_file}.omg-backup-stage.XXXXXX") || error "Failed to stage shell backup; shell configuration was retained"
-  trap 'rm -f "$staging_dir/backup"; rmdir "$staging_dir"' EXIT
+  # Bash 3.2 can unwind function locals before running the subshell EXIT trap
+  # on failure. Capture shell-quoted paths while those locals still exist.
+  printf -v cleanup_command 'rm -f %q; rmdir %q' "$staging_dir/backup" "$staging_dir"
+  trap "$cleanup_command" EXIT
   cp -p "$rc_file" "$staging_dir/backup" || error "Failed to copy shell backup; shell configuration was retained"
   rename_install_binary "$staging_dir/backup" "$rc_file.omg-backup" || error "Failed to publish shell backup; shell configuration was retained"
 )

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ShellBackupSafety(unittest.TestCase):
     def check_backup(self, action, shape, platform="native"):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(prefix="omg backup ' ") as directory:
             home = Path(directory)
             install = home / "bin with ' quote"
             install.mkdir()
