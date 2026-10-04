@@ -58,6 +58,46 @@ def bundle(provenance, payload, extra=None):
 
 
 class NativeBuildAdmission(unittest.TestCase):
+    def test_metadata_attempts_share_the_original_wall_clock_deadline(self):
+        clock = [0.0]
+        timeouts = []
+        response = self.metadata_response([(503, b'partial error'), (502, b'other error'),
+                                           (200, b'{"id":42}')])
+        elapsed = iter((30, 20, 1))
+
+        def request(argv, *, stdout, check, timeout):
+            timeouts.append(timeout)
+            clock[0] += next(elapsed)
+            return response(argv, stdout=stdout, check=check, timeout=timeout)
+
+        with patch.object(BUILD.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(BUILD.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                patch.object(BUILD.subprocess, 'run', side_effect=request):
+            self.assertEqual(BUILD.api_json('repos/omg-cli/omg/actions/runs/10'), {'id': 42})
+        self.assertEqual(timeouts, [90, 59, 37])
+
+    def test_metadata_deadline_exhaustion_cannot_start_another_attempt(self):
+        path = 'repos/omg-cli/omg/actions/runs/10'
+        for elapsed, failure in ((89.5, subprocess.CalledProcessError),
+                                 (90, subprocess.TimeoutExpired)):
+            clock = [0.0]
+            response = self.metadata_response([(503, b'{}'), (200, b'{"id":42}')])
+
+            def request(argv, *, stdout, check, timeout):
+                clock[0] += elapsed
+                if failure is subprocess.TimeoutExpired:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                return response(argv, stdout=stdout, check=check, timeout=timeout)
+
+            with self.subTest(failure=failure.__name__), \
+                    patch.object(BUILD.time, 'monotonic', side_effect=lambda: clock[0]), \
+                    patch.object(BUILD.time, 'sleep') as sleep, \
+                    patch.object(BUILD.subprocess, 'run', side_effect=request) as run:
+                with self.assertRaises(failure):
+                    BUILD.api_json(path)
+                self.assertEqual(run.call_count, 1)
+                sleep.assert_not_called()
+
     @staticmethod
     def metadata_response(responses):
         responses = iter(responses)
