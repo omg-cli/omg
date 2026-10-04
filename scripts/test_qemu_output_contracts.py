@@ -3143,7 +3143,7 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
                         cleanup='tempdir-drop', network_scope='offline', ssh_user='fixture',
                         args_json='["doctor","--turbo"]')
         variants = [(distro, {'distro': distro}, '0:retained')
-                    for distro in ('arch', 'debian', 'ubuntu', 'fedora')]
+                    for distro in ('arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora')]
         for key, value in (
             ('distro', 'other'), ('ssh_user', 'root'), ('case', 'other'),
             ('safety', 'read'), ('assertions', '-'), ('expected_ux', 'declared'),
@@ -3156,6 +3156,9 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
         variants += [('wrong expected exit', {'resolved_exit': '1'}, '1:dropped'),
                      ('prerequisite chain', {'chain_entry': 'help'}, '1:dropped'),
                      ('network scope unchanged', {'network_scope': 'network'}, 'unwrapped')]
+        variants += [(label + ' [Trixie]', dict(changes, distro='debian-trixie'), expected)
+                     for label, changes, expected in list(variants)
+                     if 'distro' not in changes]
         wrappers = r"""
 sudo() { [[ "$1" == -n ]] || return 90; shift; "$@"; }
 unshare() { [[ "$1:$2" == --net:-- ]] || return 91; shift 2; "$@"; }
