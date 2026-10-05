@@ -13,3 +13,9 @@
 - Control-plane disposition is only confirmed if the PATCH response echoes blocked. A timeout is an unconfirmed write, not a successful status change. Runtime final response is the sanctioned fallback when the update cannot be verified.
 
 This checkpoint records a coordination blocker, not product delivery or an engineering-test pass.
+
+## Final receipts
+
+- Audited PATCH of this task to blocked, including comment and self-owned recovery descriptor: timed out after 15 seconds. Write FAILED/unconfirmed; no duplicate replay attempted.
+- Checkpoint commit c3b36c14a7d5e8d2eba5d8d9c3c507130c008d9f succeeded. Git also reported permission-denied deletion attempts on existing omg2/omg32 worktree metadata; no manual deletion, lock change, or cleanup recovery was performed.
+- Platform routing could not be persisted. Runtime final response must carry the API blocker and intended Local Platform action; issue state remains unverified.
