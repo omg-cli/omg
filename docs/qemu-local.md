@@ -301,6 +301,20 @@ Working directories and installed runtime state disappear with the guest;
 only cwd-local fixtures are isolated per row, not the guest's home directory
 or package database. Native ARM and macOS results require their own runners.
 
+Failed Fedora package install/remove rows retain native history, RPM identity,
+and kernel output. Before querying history, the runner also samples at most
+24 KiB from the default root DNF5 log, `/var/log/dnf5.log`. It emits only file
+metadata and the count of the fixed pipe-creation error signal. It does not
+export raw log text. Symlinks, hard links, and special files are refused, and
+each probe has a two-second deadline with a one-second kill grace period.
+Missing logs and custom log directories remain unavailable. A zero count
+does not exclude errors outside the sample. The tail is not UUID-correlated
+and does not establish why the failed transaction remained Started.
+Upstream [DNF5 starts history before creating the scriptlet pipe](https://github.com/rpm-software-management/dnf5/blob/5.4.1.0/libdnf5/base/transaction.cpp#L1121)
+and can return without finalization if pipe creation fails. Its CLI uses
+[`dnf5.log`](https://github.com/rpm-software-management/dnf5/blob/5.4.1.0/dnf5/main.cpp#L96)
+under the [configured log directory](https://dnf5.readthedocs.io/en/stable/dnf5.conf.5.html#logdir).
+
 ## Evidence contracts and sources
 
 - [GNU timeout](https://www.gnu.org/software/coreutils/manual/html_node/timeout-invocation.html)
@@ -482,6 +496,20 @@ terminated by a signal", and that `ExitStatusExt::signal` reports that signal
 made-up exit code, and dnf failures carry the recorded history row as well.
 
 ## Where to go next
+
+`doctor --turbo` runs in the container profile against a private copy of the
+guest's exact executable. The row seeds `cap_net_bind_service=ep` on that copy,
+requires the actual command to remove its `security.capability` xattr, and
+checks unchanged executable bytes and unchanged original file state. It also
+requires the matching cleanup result and explanation that no permanent binary
+privileges are granted. A warning or zero exit without removal fails. An empty
+capability set also fails: libcap distinguishes it from removal
+([setcap](https://man7.org/linux/man-pages/man8/setcap.8.html),
+[getcap](https://man7.org/linux/man-pages/man8/getcap.8.html)).
+The private directory permits only its owner to access the copy; cleanup removes
+it on normal completion or a failed row. Missing trusted tools or unavailable
+capability setup produces BLOCKED. This row tests unattended cleanup, not the
+attended confirmation dialog or interactive sudo credential caching.
 
 - [QA issue loop](./qa-loop.md) explains when an issue opens or closes.
 - [QEMU image review](./qemu-image-renewal.md) covers image provenance expiry.

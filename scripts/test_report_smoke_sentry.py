@@ -114,6 +114,42 @@ class SentryResultAdmissionTests(unittest.TestCase):
         self.assertEqual(event["fingerprint"],
                          ["omg-smoke", "unknown", "matrix:ci-non-qemu-workflow:HARNESS_ERROR"])
 
+    def test_valid_guest_evidence_does_not_suppress_ci_failure_telemetry(self):
+        spec = importlib.util.spec_from_file_location(
+            "qemu_reporting_valid_evidence_fixture", SCRIPT.with_name("test_qemu_reporting.py"))
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        boundary = fixture.ReportingBoundaryTests(methodName="runTest")
+        expected = [dict(case_id="ci-non-qemu-workflow", distro="matrix",
+                         result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)]
+        for guest_result in ("PASS", "FAIL"):
+            with self.subTest(guest_result=guest_result):
+                jobs = [
+                    {"name": "QEMU behavioral verification / Distro lane (arch) / QEMU guest (arch)",
+                     "conclusion": "success" if guest_result == "PASS" else "failure",
+                     "id": 11, "steps": []},
+                    {"name": "Docs audit", "conclusion": "failure", "id": 12, "steps": []},
+                    {"name": "CI Success", "conclusion": "failure", "id": 13, "steps": []},
+                ]
+                previous = Path.cwd()
+                try:
+                    os.chdir(SCRIPT.parent.parent)
+                    with redirect_stdout(io.StringIO()):
+                        calls, catalog = boundary.run_report_fixture(
+                            [boundary.row(guest_result)], workflow_path=".github/workflows/ci.yml",
+                            jobs=jobs)
+                finally:
+                    os.chdir(previous)
+                self.assertFalse(catalog["evidence_invalid_or_unavailable"])
+                senders = [call for call in calls if call[0] == "scripts/report-smoke-sentry.sh"]
+                self.assertEqual(len(senders), 1)
+                self.assertEqual(senders[0][1], expected)
+                result, envelope = self.run_rows(senders[0][1])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(envelope[2]["extra"], {"failures": expected})
+                self.assertEqual(envelope[2]["fingerprint"],
+                                 ["omg-smoke", "unknown", "matrix:ci-non-qemu-workflow:HARNESS_ERROR"])
+
     def test_ci_matrix_neighbor_case_ids_remain_rejected(self):
         for case_id in ("ci-non-qemu-workflow-extra", "ci-non-qemu-workflows", "ci-workflow"):
             with self.subTest(case_id=case_id):
