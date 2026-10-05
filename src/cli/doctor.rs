@@ -819,12 +819,64 @@ async fn validate_homebrew_api_response(
     crate::package_managers::homebrew::validate_homebrew_index(kind, &body)
 }
 
+async fn check_mirror(
+    client: &reqwest::Client,
+    name: &str,
+    url: &str,
+    is_homebrew_index: bool,
+    deadline: Duration,
+) -> usize {
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(deadline, async {
+        let response = client.get(url).send().await?;
+        let status = response.status();
+        #[cfg(any(feature = "macos", target_os = "macos"))]
+        if is_homebrew_index && status.is_success() {
+            let kind = match name {
+                "Homebrew formula API" => {
+                    crate::package_managers::homebrew::HomebrewIndexKind::Formula
+                }
+                "Homebrew cask API" => crate::package_managers::homebrew::HomebrewIndexKind::Cask,
+                _ => unreachable!("Homebrew index name was checked above"),
+            };
+            validate_homebrew_api_response(response, kind, HOMEBREW_API_BODY_LIMIT).await?;
+        }
+        Ok::<_, anyhow::Error>(status)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(status)) => {
+            let latency = start.elapsed().as_millis();
+            if mirror_status_is_issue(status) || (is_homebrew_index && !status.is_success()) {
+                println!(
+                    "  {} {} (HTTP {})",
+                    style::warning("⚠"),
+                    name,
+                    status.as_u16()
+                );
+                1
+            } else {
+                println!("  {} {} ({} ms)", style::success("✓"), name, latency);
+                0
+            }
+        }
+        Ok(Err(e)) => {
+            println!("  {} {} ({})", style::error("✗"), name, e);
+            1
+        }
+        Err(_) => {
+            println!("  {} {} (timeout)", style::error("✗"), name);
+            1
+        }
+    }
+}
+
 async fn check_network(distro: Distro) -> usize {
     let mut issues = 0;
     let (endpoints, dns_hosts) = network_targets(distro);
 
     for (name, url) in endpoints {
-        let start = std::time::Instant::now();
         let is_homebrew_index = matches!(distro, Distro::MacOS)
             && matches!(*name, "Homebrew formula API" | "Homebrew cask API");
         // The shared client has a 15-second request timeout. Full indexes
@@ -841,50 +893,7 @@ async fn check_network(distro: Distro) -> usize {
         } else {
             Duration::from_secs(5)
         };
-        let result = tokio::time::timeout(deadline, async {
-            let response = client.get(*url).send().await?;
-            let status = response.status();
-            #[cfg(any(feature = "macos", target_os = "macos"))]
-            if is_homebrew_index && status.is_success() {
-                let kind = match *name {
-                    "Homebrew formula API" => {
-                        crate::package_managers::homebrew::HomebrewIndexKind::Formula
-                    }
-                    "Homebrew cask API" => {
-                        crate::package_managers::homebrew::HomebrewIndexKind::Cask
-                    }
-                    _ => unreachable!("Homebrew index name was checked above"),
-                };
-                validate_homebrew_api_response(response, kind, HOMEBREW_API_BODY_LIMIT).await?;
-            }
-            Ok::<_, anyhow::Error>(status)
-        })
-        .await;
-
-        match result {
-            Ok(Ok(status)) => {
-                let latency = start.elapsed().as_millis();
-                if mirror_status_is_issue(status) || (is_homebrew_index && !status.is_success()) {
-                    println!(
-                        "  {} {} (HTTP {})",
-                        style::warning("⚠"),
-                        name,
-                        status.as_u16()
-                    );
-                    issues += 1;
-                } else {
-                    println!("  {} {} ({} ms)", style::success("✓"), name, latency);
-                }
-            }
-            Ok(Err(e)) => {
-                println!("  {} {} ({})", style::error("✗"), name, e);
-                issues += 1;
-            }
-            Err(_) => {
-                println!("  {} {} (timeout)", style::error("✗"), name);
-                issues += 1;
-            }
-        }
+        issues += check_mirror(client, name, url, is_homebrew_index, deadline).await;
     }
 
     // DNS resolution test
@@ -1803,6 +1812,87 @@ mod tests {
             assert_eq!(result.is_ok(), should_pass, "fixture {wire:?}: {result:?}");
             finish_probe_server(server).await;
         }
+    }
+
+    #[tokio::test]
+    async fn mirror_check_counts_transport_errors_with_local_http() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local mirror client");
+        let (url, server) =
+            serve_probe_response(b"not an HTTP response\r\n\r\n", Duration::ZERO).await;
+        assert_eq!(
+            check_mirror(
+                &client,
+                "local malformed mirror",
+                &url,
+                false,
+                Duration::from_secs(2)
+            )
+            .await,
+            1,
+            "a completed transport error must count as one Doctor issue"
+        );
+        finish_probe_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn mirror_check_counts_status_failures_without_rejecting_success() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local mirror client");
+        for (wire, issues) in [
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(), 0),
+            (b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(), 1),
+        ] {
+            let (url, server) = serve_probe_response(wire, Duration::ZERO).await;
+            assert_eq!(
+                check_mirror(&client, "local mirror", &url, false, Duration::from_secs(2)).await,
+                issues
+            );
+            finish_probe_server(server).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mirror_check_counts_outer_deadline_after_request_delivery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local stalled mirror listener");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (delivered, delivery) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "mirror request ended before headers");
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 8192);
+            }
+            delivered.send(()).unwrap();
+            released.await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("local stalled mirror client");
+        let deadline = Duration::from_secs(5);
+        let check = check_mirror(&client, "local stalled mirror", &url, false, deadline);
+        tokio::pin!(check);
+        tokio::select! {
+            arrived = delivery => { arrived.expect("complete mirror request delivered"); }
+            result = &mut check => panic!("mirror finished before the outer deadline: {result}"),
+        }
+        tokio::time::advance(deadline).await;
+        assert_eq!(check.await, 1, "outer deadline must count one Doctor issue");
+        release.send(()).unwrap();
+        finish_probe_server(server).await;
     }
 
     #[tokio::test]
