@@ -943,9 +943,11 @@ def main():
             if not verified_published:
                 helper.append("--failures-only")
             subprocess.run(helper, check=True, timeout=180)
-        if run["event"] == "pull_request" or evidence_error:
+        sentry_rows = (selected if run["event"] == "pull_request" or evidence_error else
+                       [row for row in selected if row["case_id"] == "ci-non-qemu-workflow"])
+        if sentry_rows:
             results = Path(directory) / "results-all.json"
-            results.write_text(json.dumps(selected) + "\n")
+            results.write_text(json.dumps(sentry_rows) + "\n")
             subprocess.run(["bash", "scripts/report-smoke-sentry.sh", str(results)], check=True, timeout=20)
     print(f"Reported run {run_id}, attempt {run['run_attempt']}, commit {run['head_sha']}")
     return 0
