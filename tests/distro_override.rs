@@ -100,28 +100,120 @@ fn release_guard() {
     }
 }
 
+fn harness_contract() {
+    let executable = std::env::current_exe().expect("test executable");
+    let listed = Command::new(&executable)
+        .args(["--list", "--format", "terse"])
+        .output()
+        .expect("discovery child");
+    assert!(listed.status.success(), "discovery: {listed:?}");
+    let expected = if cfg!(debug_assertions) {
+        "transitions: test\noverride-first: test\naliases: test\nharness-contract: test\n"
+    } else {
+        "release: test\nharness-contract: test\n"
+    };
+    assert_eq!(
+        String::from_utf8(listed.stdout).expect("UTF-8 list"),
+        expected
+    );
+    let ignored = Command::new(&executable)
+        .args(["--list", "--format", "terse", "--ignored"])
+        .output()
+        .expect("ignored discovery child");
+    assert!(ignored.status.success(), "ignored discovery: {ignored:?}");
+    assert!(ignored.stdout.is_empty(), "no ignored scenarios");
+    let scenario = if cfg!(debug_assertions) {
+        "aliases"
+    } else {
+        "release"
+    };
+    let exact = Command::new(&executable)
+        .args([scenario, "--nocapture", "--exact"])
+        // Exact execution must still create a child with controlled initial env.
+        .env("OMG_TEST_MODE", "1")
+        .env("OMG_TEST_DISTRO", "nonsense")
+        .output()
+        .expect("exact execution child");
+    assert!(exact.status.success(), "exact execution: {exact:?}");
+    assert_eq!(
+        String::from_utf8(exact.stdout).expect("UTF-8 result"),
+        format!("PASS {scenario}\n")
+    );
+    let unmatched = Command::new(&executable)
+        .args(["absent-scenario", "--nocapture", "--exact"])
+        .output()
+        .expect("unmatched exact child");
+    assert!(unmatched.status.success(), "unmatched: {unmatched:?}");
+    assert!(
+        unmatched.stdout.is_empty(),
+        "exact filter must not run other scenarios"
+    );
+}
+
 fn main() {
-    if let Some(scenario) = std::env::args().nth(1) {
+    let mut args = std::env::args().skip(1);
+    // Only this private entry executes assertions in a single-threaded child.
+    // Nextest's exact execution must go through the parent setup below too.
+    if std::env::args().nth(1).as_deref() == Some("--isolated-scenario") {
+        args.next();
+        let scenario = args.next().expect("isolated scenario name");
+        assert!(args.next().is_none(), "unexpected isolated child argument");
         match scenario.as_str() {
             "transitions" => transitions(),
             "override-first" => override_first(),
             "aliases" => aliases(),
             "release" => release_guard(),
+            "harness-contract" => harness_contract(),
             _ => panic!("unknown scenario {scenario}"),
         }
         println!("PASS {scenario}");
         return;
     }
 
-    let executable = std::env::current_exe().expect("test executable");
     let scenarios: &[&str] = if cfg!(debug_assertions) {
-        &["transitions", "override-first", "aliases"]
+        &[
+            "transitions",
+            "override-first",
+            "aliases",
+            "harness-contract",
+        ]
     } else {
-        &["release"]
+        &["release", "harness-contract"]
     };
+    let mut list = false;
+    let mut ignored = false;
+    let mut exact = false;
+    let mut filter = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--list" => list = true,
+            "--ignored" => ignored = true,
+            "--exact" => exact = true,
+            "--nocapture" => {} // Child output is always inherited.
+            "--format" => assert_eq!(args.next().as_deref(), Some("terse")),
+            _ if !arg.starts_with('-') && filter.is_none() => filter = Some(arg),
+            _ => panic!("unsupported test argument {arg}"),
+        }
+    }
+    let executable = std::env::current_exe().expect("test executable");
     for scenario in scenarios {
+        if ignored
+            || filter.as_deref().is_some_and(|filter| {
+                if exact {
+                    *scenario != filter
+                } else {
+                    !scenario.contains(filter)
+                }
+            })
+        {
+            continue;
+        }
+        if list {
+            println!("{scenario}: test");
+            continue;
+        }
         let status = Command::new(&executable)
-            .arg(scenario)
+            .args(["--isolated-scenario", scenario])
             .env_remove("OMG_TEST_MODE")
             .env_remove("OMG_TEST_DISTRO")
             .envs(if *scenario == "override-first" {
