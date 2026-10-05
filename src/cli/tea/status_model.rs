@@ -199,20 +199,15 @@ impl Model for StatusModel {
 
     fn view(&self) -> String {
         match self.state {
-            StatusState::Idle => String::new(),
+            // On failure, update() returns Cmd::error; the process reporter
+            // owns its output. Rendering here would print the backend error twice.
+            StatusState::Idle | StatusState::Failed => String::new(),
             StatusState::Loading => style::accent("⟳ Gathering system status..."),
             StatusState::Complete => {
                 if let Some(data) = &self.data {
                     data.render()
                 } else {
                     "No data available".to_string()
-                }
-            }
-            StatusState::Failed => {
-                if let Some(err) = &self.error {
-                    format!("\n✗ Status failed: {}\n", style::negative(err))
-                } else {
-                    "\n✗ Status failed\n".to_string()
                 }
             }
         }
@@ -222,6 +217,157 @@ impl Model for StatusModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Inject only the backend result; keep the production status transition,
+    /// command dispatcher, and stdout renderer in the subprocess.
+    struct StatusResultModel {
+        status: StatusModel,
+        exec: bool,
+        fail: bool,
+    }
+
+    impl Model for StatusResultModel {
+        type Msg = StatusMsg;
+
+        fn init(&self) -> Cmd<Self::Msg> {
+            let msg = if self.fail {
+                StatusMsg::Error("fixture backend unavailable".to_owned())
+            } else {
+                StatusMsg::Loaded(StatusData {
+                    total_packages: 120,
+                    explicit_packages: 40,
+                    ..StatusData::default()
+                })
+            };
+            let result = if self.exec {
+                Cmd::exec(move || msg)
+            } else {
+                Cmd::msg(msg)
+            };
+            Cmd::batch([
+                Cmd::info("before status"),
+                result,
+                Cmd::info("after status"),
+            ])
+        }
+
+        fn update(&mut self, msg: Self::Msg) -> Cmd<Self::Msg> {
+            self.status.update(msg)
+        }
+
+        fn view(&self) -> String {
+            self.status.view()
+        }
+    }
+
+    fn capture_status_result(test_name: &str, exec: bool, fail: bool) {
+        // libtest names omit the crate prefix present in module_path!().
+        let test_name = test_name.strip_prefix("omg_lib::").unwrap();
+        const CHILD: &str = "OMG_STATUS_RESULT_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(test_name) {
+            let result = crate::cli::tea::Program::new(StatusResultModel {
+                status: StatusModel::new(),
+                exec,
+                fail,
+            })
+            .run();
+            // Test process reporter, not the production binary's finish().
+            // Preserve and verify the runtime error before reporting it once.
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                    assert_eq!(
+                        error.to_string(),
+                        "Status check failed: fixture backend unavailable"
+                    );
+                    let error = anyhow::Error::from(error).context("status request failed");
+                    eprintln!("Error: {error:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, test_name)
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stdout.contains("before status"), "stdout: {stdout}");
+        if fail {
+            assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+            assert!(
+                !stdout.contains("fixture backend unavailable"),
+                "stdout: {stdout}"
+            );
+            assert!(!stdout.contains("Status failed"), "stdout: {stdout}");
+            assert!(!stdout.contains("after status"), "stdout: {stdout}");
+            assert_eq!(
+                stderr,
+                "Error: status request failed: Status check failed: fixture backend unavailable\n"
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+            assert!(stderr.is_empty(), "stderr: {stderr}");
+            let before = stdout.find("before status").unwrap();
+            let status = stdout.find("120 packages installed · 40 explicit").unwrap();
+            let after = stdout.find("after status").unwrap();
+            assert!(before < status && status < after, "stdout: {stdout}");
+            assert_eq!(stdout.matches("120 packages installed").count(), 1);
+        }
+    }
+
+    #[test]
+    fn status_msg_failure_is_reported_once_and_exits_unsuccessfully() {
+        capture_status_result(
+            concat!(
+                module_path!(),
+                "::status_msg_failure_is_reported_once_and_exits_unsuccessfully"
+            ),
+            false,
+            true,
+        );
+    }
+
+    #[test]
+    fn status_exec_failure_is_reported_once_and_exits_unsuccessfully() {
+        capture_status_result(
+            concat!(
+                module_path!(),
+                "::status_exec_failure_is_reported_once_and_exits_unsuccessfully"
+            ),
+            true,
+            true,
+        );
+    }
+
+    #[test]
+    fn status_msg_success_renders_in_command_order() {
+        capture_status_result(
+            concat!(
+                module_path!(),
+                "::status_msg_success_renders_in_command_order"
+            ),
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn status_exec_success_renders_in_command_order() {
+        capture_status_result(
+            concat!(
+                module_path!(),
+                "::status_exec_success_renders_in_command_order"
+            ),
+            true,
+            false,
+        );
+    }
 
     #[test]
     fn status_without_scan_never_claims_security_health() {
