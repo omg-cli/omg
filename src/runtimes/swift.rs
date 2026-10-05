@@ -574,6 +574,48 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    async fn wait_for_prefix(directory: &Path, prefix: &[u8]) -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let mut entries = tokio::fs::read_dir(directory).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".download-")
+                        && tokio::fs::read(entry.path()).await? == prefix
+                    {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn swift_prefix_observer_refuses_decoys_and_times_out() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let unrelated = directory.path().join("archive.tar.gz");
+        let partial = directory.path().join(".download-decoy");
+        fs::write(&unrelated, b"matching prefix")?;
+        fs::write(&partial, b"incorrect prefix")?;
+
+        let error = wait_for_prefix(directory.path(), b"matching prefix")
+            .await
+            .expect_err("unrelated names and incorrect partial bytes must not match");
+        assert!(
+            error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
+        );
+        assert_eq!(fs::read(&unrelated)?, b"matching prefix");
+        assert_eq!(fs::read(&partial)?, b"incorrect prefix");
+        Ok(())
+    }
+
     #[test]
     fn swift_download_retries_and_refuses_invalid_transfers() -> Result<()> {
         const CHILD: &str = "OMG_SWIFT_DOWNLOAD_FIXTURE";
@@ -623,26 +665,6 @@ mod tests {
             let dest = directory.path().join("archive.tar.gz");
             fs::write(&dest, b"existing staged artifact")?;
             let server = async {
-                async fn wait_for_prefix(directory: &Path, prefix: &[u8]) -> Result<()> {
-                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                        loop {
-                            let mut entries = tokio::fs::read_dir(directory).await?;
-                            while let Some(entry) = entries.next_entry().await? {
-                                if entry
-                                    .file_name()
-                                    .to_string_lossy()
-                                    .starts_with(".download-")
-                                    && tokio::fs::read(entry.path()).await? == prefix
-                                {
-                                    return Ok::<_, anyhow::Error>(());
-                                }
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                    })
-                    .await??;
-                    Ok(())
-                }
                 for step in 0..attempts {
                     let (mut stream, _) = listener.accept().await?;
                     let mut request = Vec::new();

@@ -174,10 +174,10 @@ check_native_counter() {
     arch:tc) native=(pacman -Qq) ;;
     arch:oc) native=(pacman -Qdtq) ;;
     arch:uc) native=(pacman -Quq) ;;
-    debian:tc|ubuntu:tc) native=(dpkg-query -W '-f=${db:Status-Status}\n') ;;
-    debian:ec|ubuntu:ec) native=(apt-mark showmanual) ;;
-    debian:oc|ubuntu:oc) native=(apt-get -s autoremove) ;;
-    debian:uc|ubuntu:uc) native=(apt list --upgradable) ;;
+    debian:tc|debian-trixie:tc|ubuntu:tc) native=(dpkg-query -W '-f=${db:Status-Status}\n') ;;
+    debian:ec|debian-trixie:ec|ubuntu:ec) native=(apt-mark showmanual) ;;
+    debian:oc|debian-trixie:oc|ubuntu:oc) native=(apt-get -s autoremove) ;;
+    debian:uc|debian-trixie:uc|ubuntu:uc) native=(apt list --upgradable) ;;
     fedora:tc) native=(rpm -qa --qf '%{NAME}.%{ARCH}\n') ;;
     fedora:ec) native=(dnf --cacheonly repoquery --userinstalled --qf '%{name}\n') ;;
     fedora:oc) native=(dnf --cacheonly repoquery --unneeded --qf '%{name}.%{arch}\n') ;;
@@ -195,9 +195,9 @@ check_native_counter() {
   expected=$(
     set -o pipefail
     case "$distro:$counter" in
-      debian:tc|ubuntu:tc) awk '$0 == "installed" {n++} END {print n+0}' native-counter.raw ;;
-      debian:oc|ubuntu:oc) awk '/^Remv / {n++} END {print n+0}' native-counter.raw ;;
-      debian:uc|ubuntu:uc) awk '$1 ~ /\// {n++} END {print n+0}' native-counter.raw ;;
+      debian:tc|debian-trixie:tc|ubuntu:tc) awk '$0 == "installed" {n++} END {print n+0}' native-counter.raw ;;
+      debian:oc|debian-trixie:oc|ubuntu:oc) awk '/^Remv / {n++} END {print n+0}' native-counter.raw ;;
+      debian:uc|debian-trixie:uc|ubuntu:uc) awk '$1 ~ /\// {n++} END {print n+0}' native-counter.raw ;;
       *:ec|fedora:oc|fedora:uc) sort -u native-counter.raw | awk 'NF {n++} END {print n+0}' ;;
       *) awk 'NF {n++} END {print n+0}' native-counter.raw ;;
     esac
@@ -291,19 +291,28 @@ check_outdated_native_count() {
 
 # BEGIN DOCTOR BACKEND ORACLE
 check_doctor_native_backend() {
-  local distro=$1 output=$2 os_release=${3:-/etc/os-release} exec_receipt=${4:-} restricted_path=${5:-false} index_receipt=${6:-} guest_id expected
+  local distro=$1 output=$2 os_release=${3:-/etc/os-release} exec_receipt=${4:-} restricted_path=${5:-false} index_receipt=${6:-} guest_id guest_version expected_guest expected
   if [[ ! -f "$os_release" ]]; then
     printf 'native doctor reference lacks an os-release file\n' >&2
     return 2
   fi
-  guest_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")
-  if [[ "$guest_id" != "$distro" ]]; then
+  guest_id=$(awk -F= '$1 == "ID" {v=$2; if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v=substr(v,2,length(v)-2); print v}' "$os_release")
+  expected_guest=$distro
+  if [[ "$distro" == debian-trixie ]]; then
+    expected_guest=debian
+    guest_version=$(awk -F= '$1 == "VERSION_ID" {v=$2; if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v=substr(v,2,length(v)-2); print v}' "$os_release")
+    if [[ "$guest_version" != 13 ]]; then
+      printf 'native doctor reference requires Debian 13 for the Trixie guest\n' >&2
+      return 2
+    fi
+  fi
+  if [[ "$guest_id" != "$expected_guest" ]]; then
     printf 'native doctor reference expected %s guest, found %s\n' "$distro" "$guest_id" >&2
     return 2
   fi
   case "$distro" in
     arch) expected='Arch Linux detected' ;;
-    debian|ubuntu) expected='Debian/Ubuntu detected (apt backend)' ;;
+    debian|debian-trixie|ubuntu) expected='Debian/Ubuntu detected (apt backend)' ;;
     fedora) expected='Fedora/RHEL detected (dnf backend)' ;;
     *) return 2 ;;
   esac
@@ -320,7 +329,7 @@ check_doctor_native_backend() {
     printf 'assertion failed: doctor did not verify trusted sudo for the unprivileged guest user\n' >&2
     return 1
   fi
-  if [[ "$distro" == debian || "$distro" == ubuntu ]] \
+  if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]] \
     && [[ $(grep -Fxc '  Found dependency: apt-get' "$output") != 1 ]]; then
     printf 'assertion failed: doctor did not verify trusted apt-get\n' >&2
     return 1
@@ -347,7 +356,7 @@ check_doctor_native_backend() {
         printf 'assertion failed: doctor disagrees with native Arch package database health\n' >&2
         return 1
       } ;;
-    debian|ubuntu)
+    debian|debian-trixie|ubuntu)
       if ! grep -Fq 'dpkg package database (/var/lib/dpkg/status)' "$output" \
         || ! grep -Fq 'APT package indexes (/var/lib/apt/lists)' "$output"; then
         printf 'assertion failed: doctor omitted an APT or dpkg health check\n' >&2
@@ -484,7 +493,7 @@ check_info_native_package() {
       timeout --kill-after=2s 30 pacman -Si pacman > native-info.raw 2> native-info.stderr || status=$?
       version=$(awk '$1 == "Version" && $2 == ":" {print $3}' native-info.raw)
       source=$(awk '$1 == "Repository" && $2 == ":" {print "Official repository (" $3 ")"}' native-info.raw) ;;
-    debian|ubuntu)
+    debian|debian-trixie|ubuntu)
       timeout --kill-after=2s 30 apt-cache policy pacman > native-info.raw 2> native-info.stderr || status=$?
       version=$(awk '$1 == "Candidate:" {print $2}' native-info.raw)
       source='Official repository (apt)' ;;
@@ -521,7 +530,7 @@ check_native_tree_state() {
     arch)
       inventory=$(pacman -Qq) || { printf 'assertion failed: native pacman database query failed\n' >&2; return 1; }
       grep -Fxq tree <<< "$inventory" && installed=true ;;
-    debian|ubuntu)
+    debian|debian-trixie|ubuntu)
       inventory=$(dpkg-query -W '-f=${Package}\t${Status}\n') || { printf 'assertion failed: native dpkg database query failed\n' >&2; return 1; }
       grep -Fxq $'tree\tinstall ok installed' <<< "$inventory" && installed=true ;;
     fedora)
@@ -553,7 +562,7 @@ check_native_tree_state() {
 # contract harness runs on hosts that may have an unrelated /usr/bin/tree.
 check_apt_tree_absent() {
   local distro=$1 inventory
-  [[ "$distro" == debian || "$distro" == ubuntu ]] || return 1
+  [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]] || return 1
   inventory=$(dpkg-query -W '-f=${Package}\t${Status}\n') || return 1
   [[ -n "$inventory" ]] || return 1
   if grep -Fxq $'tree\tinstall ok installed' <<< "$inventory"; then
@@ -670,7 +679,7 @@ native_package_snapshot() {
     arch)
       inventory=$(pacman -Q) || return 1
       reasons=$(pacman -Qqe) || return 1 ;;
-    debian|ubuntu)
+    debian|debian-trixie|ubuntu)
       inventory=$(dpkg-query -W '-f=${Package}\t${Version}\t${Status}\t${Architecture}\n') || return 1
       reasons=$(apt-mark showmanual) || return 1 ;;
     fedora)
@@ -699,7 +708,7 @@ cleanup_native_tree_fixture() {
   case "$distro" in
     arch)
       if pacman -Qq tree >/dev/null 2>&1; then sudo -n pacman -R --noconfirm tree >/dev/null || return 1; fi ;;
-    debian|ubuntu)
+    debian|debian-trixie|ubuntu)
       sudo -n dpkg --purge tree >/dev/null || return 1 ;;
     fedora)
       if rpm -q tree >/dev/null 2>&1; then sudo -n rpm -e tree >/dev/null || return 1; fi ;;
@@ -712,7 +721,7 @@ native_installed_version() {
   local distro=$1 package=$2 output
   case "$distro" in
     arch) pacman -Q "$package" | awk -v name="$package" '$1 == name { print $2 }' ;;
-    debian|ubuntu) dpkg-query -W '-f=${Status}\t${Version}\n' "$package" | awk -F '\t' '$1 == "install ok installed" { print $2 }' ;;
+    debian|debian-trixie|ubuntu) dpkg-query -W '-f=${Status}\t${Version}\n' "$package" | awk -F '\t' '$1 == "install ok installed" { print $2 }' ;;
     fedora)
       output=$(rpm -q --qf '%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\n' "$package") || return $?
       printf '%s\n' "$output" | awk -F '\t' '
@@ -731,7 +740,7 @@ native_installed_version() {
 native_installed_identity() {
   local distro=$1 package=$2 output
   case "$distro" in
-    arch|debian|ubuntu) printf '%s\n' "$package" ;;
+    arch|debian|debian-trixie|ubuntu) printf '%s\n' "$package" ;;
     fedora)
       output=$(rpm -q --qf '%{NAME}\t%{ARCH}\n' "$package") || return $?
       printf '%s\n' "$output" | awk -F '\t' -v name="$package" '
@@ -1279,7 +1288,7 @@ mirrors = [('Arch Linux', 'https://archlinux.org'), ('Kernel.org', 'https://kern
 if distro != 'arch':
     mirrors = mirrors[1:3]
 hosts = ['archlinux.org', 'aur.archlinux.org', 'github.com'] if distro == 'arch' else ['kernel.org', 'github.com']
-if distro not in ('arch', 'debian', 'ubuntu', 'fedora'):
+if distro not in ('arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'):
     raise SystemExit('assertion failed: unknown doctor network backend')
 text = Path(output).read_text()
 if text.count('Network Diagnostics\n') != 1 or text.count('DNS Resolution:\n') != 1:
@@ -1525,6 +1534,39 @@ capture_fedora_failure_context() {
     }
     printf '\nOMG_QEMU_NATIVE_FAILURE_CONTEXT boot_id=%s history_selection=last\n' \
       "$(cat /proc/sys/kernel/random/boot_id)"
+    # Observe the default log before history adds new entries. Do not export raw text.
+    # DNF5 5.4.1.0 transaction.cpp:1121-1126 starts history before creating this pipe.
+    native_failure_probe dnf-log-summary sudo -n python3 - /var/log/dnf5.log <<'PY_DNF_LOG'
+import json
+import os
+import stat
+import sys
+
+summary = {'available': False, 'selection': 'default-log-tail-not-uuid-correlated'}
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as log:
+        metadata = os.fstat(log.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            summary['reason'] = 'unsafe-file-type-or-links'
+        else:
+            limit = 24576
+            offset = max(0, metadata.st_size - limit)
+            log.seek(offset)
+            sample = log.read(limit)
+            # A partial first line cannot establish an intact native log record.
+            if offset:
+                sample = sample.partition(b'\n')[2]
+            summary.update(available=True, file_bytes=metadata.st_size,
+                           mtime_ns=metadata.st_mtime_ns, sample_bytes=len(sample),
+                           truncated=bool(offset),
+                           pipe_creation_failure_count=sample.count(
+                               b'Transaction::Run: Cannot create pipe:'))
+except OSError as error:
+    summary.update(reason='read-unavailable', errno=error.errno)
+print('OMG_QEMU_DNF_LOG_SUMMARY ' + json.dumps(summary, sort_keys=True))
+sys.exit(0 if summary['available'] else 1)
+PY_DNF_LOG
     # Latest history is an observation; its comment must establish correlation.
     # https://dnf5.readthedocs.io/en/latest/commands/history.8.html
     native_failure_probe dnf-history sudo -n dnf history info --json last
@@ -1643,7 +1685,7 @@ check_product_output() {
   if [[ "$assertion" == audit-fix-refusal ]]; then
     case "$distro" in
       arch) assertion=audit-source-failure ;;
-      debian|ubuntu|fedora)
+      debian|debian-trixie|ubuntu|fedora)
         if [[ "$code" != 1 ]] \
           || ! grep -Fxq 'Error: Vulnerability auto-fix is not available without the Arch backend; upgrade the affected packages manually' "$stderr" \
           || grep -Eq 'Scanning for fixable vulnerabilities|No vulnerabilities found|Security audit completed' "$stdout"; then
@@ -1956,7 +1998,7 @@ PY
         fi ;;
       search-firefox-results)
         local target=firefox
-        [[ "$distro" != debian ]] || target=firefox-esr
+        [[ "$distro" != debian && "$distro" != debian-trixie ]] || target=firefox-esr
         if [[ "$code" != 0 ]] || ! grep -Fxq '  | Search' "$stdout" \
           || ! grep -Fxq '    firefox' "$stdout" \
           || ! awk -v target="$target" '
@@ -2168,7 +2210,9 @@ else
   man_page_mode=structural-legacy
 fi
 [[ "$row_timeout" =~ ^[0-9]+$ && "$row_timeout" -gt 0 ]] || exit 2
-case "$distro" in arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
+case "$distro" in arch|debian|debian-trixie|ubuntu|fedora) ;; *) exit 2 ;; esac
+backend_family=$distro
+if [[ "$distro" == debian-trixie ]]; then backend_family=debian; fi
 for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3; done
 overlap_fixture=$(jq -rn --rawfile fixture "$(dirname "$0")/workspace-overlap-fixture.sh" '$fixture | @sh')
 license_oracle_path="$(dirname "$0")/qemu-license-oracle.py"
@@ -2200,7 +2244,7 @@ out="$root/inventory"
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
 local_oracle_path="$(dirname "${BASH_SOURCE[0]}")/qemu-local-oracle.py"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$local_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$(dirname "$0")/qemu-enterprise-export-oracle.py" "$(dirname "$0")/qemu-audit-log-oracle.py" "$(dirname "$0")/qemu-rust-install-oracle.py" "$(dirname "$0")/qemu-doctor-live-oracle.py" > "$out/input-sha256.txt"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$local_oracle_path" "$container_engine_path" "$(dirname "$0")/qemu-run-watch-check.py" "$(dirname "$0")/qemu-enterprise-export-oracle.py" "$(dirname "$0")/qemu-audit-log-oracle.py" "$(dirname "$0")/qemu-rust-install-oracle.py" "$(dirname "$0")/qemu-doctor-live-oracle.py" "$(dirname "$0")/qemu-doctor-turbo-oracle.py" > "$out/input-sha256.txt"
 if [[ "$man_page_mode" == exact ]]; then sha256sum "$man_page_inventory" >> "$out/input-sha256.txt"; fi
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" --arg man_page_mode "$man_page_mode" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
@@ -2242,7 +2286,7 @@ resolve_exit() {
     key=${entry%%:*}
     [[ "$seen" != *",$key,"* ]] && (( ${entry#*:} <= 255 )) || return 1
     seen+="$key,"
-    [[ "$key" != "$distro" ]] || value=${entry#*:}
+    [[ "$key" != "$backend_family" ]] || value=${entry#*:}
   done
   [[ ${#entries[@]} == 4 && -n "$value" ]] || return 1
   printf '%s' "$value"
@@ -2296,7 +2340,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock|local:*|missing-lock-ci-refusal|missing-snapshot-refusal|invalid-runtime-refusal|missing-env-manifest-refusal|daemon-status-missing-socket|bash-hook-behavior|ci-cache-paths|container-init-artifacts|completion-env-capture|workspace-init-state|workspace-add-state|workspace-second-state|workspace-remove-state|workspace-list-state|workspace-status-state|bash-completion-stdout|bash-completion-installed|man-command-artifacts|search-firefox-results) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-capability-cleanup|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock|local:*|missing-lock-ci-refusal|missing-snapshot-refusal|invalid-runtime-refusal|missing-env-manifest-refusal|daemon-status-missing-socket|bash-hook-behavior|ci-cache-paths|container-init-artifacts|completion-env-capture|workspace-init-state|workspace-add-state|workspace-second-state|workspace-remove-state|workspace-list-state|workspace-status-state|bash-completion-stdout|bash-completion-installed|man-command-artifacts|search-firefox-results) ;; *) exit 2 ;; esac
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-list:workspace-list-state|workspace-remove:workspace-project-removed|workspace-remove:workspace-remove-state|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
@@ -2460,6 +2504,17 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   elif [[ "$a" == doctor-native-backend ]]; then
     exit 2
   fi
+  if [[ "$id" == doctor-turbo ]]; then
+    [[ "$r" == - ]] || exit 2
+    if [[ "$u" == declared ]]; then
+      [[ "$a" == - && "$s" == read && "$e" == - && "$t" == qemu && "$cleanup" == none && "$tg" == arch:pending,debian:pending,ubuntu:pending,fedora:pending ]] || exit 2
+    else
+      [[ "$a" == doctor-capability-cleanup && "$s" == isolated-write && "$resolved" == 0 && "$t" == container && "$cleanup" == tempdir-drop && "$tg" == arch:pass,debian:pass,ubuntu:pass,fedora:pass ]] || exit 2
+    fi
+    jq -e '. == ["doctor", "--turbo"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == doctor-capability-cleanup ]]; then
+    exit 2
+  fi
   if [[ "$id" == doctor-eol ]]; then
     [[ "$a" == doctor-eol-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == container ]] || exit 2
     jq -e '. == ["doctor", "--eol"]' <<< "$aj" >/dev/null || exit 2
@@ -2563,7 +2618,7 @@ prereq_runnable() { # id -> 0 when replayable
   local id=$1 t
   [[ -n "${row_args[$id]:-}" ]] || return 1
   [[ "${row_ux[$id]}" != declared ]] || return 1
-  [[ "${row_targets[$id]}" == hermetic:pass || ",${row_targets[$id]}," == *",$distro:pass,"* || ",${row_targets[$id]}," == *",$distro:known-defect,"* ]] || return 1
+  [[ "${row_targets[$id]}" == hermetic:pass || ",${row_targets[$id]}," == *",$backend_family:pass,"* || ",${row_targets[$id]}," == *",$backend_family:known-defect,"* ]] || return 1
   local hit=false
   IFS=',' read -ra tier_list <<< "${row_tier[$id]}"
   for t in "${tier_list[@]}"; do
@@ -2613,7 +2668,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   else
     IFS=',' read -ra target_list <<< "$targets"
     for t in "${target_list[@]}"; do
-      if [[ "$t" == "$distro:"* ]]; then status="${t#*:}"; break; fi
+      if [[ "$t" == "$backend_family:"* ]]; then status="${t#*:}"; break; fi
     done
   fi
   if [[ -z "$status" || "$status" == pending || "$status" == not-applicable ]]; then
@@ -2753,7 +2808,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == package-dry-run-* ]]; then
     remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f native_installed_identity); $(declare -f check_native_remove_preview)"
   fi
-  if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
+  if [[ ( "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; $(declare -f check_apt_tree_absent); $(declare -f prepare_apt_update_fixture); $(declare -f check_apt_update_fixture); $(declare -f native_package_snapshot); $(declare -f check_apt_update_delta); $(declare -f cleanup_apt_update_fixture)"
   fi
   if [[ "$assertions" == audit-log-filtered-export ]]; then
@@ -2924,7 +2979,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     # The root-owned helper restores system repo policy and checks the RPMDB
     # plus native DNF history before it can report success.
     remote+="; run_omg '$command_timeout' sudo -n bash \"\$HOME/qemu-fedora-update-fixture.sh\" '${case#update-}' $quoted_binary '$ssh_user' > command.stdout.log 2> command.stderr.log; assertion=0"
-  elif [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
+  elif [[ ( "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; export OMG_DISABLE_DAEMON=1; apt_fixture_installed=0; apt_fixture_pin_created=0"
     remote+="; apt_fixture_exit_cleanup() { if [[ \"\$apt_fixture_installed\" == 1 || \"\$apt_fixture_pin_created\" == 1 ]]; then cleanup_apt_update_fixture '$distro' >/dev/null 2>&1 || true; fi; rm -f \"\$status_file\"; }; trap apt_fixture_exit_cleanup EXIT"
     remote+="; if ! prepare_apt_update_fixture '$distro' \"\$rowdir\" || ! apt_before=\$(native_package_snapshot '$distro'); then if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT setup cleanup failed\\n' >&2; fi; printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
@@ -2935,6 +2990,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == run-watch ]]; then
     remote+="; run_omg '$command_timeout' python3 \"\$HOME/qemu-run-watch-check.py\" $quoted_binary \"\$rowdir\" > command.stdout.log 2> command.stderr.log; assertion=0"
+  elif [[ "$case" == doctor-turbo ]]; then
+    capability_oracle=$(jq -rn --rawfile fixture "$(dirname "$0")/qemu-doctor-turbo-oracle.py" '$fixture | @sh')
+    remote+="; printf '%s' $capability_oracle > qemu-doctor-turbo-oracle.py"
+    remote+="; doctor_capability_cleanup() { local cleanup_rc=0; python3 qemu-doctor-turbo-oracle.py cleanup --source $quoted_binary --root \"\$rowdir\" || cleanup_rc=\$?; rm -f \"\$status_file\" || cleanup_rc=\$?; return \"\$cleanup_rc\"; }; trap doctor_capability_cleanup EXIT"
+    remote+="; if ! python3 qemu-doctor-turbo-oracle.py prepare --source $quoted_binary --root \"\$rowdir\"; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
+    remote+="; run_omg '$command_timeout' \"\$rowdir/doctor-turbo-private/omg\" $arg_string </dev/null > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$distro" == fedora && "$case" == doctor ]]; then
     remote+="; if ! command -v strace >/dev/null || ! strace --seccomp-bpf -f -qq -e trace=execve -o doctor.preflight.log true; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve -o doctor.exec.log $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
@@ -2943,6 +3004,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
+  if [[ "$case" == doctor-turbo ]]; then
+    remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]]; then if ! python3 qemu-doctor-turbo-oracle.py verify --source $quoted_binary --root \"\$rowdir\" --output command.stdout.log; then assertion=1; fi; fi"
+    remote+="; if ! doctor_capability_cleanup; then printf 'assertion failed: capability fixture cleanup failed\n' >&2; assertion=1; fi; trap - EXIT"
+  fi
   if [[ "$case" == release-package-install-tree || "$case" == release-package-remove-tree ]]; then
     remote+="; tree_after=\$(native_package_snapshot '$distro') || { printf 'assertion failed: native package after-state is unavailable\n' >&2; assertion=1; tree_after=missing; }"
     remote+="; tree_delta_ok=1; if ! check_native_tree_only_delta \"\$tree_before\" \"\$tree_after\"; then tree_delta_ok=0; assertion=1; fi"
@@ -2988,7 +3053,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; if [[ \"\$rc\" == 121 ]] && grep -Fq 'OMG_QEMU_FIXTURE_CLEANUP_FAILED' command.stderr.log; then execution_phase=dependency; fi"
     remote+="; if [[ \"\$rc\" == 0 ]] && { ! grep -Fxq 'OMG_QEMU_UPDATE_FIXTURE:before:${case#update-}:1' command.stdout.log || ! grep -Fxq 'OMG_QEMU_UPDATE_FIXTURE:after:${case#update-}:2:native-upgrade' command.stdout.log; }; then printf 'assertion failed: bounded native update lacks before/after evidence\\n' >&2; assertion=1; fi"
   fi
-  if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
+  if [[ ( "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     remote+="; if [[ \"\$execution_phase\" == product && \"\$rc\" == 0 ]]; then if ! check_apt_update_fixture; then assertion=1; fi; if ! apt_after=\$(native_package_snapshot '$distro'); then printf 'assertion failed: APT package/reason after-state is unavailable\\n' >&2; assertion=1; elif ! check_apt_update_delta \"\$apt_before\" \"\$apt_after\"; then assertion=1; fi; fi"
     remote+="; if ! cleanup_apt_update_fixture '$distro'; then printf 'assertion failed: APT update fixture cleanup failed\\n' >&2; execution_phase=dependency; rc=2; assertion=1; fi"
   fi
@@ -2997,12 +3062,12 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; cd \"\${rowdir%/*}\"; if ! rm -rf -- \"\$rowdir\" || [ -e \"\$rowdir\" ] || [ -L \"\$rowdir\" ]; then printf 'assertion failed: counter fixture cleanup failed\\n' >&2; assertion=1; fi"
   fi
   if [[ "$assertions" == doctor-native-backend ]]; then
-    if [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+    if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]]; then
       remote+="; index_probe_rc=0; sudo -n unshare --mount --propagation private python3 \"\$HOME/qemu-doctor-index-oracle.py\" --binary $quoted_binary --distro '$distro' > doctor-index-proof.json 2> doctor-index-proof.stderr || index_probe_rc=\$?; cat doctor-index-proof.json doctor-index-proof.stderr >&2; if [[ \"\$index_probe_rc\" == 1 ]]; then assertion=1; elif [[ \"\$index_probe_rc\" != 0 ]]; then execution_phase=dependency; rc=2; assertion=1; fi"
     fi
     if [[ "$distro" == fedora ]]; then
       remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log /etc/os-release doctor.exec.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
-    elif [[ "$distro" == debian || "$distro" == ubuntu ]]; then
+    elif [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]]; then
       remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log /etc/os-release '' false doctor-index-proof.json || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
     else
       remote+="; if [ \"\$rc\" = 0 ]; then oracle_rc=0; check_doctor_native_backend '$distro' command.stdout.log || oracle_rc=\$?; if [ \"\$oracle_rc\" = 2 ]; then execution_phase=dependency; rc=2; elif [ \"\$oracle_rc\" != 0 ]; then assertion=1; fi; fi"
@@ -3104,20 +3169,32 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
       # Native DNF5 stored-plan resolution requires authenticated root even
       # for a dry run. Admit only this exact validated, prerequisite-free row;
       # keep its initial user/group/capability drop and offline namespace.
-      preview_privilege=false
+      native_privilege=false
       if [[ "$distro" == fedora && "$case" == remove && "$safety" == read
             && "$assertions" == package-dry-run-remove && "${row_exit[$case]}" == 0
             && "$expected_ux" == pass && "$requires" == - && ${#chain[@]} == 0
             && "$tier" == hermetic && "$targets" == hermetic:pass
             && "$cleanup" == tempdir-drop && "$ssh_user" != root ]] \
         && jq -e '. == ["remove", "--dry-run", "jq"]' <<< "$args_json" >/dev/null; then
-        preview_privilege=true
+        native_privilege=true
       fi
-      if [[ "$preview_privilege" == false ]]; then
+      # Doctor must seed and remove a capability on its private exact-copy
+      # executable through authenticated sudo. Keep this exception row-exact;
+      # no_new_privs or a dropped bounding set prevents that native transition.
+      if [[ "$case" == doctor-turbo && "$safety" == isolated-write
+            && "$assertions" == doctor-capability-cleanup && "${row_exit[$case]}" == 0
+            && "$expected_ux" == pass && "$requires" == - && ${#chain[@]} == 0
+            && "$tier" == container && "$targets" == arch:pass,debian:pass,ubuntu:pass,fedora:pass
+            && "$cleanup" == tempdir-drop && "$ssh_user" != root
+            && ( "$distro" == arch || "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu || "$distro" == fedora ) ]] \
+        && jq -e '. == ["doctor", "--turbo"]' <<< "$args_json" >/dev/null; then
+        native_privilege=true
+      fi
+      if [[ "$native_privilege" == false ]]; then
         remote="sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
       else
-        # Retain the bounding set solely so sudo can authenticate this native
-        # preview. Refuse an initial root user before any fixture or receipt.
+        # Retain the bounding set solely for the validated temporary native
+        # operation. Refuse an initial root user before any fixture or receipt.
         remote="test \$(id -u) -ne 0 && sudo -n unshare --net -- setpriv --reuid=\"\$(id -u)\" --regid=\"\$(id -g)\" --clear-groups --inh-caps=-all --ambient-caps=-all env HOME=\"\$HOME\" USER='$ssh_user' LOGNAME='$ssh_user' $remote"
       fi
     fi
@@ -3129,6 +3206,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   start_centis=${uptime/./}
   transport=0
   budget=$(( (row_timeout + 5) * ${#chain[@]} + command_timeout + 20 ))
+  # Two trusted setcap operations have independent 10-second setup deadlines.
+  # Preserve the actual Doctor command's original row deadline.
+  if [[ "$case" == doctor-turbo ]]; then budget=$((budget + 25)); fi
   if [[ "$case" == runtime-rust-install ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ "$assertions" == doctor-eol-state || "$assertions" == doctor-network-state || "$assertions" == doctor-network-live-state ]]; then budget=$((budget + row_timeout + 5)); fi
   if [[ "$assertions" == doctor-native-backend ]]; then
@@ -3155,7 +3235,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     budget=$((budget + 74))
   fi
   if [[ "$case" == runtime-go-install ]]; then budget=$((budget + 210)); fi
-  if [[ ( "$distro" == debian || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then budget=$((budget + 60)); fi
+  if [[ ( "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ) && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then budget=$((budget + 60)); fi
   if ((receiver_status != 0)); then
     transport=$receiver_status
     : > "$out/rows/$case.stdout.log"

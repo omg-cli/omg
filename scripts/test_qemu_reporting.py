@@ -1,4 +1,5 @@
 import copy
+import base64
 from contextlib import nullcontext
 import hashlib
 import importlib.util
@@ -31,7 +32,7 @@ def published_rows(distro, overrides=()):
     for case in snapshot["cases"]:
         if not set(case["tiers"]) & set(profile):
             continue
-        skipped = distro in case["allowed_skips"]
+        skipped = CHECKER.backend_family(distro) in case["allowed_skips"]
         rows.append(dict(case_id=f"qemu-{distro}-{case['id']}", distro=distro,
                          artifact_source="inventory", network_scope=case["network_scope"],
                          result="SKIPPED" if skipped else "PASS",
@@ -930,6 +931,21 @@ class ReportingBoundaryTests(unittest.TestCase):
         receipt = REPORT.workflow_receipt(jobs, "failure")
         self.assertEqual(receipt["distro"], "matrix")
 
+    def test_exact_source_five_guest_ci_cannot_accept_only_four_artifacts(self):
+        rows = [dict(self.row('PASS'), distro=distro, case_id=f'qemu-{distro}-search')
+                for distro in REPORT.GUEST_DISTROS]
+        _, missing = self.run_report_fixture(rows, conclusion='success',
+            workflow_path='.github/workflows/ci.yml', all_distros=True,
+            workflow_distros=REPORT.GUEST_DISTROS)
+        self.assertTrue(missing['evidence_invalid_or_unavailable'])
+        _, complete = self.run_report_fixture(rows, conclusion='success',
+            workflow_path='.github/workflows/ci.yml', all_distros=True,
+            workflow_distros=REPORT.GUEST_DISTROS, artifact_distros=REPORT.GUEST_DISTROS)
+        self.assertIsNone(complete, 'complete staged CI must not generate a failure catalog')
+        _, historical = self.run_report_fixture(rows, conclusion='success',
+            workflow_path='.github/workflows/ci.yml', all_distros=True)
+        self.assertIsNone(historical, 'historical four-guest CI must remain admissible')
+
     def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
                            corrupt=False, expired=False, helper_fails=False, case_log=None,
                            log_case="search", main_shas=None, changed_attempt=False,
@@ -940,7 +956,8 @@ class ReportingBoundaryTests(unittest.TestCase):
                             arm_first=False, arm_provenance_override=None,
                             no_artifacts=False, artifact_listing_error=False,
                             catalog_damage=None, jobs_payload=None, jobs_api_error=None,
-                            artifacts_payload=None, published_damage=None):
+                            artifacts_payload=None, published_damage=None,
+                            workflow_distros=None, artifact_distros=None):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -962,7 +979,7 @@ class ReportingBoundaryTests(unittest.TestCase):
             artifacts, payloads = [], {}
         if all_distros:
             artifacts, payloads = [], {}
-            for identifier, distro in enumerate(REPORT.DISTROS, 30):
+            for identifier, distro in enumerate(artifact_distros or REPORT.DISTROS, 30):
                 output = io.BytesIO()
                 with zipfile.ZipFile(output, "w") as archive:
                     published = (conclusion == "success" and event_kind in ("schedule", "workflow_dispatch")
@@ -1047,6 +1064,12 @@ class ReportingBoundaryTests(unittest.TestCase):
         run_reads = 0
         def api(path, *args):
             nonlocal run_reads
+            if '/contents/.github/workflows/qemu-matrix.yml?ref=' in path:
+                self.assertTrue(path.endswith(run['head_sha']))
+                content = ('          distros=\'' + json.dumps(list(workflow_distros or REPORT.DISTROS)) + '\'\n').encode()
+                blob = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+                return json.dumps(dict(type='file', path='.github/workflows/qemu-matrix.yml',
+                    encoding='base64', content=base64.b64encode(content).decode(), size=len(content), sha=blob))
             if path.endswith("/actions/runs/10"):
                 run_reads += 1
                 current = dict(run)
@@ -1404,9 +1427,11 @@ class ReportingBoundaryTests(unittest.TestCase):
             jobs=jobs)
         self.assertEqual(len(catalog["failures"]), 1)
         self.assertEqual(catalog["failures"][0]["case_id"], "ci-non-qemu-workflow")
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][1][0]["case_id"], "ci-non-qemu-workflow")
         self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "ci")
+        self.assertEqual(calls[1][0], "scripts/report-smoke-sentry.sh")
+        self.assertEqual(calls[1][1], catalog["failures"])
 
     def test_failed_native_ci_with_unavailable_artifacts_does_not_invent_qemu_failure(self):
         jobs = [
@@ -1462,8 +1487,10 @@ class ReportingBoundaryTests(unittest.TestCase):
             [self.row("PASS")], workflow_path=".github/workflows/ci.yml", jobs=jobs)
         self.assertEqual([row["case_id"] for row in catalog["failures"]],
                          ["ci-non-qemu-workflow"])
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][3][calls[0][3].index("--source") + 1], "ci")
+        self.assertEqual(calls[1][0], "scripts/report-smoke-sentry.sh")
+        self.assertEqual(calls[1][1], catalog["failures"])
 
     def test_parallel_ci_and_qemu_failures_keep_both_identities(self):
         jobs = [
@@ -1476,8 +1503,12 @@ class ReportingBoundaryTests(unittest.TestCase):
             [self.row()], workflow_path=".github/workflows/ci.yml", jobs=jobs)
         self.assertEqual({row["case_id"] for row in catalog["failures"]},
                          {"qemu-arch-search", "ci-non-qemu-workflow"})
-        self.assertEqual({call[3][call[3].index("--source") + 1] for call in calls},
+        self.assertEqual(len(calls), 3)
+        self.assertEqual({call[3][call[3].index("--source") + 1] for call in calls
+                          if call[0] == "scripts/qa-file-issue.sh"},
                          {"qemu-matrix", "ci"})
+        self.assertEqual(calls[2][0], "scripts/report-smoke-sentry.sh")
+        self.assertEqual([row["case_id"] for row in calls[2][1]], ["ci-non-qemu-workflow"])
         qemu_transcript = calls[0][2]["arch-qemu-arch-search"]
         ci_transcript = calls[0][2]["matrix-ci-non-qemu-workflow"]
         self.assertIn("QEMU guest (arch)", qemu_transcript)

@@ -26,6 +26,19 @@ SPEC.loader.exec_module(POLICY)
 
 
 class PolicyTests(unittest.TestCase):
+    def test_doctor_turbo_executes_capability_removal_contract(self):
+        with (ROOT / 'tests/cli_behavior_inventory.tsv').open(newline='') as source:
+            row = next(row for row in csv.DictReader(source, delimiter='\t')
+                       if row['case'] == 'doctor-turbo')
+        self.assertEqual(json.loads(row['args_json']), ['doctor', '--turbo'])
+        self.assertEqual(row['expected_ux'], 'pass')
+        self.assertEqual(row['expected_exit'], '0')
+        self.assertEqual(row['safety'], 'isolated-write')
+        self.assertEqual(row['tier'], 'container')
+        self.assertEqual(row['assertions'], 'doctor-capability-cleanup')
+        self.assertEqual(row['targets'], 'arch:pass,debian:pass,ubuntu:pass,fedora:pass')
+        self.assertEqual(row['cleanup'], 'tempdir-drop')
+
     def test_native_orphan_cleanup_executes_on_fedora(self):
         with (ROOT / 'tests/cli_behavior_inventory.tsv').open(newline='') as source:
             rows = {row['case']: row for row in csv.DictReader(source, delimiter='\t')}

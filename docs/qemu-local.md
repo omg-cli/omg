@@ -71,7 +71,37 @@ working SSH transport. The [capability spike](https://github.com/omg-cli/omg/iss
 did not boot a guest or prove clone readiness. Any transport extension must
 account for this policy boundary without silently disabling confinement.
 
+A separate local namespace probe also found a seccomp boundary for
+`unshare(CLONE_NEWUSER | CLONE_NEWNET)`. The actual kernel filter from Docker
+29.8.1's builtin profile returned `SECCOMP_RET_ERRNO | EPERM` for that call.
+Replaying the captured filter in a short-lived native process reproduced the
+refusal while preserving an allowed control syscall. See the
+[filter read-back and kernel replay](https://github.com/omg-cli/omg/issues/611#issuecomment-5973676486).
+This is evidence for the audited WSL controller, not a claim about every runner
+or the older passt startup failure. Installing passt or mapping a device alone
+does not resolve this syscall boundary. Keep transport adoption pending a
+reviewed confinement design and real guest/egress checks. The
+[kernel seccomp contract](https://docs.kernel.org/userspace-api/seccomp_filter.html)
+defines the returned action; it is separate from guest network readiness.
+
 ## What to run
+
+The x86-64 QEMU `all` profile selects Arch, Debian 12, Debian 13 (Trixie),
+Ubuntu and Fedora. The ARM `all` profile selects Debian 12, Ubuntu and Fedora;
+Arch and Trixie ARM are unsupported. The suite creates one result row for
+every selected guest before running it. A failed guest or missing result
+keeps the suite unsuccessful. The
+[workflow selection and suite regressions](../tests/test_qemu_workflow.py)
+exercise those boundaries without downloading images or booting guests.
+
+Trixie requires native APT 7 for both `omg` and `omgd`. Before either product
+entrypoint executes, the ordinary guest user records the trusted dynamic
+loader's [`--list` output](https://man7.org/linux/man-pages/man8/ld.so.8.html).
+The [host evidence validator](../scripts/qemu-apt-abi-evidence.py) checks the
+two binary hashes against the native archive and binds the raw dependency
+logs and Debian 13 identity to the selected probe source. This dependency
+check is one prerequisite; passing it does not establish the lifecycle,
+inventory, advisory, fault or reset-transaction results.
 
 ### ARM runner configuration
 
@@ -271,6 +301,20 @@ Working directories and installed runtime state disappear with the guest;
 only cwd-local fixtures are isolated per row, not the guest's home directory
 or package database. Native ARM and macOS results require their own runners.
 
+Failed Fedora package install/remove rows retain native history, RPM identity,
+and kernel output. Before querying history, the runner also samples at most
+24 KiB from the default root DNF5 log, `/var/log/dnf5.log`. It emits only file
+metadata and the count of the fixed pipe-creation error signal. It does not
+export raw log text. Symlinks, hard links, and special files are refused, and
+each probe has a two-second deadline with a one-second kill grace period.
+Missing logs and custom log directories remain unavailable. A zero count
+does not exclude errors outside the sample. The tail is not UUID-correlated
+and does not establish why the failed transaction remained Started.
+Upstream [DNF5 starts history before creating the scriptlet pipe](https://github.com/rpm-software-management/dnf5/blob/5.4.1.0/libdnf5/base/transaction.cpp#L1121)
+and can return without finalization if pipe creation fails. Its CLI uses
+[`dnf5.log`](https://github.com/rpm-software-management/dnf5/blob/5.4.1.0/dnf5/main.cpp#L96)
+under the [configured log directory](https://dnf5.readthedocs.io/en/stable/dnf5.conf.5.html#logdir).
+
 ## Evidence contracts and sources
 
 - [GNU timeout](https://www.gnu.org/software/coreutils/manual/html_node/timeout-invocation.html)
@@ -452,6 +496,20 @@ terminated by a signal", and that `ExitStatusExt::signal` reports that signal
 made-up exit code, and dnf failures carry the recorded history row as well.
 
 ## Where to go next
+
+`doctor --turbo` runs in the container profile against a private copy of the
+guest's exact executable. The row seeds `cap_net_bind_service=ep` on that copy,
+requires the actual command to remove its `security.capability` xattr, and
+checks unchanged executable bytes and unchanged original file state. It also
+requires the matching cleanup result and explanation that no permanent binary
+privileges are granted. A warning or zero exit without removal fails. An empty
+capability set also fails: libcap distinguishes it from removal
+([setcap](https://man7.org/linux/man-pages/man8/setcap.8.html),
+[getcap](https://man7.org/linux/man-pages/man8/getcap.8.html)).
+The private directory permits only its owner to access the copy; cleanup removes
+it on normal completion or a failed row. Missing trusted tools or unavailable
+capability setup produces BLOCKED. This row tests unattended cleanup, not the
+attended confirmation dialog or interactive sudo credential caching.
 
 - [QA issue loop](./qa-loop.md) explains when an issue opens or closes.
 - [QEMU image review](./qemu-image-renewal.md) covers image provenance expiry.
