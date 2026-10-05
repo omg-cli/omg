@@ -40,14 +40,15 @@ jq -n --argjson count "$samples" '
 ' > "$output/results.json"
 jq -n '{install:null,remove:null}' > "$output/bases.json"
 write_summary() {
+  # finish calls this in an OR-list, where Bash ignores errexit in the body.
   jq -n --arg distro "$distro" --arg phase "$phase" --arg preparation_step "$preparation_step" --argjson count "$samples" \
     --argjson complete "$1" --slurpfile rows "$output/results.json" \
     --slurpfile bases "$output/bases.json" '
     {schema_version:2,kind:"transaction-suite",distro:$distro,complete:$complete,
      phase:$phase,preparation_step:$preparation_step,samples_per_tool:$count,expected_trials:($count*4),
      bases:$bases[0],results:$rows[0]}
-  ' > "$output/summary.next.json"
-  mv "$output/summary.next.json" "$output/summary.json"
+  ' > "$output/summary.next.json" || return "$?"
+  mv "$output/summary.next.json" "$output/summary.json" || return "$?"
 }
 set_result() {
   jq --arg id "$current_id" --arg result "$1" --argjson code "$2" \
