@@ -34,7 +34,8 @@ class CloudInitReadyTests(unittest.TestCase):
 
     def check(self, status, *, result=True, target_ready_after=1, failed_unit="",
               status_exit=0, target_exit=0, diagnostic_exit=0, status_timeout=False,
-              diagnostic_journal_bytes=0, status_resets=0, target_resets=0, timeout_seconds=180):
+              diagnostic_journal_bytes=0, status_resets=0, target_resets=0, timeout_seconds=180,
+              expire_status_clock=False):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             (temp / "status.json").write_text(json.dumps(status), encoding="utf-8")
@@ -62,6 +63,9 @@ elif [[ "$*" == *'/run/cloud-init/result.json'* ]]; then
   if [[ "$MOCK_STATUS_TIMEOUT" == yes ]]; then sleep 5; fi
   if (( MOCK_STATUS_EXIT != 0 )); then
     echo 'cloud-final.service failed before publishing result.json' >&2
+    if [[ -n "$MOCK_STATUS_CLOCK" ]]; then
+      printf '%s\\n' "$OMG_QEMU_CLOUD_INIT_TIMEOUT_SECONDS" > "$MOCK_STATUS_CLOCK"
+    fi
     exit "$MOCK_STATUS_EXIT"
   fi
   [[ "$MOCK_RESULT" == present ]] || exit 1
@@ -110,6 +114,19 @@ fi
 exec "{shutil.which("timeout")}" "$@"
 ''', encoding="utf-8")
                 timeout.chmod(0o755)
+            check = CHECK
+            clock = temp / "boot-seconds"
+            if expire_status_clock:
+                clock.write_text("0\n")
+                # Admit the primary SSH call before expiring the private clock.
+                # Real timeout still runs with the full status-phase budget.
+                source, replacements = re.subn(
+                    r"^boot_seconds\(\) \{[^\n]*\}$",
+                    lambda _: 'boot_seconds() { cat "$MOCK_STATUS_CLOCK"; }',
+                    CHECK.read_text(), flags=re.M)
+                self.assertEqual(replacements, 1, "one helper clock must be controlled")
+                check = temp / "check.sh"
+                check.write_text(source)
             env = dict(os.environ, PATH=f"{temp}{os.pathsep}{os.environ['PATH']}",
                        MOCK_STATUS=str(temp / "status.json"),
                        MOCK_RESULT="present" if result else "missing",
@@ -118,6 +135,7 @@ exec "{shutil.which("timeout")}" "$@"
                        MOCK_FAILED_UNIT=failed_unit,
                        MOCK_SSH_CALLS=str(temp / "ssh-calls"),
                        MOCK_STATUS_EXIT=str(status_exit),
+                       MOCK_STATUS_CLOCK=str(clock) if expire_status_clock else "",
                        MOCK_TARGET_EXIT=str(target_exit),
                        MOCK_DIAGNOSTIC_EXIT=str(diagnostic_exit),
                        MOCK_CLOUD_INIT_DIR=str(records),
@@ -128,7 +146,7 @@ exec "{shutil.which("timeout")}" "$@"
                        MOCK_STATUS_RESETS=str(status_resets),
                        MOCK_TARGET_RESETS=str(target_resets),
                        OMG_QEMU_CLOUD_INIT_TIMEOUT_SECONDS=str(timeout_seconds))
-            completed = subprocess.run(["bash", str(CHECK), "bench@127.0.0.1", "-p", "2222"],
+            completed = subprocess.run(["bash", str(check), "bench@127.0.0.1", "-p", "2222"],
                                        env=env, text=True, capture_output=True, timeout=20)
             calls = int((temp / "target-calls").read_text()) if (temp / "target-calls").exists() else 0
             self.assertEqual({record.name: record.read_bytes() for record in records.iterdir()}, before,
@@ -220,10 +238,13 @@ exec "{shutil.which("timeout")}" "$@"
             self.assertNotIn("verified", result.stdout)
 
     def test_failed_diagnostic_preserves_primary_failure(self):
-        status, _ = self.check(healthy_status(), status_exit=255, diagnostic_exit=7, timeout_seconds=1)
+        status, _ = self.check(healthy_status(), status_exit=255, diagnostic_exit=7,
+                               expire_status_clock=True)
         self.assertEqual(status.returncode, 1, status.stderr)
         self.assertIn("timeout_ssh_exit=255", status.stderr)
         self.assertIn("diagnostic_exit=7", status.stderr)
+        self.assertNotIn("timeout_ssh_exit=124", status.stderr)
+        self.assertNotIn("verified", status.stdout)
         target, _ = self.check(healthy_status(), target_exit=9, diagnostic_exit=7)
         self.assertEqual(target.returncode, 9, target.stderr)
         self.assertIn("cloud_init_phase=target", target.stderr)
