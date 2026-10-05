@@ -28,7 +28,7 @@ OMG prints the selected ecosystem and source file before it runs the task. To pa
 omg run test -- --coverage
 ```
 
-Task names can contain ASCII letters, digits, `-`, `_`, and `.`. A colon in a requested name, such as `test:watch`, is rejected by the current CLI. Run that script with its native tool instead.
+Task names can contain ASCII letters, digits, `-`, `_`, `:`, and `.`. You can request a colon-containing name, such as `omg run test:watch`. Execution still depends on task discovery, the selected ecosystem, and the project's available tools and dependencies.
 
 ## Project files OMG reads
 

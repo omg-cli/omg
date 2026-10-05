@@ -82,7 +82,7 @@ omg run build --using mise
 
 Dependencies run once, in declared order, before the requested task. OMG checks for missing dependencies and cycles before it starts. Arguments after `--` go only to the requested task. Task-local environment values do not flow into dependencies. A task runs from its declaring configuration root by default; a literal `dir` changes that directory relative to the root.
 
-Task names requested through `omg run` may contain only ASCII letters, digits, `-`, `_`, and `.`. The file parser may accept a dependency name that you cannot request directly because it contains a colon. Use a supported top-level name or the native mise command for that task.
+Task names requested through `omg run` may contain only ASCII letters, digits, `-`, `_`, `:`, and `.`. Colon-containing names are accepted for both directly requested tasks and dependencies. A directly requested mise task must still be discovered and use OMG's supported task properties; accepting its name does not guarantee successful execution.
 
 OMG rejects unsupported execution properties instead of ignoring them. These include `task_config`, post-dependencies, conditional controls, custom shells, file tasks, dependency arguments or patterns, and templates in `run` or `dir`. Tasks run sequentially; the supported subset does not claim identical mise scheduling or visibility behavior.
 
