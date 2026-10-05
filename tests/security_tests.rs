@@ -748,6 +748,92 @@ mod network_security {
         }
     }
 
+    fn common_with_production_item_before(anchor: &str, item: &str) -> String {
+        let source = include_str!("../src/runtimes/common.rs");
+        assert_eq!(source.matches(anchor).count(), 1, "mutation anchor changed");
+        source.replacen(anchor, &format!("{item}\n{anchor}"), 1)
+    }
+
+    #[test]
+    #[should_panic(expected = "must not embed a plaintext HTTP URL")]
+    fn test_http_after_nested_test_helpers_is_rejected() {
+        let source = common_with_production_item_before(
+            "fn extract_domain(url: &str)",
+            "const INJECTED_URL: &str = \"http://example.invalid\";",
+        );
+        assert_no_plaintext_http(production_source(&source), "mutated common.rs");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not disable TLS certificate validation")]
+    fn test_tls_disable_after_nested_test_helpers_is_rejected() {
+        let source = common_with_production_item_before(
+            "fn extract_domain(url: &str)",
+            "fn injected_client() { let _ = reqwest::Client::builder().danger_accept_invalid_certs(true); }",
+        );
+        assert_no_plaintext_http(production_source(&source), "mutated common.rs");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not embed a plaintext HTTP URL")]
+    fn test_http_after_top_level_test_module_is_rejected() {
+        let source = common_with_production_item_before(
+            "const MAX_ARCHIVE_ENTRIES:",
+            "const INJECTED_URL: &str = \"http://example.invalid\";",
+        );
+        assert_no_plaintext_http(production_source(&source), "mutated common.rs");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not disable TLS certificate validation")]
+    fn test_tls_disable_after_top_level_test_module_is_rejected() {
+        let source = common_with_production_item_before(
+            "const MAX_ARCHIVE_ENTRIES:",
+            "fn injected_client() { let _ = reqwest::Client::builder().danger_accept_invalid_certs(true); }",
+        );
+        assert_no_plaintext_http(production_source(&source), "mutated common.rs");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not embed a plaintext HTTP URL")]
+    fn test_http_before_test_attributes_is_rejected() {
+        assert_no_plaintext_http(
+            production_source("const URL: &str = \"http://example.invalid\";"),
+            "positive control",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must not disable TLS certificate validation")]
+    fn test_tls_disable_before_test_attributes_is_rejected() {
+        assert_no_plaintext_http(
+            production_source("fn client() { let _ = reqwest::Client::builder().danger_accept_invalid_certs(true); }"),
+            "positive control",
+        );
+    }
+
+    #[test]
+    fn test_comments_and_test_fixtures_remain_valid() {
+        let source = r#"
+// Example "http://example.invalid" and danger_accept_invalid_certs
+struct Client;
+impl Client {
+    #[cfg(test)]
+    fn fixture() { let _ = "http://fixture.invalid"; }
+    fn production() { let _ = "https://example.invalid"; }
+}
+#[cfg(test)]
+mod tests {
+    const FIXTURE: &str = "http://fixture.invalid";
+    fn fixture() { let _ = "danger_accept_invalid_certs"; }
+}
+const PRODUCTION: &str = "https://example.invalid";
+#[cfg(test)]
+mod more_tests { const FIXTURE: &str = "http://second.invalid"; }
+"#;
+        assert_no_plaintext_http(production_source(source), "legitimate fixtures");
+    }
+
     #[test]
     fn test_runtime_and_http_clients_are_https() {
         assert_no_plaintext_http(
