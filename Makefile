@@ -253,11 +253,8 @@ deps-check:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Run development environment (build + daemon)
-dev: build
-	@echo "Starting OMG daemon..."
-	@pkill omgd 2>/dev/null || true
-	./target/debug/omgd &
-	@echo "Daemon started. Run 'make dev-stop' to stop."
+dev:
+	python3 scripts/dev-daemon.py
 
 # Stop development daemon
 dev-stop:
