@@ -898,6 +898,7 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SYNC_EXISTING_TAG: ${{ inputs.sync_existing_tag }}
         run: |
           WRANGLER="$PWD/.github/deps/release-tools/node_modules/.bin/wrangler"
           # Keep the bucket-served installer current so a pinned release URL
@@ -927,6 +928,39 @@ jobs:
             exit 1
           fi
           echo "✓ Updated installer"
+          # Resync repairs historical objects; it is not an implicit rollback.
+          # Fail closed if the current marker cannot be read or parsed. Fresh
+          # releases retain the bootstrap path; intentional downgrades use
+          # scripts/r2-rollback.sh and its artifact preflight.
+          if [[ -n "$SYNC_EXISTING_TAG" ]]; then
+            "$WRANGLER" r2 object get "omg-releases/latest-version" --remote \
+              --file="$verify_dir/latest-version" >/dev/null
+            promote=$(python3 - "$VERSION" "$verify_dir/latest-version" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          number = r'(0|[1-9][0-9]*)'
+          identifier = r'(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          stable = rf'{number}\.{number}\.{number}'
+          semver = rf'{stable}(?:-({identifier}(?:\.{identifier})*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?'
+          candidate = re.fullmatch(stable, sys.argv[1])
+          current = re.fullmatch(semver, Path(sys.argv[2]).read_text().strip())
+          if candidate is None or current is None:
+              sys.exit('Cannot safely promote resync: invalid release version or latest-version marker')
+          target_core = tuple(map(int, candidate.groups()))
+          current_core = tuple(map(int, current.groups()[:3]))
+          # The resync input is stable. At equal core, stable outranks any
+          # prerelease; build metadata never changes SemVer precedence.
+          print('true' if target_core > current_core or
+                (target_core == current_core and current.group(4) is not None) else 'false')
+          PY
+            )
+            if [[ "$promote" != true ]]; then
+              echo "Resynced $SYNC_EXISTING_TAG; keeping latest-version (equal or newer precedence)"
+              exit 0
+            fi
+          fi
           echo -n "$VERSION" > release/latest-version
           "$WRANGLER" r2 object put "omg-releases/latest-version" --remote \
             --file=release/latest-version \
