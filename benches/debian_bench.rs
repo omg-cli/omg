@@ -149,7 +149,9 @@ fn bench_resolver(c: &mut Criterion) {
         b.iter(|| {
             let mut resolver = DependencyResolver::new().expect("resolver creation should succeed");
             // Large packages with many dependencies
-            resolver.add_package("build-essential").ok();
+            resolver
+                .add_package("build-essential")
+                .expect("build-essential benchmark seed should be available");
             let result = resolver.resolve();
             std::hint::black_box(result)
         });
