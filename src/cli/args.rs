@@ -238,7 +238,8 @@ pub enum Commands {
         /// Runtime to switch (node, python, go, rust, ruby, java, bun, pi,
         /// deno, zig, dotnet, erlang, php, swift)
         runtime: String,
-        /// Version to use (e.g., 20.10.0, latest, lts). If omitted, detects from version file.
+        /// Version to use (e.g., 20.10.0, latest, lts).
+        /// If omitted when switching, detects from version file. A version is required with --uninstall.
         version: Option<String>,
         /// Remove the version instead of switching to it
         #[arg(long)]
@@ -367,7 +368,9 @@ pub enum Commands {
         fast: bool,
     },
 
-    /// Check system health and environment configuration (exit 0: healthy, exit 1: issues found)
+    /// Check system health and environment configuration.
+    /// Without --turbo, exit 0: healthy, exit 1: issues found.
+    /// --turbo primes sudo credentials instead of checking health.
     Doctor {
         /// Test network connectivity to package mirrors
         #[arg(long)]
@@ -1280,6 +1283,69 @@ mod tests {
     #[test]
     fn verify_cli() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn doctor_documentation_qualifies_turbo_health_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Cli::command();
+        command.build();
+        let doctor = command
+            .find_subcommand_mut("doctor")
+            .ok_or("missing doctor")?;
+        let help = doctor.render_long_help().to_string();
+        let mut page = Vec::new();
+        clap_mangen::Man::new(doctor.clone()).render(&mut page)?;
+        let man = String::from_utf8(page)?.replace("\\-", "-");
+        for documentation in [help, man] {
+            let documentation = documentation
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(documentation.contains("Without --turbo"), "{documentation}");
+            assert!(
+                documentation.contains("exit 0: healthy, exit 1: issues found"),
+                "{documentation}"
+            );
+            assert!(
+                documentation
+                    .contains("--turbo primes sudo credentials instead of checking health"),
+                "{documentation}"
+            );
+            assert!(
+                documentation
+                    .contains("Prime sudo credentials for prompt-light package operations"),
+                "{documentation}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn use_documentation_qualifies_uninstall_version_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Cli::command();
+        command.build();
+        let use_command = command.find_subcommand_mut("use").ok_or("missing use")?;
+        let help = use_command.render_long_help().to_string();
+        let mut page = Vec::new();
+        clap_mangen::Man::new(use_command.clone()).render(&mut page)?;
+        let man = String::from_utf8(page)?.replace("\\-", "-");
+        for documentation in [help, man] {
+            let documentation = documentation
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                documentation.contains("If omitted when switching, detects from version file"),
+                "{documentation}"
+            );
+            assert!(
+                documentation.contains("A version is required with --uninstall"),
+                "{documentation}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
