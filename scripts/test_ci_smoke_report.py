@@ -2,6 +2,8 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,6 +16,31 @@ SPEC.loader.exec_module(REPORT)
 
 
 class ReportingTests(unittest.TestCase):
+    def test_negative_delivery_fixture_does_not_annotate_the_workflow(self):
+        result = subprocess.run(
+            [sys.executable, '-B', '-m', 'unittest',
+             'test_ci_smoke_report.ReportingTests.test_trixie_failure_keeps_its_identity_and_delivery_receipt'],
+            cwd=Path(__file__).parent, capture_output=True, text=True, timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('::warning::', result.stdout)
+        self.assertNotIn('::error::', result.stdout)
+
+    def test_trixie_failure_keeps_its_identity_and_delivery_receipt(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(REPORT.subprocess, 'run') as run:
+            run.return_value = type('Delivery', (), dict(returncode=1, stdout='', stderr='HTTP 429\n'))()
+            root = Path(directory)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(REPORT.status('debian-trixie', 'qemu-debian-trixie-lifecycle', 'failure', root), 0)
+            self.assertIn('::warning::Sentry delivery failed', output.getvalue())
+            row = json.loads((root / 'results.json').read_text())[0]
+            self.assertEqual(row['distro'], 'debian-trixie')
+            self.assertEqual(row['case_id'], 'qemu-debian-trixie-lifecycle')
+            self.assertEqual(json.loads((root / 'reporting-status.json').read_text()), {'exit_code': 1})
+            self.assertIn('429', (root / 'reporting.log').read_text())
+
     def test_secure_config_and_no_secret_export(self):
         with tempfile.TemporaryDirectory() as directory:
             export = Path(directory) / "env"
