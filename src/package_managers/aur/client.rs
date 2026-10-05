@@ -2661,11 +2661,6 @@ impl AurClient {
                     filename.starts_with(name) && filename.chars().nth(name.len()) == Some('-')
                 })
             {
-                // Skip debug subpackages early
-                if filename.contains("-debug-") || filename.contains("-debug.pkg.tar") {
-                    continue;
-                }
-
                 // Filename matching is only a candidate filter. The archive's
                 // embedded identity is authoritative; unreadable or absent
                 // metadata must never select an artifact for installation.
@@ -5013,6 +5008,87 @@ mod tests {
         assert_eq!(
             AurClient::parse_pkginfo_name_version("  pkgname =   spaced  \n pkgver =  2.0 \n"),
             Some(("spaced".to_string(), "2.0".to_string()))
+        );
+    }
+
+    fn write_discovery_archive(directory: &Path, filename_name: &str, pkgname: &str) -> PathBuf {
+        let path = directory.join(format!("{filename_name}-1-1-any.pkg.tar.zst"));
+        let encoder = zstd::Encoder::new(File::create(&path).unwrap(), 0).unwrap();
+        let mut archive = tar::Builder::new(encoder);
+        let info = format!("pkgname = {pkgname}\npkgver = 1-1\narch = any\n");
+        let mut header = tar::Header::new_gnu();
+        header.set_size(info.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, ".PKGINFO", info.as_bytes())
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn built_package_discovery_accepts_requested_debug_named_output() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["docker-debug", "docker-debug-tools"] {
+            let archive = write_discovery_archive(directory.path(), name, name);
+            assert_eq!(
+                AurClient::find_built_packages(
+                    directory.path(),
+                    directory.path(),
+                    &[name.to_string()]
+                )
+                .await
+                .unwrap(),
+                vec![archive]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn built_package_discovery_accepts_requested_debug_named_split_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let main = write_discovery_archive(directory.path(), "docker", "docker");
+        let debug = write_discovery_archive(directory.path(), "docker-debug", "docker-debug");
+        write_discovery_archive(directory.path(), "docker-debug-debug", "docker-debug-debug");
+        assert_eq!(
+            AurClient::find_built_packages(
+                directory.path(),
+                directory.path(),
+                &["docker-debug".to_string(), "docker".to_string()],
+            )
+            .await
+            .unwrap(),
+            vec![debug, main]
+        );
+    }
+
+    #[tokio::test]
+    async fn built_package_discovery_does_not_add_unrequested_debug_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        write_discovery_archive(directory.path(), "docker-debug", "docker-debug");
+        let requested = ["docker".to_string()];
+        assert!(
+            AurClient::find_built_packages(directory.path(), directory.path(), &requested)
+                .await
+                .is_err()
+        );
+        let main = write_discovery_archive(directory.path(), "docker", "docker");
+        assert_eq!(
+            AurClient::find_built_packages(directory.path(), directory.path(), &requested)
+                .await
+                .unwrap(),
+            vec![main]
+        );
+    }
+
+    #[test]
+    fn built_package_discovery_rejects_mismatched_debug_named_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        write_discovery_archive(directory.path(), "docker-debug", "unrelated");
+        assert_eq!(
+            AurClient::find_package_in_dir(directory.path(), &["docker-debug".to_string()]),
+            None
         );
     }
 
