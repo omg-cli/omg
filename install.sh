@@ -945,7 +945,7 @@ build_omg() {
   linux)
     case "$detected_distro" in
     arch) cargo_features="--features arch,license,pgp" ;;
-    debian | ubuntu) cargo_features="--no-default-features --features debian,license" ;;
+    debian | ubuntu) cargo_features="--no-default-features --features debian,license,pgp" ;;
     fedora) cargo_features="--no-default-features --features fedora,license,pgp" ;;
     *) cargo_features="--no-default-features --features fedora,license,pgp" ;;
     esac

@@ -17,6 +17,7 @@ wait_until_dead() {
   return 1
 }
 cd "$(dirname "$0")/.."
+bash tests/installer_source_features.sh
 task_dir=$(mktemp -d)
 trap 'rm -rf "$task_dir"' EXIT
 sed '$d' install.sh > "$task_dir/functions.sh"
