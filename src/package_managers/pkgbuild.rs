@@ -545,7 +545,7 @@ mod tests {
                 for index in 0..assignments {
                     writeln!(content, "a{index:07}=x").expect("fixture");
                 }
-                let description = "z".repeat(524288);
+                let description = "z".repeat(524_288);
                 writeln!(content, "pkgdesc='{description}{reference}'").expect("fixture");
                 assert!(content.len() < MAX_PKGBUILD_BYTES as usize);
                 SUBSTITUTION_SCAN_BYTES.with(|count| count.set(0));
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn array_continuations_scan_each_appended_byte_once() {
-        for lines in [2000, 8000, 100000] {
+        for lines in [2000, 8000, 100_000] {
             let content = format!(
                 "pkgname=demo\npkgver=1\npkgrel=1\ndepends=(\n{}",
                 " ( \n".repeat(lines)
