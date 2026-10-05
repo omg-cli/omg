@@ -39,6 +39,28 @@ out=$("$runner" "$scratch/clean.json"); rc=$?
 [[ "$rc" -eq 0 ]] || fail "clean audit must exit 0, got $rc"
 grep -q "clean" <<< "$out" || fail "clean audit printed no notice: $out"
 
+# PASS records executed evidence, including declared nonzero expectations
+# (the inventory diff case expects exit 1), but never the missing-exit sentinel.
+source "$repo_root/scripts/qa-evidence-lib.sh"
+for code in -1 0 1 255; do
+  jq -n --argjson code "$code" '[{case_id:"qemu-arch-diff", distro:"arch",
+    result:"PASS", exit_code:$code, elapsed_seconds:0}]' > "$scratch/pass-exit.json"
+  validator_rc=0
+  qa_result_rows "$scratch/pass-exit.json" > "$scratch/validated.json" 2>/dev/null || validator_rc=$?
+  rc=0
+  out=$("$runner" "$scratch/pass-exit.json") || rc=$?
+  if [[ "$code" -lt 0 ]]; then
+    [[ "$validator_rc" -ne 0 ]] || fail "shared validator admitted PASS without executed exit"
+    [[ "$rc" -eq 1 ]] || fail "PASS without executed exit must make audit incomplete, got $rc"
+    grep -q 'invalid results.json; audit incomplete' <<< "$out" || fail "missing executed exit was called clean"
+    grep -q 'invalid-files=1' <<< "$out" || fail "missing executed exit was not counted invalid"
+  else
+    [[ "$validator_rc" -eq 0 ]] || fail "shared validator rejected PASS/$code"
+    [[ "$rc" -eq 0 ]] || fail "executed PASS/$code must remain clean, got $rc"
+    grep -q '^clean$' <<< "$out" || fail "executed PASS/$code was not clean"
+  fi
+done
+
 # Directory scan finds nested results; junk files are skipped loudly.
 mkdir -p "$scratch/suite/a/b"
 printf '%s' '[{"case_id":"x","distro":"fedora","result":"HARNESS_ERROR","exit_code":3,"elapsed_seconds":0}]' > "$scratch/suite/a/b/results.json"

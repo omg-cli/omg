@@ -44,6 +44,8 @@ failures="$(jq -ce '
                      "ci-non-qemu-workflow")))) and
     (.result | IN("PASS", "SKIPPED", "EXPECTED_REJECTION", "PRODUCT_FAIL", "HARNESS_ERROR", "FAIL", "BLOCKED")) and
     (.exit_code | type == "number" and floor == . and . >= -1 and . <= 255) and
+    # PASS requires an executed exit; inventory expectations may be nonzero.
+    (.result != "PASS" or .exit_code >= 0) and
     (.elapsed_seconds | type == "number" and . >= 0 and . <= 86400))
   then . else error("invalid result fields") end |
   map(select(.result == "PRODUCT_FAIL" or .result == "HARNESS_ERROR" or .result == "FAIL") |
