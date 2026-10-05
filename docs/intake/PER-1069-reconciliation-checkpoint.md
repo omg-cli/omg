@@ -1,0 +1,24 @@
+Bounded intake checkpoint: changed evidence captured; canonical reconciliation blocked by control-plane read timeouts.
+
+- Scope: [PER-1069](/PER/issues/PER-1069), authentic injected run identity; harness checkout reused. [Operations status](/PER/issues/PER-4#document-operations-status) revision 23c0c55c-01e9-49da-91c6-33af274dde68 and [triage policy](/PER/issues/PER-4#document-triage-policy) revision 636246df-ec5b-434f-95a5-fb3dbb4a02e5 were read. Autonomy-plan and orchestration-team were read; current ten-slot override takes precedence over historical four-slot text.
+- Local branch is unchanged, clean PER-1069 at 4f57eec8cc4a08587de217cc1485714a067ee7d8. Harness base refresh failed on dubious ownership; local source is a snapshot, not a fresh-main receipt. No global config mutation.
+
+| Canonical source task | GitHub candidate | Fresh observed head | Outcome |
+| --- | --- | --- | --- |
+| [PER-1004](/PER/issues/PER-1004), adjudication [PER-999](/PER/issues/PER-999) | [PR858](https://github.com/omg-cli/omg/pull/858) | fe1129420a69895c15491686824bd4d4d4ac74e9 | open, merged=false, merged_at=null; canonical GitHub defect issue lookup unresolved |
+| [PER-1033](/PER/issues/PER-1033) | [PR859](https://github.com/omg-cli/omg/pull/859) | 85227b798d4ffa35b4f500f81f9f0a342b9bc75b | open, merged=false, merged_at=null; canonical GitHub defect issue lookup unresolved |
+
+Source and validation scope:
+- PR858: independently read base Makefile lines 105-137 at local exact SHA; directory-existence predicates are at 110,118,137. [Immutable source](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/Makefile#L105-L137). Author reports six expected RED failures and 22 GREEN cases from python3 scripts/test_make_fuzz_artifacts.py -v using real Make recipes with mocked Cargo. [Author validation and raw receipt](https://github.com/omg-cli/omg/pull/858). Those are linked author claims, not new Intake execution or independent admission. No actual fuzz campaign/Rust/guest proof was supplied by this heartbeat.
+- PR859: independently read base install.sh lines943-952; Debian/Ubuntu disables defaults and selects debian,license at948. [Immutable producer](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/install.sh#L943-L952). Author reports a RED missing-pgp producer argv and nine GREEN installer scenarios via bash tests/installer_security.sh, plus bash syntax and diff checks. [Author validation](https://github.com/omg-cli/omg/pull/859). Fixture checks do not establish a Cargo build, signed Swift installation, Ubuntu guest or hosted admission.
+- GitHub fetch_pr independently returned current open state, exact heads and absent merge timestamps for both. Non-null merge_commit_sha on these unmerged PRs is a synthetic merge candidate, not a landed receipt. Neither source task or GitHub issue was closed, approved or merged.
+- GitHub connection discovery returned ready; no credential copying or alternate identity. Issue search for repo:omg-cli/omg is:issue "empty" "fuzz" returned no matches, which does not prove no semantic duplicate or establish complete canonical mapping.
+
+Audit checkpoint:
+- git ls-files '.audit/*' '*postmortem*' '*500*' returned only .audit/deep-audit.tsv in this assigned snapshot. SHA256 139461ab9607df5f2a1c8b17d618f78c8078f357f74365c9444b96ba146977ac. Header and first three records were read; they are historical workflow observations, not accepted defects. This is a file-byte hash, not a finding identity or an adjudication.
+- Source archive remains [central source-evidence](/PER/issues/PER-4#document-source-evidence), SHA256 b2486f4ad6b9772e7b02ba1cba5037af102dc37057e7f8463d9924c20257b4ef. Full archive/500-lens coverage and novelty comparison were not performed this episode. Zero findings imported, zero duplicates discarded, zero INFO/positive controls promoted.
+
+Exact blocker and next action:
+- Central document listing, prior intake episode search, own episode list and canonical PR858/859 Paperclip searches timed out at bounded 10-20 seconds after earlier successful reads. Prior checkpoint/ledger identity therefore remains unknown. This matches an observed availability symptom; no latency root cause is diagnosed.
+- Intake owns retrying bounded prior-checkpoint and canonical issue lookups after control-plane availability returns, then linking these two candidates and comparing at most ten finding hashes idempotently. Existing Manager/Platform retain availability diagnosis; no duplicate infrastructure task, unrelated cross-issue comment or blanket wake was created.
+- CI/Guest reviewer owns independent exact-head technical verdicts; Delivery owns required-check admission and actual landed SHA/time receipts. Intake must consume those receipts before implemented-issue closure. No production source edits, product tests, guest lane, self-approval or merge occurred.
