@@ -18,6 +18,101 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipIf(os.name == 'nt', 'native preview assertions require POSIX bash')
 class NativeRemovalContracts(unittest.TestCase):
+    def test_trixie_doctor_backend_reference_preserves_os_and_lane_identity(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        begin = source.index('# BEGIN DOCTOR BACKEND ORACLE')
+        end = source.index('# END DOCTOR BACKEND ORACLE', begin)
+        command = source[begin:end] + '\ncheck_doctor_native_backend "$1" "$2" "$3"\n'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / 'os-release'
+            output = root / 'doctor.out'
+            healthy = ('  Debian/Ubuntu detected (apt backend)\n'
+                       '  Found dependency: apt-get\n'
+                       '  Found dependency: sudo\n'
+                       '  dpkg package database (/var/lib/dpkg/status)\n'
+                       '  APT package indexes (/var/lib/apt/lists)\n')
+            output.write_text(healthy, encoding='utf-8')
+            cases = (
+                ('ID=debian\nVERSION_ID=13\n', 0),
+                ('ID="debian"\nVERSION_ID="13"\n', 0),
+                ("ID='debian'\nVERSION_ID='13'\n", 0),
+                ('ID=debian\nVERSION_ID=12\n', 2),
+                ('ID=ubuntu\nVERSION_ID=13\n', 2),
+                ('ID=debian\n', 2),
+                ('ID=debian\nID=debian\nVERSION_ID=13\n', 2),
+                ('ID=debian\nVERSION_ID=13\nVERSION_ID=13\n', 2),
+            )
+            for identity, expected in cases:
+                with self.subTest(identity=identity):
+                    release.write_text(identity, encoding='utf-8')
+                    result = subprocess.run(
+                        [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                         command, '_', 'debian-trixie', str(output), str(release)],
+                        cwd=root, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+            release.write_text('ID=debian\nVERSION_ID=13\n', encoding='utf-8')
+            output.write_text(healthy.replace('  Found dependency: apt-get\n', ''),
+                              encoding='utf-8')
+            result = subprocess.run(
+                [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                 command, '_', 'debian-trixie', str(output), str(release)],
+                cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1,
+                             'Trixie OS identity must retain trusted apt-get validation')
+
+    def test_trixie_connectivity_setup_requires_debian_13(self):
+        source = (ROOT / 'scripts/qemu-doctor-connectivity-check.sh').read_text(encoding='utf-8')
+        marker = '[[ -d "$evidence" ]] || setup_fail \'evidence directory unavailable\''
+        self.assertIn(marker, source)
+        prefix = source.split(marker, 1)[0] + marker
+        for release, code in (('ID=debian\nVERSION_ID=13\n', 0),
+                              ('ID=debian\nVERSION_ID=12\n', 120),
+                              ('ID=ubuntu\nVERSION_ID=13\n', 120)):
+            with self.subTest(release=release), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                os_release = root / 'os-release'
+                os_release.write_text(release)
+                (root / 'qemu-doctor-connectivity-fixture.py').symlink_to(ROOT / 'scripts/qemu-doctor-connectivity-fixture.py')
+                binary = root / 'omg'
+                binary.write_text('#!/bin/sh\nexit 99\n')
+                binary.chmod(0o755)
+                script = root / 'setup.sh'
+                script.write_text(prefix.replace('/etc/os-release', str(os_release)) + '\n')
+                result = subprocess.run(['bash', str(script), str(binary), 'debian-trixie', str(root)],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, code, result.stderr)
+
+    def test_trixie_native_version_and_identity_require_installed_apt_records(self):
+        provider = 'dpkg-query() { printf "%s" "$QUERY_OUT"; }\n'
+        for record, expected, code in (
+            ('install ok installed\t1.2-3\n', '1.2-3', 0),
+            ('deinstall ok config-files\t1.2-3\n', '', 0),
+        ):
+            with self.subTest(record=record):
+                result = subprocess.run(['bash', '-c', provider + self.functions() +
+                    '\nnative_installed_version debian-trixie tree', '_'],
+                    env=dict(os.environ, QUERY_OUT=record), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+        identity = subprocess.run(['bash', '-c', self.functions() +
+            '\nnative_installed_identity debian-trixie tree'], capture_output=True, text=True, timeout=10)
+        self.assertEqual(identity.returncode, 0, identity.stderr)
+        self.assertEqual(identity.stdout.strip(), 'tree')
+
+    def test_trixie_transaction_invokes_exact_native_apt_operations(self):
+        source = (ROOT / 'scripts/qemu-transactions.sh').read_text(encoding='utf-8')
+        function = source[source.index('native_change() {'):source.index('capture_repository_state() {')]
+        for operation in ('install', 'remove'):
+            with self.subTest(operation=operation):
+                result = subprocess.run(['bash', '-c',
+                    'distro=debian-trixie\nremote_argv() { printf "%s\\n" "$@"; }\n' +
+                    function + '\nnative_change "$1"', '_', operation],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ['sudo', '-n', 'env',
+                    'DEBIAN_FRONTEND=noninteractive', 'apt-get', operation, '-y', 'tree'])
+
     @staticmethod
     def functions():
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
@@ -190,6 +285,41 @@ trap 'printf "exit-trap\\n"' EXIT
 
 
 class OutputContracts(unittest.TestCase):
+    def test_historical_declared_doctor_turbo_remains_explicit_skip(self):
+        rows = ['help\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop',
+                'doctor-turbo\t["doctor","--turbo"]\tread\t-\tdeclared\t-\tqemu\tarch:pending,debian:pending,ubuntu:pending,fedora:pending\t-\tnone']
+        result, evidence, logs = self.run_inventory('printf "Usage: fixture\\n"\n', rows, tiers='hermetic,qemu')
+        self.assertEqual(result.returncode, 0, logs)
+        self.assertEqual([item['result'] for item in evidence], ['PASS', 'SKIPPED'], logs)
+
+    def test_doctor_turbo_requires_real_capability_removal(self):
+        rows = ['doctor-turbo\t["doctor","--turbo"]\tisolated-write\t0\tpass\t-\tcontainer\tarch:pass,debian:pass,ubuntu:pass,fedora:pass\tdoctor-capability-cleanup\ttempdir-drop']
+        for defect in ('none', 'no-op', 'empty-set', 'changed-copy', 'wrong-output', 'command-failure', 'timeout'):
+            with self.subTest(defect=defect):
+                product = '''[[ "$*" == 'doctor --turbo' ]] || exit 70
+printf '%s\\n' 'No file capabilities remain (or none were set)' 'No permanent privileges granted to any binary'
+'''
+                if defect in ('none', 'wrong-output', 'command-failure'):
+                    product += '/usr/bin/sudo -n -- /usr/sbin/setcap -r "$0" || /usr/bin/sudo -n -- /usr/bin/setcap -r "$0"\n'
+                elif defect == 'empty-set':
+                    product += '/usr/bin/sudo -n -- /usr/sbin/setcap = "$0" || /usr/bin/sudo -n -- /usr/bin/setcap = "$0"\n'
+                elif defect == 'changed-copy':
+                    product += 'printf "# changed\\n" >> "$0"\n'
+                if defect == 'wrong-output':
+                    product = product.replace('No permanent privileges granted to any binary', 'permanent privileges are fine')
+                if defect == 'command-failure':
+                    product += 'exit 1\n'
+                if defect == 'timeout':
+                    product += 'sleep 3\n'
+                result, evidence, logs = self.run_inventory(
+                    product, rows, tiers='container', allow_mutations=True,
+                    row_timeout=1 if defect == 'timeout' else None)
+                self.assertEqual(result.returncode, int(defect != 'none'), logs)
+                self.assertEqual(evidence[0]['result'], 'PASS' if defect == 'none' else 'FAIL', logs)
+                if defect == 'none':
+                    self.assertIn('"original_unchanged": true', logs['doctor-turbo.stdout.log'])
+                    self.assertIn('"capabilities_removed": true', logs['doctor-turbo.stdout.log'])
+
     def test_run_watch_row_uses_bounded_source_edit_and_receipt(self):
         inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
         row = next(line for line in inventory.splitlines() if line.startswith('run-watch\t'))
@@ -3002,6 +3132,92 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
 
 
     @unittest.skipIf(os.name == 'nt', 'Generated offline launch requires POSIX bash')
+    def test_offline_doctor_launch_admits_only_exact_capability_cleanup(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
+        launch = source[start:source.index('  # Bash SECONDS', start)]
+        defaults = dict(distro='debian', case='doctor-turbo', safety='isolated-write',
+                        assertions='doctor-capability-cleanup', expected_ux='pass',
+                        requires='-', tier='container',
+                        targets='arch:pass,debian:pass,ubuntu:pass,fedora:pass',
+                        cleanup='tempdir-drop', network_scope='offline', ssh_user='fixture',
+                        args_json='["doctor","--turbo"]')
+        variants = [(distro, {'distro': distro}, '0:retained')
+                    for distro in ('arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora')]
+        for key, value in (
+            ('distro', 'other'), ('ssh_user', 'root'), ('case', 'other'),
+            ('safety', 'read'), ('assertions', '-'), ('expected_ux', 'declared'),
+            ('requires', 'help'), ('tier', 'hermetic'), ('targets', 'debian:pass'),
+            ('cleanup', 'none'), ('args_json', '["doctor"]'),
+            ('args_json', '["doctor","--turbo","--yes"]'),
+            ('args_json', '["doctor","--network"]'),
+        ):
+            variants.append((key + '=' + value, {key: value}, '1:dropped'))
+        variants += [('wrong expected exit', {'resolved_exit': '1'}, '1:dropped'),
+                     ('prerequisite chain', {'chain_entry': 'help'}, '1:dropped'),
+                     ('network scope unchanged', {'network_scope': 'network'}, 'unwrapped')]
+        variants += [(label + ' [Trixie]', dict(changes, distro='debian-trixie'), expected)
+                     for label, changes, expected in list(variants)
+                     if 'distro' not in changes]
+        wrappers = r"""
+sudo() { [[ "$1" == -n ]] || return 90; shift; "$@"; }
+unshare() { [[ "$1:$2" == --net:-- ]] || return 91; shift 2; "$@"; }
+setpriv() {
+  local nnp=0 bound=retained uid= gid= clear=0 inh=0 ambient=0
+  while [[ "$1" != env ]]; do
+    case "$1" in
+      --reuid=*) uid=${1#*=} ;; --regid=*) gid=${1#*=} ;;
+      --clear-groups) clear=1 ;; --no-new-privs) nnp=1 ;;
+      --bounding-set=-all) bound=dropped ;; --inh-caps=-all) inh=1 ;;
+      --ambient-caps=-all) ambient=1 ;; *) return 92 ;;
+    esac; shift
+  done
+  [[ "$uid" == "$(id -u)" && "$gid" == "$(id -g)" && "$uid" != 0 && "$clear:$inh:$ambient" == 1:1:1 ]] || return 93
+  export OMG_QEMU_TEST_LAUNCH="$nnp:$bound"
+  "$@"
+}
+export -f sudo unshare setpriv
+"""
+        for label, changes, expected in variants:
+            values = dict(defaults, **{k: v for k, v in changes.items()
+                                      if k not in {'resolved_exit', 'chain_entry'}})
+            assignments = '\n'.join(f'{key}={shlex.quote(value)}' for key, value in values.items())
+            chain = shlex.quote(changes['chain_entry']) if 'chain_entry' in changes else ''
+            setup = (assignments + '\ndeclare -A row_exit=([$case]='
+                     + shlex.quote(changes.get('resolved_exit', '0')) + ')\nchain=(' + chain + ')\n')
+            script = (wrappers + setup
+                      + 'remote=' + shlex.quote('bash -c ' + shlex.quote(
+                          'printf %s "${OMG_QEMU_TEST_LAUNCH:-unwrapped}"')) + '\n'
+                      + launch + '\nbash -c "$remote"\n')
+            with self.subTest(label=label):
+                result = subprocess.run(['bash', '-c', script], capture_output=True,
+                                        text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected, label)
+
+    @unittest.skipIf(os.name == 'nt', 'Generated offline launch requires POSIX bash')
+    def test_offline_doctor_rejects_an_initial_root_user_before_sudo(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
+        launch = source[start:source.index('  # Bash SECONDS', start)]
+        setup = '''
+distro=debian; case=doctor-turbo; safety=isolated-write
+assertions=doctor-capability-cleanup; expected_ux=pass; requires=-
+tier=container; targets=arch:pass,debian:pass,ubuntu:pass,fedora:pass
+cleanup=tempdir-drop; network_scope=offline; ssh_user=fixture
+args_json='["doctor","--turbo"]'
+declare -A row_exit=([doctor-turbo]=0); chain=()
+remote='printf forbidden-product'
+id() { printf 0; }
+sudo() { printf forbidden-sudo; }
+export -f id sudo
+'''
+        result = subprocess.run(['bash', '-c', setup + launch + '\nbash -c "$remote"'],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    @unittest.skipIf(os.name == 'nt', 'Generated offline launch requires POSIX bash')
     def test_offline_preview_launch_admits_only_the_exact_fedora_dry_run(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
@@ -3290,6 +3506,18 @@ printf 'Usage: fixture\\n'
             self.assertTrue(evidence.exists(), result.stdout + result.stderr)
             return result, json.loads(evidence.read_text()), {
                 path.name: path.read_text() for path in (root / 'inventory/rows').glob('*.log')}
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_trixie_runner_selects_apt_targets_and_keeps_guest_identity(self):
+        rows = ['help\t["--help"]\thelp-boundary\tarch:1,debian:0,ubuntu:0,fedora:125\tpass\t-\thermetic\tarch:pending,debian:pass,ubuntu:pass,fedora:pending\t-\ttempdir-drop']
+        result, evidence, logs = self.run_inventory(
+            'printf "Usage: fixture\\n"\n', rows, distro='debian-trixie')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(evidence), 1, logs)
+        self.assertEqual(evidence[0]['case_id'], 'qemu-debian-trixie-help')
+        self.assertEqual(evidence[0]['distro'], 'debian-trixie')
+        self.assertEqual(evidence[0]['result'], 'PASS', logs)
+        self.assertEqual(evidence[0]['exit_code'], 0, logs)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
     def test_actual_runner_records_not_applicable_target_without_running_product(self):

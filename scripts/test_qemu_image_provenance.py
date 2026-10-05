@@ -24,10 +24,10 @@ class ImageProvenanceTests(unittest.TestCase):
         bash = os.environ.get("OMG_TEST_BASH") or shutil.which("bash")
         self.assertIsNotNone(bash)
         lines = subprocess.check_output([bash, str(ROOT / "scripts/benchmark-qemu.sh"), "--print-pins"], text=True).splitlines()
-        self.assertEqual(len(lines), 7)
+        self.assertEqual(len(lines), 8)
         for line in lines:
             distro, arch, url, digest, algorithm, _ = line.split("\t")
-            entry = IMAGE.policy(MANIFEST, distro + "-" + arch, url, digest, date(2026, 9, 15))
+            entry = IMAGE.policy(MANIFEST, distro + "-" + arch, url, digest, date(2026, 10, 3))
             self.assertEqual(entry["algorithm"] + "sum", algorithm)
 
     def test_expired_or_changed_pin_cannot_boot(self):
@@ -35,7 +35,25 @@ class ImageProvenanceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             IMAGE.policy(MANIFEST, "ubuntu-x86_64", entry["url"], entry["digest"], date(2026, 10, 15))
         with self.assertRaises(ValueError):
-            IMAGE.policy(MANIFEST, "ubuntu-x86_64", entry["url"], "0" * 64, date(2026, 9, 15))
+            IMAGE.policy(MANIFEST, "ubuntu-x86_64", entry["url"], "0" * 64, date(2026, 10, 3))
+
+    def test_trixie_has_a_versioned_x64_pin_and_explicit_unsigned_checksum_policy(self):
+        bash = os.environ.get("OMG_TEST_BASH") or shutil.which("bash")
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([bash, str(ROOT / 'scripts/benchmark-qemu.sh'),
+                                     '--distro', 'debian-trixie', '--print-pins',
+                                     '--evidence-dir', directory], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [line.split('\t') for line in result.stdout.splitlines()]
+        self.assertEqual(len(rows), 1, 'Trixie ARM is not an admitted build profile')
+        distro, arch, url, digest, algorithm, _ = rows[0]
+        self.assertEqual((distro, arch, algorithm), ('debian-trixie', 'x86_64', 'sha512sum'))
+        self.assertEqual(url, 'https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-amd64-20261001-2618.qcow2')
+        self.assertEqual(digest, 'f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d')
+        entry = IMAGE.policy(MANIFEST, 'debian-trixie-x86_64', url, digest, date(2026, 10, 3))
+        self.assertEqual(entry['algorithm'], 'sha512')
+        self.assertEqual(entry['signature_policy'], 'publisher-unsigned-cloud-checksums')
+        self.assertFalse(IMAGE.verify_signature(entry, MANIFEST.parent, Path('unused'))['signature_verified'])
 
     @unittest.skipUnless(GPGV, "OpenPGP verification requires gpgv")
     def test_real_publisher_checksum_signatures(self):

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Report QEMU evidence from a trusted workflow_run job without executing it."""
 import io
+import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -18,6 +20,36 @@ from qemu_inventory_policy import all_snapshots
 MAX_DOWNLOAD = 16 * 1024 * 1024
 FAILURES = {"FAIL", "PRODUCT_FAIL", "HARNESS_ERROR", "BLOCKED"}
 DISTROS = ("arch", "debian", "ubuntu", "fedora")
+GUEST_DISTROS = ("arch", "debian", "debian-trixie", "ubuntu", "fedora")
+
+
+def required_guest_distros(source):
+    """Read a closed guest profile from immutable workflow bytes, never execute it."""
+    if not isinstance(source, bytes) or not 0 < len(source) <= 256 * 1024:
+        raise ValueError("invalid guest profile source")
+    matches = re.findall(r"^ +distros='(\[[^\n]*\])' *$", source.decode('utf-8'), re.M)
+    if len(matches) != 1:
+        raise ValueError("missing or ambiguous default guest profile")
+    values = json.loads(matches[0])
+    if not isinstance(values, list) or tuple(values) not in (DISTROS, GUEST_DISTROS):
+        raise ValueError("unreviewed default guest profile")
+    return tuple(values)
+
+
+def run_guest_profile(repository, revision):
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository) or not re.fullmatch('[0-9a-f]{40}', revision):
+        raise ValueError("invalid guest profile owner")
+    path = '.github/workflows/qemu-matrix.yml'
+    value = json.loads(api(f'repos/{repository}/contents/{path}?ref={revision}'), object_pairs_hook=unique_object)
+    if (not isinstance(value, dict) or value.get('type') != 'file' or value.get('path') != path
+            or value.get('encoding') != 'base64' or type(value.get('size')) is not int
+            or not 0 < value['size'] <= 256 * 1024 or not isinstance(value.get('content'), str)):
+        raise ValueError("invalid source-bound workflow file")
+    content = base64.b64decode(value['content'].replace('\n', ''), validate=True)
+    blob = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+    if len(content) != value['size'] or value.get('sha') != blob:
+        raise ValueError("guest profile Git blob differs")
+    return required_guest_distros(content)
 
 
 def api(path, limit=1024 * 1024):
@@ -63,10 +95,10 @@ def canonical_case_ids(policy):
             case_id = case.get("id") if isinstance(case, dict) else None
             if not isinstance(case_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,120}", case_id):
                 raise ValueError("invalid inventory policy case")
-            identifiers.update(f"qemu-{distro}-{case_id}" for distro in DISTROS)
-    identifiers.update(f"qemu-{distro}-lifecycle" for distro in DISTROS)
+            identifiers.update(f"qemu-{distro}-{case_id}" for distro in GUEST_DISTROS)
+    identifiers.update(f"qemu-{distro}-lifecycle" for distro in GUEST_DISTROS)
     identifiers.update(f"qemu-{distro}-aarch64-lifecycle" for distro in DISTROS)
-    identifiers.update(f"qemu-{distro}-backend-mismatch" for distro in DISTROS)
+    identifiers.update(f"qemu-{distro}-backend-mismatch" for distro in GUEST_DISTROS)
     identifiers.add("qemu-matrix-workflow")
     identifiers.update(("qemu-matrix-x86-workflow", "qemu-matrix-arm-workflow",
                         "qemu-matrix-all-workflow", "qemu-arm-runner-kvm-health"))
@@ -142,7 +174,8 @@ def archive_rows(content, allowed_cases, diagnostics=None, *, guest=None, revisi
                         or not isinstance(row.get("case_id"), str)
                         or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", row["case_id"])
                         or row["case_id"] not in allowed_cases
-                        or row.get("distro") not in ("arch", "debian", "ubuntu", "fedora")
+                        or row.get("distro") not in GUEST_DISTROS
+                        or (row.get("distro") == "debian-trixie" and row.get("arch", "x86_64") != "x86_64")
                         or (row["case_id"] != "qemu-matrix-workflow"
                             and not row["case_id"].startswith(f"qemu-{row['distro']}-"))
                         or row.get("result") not in FAILURES | {"PASS", "SKIPPED"}
@@ -412,7 +445,7 @@ def projection(rows, verified_published):
                 and row["result"] in FAILURES}
 
     def covered(row):
-        if row["distro"] not in DISTROS:
+        if row["distro"] not in GUEST_DISTROS:
             # A matrix-wide receipt does not identify which guests failed.
             return False
         case_id = row["case_id"]
@@ -543,7 +576,7 @@ def failed_lane_guests(jobs):
             continue
         name = job["name"]
         arm = re.search(r"QEMU guest arm64 \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
-        x86 = re.search(r"(?:QEMU guest|Distro lane) \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
+        x86 = re.search(r"(?:QEMU guest|Distro lane) \((arch|debian|debian-trixie|ubuntu|fedora)\)(?:\s*/|$)", name)
         if arm:
             guests.add((arm.group(1), "aarch64"))
         elif x86:
@@ -560,7 +593,7 @@ def failed_guest_receipts(jobs):
 def case_job_details(run, jobs, row):
     source = "ci" if row["case_id"] == "ci-non-qemu-workflow" else "qemu-matrix"
     guest = ((row["distro"], row.get("arch", "x86_64"))
-             if row["distro"] in DISTROS
+             if row["distro"] in GUEST_DISTROS
              and row["case_id"].startswith((f"qemu-{row['distro']}-", "qemu-matrix-")) else None)
     details = []
     for job in jobs:
@@ -599,7 +632,7 @@ def workflow_receipt(jobs, conclusion):
         name = job["name"]
         job_conclusion = job.get("conclusion")
         if job_conclusion in ("failure", "timed_out", "cancelled", "action_required"):
-            lane = re.search(r"(?:^|/)\s*Distro lane \((arch|debian|ubuntu|fedora)\)(?:\s*/|$)", name)
+            lane = re.search(r"(?:^|/)\s*Distro lane \((arch|debian|debian-trixie|ubuntu|fedora)\)(?:\s*/|$)", name)
             if lane:
                 failed_lane_distros.add(lane.group(1))
             else:
@@ -674,8 +707,8 @@ def write_failure_catalog(directory, run, repository, failures, evidence_error):
 def retained_guest_artifact(artifact, run, jobs):
     """Admit old evidence only for a successful guest job carried into a rerun."""
     name = artifact["name"]
-    guest = re.fullmatch(r"qemu-(arm-)?evidence-(arch|debian|ubuntu|fedora)", name)
-    if guest is None:
+    guest = re.fullmatch(r"qemu-(arm-)?evidence-(arch|debian|debian-trixie|ubuntu|fedora)", name)
+    if guest is None or guest.group(1) and guest.group(2) == "debian-trixie":
         return False
     label = (f"QEMU guest arm64 ({guest.group(2)})" if guest.group(1)
              else f"QEMU guest ({guest.group(2)})")
@@ -688,8 +721,8 @@ def retained_guest_artifact(artifact, run, jobs):
 
 
 def artifact_guest_identity(name):
-    match = re.fullmatch(r"qemu-(arm-)?evidence-(arch|debian|ubuntu|fedora)", name)
-    if match is None:
+    match = re.fullmatch(r"qemu-(arm-)?evidence-(arch|debian|debian-trixie|ubuntu|fedora)", name)
+    if match is None or match.group(1) and match.group(2) == "debian-trixie":
         return None
     return match.group(2), "aarch64" if match.group(1) else "x86_64"
 
@@ -711,7 +744,9 @@ def main():
     # Keep the workflow failure reportable, but do not admit guest identities
     # using an incomplete allowlist or whatever happened to remain readable.
     evidence_error = False
+    required_distros = None
     try:
+        required_distros = run_guest_profile(repository, run['head_sha'])
         _, snapshots = all_snapshots(Path("tests/qemu-inventory-policy.json"))
         allowed_cases = canonical_case_ids({"inventories": snapshots})
     except (OSError, ValueError, KeyError, TypeError):
@@ -746,7 +781,7 @@ def main():
     rows = []
     diagnostics = {}
     try:
-        if allowed_cases is None or not jobs_valid:
+        if allowed_cases is None or not jobs_valid or required_distros is None:
             raise ValueError("unvalidated policy catalog or job listing")
         listing = json.loads(api(f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100"),
                              object_pairs_hook=unique_object)
@@ -754,7 +789,7 @@ def main():
         guest_artifacts = set()
         published_artifacts = {}
         for artifact in artifacts:
-            if not re.fullmatch(r"qemu-(?:arm-)?evidence-(?:arch|debian|ubuntu|fedora)|qemu-workflow-report", artifact["name"]):
+            if artifact_guest_identity(artifact["name"]) is None and artifact["name"] != "qemu-workflow-report":
                 continue
             # Re-run failed jobs retains successful jobs and their artifacts.
             # Carry those guests forward only when the latest job receipt still
@@ -785,14 +820,14 @@ def main():
                     raise ValueError("duplicate published guest artifact")
                 published_artifacts[artifact["name"]] = content
         if run["path"] == ".github/workflows/ci.yml" and run["conclusion"] == "success":
-            if (not {f"qemu-evidence-{distro}" for distro in DISTROS} <= guest_artifacts
-                    or not set(DISTROS) <= {row["distro"] for row in rows}):
+            if (not {f"qemu-evidence-{distro}" for distro in required_distros} <= guest_artifacts
+                    or not set(required_distros) <= {row["distro"] for row in rows}):
                 raise ValueError("successful CI is missing required Linux guest evidence")
         if published_candidate:
-            required = {f"qemu-evidence-{distro}" for distro in DISTROS}
+            required = {f"qemu-evidence-{distro}" for distro in required_distros}
             if set(published_artifacts) == required:
                 sources = {published_provenance(published_artifacts[f"qemu-evidence-{distro}"],
-                                                distro, run["head_sha"]) for distro in DISTROS}
+                                                distro, run["head_sha"]) for distro in required_distros}
                 if None in sources and len(sources) > 1:
                     raise ValueError("mixed staged and published guest artifacts")
                 if None not in sources:
@@ -805,7 +840,7 @@ def main():
                     latest = json.loads(api(f"repos/{repository}/releases/latest"))
                     admissions = [published_inventory_admission(
                         published_artifacts[f"qemu-evidence-{distro}"], distro,
-                        Path("tests/qemu-inventory-policy.json")) for distro in DISTROS]
+                        Path("tests/qemu-inventory-policy.json")) for distro in required_distros]
                     verified_published = latest.get("tag_name") == source_tag and all(admissions)
                     published_tag = source_tag if verified_published else None
                     published_revision = source_revision if verified_published else None
@@ -908,9 +943,11 @@ def main():
             if not verified_published:
                 helper.append("--failures-only")
             subprocess.run(helper, check=True, timeout=180)
-        if run["event"] == "pull_request" or evidence_error:
+        sentry_rows = (selected if run["event"] == "pull_request" or evidence_error else
+                       [row for row in selected if row["case_id"] == "ci-non-qemu-workflow"])
+        if sentry_rows:
             results = Path(directory) / "results-all.json"
-            results.write_text(json.dumps(selected) + "\n")
+            results.write_text(json.dumps(sentry_rows) + "\n")
             subprocess.run(["bash", "scripts/report-smoke-sentry.sh", str(results)], check=True, timeout=20)
     print(f"Reported run {run_id}, attempt {run['run_attempt']}, commit {run['head_sha']}")
     return 0
