@@ -1311,6 +1311,68 @@ impl PackageManager for HomebrewPackageManager {
 mod tests {
     use super::*;
 
+    async fn assert_retained_formula_versions(
+        versions: &[&str],
+        stable: &str,
+        expected_installed: &str,
+        expected_pending: bool,
+    ) -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cellar = root.path().join(CELLAR_DIR);
+        for version in versions {
+            fs::create_dir_all(cellar.join("retained-formula").join(version)).await?;
+        }
+        let cache = HomebrewPackageManager::build_cache(
+            vec![FormulaInfo {
+                name: "retained-formula".to_string(),
+                full_name: "retained-formula".to_string(),
+                desc: String::new(),
+                homepage: None,
+                versions: FormulaVersions {
+                    stable: Some(stable.to_string()),
+                    head: None,
+                    bottle: None,
+                },
+                installed: Vec::new(),
+            }],
+            Vec::new(),
+        );
+        let manager = HomebrewPackageManager {
+            prefix: root.path().to_path_buf(),
+            cellar,
+            cache: Arc::new(RwLock::new(Some(cache))),
+            client: crate::core::http::download_client().clone(),
+        };
+        let installed = manager.read_installed_packages().await?;
+        let updates = manager.list_updates().await?;
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            (installed[0].version.as_str(), !updates.is_empty()),
+            (expected_installed, expected_pending),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_formula_stable_satisfies_update_after_alpha_version() -> Result<()> {
+        assert_retained_formula_versions(&["1.0a", "1.0.1"], "1.0.1", "1.0.1", false).await
+    }
+
+    #[tokio::test]
+    async fn retained_formula_numeric_version_satisfies_update() -> Result<()> {
+        assert_retained_formula_versions(&["1.9", "1.10"], "1.10", "1.10", false).await
+    }
+
+    #[tokio::test]
+    async fn retained_formula_revision_satisfies_same_stable_update() -> Result<()> {
+        assert_retained_formula_versions(&["1.0.1", "1.0.1_1"], "1.0.1", "1.0.1_1", false).await
+    }
+
+    #[tokio::test]
+    async fn retained_formula_alpha_alone_needs_stable_update() -> Result<()> {
+        assert_retained_formula_versions(&["1.0a"], "1.0.1", "1.0a", true).await
+    }
+
     #[test]
     fn installed_version_selection_uses_numeric_ordering() {
         let directory = tempfile::tempdir().unwrap();
