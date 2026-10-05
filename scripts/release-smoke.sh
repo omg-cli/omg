@@ -447,9 +447,11 @@ resolve_artifact() {
   if [[ -n "$digest_pin_file" ]]; then
     verify_pinned_digest "$digest" "$archive" "$digest_pin_file" || return 1
   fi
-    if [[ "$executor" == "native" && -z "$staged_dir" ]]; then
+  if [[ -z "$staged_dir" ]]; then
       # A release uploader can replace an archive and its server-side digest.
-      # Verify the release workflow identity before extracting or running it.
+      # Verify the release workflow identity for every published executor
+      # before extracting or running it. Staged candidates are supplied by
+      # the release workflow before publication/attestation.
       local signer_repo="$repo"
       if [[ "$repo" == omg-cli/omg || "$repo" == PyRo1121/omg ]]; then
         signer_repo=omg-cli/omg

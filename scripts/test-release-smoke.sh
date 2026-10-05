@@ -134,6 +134,9 @@ ln -s fake-engine "$scratch/bin/docker"
 cat > "$scratch/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-} ${2:-}" == 'attestation verify' ]]; then
+  exit "${FAKE_ATTESTATION_EXIT:-0}"
+fi
 [[ "${1:-}" == "release" ]] || exit 2
 case "${2:-}" in
   view)
@@ -316,6 +319,13 @@ unset FAKE_RUN_EXIT
 grep -q '"result":"PRODUCT_FAIL"' "$(results_file "$scratch/remaining-defect")" || fail "remaining defect was hidden"
 
 export FAKE_GH_SOURCE="$scratch/valid"
+export FAKE_ATTESTATION_EXIT=1 FAKE_ENGINE_ARGS="$scratch/published-rejected-engine"
+assert_rc 3 "$runner" "${base_args[@]}" --evidence-dir "$scratch/published-rejected"
+grep -q '"result":"HARNESS_ERROR"' "$(results_file "$scratch/published-rejected")" || fail "invalid published provenance was not a harness error"
+if [[ -f "$FAKE_ENGINE_ARGS" ]]; then
+  grep -Fxq 'run' "$FAKE_ENGINE_ARGS" && fail "invalid published provenance reached container execution"
+fi
+unset FAKE_ATTESTATION_EXIT FAKE_ENGINE_ARGS
 assert_rc 0 "$runner" "${base_args[@]}" --evidence-dir "$scratch/published-evidence"
 grep -q '"result":"PASS"' "$(results_file "$scratch/published-evidence")" || fail "published artifact path did not pass"
 grep -q '"artifact_source":"published"' "$(results_file "$scratch/published-evidence")" || fail "published source is not recorded"
