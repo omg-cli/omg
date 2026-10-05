@@ -25,3 +25,9 @@ Control-plane comment/status receipts must be confirmed separately; timeout is n
 ## Write receipts
 
 Authenticated POST comment and PATCH blocked disposition each timed out at 15 seconds without a response. Both writes FAILED confirmation; server-side disposition is UNKNOWN. No successful task transition or recorded handoff claimed.
+## Unblock wake 2026-10-05
+
+Authentic run: 74b4a404-7f9c-41ba-a1db-3391a0386976.
+Server-supplied delta confirms that the prior progress comment persisted, despite its client timeout. That receipt does not prove API recovery. Fresh authenticated GET operations-status, triage-policy, and assigned task each timed out at 20 seconds. No admission, reassignment or guest-lane start occurred. Current capacity and queue eligibility remain unknown. Local Platform owns diagnosis of authenticated HTTP responsiveness; Delivery Manager resumes live native checks after recovery. Existing ownership and independent gates remain unchanged.
+
+Two consecutive audited blocked-disposition PATCH attempts timed out at 20 seconds. Writes stopped for this heartbeat. Final authenticated GET verification also timed out at 20 seconds; the server disposition remains unconfirmed. Runtime fallback must record the blocker if the API remains unavailable.
