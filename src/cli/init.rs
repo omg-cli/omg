@@ -268,7 +268,7 @@ pub async fn run_interactive(skip_shell: bool, skip_daemon: bool) -> Result<()> 
     }
 
     // Configure daemon startup
-    configure_daemon_startup(&mut stdout, state.daemon_startup)?;
+    configure_daemon_startup(&mut stdout, state.daemon_startup).await?;
 
     // Configure telemetry
     apply_telemetry_config(&mut stdout, state.telemetry_enabled)?;
@@ -387,7 +387,8 @@ pub async fn run_defaults(skip_shell: bool, skip_daemon: bool) -> Result<()> {
             } else {
                 DaemonStartup::OnDemand
             },
-        )?;
+        )
+        .await?;
     }
 
     capture_environment(&mut stdout).await?;
@@ -813,7 +814,7 @@ fn install_shell_hook(stdout: &mut io::Stdout, shell: Shell, start_daemon: bool)
     Ok(())
 }
 
-fn configure_daemon_startup(stdout: &mut io::Stdout, startup: DaemonStartup) -> Result<()> {
+async fn configure_daemon_startup(stdout: &mut io::Stdout, startup: DaemonStartup) -> Result<()> {
     write!(stdout, "  ")?;
     write_styled(stdout, Color::Blue, "→")?;
     write!(stdout, " Configuring daemon...")?;
@@ -824,7 +825,7 @@ fn configure_daemon_startup(stdout: &mut io::Stdout, startup: DaemonStartup) -> 
             write_styled(stdout, Color::Green, "✓")?;
             writeln!(stdout, " (via shell hook)")?;
         }
-        DaemonStartup::OnDemand => match start_on_demand_daemon() {
+        DaemonStartup::OnDemand => match start_on_demand_daemon().await {
             Ok(()) => {
                 write!(stdout, " ")?;
                 write_styled(stdout, Color::Green, "✓")?;
@@ -846,9 +847,11 @@ fn configure_daemon_startup(stdout: &mut io::Stdout, startup: DaemonStartup) -> 
     Ok(())
 }
 
-fn start_on_demand_daemon() -> Result<()> {
+async fn start_on_demand_daemon() -> Result<()> {
+    use std::time::Duration;
+
     let daemon = omgd_sibling_path().context("matching omgd binary was not found next to omg")?;
-    Command::new(daemon)
+    let mut child = Command::new(daemon)
         .arg("--")
         // Detach stdio: the daemon outlives this process, and an inherited
         // pipe would keep the parent's readers open forever.
@@ -857,7 +860,28 @@ fn start_on_demand_daemon() -> Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .context("Failed to start the OMG daemon")?;
-    Ok(())
+    // Process creation is not readiness. Bound the entire wait, including
+    // connection retries and ping I/O, instead of counting sleeps alone.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            // A healthy existing daemon can answer even if this redundant
+            // child exits after losing the singleton lock.
+            if let Ok(mut client) = crate::core::client::DaemonClient::connect().await
+                && client.ping().await.is_ok()
+            {
+                return Ok(());
+            }
+            if let Some(status) = child
+                .try_wait()
+                .context("Failed to check OMG daemon startup")?
+            {
+                anyhow::bail!("OMG daemon exited before readiness: {status}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("Timed out waiting for OMG daemon readiness")?
 }
 
 /// Resolve the `omgd` binary shipped next to the running `omg`, so a PATH
