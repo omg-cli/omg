@@ -73,7 +73,7 @@ For Rust changes, run the narrowest useful check first. These commands check
 formatting and a selected backend without changing packages:
 
 ```bash
-cargo fmt --all -- --check
+make fmt-check
 cargo check --locked --no-default-features --features arch,pgp,license
 ```
 
@@ -83,6 +83,11 @@ Unix development host, `make ci-local-quick` runs shell syntax checks, Python
 fixtures, formatting, portable compilation, and fuzz compilation. The full
 gate adds feature-specific Clippy and nextest runs. It needs the tools named
 in [Makefile](Makefile), including `cargo nextest` for the full gate.
+
+`make fmt-check` selects the root package, both standalone test manifests, and
+the fuzz manifest explicitly using the pinned toolchain in `rust-toolchain.toml`.
+Use `make fmt` to apply formatting to the same packages. Root `cargo fmt --all`
+alone does not cover the independent standalone entry files.
 
 ```bash
 make ci-local-quick

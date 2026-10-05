@@ -146,11 +146,17 @@ check:
 
 # Format code
 fmt:
-	cargo fmt
+	cargo fmt --all
+	cargo fmt --manifest-path tests/env-portable/Cargo.toml --all
+	cargo fmt --manifest-path tests/mise-compat/Cargo.toml --all
+	cargo fmt --manifest-path fuzz/Cargo.toml --all
 
 # Check formatting without modifying
 fmt-check:
-	cargo fmt -- --check
+	cargo fmt --all -- --check
+	cargo fmt --manifest-path tests/env-portable/Cargo.toml --all -- --check
+	cargo fmt --manifest-path tests/mise-compat/Cargo.toml --all -- --check
+	cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
 
 # Run clippy with warnings as errors
 clippy:
@@ -285,8 +291,7 @@ debt-refresh:
 	python3 scripts/debt-ratchet.py --refresh
 
 # Hosted prerequisite: no compilation before independent platform jobs.
-ci-workflow-quick: check-shell-syntax
-	cargo fmt --all -- --check
+ci-workflow-quick: check-shell-syntax fmt-check
 	python3 -m unittest discover -s scripts -p 'test_*.py'
 	python3 tests/test_benchmark_records.py
 	python3 tests/test_terminal_update_notice.py
