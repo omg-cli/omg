@@ -210,7 +210,8 @@ p384 = { version = "=0.13.1", features = ["ecdsa", "pkcs8"] }
 x509-parser = { version = "=0.18.1", default-features = false, features = ["verify"] }
 
 # System calls (for disk space checks, etc.)
-nix = { version = "0.31", features = ["fs", "signal", "user"] }
+nix = { version = "0.31", features = ["fs", "signal", "term", "user"] }
+signal-hook = "0.3.18"
 
 # Date & Time
 jiff = { version = "0.2.21", features = ["serde"] }

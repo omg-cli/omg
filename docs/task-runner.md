@@ -94,6 +94,28 @@ omg run test --watch
 
 Watch mode reruns a single task when watched files change. Stop it with Ctrl+C.
 
+On Unix, each running task owns a separate process group. SIGINT, SIGTERM,
+or SIGHUP sent to OMG cancels the active task scopes, including parallel tasks
+and an idle watcher. OMG forwards the signal to each owned group, allows
+250 milliseconds for graceful interruption, sends SIGTERM, then sends SIGKILL
+after another 750 milliseconds and reaps its direct child. Background children
+that ignore SIGINT are included while they remain in the owned group.
+
+A single foreground task receives access to the controlling terminal; OMG
+restores its original foreground group afterward. In parallel mode only one
+task can own terminal input at a time. An unhandled SIGINT, SIGTERM, or SIGHUP
+killing the foreground task also triggers group cleanup. If a foreground task
+deliberately ignores or handles a terminal interrupt without exiting, send the
+cancellation signal to OMG itself to initiate cleanup.
+
+Descendants that deliberately create a separate session or process group escape
+this ownership boundary. OMG does not manage external Docker services, cannot
+clean up after OMG itself is killed with SIGKILL, and does not reap grandchildren
+reparented to the system's child reaper. Normal task completion keeps its existing
+exit behavior. Kernel tasks stuck in uninterruptible sleep may delay reaping
+even after SIGKILL; the grace periods bound signal escalation, not that kernel
+wait.
+
 ```bash
 omg run build,test --parallel
 ```

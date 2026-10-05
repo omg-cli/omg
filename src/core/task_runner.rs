@@ -15,6 +15,10 @@ use crate::runtimes::{BunManager, NodeManager};
 
 static TASK_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(unix)]
+#[path = "task_process.rs"]
+mod task_process;
+
 fn lock_task_setup() -> std::sync::MutexGuard<'static, ()> {
     TASK_SETUP_LOCK
         .lock()
@@ -534,6 +538,10 @@ pub fn run_task_advanced(
     using: Option<&str>,
     all: bool,
 ) -> Result<()> {
+    #[cfg(unix)]
+    let cancellation = task_process::Cancellation::enter()?;
+    #[cfg(unix)]
+    cancellation.check()?;
     // SECURITY: Validate task name
     validate_task_name(task_name)?;
 
@@ -588,6 +596,8 @@ pub fn run_task_advanced(
     }
 
     for task in matches {
+        #[cfg(unix)]
+        cancellation.check()?;
         println!(
             "{} Running task '{}' via {} ({})...",
             style::runtime("OMG"),
@@ -930,6 +940,10 @@ fn execute_process_in(
     working_dir: &Path,
     task_root: &Path,
 ) -> Result<()> {
+    #[cfg(unix)]
+    let cancellation = task_process::Cancellation::enter()?;
+    #[cfg(unix)]
+    cancellation.check()?;
     // Project selection remains tied to the invocation directory. Each task
     // gets its own cwd and declaring root without changing process-global cwd.
     anyhow::ensure!(
@@ -1052,6 +1066,10 @@ fn execute_process_in(
         apply_resolved_environment(&mut command, &resolved)?;
     }
 
+    #[cfg(unix)]
+    let status = task_process::run(&mut command, &cancellation)
+        .with_context(|| format!("Failed to execute '{cmd}'"))?;
+    #[cfg(not(unix))]
     let status = command
         .status()
         .with_context(|| format!("Failed to execute '{cmd}'"))?;
@@ -1314,6 +1332,9 @@ pub fn run_task_watch(task_name: &str, extra_args: &[String]) -> Result<()> {
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
+    #[cfg(unix)]
+    let cancellation = task_process::Cancellation::enter()?;
+
     println!(
         "{} Watch mode: {} (Ctrl+C to stop)\n",
         style::runtime("OMG"),
@@ -1324,6 +1345,8 @@ pub fn run_task_watch(task_name: &str, extra_args: &[String]) -> Result<()> {
     if let Err(error) = run_task(task_name, extra_args) {
         eprintln!("{} Task failed: {error}", style::caution("!"));
     }
+    #[cfg(unix)]
+    cancellation.check()?;
 
     // Set up file watcher. Events under build-artifact/VCS directories are
     // dropped: without this filter, watching a project root turns `target/`
@@ -1378,9 +1401,23 @@ pub fn run_task_watch(task_name: &str, extra_args: &[String]) -> Result<()> {
 
     println!("  {} Watching for changes...\n", style::dim("→"));
 
-    process_watch_events(&rx, Duration::from_millis(300), || {
-        rerun_task_in_watch(task_name, extra_args);
-    });
+    process_watch_events(
+        &rx,
+        Duration::from_millis(300),
+        || rerun_task_in_watch(task_name, extra_args),
+        || {
+            #[cfg(unix)]
+            {
+                cancellation.signal().is_some()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        },
+    );
+    #[cfg(unix)]
+    cancellation.check()?;
     Ok(())
 }
 
@@ -1388,18 +1425,37 @@ fn process_watch_events<T>(
     receiver: &std::sync::mpsc::Receiver<T>,
     debounce: std::time::Duration,
     mut rerun: impl FnMut(),
+    should_stop: impl Fn() -> bool,
 ) {
-    while receiver.recv().is_ok() {
+    let poll = std::time::Duration::from_millis(50);
+    while !should_stop() {
+        match receiver.recv_timeout(poll) {
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
         // Wait for a quiet debounce window, resetting it for every new event.
         // Events queued while the task runs become one subsequent batch rather
         // than one rerun per stale event.
+        let mut deadline = std::time::Instant::now() + debounce;
         let disconnected = loop {
-            match receiver.recv_timeout(debounce) {
-                Ok(_) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break false,
+            if should_stop() {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match receiver.recv_timeout(remaining.min(poll)) {
+                Ok(_) => deadline = std::time::Instant::now() + debounce,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if std::time::Instant::now() >= deadline {
+                        break false;
+                    }
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break true,
             }
         };
+        if should_stop() {
+            break;
+        }
         rerun();
         if disconnected {
             break;
@@ -1448,6 +1504,12 @@ async fn run_on_blocking_worker<T: Send + 'static>(
 
 /// Run multiple tasks in parallel (comma-separated task names).
 pub async fn run_tasks_parallel(tasks_str: &str, extra_args: &[String]) -> Result<()> {
+    // Keep one cancellation scope alive until every blocking task has reaped
+    // its child, including workers that have not reached spawn yet.
+    #[cfg(unix)]
+    let cancellation = task_process::Cancellation::enter()?;
+    #[cfg(unix)]
+    cancellation.check()?;
     let mut task_names = parse_parallel_task_names(tasks_str)?;
 
     if task_names.len() == 1 {
@@ -1657,16 +1719,21 @@ mod tests {
         let mut sender_during_run = Some(sender);
         let mut runs = 0;
 
-        process_watch_events(&receiver, std::time::Duration::from_millis(1), || {
-            runs += 1;
-            if runs == 1 {
-                let sender = sender_during_run.take().unwrap();
-                for _ in 0..8 {
-                    sender.send(()).unwrap();
+        process_watch_events(
+            &receiver,
+            std::time::Duration::from_millis(1),
+            || {
+                runs += 1;
+                if runs == 1 {
+                    let sender = sender_during_run.take().unwrap();
+                    for _ in 0..8 {
+                        sender.send(()).unwrap();
+                    }
+                    drop(sender);
                 }
-                drop(sender);
-            }
-        });
+            },
+            || false,
+        );
 
         assert_eq!(runs, 2, "events during one run require one follow-up run");
     }
@@ -1680,7 +1747,12 @@ mod tests {
         drop(sender);
         let mut runs = 0;
 
-        process_watch_events(&receiver, std::time::Duration::from_millis(1), || runs += 1);
+        process_watch_events(
+            &receiver,
+            std::time::Duration::from_millis(1),
+            || runs += 1,
+            || false,
+        );
 
         assert_eq!(runs, 1);
     }
