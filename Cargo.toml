@@ -29,6 +29,11 @@ path = "src/bin/omg.rs"
 name = "omgd"
 path = "src/bin/omgd.rs"
 
+# Environment transitions run only in disposable single-threaded processes.
+[[test]]
+name = "distro_override"
+harness = false
+
 # Criterion benchmarks. Each target defines its own entry point via
 # `criterion_main!`, so every one MUST declare `harness = false`; with the
 # default libtest harness rustc skips its injected main and criterion never
