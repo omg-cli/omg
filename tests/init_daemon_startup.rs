@@ -69,18 +69,22 @@ impl Fixture {
 #[test]
 fn init_reports_child_failure_and_continues_setup() -> Result<()> {
     let fixture = Fixture::new("#!/bin/sh\nprintf executed > child-marker\nexit 37\n")?;
+    let marker = fixture.directory.path().join("child-marker");
+    let control = Command::new(fixture.directory.path().join("omgd"))
+        .current_dir(fixture.directory.path())
+        .env_clear()
+        .status()?;
+    assert_eq!(control.code(), Some(37));
+    std::fs::remove_file(&marker)?;
     let output = fixture.run()?;
     let stdout = String::from_utf8(output.stdout)?;
     assert!(output.status.success(), "{stdout}");
+    assert_eq!(std::fs::read_to_string(marker)?, "executed");
     assert!(stdout.contains("not started:"), "{stdout}");
     assert!(stdout.contains("37"), "{stdout}");
     assert!(stdout.contains("continuing setup"), "{stdout}");
     assert!(stdout.contains("Setup complete!"), "{stdout}");
     assert!(!stdout.contains("(started)"), "{stdout}");
-    assert_eq!(
-        std::fs::read_to_string(fixture.directory.path().join("child-marker"))?,
-        "executed"
-    );
     Ok(())
 }
 
