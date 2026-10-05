@@ -30,6 +30,20 @@ intermediate parents waiting for children. Maximum RSS is a high-water value,
 not simultaneous aggregate tree memory. Persistent daemons, detached/unwaited
 descendants and other workers are not measured by this collector.
 
+`max_rss_kib` is raw process-lifetime RSS, including the child's pre-exec
+image, rather than executable-only memory. Linux preserves resource usage
+across exec (the Notes section of the Linux contract above). A child spawned
+from a loaded caller can therefore retain a pre-exec RSS floor larger than
+the executable's own peak. This is distinct from previous-child cumulative
+accounting; neither a caller-floor subtraction nor an RSS delta is valid.
+For comparable samples, launch the CLI as a fresh lightweight process that
+then launches the workload, and keep that launcher and environment consistent.
+Exec of the collector does not reset its own lifetime accounting, but frees
+the loaded image before the collector launches the measured child. The
+reported PID and usage belong to that measured child, not to the outer CLI.
+Other launch mechanisms/platforms can differ; this does not promise a
+universal floor or establish the allocation in an earlier hosted failure.
+
 Elapsed timing uses monotonic time from before spawn to after reaping, including
 spawn and polling overhead, excluding output hashing. Polling sleeps 1 ms.
 Timeout kills the owned process group and reaps the direct child. Commands that
@@ -45,12 +59,18 @@ the host's actual resolution. Linux-only units are explicitly enforced.
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_resource_collector.py -v
 ```
 
-Seven real-process controls cover CPU load, touched 64 MiB memory, a following
-small child (detecting cumulative RSS contamination), nonzero exit, binary stdout
+Nine real-process controls cover CPU load, touched 64 MiB memory, a following
+small child in the same fresh collector (detecting cumulative RSS contamination),
+the same pair while the test caller retains 96 MiB, direct loaded-caller raw
+RSS floor, nonzero exit, binary stdout
 and stderr hashes, timeout and reaping, sleep elapsed distinct from CPU, invalid
-timeouts, missing executable, and the CLI failure contract. Before implementation,
-all seven failed with the explicit missing-collector assertion. After implementation
-all passed on WSL archlinux as omg-audit, Python 3.14.7. These numbers validate
+timeouts, missing executable, and the CLI failure contract. The memory pair
+retains its 64 MiB allocation and strict 32 MiB separation assertion. Before
+the isolation repair, the retained loaded-caller regression failed that
+assertion; direct raw collection remains intentionally subject to the floor.
+The original seven missing-collector failures and subsequent positive-control
+passes are historical evidence, not proof that the isolation defect was absent.
+These controls validate
 the collector only; they are not an OMG performance baseline. Exact commands,
 hashes and run output are retained in the Paperclip task evidence.
 

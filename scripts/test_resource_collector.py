@@ -33,12 +33,50 @@ class ResourceCollectorTests(unittest.TestCase):
         self.assertGreaterEqual(result["elapsed_seconds"], 0.1)
         self.assertFalse(result["timed_out"])
 
-    def test_memory_positive_control_and_no_previous_child_contamination(self):
-        big = self.run_child("x=bytearray(64*1024*1024); print(len(x))")
-        small = self.run_child("print('small')")
+    def assert_isolated_memory_discrimination(self):
+        # Exec a lightweight collector before it forks either measured child.
+        # Both measurements share that collector to detect cumulative RSS misuse.
+        worker = (
+            "import json, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from resource_collector import collect\n"
+            "for code in (\"x=bytearray(64*1024*1024); print(len(x))\", \"print('small')\"):\n"
+            " print(json.dumps(collect([sys.executable, '-c', code], 3, sys.argv[2])))\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", worker, str(Path(__file__).parent), self.scratch.name],
+            capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+        self.assertEqual(completed.stderr, b"")
+        records = completed.stdout.splitlines()
+        self.assertEqual(len(records), 2)
+        big, small = map(json.loads, records)
+        print(completed.stdout.decode(), end="")
+        for result, output in ((big, b"67108864\n"), (small, b"small\n")):
+            self.assertEqual(result["exit_code"], 0)
+            self.assertFalse(result["timed_out"])
+            self.assertEqual(result["stdout_bytes"], len(output))
+            self.assertEqual(result["stdout_sha256"], hashlib.sha256(output).hexdigest())
         self.assertGreater(big["max_rss_kib"], 64*1024)
         self.assertGreater(small["max_rss_kib"], 0)
         self.assertLess(small["max_rss_kib"], big["max_rss_kib"] - 32*1024)
+
+    def test_memory_positive_control_and_no_previous_child_contamination(self):
+        self.assert_isolated_memory_discrimination()
+
+    def test_memory_discrimination_with_retained_loaded_caller(self):
+        retained = bytearray(96*1024*1024)
+        self.assert_isolated_memory_discrimination()
+        self.assertEqual(len(retained), 96*1024*1024)
+
+    def test_raw_rss_includes_loaded_caller_pre_exec_floor(self):
+        retained = bytearray(96*1024*1024)
+        result = self.run_child("print('small')")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["timed_out"])
+        self.assertGreaterEqual(result["max_rss_kib"], 96*1024)
+        self.assertEqual(len(retained), 96*1024*1024)
 
     def test_nonzero_exit_and_binary_output_identity(self):
         result = self.run_child("import os; os.write(1,b'hello\\x00\\xff'); os.write(2,b'failure'); raise SystemExit(7)")

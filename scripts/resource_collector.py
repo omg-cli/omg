@@ -2,6 +2,10 @@
 
 CPU includes descendants the child itself waited for. Maximum RSS is a
 high-water value in KiB, not simultaneous aggregate process-tree memory.
+RSS covers the child's raw process lifetime, including its pre-exec image:
+a loaded caller can impose a floor even on a small executable. Exec does not
+reset resource usage. Use a fresh lightweight collector for comparisons;
+no caller-floor or cumulative-RSS subtraction is performed.
 Detached/unwaited descendants and persistent daemons are outside this scope.
 Use only trusted bounded commands that do not escape their process group.
 """
@@ -64,7 +68,7 @@ def collect(command, timeout, scratch_dir):
         "elapsed_seconds": elapsed, "elapsed_clock": "monotonic",
         "user_cpu_seconds": usage.ru_utime, "system_cpu_seconds": usage.ru_stime,
         "max_rss_kib": usage.ru_maxrss,
-        "resource_scope": "wait4 child and waited descendants; RSS is not aggregate tree usage",
+        "resource_scope": "wait4 child and waited descendants; raw process-lifetime RSS includes pre-exec floor; RSS is not aggregate tree usage",
         "stdout_bytes": stdout_size, "stdout_sha256": stdout_hash,
         "stderr_bytes": stderr_size, "stderr_sha256": stderr_hash,
     }
