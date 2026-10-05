@@ -27,7 +27,7 @@ fn aur_build_concurrency(raw: Option<&str>, configured_default: usize) -> usize 
         }
     }
 
-    let configured_default = configured_default.max(MIN_AUR_BUILD_CONCURRENCY);
+    let configured_default = clamp(configured_default);
     let Some(raw) = raw else {
         return configured_default;
     };
@@ -664,6 +664,26 @@ mod tests {
     fn aur_parallel_unset_uses_default() {
         assert_eq!(aur_build_concurrency(None, 5), 5);
         assert_eq!(aur_build_concurrency(None, 0), 1);
+    }
+
+    #[test]
+    fn aur_parallel_unset_caps_high_configured_default() {
+        assert_eq!(aur_build_concurrency(None, 64), 8);
+        assert_eq!(aur_build_concurrency(None, usize::MAX), 8);
+    }
+
+    #[test]
+    fn aur_parallel_invalid_caps_high_configured_default() {
+        for raw in ["abc", "", "-2", "18446744073709551616"] {
+            assert_eq!(aur_build_concurrency(Some(raw), 64), 8, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn aur_parallel_override_takes_precedence_over_high_default() {
+        assert_eq!(aur_build_concurrency(Some("4"), 64), 4);
+        assert_eq!(aur_build_concurrency(Some("0"), 64), 1);
+        assert_eq!(aur_build_concurrency(Some("1000000"), 64), 8);
     }
 
     #[test]
