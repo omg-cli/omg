@@ -300,6 +300,7 @@ rusqlite = { version = "0.40", features = [
 cvss = "2.2.0"
 
 [dev-dependencies]
+stats_alloc = "=0.1.10" # Allocation regression instrumentation; no runtime dependency.
 lzma-rs = "0.3" # Test-only XZ encoder for synthetic archives.
 tokio = { version = "1.49", features = ["test-util"] }
 rcgen = "=0.13.2"

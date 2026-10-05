@@ -58,6 +58,7 @@ name = "allocations"
 path = "src/allocations.rs"
 [dependencies]
 nucleo-matcher = "=0.3.1"
+stats_alloc = "=0.1.10"
 ''', encoding="utf-8")
     environment = os.environ.copy()
     environment["CARGO_BUILD_JOBS"] = "2"

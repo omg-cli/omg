@@ -1,34 +1,12 @@
 //! Allocation regression for the production completion path, in its own process.
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::alloc::System;
+
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 use omg_lib::core::completion::CompletionEngine;
 
-struct CountingAllocator;
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-// SAFETY: Every operation delegates the unchanged pointer/layout to System.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: The caller supplies the GlobalAlloc layout contract.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: The caller supplies the original allocated pointer/layout.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: The caller supplies the GlobalAlloc realloc contract.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 #[test]
 fn fuzzy_ranking_allocations_grow_with_candidates() {
@@ -46,12 +24,15 @@ fn fuzzy_ranking_allocations_grow_with_candidates() {
                 }
             })
             .collect();
-        let before = ALLOCATIONS.load(Ordering::Relaxed);
+        let region = Region::new(ALLOCATOR);
         let ranked = engine.fuzzy_match("pkg", candidates);
-        let allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
+        let stats = region.change();
+        let allocations = stats.allocations + stats.reallocations;
         println!(
-            "candidates={count} matches={} allocations={allocations}",
-            ranked.len()
+            "candidates={count} matches={} allocations={allocations} allocated_bytes={} reallocated_bytes_delta={}",
+            ranked.len(),
+            stats.bytes_allocated,
+            stats.bytes_reallocated
         );
         assert_eq!(ranked.len(), count);
         // Scoring may allocate a UTF32 buffer per candidate. Collection growth,
