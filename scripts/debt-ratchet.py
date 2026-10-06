@@ -11,12 +11,24 @@ Usage:
     python3 scripts/debt-ratchet.py                 # gate (exit 1 on regression)
     python3 scripts/debt-ratchet.py --report        # verbose status for all files
     python3 scripts/debt-ratchet.py --refresh       # lower the floor after cleanup
+    python3 scripts/debt-ratchet.py --ci            # verified event-base floor
+
+CI requires the Actions event repository and SHA to match the checkout. The
+floor comes from the PR merge's exact base parent, merge_group.base_sha, or
+push.before. Manual dispatch compares against the selected commit's first
+parent (not a claim of branch approval). Missing identities, Git objects or
+baselines fail closed. CI cannot seed/refresh or select an alternate baseline
+directory; standalone seeding/refresh retains the local-file contract above.
+This is policy independence, not a boundary against edits to the checker/workflow.
 
 Exit codes: 0 clean, 1 regression or refused refresh, 2 invalid usage,
 4 configuration error.
 """
 import argparse
+import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -189,19 +201,92 @@ def baseline_path(baseline_dir, name):
 def read_baseline(path):
     if not path.exists():
         return None
-    entries = {}
     try:
-        for number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), start=1):
-            if not line.strip():
-                continue
-            match = re.fullmatch(r'(\d+) = (.+)', line)
-            if not match:
-                raise ValueError(f'{path}:{number}: invalid baseline row')
-            entries[match.group(2)] = int(match.group(1))
-    except (OSError, ValueError) as error:
+        return parse_baseline(path.read_text(encoding='utf-8'), path)
+    except (OSError, ValueError, UnicodeError) as error:
         print(f'configuration error: {error}', file=sys.stderr)
         raise SystemExit(4) from error
+
+
+def parse_baseline(text, source):
+    entries = {}
+    for number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        match = re.fullmatch(r'(\d+) = (.+)', line)
+        if not match:
+            raise ValueError(f'{source}:{number}: invalid baseline row')
+        entries[match.group(2)] = int(match.group(1))
     return entries
+
+
+def git_output(root, *args):
+    """Read actual objects, without local replacement-object substitution."""
+    try:
+        return subprocess.run(
+            ['git', *args], cwd=root, check=True, capture_output=True,
+            text=True, encoding='utf-8', timeout=30,
+            env=dict(os.environ, GIT_NO_REPLACE_OBJECTS='1'),
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError('cannot verify CI Git identity or baseline object') from error
+
+
+def commit_identity(value):
+    if (not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{40}', value)
+            or value == '0' * 40):
+        raise ValueError('missing or invalid CI commit identity')
+    return value
+
+
+def ci_baselines(root):
+    """Bind the independently stored floor to the runner-supplied event."""
+    event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
+    repository = os.environ['GITHUB_REPOSITORY']
+    if not repository or event['repository']['full_name'] != repository:
+        raise ValueError('CI event repository mismatch')
+    head = commit_identity(os.environ['GITHUB_SHA'])
+    if Path(git_output(root, 'rev-parse', '--show-toplevel').strip()).resolve() != root:
+        raise ValueError('CI root is not the checkout root')
+    if git_output(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != head:
+        raise ValueError('CI checkout SHA mismatch')
+    name = os.environ['GITHUB_EVENT_NAME']
+    if name == 'pull_request':
+        pr = event['pull_request']
+        if pr['base']['repo']['full_name'] != repository:
+            raise ValueError('PR base repository mismatch')
+        base = commit_identity(pr['base']['sha'])
+        candidate = commit_identity(pr['head']['sha'])
+        parents = git_output(root, 'show', '-s', '--format=%P', head).strip().split()
+        if parents != [base, candidate]:
+            raise ValueError('PR merge parents do not match event base/head')
+    elif name == 'merge_group':
+        base = commit_identity(event['merge_group']['base_sha'])
+        if commit_identity(event['merge_group']['head_sha']) != head:
+            raise ValueError('merge group checkout SHA mismatch')
+    elif name == 'push':
+        base = commit_identity(event['before'])
+        if commit_identity(event['after']) != head:
+            raise ValueError('push checkout SHA mismatch')
+    elif name == 'workflow_dispatch':
+        # Dispatch has no event base; use the authenticated commit's first parent.
+        base = commit_identity(git_output(root, 'rev-parse', '--verify', 'HEAD^1').strip())
+    else:
+        raise ValueError('unsupported CI event for debt baseline verification')
+    if base == head:
+        raise ValueError('CI baseline must precede candidate')
+    if git_output(root, 'rev-parse', '--verify', f'{base}^{{commit}}').strip() != base:
+        raise ValueError('CI base is not the expected commit')
+    git_output(root, 'merge-base', '--is-ancestor', base, head)
+    floors = {}
+    for ratchet in RATCHETS:
+        path = baseline_path(BASELINE_DIR, ratchet).as_posix()
+        floors[ratchet] = parse_baseline(git_output(root, 'show', f'{base}:{path}'),
+                                        f'{base}:{path}')
+        if read_baseline(root / path) is None:
+            raise ValueError(f'missing candidate baseline: {path}')
+    print(f'CI debt floor: event={name} base={base} candidate={head}')
+    return floors
 
 
 def render_baseline(counts):
@@ -229,7 +314,10 @@ def main(argv=None):
     parser.add_argument('--baseline-dir', type=Path, default=None)
     parser.add_argument('--refresh', action='store_true')
     parser.add_argument('--report', action='store_true')
+    parser.add_argument('--ci', action='store_true')
     args = parser.parse_args(argv)
+    if args.ci and (args.refresh or args.baseline_dir is not None):
+        parser.error('--ci cannot refresh/seed or override the baseline directory')
 
     root = args.root.resolve()
     baseline_dir = (args.baseline_dir or root / BASELINE_DIR).resolve()
@@ -239,12 +327,25 @@ def main(argv=None):
 
     failures = []
     summaries = []
+    try:
+        floors = ci_baselines(root) if args.ci else None
+    except (KeyError, TypeError, OSError, ValueError) as error:
+        print(f'configuration error: CI debt floor unavailable: {error}', file=sys.stderr)
+        return 4
     for name, pattern in RATCHETS.items():
         counts = count_matches(root, pattern)
         path = baseline_path(baseline_dir, name)
         baseline = read_baseline(path)
         seeding = baseline is None
         baseline = baseline or {}
+        raised = []
+        if floors is not None:
+            raised, _ = evaluate(baseline, floors[name])
+            # Adding a zero row does not increase the implicit zero floor.
+            raised = [finding for finding in raised if finding[1]]
+            for offender, count, previous in raised:
+                failures.append(f'{name}: floor increased: {offender} = {count}'
+                                f' (verified base {previous or 0})')
         regressions, fixed = evaluate(counts, baseline)
 
         for offender, previous, count in fixed:
@@ -279,7 +380,7 @@ def main(argv=None):
                 + (f' (baseline {previous})' if previous is not None else '')
             )
         summaries.append(
-            f'{name}: {"pass" if not regressions else "fail"} '
+            f'{name}: {"pass" if not regressions and not raised else "fail"} '
             f'({sum(counts.values())} findings, {len(fixed)} improved)'
         )
 
