@@ -158,6 +158,63 @@ async fn http_request(
 #[serial_test::serial]
 async fn real_server_fetches_scores_and_rejects_failed_scans_before_recovery() -> anyhow::Result<()>
 {
+    const TEST: &str = "daemon::handlers::audit_transport_tests::real_server_fetches_scores_and_rejects_failed_scans_before_recovery";
+    const CHILD: &str = "OMG_AUDIT_TRANSPORT_ISOLATED_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+        // Other tests enqueue events through the same process-global writer.
+        // Keep this real server and its owned audit directory in one process
+        // so unrelated producers cannot recreate the directory during cleanup.
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", TEST, "--nocapture", "--color", "never"])
+            .env(CHILD, TEST)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdout = child.stdout.take().context("missing child stdout")?;
+        let stderr = child.stderr.take().context("missing child stderr")?;
+        const MAX_OUTPUT: u64 = 256 * 1024;
+        let capture = async {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let mut stdout = stdout.take(MAX_OUTPUT + 1);
+            let mut stderr = stderr.take(MAX_OUTPUT + 1);
+            let (status, _, _) = tokio::try_join!(
+                child.wait(),
+                stdout.read_to_end(&mut out),
+                stderr.read_to_end(&mut err),
+            )?;
+            anyhow::Ok((status, out, err))
+        };
+        let (status, out, err) = match timeout(Duration::from_secs(60), capture).await {
+            Ok(Ok(output)) => output,
+            failure => {
+                if child.try_wait()?.is_none() {
+                    child.kill().await?;
+                }
+                child.wait().await?;
+                anyhow::bail!("isolated audit transport did not finish: {failure:?}");
+            }
+        };
+        anyhow::ensure!(
+            out.len() <= MAX_OUTPUT as usize && err.len() <= MAX_OUTPUT as usize,
+            "isolated audit output exceeded its bound"
+        );
+        let out = String::from_utf8(out)?;
+        let err = String::from_utf8(err)?;
+        anyhow::ensure!(
+            status.success(),
+            "isolated audit transport failed: {status}\n{out}\n{err}"
+        );
+        anyhow::ensure!(
+            out.lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+            "isolated audit transport must execute its test: {out}"
+        );
+        println!("AUDIT_TRANSPORT_CHILD_BEGIN\n{out}\n{err}\nAUDIT_TRANSPORT_CHILD_END");
+        return Ok(());
+    }
     let temp = tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()?;
