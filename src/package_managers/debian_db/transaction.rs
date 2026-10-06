@@ -1036,13 +1036,33 @@ impl Transaction {
         .await
         .context("Debian removal validation task failed")??;
 
-        let _process_lock = DPKG_TRANSACTION_LOCK.lock().await;
-        let _dpkg_locks = acquire_dpkg_locks().await?;
-        let _journal = DpkgTransactionJournalGuard::acquire("remove", &package_names).await?;
-        tokio::task::spawn_blocking(move || execute_removal_blocking(&package_names))
-            .await
-            .context("Package removal task failed")?
+        let process_lock = Arc::clone(&DPKG_TRANSACTION_LOCK).lock_owned().await;
+        let dpkg_locks = acquire_dpkg_locks().await?;
+        let journal = DpkgTransactionJournalGuard::acquire("remove", &package_names).await?;
+        removal_on_blocking_pool(process_lock, dpkg_locks, journal, move || {
+            execute_removal_blocking(&package_names)
+        })
+        .await
     }
+}
+
+async fn removal_on_blocking_pool(
+    process_lock: tokio::sync::OwnedMutexGuard<()>,
+    dpkg_locks: DpkgLockGuard,
+    journal: DpkgTransactionJournalGuard,
+    worker: impl FnOnce() -> Result<()> + Send + 'static,
+) -> Result<()> {
+    // A started blocking worker outlives an aborted async waiter. It must
+    // own the guards through mutation/finalization, dropping the journal
+    // before the filesystem locks and the process lock last.
+    tokio::task::spawn_blocking(move || {
+        let _process_lock = process_lock;
+        let _dpkg_locks = dpkg_locks;
+        let _journal = journal;
+        worker()
+    })
+    .await
+    .context("Package removal task failed")?
 }
 /// Synchronous body of [`Transaction::execute_removal`], executed on the
 /// blocking pool so maintainer scripts and fsync-heavy status rewrites never
@@ -2537,6 +2557,141 @@ mod tests {
     use std::os::unix::fs::OpenOptionsExt;
 
     use super::*;
+
+    fn external_record_lock_available(path: &Path) -> bool {
+        let output = Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys\nf=open(sys.argv[1], 'r+')\ntry: fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(1)",
+            ])
+            .arg(path)
+            .output()
+            .expect("external POSIX lock probe");
+        match output.status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            code => panic!("lock probe failed ({code:?}): {:?}", output.stderr),
+        }
+    }
+
+    async fn check_removal_guard_lifetime(cancel_waiter: bool, fail_worker: bool) {
+        let directory = tempfile::tempdir().expect("removal fixture");
+        let frontend = directory.path().join("frontend.lock");
+        let database = directory.path().join("database.lock");
+        let journal_path = directory.path().join("journal.json");
+        let finalized = directory.path().join("finalized");
+        let process_mutex = Arc::new(tokio::sync::Mutex::new(()));
+        let process_lock = Arc::clone(&process_mutex).lock_owned().await;
+        let dpkg_locks = acquire_dpkg_locks_at(&frontend, &database).expect("dpkg locks");
+        let journal = DpkgTransactionJournalGuard::acquire_at(
+            &journal_path,
+            "remove",
+            &["fixture".to_string()],
+        )
+        .expect("journal");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let final_path = finalized.clone();
+        let waiter = tokio::spawn(removal_on_blocking_pool(
+            process_lock,
+            dpkg_locks,
+            journal,
+            move || {
+                started_tx.send(()).expect("worker started");
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release worker");
+                fs::write(final_path, b"finalized")?;
+                finished_tx.send(()).expect("worker finalized");
+                anyhow::ensure!(!fail_worker, "fixture removal failed");
+                Ok(())
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("worker start timeout")
+            .expect("worker start");
+        if cancel_waiter {
+            waiter.abort();
+        }
+        // Capture observations before releasing the worker, but assert after
+        // release so a regression cannot leave the blocking pool hung.
+        if cancel_waiter {
+            assert!(waiter.await.expect_err("cancelled waiter").is_cancelled());
+            let process_held = process_mutex.try_lock().is_err();
+            let journal_visible = stale_transaction_journal(&journal_path).is_some();
+            let frontend_held = !external_record_lock_available(&frontend);
+            let database_held = !external_record_lock_available(&database);
+            release_tx.send(()).expect("release worker");
+            tokio::time::timeout(Duration::from_secs(5), finished_rx)
+                .await
+                .expect("worker finalization timeout")
+                .expect("worker finalization");
+            let _completed = tokio::time::timeout(Duration::from_secs(5), process_mutex.lock())
+                .await
+                .expect("worker completion timeout");
+            assert!(
+                process_held,
+                "cancelled waiter released process lock before worker completion: journal_visible={journal_visible}, frontend_held={frontend_held}, database_held={database_held}"
+            );
+            assert!(
+                journal_visible,
+                "cancelled waiter cleared in-flight journal"
+            );
+            assert!(
+                frontend_held,
+                "cancelled waiter released frontend record lock"
+            );
+            assert!(
+                database_held,
+                "cancelled waiter released database record lock"
+            );
+        } else {
+            assert!(process_mutex.try_lock().is_err());
+            assert!(journal_path.exists());
+            assert!(!external_record_lock_available(&frontend));
+            assert!(!external_record_lock_available(&database));
+            release_tx.send(()).expect("release worker");
+            let result = waiter.await.expect("worker waiter");
+            if fail_worker {
+                assert_eq!(
+                    result.expect_err("worker failure").to_string(),
+                    "fixture removal failed"
+                );
+            } else {
+                result.expect("normal removal completion");
+            }
+        }
+        assert!(
+            finalized.exists(),
+            "worker must finalize before releasing guards"
+        );
+        assert!(!journal_path.exists());
+        assert!(process_mutex.try_lock().is_ok());
+        assert!(external_record_lock_available(&frontend));
+        assert!(external_record_lock_available(&database));
+    }
+
+    #[tokio::test]
+    async fn removal_cancelled_waiter_retains_guards_until_success() {
+        check_removal_guard_lifetime(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn removal_cancelled_waiter_retains_guards_until_failure() {
+        check_removal_guard_lifetime(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn removal_normal_completion_releases_guards() {
+        check_removal_guard_lifetime(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn removal_worker_failure_releases_guards_and_returns_error() {
+        check_removal_guard_lifetime(false, true).await;
+    }
 
     async fn configure_on_test_locks(transaction: &mut Transaction) -> Result<()> {
         let lock_directory = tempfile::tempdir().expect("lock directory");
