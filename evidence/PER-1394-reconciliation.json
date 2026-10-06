@@ -1,0 +1,1468 @@
+﻿{
+    "schema":  "omg.intake.reconciliation.v1",
+    "observedAt":  "2026-10-06T09:27:52.742Z",
+    "issue":  "PER-1394",
+    "sourceHead":  "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+    "scope":  "Frozen GitHub baseline membership complete; bounded later-arrival linkage; no product admission",
+    "baselineFiles":  [
+                          "overnight-github-baseline-20261006.json",
+                          "overnight-paperclip-baseline-20261006.json"
+                      ],
+    "comparison":  [
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  859,
+                           "baselineHead":  "85227b798d4ffa35b4f500f81f9f0a342b9bc75b",
+                           "currentHead":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  true,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p2",
+                                                 "status:ci-blocked",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  858,
+                           "baselineHead":  "fe1129420a69895c15491686824bd4d4d4ac74e9",
+                           "currentHead":  "fe1129420a69895c15491686824bd4d4d4ac74e9",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p2",
+                                                 "status:ci-blocked",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  856,
+                           "baselineHead":  "a009ff8847e47cac691e2dfdac7b4826a33e050b",
+                           "currentHead":  "a009ff8847e47cac691e2dfdac7b4826a33e050b",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p3",
+                                                 "rust",
+                                                 "status:ci-blocked"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  855,
+                           "baselineHead":  "c6dcad3edd220bcadaf5e95e7a34be2968cd1334",
+                           "currentHead":  "c6dcad3edd220bcadaf5e95e7a34be2968cd1334",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:ci-blocked",
+                                                 "status:needs-work"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  854,
+                           "baselineHead":  "2ecebe7aab68181a85c6c0d874e7d22f0af8d0b3",
+                           "currentHead":  "2ecebe7aab68181a85c6c0d874e7d22f0af8d0b3",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "github_actions",
+                                                 "priority:p2",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  853,
+                           "baselineHead":  "aebcb0743190356030ebdae5a846a887ee37a6f8",
+                           "currentHead":  "aebcb0743190356030ebdae5a846a887ee37a6f8",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p3",
+                                                 "rust",
+                                                 "status:ci-blocked",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  852,
+                           "baselineHead":  "19bd11204bda8d9e245f3f2e0eecf50e660a6941",
+                           "currentHead":  "19bd11204bda8d9e245f3f2e0eecf50e660a6941",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p3",
+                                                 "rust",
+                                                 "status:ci-blocked",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  851,
+                           "baselineHead":  "1f7383bcaaf61bc2cef61fb1e3cb16deec93241e",
+                           "currentHead":  "1f7383bcaaf61bc2cef61fb1e3cb16deec93241e",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p3",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  850,
+                           "baselineHead":  "b5140618985c3b113a954a8fcab3a0ce36351b5d",
+                           "currentHead":  "b5140618985c3b113a954a8fcab3a0ce36351b5d",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:ci-blocked",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  849,
+                           "baselineHead":  "c61f2c614134ba185a111e8b2b0675ce97715932",
+                           "currentHead":  "c61f2c614134ba185a111e8b2b0675ce97715932",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  848,
+                           "baselineHead":  "2f670e58484ab2ba8428b3ee83db487072853051",
+                           "currentHead":  "2f670e58484ab2ba8428b3ee83db487072853051",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "documentation",
+                                                 "priority:p2",
+                                                 "status:ci-blocked",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  845,
+                           "baselineHead":  "fd96cabd28abe66c24fa46e66c5c89efa890fdf3",
+                           "currentHead":  "fd96cabd28abe66c24fa46e66c5c89efa890fdf3",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:needs-work"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  844,
+                           "baselineHead":  "e60c4c5f480edb8b7e70456a41967b680431d9db",
+                           "currentHead":  "e60c4c5f480edb8b7e70456a41967b680431d9db",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:needs-work"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  843,
+                           "baselineHead":  "8a51aea536d5c2a63e66570a4c1a2c9aff677ac7",
+                           "currentHead":  "8a51aea536d5c2a63e66570a4c1a2c9aff677ac7",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "github_actions",
+                                                 "priority:p2",
+                                                 "status:needs-evidence",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  841,
+                           "baselineHead":  "1ff3510d1ea0f50c7006032974d1064763f8a595",
+                           "currentHead":  "1ff3510d1ea0f50c7006032974d1064763f8a595",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:needs-evidence",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  839,
+                           "baselineHead":  "c4091314c02a7ad57fea83724923099f71ae28c8",
+                           "currentHead":  "c4091314c02a7ad57fea83724923099f71ae28c8",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:needs-evidence",
+                                                 "status:needs-work"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  837,
+                           "baselineHead":  "457172782572ccf905a3d642ce7825ca69f44a11",
+                           "currentHead":  "457172782572ccf905a3d642ce7825ca69f44a11",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:ci-blocked",
+                                                 "status:needs-evidence"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  836,
+                           "baselineHead":  "a042d44ed68f6f40991d4182ccac70a3e5afdc5c",
+                           "currentHead":  "a042d44ed68f6f40991d4182ccac70a3e5afdc5c",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p1",
+                                                 "security",
+                                                 "status:ci-blocked",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  835,
+                           "baselineHead":  "4cd4d7003f671f8b8b577a01660a84623778226c",
+                           "currentHead":  "4cd4d7003f671f8b8b577a01660a84623778226c",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:ci-blocked",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  834,
+                           "baselineHead":  "110d5b1cc1cac9ac9743c10661705cd5fe9ce5bf",
+                           "currentHead":  "110d5b1cc1cac9ac9743c10661705cd5fe9ce5bf",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p1",
+                                                 "rust",
+                                                 "status:needs-work"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  828,
+                           "baselineHead":  "8263c72832bddbc250ccd96b46b67cb2c9833bf7",
+                           "currentHead":  "8263c72832bddbc250ccd96b46b67cb2c9833bf7",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  825,
+                           "baselineHead":  "6f242c6b03a70f832675f31a1290abae52b8f56d",
+                           "currentHead":  "6f242c6b03a70f832675f31a1290abae52b8f56d",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "github_actions",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:ci-blocked",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  822,
+                           "baselineHead":  "6e82693b594712e03c4589d99c788bf9f368a015",
+                           "currentHead":  "6e82693b594712e03c4589d99c788bf9f368a015",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "documentation",
+                                                 "priority:p1",
+                                                 "status:ci-blocked",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  821,
+                           "baselineHead":  "d0acc2f8addd10518326d374d7940539bb649631",
+                           "currentHead":  "d0acc2f8addd10518326d374d7940539bb649631",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p1",
+                                                 "rust",
+                                                 "status:ci-blocked",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  796,
+                           "baselineHead":  "385414d67018b4b099c58d817aedb03087e8aace",
+                           "currentHead":  "385414d67018b4b099c58d817aedb03087e8aace",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:needs-evidence",
+                                                 "status:needs-review",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  789,
+                           "baselineHead":  "b398c7030b6938cfcb1e6d7411f59844f482ec0c",
+                           "currentHead":  "b398c7030b6938cfcb1e6d7411f59844f482ec0c",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p3",
+                                                 "rust",
+                                                 "status:needs-evidence",
+                                                 "status:needs-work",
+                                                 "type:maintenance"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "pr",
+                           "number":  787,
+                           "baselineHead":  "cb97c6d987e351161522f6c015334c2bad97c0d4",
+                           "currentHead":  "cb97c6d987e351161522f6c015334c2bad97c0d4",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "security",
+                                                 "status:ci-blocked",
+                                                 "status:needs-evidence"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  857,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p3",
+                                                 "status:has-pr"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  847,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  842,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "github_actions",
+                                                 "priority:p2",
+                                                 "status:has-pr",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  820,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:has-pr"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  819,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:has-pr",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  818,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:has-pr",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  817,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:has-pr"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  816,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p1",
+                                                 "rust",
+                                                 "status:has-pr"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  815,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p1",
+                                                 "security",
+                                                 "status:has-pr"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  814,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:has-pr",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  813,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:has-pr"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  812,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:has-pr"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  811,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:has-pr",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  810,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  807,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "status:has-pr"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  806,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p1",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  805,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p1",
+                                                 "rust",
+                                                 "status:has-pr"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  802,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "qa-failure"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  801,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "qa-failure"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  800,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "qa-failure",
+                                                 "status:has-pr"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  791,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:has-pr",
+                                                 "status:needs-evidence",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  785,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "rust",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  772,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:ci-blocked",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  770,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:needs-evidence",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  764,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p2",
+                                                 "status:has-pr",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  757,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p2",
+                                                 "qa-failure",
+                                                 "status:needs-evidence",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  665,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p1",
+                                                 "qa-failure",
+                                                 "status:needs-evidence",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  626,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "priority:p1",
+                                                 "status:has-pr",
+                                                 "status:needs-evidence"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  623,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p2",
+                                                 "qa-failure",
+                                                 "status:needs-evidence",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  616,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "enhancement",
+                                                 "priority:p2",
+                                                 "status:has-pr",
+                                                 "status:needs-evidence",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  611,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "enhancement",
+                                                 "priority:p2",
+                                                 "status:has-pr",
+                                                 "status:needs-evidence",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "omg-cli/omg",
+                           "kind":  "issue",
+                           "number":  452,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "priority:p1",
+                                                 "qa-failure",
+                                                 "status:needs-evidence",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "PyRo1121/paperclip-local",
+                           "kind":  "pr",
+                           "number":  2,
+                           "baselineHead":  "c5814adc59027f37cc0714d75083ab4bf48abcd4",
+                           "currentHead":  "c5814adc59027f37cc0714d75083ab4bf48abcd4",
+                           "state":  "open",
+                           "mergedAt":  null,
+                           "headChanged":  false,
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+                                                 "bug",
+                                                 "documentation",
+                                                 "priority:p1",
+                                                 "status:ci-blocked",
+                                                 "status:needs-work",
+                                                 "type:ci"
+                                             ]
+                       },
+                       {
+                           "repo":  "PyRo1121/paperclip-local",
+                           "kind":  "issue",
+                           "number":  1,
+                           "state":  "open",
+                           "labelsChanged":  false,
+                           "currentLabels":  [
+
+                                             ]
+                       }
+                   ],
+    "freshPrReadbacks":  [
+                             {
+                                 "number":  859,
+                                 "state":  "open",
+                                 "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                                 "merged":  false,
+                                 "mergedAt":  null,
+                                 "mergeCommit":  "eaa009da32e15345eae61a1fe456d33f4206e5cb",
+                                 "mergeable":  true,
+                                 "mergeableState":  "blocked",
+                                 "labels":  [
+                                                "priority:p2",
+                                                "type:ci",
+                                                "status:ci-blocked"
+                                            ],
+                                 "updatedAt":  "2026-10-06T09:07:59Z"
+                             },
+                             {
+                                 "number":  870,
+                                 "state":  "open",
+                                 "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                                 "merged":  false,
+                                 "mergedAt":  null,
+                                 "mergeCommit":  "6eefeabfc82aac8095cede4294eaa73b8d4d8b82",
+                                 "mergeable":  true,
+                                 "mergeableState":  "blocked",
+                                 "labels":  [
+                                                "bug",
+                                                "rust",
+                                                "priority:p2",
+                                                "type:ci",
+                                                "status:ci-blocked"
+                                            ],
+                                 "updatedAt":  "2026-10-06T09:20:53Z"
+                             }
+                         ],
+    "changedCommit":  {
+                          "sha":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                          "parents":  [
+                                          "85227b798d4ffa35b4f500f81f9f0a342b9bc75b"
+                                      ],
+                          "files":  [
+                                        {
+                                            "path":  "tests/installer_source_features.sh",
+                                            "status":  "modified",
+                                            "additions":  21,
+                                            "deletions":  2
+                                        }
+                                    ],
+                          "message":  "Make source installer library fixtures independent of the host\n\nCo-Authored-By: Paperclip \u003cnoreply@paperclip.ing\u003e"
+                      },
+    "pr859Checks":  [
+                        {
+                            "name":  "QEMU behavioral verification / QEMU guest arm64 (${{ matrix.distro }})",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200181184",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (arch) / Staged build (ubuntu)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200180758",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Staged build arm64 (${{ matrix.distro }})",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200180587",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (ubuntu) / Staged build (ubuntu)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200180578",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Staged build arm64 (ubuntu)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200180553",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (arch) / Staged build (${{ inputs.distro }})",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200180227",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / ARM guest runner KVM health",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200180137",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (fedora) / Staged build (${{ inputs.distro }})",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200180074",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (ubuntu) / Staged build (${{ inputs.distro }})",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200180067",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (debian) / Staged build (${{ inputs.distro }})",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200180032",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (fedora) / Staged build (ubuntu)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200179953",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (debian) / Staged build (ubuntu)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200179711",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (debian-trixie) / Staged build (${{ inputs.distro }})",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200179702",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (debian-trixie) / Staged build (ubuntu)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200179503",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (fedora) / QEMU guest (fedora)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200179351",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (debian) / QEMU guest (debian)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200179254",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (arch) / QEMU guest (arch)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200179236",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (debian-trixie) / QEMU guest (debian-trixie)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200179101",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Distro lane (ubuntu) / QEMU guest (ubuntu)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112200179063",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "QEMU behavioral verification / Resolve test selection and provenance",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112199860763",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Runtime usage accounting (Ubuntu)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112199860258",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "AUR sandbox security regressions",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112199590705",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Generate Coverage Report",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440859348/job/112196593699",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Linux (arch)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112196227897",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Linux (debian-trixie)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112196227878",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Linux (ubuntu)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112196227829",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Linux (ubuntu-2604)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112196227813",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Linux (debian)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112196227772",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Intersections (debian-pgp)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112196227739",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Portable Rust",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112196227717",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Linux (fedora)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112196227707",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "macOS (ARM64)",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "failure",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112196227661",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "macOS nextest source contract",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112196227606",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "[code]smith",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/runs/112195866091",
+                            "app":  "blacksmith-sh"
+                        },
+                        {
+                            "name":  "Instrumented coverage tests",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440859348/job/112194036096",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Quick Gate",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112193987316",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Docs audit",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024/job/112193987061",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "TruffleHog Secret Scan",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440859242/job/112193984541",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Classify coverage scope",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440859348/job/112193984458",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Gitleaks Secret Scan",
+                            "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37440859242/job/112193984183",
+                            "app":  "github-actions"
+                        }
+                    ],
+    "pr859WorkflowRuns":  [
+                              {
+                                  "id":  37440859242,
+                                  "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                                  "status":  "completed",
+                                  "conclusion":  "success",
+                                  "url":  "https://github.com/omg-cli/omg/actions/runs/37440859242"
+                              },
+                              {
+                                  "id":  37440859348,
+                                  "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                                  "status":  "completed",
+                                  "conclusion":  "success",
+                                  "url":  "https://github.com/omg-cli/omg/actions/runs/37440859348"
+                              },
+                              {
+                                  "id":  37440860024,
+                                  "head":  "73157d5b82aca368bbceb9e6107fce45d3f80fb8",
+                                  "status":  "in_progress",
+                                  "conclusion":  null,
+                                  "url":  "https://github.com/omg-cli/omg/actions/runs/37440860024"
+                              }
+                          ],
+    "pr859GithubReviews":  [
+
+                           ],
+    "pr870Checks":  [
+                        {
+                            "name":  "CodeQL",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "completed",
+                            "conclusion":  "neutral",
+                            "url":  "https://github.com/omg-cli/omg/runs/112199022851",
+                            "app":  "github-advanced-security"
+                        },
+                        {
+                            "name":  "Instrumented coverage tests",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442313094/job/112198836333",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Docs audit",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442314523/job/112198776858",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Quick Gate",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442314523/job/112198776532",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Classify coverage scope",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442313094/job/112198773657",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Vulnerability Scan",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442313057/job/112198773507",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Mutation shard (0)",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442312994/job/112198772858",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Analyze",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442312989/job/112198772766",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "docker-e2e-main",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442312794/job/112198772737",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Analyze workflow security",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442312989/job/112198772244",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "Gitleaks Secret Scan",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442312881/job/112198771818",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "TruffleHog Secret Scan",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "completed",
+                            "conclusion":  "success",
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442312881/job/112198771486",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "docker-e2e",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "in_progress",
+                            "conclusion":  null,
+                            "url":  "https://github.com/omg-cli/omg/actions/runs/37442312794/job/112198771079",
+                            "app":  "github-actions"
+                        },
+                        {
+                            "name":  "[code]smith",
+                            "head":  "6c01928a241d60bb5786fab754d834fb8b33bcc1",
+                            "status":  "completed",
+                            "conclusion":  "skipped",
+                            "url":  "https://github.com/omg-cli/omg/runs/112198761754",
+                            "app":  "blacksmith-sh"
+                        }
+                    ],
+    "audit":  {
+                  "imported":  0,
+                  "reason":  "Existing backlog prioritized; prior episode document/comment cursor reads timed out. No new source hash admitted without canonical ledger proof.",
+                  "localTrackedAuditFile":  ".audit/deep-audit.tsv",
+                  "sha256":  "139461ab9607df5f2a1c8b17d618f78c8078f357f74365c9444b96ba146977ac"
+              },
+    "counts":  {
+                   "baselinePrs":  28,
+                   "baselineIssues":  33,
+                   "baselineOpen":  61,
+                   "baselineMerged":  0,
+                   "baselineHeadChanges":  1,
+                   "baselineLabelChanges":  0,
+                   "mutations":  0,
+                   "imports":  0,
+                   "closures":  0,
+                   "retiredPaths":  0,
+                   "reclaimedBytes":  0
+               },
+    "limitations":  [
+                        "No implementation test rerun or independent QA verdict by Intake",
+                        "PR merge_commit_sha on an open unmerged PR is not a landed receipt",
+                        "Paperclip PER-1385 documents/comments and PER-1033 documents timed out; no read retries",
+                        "Missing later-arrival canonical issue labels retained as CTO effective-access handoff; existing PER-1373 owns the demonstrated grant hold"
+                    ],
+    "runId":  "13590efa-094f-4bff-a0b0-5225ad9e1ffe",
+    "agentId":  "bb90751a-34e9-4e39-abf6-e9ae7bbdfd82"
+}
