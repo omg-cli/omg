@@ -79,13 +79,16 @@ for results in "${files[@]}"; do
   if [[ -z "$failing" ]]; then printf 'clean\n\n'; continue; fi
   while IFS= read -r row; do
     case_id=$(jq -r '.case_id' <<< "$row"); distro=$(jq -r '.distro' <<< "$row")
+    row_arch=$(jq -r '.arch // empty' <<< "$row"); arch=${row_arch:-x86_64}
+    row_identity=$distro
+    if [[ -n "$row_arch" ]]; then row_identity+="/$arch"; fi
     result=$(jq -r '.result' <<< "$row"); exit_code=$(jq -r '.exit_code' <<< "$row")
     elapsed=$(jq -r '.elapsed_seconds' <<< "$row")
     total_fail=$((total_fail + 1))
-    printf '\n### %s on %s: %s (exit %s, %ss)\n' "$case_id" "$distro" "$result" "$exit_code" "$elapsed"
+    printf '\n### %s on %s: %s (exit %s, %ss)\n' "$case_id" "$row_identity" "$result" "$exit_code" "$elapsed"
     command_for "$case_id" || true
     src_tmp="$(mktemp)"
-    if excerpt="$(excerpt_for "$case_id" "$distro" 3>"$src_tmp" 2>/dev/null)"; then
+    if excerpt="$(excerpt_for "$case_id" "$distro" "$arch" 3>"$src_tmp" 2>/dev/null)"; then
       printf 'excerpt (%s):\n````log\n%s\n````\n' "$(cat "$src_tmp")" "$excerpt"
     fi
     rm -f "$src_tmp"

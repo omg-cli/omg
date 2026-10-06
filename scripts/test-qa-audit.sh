@@ -33,6 +33,64 @@ if grep -q $'\x1b' <<< "$out"; then fail "audit leaked ANSI escapes"; fi
 grep -q "files=1 failing-rows=1" <<< "$out" || fail "audit bad summary: $out"
 unset GH_TOKEN
 
+# Dropping the validated architecture must not select the other guest's log.
+mkdir -p "$scratch/multi/arch-search-tree" "$scratch/multi/arch-aarch64-search-tree"
+printf 'X86_ONLY_MARKER\n' > "$scratch/multi/arch-search-tree/transcript.txt"
+printf 'ARM_ONLY_MARKER\n' > "$scratch/multi/arch-aarch64-search-tree/transcript.txt"
+cat > "$scratch/multi/results.json" <<'EOF'
+[{"case_id":"search-tree","distro":"arch","arch":"x86_64","result":"PRODUCT_FAIL","exit_code":1,"elapsed_seconds":2},{"case_id":"search-tree","distro":"arch","arch":"aarch64","result":"PRODUCT_FAIL","exit_code":1,"elapsed_seconds":2}]
+EOF
+rc=0
+out=$("$runner" "$scratch/multi/results.json") || rc=$?
+[[ "$rc" -eq 1 ]] || fail "multi-arch failures must exit 1, got $rc"
+grep -q 'files=1 failing-rows=2 invalid-files=0' <<< "$out" || fail "multi-arch rows were not audited"
+for arch in x86_64 aarch64; do
+  section=$(awk -v heading="### search-tree on arch/$arch:" 'index($0, "### ") == 1 { active = index($0, heading) == 1 } active { print }' <<< "$out")
+  [[ -n "$section" ]] || fail "audit omitted distinct $arch heading"
+  if [[ "$arch" == x86_64 ]]; then
+    grep -q 'excerpt (arch-search-tree/transcript.txt)' <<< "$section" || fail "x86 excerpt source missing"
+    grep -q 'X86_ONLY_MARKER' <<< "$section" || fail "x86 transcript missing"
+    if grep -q 'ARM_ONLY_MARKER' <<< "$section"; then fail "x86 row borrowed ARM transcript"; fi
+  else
+    grep -q 'excerpt (arch-aarch64-search-tree/transcript.txt)' <<< "$section" || fail "ARM excerpt source missing"
+    grep -q 'ARM_ONLY_MARKER' <<< "$section" || fail "ARM transcript missing"
+    if grep -q 'X86_ONLY_MARKER' <<< "$section"; then fail "ARM row borrowed x86 transcript"; fi
+  fi
+done
+
+# ARM-only evidence works without an x86 transcript; missing ARM evidence
+# must never borrow an available x86 transcript.
+for scenario in arm-only missing-arm; do
+  mkdir -p "$scratch/$scenario"
+  jq '[.[] | select(.arch == "aarch64")]' "$scratch/multi/results.json" > "$scratch/$scenario/results.json"
+  if [[ "$scenario" == arm-only ]]; then
+    cp -r "$scratch/multi/arch-aarch64-search-tree" "$scratch/$scenario/"
+  else
+    cp -r "$scratch/multi/arch-search-tree" "$scratch/$scenario/"
+  fi
+  rc=0
+  out=$("$runner" "$scratch/$scenario/results.json") || rc=$?
+  [[ "$rc" -eq 1 ]] || fail "$scenario must remain a failing audit, got $rc"
+  grep -q 'files=1 failing-rows=1 invalid-files=0' <<< "$out" || fail "$scenario lost the failing row"
+  grep -q '### search-tree on arch/aarch64:' <<< "$out" || fail "$scenario omitted ARM identity"
+  if [[ "$scenario" == arm-only ]]; then
+    grep -q 'ARM_ONLY_MARKER' <<< "$out" || fail "ARM-only transcript missing"
+    grep -q 'excerpt (arch-aarch64-search-tree/transcript.txt)' <<< "$out" || fail "ARM-only source missing"
+  elif grep -q 'excerpt (' <<< "$out"; then
+    fail "missing ARM transcript borrowed an excerpt"
+  fi
+  if grep -q 'X86_ONLY_MARKER' <<< "$out"; then fail "$scenario borrowed x86 transcript"; fi
+done
+
+# Legacy rows keep their x86 default even beside a matching ARM transcript.
+jq '[.[0] | del(.arch)]' "$scratch/multi/results.json" > "$scratch/multi/legacy.json"
+rc=0
+out=$("$runner" "$scratch/multi/legacy.json") || rc=$?
+[[ "$rc" -eq 1 ]] || fail "legacy failure must exit 1, got $rc"
+grep -q '### search-tree on arch:' <<< "$out" || fail "legacy heading changed"
+grep -q 'X86_ONLY_MARKER' <<< "$out" || fail "legacy x86 transcript missing"
+if grep -q 'ARM_ONLY_MARKER' <<< "$out"; then fail "legacy row borrowed ARM transcript"; fi
+
 # Clean run exits 0 and says so.
 printf '%s' '[{"case_id":"other","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":1}]' > "$scratch/clean.json"
 out=$("$runner" "$scratch/clean.json"); rc=$?
