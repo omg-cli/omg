@@ -1582,6 +1582,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dropping_successful_managed_install_still_verifies_and_activates() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::dropping_successful_managed_install_still_verifies_and_activates",
+        ) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
         use std::time::Duration;
 
@@ -1662,6 +1667,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn dropping_managed_install_keeps_child_and_cleanup_owned() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::dropping_managed_install_keeps_child_and_cleanup_owned",
+        ) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
         use std::time::Duration;
 
@@ -1743,6 +1753,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn slow_managed_install_does_not_starve_current_thread_timer() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::slow_managed_install_does_not_starve_current_thread_timer",
+        ) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
         use std::time::{Duration, Instant};
 
