@@ -1021,6 +1021,28 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn run_isolated_sudo_test(name: &str) -> bool {
+        const CHILD: &str = "OMG_ISOLATED_SUDO_TEST";
+        let full_name = format!("core::privilege::tests::{name}");
+        if std::env::var(CHILD).as_deref() == Ok(full_name.as_str()) {
+            return false;
+        }
+        // Create executable fixtures after exec, outside sibling tests that
+        // may fork while their script-writing file descriptors are still open.
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, &full_name)
+            .output()
+            .expect("isolated sudo test process");
+        assert!(
+            result.status.success(),
+            "isolated sudo test failed: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        true
+    }
+
     fn fake_sudo(
         validation_exit: i32,
         payload_exit: i32,
@@ -1231,6 +1253,9 @@ mod tests {
 
     #[tokio::test]
     async fn cached_credentials_run_one_noninteractive_payload() {
+        if run_isolated_sudo_test("cached_credentials_run_one_noninteractive_payload") {
+            return;
+        }
         let (_directory, sudo, log) = fake_sudo(0, 7);
         let status = sudo_payload_status_in(
             &sudo,
@@ -1255,6 +1280,9 @@ mod tests {
 
     #[tokio::test]
     async fn sudo_shaped_payload_stderr_does_not_authorize_retry() {
+        if run_isolated_sudo_test("sudo_shaped_payload_stderr_does_not_authorize_retry") {
+            return;
+        }
         let (_directory, sudo, log) = fake_sudo(0, 1);
         let script = format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
@@ -1296,6 +1324,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_preflight_with_yes_never_runs_payload() {
+        if run_isolated_sudo_test("failed_preflight_with_yes_never_runs_payload") {
+            return;
+        }
         set_yes_flag(true);
         let _reset = YesFlagReset;
         let (_directory, sudo, log) = fake_sudo(1, 0);

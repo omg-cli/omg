@@ -1946,21 +1946,23 @@ mod tests {
         assert_eq!(status.diagnostic(), "HTTP 500");
         finish_probe_server(server).await;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("refused probe listener");
+        let reservation = tokio::net::TcpSocket::new_v4().expect("refused probe socket");
+        reservation
+            .bind("127.0.0.1:0".parse().unwrap())
+            .expect("reserve refused probe address");
         let url = format!(
             "http://{}",
-            listener.local_addr().expect("listener address")
+            reservation.local_addr().expect("reserved address")
         );
-        // Close the listener: a bound, non-listening socket need not refuse on every OS.
-        drop(listener);
+        // Retain the port without listening so another concurrent fixture
+        // cannot claim it between address selection and the connection probe.
         let refused = probe_endpoint(&client, &url, Duration::from_secs(1)).await;
         assert!(
             matches!(refused, EndpointProbe::ConnectFailure(_)),
-            "closed loopback listener must refuse the connection: {refused:?}"
+            "reserved non-listening loopback port must refuse the connection: {refused:?}"
         );
         assert!(refused.diagnostic().starts_with("connection error: "));
+        drop(reservation);
 
         let deadline = Duration::from_millis(50);
         let (url, server) = serve_probe_response(OK, Duration::from_millis(250)).await;
