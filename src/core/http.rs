@@ -94,7 +94,7 @@ pub fn is_private_or_local_host(host: Option<&str>) -> bool {
 pub(crate) fn is_public_address(address: std::net::IpAddr) -> bool {
     match address {
         std::net::IpAddr::V4(ip) => {
-            let [a, b, _, _] = ip.octets();
+            let [a, b, c, _] = ip.octets();
             !ip.is_private()
                 && !ip.is_loopback()
                 && !ip.is_link_local()
@@ -104,7 +104,7 @@ pub(crate) fn is_public_address(address: std::net::IpAddr) -> bool {
                 && a != 0
                 && a < 224
                 && !(a == 100 && (64..=127).contains(&b))
-                && !(a == 192 && b == 0)
+                && !(a == 192 && b == 0 && c == 0)
                 && !(a == 198 && (18..=19).contains(&b))
         }
         std::net::IpAddr::V6(ip) => {
@@ -479,6 +479,49 @@ mod tests {
             assert!(validate_resolved_addresses(&[address], true).is_err());
         }
         Ok(())
+    }
+
+    #[test]
+    fn resolved_download_addresses_preserve_ipv4_special_use_boundaries() {
+        // IANA's IPv4 Special-Purpose registry. Preserve this downloader's
+        // conservative whole-192.0.0.0/24 exclusion, including its exceptions.
+        for raw in [
+            "1.0.0.1",
+            "8.0.0.1",
+            "191.255.255.254",
+            "192.0.1.1",
+            "192.1.0.1",
+            "198.17.255.254",
+            "198.20.0.1",
+            "223.255.255.254",
+        ] {
+            assert!(is_public_address(raw.parse().unwrap()), "{raw}");
+        }
+        for raw in [
+            "0.0.0.0",
+            "0.255.255.255",
+            "10.0.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.0.0.0",
+            "192.0.0.8",
+            "192.0.0.9",
+            "192.0.0.10",
+            "192.0.0.255",
+            "192.0.2.1",
+            "192.168.0.1",
+            "198.18.0.0",
+            "198.19.255.255",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.0",
+            "239.255.255.255",
+            "240.0.0.0",
+            "255.255.255.255",
+        ] {
+            assert!(!is_public_address(raw.parse().unwrap()), "{raw}");
+        }
     }
 
     #[tokio::test]
