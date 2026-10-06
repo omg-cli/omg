@@ -33,6 +33,19 @@ if grep -q $'\x1b' <<< "$out"; then fail "audit leaked ANSI escapes"; fi
 grep -q "files=1 failing-rows=1" <<< "$out" || fail "audit bad summary: $out"
 unset GH_TOKEN
 
+# No discovered evidence is incomplete, even when the directory exists.
+mkdir -p "$scratch/empty"
+rc=0
+out=$("$runner" "$scratch/empty") || rc=$?
+[[ "$rc" -eq 2 ]] || fail "empty-directory audit must exit 2, got $rc"
+grep -q 'No results.json files found.' <<< "$out" || fail "empty audit omitted the absence notice"
+
+# A missing path remains a configuration error.
+rc=0
+out=$("$runner" "$scratch/missing" 2>&1) || rc=$?
+[[ "$rc" -eq 2 ]] || fail "missing-path audit must exit 2, got $rc"
+grep -q 'error: not found:' <<< "$out" || fail "missing audit path omitted the error"
+
 # Clean run exits 0 and says so.
 printf '%s' '[{"case_id":"other","distro":"arch","result":"PASS","exit_code":0,"elapsed_seconds":1}]' > "$scratch/clean.json"
 out=$("$runner" "$scratch/clean.json"); rc=$?
@@ -60,6 +73,15 @@ for code in -1 0 1 255; do
     grep -q '^clean$' <<< "$out" || fail "executed PASS/$code was not clean"
   fi
 done
+
+# A directory containing valid nested evidence still succeeds.
+mkdir -p "$scratch/clean-dir/nested"
+cp "$scratch/clean.json" "$scratch/clean-dir/nested/results.json"
+rc=0
+out=$("$runner" "$scratch/clean-dir") || rc=$?
+[[ "$rc" -eq 0 ]] || fail "valid-directory audit must exit 0, got $rc"
+grep -q 'verdicts: PASS=1' <<< "$out" || fail "directory audit omitted valid evidence"
+grep -q 'files=1 failing-rows=0 invalid-files=0' <<< "$out" || fail "valid directory audit bad summary"
 
 # Directory scan finds nested results; junk files are skipped loudly.
 mkdir -p "$scratch/suite/a/b"
