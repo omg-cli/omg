@@ -9,7 +9,6 @@
 //! - Profile-based installation (minimal or default)
 //! - rust-toolchain.toml support
 
-use crate::core::http::BoundedResponseExt;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -672,18 +671,9 @@ impl RustManager {
             None => format!("{RUST_DIST_URL}/{filename}"),
         };
 
-        let manifest = self
-            .client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
+        let manifest = crate::core::http::fetch_metadata_text(self.client, &url)
             .await
-            .with_context(|| format!("Failed to fetch Rust manifest from {url}"))?
-            .error_for_status()
-            .with_context(|| format!("Rust manifest request failed for channel '{channel}'"))?
-            .bounded_text()
-            .await
-            .context("Failed to read Rust version manifest")?;
+            .with_context(|| format!("Failed to fetch Rust manifest from {url}"))?;
 
         toml::from_str(&manifest).map_err(Into::into)
     }
@@ -874,6 +864,51 @@ fn manifest_component_checksum(
 #[expect(clippy::unwrap_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metadata_retry_recovers_rust_manifest_without_publishing_toolchain() -> Result<()> {
+        let path = "/dist/channel-rust-1.85.0.toml";
+        let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
+            "static.rust-lang.org",
+            vec![
+                (path.into(), 503, b"temporarily unavailable".to_vec()),
+                (path.into(), 200, b"manifest-version = '2'\n".to_vec()),
+            ],
+        )
+        .await?;
+        let directory = tempfile::tempdir()?;
+        let manager = RustManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        let manifest = manager.fetch_manifest("1.85.0", None).await?;
+        assert_eq!(manifest["manifest-version"].as_str(), Some("2"));
+        assert_eq!(
+            fixture.finish().await?,
+            vec![format!("GET {path} HTTP/1.1"); 2]
+        );
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_retry_does_not_retry_invalid_rust_manifest() -> Result<()> {
+        let path = "/dist/channel-rust-1.85.0.toml";
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "static.rust-lang.org",
+            vec![(path.into(), b"[invalid".to_vec())],
+        )
+        .await?;
+        let directory = tempfile::tempdir()?;
+        let manager = RustManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        assert!(manager.fetch_manifest("1.85.0", None).await.is_err());
+        assert_eq!(fixture.finish().await?.len(), 1);
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
     use std::io::Cursor;
     use tar::{Builder, EntryType, Header};
     use tempfile::TempDir;
