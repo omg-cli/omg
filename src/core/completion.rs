@@ -99,24 +99,25 @@ impl CompletionEngine {
         let mut matcher = Matcher::new(Config::DEFAULT);
         let pat = Pattern::parse(pattern, CaseMatching::Ignore, Normalization::Smart);
 
-        let mut matches: Vec<(usize, u32)> = candidates
+        let mut matches: Vec<(usize, u32, bool)> = candidates
             .iter()
             .enumerate()
             .filter_map(|(index, candidate)| {
                 let haystack = Utf32String::from(candidate.as_str());
                 let score = pat.score(haystack.slice(..), &mut matcher)?;
-                Some((index, score))
+                // Prefix preference is ASCII-only, unlike nucleo's scoring.
+                // Compare bytes so a short UTF-8 prefix need not be a str boundary.
+                let prefix = candidate
+                    .as_bytes()
+                    .get(..pattern.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(pattern.as_bytes()));
+                Some((index, score, prefix))
             })
             .collect();
 
-        let pattern_lower = pattern.to_ascii_lowercase();
         matches.sort_by(|a, b| {
-            let a_prefix = candidates[a.0]
-                .to_ascii_lowercase()
-                .starts_with(&pattern_lower);
-            let b_prefix = candidates[b.0]
-                .to_ascii_lowercase()
-                .starts_with(&pattern_lower);
+            let a_prefix = a.2;
+            let b_prefix = b.2;
             b_prefix.cmp(&a_prefix).then_with(|| {
                 if a_prefix && b_prefix {
                     candidates[a.0]
@@ -134,7 +135,7 @@ impl CompletionEngine {
         matches
             .into_iter()
             .take(limit)
-            .map(|(index, _)| index)
+            .map(|(index, _, _)| index)
             .collect()
     }
 
@@ -485,5 +486,98 @@ mod tests {
     fn read_optional_file_missing_is_none() {
         let missing = TempDir::new().unwrap().path().join("does-not-exist");
         assert!(read_optional_file(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn fuzzy_indices_preserves_legacy_ordering() {
+        let mut candidates: Vec<String> = [
+            "pkg",
+            "Pkg",
+            "PKG",
+            "pkg",
+            "pkg-a",
+            "pkg-z",
+            "pkg-longer",
+            "x-pkg",
+            "p-k-g",
+            "prefix-pkg",
+            "éPkg",
+            "Épkg",
+            "pkg-é",
+            "pkg-É",
+            "猫pkg",
+            "p猫kg",
+            "é",
+            "É",
+            "unrelated",
+            "",
+            "p",
+            "猫",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        for pattern in [
+            "pkg", "PKG", "p", "é", "É", "猫", "p猫", "absent", "", "^pkg", "pkg$", "!pkg",
+        ] {
+            for limit in [0, 1, 3, 16, usize::MAX] {
+                for _ in 0..candidates.len() {
+                    assert_eq!(
+                        CompletionEngine::fuzzy_indices(pattern, &candidates, limit),
+                        legacy_fuzzy_indices(pattern, &candidates, limit),
+                        "pattern={pattern:?} limit={limit}",
+                    );
+                    candidates.rotate_left(1);
+                }
+            }
+        }
+    }
+
+    // Compatibility oracle: verbatim ranking from a69cb34218b59aa692ca380622a48402f1ecabfe.
+    fn legacy_fuzzy_indices(pattern: &str, candidates: &[String], limit: usize) -> Vec<usize> {
+        if pattern.is_empty() {
+            return (0..candidates.len()).take(limit).collect();
+        }
+
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let pat = Pattern::parse(pattern, CaseMatching::Ignore, Normalization::Smart);
+
+        let mut matches: Vec<(usize, u32)> = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                let haystack = Utf32String::from(candidate.as_str());
+                let score = pat.score(haystack.slice(..), &mut matcher)?;
+                Some((index, score))
+            })
+            .collect();
+
+        let pattern_lower = pattern.to_ascii_lowercase();
+        matches.sort_by(|a, b| {
+            let a_prefix = candidates[a.0]
+                .to_ascii_lowercase()
+                .starts_with(&pattern_lower);
+            let b_prefix = candidates[b.0]
+                .to_ascii_lowercase()
+                .starts_with(&pattern_lower);
+            b_prefix.cmp(&a_prefix).then_with(|| {
+                if a_prefix && b_prefix {
+                    candidates[a.0]
+                        .len()
+                        .cmp(&candidates[b.0].len())
+                        .then_with(|| candidates[a.0].cmp(&candidates[b.0]))
+                } else {
+                    b.1.cmp(&a.1)
+                        .then_with(|| candidates[a.0].len().cmp(&candidates[b.0].len()))
+                        .then_with(|| candidates[a.0].cmp(&candidates[b.0]))
+                }
+            })
+        });
+
+        matches
+            .into_iter()
+            .take(limit)
+            .map(|(index, _)| index)
+            .collect()
     }
 }
