@@ -50,12 +50,15 @@ class DaemonContractTests(unittest.TestCase):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         setup = source.split('guest_tools=(', 1)[1].split("printf 'daemon lifecycle start", 1)[0]
         setup = 'guest_tools=(' + setup
-        for distro in ('arch', 'debian', 'ubuntu', 'fedora'):
+        for distro in ('arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'):
             for benchmark in ('true', 'false'):
-                with self.subTest(distro=distro, benchmark=benchmark):
+                with self.subTest(distro=distro, benchmark=benchmark), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / 'evidence').mkdir()
                     result = subprocess.run(
-                        [BASH, '-euc', 'sudo() { printf "%s\\n" "$@"; };\n' + setup],
-                        env=dict(os.environ, distro=distro, benchmark=benchmark),
+                        [BASH, '-euc', 'sudo() { printf "%s\\n" "$@"; };\n'
+                         'timeout() { printf "%s\\n" "$@" > "$HOME/provision.argv"; };\n' + setup],
+                        cwd=root, env=dict(os.environ, HOME=str(root), distro=distro, benchmark=benchmark),
                         capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     args = result.stdout.splitlines()
@@ -64,6 +67,27 @@ class DaemonContractTests(unittest.TestCase):
                     self.assertEqual(args.count('python' if distro == 'arch' else 'python3'), 1)
                     self.assertEqual(args.count('python3' if distro == 'arch' else 'python'), 0)
                     self.assertEqual(args.count('hyperfine'), int(benchmark == 'true'))
+                    collector = 'systemd' if distro in ('arch', 'fedora') else 'systemd-coredump'
+                    self.assertEqual(args.count(collector), 1)
+                    self.assertEqual(args.count('libcap2-bin'), int(distro in ('debian', 'debian-trixie', 'ubuntu')))
+                    self.assertEqual((root / 'provision.argv').read_text().splitlines(),
+                                     ['--kill-after=5s', '90s', 'sudo', '-n', 'python3',
+                                      str(root / 'provision-qemu-crash-channel.py')])
+                    self.assertTrue((root / 'evidence/crash-channel-provision.json').is_file())
+
+    @unittest.skipIf(os.name == 'nt', 'guest setup requires POSIX bash')
+    def test_crash_provision_failure_prevents_daemon_start(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        setup = 'guest_tools=(' + source.split('guest_tools=(', 1)[1].split("printf 'daemon lifecycle start", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'evidence').mkdir()
+            result = subprocess.run(
+                [BASH, '-euc', 'sudo() { :; }; timeout() { return 120; };\n' + setup + '\necho daemon-started'],
+                cwd=root, env=dict(os.environ, HOME=str(root), distro='debian-trixie', benchmark='false'),
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 120, result.stderr)
+            self.assertNotIn('daemon-started', result.stdout)
 
     def test_query_parity_receipt_is_mandatory(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
