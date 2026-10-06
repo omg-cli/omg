@@ -6687,6 +6687,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_build_releases_cleanup_ownership() -> Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::aur::client::tests::cancelled_build_releases_cleanup_ownership",
+        ) {
+            return Ok(());
+        }
         let directory = tempfile::tempdir()?;
         let client = AurClient {
             build_dir: directory.path().join("aur"),
