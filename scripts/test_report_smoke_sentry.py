@@ -47,6 +47,36 @@ class SentryResultAdmissionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Sentry accepted event", result.stdout)
 
+    def test_pass_without_executed_exit_is_rejected_before_transport(self):
+        result, envelope = self.run_rows([
+            dict(case_id="qemu-arch-diff", distro="arch", result="PASS",
+                 exit_code=-1, elapsed_seconds=0)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid result fields", result.stderr)
+        self.assertIsNone(envelope)
+
+    def test_executed_pass_preserves_declared_nonzero_expectations(self):
+        # Inventory diff declares expected_exit=1; PASS does not imply exit 0.
+        for code in (0, 1, 255):
+            with self.subTest(code=code):
+                result, envelope = self.run_rows([
+                    dict(case_id="qemu-arch-diff", distro="arch", result="PASS",
+                         exit_code=code, elapsed_seconds=0)])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Sentry report not needed: no failures", result.stdout)
+                self.assertIsNone(envelope)
+
+    def test_failure_classifications_preserve_zero_and_missing_exits(self):
+        rows = [dict(case_id=f"case-{index}", distro="arch", result=verdict,
+                     exit_code=code, elapsed_seconds=0)
+                for index, (verdict, code) in enumerate(
+                    (("FAIL", 0), ("PRODUCT_FAIL", 0), ("HARNESS_ERROR", -1),
+                     ("FAIL", -1), ("BLOCKED", -1), ("SKIPPED", -1),
+                     ("EXPECTED_REJECTION", 1)))]
+        result, envelope = self.run_rows(rows)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(envelope[2]["extra"]["failures"], rows[:4])
+
     def test_trixie_failure_reaches_sender_without_identity_rewrite(self):
         rows = [dict(case_id="qemu-debian-trixie-lifecycle", distro="debian-trixie",
                      result="HARNESS_ERROR", exit_code=120, elapsed_seconds=2)]
