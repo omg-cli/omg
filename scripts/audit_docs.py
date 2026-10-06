@@ -59,16 +59,24 @@ def get_md_files(repo):
         and p.name not in ("changelog.md",)
     ]
 
-def check_broken_links(repo):
-    broken = []
-    md_files = get_md_files(repo)
-    
-    file_headings = {}
-    for path in md_files:
+def read_documents(repo, paths, findings):
+    """Yield readable inputs and record every selected input's read failure."""
+    for path in paths:
         try:
             content = path.read_text(encoding="utf-8")
-        except Exception:
+        except (OSError, UnicodeError) as error:
+            rel = path.relative_to(repo).as_posix()
+            findings.append(f"{rel}: cannot read: {type(error).__name__}: {error}")
             continue
+        yield path, content
+
+
+def check_broken_links(repo):
+    broken = []
+    documents = list(read_documents(repo, get_md_files(repo), broken))
+
+    file_headings = {}
+    for path, content in documents:
         headings = set()
         for line in content.splitlines():
             m = re.match(r"^#+\s+(.+)$", line)
@@ -83,11 +91,7 @@ def check_broken_links(repo):
 
     link_regex = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
 
-    for path in md_files:
-        try:
-            content = path.read_text(encoding="utf-8")
-        except Exception:
-            continue
+    for path, content in documents:
         rel = path.relative_to(repo).as_posix()
         for lineno, line in enumerate(content.splitlines(), 1):
             for match in link_regex.finditer(line):
@@ -129,14 +133,10 @@ def check_forbidden_patterns(repo):
         (r'omg enterprise reports\b.*--format\b', "Flag --format was removed from 'omg enterprise reports'"),
     ]
 
-    for path in get_md_files(repo):
+    for path, content in read_documents(repo, get_md_files(repo), findings):
         if path.name in ("TECH-DEBT-REVIEW-2026-08-31.md", "mise-compatibility.md"):
             continue
         rel = path.relative_to(repo).as_posix()
-        try:
-            content = path.read_text(encoding="utf-8")
-        except Exception:
-            continue
         for lineno, line in enumerate(content.splitlines(), 1):
             for pattern, reason in forbidden:
                 if re.search(pattern, line):
@@ -149,12 +149,8 @@ def check_config_keys(repo):
     findings = []
     # Check config keys in docs/ and examples/
     files_to_check = get_md_files(repo) + [repo / "examples" / "config.toml"]
-    for path in files_to_check:
+    for path, content in read_documents(repo, files_to_check, findings):
         rel = path.relative_to(repo).as_posix()
-        try:
-            content = path.read_text(encoding="utf-8")
-        except Exception:
-            continue
         
         # Check for build_concurrency > 8
         for lineno, line in enumerate(content.splitlines(), 1):
@@ -206,12 +202,8 @@ def check_all_command_references(repo):
     enums = ALIGNMENT.parse_enums(args_rs.read_text(encoding='utf-8').splitlines())
     
     findings = []
-    for path in get_md_files(repo):
+    for path, content in read_documents(repo, get_md_files(repo), findings):
         rel = path.relative_to(repo).as_posix()
-        try:
-            content = path.read_text(encoding="utf-8")
-        except Exception:
-            continue
         
         in_fence = False
         for lineno, line in enumerate(content.splitlines(), 1):
