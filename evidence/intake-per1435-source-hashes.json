@@ -1,0 +1,411 @@
+{
+    "sourceHead":  "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+    "previousSourceCommit":  "d5f7cc1eb8988cb6406c8392a93b04df37e9d0aa",
+    "runId":  "635ced5a-eacf-413a-90b2-ff10a54c51b8",
+    "sources":  [
+                    {
+                        "path":  "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave2\\slice-a.md",
+                        "sha256":  "1fbb9b701c2c279f8c95361bccc1e3be903013f349ff4b7ff53a604d1593ed90",
+                        "priorSha256":  "1fbb9b701c2c279f8c95361bccc1e3be903013f349ff4b7ff53a604d1593ed90",
+                        "unchanged":  true,
+                        "bytes":  7282,
+                        "previousHeadingAnchors":  [
+                                                       {
+                                                           "line":  8,
+                                                           "text":  "## Lens 051 — Env-scrub list thorough but GCONV_PATH absent — P1"
+                                                       },
+                                                       {
+                                                           "line":  22,
+                                                           "text":  "## Lens 052 — sudo/sudoloop sites use scrubbed constructors — contained"
+                                                       },
+                                                       {
+                                                           "line":  40,
+                                                           "text":  "## Lens 053 — PrivilegeChecker whitelist is dead surface — P1"
+                                                       },
+                                                       {
+                                                           "line":  54,
+                                                           "text":  "## Lens 054 — OMG_ELEVATED contract split between env and argv — P1"
+                                                       },
+                                                       {
+                                                           "line":  70,
+                                                           "text":  "## Lens 055 — Privileged sync has no audit record — P0"
+                                                       },
+                                                       {
+                                                           "line":  85,
+                                                           "text":  "## Lens 056 — OMG_PACMAN_CACHE_DIR dead override for unprivileged users — P1"
+                                                       },
+                                                       {
+                                                           "line":  96,
+                                                           "text":  "## Lens 057 — setup_shell rc symlink overwrite — P0"
+                                                       },
+                                                       {
+                                                           "line":  107,
+                                                           "text":  "## Lens 058 — install_shell_hook rc symlink handling — P1 complement"
+                                                       },
+                                                       {
+                                                           "line":  119,
+                                                           "text":  "## Lens 059 — Native builds have no_new_privs but no env containment — P0"
+                                                       },
+                                                       {
+                                                           "line":  130,
+                                                           "text":  "## Lens 060 — Privilege-account resolution avoids numeric SUDO_UID — contained"
+                                                       }
+                                                   ],
+                        "scope":  "Hash and byte count rechecked; unchanged bytes preserve prior line citations; no new adjudication"
+                    },
+                    {
+                        "path":  "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave2\\slice-b.md",
+                        "sha256":  "138f8ebcb3f82dc85ff5a1c16a4322ac9e74f054b9a1af2e7218a791262edb43",
+                        "priorSha256":  "138f8ebcb3f82dc85ff5a1c16a4322ac9e74f054b9a1af2e7218a791262edb43",
+                        "unchanged":  true,
+                        "bytes":  6843,
+                        "previousHeadingAnchors":  [
+                                                       {
+                                                           "line":  4,
+                                                           "text":  "## 061 — ~/.gnupg ro-bind removal (scoped keyring)"
+                                                       },
+                                                       {
+                                                           "line":  9,
+                                                           "text":  "## 062 — hooksPath=/dev/null + NOSYSTEM partial vs fresh checkout"
+                                                       },
+                                                       {
+                                                           "line":  17,
+                                                           "text":  "## 063 — per-build PKGDEST/SRCDEST"
+                                                       },
+                                                       {
+                                                           "line":  24,
+                                                           "text":  "## 064 — digest pre-install"
+                                                       },
+                                                       {
+                                                           "line":  31,
+                                                           "text":  "## 065 — offline default + allow_network trust (localhost)"
+                                                       },
+                                                       {
+                                                           "line":  39,
+                                                           "text":  "## 066 — chroot devtools same setting"
+                                                       },
+                                                       {
+                                                           "line":  45,
+                                                           "text":  "## 067 — review ordering before parse/download"
+                                                       },
+                                                       {
+                                                           "line":  52,
+                                                           "text":  "## 068 — source-rename validation + byte caps"
+                                                       },
+                                                       {
+                                                           "line":  60,
+                                                           "text":  "## 069 — complete hook rendering before auth"
+                                                       },
+                                                       {
+                                                           "line":  68,
+                                                           "text":  "## 070 — AUR timeout process-group kill"
+                                                       }
+                                                   ],
+                        "scope":  "Hash and byte count rechecked; unchanged bytes preserve prior line citations; no new adjudication"
+                    },
+                    {
+                        "path":  "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave2\\slice-c.md",
+                        "sha256":  "fdf0c222f1a9bed11288c810e6882ad9df6dcf6b5928b8ec2be003f75ece53cd",
+                        "priorSha256":  "fdf0c222f1a9bed11288c810e6882ad9df6dcf6b5928b8ec2be003f75ece53cd",
+                        "unchanged":  true,
+                        "bytes":  12671,
+                        "previousHeadingAnchors":  [
+                                                       {
+                                                           "line":  5,
+                                                           "text":  "## 071 — PGP verifier feature-gated; single prod caller (Swift), zero backend callers"
+                                                       },
+                                                       {
+                                                           "line":  12,
+                                                           "text":  "## 072 — AUR makepkg delegation vs stale `:2992` pointer; `secure_makepkg` is cleanbuild-only"
+                                                       },
+                                                       {
+                                                           "line":  19,
+                                                           "text":  "## 073 — sequoia 2.x stable + experimental-crypto flags (compile opt-in, not PQC)"
+                                                       },
+                                                       {
+                                                           "line":  26,
+                                                           "text":  "## 074 — publisher digest vs compromise (corruption != provenance)"
+                                                       },
+                                                       {
+                                                           "line":  33,
+                                                           "text":  "## 075 — SLSA artifact cert identity required; verified result still level None"
+                                                       },
+                                                       {
+                                                           "line":  41,
+                                                           "text":  "## 076 — Cargo.lock authority vs caret ranges"
+                                                       },
+                                                       {
+                                                           "line":  49,
+                                                           "text":  "## 077 — alpm git exact+rev, all-together (count comment drifted, rev uniformity holds)"
+                                                       },
+                                                       {
+                                                           "line":  57,
+                                                           "text":  "## 078 — vendored rust-apt GPL-3.0 feature-gate + patch provenance (license/deny gap)"
+                                                       },
+                                                       {
+                                                           "line":  66,
+                                                           "text":  "## 079 — install.sh binary pick `find|head`, checksum sidecar, umask"
+                                                       },
+                                                       {
+                                                           "line":  73,
+                                                           "text":  "## 080 — curl|sh bootstrap trust + gh attestation gate (fail-closed, non-retroactive)"
+                                                       }
+                                                   ],
+                        "scope":  "Hash and byte count rechecked; unchanged bytes preserve prior line citations; no new adjudication"
+                    },
+                    {
+                        "path":  "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave2\\slice-d.md",
+                        "sha256":  "4f59bf69ba732d500790cf1d07c7b28f7d639f4628133ec3281a289f1b927430",
+                        "priorSha256":  "4f59bf69ba732d500790cf1d07c7b28f7d639f4628133ec3281a289f1b927430",
+                        "unchanged":  true,
+                        "bytes":  12981,
+                        "previousHeadingAnchors":  [
+                                                       {
+                                                           "line":  7,
+                                                           "text":  "## 081 — Hash chain is local-only: rewrite/rehash/remove/incomplete-marker removal"
+                                                       },
+                                                       {
+                                                           "line":  26,
+                                                           "text":  "## 082 — Root-owned `/var/lib/omg/audit` sync persist + legacy `/var/log/omg` migrate"
+                                                       },
+                                                       {
+                                                           "line":  45,
+                                                           "text":  "## 083 — Daemon overflow/persistence failure: audit/incomplete + verify refuses complete"
+                                                       },
+                                                       {
+                                                           "line":  64,
+                                                           "text":  "## 084 — Root can alter logs: remote/independent retention is required"
+                                                       },
+                                                       {
+                                                           "line":  81,
+                                                           "text":  "## 085 — Socket validation: `validate_socket_with_context` + `OMG_SOCKET_PATH` + `..` + `sun_path`"
+                                                       },
+                                                       {
+                                                           "line":  91,
+                                                           "text":  "## 086 — `fast_status_path` derivation + launcher unlink owned-by-`omgd` singleton"
+                                                       },
+                                                       {
+                                                           "line":  111,
+                                                           "text":  "## 087 — No STUB JWT: production Ed25519 key + fail-closed verification"
+                                                       },
+                                                       {
+                                                           "line":  120,
+                                                           "text":  "## 088 — Secrets regexes: compiled once + placeholder/entropy gating"
+                                                       },
+                                                       {
+                                                           "line":  138,
+                                                           "text":  "## 089 — `gitleaks:allow` on the wrong line; secrets.yml gating gap"
+                                                       },
+                                                       {
+                                                           "line":  155,
+                                                           "text":  "## 090 — secrets.yml scope + scanner layering (gitleaks vs in-repo vs TruffleHog)"
+                                                       }
+                                                   ],
+                        "scope":  "Hash and byte count rechecked; unchanged bytes preserve prior line citations; no new adjudication"
+                    },
+                    {
+                        "path":  "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave2\\slice-e.md",
+                        "sha256":  "8d2346c749ab5ad2d8468984c26e3084ee5b13a40c2352a5e84f6ae1c4665753",
+                        "priorSha256":  "8d2346c749ab5ad2d8468984c26e3084ee5b13a40c2352a5e84f6ae1c4665753",
+                        "unchanged":  true,
+                        "bytes":  11689,
+                        "previousHeadingAnchors":  [
+                                                       {
+                                                           "line":  13,
+                                                           "text":  "## 091 — No InRelease clear-signed verification in Debian read path — P0"
+                                                       },
+                                                       {
+                                                           "line":  36,
+                                                           "text":  "## 092 — Packages hash binding absent; per-file SHA-256 is not Release binding — P0"
+                                                       },
+                                                       {
+                                                           "line":  53,
+                                                           "text":  "## 093 — Valid-Until / Date freshness not enforced — P1"
+                                                       },
+                                                       {
+                                                           "line":  62,
+                                                           "text":  "## 094 — HTTP / trusted=yes rejection missing in code; file:// parseable — P1"
+                                                       },
+                                                       {
+                                                           "line":  80,
+                                                           "text":  "## 095 — No hostile-mirror fixtures in-repo — P1 process gap"
+                                                       },
+                                                       {
+                                                           "line":  93,
+                                                           "text":  "## 096 — Sync/index authority split: native lists vs OMG snapshot — P1"
+                                                       },
+                                                       {
+                                                           "line":  111,
+                                                           "text":  "## 097 — fetch_public_download DNS pin misses bracketed IPv6; redirect guard narrower — P0-adjacent"
+                                                       },
+                                                       {
+                                                           "line":  131,
+                                                           "text":  "## 098 — Explicit policies re-enforced on ALPM; native APT/DNF/Homebrew refuse — contained"
+                                                       },
+                                                       {
+                                                           "line":  147,
+                                                           "text":  "## 099 — debian-pure refuses live mutations; user cache not authority — contained"
+                                                       },
+                                                       {
+                                                           "line":  160,
+                                                           "text":  "## 100 — Residual: .deb fetch path bypasses pinned downloader — P1"
+                                                       }
+                                                   ],
+                        "scope":  "Hash and byte count rechecked; unchanged bytes preserve prior line citations; no new adjudication"
+                    },
+                    {
+                        "path":  "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave3\\slice-a.md",
+                        "sha256":  "56890d73d47bbe95b931e954685da0a6dc7ad81a23eac728258155d41a03bed2",
+                        "priorSha256":  "56890d73d47bbe95b931e954685da0a6dc7ad81a23eac728258155d41a03bed2",
+                        "unchanged":  true,
+                        "bytes":  9624,
+                        "previousHeadingAnchors":  [
+                                                       {
+                                                           "line":  8,
+                                                           "text":  "## Lens 101 — `error.rs` typed contract deleted, CLI matches on substrings — P2"
+                                                       },
+                                                       {
+                                                           "line":  16,
+                                                           "text":  "## Lens 102 — `client.rs` socket-parent validation is centralized but message-only — P1"
+                                                       },
+                                                       {
+                                                           "line":  24,
+                                                           "text":  "## Lens 104 — Sync connect validates, then sets read+write timeouts — P2"
+                                                       },
+                                                       {
+                                                           "line":  32,
+                                                           "text":  "## Lens 105 — `default_socket_path()` is a thin alias — P2"
+                                                       },
+                                                       {
+                                                           "line":  40,
+                                                           "text":  "## Lens 106 — Response-ID validation rejects mismatched/failed frames — P1 (positive)"
+                                                       },
+                                                       {
+                                                           "line":  48,
+                                                           "text":  "## Lens 103 — `daemon_disabled()` truthy-env gate is explicit, two names — P2"
+                                                       },
+                                                       {
+                                                           "line":  49,
+                                                           "text":  "## Lens 107 — Framing: version gate + 10 MiB ceiling, codec default is the tight side — P1"
+                                                       },
+                                                       {
+                                                           "line":  57,
+                                                           "text":  "## Lens 108 — Async `call` timeout covers send+receive; sync timeout is caller-chosen — P2"
+                                                       },
+                                                       {
+                                                           "line":  66,
+                                                           "text":  "## Lens 111 — Socket-parent checks cover only the immediate parent — P1"
+                                                       },
+                                                       {
+                                                           "line":  79,
+                                                           "text":  "## Lens 109 — Root ignores caller-controlled socket/state paths — P1 (positive)"
+                                                       },
+                                                       {
+                                                           "line":  87,
+                                                           "text":  "## Lens 110 — `OMG_SOCKET_PATH` accepted unvalidated (relative, `..`, length) — P1"
+                                                       }
+                                                   ],
+                        "scope":  "Hash and byte count rechecked; unchanged bytes preserve prior line citations; no new adjudication"
+                    },
+                    {
+                        "path":  "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave3\\slice-b.md",
+                        "sha256":  "cacf9bad2bb30d1541d0e290e0cb30e0e5288078dfb05b2e610952f1524fcff7",
+                        "priorSha256":  "cacf9bad2bb30d1541d0e290e0cb30e0e5288078dfb05b2e610952f1524fcff7",
+                        "unchanged":  true,
+                        "bytes":  2768,
+                        "previousHeadingAnchors":  [
+                                                       {
+                                                           "line":  6,
+                                                           "text":  "## Lens 118 — Debian folded Depends dropped (`dependencies_from_status`)"
+                                                       },
+                                                       {
+                                                           "line":  11,
+                                                           "text":  "## Lens 119 — Same fold bug in `dependency_map_from_status`"
+                                                       },
+                                                       {
+                                                           "line":  16,
+                                                           "text":  "## Lens 120 — `execute_removal` holds locks across abort-prone await"
+                                                       },
+                                                       {
+                                                           "line":  21,
+                                                           "text":  "## Lens 121 — `:1020` gate makes lens 120 unreachable; delete, don\u0027t refactor"
+                                                       },
+                                                       {
+                                                           "line":  26,
+                                                           "text":  "## Lens 122 — Native build creates a new session (`setsid`)"
+                                                       },
+                                                       {
+                                                           "line":  31,
+                                                           "text":  "## Lens 123 — Timeout kills the wrong process group"
+                                                       }
+                                                   ],
+                        "scope":  "Hash and byte count rechecked; unchanged bytes preserve prior line citations; no new adjudication"
+                    },
+                    {
+                        "path":  "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\deep-review-20261003\\agent-67\\lens-67-coverage-workflow.md",
+                        "sha256":  "fe4cce4c3fc108b59bdefd79c5cf152672ee2be714b619ec2d817d07a86808b1",
+                        "priorSha256":  "fe4cce4c3fc108b59bdefd79c5cf152672ee2be714b619ec2d817d07a86808b1",
+                        "unchanged":  true,
+                        "bytes":  11659,
+                        "previousHeadingAnchors":  [
+                                                       {
+                                                           "line":  4,
+                                                           "text":  "## Findings"
+                                                       },
+                                                       {
+                                                           "line":  59,
+                                                           "text":  "## OUT_OF_SCOPE_LEAD"
+                                                       },
+                                                       {
+                                                           "line":  64,
+                                                           "text":  "## Coverage notes"
+                                                       }
+                                                   ],
+                        "scope":  "Hash and byte count rechecked; unchanged bytes preserve prior line citations; no new adjudication"
+                    },
+                    {
+                        "path":  "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\deep-review-20261003\\agent-11-daemon-lifecycle.md",
+                        "sha256":  "0f7461e0d2ab8b8387a740f30e9fe2dc53c4037d7b4f4ecf83b60acb8f914e35",
+                        "priorSha256":  "0f7461e0d2ab8b8387a740f30e9fe2dc53c4037d7b4f4ecf83b60acb8f914e35",
+                        "unchanged":  true,
+                        "bytes":  13808,
+                        "previousHeadingAnchors":  [
+                                                       {
+                                                           "line":  4,
+                                                           "text":  "## Findings"
+                                                       },
+                                                       {
+                                                           "line":  84,
+                                                           "text":  "## OUT_OF_SCOPE_LEAD"
+                                                       },
+                                                       {
+                                                           "line":  88,
+                                                           "text":  "## Coverage notes"
+                                                       }
+                                                   ],
+                        "scope":  "Hash and byte count rechecked; unchanged bytes preserve prior line citations; no new adjudication"
+                    },
+                    {
+                        "path":  "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\deep-review-20261003\\agent-12-daemon-ipc.md",
+                        "sha256":  "b2f879b8fe3861a220bbebc25aa8bac9a3630da74e033bf122a4b592d8aa47a5",
+                        "priorSha256":  "b2f879b8fe3861a220bbebc25aa8bac9a3630da74e033bf122a4b592d8aa47a5",
+                        "unchanged":  true,
+                        "bytes":  11238,
+                        "previousHeadingAnchors":  [
+                                                       {
+                                                           "line":  4,
+                                                           "text":  "## Findings"
+                                                       },
+                                                       {
+                                                           "line":  44,
+                                                           "text":  "## OUT_OF_SCOPE_LEAD"
+                                                       },
+                                                       {
+                                                           "line":  49,
+                                                           "text":  "## Coverage notes"
+                                                       }
+                                                   ],
+                        "scope":  "Hash and byte count rechecked; unchanged bytes preserve prior line citations; no new adjudication"
+                    }
+                ]
+}
