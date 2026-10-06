@@ -1,0 +1,760 @@
+{
+  "runId": "d9bd258f-bcef-4826-a66d-ead246de5787",
+  "sourceSHA": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+  "scope": "Frozen 28 PR / 33 issue inventory; 868/869 are later arrivals",
+  "prs": [
+    {
+      "repo": "omg-cli/omg",
+      "number": 859,
+      "state": "open",
+      "merged": false,
+      "head": "0378175b74538b8cc120f8b81b7a5168bd698ad1",
+      "base": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T09:41:57Z",
+      "task": [
+        "PER-1033"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 858,
+      "state": "open",
+      "merged": false,
+      "head": "fe1129420a69895c15491686824bd4d4d4ac74e9",
+      "base": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T08:03:55Z",
+      "task": [
+        "PER-1004",
+        "PER-999"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 856,
+      "state": "open",
+      "merged": false,
+      "head": "a009ff8847e47cac691e2dfdac7b4826a33e050b",
+      "base": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:05:55Z",
+      "task": [
+        "PER-985"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 855,
+      "state": "open",
+      "merged": false,
+      "head": "c6dcad3edd220bcadaf5e95e7a34be2968cd1334",
+      "base": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:05:55Z",
+      "task": [
+        "PER-933",
+        "PER-930",
+        "PER-935",
+        "PER-822"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 854,
+      "state": "open",
+      "merged": false,
+      "head": "2ecebe7aab68181a85c6c0d874e7d22f0af8d0b3",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:05:59Z",
+      "task": [
+        "PER-44",
+        "PER-885",
+        "PER-886"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 853,
+      "state": "open",
+      "merged": false,
+      "head": "aebcb0743190356030ebdae5a846a887ee37a6f8",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:05:59Z",
+      "task": [
+        "PER-849",
+        "PER-859"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 852,
+      "state": "open",
+      "merged": false,
+      "head": "19bd11204bda8d9e245f3f2e0eecf50e660a6941",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:05:59Z",
+      "task": [
+        "PER-851",
+        "PER-855",
+        "PER-164",
+        "PER-115"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 851,
+      "state": "open",
+      "merged": false,
+      "head": "1f7383bcaaf61bc2cef61fb1e3cb16deec93241e",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:01Z",
+      "task": [
+        "PER-848"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 850,
+      "state": "open",
+      "merged": false,
+      "head": "b5140618985c3b113a954a8fcab3a0ce36351b5d",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:03Z",
+      "task": [
+        "PER-833",
+        "PER-837"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 849,
+      "state": "open",
+      "merged": false,
+      "head": "c61f2c614134ba185a111e8b2b0675ce97715932",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:04Z",
+      "task": [
+        "PER-813",
+        "PER-392"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 848,
+      "state": "open",
+      "merged": false,
+      "head": "2f670e58484ab2ba8428b3ee83db487072853051",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:05Z",
+      "task": [
+        "PER-803",
+        "PER-469"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 845,
+      "state": "open",
+      "merged": false,
+      "head": "fd96cabd28abe66c24fa46e66c5c89efa890fdf3",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:06Z",
+      "task": [
+        "PER-43"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 844,
+      "state": "open",
+      "merged": false,
+      "head": "e60c4c5f480edb8b7e70456a41967b680431d9db",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:08Z",
+      "task": [
+        "PER-46",
+        "PER-644"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 843,
+      "state": "open",
+      "merged": false,
+      "head": "8a51aea536d5c2a63e66570a4c1a2c9aff677ac7",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:34:56Z",
+      "task": [
+        "PER-611",
+        "PER-632"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 841,
+      "state": "open",
+      "merged": false,
+      "head": "1ff3510d1ea0f50c7006032974d1064763f8a595",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:09Z",
+      "task": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 839,
+      "state": "open",
+      "merged": false,
+      "head": "c4091314c02a7ad57fea83724923099f71ae28c8",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:11Z",
+      "task": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 837,
+      "state": "open",
+      "merged": false,
+      "head": "457172782572ccf905a3d642ce7825ca69f44a11",
+      "base": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:12Z",
+      "task": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 836,
+      "state": "open",
+      "merged": false,
+      "head": "a042d44ed68f6f40991d4182ccac70a3e5afdc5c",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:15Z",
+      "task": [
+        "PER-41",
+        "PER-591"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 835,
+      "state": "open",
+      "merged": false,
+      "head": "4cd4d7003f671f8b8b577a01660a84623778226c",
+      "base": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:15Z",
+      "task": [
+        "PER-37"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 834,
+      "state": "open",
+      "merged": false,
+      "head": "110d5b1cc1cac9ac9743c10661705cd5fe9ce5bf",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:17Z",
+      "task": [
+        "PER-42"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 828,
+      "state": "open",
+      "merged": false,
+      "head": "8263c72832bddbc250ccd96b46b67cb2c9833bf7",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:18Z",
+      "task": [
+        "PER-40",
+        "PER-485"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 825,
+      "state": "open",
+      "merged": false,
+      "head": "6f242c6b03a70f832675f31a1290abae52b8f56d",
+      "base": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:22Z",
+      "task": [
+        "PER-45"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 822,
+      "state": "open",
+      "merged": false,
+      "head": "6e82693b594712e03c4589d99c788bf9f368a015",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:21Z",
+      "task": [
+        "PER-32",
+        "PER-456",
+        "PER-460"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 821,
+      "state": "open",
+      "merged": false,
+      "head": "d0acc2f8addd10518326d374d7940539bb649631",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:23Z",
+      "task": [
+        "PER-31"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 796,
+      "state": "open",
+      "merged": false,
+      "head": "385414d67018b4b099c58d817aedb03087e8aace",
+      "base": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:25Z",
+      "task": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 789,
+      "state": "open",
+      "merged": false,
+      "head": "b398c7030b6938cfcb1e6d7411f59844f482ec0c",
+      "base": "a69cb34218b59aa692ca380622a48402f1ecabfe",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:26Z",
+      "task": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 787,
+      "state": "open",
+      "merged": false,
+      "head": "cb97c6d987e351161522f6c015334c2bad97c0d4",
+      "base": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "updated_at": "2026-10-06T00:06:28Z",
+      "task": []
+    },
+    {
+      "repo": "PyRo1121/paperclip-local",
+      "number": 2,
+      "state": "open",
+      "merged": false,
+      "head": "c5814adc59027f37cc0714d75083ab4bf48abcd4",
+      "merged_at": null,
+      "merge_commit_sha": null
+    }
+  ],
+  "issues": [
+    {
+      "repo": "omg-cli/omg",
+      "number": 857,
+      "state": "open",
+      "labels": [
+        "priority:p3",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 847,
+      "state": "open",
+      "labels": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 842,
+      "state": "open",
+      "labels": [
+        "bug",
+        "github_actions",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 820,
+      "state": "open",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 819,
+      "state": "open",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 818,
+      "state": "open",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 817,
+      "state": "open",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 816,
+      "state": "open",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p1",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 815,
+      "state": "open",
+      "labels": [
+        "bug",
+        "security",
+        "priority:p1",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 814,
+      "state": "open",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 813,
+      "state": "open",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 812,
+      "state": "open",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 811,
+      "state": "open",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 810,
+      "state": "open",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 807,
+      "state": "open",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 806,
+      "state": "open",
+      "labels": [
+        "bug",
+        "priority:p1",
+        "type:ci"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 805,
+      "state": "open",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p1",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 802,
+      "state": "open",
+      "labels": [
+        "qa-failure"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 801,
+      "state": "open",
+      "labels": [
+        "qa-failure"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 800,
+      "state": "open",
+      "labels": [
+        "qa-failure",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 791,
+      "state": "open",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 785,
+      "state": "open",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "type:ci"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 772,
+      "state": "open",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:ci-blocked"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 770,
+      "state": "open",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 764,
+      "state": "open",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 757,
+      "state": "open",
+      "labels": [
+        "qa-failure",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 665,
+      "state": "open",
+      "labels": [
+        "qa-failure",
+        "priority:p1",
+        "type:ci",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 626,
+      "state": "open",
+      "labels": [
+        "bug",
+        "priority:p1",
+        "status:has-pr",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 623,
+      "state": "open",
+      "labels": [
+        "qa-failure",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 616,
+      "state": "open",
+      "labels": [
+        "enhancement",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 611,
+      "state": "open",
+      "labels": [
+        "enhancement",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 452,
+      "state": "open",
+      "labels": [
+        "qa-failure",
+        "priority:p1",
+        "type:ci",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 868,
+      "state": "open",
+      "labels": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 869,
+      "state": "open",
+      "labels": []
+    },
+    {
+      "repo": "PyRo1121/paperclip-local",
+      "number": 1,
+      "state": "open",
+      "labels": []
+    }
+  ]
+}
