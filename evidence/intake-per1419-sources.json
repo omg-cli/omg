@@ -1,0 +1,410 @@
+{
+  "runId": "da8d7411-1707-48de-8269-f0b43ed33d23",
+  "sourceHead": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+  "sources": [
+    {
+      "path": "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave2\\slice-a.md",
+      "sha256": "1fbb9b701c2c279f8c95361bccc1e3be903013f349ff4b7ff53a604d1593ed90",
+      "bytes": 7282,
+      "lines": 139,
+      "headingAnchors": [
+        {
+          "line": 8,
+          "text": "## Lens 051 \u2014 Env-scrub list thorough but GCONV_PATH absent \u2014 P1"
+        },
+        {
+          "line": 22,
+          "text": "## Lens 052 \u2014 sudo/sudoloop sites use scrubbed constructors \u2014 contained"
+        },
+        {
+          "line": 40,
+          "text": "## Lens 053 \u2014 PrivilegeChecker whitelist is dead surface \u2014 P1"
+        },
+        {
+          "line": 54,
+          "text": "## Lens 054 \u2014 OMG_ELEVATED contract split between env and argv \u2014 P1"
+        },
+        {
+          "line": 70,
+          "text": "## Lens 055 \u2014 Privileged sync has no audit record \u2014 P0"
+        },
+        {
+          "line": 85,
+          "text": "## Lens 056 \u2014 OMG_PACMAN_CACHE_DIR dead override for unprivileged users \u2014 P1"
+        },
+        {
+          "line": 96,
+          "text": "## Lens 057 \u2014 setup_shell rc symlink overwrite \u2014 P0"
+        },
+        {
+          "line": 107,
+          "text": "## Lens 058 \u2014 install_shell_hook rc symlink handling \u2014 P1 complement"
+        },
+        {
+          "line": 119,
+          "text": "## Lens 059 \u2014 Native builds have no_new_privs but no env containment \u2014 P0"
+        },
+        {
+          "line": 130,
+          "text": "## Lens 060 \u2014 Privilege-account resolution avoids numeric SUDO_UID \u2014 contained"
+        }
+      ],
+      "existingExactHash": true
+    },
+    {
+      "path": "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave2\\slice-b.md",
+      "sha256": "138f8ebcb3f82dc85ff5a1c16a4322ac9e74f054b9a1af2e7218a791262edb43",
+      "bytes": 6843,
+      "lines": 78,
+      "headingAnchors": [
+        {
+          "line": 4,
+          "text": "## 061 \u2014 ~/.gnupg ro-bind removal (scoped keyring)"
+        },
+        {
+          "line": 9,
+          "text": "## 062 \u2014 hooksPath=/dev/null + NOSYSTEM partial vs fresh checkout"
+        },
+        {
+          "line": 17,
+          "text": "## 063 \u2014 per-build PKGDEST/SRCDEST"
+        },
+        {
+          "line": 24,
+          "text": "## 064 \u2014 digest pre-install"
+        },
+        {
+          "line": 31,
+          "text": "## 065 \u2014 offline default + allow_network trust (localhost)"
+        },
+        {
+          "line": 39,
+          "text": "## 066 \u2014 chroot devtools same setting"
+        },
+        {
+          "line": 45,
+          "text": "## 067 \u2014 review ordering before parse/download"
+        },
+        {
+          "line": 52,
+          "text": "## 068 \u2014 source-rename validation + byte caps"
+        },
+        {
+          "line": 60,
+          "text": "## 069 \u2014 complete hook rendering before auth"
+        },
+        {
+          "line": 68,
+          "text": "## 070 \u2014 AUR timeout process-group kill"
+        }
+      ],
+      "existingExactHash": true
+    },
+    {
+      "path": "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave2\\slice-c.md",
+      "sha256": "fdf0c222f1a9bed11288c810e6882ad9df6dcf6b5928b8ec2be003f75ece53cd",
+      "bytes": 12671,
+      "lines": 82,
+      "headingAnchors": [
+        {
+          "line": 5,
+          "text": "## 071 \u2014 PGP verifier feature-gated; single prod caller (Swift), zero backend callers"
+        },
+        {
+          "line": 12,
+          "text": "## 072 \u2014 AUR makepkg delegation vs stale `:2992` pointer; `secure_makepkg` is cleanbuild-only"
+        },
+        {
+          "line": 19,
+          "text": "## 073 \u2014 sequoia 2.x stable + experimental-crypto flags (compile opt-in, not PQC)"
+        },
+        {
+          "line": 26,
+          "text": "## 074 \u2014 publisher digest vs compromise (corruption != provenance)"
+        },
+        {
+          "line": 33,
+          "text": "## 075 \u2014 SLSA artifact cert identity required; verified result still level None"
+        },
+        {
+          "line": 41,
+          "text": "## 076 \u2014 Cargo.lock authority vs caret ranges"
+        },
+        {
+          "line": 49,
+          "text": "## 077 \u2014 alpm git exact+rev, all-together (count comment drifted, rev uniformity holds)"
+        },
+        {
+          "line": 57,
+          "text": "## 078 \u2014 vendored rust-apt GPL-3.0 feature-gate + patch provenance (license/deny gap)"
+        },
+        {
+          "line": 66,
+          "text": "## 079 \u2014 install.sh binary pick `find|head`, checksum sidecar, umask"
+        },
+        {
+          "line": 73,
+          "text": "## 080 \u2014 curl|sh bootstrap trust + gh attestation gate (fail-closed, non-retroactive)"
+        }
+      ],
+      "existingExactHash": true
+    },
+    {
+      "path": "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave2\\slice-d.md",
+      "sha256": "4f59bf69ba732d500790cf1d07c7b28f7d639f4628133ec3281a289f1b927430",
+      "bytes": 12981,
+      "lines": 196,
+      "headingAnchors": [
+        {
+          "line": 7,
+          "text": "## 081 \u2014 Hash chain is local-only: rewrite/rehash/remove/incomplete-marker removal"
+        },
+        {
+          "line": 26,
+          "text": "## 082 \u2014 Root-owned `/var/lib/omg/audit` sync persist + legacy `/var/log/omg` migrate"
+        },
+        {
+          "line": 45,
+          "text": "## 083 \u2014 Daemon overflow/persistence failure: audit/incomplete + verify refuses complete"
+        },
+        {
+          "line": 64,
+          "text": "## 084 \u2014 Root can alter logs: remote/independent retention is required"
+        },
+        {
+          "line": 81,
+          "text": "## 085 \u2014 Socket validation: `validate_socket_with_context` + `OMG_SOCKET_PATH` + `..` + `sun_path`"
+        },
+        {
+          "line": 91,
+          "text": "## 086 \u2014 `fast_status_path` derivation + launcher unlink owned-by-`omgd` singleton"
+        },
+        {
+          "line": 111,
+          "text": "## 087 \u2014 No STUB JWT: production Ed25519 key + fail-closed verification"
+        },
+        {
+          "line": 120,
+          "text": "## 088 \u2014 Secrets regexes: compiled once + placeholder/entropy gating"
+        },
+        {
+          "line": 138,
+          "text": "## 089 \u2014 `gitleaks:allow` on the wrong line; secrets.yml gating gap"
+        },
+        {
+          "line": 155,
+          "text": "## 090 \u2014 secrets.yml scope + scanner layering (gitleaks vs in-repo vs TruffleHog)"
+        }
+      ],
+      "existingExactHash": true
+    },
+    {
+      "path": "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave2\\slice-e.md",
+      "sha256": "8d2346c749ab5ad2d8468984c26e3084ee5b13a40c2352a5e84f6ae1c4665753",
+      "bytes": 11689,
+      "lines": 184,
+      "headingAnchors": [
+        {
+          "line": 13,
+          "text": "## 091 \u2014 No InRelease clear-signed verification in Debian read path \u2014 P0"
+        },
+        {
+          "line": 36,
+          "text": "## 092 \u2014 Packages hash binding absent; per-file SHA-256 is not Release binding \u2014 P0"
+        },
+        {
+          "line": 53,
+          "text": "## 093 \u2014 Valid-Until / Date freshness not enforced \u2014 P1"
+        },
+        {
+          "line": 62,
+          "text": "## 094 \u2014 HTTP / trusted=yes rejection missing in code; file:// parseable \u2014 P1"
+        },
+        {
+          "line": 80,
+          "text": "## 095 \u2014 No hostile-mirror fixtures in-repo \u2014 P1 process gap"
+        },
+        {
+          "line": 93,
+          "text": "## 096 \u2014 Sync/index authority split: native lists vs OMG snapshot \u2014 P1"
+        },
+        {
+          "line": 111,
+          "text": "## 097 \u2014 fetch_public_download DNS pin misses bracketed IPv6; redirect guard narrower \u2014 P0-adjacent"
+        },
+        {
+          "line": 131,
+          "text": "## 098 \u2014 Explicit policies re-enforced on ALPM; native APT/DNF/Homebrew refuse \u2014 contained"
+        },
+        {
+          "line": 147,
+          "text": "## 099 \u2014 debian-pure refuses live mutations; user cache not authority \u2014 contained"
+        },
+        {
+          "line": 160,
+          "text": "## 100 \u2014 Residual: .deb fetch path bypasses pinned downloader \u2014 P1"
+        }
+      ],
+      "existingExactHash": true
+    },
+    {
+      "path": "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave3\\slice-a.md",
+      "sha256": "56890d73d47bbe95b931e954685da0a6dc7ad81a23eac728258155d41a03bed2",
+      "bytes": 9624,
+      "lines": 93,
+      "headingAnchors": [
+        {
+          "line": 8,
+          "text": "## Lens 101 \u2014 `error.rs` typed contract deleted, CLI matches on substrings \u2014 P2"
+        },
+        {
+          "line": 16,
+          "text": "## Lens 102 \u2014 `client.rs` socket-parent validation is centralized but message-only \u2014 P1"
+        },
+        {
+          "line": 24,
+          "text": "## Lens 104 \u2014 Sync connect validates, then sets read+write timeouts \u2014 P2"
+        },
+        {
+          "line": 32,
+          "text": "## Lens 105 \u2014 `default_socket_path()` is a thin alias \u2014 P2"
+        },
+        {
+          "line": 40,
+          "text": "## Lens 106 \u2014 Response-ID validation rejects mismatched/failed frames \u2014 P1 (positive)"
+        },
+        {
+          "line": 48,
+          "text": "## Lens 103 \u2014 `daemon_disabled()` truthy-env gate is explicit, two names \u2014 P2"
+        },
+        {
+          "line": 49,
+          "text": "## Lens 107 \u2014 Framing: version gate + 10 MiB ceiling, codec default is the tight side \u2014 P1"
+        },
+        {
+          "line": 57,
+          "text": "## Lens 108 \u2014 Async `call` timeout covers send+receive; sync timeout is caller-chosen \u2014 P2"
+        },
+        {
+          "line": 66,
+          "text": "## Lens 111 \u2014 Socket-parent checks cover only the immediate parent \u2014 P1"
+        },
+        {
+          "line": 79,
+          "text": "## Lens 109 \u2014 Root ignores caller-controlled socket/state paths \u2014 P1 (positive)"
+        },
+        {
+          "line": 87,
+          "text": "## Lens 110 \u2014 `OMG_SOCKET_PATH` accepted unvalidated (relative, `..`, length) \u2014 P1"
+        }
+      ],
+      "existingExactHash": true
+    },
+    {
+      "path": "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\500-lens\\wave3\\slice-b.md",
+      "sha256": "cacf9bad2bb30d1541d0e290e0cb30e0e5288078dfb05b2e610952f1524fcff7",
+      "bytes": 2768,
+      "lines": 34,
+      "headingAnchors": [
+        {
+          "line": 6,
+          "text": "## Lens 118 \u2014 Debian folded Depends dropped (`dependencies_from_status`)"
+        },
+        {
+          "line": 11,
+          "text": "## Lens 119 \u2014 Same fold bug in `dependency_map_from_status`"
+        },
+        {
+          "line": 16,
+          "text": "## Lens 120 \u2014 `execute_removal` holds locks across abort-prone await"
+        },
+        {
+          "line": 21,
+          "text": "## Lens 121 \u2014 `:1020` gate makes lens 120 unreachable; delete, don't refactor"
+        },
+        {
+          "line": 26,
+          "text": "## Lens 122 \u2014 Native build creates a new session (`setsid`)"
+        },
+        {
+          "line": 31,
+          "text": "## Lens 123 \u2014 Timeout kills the wrong process group"
+        }
+      ],
+      "existingExactHash": true
+    },
+    {
+      "path": "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\deep-review-20261003\\agent-67\\lens-67-coverage-workflow.md",
+      "sha256": "fe4cce4c3fc108b59bdefd79c5cf152672ee2be714b619ec2d817d07a86808b1",
+      "bytes": 11659,
+      "lines": 85,
+      "headingAnchors": [
+        {
+          "line": 4,
+          "text": "## Findings"
+        },
+        {
+          "line": 59,
+          "text": "## OUT_OF_SCOPE_LEAD"
+        },
+        {
+          "line": 64,
+          "text": "## Coverage notes"
+        }
+      ],
+      "existingExactHash": true
+    },
+    {
+      "path": "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\deep-review-20261003\\agent-11-daemon-lifecycle.md",
+      "sha256": "0f7461e0d2ab8b8387a740f30e9fe2dc53c4037d7b4f4ecf83b60acb8f914e35",
+      "bytes": 13808,
+      "lines": 122,
+      "headingAnchors": [
+        {
+          "line": 4,
+          "text": "## Findings"
+        },
+        {
+          "line": 84,
+          "text": "## OUT_OF_SCOPE_LEAD"
+        },
+        {
+          "line": 88,
+          "text": "## Coverage notes"
+        }
+      ],
+      "existingExactHash": true
+    },
+    {
+      "path": "C:\\Users\\olen\\Documents\\Codex\\omg\\.audit\\deep-review-20261003\\agent-12-daemon-ipc.md",
+      "sha256": "b2f879b8fe3861a220bbebc25aa8bac9a3630da74e033bf122a4b592d8aa47a5",
+      "bytes": 11238,
+      "lines": 56,
+      "headingAnchors": [
+        {
+          "line": 4,
+          "text": "## Findings"
+        },
+        {
+          "line": 44,
+          "text": "## OUT_OF_SCOPE_LEAD"
+        },
+        {
+          "line": 49,
+          "text": "## Coverage notes"
+        }
+      ],
+      "existingExactHash": true
+    }
+  ],
+  "baselineChanges": [
+    {
+      "repository": "omg-cli/omg",
+      "number": 859,
+      "baselineHead": "85227b798d4ffa35b4f500f81f9f0a342b9bc75b",
+      "currentHead": "0378175b74538b8cc120f8b81b7a5168bd698ad1"
+    }
+  ],
+  "commands": "python verify_intake.py: exact ten source hashes present in existing PER-443 ledger; individual metadata all 28 open/unmerged PRs and 33 open issues; one baseline head delta; exit 0",
+  "scope": "Source identity/metadata checks only; reported source sections not accepted defects; INFO/positive/unsupported/duplicate scopes retained"
+}
