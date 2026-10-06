@@ -1,0 +1,950 @@
+{
+  "issue": "PER-1318",
+  "runId": "abd151b6-b97c-4e94-ad97-c6d9952d07d8",
+  "readAt": "2026-10-06T05:29:01.236Z",
+  "method": "Managed github_fetch open pulls/issues collections; per_page=100, each returned fewer than 100 items; PR entries excluded from issue counts.",
+  "rows": [
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 859,
+      "state": "open",
+      "head": "85227b798d4ffa35b4f500f81f9f0a342b9bc75b",
+      "url": "https://github.com/omg-cli/omg/pull/859",
+      "updated": "2026-10-06T00:05:54Z",
+      "labels": [
+        "priority:p2",
+        "type:ci",
+        "status:ci-blocked"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 858,
+      "state": "open",
+      "head": "fe1129420a69895c15491686824bd4d4d4ac74e9",
+      "url": "https://github.com/omg-cli/omg/pull/858",
+      "updated": "2026-10-06T00:05:54Z",
+      "labels": [
+        "priority:p2",
+        "type:ci",
+        "status:ci-blocked"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 856,
+      "state": "open",
+      "head": "a009ff8847e47cac691e2dfdac7b4826a33e050b",
+      "url": "https://github.com/omg-cli/omg/pull/856",
+      "updated": "2026-10-06T00:05:55Z",
+      "labels": [
+        "rust",
+        "priority:p3",
+        "status:ci-blocked"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 855,
+      "state": "open",
+      "head": "c6dcad3edd220bcadaf5e95e7a34be2968cd1334",
+      "url": "https://github.com/omg-cli/omg/pull/855",
+      "updated": "2026-10-06T00:05:55Z",
+      "labels": [
+        "rust",
+        "priority:p2",
+        "status:ci-blocked",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 854,
+      "state": "open",
+      "head": "2ecebe7aab68181a85c6c0d874e7d22f0af8d0b3",
+      "url": "https://github.com/omg-cli/omg/pull/854",
+      "updated": "2026-10-06T00:05:59Z",
+      "labels": [
+        "bug",
+        "github_actions",
+        "priority:p2",
+        "type:ci",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 853,
+      "state": "open",
+      "head": "aebcb0743190356030ebdae5a846a887ee37a6f8",
+      "url": "https://github.com/omg-cli/omg/pull/853",
+      "updated": "2026-10-06T00:05:59Z",
+      "labels": [
+        "rust",
+        "priority:p3",
+        "type:ci",
+        "status:ci-blocked",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 852,
+      "state": "open",
+      "head": "19bd11204bda8d9e245f3f2e0eecf50e660a6941",
+      "url": "https://github.com/omg-cli/omg/pull/852",
+      "updated": "2026-10-06T00:05:59Z",
+      "labels": [
+        "rust",
+        "priority:p3",
+        "type:ci",
+        "status:ci-blocked",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 851,
+      "state": "open",
+      "head": "1f7383bcaaf61bc2cef61fb1e3cb16deec93241e",
+      "url": "https://github.com/omg-cli/omg/pull/851",
+      "updated": "2026-10-06T00:06:01Z",
+      "labels": [
+        "bug",
+        "priority:p3",
+        "type:ci",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 850,
+      "state": "open",
+      "head": "b5140618985c3b113a954a8fcab3a0ce36351b5d",
+      "url": "https://github.com/omg-cli/omg/pull/850",
+      "updated": "2026-10-06T00:06:03Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "type:ci",
+        "status:ci-blocked",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 849,
+      "state": "open",
+      "head": "c61f2c614134ba185a111e8b2b0675ce97715932",
+      "url": "https://github.com/omg-cli/omg/pull/849",
+      "updated": "2026-10-06T00:06:04Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 848,
+      "state": "open",
+      "head": "2f670e58484ab2ba8428b3ee83db487072853051",
+      "url": "https://github.com/omg-cli/omg/pull/848",
+      "updated": "2026-10-06T00:06:05Z",
+      "labels": [
+        "documentation",
+        "priority:p2",
+        "type:ci",
+        "status:ci-blocked",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 845,
+      "state": "open",
+      "head": "fd96cabd28abe66c24fa46e66c5c89efa890fdf3",
+      "url": "https://github.com/omg-cli/omg/pull/845",
+      "updated": "2026-10-06T00:06:06Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 844,
+      "state": "open",
+      "head": "e60c4c5f480edb8b7e70456a41967b680431d9db",
+      "url": "https://github.com/omg-cli/omg/pull/844",
+      "updated": "2026-10-06T00:06:08Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 843,
+      "state": "open",
+      "head": "8a51aea536d5c2a63e66570a4c1a2c9aff677ac7",
+      "url": "https://github.com/omg-cli/omg/pull/843",
+      "updated": "2026-10-06T00:34:56Z",
+      "labels": [
+        "bug",
+        "github_actions",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 841,
+      "state": "open",
+      "head": "1ff3510d1ea0f50c7006032974d1064763f8a595",
+      "url": "https://github.com/omg-cli/omg/pull/841",
+      "updated": "2026-10-06T00:06:09Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 839,
+      "state": "open",
+      "head": "c4091314c02a7ad57fea83724923099f71ae28c8",
+      "url": "https://github.com/omg-cli/omg/pull/839",
+      "updated": "2026-10-06T00:06:11Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:needs-evidence",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 837,
+      "state": "open",
+      "head": "457172782572ccf905a3d642ce7825ca69f44a11",
+      "url": "https://github.com/omg-cli/omg/pull/837",
+      "updated": "2026-10-06T00:06:12Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:needs-evidence",
+        "status:ci-blocked"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 836,
+      "state": "open",
+      "head": "a042d44ed68f6f40991d4182ccac70a3e5afdc5c",
+      "url": "https://github.com/omg-cli/omg/pull/836",
+      "updated": "2026-10-06T00:06:15Z",
+      "labels": [
+        "bug",
+        "security",
+        "priority:p1",
+        "type:ci",
+        "status:ci-blocked",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 835,
+      "state": "open",
+      "head": "4cd4d7003f671f8b8b577a01660a84623778226c",
+      "url": "https://github.com/omg-cli/omg/pull/835",
+      "updated": "2026-10-06T00:06:15Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:ci-blocked"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 834,
+      "state": "open",
+      "head": "110d5b1cc1cac9ac9743c10661705cd5fe9ce5bf",
+      "url": "https://github.com/omg-cli/omg/pull/834",
+      "updated": "2026-10-06T00:06:17Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p1",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 828,
+      "state": "open",
+      "head": "8263c72832bddbc250ccd96b46b67cb2c9833bf7",
+      "url": "https://github.com/omg-cli/omg/pull/828",
+      "updated": "2026-10-06T00:06:18Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "type:ci",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 825,
+      "state": "open",
+      "head": "6f242c6b03a70f832675f31a1290abae52b8f56d",
+      "url": "https://github.com/omg-cli/omg/pull/825",
+      "updated": "2026-10-06T00:06:22Z",
+      "labels": [
+        "bug",
+        "rust",
+        "github_actions",
+        "priority:p2",
+        "type:ci",
+        "status:ci-blocked"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 822,
+      "state": "open",
+      "head": "6e82693b594712e03c4589d99c788bf9f368a015",
+      "url": "https://github.com/omg-cli/omg/pull/822",
+      "updated": "2026-10-06T00:06:21Z",
+      "labels": [
+        "bug",
+        "documentation",
+        "priority:p1",
+        "type:ci",
+        "status:ci-blocked",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 821,
+      "state": "open",
+      "head": "d0acc2f8addd10518326d374d7940539bb649631",
+      "url": "https://github.com/omg-cli/omg/pull/821",
+      "updated": "2026-10-06T00:06:23Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p1",
+        "type:ci",
+        "status:ci-blocked",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 796,
+      "state": "open",
+      "head": "385414d67018b4b099c58d817aedb03087e8aace",
+      "url": "https://github.com/omg-cli/omg/pull/796",
+      "updated": "2026-10-06T00:06:25Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence",
+        "status:needs-review"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 789,
+      "state": "open",
+      "head": "b398c7030b6938cfcb1e6d7411f59844f482ec0c",
+      "url": "https://github.com/omg-cli/omg/pull/789",
+      "updated": "2026-10-06T00:06:26Z",
+      "labels": [
+        "rust",
+        "priority:p3",
+        "type:maintenance",
+        "status:needs-evidence",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "pr",
+      "number": 787,
+      "state": "open",
+      "head": "cb97c6d987e351161522f6c015334c2bad97c0d4",
+      "url": "https://github.com/omg-cli/omg/pull/787",
+      "updated": "2026-10-06T00:06:28Z",
+      "labels": [
+        "bug",
+        "rust",
+        "security",
+        "priority:p2",
+        "status:needs-evidence",
+        "status:ci-blocked"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 865,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/865",
+      "updated": "2026-10-06T05:24:58Z",
+      "labels": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 864,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/864",
+      "updated": "2026-10-06T05:15:01Z",
+      "labels": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 863,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/863",
+      "updated": "2026-10-06T05:05:50Z",
+      "labels": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 862,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/862",
+      "updated": "2026-10-06T04:50:37Z",
+      "labels": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 861,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/861",
+      "updated": "2026-10-06T04:29:51Z",
+      "labels": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 860,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/860",
+      "updated": "2026-10-06T04:23:15Z",
+      "labels": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 857,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/857",
+      "updated": "2026-10-06T00:05:57Z",
+      "labels": [
+        "priority:p3",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 847,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/847",
+      "updated": "2026-10-05T03:33:49Z",
+      "labels": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 842,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/842",
+      "updated": "2026-10-04T10:52:36Z",
+      "labels": [
+        "bug",
+        "github_actions",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 820,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/820",
+      "updated": "2026-10-06T00:06:10Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 819,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/819",
+      "updated": "2026-10-06T00:06:24Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 818,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/818",
+      "updated": "2026-10-06T00:06:01Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 817,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/817",
+      "updated": "2026-10-06T00:06:08Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 816,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/816",
+      "updated": "2026-10-06T00:06:19Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p1",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 815,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/815",
+      "updated": "2026-10-06T00:06:17Z",
+      "labels": [
+        "bug",
+        "security",
+        "priority:p1",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 814,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/814",
+      "updated": "2026-10-06T00:06:21Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 813,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/813",
+      "updated": "2026-10-04T10:37:22Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 812,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/812",
+      "updated": "2026-10-06T00:06:12Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 811,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/811",
+      "updated": "2026-10-06T00:06:18Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 810,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/810",
+      "updated": "2026-10-04T00:04:09Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 807,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/807",
+      "updated": "2026-10-06T00:06:14Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 806,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/806",
+      "updated": "2026-10-04T00:04:04Z",
+      "labels": [
+        "bug",
+        "priority:p1",
+        "type:ci"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 805,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/805",
+      "updated": "2026-10-06T00:06:26Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p1",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 802,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/802",
+      "updated": "2026-10-03T23:27:07Z",
+      "labels": [
+        "qa-failure"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 801,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/801",
+      "updated": "2026-10-03T23:27:06Z",
+      "labels": [
+        "qa-failure"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 800,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/800",
+      "updated": "2026-10-04T06:31:19Z",
+      "labels": [
+        "qa-failure",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 791,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/791",
+      "updated": "2026-10-03T21:19:24Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 785,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/785",
+      "updated": "2026-10-03T20:28:34Z",
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "type:ci"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 772,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/772",
+      "updated": "2026-10-03T16:25:35Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:ci-blocked"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 770,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/770",
+      "updated": "2026-10-03T16:39:51Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 764,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/764",
+      "updated": "2026-10-04T05:13:42Z",
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 757,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/757",
+      "updated": "2026-10-03T20:45:19Z",
+      "labels": [
+        "qa-failure",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 665,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/665",
+      "updated": "2026-10-04T22:14:19Z",
+      "labels": [
+        "qa-failure",
+        "priority:p1",
+        "type:ci",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 626,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/626",
+      "updated": "2026-10-03T21:19:23Z",
+      "labels": [
+        "bug",
+        "priority:p1",
+        "status:has-pr",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 623,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/623",
+      "updated": "2026-10-03T10:17:53Z",
+      "labels": [
+        "qa-failure",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 616,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/616",
+      "updated": "2026-10-03T23:26:30Z",
+      "labels": [
+        "enhancement",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 611,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/611",
+      "updated": "2026-10-03T21:30:38Z",
+      "labels": [
+        "enhancement",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "omg-cli/omg",
+      "kind": "issue",
+      "number": 452,
+      "state": "open",
+      "url": "https://github.com/omg-cli/omg/issues/452",
+      "updated": "2026-10-04T11:44:48Z",
+      "labels": [
+        "qa-failure",
+        "priority:p1",
+        "type:ci",
+        "status:needs-evidence"
+      ]
+    },
+    {
+      "repo": "PyRo1121/paperclip-local",
+      "kind": "pr",
+      "number": 2,
+      "state": "open",
+      "head": "c5814adc59027f37cc0714d75083ab4bf48abcd4",
+      "url": "https://github.com/PyRo1121/paperclip-local/pull/2",
+      "updated": "2026-10-06T02:03:12Z",
+      "labels": [
+        "bug",
+        "documentation",
+        "type:ci",
+        "priority:p1",
+        "status:ci-blocked",
+        "status:needs-work"
+      ]
+    },
+    {
+      "repo": "PyRo1121/paperclip-local",
+      "kind": "issue",
+      "number": 1,
+      "state": "open",
+      "url": "https://github.com/PyRo1121/paperclip-local/issues/1",
+      "updated": "2026-10-05T02:55:10Z",
+      "labels": []
+    }
+  ]
+}
