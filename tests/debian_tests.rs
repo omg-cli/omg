@@ -740,7 +740,7 @@ macro_rules! require_debian_like {
     () => {
         let config = $crate::common::TestConfig::default();
         if !config.is_debian() && !config.is_ubuntu() {
-            eprintln!("⏭️  Skipping test: requires Debian or Ubuntu");
+            $crate::common::report_skip("requires Debian or Ubuntu");
             return;
         }
     };
