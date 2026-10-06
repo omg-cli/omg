@@ -18,7 +18,7 @@ class ResourceCollectorTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("resource_collector", path)
         self.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.module)
-        self.scratch = tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR"))
+        self.scratch = tempfile.TemporaryDirectory()
         self.addCleanup(self.scratch.cleanup)
 
     def run_child(self, code, timeout=3):

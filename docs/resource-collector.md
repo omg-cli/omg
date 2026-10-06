@@ -1,14 +1,17 @@
 # Scoped Linux resource collector
 
-Optional preparation for [PER-803](http://127.0.0.1:3100/PER/issues/PER-803)
-and the canonical [resource baseline](http://127.0.0.1:3100/PER/issues/PER-469).
+Optional preparation tracked in [issue847](https://github.com/omg-cli/omg/issues/847).
 This script does not schedule a measurement window or run product benchmarks.
 
 Run one trusted, bounded command on Linux:
 
 ```sh
-python3 scripts/resource_collector.py --scratch-dir "$PAPERCLIP_RUN_SCRATCH_DIR" \
-  --timeout 60 -- /absolute/path/to/command argument
+(
+  task_scratch=$(mktemp -d) || exit
+  trap 'rmdir -- "$task_scratch"' EXIT
+  python3 scripts/resource_collector.py --scratch-dir "$task_scratch" \
+    --timeout 60 -- /absolute/path/to/command argument
+)
 ```
 
 The scratch path must be translated to a Linux path when invoking through WSL.
@@ -72,23 +75,18 @@ The original seven missing-collector failures and subsequent positive-control
 passes are historical evidence, not proof that the isolation defect was absent.
 These controls validate
 the collector only; they are not an OMG performance baseline. Exact commands,
-hashes and run output are retained in the Paperclip task evidence.
+hashes and run output should be retained with the measurement records.
 
-## Canonical next-wake checks and admission
+## Reproducible measurement preparation
 
-Using the next owner's actual run authentication, GET `/api/issues/PER-469`,
-then GET `/api/execution-workspaces/<returned executionWorkspaceId>`, then inspect
-`currentExecutionWorkspace` in `/api/issues/PER-469/heartbeat-context`. Require an
-active workspace whose sourceIssueId is the canonical task, distinct from PER-4.
-Verify cwd with `git rev-parse --show-toplevel`, `git rev-parse --git-dir`,
-`git branch --show-current`, `git rev-parse HEAD`, and `git status --porcelain=v1`.
-Do not substitute PER-803's child workspace as proof.
+Before collecting a product baseline, record the tested commit, checkout state,
+collector hash, toolchain and command. Verify that the collector exists on the
+pinned source, or use its separately verified immutable path. Keep preparation
+outside the measured samples and avoid competing guest or heavy build workloads.
+Use a task-specific Cargo target with `CARGO_BUILD_JOBS=2` when building fixtures.
 
-Manager retains measurement admission after independent CI and Guest Quality
-review and Delivery approval of this candidate: at most ten minutes preparation
-outside samples, task-specific target and CARGO_BUILD_JOBS=2, three warmups and
-twenty samples per case capped at sixty seconds, no competing guest/heavy build.
-Performance remains canonical baseline owner. No active reservation is created
-by these instructions. A future canonical source head must contain the approved
-collector (or use its separately verified immutable path); workspace realization
-does not establish collector availability on the pinned baseline source.
+A repeatable protocol can use three warmups and twenty samples per case capped
+at sixty seconds. Report actual output assertions, failures and exclusions with
+the resource records; these instructions do not create a measurement reservation
+or establish a product performance baseline. Review the collector and workload
+contract before relying on numerical comparisons.
