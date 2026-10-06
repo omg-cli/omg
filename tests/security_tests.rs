@@ -725,10 +725,86 @@ mod env_security {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod network_security {
-    fn production_source(source: &str) -> &str {
-        source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(production, _)| production)
+    use syn::{spanned::Spanned, visit::Visit};
+
+    #[derive(Default)]
+    struct TestItems {
+        ranges: Vec<std::ops::Range<usize>>,
+    }
+
+    fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+        // Exclude only explicit cfg(test). Other predicates remain audited:
+        // e.g. cfg(any(test, unix)) can also enable production code.
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Path>()
+                    .is_ok_and(|predicate| predicate.is_ident("test"))
+        })
+    }
+
+    macro_rules! visit_test_items {
+        ($($method:ident($node:ident)),* $(,)?) => {
+            $(fn $method(&mut self, node: &'ast syn::$node) {
+                if is_test_only(&node.attrs) {
+                    self.ranges.push(node.span().byte_range());
+                } else {
+                    syn::visit::$method(self, node);
+                }
+            })*
+        };
+    }
+
+    impl<'ast> Visit<'ast> for TestItems {
+        visit_test_items!(
+            visit_item_const(ItemConst),
+            visit_item_enum(ItemEnum),
+            visit_item_extern_crate(ItemExternCrate),
+            visit_item_fn(ItemFn),
+            visit_item_foreign_mod(ItemForeignMod),
+            visit_item_impl(ItemImpl),
+            visit_item_macro(ItemMacro),
+            visit_item_mod(ItemMod),
+            visit_item_static(ItemStatic),
+            visit_item_struct(ItemStruct),
+            visit_item_trait(ItemTrait),
+            visit_item_trait_alias(ItemTraitAlias),
+            visit_item_type(ItemType),
+            visit_item_union(ItemUnion),
+            visit_item_use(ItemUse),
+            visit_impl_item_const(ImplItemConst),
+            visit_impl_item_fn(ImplItemFn),
+            visit_impl_item_macro(ImplItemMacro),
+            visit_impl_item_type(ImplItemType),
+            visit_trait_item_const(TraitItemConst),
+            visit_trait_item_fn(TraitItemFn),
+            visit_trait_item_macro(TraitItemMacro),
+            visit_trait_item_type(TraitItemType),
+            visit_foreign_item_fn(ForeignItemFn),
+            visit_foreign_item_macro(ForeignItemMacro),
+            visit_foreign_item_static(ForeignItemStatic),
+            visit_foreign_item_type(ForeignItemType),
+        );
+    }
+
+    fn production_source(source: &str) -> String {
+        let syntax =
+            syn::parse_str::<syn::File>(source).expect("audited source must parse as Rust");
+        let mut test_items = TestItems::default();
+        test_items.visit_file(&syntax);
+
+        // Preserve original production text, comments and line boundaries.
+        // Spans from parsing outside a procedural macro have accurate byte
+        // ranges on stable Rust; do not infer nesting from indentation/braces.
+        let mut selected = source.as_bytes().to_vec();
+        for range in test_items.ranges {
+            for byte in &mut selected[range] {
+                if !matches!(*byte, b'\n' | b'\r') {
+                    *byte = b' ';
+                }
+            }
+        }
+        String::from_utf8(selected).expect("item spans must preserve UTF-8 boundaries")
     }
 
     fn assert_no_plaintext_http(source: &str, name: &str) {
@@ -748,14 +824,144 @@ mod network_security {
         }
     }
 
+    fn common_with_production_item_before(anchor: &str, item: &str) -> String {
+        let source = include_str!("../src/runtimes/common.rs");
+        assert_eq!(source.matches(anchor).count(), 1, "mutation anchor changed");
+        source.replacen(anchor, &format!("{item}\n{anchor}"), 1)
+    }
+
+    #[test]
+    #[should_panic(expected = "must not embed a plaintext HTTP URL")]
+    fn test_http_after_nested_test_helpers_is_rejected() {
+        let source = common_with_production_item_before(
+            "fn extract_domain(url: &str)",
+            "const INJECTED_URL: &str = \"http://example.invalid\";",
+        );
+        assert_no_plaintext_http(&production_source(&source), "mutated common.rs");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not disable TLS certificate validation")]
+    fn test_tls_disable_after_nested_test_helpers_is_rejected() {
+        let source = common_with_production_item_before(
+            "fn extract_domain(url: &str)",
+            "fn injected_client() { let _ = reqwest::Client::builder().danger_accept_invalid_certs(true); }",
+        );
+        assert_no_plaintext_http(&production_source(&source), "mutated common.rs");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not embed a plaintext HTTP URL")]
+    fn test_http_after_top_level_test_module_is_rejected() {
+        let source = common_with_production_item_before(
+            "const MAX_ARCHIVE_ENTRIES:",
+            "const INJECTED_URL: &str = \"http://example.invalid\";",
+        );
+        assert_no_plaintext_http(&production_source(&source), "mutated common.rs");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not disable TLS certificate validation")]
+    fn test_tls_disable_after_top_level_test_module_is_rejected() {
+        let source = common_with_production_item_before(
+            "const MAX_ARCHIVE_ENTRIES:",
+            "fn injected_client() { let _ = reqwest::Client::builder().danger_accept_invalid_certs(true); }",
+        );
+        assert_no_plaintext_http(&production_source(&source), "mutated common.rs");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not embed a plaintext HTTP URL")]
+    fn test_http_before_test_attributes_is_rejected() {
+        assert_no_plaintext_http(
+            &production_source("const URL: &str = \"http://example.invalid\";"),
+            "positive control",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must not disable TLS certificate validation")]
+    fn test_tls_disable_before_test_attributes_is_rejected() {
+        assert_no_plaintext_http(
+            &production_source(
+                "fn client() { let _ = reqwest::Client::builder().danger_accept_invalid_certs(true); }",
+            ),
+            "positive control",
+        );
+    }
+
+    #[test]
+    fn test_comments_and_test_fixtures_remain_valid() {
+        let source = r#"
+// Example "http://example.invalid" and danger_accept_invalid_certs
+// Unicode before the excluded spans: café
+struct Client;
+impl Client {
+    #[cfg(test)]
+    fn fixture() { let _ = ("http://fixture.invalid", "} {", '{'); }
+    fn production() { let _ = "https://example.invalid"; }
+}
+#[cfg(test)]
+mod tests {
+    const FIXTURE: &str = "http://fixture.invalid";
+    fn fixture() { let _ = "danger_accept_invalid_certs"; }
+}
+const PRODUCTION: &str = "https://example.invalid";
+#[cfg(test)]
+mod more_tests { const FIXTURE: &str = "http://second.invalid"; }
+"#;
+        let selected = production_source(source);
+        assert_no_plaintext_http(&selected, "legitimate fixtures");
+        assert!(selected.contains("const PRODUCTION:"));
+        assert!(selected.contains("fn production()"));
+        assert!(!selected.contains("fixture.invalid"));
+        assert!(!selected.contains("second.invalid"));
+        assert_eq!(source.lines().count(), selected.lines().count());
+    }
+
+    #[test]
+    #[should_panic(expected = "must not embed a plaintext HTTP URL")]
+    fn test_test_attribute_in_comment_does_not_end_audit() {
+        assert_no_plaintext_http(
+            &production_source("// #[cfg(test)]\nconst URL: &str = \"http://example.invalid\";"),
+            "comment delimiter control",
+        );
+    }
+
+    #[test]
+    fn test_production_items_after_test_modules_are_selected() {
+        let selected = production_source(include_str!("../src/runtimes/common.rs"));
+        assert!(selected.contains("const MAX_ARCHIVE_ENTRIES:"));
+        assert!(selected.contains("impl ArchiveEntryBudget"));
+        let selected = production_source(include_str!("../src/core/http.rs"));
+        assert!(selected.contains("impl BoundedResponseExt for reqwest::Response"));
+    }
+
+    #[test]
+    #[should_panic(expected = "must not embed a plaintext HTTP URL")]
+    fn test_mixed_cfg_predicate_remains_audited() {
+        assert_no_plaintext_http(
+            &production_source(
+                "#[cfg(any(test, unix))] const URL: &str = \"http://example.invalid\";",
+            ),
+            "mixed predicate control",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "audited source must parse as Rust")]
+    fn test_invalid_source_cannot_silently_pass_selection() {
+        let _ = production_source("#[cfg(test)] mod tests { unclosed");
+    }
+
     #[test]
     fn test_runtime_and_http_clients_are_https() {
         assert_no_plaintext_http(
-            production_source(include_str!("../src/core/http.rs")),
+            &production_source(include_str!("../src/core/http.rs")),
             "src/core/http.rs",
         );
         assert_no_plaintext_http(
-            production_source(include_str!("../src/runtimes/common.rs")),
+            &production_source(include_str!("../src/runtimes/common.rs")),
             "src/runtimes/common.rs",
         );
         assert_no_plaintext_http(
@@ -763,12 +969,12 @@ mod network_security {
             "src/runtimes/node.rs",
         );
         assert_no_plaintext_http(
-            production_source(include_str!("../src/runtimes/python.rs")),
+            &production_source(include_str!("../src/runtimes/python.rs")),
             "src/runtimes/python.rs",
         );
         assert_no_plaintext_http(include_str!("../src/runtimes/go.rs"), "src/runtimes/go.rs");
         assert_no_plaintext_http(
-            production_source(include_str!("../src/runtimes/rust.rs")),
+            &production_source(include_str!("../src/runtimes/rust.rs")),
             "src/runtimes/rust.rs",
         );
         assert_no_plaintext_http(
