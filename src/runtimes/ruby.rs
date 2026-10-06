@@ -151,12 +151,17 @@ impl RubyManager {
         println!("{} Extracting (pure Rust)...", style::informative("→"));
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(&download_path, staging.path(), 1).await?;
-        complete_staged_install(&staging, &version_dir, &version)?;
+        self.publish_install(&staging, &version)?;
 
         print_installed("Ruby", &version);
         self.use_version(&version)?;
 
         Ok(())
+    }
+
+    fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
+        super::common::require_regular_file(&staging.path().join("bin/ruby"))?;
+        complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
     /// Resolve a partial version request (`3`, `3.2`) to the newest matching
@@ -217,6 +222,58 @@ fn ruby_platform() -> Result<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn incomplete_ruby_archive_is_not_published_and_can_be_retried() -> Result<()> {
+        check_archive_publication(super::super::test_archive::Launcher::Missing).await
+    }
+
+    #[tokio::test]
+    async fn directory_ruby_launcher_is_not_published_and_can_be_retried() -> Result<()> {
+        check_archive_publication(super::super::test_archive::Launcher::Directory).await
+    }
+
+    async fn check_archive_publication(
+        invalid: super::super::test_archive::Launcher,
+    ) -> Result<()> {
+        use super::super::test_archive::{Launcher, tar_gz};
+        let versions = tempfile::tempdir()?;
+        let manager = RubyManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: download_client(),
+        };
+        let downloads = tempfile::tempdir()?;
+        let archive_path = downloads.path().join("runtime.tar.gz");
+        let staging = begin_staged_install(versions.path())?;
+        fs::write(&archive_path, tar_gz("runtime", "bin/ruby", invalid)?)?;
+        extract_tar_gz(&archive_path, staging.path(), 1).await?;
+        let result = manager.publish_install(&staging, "3.4.10");
+        assert!(
+            !versions.path().join("3.4.10").exists(),
+            "invalid ruby archive must not be published: {result:?}"
+        );
+        assert!(result.is_err(), "invalid launcher must be refused");
+        assert!(manager.list_installed()?.is_empty());
+        assert!(!versions.path().join("current").exists());
+        assert_eq!(manager.current_version(), None);
+        drop(staging);
+
+        let staging = begin_staged_install(versions.path())?;
+        fs::write(
+            &archive_path,
+            tar_gz("runtime", "bin/ruby", Launcher::Regular)?,
+        )?;
+        extract_tar_gz(&archive_path, staging.path(), 1).await?;
+        manager.publish_install(&staging, "3.4.10")?;
+        manager.use_version("3.4.10")?;
+        assert_eq!(manager.list_installed()?, vec!["3.4.10"]);
+        assert_eq!(manager.current_version().as_deref(), Some("3.4.10"));
+        assert_eq!(
+            fs::read(versions.path().join("current/bin/ruby"))?,
+            b"fixture launcher"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_ruby_manager_new() {

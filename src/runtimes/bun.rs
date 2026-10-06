@@ -108,12 +108,17 @@ impl BunManager {
         println!("{} Extracting (pure Rust)...", style::informative("→"));
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_zip(&download_path, staging.path(), 1).await?;
-        complete_staged_install(&staging, &version_dir, &version)?;
+        self.publish_install(&staging, &version)?;
 
         print_installed("Bun", &version);
         self.use_version(&version)?;
 
         Ok(())
+    }
+
+    fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
+        super::common::require_regular_file(&staging.path().join("bun"))?;
+        complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
     /// Resolve a partial version request (`1`, `1.0`) to the newest matching
@@ -227,6 +232,55 @@ fn bun_platform() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn incomplete_bun_archive_is_not_published_and_can_be_retried() -> Result<()> {
+        check_archive_publication(super::super::test_archive::Launcher::Missing).await
+    }
+
+    #[tokio::test]
+    async fn directory_bun_launcher_is_not_published_and_can_be_retried() -> Result<()> {
+        check_archive_publication(super::super::test_archive::Launcher::Directory).await
+    }
+
+    async fn check_archive_publication(
+        invalid: super::super::test_archive::Launcher,
+    ) -> Result<()> {
+        use super::super::test_archive::{Launcher, zip};
+        let versions = tempfile::tempdir()?;
+        let manager = BunManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: download_client(),
+        };
+        let downloads = tempfile::tempdir()?;
+        let archive_path = downloads.path().join("runtime.zip");
+        let staging = begin_staged_install(versions.path())?;
+        fs::write(&archive_path, zip("runtime", "bun", invalid)?)?;
+        extract_zip(&archive_path, staging.path(), 1).await?;
+        let result = manager.publish_install(&staging, "1.4.0");
+        assert!(
+            !versions.path().join("1.4.0").exists(),
+            "invalid bun archive must not be published: {result:?}"
+        );
+        assert!(result.is_err(), "invalid launcher must be refused");
+        assert!(manager.list_installed()?.is_empty());
+        assert!(!versions.path().join("current").exists());
+        assert_eq!(manager.current_version(), None);
+        drop(staging);
+
+        let staging = begin_staged_install(versions.path())?;
+        fs::write(&archive_path, zip("runtime", "bun", Launcher::Regular)?)?;
+        extract_zip(&archive_path, staging.path(), 1).await?;
+        manager.publish_install(&staging, "1.4.0")?;
+        manager.use_version("1.4.0")?;
+        assert_eq!(manager.list_installed()?, vec!["1.4.0"]);
+        assert_eq!(manager.current_version().as_deref(), Some("1.4.0"));
+        assert_eq!(
+            fs::read(versions.path().join("current/bun"))?,
+            b"fixture launcher"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_bun_manager_new() {
