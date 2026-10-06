@@ -42,6 +42,10 @@ OMG asks before the package transaction. `--yes` skips that normal confirmation 
 
 These checks reduce specific build and handoff risks. A reproducible malicious recipe remains malicious. A package hash is not a publisher signature. Check the recipe's source verification, including `validpgpkeys`, and the upstream project before trusting it. Read [security](./security.md) for the limits of grades and audit evidence.
 
+For a split package, OMG selects the requested outputs and their transitive same-base runtime dependencies. Each sibling output must satisfy the declared version constraint; compatible runtime cycles select each output once. Unrelated sibling outputs are not installed.
+
+Build and test dependencies are required before packaging. If a recipe names one of its own outputs as a build or test tool, OMG checks the installed package database against the full dependency expression. A missing or incompatible same-base prerequisite stops the plan with bootstrap guidance. Producing that sibling later cannot satisfy the current build. Install a compatible existing package or correct the recipe's dependency metadata before retrying. This distinction follows [makepkg's split-package build rules](https://man.archlinux.org/man/PKGBUILD.5.en#PACKAGE_SPLITTING).
+
 ## Review and unattended runs
 
 PKGBUILD review defaults to on. With review enabled, a session without an interactive terminal fails before building. `omg install --review PACKAGE` or `omg update --review` forces review even when configuration has disabled it. Turning review off does not disable archive inspection or the separate exceptional privilege approval.
