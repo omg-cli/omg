@@ -1105,6 +1105,22 @@ validate_install_dir_path() {
   fi
 }
 
+# Copy only into a private directory, then publish by replacing the backup's
+# directory entry. Never truncate an existing backup inode: it may be linked to
+# an unrelated file. The rename also handles links/directories swapped in after
+# the pre-check without following them (including on macOS).
+backup_shell_config() (
+  local rc_file="$1" staging_dir cleanup_command
+  [[ ! -L "$rc_file.omg-backup" ]] || error "Refusing symlink shell backup: $rc_file.omg-backup"
+  staging_dir=$(mktemp -d "${rc_file}.omg-backup-stage.XXXXXX") || error "Failed to stage shell backup; shell configuration was retained"
+  # Bash 3.2 can unwind function locals before running the subshell EXIT trap
+  # on failure. Capture shell-quoted paths while those locals still exist.
+  printf -v cleanup_command 'rm -f %q; rmdir %q' "$staging_dir/backup" "$staging_dir"
+  trap "$cleanup_command" EXIT
+  cp -p "$rc_file" "$staging_dir/backup" || error "Failed to copy shell backup; shell configuration was retained"
+  rename_install_binary "$staging_dir/backup" "$rc_file.omg-backup" || error "Failed to publish shell backup; shell configuration was retained"
+)
+
 setup_shell() {
   if [[ "${OMG_SKIP_SHELL:-0}" == "1" ]]; then
     info "Skipping shell integration (OMG_SKIP_SHELL=1)"
@@ -1135,7 +1151,7 @@ setup_shell() {
     path_line=$(shell_path_line "$shell_type")
     legacy_path_line=$(legacy_shell_path_line "$shell_type")
     if grep -Fqx -- "$legacy_path_line" "$rc_file"; then
-      cp "$rc_file" "$rc_file.omg-backup" || error "Failed to back up shell configuration"
+      backup_shell_config "$rc_file" || error "Failed to back up shell configuration; shell configuration was retained"
       local migrated
       migrated=$(mktemp "${rc_file}.omg-upgrade.XXXXXX") || error "Failed to stage shell upgrade"
       cp -p "$rc_file" "$migrated" || error "Failed to preserve shell file permissions"
@@ -1208,8 +1224,7 @@ uninstall_omg() {
     if grep -Fqx -- "$path_line" "$rc_file" ||
       grep -Fqx -- "$legacy_path_line" "$rc_file" ||
       grep -qE "# OMG Package Manager|omg hook" "$rc_file"; then
-      [[ ! -L "$rc_file.omg-backup" ]] || error "Refusing symlink shell backup: $rc_file.omg-backup"
-      cp "$rc_file" "$rc_file.omg-backup" || error "Failed to back up $rc_file; shell configuration was retained"
+      backup_shell_config "$rc_file" || error "Failed to back up $rc_file; shell configuration was retained"
       local filtered
       filtered=$(mktemp "${rc_file}.omg-remove.XXXXXX") || error "Failed to stage shell cleanup"
       cp -p "$rc_file" "$filtered" || error "Failed to preserve shell file permissions"
