@@ -85,6 +85,9 @@ def initialize(state, context):
         (state / name).mkdir(mode=0o700)
     value = dict(identity(context), uid=os.getuid(), path=str(state), inode=state.stat().st_ino)
     write_json(state / 'ownership.json', value)
+    # Only identity()'s validated fields and private-state ownership, never the
+    # full event or environment (which can contain credentials and PR text).
+    write_json(state / 'evidence/identity.json', value)
 
 
 def checked_state(state, context):
@@ -178,13 +181,37 @@ def fetch_pages(path, key):
 
 def admit(state, context):
     expected = checked_state(state, context)
-    require(native.command_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD']) == expected['source'],
+    inputs_path = state / 'evidence/admission-inputs.json'
+    inputs = dict(trustedIdentity=expected)
+    write_json(inputs_path, inputs)
+    inputs['checkoutSource'] = native.command_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'])
+    write_json(inputs_path, inputs)
+    require(inputs['checkoutSource'] == expected['source'],
             'consumer checkout source mismatch')
     path = 'repos/' + expected['repository'] + '/actions/runs/' + str(expected['run'])
     run = native.api_json(path)
+    producer = {key: run.get(key) for key in ('id', 'run_attempt', 'path', 'head_sha',
+                                             'event', 'status', 'conclusion')}
+    producer['repository'] = dict(full_name=run.get('repository', {}).get('full_name'))
+    producer['pull_requests'] = []
+    for row in run.get('pull_requests', []):
+        association = dict(number=row.get('number'))
+        for side in ('head', 'base'):
+            source = row.get(side, {})
+            association[side] = dict(sha=source.get('sha'), ref=source.get('ref'),
+                                     repo=dict(id=source.get('repo', {}).get('id'),
+                                               full_name=source.get('repo', {}).get('full_name')))
+        producer['pull_requests'].append(association)
+    inputs['producer'] = producer
+    write_json(inputs_path, inputs)
     validate_run(run, expected)
     commit = native.api_json('repos/' + expected['repository'] + '/git/commits/' + expected['source'])
+    inputs['sourceCommit'] = dict(sha=commit.get('sha'), tree=dict(sha=commit.get('tree', {}).get('sha')),
+                                parents=[dict(sha=parent.get('sha')) for parent in commit.get('parents', [])])
+    write_json(inputs_path, inputs)
     checkout_tree = native.command_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD^{tree}'])
+    inputs['checkoutTree'] = checkout_tree
+    write_json(inputs_path, inputs)
     validate_commit(commit, expected, checkout_tree)
     jobs = fetch_pages(path + '/attempts/' + str(expected['attempt']) + '/jobs', 'jobs')
     artifacts = fetch_pages(path + '/artifacts', 'artifacts')
