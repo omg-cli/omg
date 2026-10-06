@@ -47,9 +47,11 @@ pub fn validate_path_syntax<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
 /// Returns `false` when `overwrite` is disabled and any filesystem entry is
 /// already present. Forced replacement uses a same-directory atomic rename,
 /// which replaces a destination symlink rather than writing through it.
+/// Contents are written and synced before publication. A parent-directory sync
+/// error after publication can leave a complete file at the destination.
 #[cfg(unix)]
 pub fn write_executable(path: &Path, contents: &[u8], overwrite: bool) -> Result<bool> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     let parent = path
         .parent()
@@ -59,19 +61,7 @@ pub fn write_executable(path: &Path, contents: &[u8], overwrite: bool) -> Result
         .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
 
     if !overwrite {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true).mode(0o755);
-        return match options.open(path) {
-            Ok(mut file) => {
-                file.write_all(contents)?;
-                file.sync_all()?;
-                Ok(true)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(error) => {
-                Err(error).with_context(|| format!("Failed to create {}", path.display()))
-            }
-        };
+        return write_noclobber(path, contents, 0o755);
     }
 
     let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
@@ -94,20 +84,50 @@ pub fn write_executable(path: &Path, contents: &[u8], overwrite: bool) -> Result
 }
 
 /// Atomically claim a private marker path without following an existing entry.
+///
+/// Write and file-sync failures leave the destination absent. A directory-sync
+/// error after publication can leave a complete marker at the destination.
 #[cfg(unix)]
 pub fn create_private_marker(path: &Path, contents: &[u8]) -> Result<bool> {
-    use std::os::unix::fs::OpenOptionsExt;
+    write_noclobber(path, contents, 0o600)
+}
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    match options.open(path) {
-        Ok(mut file) => {
-            file.write_all(contents)?;
-            file.sync_all()?;
+#[cfg(unix)]
+fn write_noclobber(path: &Path, contents: &[u8], mode: u32) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Preserve the existing-entry result even when staging would fail. The
+    // publication below still checks atomically for entries created later.
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Ok(false),
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).with_context(|| format!("Failed to inspect {}", path.display()));
+            }
+        }
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Create with the requested mode (subject to umask), just like create_new.
+    // A failed write or file sync only leaves a temporary owned by this guard;
+    // never unlink the destination, which could belong to another writer.
+    let mut temporary = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(mode))
+        .tempfile_in(parent)
+        .with_context(|| format!("Failed to stage {}", path.display()))?;
+    temporary.as_file_mut().write_all(contents)?;
+    temporary.as_file_mut().sync_all()?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => {
+            sync_parent_directory_sync(path)?;
             Ok(true)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("Failed to create {}", path.display())),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => {
+            Err(error.error).with_context(|| format!("Failed to create {}", path.display()))
+        }
     }
 }
 
