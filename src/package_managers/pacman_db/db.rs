@@ -3223,6 +3223,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn fast_path_and_libalpm_counts_agree_on_fixture_local_db() {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_agree_on_fixture_local_db",
+        ) {
+            return;
+        }
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
         let db_dir = root.join("var/lib/pacman");

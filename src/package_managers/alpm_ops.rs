@@ -2283,6 +2283,11 @@ mod tests {
 
     #[test]
     fn clean_cache_sorts_by_alpm_vercmp_and_keeps_newest_version() {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::alpm_ops::tests::clean_cache_sorts_by_alpm_vercmp_and_keeps_newest_version",
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let cache_dir = temp.path().join("var/cache/pacman/pkg");
         std::fs::create_dir_all(&cache_dir).expect("create cache dir");

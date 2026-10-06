@@ -497,6 +497,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn opt_out_api_purges_the_queue_and_is_idempotent() {
+        if crate::core::testing::run_isolated_test(
+            "cli::telemetry::tests::opt_out_api_purges_the_queue_and_is_idempotent",
+        ) {
+            return;
+        }
         if crate::core::is_root() {
             // Elevated processes resolve the data directory to /var/lib/omg
             // regardless of OMG_DATA_DIR, so this fixture-based purge test is

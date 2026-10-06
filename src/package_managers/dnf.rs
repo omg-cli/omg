@@ -1990,6 +1990,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn removal_preview_directory_ignores_caller_tmpdir() -> Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::dnf::tests::removal_preview_directory_ignores_caller_tmpdir",
+        ) {
+            return Ok(());
+        }
         let caller = tempfile::tempdir()?;
         temp_env::with_var("TMPDIR", Some(caller.path()), || -> Result<()> {
             let directory = DnfPackageManager::removal_preview_directory()?;

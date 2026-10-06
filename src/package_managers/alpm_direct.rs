@@ -450,6 +450,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn security_update_eligibility_respects_repository_priority_and_ignore_filters() {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::alpm_direct::tests::security_update_eligibility_respects_repository_priority_and_ignore_filters",
+        ) {
+            return;
+        }
         if crate::core::is_root() {
             eprintln!("skipped: fixture overrides require an unprivileged process");
             return;
