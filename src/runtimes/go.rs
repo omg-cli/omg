@@ -117,10 +117,15 @@ impl GoManager {
         println!("{} Extracting (pure Rust)...", style::informative("→"));
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(&download_path, staging.path(), 1).await?;
-        complete_staged_install(&staging, &version_dir, &version)?;
+        self.publish_install(&staging, &version)?;
 
         print_installed("Go", &version);
         self.use_version(&version)
+    }
+
+    fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
+        super::common::require_regular_file(&staging.path().join("bin/go"))?;
+        complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
     /// Resolve a partial version request (`1`, `1.21`) to the newest matching
@@ -195,6 +200,58 @@ fn go_platform() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn incomplete_go_archive_is_not_published_and_can_be_retried() -> Result<()> {
+        check_archive_publication(super::super::test_archive::Launcher::Missing).await
+    }
+
+    #[tokio::test]
+    async fn directory_go_launcher_is_not_published_and_can_be_retried() -> Result<()> {
+        check_archive_publication(super::super::test_archive::Launcher::Directory).await
+    }
+
+    async fn check_archive_publication(
+        invalid: super::super::test_archive::Launcher,
+    ) -> Result<()> {
+        use super::super::test_archive::{Launcher, tar_gz};
+        let versions = tempfile::tempdir()?;
+        let manager = GoManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: download_client(),
+        };
+        let downloads = tempfile::tempdir()?;
+        let archive_path = downloads.path().join("runtime.tar.gz");
+        let staging = begin_staged_install(versions.path())?;
+        fs::write(&archive_path, tar_gz("runtime", "bin/go", invalid)?)?;
+        extract_tar_gz(&archive_path, staging.path(), 1).await?;
+        let result = manager.publish_install(&staging, "1.27.0");
+        assert!(
+            !versions.path().join("1.27.0").exists(),
+            "invalid go archive must not be published: {result:?}"
+        );
+        assert!(result.is_err(), "invalid launcher must be refused");
+        assert!(manager.list_installed()?.is_empty());
+        assert!(!versions.path().join("current").exists());
+        assert_eq!(manager.current_version(), None);
+        drop(staging);
+
+        let staging = begin_staged_install(versions.path())?;
+        fs::write(
+            &archive_path,
+            tar_gz("runtime", "bin/go", Launcher::Regular)?,
+        )?;
+        extract_tar_gz(&archive_path, staging.path(), 1).await?;
+        manager.publish_install(&staging, "1.27.0")?;
+        manager.use_version("1.27.0")?;
+        assert_eq!(manager.list_installed()?, vec!["1.27.0"]);
+        assert_eq!(manager.current_version().as_deref(), Some("1.27.0"));
+        assert_eq!(
+            fs::read(versions.path().join("current/bin/go"))?,
+            b"fixture launcher"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_go_manager_new() {
