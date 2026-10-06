@@ -41,11 +41,28 @@ pub fn ensure_active_version(runtime: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-pub(crate) fn ensure_active_version_in(
-    runtime: &str,
+/// Resolve one fresh configuration snapshot for all known runtimes.
+pub(crate) fn active_versions_in(data_dir: &std::path::Path) -> Result<Vec<(String, String)>> {
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    active_versions_at(&cwd, data_dir)
+}
+
+fn active_versions_at(
+    cwd: &std::path::Path,
     data_dir: &std::path::Path,
-) -> Result<Option<String>> {
-    resolve_active_version_in(runtime, Some(data_dir))
+) -> Result<Vec<(String, String)>> {
+    let pins = crate::hooks::detect_versions(cwd)?;
+    let versions = known_runtimes()?
+        .into_iter()
+        .filter_map(|runtime| {
+            let version = pins
+                .get(&runtime)
+                .cloned()
+                .or_else(|| crate::runtimes::probe_version_in(&runtime, data_dir));
+            version.map(|version| (runtime, version))
+        })
+        .collect();
+    Ok(versions)
 }
 
 pub fn known_runtimes() -> Result<Vec<String>> {
@@ -648,6 +665,70 @@ pub async fn list_versions(runtime: Option<&str>, available: bool, json: bool) -
 #[cfg(test)]
 mod tests {
     use super::{canonical_runtime_name, validate_requested_version};
+
+    #[test]
+    fn active_versions_snapshot_preserves_nearest_pins_and_rereads_changes()
+    -> Result<(), anyhow::Error> {
+        let root = tempfile::tempdir()?;
+        let project = root.path().join("project");
+        let data = root.path().join("data");
+        std::fs::create_dir(&project)?;
+        std::fs::write(
+            root.path().join(".tool-versions"),
+            "node 20.0.0\nrust 1.94.0\n",
+        )?;
+        let pins = project.join(".tool-versions");
+        std::fs::write(&pins, "nodejs 22.0.0\ncobol 1.0.0\n")?;
+
+        let first = super::active_versions_at(&project, &data)?;
+        assert!(first.contains(&("node".into(), "22.0.0".into())));
+        assert!(first.contains(&("rust".into(), "1.94.0".into())));
+        assert!(!first.iter().any(|(runtime, _)| runtime == "cobol"));
+        assert!(first.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+        std::fs::write(&pins, "node 24.0.0\n")?;
+        let second = super::active_versions_at(&project, &data)?;
+        assert!(second.contains(&("node".into(), "24.0.0".into())));
+        assert!(!second.contains(&("node".into(), "22.0.0".into())));
+        Ok(())
+    }
+
+    #[test]
+    fn active_versions_snapshot_refuses_malformed_current_configuration()
+    -> Result<(), anyhow::Error> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("pyproject.toml"), "[project\n")?;
+        assert!(super::active_versions_at(root.path(), &root.path().join("data")).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_versions_snapshot_uses_only_managed_fallback_links() -> Result<(), anyhow::Error> {
+        let root = tempfile::tempdir()?;
+        let project = root.path().join("project");
+        let data = root.path().join("data");
+        std::fs::create_dir(&project)?;
+        std::fs::write(project.join(".tool-versions"), "node 24.0.0\n")?;
+        for (runtime, version) in [("node", "22.0.0"), ("ripgrep", "14.1.0")] {
+            let versions = data.join("versions").join(runtime);
+            std::fs::create_dir_all(versions.join(version))?;
+            std::os::unix::fs::symlink(version, versions.join("current"))?;
+        }
+        let go = data.join("versions/go");
+        let outside = root.path().join("outside/1.24.0");
+        std::fs::create_dir_all(&outside)?;
+        std::fs::create_dir_all(go.join("1.24.0"))?;
+        std::os::unix::fs::symlink(&outside, go.join("current"))?;
+
+        let versions = super::active_versions_at(&project, &data)?;
+        assert!(versions.contains(&("node".into(), "24.0.0".into())));
+        assert!(!versions.contains(&("node".into(), "22.0.0".into())));
+        assert!(versions.contains(&("ripgrep".into(), "14.1.0".into())));
+        assert!(!versions.iter().any(|(runtime, _)| runtime == "go"));
+        assert!(!versions.iter().any(|(runtime, _)| runtime == "zig"));
+        Ok(())
+    }
 
     #[test]
     fn node_lts_requests_do_not_relax_directory_validation() {

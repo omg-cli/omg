@@ -231,24 +231,13 @@ async fn run_with_status_path(
             let index = state.index_snapshot();
             let data_dir = state.runtime_data_dir.clone();
             let versions = match tokio::task::spawn_blocking(move || {
-                use crate::cli::runtimes::{ensure_active_version_in, known_runtimes};
-
-                let mut versions = Vec::new();
-                match known_runtimes() {
-                    Ok(runtimes) => {
-                        for runtime in runtimes {
-                            match ensure_active_version_in(&runtime, &data_dir) {
-                                Ok(Some(v)) => versions.push((runtime, v)),
-                                Ok(None) => {}
-                                Err(error) => tracing::warn!(
-                                    "Failed to resolve active {runtime} version: {error}"
-                                ),
-                            }
-                        }
+                match crate::cli::runtimes::active_versions_in(&data_dir) {
+                    Ok(versions) => versions,
+                    Err(error) => {
+                        tracing::warn!("Failed to resolve active runtime versions: {error}");
+                        Vec::new()
                     }
-                    Err(error) => tracing::warn!("Failed to list known runtimes: {error}"),
                 }
-                versions
             })
             .await
             {
