@@ -44,6 +44,18 @@ Generated changelog and weekly benchmark-history updates are attached as
 and do not attempt direct main pushes. Apply reviewed generated changes in a PR;
 the repository's disabled Actions PR-approval setting remains unchanged.
 
+The CI debt ratchet reads its independent floor from the exact event base commit:
+the PR base, pre-push commit or merge-group base. Manual runs use the selected
+commit's first parent. The repository and checkout must match the event identity;
+PR checkouts must have exactly the named base and head as merge parents. The base
+must exist locally as an ancestor; missing or malformed baselines fail the gate.
+Candidate baseline increases are rejected even when current counts fit them.
+Local `make debt-refresh` retains explicit seeding and shrink-only refresh. This
+is a ratchet-policy check, not protection against a candidate rewriting its own
+workflow or checker.
+For a local independent comparison, use `scripts/debt-ratchet.py --base-revision
+<full-commit-sha>` with an exact ancestor. This mode also refuses refresh.
+
 ## QEMU evidence admission
 
 The controller verifies the installed QEMU security floor before parsing a guest
