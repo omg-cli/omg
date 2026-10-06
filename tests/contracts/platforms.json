@@ -21,7 +21,8 @@
         "e2e_runtime_management",
         "env_lockfile_integrity",
         "daemon_e2e_caching",
-        "daemon_e2e_concurrency"
+        "daemon_e2e_concurrency",
+        "init_daemon_startup"
       ]
     },
     {
@@ -50,7 +51,8 @@
         "e2e_runtime_management",
         "env_lockfile_integrity",
         "daemon_e2e_caching",
-        "daemon_e2e_concurrency"
+        "daemon_e2e_concurrency",
+        "init_daemon_startup"
       ]
     },
     {
@@ -75,7 +77,8 @@
         "env_lockfile_integrity",
         "security_daemon_optional",
         "daemon_e2e_caching",
-        "daemon_e2e_concurrency"
+        "daemon_e2e_concurrency",
+        "init_daemon_startup"
       ]
     },
     {
@@ -107,6 +110,7 @@
         "security_daemon_optional",
         "daemon_e2e_caching",
         "daemon_e2e_concurrency",
+        "init_daemon_startup",
         "apt_version_ordering"
       ]
     },
@@ -139,6 +143,7 @@
         "security_daemon_optional",
         "daemon_e2e_caching",
         "daemon_e2e_concurrency",
+        "init_daemon_startup",
         "apt_version_ordering"
       ]
     },
@@ -165,7 +170,8 @@
         "env_lockfile_integrity",
         "security_daemon_optional",
         "daemon_e2e_caching",
-        "daemon_e2e_concurrency"
+        "daemon_e2e_concurrency",
+        "init_daemon_startup"
       ]
     },
     {
@@ -197,6 +203,7 @@
         "security_daemon_optional",
         "daemon_e2e_caching",
         "daemon_e2e_concurrency",
+        "init_daemon_startup",
         "apt_version_ordering"
       ]
     },
@@ -220,7 +227,8 @@
         "e2e_runtime_management",
         "env_lockfile_integrity",
         "daemon_e2e_caching",
-        "daemon_e2e_concurrency"
+        "daemon_e2e_concurrency",
+        "init_daemon_startup"
       ]
     }
   ],
