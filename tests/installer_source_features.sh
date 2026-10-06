@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 task_dir=$(mktemp -d "${PAPERCLIP_RUN_SCRATCH_DIR:-${TMPDIR:-/tmp}}/installer-source.XXXXXX")
 trap 'rm -rf "$task_dir"' EXIT
 
-for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch arch-missing-libarchive fedora macos ubuntu-retry; do
+for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch arch-missing-libarchive fedora macos ubuntu-retry ubuntu-rename-directory; do
   fixture="$task_dir/$scenario"
   mkdir -p "$fixture/source" "$fixture/tools" "$fixture/home"
   distro=ubuntu
@@ -63,6 +63,14 @@ case "$*" in
   *) exit 2 ;;
 esac
 EOF
+  # The simulated Linux host needs file-target rename semantics even when
+  # the real runner provides BSD mv. Keep this tool fixture inside its PATH.
+  cat > "$fixture/tools/mv" <<'EOF'
+#!/usr/bin/env bash
+[[ $# == 3 && "$1" == -fT ]] || exit 2
+if [[ "$FIXTURE_RENAME_DIRECTORY" == 1 ]]; then mkdir -p "$3"; fi
+exec /usr/bin/perl -e 'rename($ARGV[0], $ARGV[1]) or die "Fixture rename failed: $!\n"' -- "$2" "$3"
+EOF
   chmod +x "$fixture/tools/"*
   target="$machine-unknown-linux-gnu"
   [[ "$system" != Darwin ]] || target="$machine-apple-darwin"
@@ -70,6 +78,8 @@ EOF
   [[ "$scenario" != ubuntu-retry ]] || retry=1
   missing_libarchive=0
   [[ "$scenario" != arch-missing-libarchive ]] || missing_libarchive=1
+  rename_directory=0
+  [[ "$scenario" != ubuntu-rename-directory ]] || rename_directory=1
   status=0
   env -u BASH_ENV -u ENV -u OMG_UNINSTALL \
     HOME="$fixture/home" SHELL=/bin/sh TERM= \
@@ -77,6 +87,7 @@ EOF
     FIXTURE_SYSTEM="$system" FIXTURE_MACHINE="$machine" \
     FIXTURE_TARGET="$target" FIXTURE_RETRY="$retry" \
     FIXTURE_MISSING_LIBARCHIVE="$missing_libarchive" \
+    FIXTURE_RENAME_DIRECTORY="$rename_directory" \
     INSTALL_DIR="$fixture/bin" XDG_CONFIG_HOME="$fixture/config" \
     XDG_DATA_HOME="$fixture/data" CARGO_TARGET_DIR="$fixture/target" \
     OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 \
@@ -85,6 +96,7 @@ EOF
   expected_status=0
   [[ "$retry" == 0 ]] || expected_status=1
   [[ "$missing_libarchive" == 0 ]] || expected_status=1
+  [[ "$rename_directory" == 0 ]] || expected_status=1
   if [[ "$status" != "$expected_status" ]]; then
     cat "$fixture/output" >&2
     printf '%s: expected exit %s, got %s\n' "$scenario" "$expected_status" "$status" >&2
@@ -114,7 +126,10 @@ EOF
   if [[ "$scenario" != arch ]]; then
     [[ $(grep -Fxc -- '--no-default-features' "$fixture/cargo-argv") == "$expected_builds" ]]
   fi
-  if [[ "$retry" == 0 ]]; then
+  if [[ "$rename_directory" == 1 ]]; then
+    grep -Fq 'Fixture rename failed:' "$fixture/output"
+    [[ -d "$fixture/bin/omg" && ! -e "$fixture/bin/omg/omg" && ! -e "$fixture/bin/omgd" ]]
+  elif [[ "$retry" == 0 ]]; then
     [[ -x "$fixture/bin/omg" && -x "$fixture/bin/omgd" ]]
     [[ -f "$fixture/config/omg/config.toml" ]]
   else
