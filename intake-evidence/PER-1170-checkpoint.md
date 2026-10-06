@@ -1,4 +1,4 @@
-﻿# Bounded canonical reconciliation checkpoint
+# Bounded canonical reconciliation checkpoint
 
 Source workspace: PER-1170; branch PER-1170; clean HEAD `4f57eec8cc4a08587de217cc1485714a067ee7d8` before evidence writing. Read workspace AGENTS.md, owned HEARTBEAT.md/TOOLS.md, Paperclip skill, and central [triage policy](/PER/issues/PER-4#document-triage-policy), [operations status](/PER/issues/PER-4#document-operations-status) revision `23c0c55c-01e9-49da-91c6-33af274dde68`, autonomy-plan and orchestration-team. Ten-slot user override controls historical four-slot references.
 
@@ -40,4 +40,3 @@ Fresh canonical native reads: PER-31 is blocked, existing Core owner, execution 
 Intake checkpoint commit `bf098e54e2507b91c171608400c19a5a5e099e0e` contains only this evidence document and the required Paperclip co-author trailer. Fresh `git diff --check HEAD^ HEAD` and `git status --porcelain` passed/empty. Initial commits failed because injected Git identity variables were empty; temporary process-scoped agent identity allowed the successful commit, without shared configuration edits. Git emitted permission-denied warnings for unrelated worktree metadata during commit; no unrelated worktree was manually deleted or repaired.
 
 Final disposition: complete this bounded reconciliation episode, not any product fix. Preserve both open GitHub issues/PRs and existing blocked native source tasks. Next owners: Installer/independent Rust reviewer reconcile renewed PR836 head against real validation; Core/Delivery retain PR821 exact-head admission; Intake's next native episode consumes changed merge/source evidence only. No new monitor or indefinite polling promised.
-
