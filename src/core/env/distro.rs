@@ -31,24 +31,27 @@ pub enum Distro {
 }
 
 /// Detect the current operating system/distribution
+///
+/// Debug test mode reads `OMG_TEST_DISTRO` on each call, defaulting to Arch
+/// like Doctor and the mock backend. Only native detection is cached; release
+/// binaries ignore the test override.
 #[must_use]
 pub fn detect_distro() -> Distro {
+    // Keep live test overrides outside the process-wide native cache.
+    if crate::core::paths::test_mode() {
+        let overridden = std::env::var("OMG_TEST_DISTRO").unwrap_or_else(|_| "arch".to_string());
+        return match overridden.to_lowercase().as_str() {
+            "arch" => Distro::Arch,
+            "debian" => Distro::Debian,
+            "ubuntu" => Distro::Ubuntu,
+            "fedora" | "rhel" | "centos" | "rocky" | "alma" => Distro::Fedora,
+            "macos" | "darwin" => Distro::MacOS,
+            _ => Distro::Unknown,
+        };
+    }
+
     static DISTRO: OnceLock<Distro> = OnceLock::new();
     *DISTRO.get_or_init(|| {
-        // Test mode override
-        if crate::core::paths::test_mode()
-            && let Ok(overridden) = std::env::var("OMG_TEST_DISTRO")
-        {
-            return match overridden.to_lowercase().as_str() {
-                "arch" => Distro::Arch,
-                "debian" => Distro::Debian,
-                "ubuntu" => Distro::Ubuntu,
-                "fedora" | "rhel" | "centos" | "rocky" | "alma" => Distro::Fedora,
-                "macos" | "darwin" => Distro::MacOS,
-                _ => Distro::Unknown,
-            };
-        }
-
         // macOS detection (compile-time)
         #[cfg(target_os = "macos")]
         {
