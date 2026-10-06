@@ -653,7 +653,9 @@ pub(crate) trait BoundedResponseExt {
     async fn bounded_text(self) -> anyhow::Result<String>;
 }
 
-async fn bounded_metadata_body(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+pub(crate) async fn bounded_metadata_body(
+    mut response: reqwest::Response,
+) -> anyhow::Result<Vec<u8>> {
     const LIMIT: usize = 16 * 1024 * 1024;
     tokio::time::timeout(Duration::from_secs(30), async move {
         anyhow::ensure!(
