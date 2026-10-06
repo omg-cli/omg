@@ -3,7 +3,7 @@
 # This checks producer argv, not compilation or a signed Swift installation.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-task_dir=$(mktemp -d "${PAPERCLIP_RUN_SCRATCH_DIR:-${TMPDIR:-/tmp}}/installer-source.XXXXXX")
+task_dir=$(mktemp -d "${TMPDIR:-/tmp}/installer-source.XXXXXX")
 trap 'rm -rf "$task_dir"' EXIT
 
 for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch arch-missing-libarchive fedora macos ubuntu-retry ubuntu-rename-directory; do
