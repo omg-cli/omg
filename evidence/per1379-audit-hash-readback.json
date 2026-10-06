@@ -1,0 +1,38 @@
+[
+    {
+        "path":  ".audit/postmortem-20261003/wave-a/audit-ci.md",
+        "sha256":  "b33f047e8347f53dd26992daf9f767c5dd1435cd4843c450146c5b2eea94bd86",
+        "bytes":  43815,
+        "result":  "MATCH recorded import source; immutable archive only"
+    },
+    {
+        "path":  ".audit/postmortem-20261003/wave-a/audit-scripts.md",
+        "sha256":  "da59b7aefaa9bd1419f42b4def70acae2a6e71530f2d3342d56fcafa9766cb7d",
+        "bytes":  27522,
+        "result":  "MATCH recorded import source; immutable archive only"
+    },
+    {
+        "path":  ".audit/sec-sweep-20261003/command-injection-report.md",
+        "sha256":  "d914b665ef3984bb4cf49927e856bf2942543b493b58c6d8b64df661a263abab",
+        "bytes":  21815,
+        "result":  "MATCH recorded import source; immutable archive only"
+    },
+    {
+        "path":  ".audit/sec-sweep-20261003/privesc-report.md",
+        "sha256":  "68343614209f921a65b5d6a42559e0c9a0914ded9a2ece8bc3c3a412279e2d18",
+        "bytes":  31068,
+        "result":  "MATCH recorded import source; immutable archive only"
+    },
+    {
+        "path":  ".audit/sec-sweep-20261003/REPORT.md",
+        "sha256":  "cc26ab5ddc3bf6bf2f2c5403448b3fd1f5e83f17612c3bc4575499a409825277",
+        "bytes":  18331,
+        "result":  "MATCH recorded import source; immutable archive only"
+    },
+    {
+        "path":  "source-snapshot/findings.json",
+        "sha256":  "be203abf580fc6ebcadbbfa710ab97d731149a4f41dc2cee1f8486c2499623fe",
+        "bytes":  687982,
+        "result":  "MATCH ledger import hash; historical source"
+    }
+]
