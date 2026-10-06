@@ -25,6 +25,8 @@ pub(crate) mod tool_registry;
 pub(crate) mod zig;
 
 #[cfg(test)]
+mod test_archive;
+#[cfg(test)]
 mod test_https;
 
 pub(crate) use bun::BunManager;
