@@ -701,7 +701,9 @@ async fn fetch_metadata_text_with_budget(
     .map_err(|_| anyhow::anyhow!("Metadata request exceeded its total deadline"))?
 }
 
-async fn bounded_metadata_body(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+pub(crate) async fn bounded_metadata_body(
+    mut response: reqwest::Response,
+) -> anyhow::Result<Vec<u8>> {
     const LIMIT: usize = 16 * 1024 * 1024;
     tokio::time::timeout(Duration::from_secs(30), async move {
         anyhow::ensure!(
