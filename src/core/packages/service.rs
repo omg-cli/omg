@@ -506,6 +506,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(history_ownership)]
     async fn removal_history_records_installed_not_candidate_version() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let backend = Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
