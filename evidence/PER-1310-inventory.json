@@ -1,0 +1,359 @@
+{
+  "sourceSha": "4f57eec8cc4a08587de217cc1485714a067ee7d8",
+  "auditSha256": "139461ab9607df5f2a1c8b17d618f78c8078f357f74365c9444b96ba146977ac",
+  "supplementalCursor": 45,
+  "prs": [
+    {
+      "number": 859,
+      "url": "https://github.com/omg-cli/omg/pull/859",
+      "head": "85227b798d4ffa35b4f500f81f9f0a342b9bc75b",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 858,
+      "url": "https://github.com/omg-cli/omg/pull/858",
+      "head": "fe1129420a69895c15491686824bd4d4d4ac74e9",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 856,
+      "url": "https://github.com/omg-cli/omg/pull/856",
+      "head": "a009ff8847e47cac691e2dfdac7b4826a33e050b",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 855,
+      "url": "https://github.com/omg-cli/omg/pull/855",
+      "head": "c6dcad3edd220bcadaf5e95e7a34be2968cd1334",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 854,
+      "url": "https://github.com/omg-cli/omg/pull/854",
+      "head": "2ecebe7aab68181a85c6c0d874e7d22f0af8d0b3",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 853,
+      "url": "https://github.com/omg-cli/omg/pull/853",
+      "head": "aebcb0743190356030ebdae5a846a887ee37a6f8",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 852,
+      "url": "https://github.com/omg-cli/omg/pull/852",
+      "head": "19bd11204bda8d9e245f3f2e0eecf50e660a6941",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 851,
+      "url": "https://github.com/omg-cli/omg/pull/851",
+      "head": "1f7383bcaaf61bc2cef61fb1e3cb16deec93241e",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 850,
+      "url": "https://github.com/omg-cli/omg/pull/850",
+      "head": "b5140618985c3b113a954a8fcab3a0ce36351b5d",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 849,
+      "url": "https://github.com/omg-cli/omg/pull/849",
+      "head": "c61f2c614134ba185a111e8b2b0675ce97715932",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 848,
+      "url": "https://github.com/omg-cli/omg/pull/848",
+      "head": "2f670e58484ab2ba8428b3ee83db487072853051",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 845,
+      "url": "https://github.com/omg-cli/omg/pull/845",
+      "head": "fd96cabd28abe66c24fa46e66c5c89efa890fdf3",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 844,
+      "url": "https://github.com/omg-cli/omg/pull/844",
+      "head": "e60c4c5f480edb8b7e70456a41967b680431d9db",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 843,
+      "url": "https://github.com/omg-cli/omg/pull/843",
+      "head": "8a51aea536d5c2a63e66570a4c1a2c9aff677ac7",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 841,
+      "url": "https://github.com/omg-cli/omg/pull/841",
+      "head": "1ff3510d1ea0f50c7006032974d1064763f8a595",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 839,
+      "url": "https://github.com/omg-cli/omg/pull/839",
+      "head": "c4091314c02a7ad57fea83724923099f71ae28c8",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 837,
+      "url": "https://github.com/omg-cli/omg/pull/837",
+      "head": "457172782572ccf905a3d642ce7825ca69f44a11",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 836,
+      "url": "https://github.com/omg-cli/omg/pull/836",
+      "head": "a042d44ed68f6f40991d4182ccac70a3e5afdc5c",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 835,
+      "url": "https://github.com/omg-cli/omg/pull/835",
+      "head": "4cd4d7003f671f8b8b577a01660a84623778226c",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 834,
+      "url": "https://github.com/omg-cli/omg/pull/834",
+      "head": "110d5b1cc1cac9ac9743c10661705cd5fe9ce5bf",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 828,
+      "url": "https://github.com/omg-cli/omg/pull/828",
+      "head": "8263c72832bddbc250ccd96b46b67cb2c9833bf7",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 825,
+      "url": "https://github.com/omg-cli/omg/pull/825",
+      "head": "6f242c6b03a70f832675f31a1290abae52b8f56d",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 822,
+      "url": "https://github.com/omg-cli/omg/pull/822",
+      "head": "6e82693b594712e03c4589d99c788bf9f368a015",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 821,
+      "url": "https://github.com/omg-cli/omg/pull/821",
+      "head": "d0acc2f8addd10518326d374d7940539bb649631",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 796,
+      "url": "https://github.com/omg-cli/omg/pull/796",
+      "head": "385414d67018b4b099c58d817aedb03087e8aace",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 789,
+      "url": "https://github.com/omg-cli/omg/pull/789",
+      "head": "b398c7030b6938cfcb1e6d7411f59844f482ec0c",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    },
+    {
+      "number": 787,
+      "url": "https://github.com/omg-cli/omg/pull/787",
+      "head": "cb97c6d987e351161522f6c015334c2bad97c0d4",
+      "state": "open",
+      "merged": false,
+      "mergedAt": null
+    }
+  ],
+  "operationsPr": {
+    "url": "https://github.com/PyRo1121/paperclip-local/pull/2",
+    "number": 2,
+    "state": "open",
+    "merged": false,
+    "mergeable": true,
+    "draft": false,
+    "body": "Paperclip's delivery pipeline can stall during setup, tool discovery, CI admission and cleanup. Fresh worktrees use moving refs and shared tracking configuration; tool discovery launches every catalog policy query at once; labels and merge admission can miss failed workflow startup; explicit retirement defaults to force.\n\nThis proposal prepares captured-commit/no-track worktree setup, bounded tool-discovery evaluation, source-backed issue/PR labels, exact-head workflow/check/producer admission, independent technical review, and non-force retirement. These are orchestration changes; OMG product code is outside this PR.\n\nTool discovery now shares four concurrent evaluations across requests in a gateway service. Decisions remain fresh, results keep their order, errors reject the batch, and unstarted work from failed batches stops. Tool execution authorization, identity, policy, grants, approval and audit paths are unchanged. The bound does not change the ten-worker ceiling or database pool.\n\nValidation:\n- Nine new discovery checks pass against both installed source and the immutable hosted compatibility input. Two cases failed before: two requests launched 80 evaluations at once, and 100 discovery queries delayed an issue read in a ten-connection fixture. The complete prepared module also parses successfully.\n- The preceding CI-startup correction passed 37 targeted checks, with six groups failing before. Those receipts cover unchanged code; they are not newly executed hosted checks at this head.\n- Earlier setup/retirement checks used real Git fixtures for config-lock contention, moving refs, preserved existing branches and retained untracked/ignored work. Native policy checks remain distinct from hosted and deployment acceptance.\n- Latest selected six blobs match local source `5121ad45cd43f1c701baa63dcfb2ee260e835cb4`; published head is `c5814adc59027f37cc0714d75083ab4bf48abcd4`. The new source snapshot contains two original trailing-whitespace lines, intentionally preserved for exact provenance; edited code passes whitespace checking.\n\nHosted CI is blocked: exact-head Actions 37402054846 and 37402051210 ended in startup_failure/BuildFailed. No hosted regression success is claimed, and the cause is still unknown. Third-party checks do not replace the failed workflows.\n\nActivation requires exact-candidate native Security review, Delivery approval, a controlled loaded-source receipt and real behavior under native load. Installed modules and helper remain unchanged. PER-780/PER-792 retain their original owners and canonical-linkage prerequisites; PER-1053 retains original-session callability scope. The new discovery-pressure evidence is routed through the existing Manager. No approval bypass, permission expansion, alternate publisher, force cleanup or speculative restart is authorized by this PR.\n\nMeasured API windows and their limits are in `API-TIMEOUT-REPAIR-20261006.md`. Source contracts: [Paperclip gateway](https://docs.paperclip.ing/reference/api/tool-gateway/), [connector access model](https://docs.paperclip.ing/connectors/access-model/), [Node event loop](https://nodejs.org/learn/asynchronous-work/dont-block-the-event-loop), [GitHub workflow runs](https://docs.github.com/en/rest/actions/workflow-runs).\n",
+    "title": "Repair worktree setup, retirement and independent delivery gates",
+    "base": "main",
+    "base_sha": "aed0de3955597ae0318cc68af2083be1842e1f39",
+    "head": "fix/delivery-pipeline-20261005",
+    "head_sha": "c5814adc59027f37cc0714d75083ab4bf48abcd4",
+    "head_repo_id": 1405016955,
+    "head_repo_full_name": "PyRo1121/paperclip-local",
+    "merge_commit_sha": "e14d9f0b4004f49455b7d73b89db83e069da7f4d",
+    "user": {
+      "login": "PyRo1121",
+      "name": "PyRo1121",
+      "email": null,
+      "avatar_url": "https://avatars.githubusercontent.com/u/32664069?v=4",
+      "id": 32664069
+    },
+    "requested_reviewers": null,
+    "requested_team_reviewers": null,
+    "diff": null,
+    "comments": null,
+    "created_at": "2026-10-06T00:28:27Z",
+    "updated_at": "2026-10-06T02:03:12Z",
+    "closed_at": null,
+    "merged_at": null,
+    "commits": 4,
+    "changed_files": 34,
+    "additions": 18538,
+    "deletions": 3,
+    "display_url": "https://github.com/PyRo1121/paperclip-local/pull/2",
+    "display_title": "Repair worktree setup, retirement and independent delivery gates"
+  },
+  "newIssues": [
+    {
+      "url": "https://github.com/omg-cli/omg/issues/860",
+      "title": "fix(aur): preserve HTTP causes and cooldown guidance for update checks",
+      "issue_number": 860,
+      "body": "<!-- omg-paperclip:canonical:PER-1240:aur-update-http-cause -->\nCanonical implementation task: [PER-1240](http://127.0.0.1:3100/PER/issues/PER-1240). Intake linkage: [PER-1242](http://127.0.0.1:3100/PER/issues/PER-1242).\nAccepted observation: [PER-117](http://127.0.0.1:3100/PER/issues/PER-117); preserved semantic duplicate: [PER-142](http://127.0.0.1:3100/PER/issues/PER-142).\n\n## Accepted diagnostic defect\nPriority P3/low. When all three AUR RPC attempts return HTTP 429, query_aur_updates discards the terminal sanitized cause and substitutes internet-connection advice. Expected: preserve safe HTTP cause and provide cooldown guidance. Actual: \"Failed to check AUR updates. Check your internet connection.\", followed by \"Check your internet connection and try again\". No false successful request or package mutation is established.\n\nVerified source SHA: 4f57eec8cc4a08587de217cc1485714a067ee7d8.\n- [HTTP status cause, client.rs L1092-L1097](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/package_managers/aur/client.rs#L1092-L1097)\n- [Three-attempt RPC boundary, L1578-L1613](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/package_managers/aur/client.rs#L1578-L1613)\n- [Cause discarded by unconditional map_err, L1625-L1633](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/package_managers/aur/client.rs#L1625-L1633)\n- [Formatter precedence, error.rs L10-L40](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/core/error.rs#L10-L40)\n- [RFC 6585 section 4](https://www.rfc-editor.org/rfc/rfc6585.html#section-4) defines 429 as rate limiting.\n\nRoot cause: fresh fixed error replaces the upstream cause. The scanner's assertion that network matching precedes rate-limit matching is outdated; source checks rate-limit phrases first.\n\n## Existing evidence and limits\nThe source task records an extracted Rust formatter/error-mapping probe on WSL archlinux as ordinary omg-audit, CARGO_BUILD_JOBS=2, run-owned CARGO_TARGET_DIR, anyhow 1.0.104:\n`cargo run --offline --manifest-path <run-scratch>/aur-diagnostic-probe/Cargo.toml`\nReported result: exit 101 on expected cooldown assertion; upstream HTTP429 positive control returns cooldown, rewritten error returns connection advice. This is prior triage evidence, not an intake rerun, production HTTP request, package update or guest pass.\nIntake independently confirmed clean PER-1242 worktree, exact HEAD above, and the numbered source ranges with git status --short, git rev-parse HEAD and Get-Content.\n\n## Bounded acceptance and delivery\nPackage Backends owns production-boundary local HTTP RED/GREEN evidence. Preserve sanitized causes with neutral context; distinguish cooldown from genuine network guidance and retain transport redaction. Retry policy and Retry-After handling are outside scope.\nCanonical source uses native Rust Quality review, then Delivery admission. Precise implementation commit, PR and exact-head verification links are pending on the source task. Do not close this defect until the linked PR and verified merge receipt are recorded.\n\nIntake searched all-state GitHub issue history for AUR, query_aur_updates, rate limit and PER-1240, with no matching root-cause issue; current source branch PR search was empty. Duplicate citations remain attached to this canonical record.\n\nPublication receipt: managed github_create_issue returned HTTP 403 Resource not accessible by integration in this heartbeat. No issue URL was created. Host keyring is read-only for Intake; no fallback write attempted.",
+      "state": "open",
+      "user": {
+        "login": "PyRo1121",
+        "name": "PyRo1121",
+        "email": null,
+        "avatar_url": "https://avatars.githubusercontent.com/u/32664069?v=4",
+        "id": 32664069
+      },
+      "assignees": null,
+      "labels": null,
+      "milestone": null,
+      "state_reason": null,
+      "comments": 0,
+      "created_at": "2026-10-06T04:23:15Z",
+      "updated_at": "2026-10-06T04:23:15Z",
+      "closed_at": null,
+      "display_url": "https://github.com/omg-cli/omg/issues/860",
+      "display_title": "fix(aur): preserve HTTP causes and cooldown guidance for update checks"
+    },
+    {
+      "url": "https://github.com/omg-cli/omg/issues/861",
+      "title": "fix(ci): compare debt against a verified base floor and reject candidate baseline increases",
+      "issue_number": 861,
+      "body": "<!-- omg-paperclip:canonical:PER-1276:97a7a67747b82653 -->\n\n# fix(ci): compare debt against a verified base floor and reject candidate baseline increases\n\nThe debt gate accepts increased debt when the candidate manually raises its checked-out baseline. Accepted P2 ratchet-policy independence defect; no hardened malicious-PR security boundary claimed.\n\nCanonical implementation: [PER-1276](/PER/issues/PER-1276). Original evidence: [PER-383](/PER/issues/PER-383); adjudication: [PER-1241](/PER/issues/PER-1241); intake: [PER-1284](/PER/issues/PER-1284).\n\n## Source and reproduction\n\nSource SHA `4f57eec8cc4a08587de217cc1485714a067ee7d8`, freshly verified by Intake using git rev-parse HEAD, git status --short and numbered source reads; clean unchanged tree.\n\n- [Checker213–265](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/scripts/debt-ratchet.py#L213-L265): candidate baseline is its own floor; refresh guards only refresh.\n- [CI62–76](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/.github/workflows/ci.yml#L62-L76): checkout followed by default checker.\n- Primary contracts: [checkout](https://github.com/actions/checkout), [workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).\n\nExpected: counts above independently verified reviewed-base floor fail despite candidate baseline edits. Actual prior engineer disposable actual-script replay: floor1/debt2 rejects exit1; refresh refuses exit1; manual floor2/debt2 wrongly passes exit0. Unchanged/decrease controls pass. Root cause: candidate input supplies the authoritative threshold.\n\nPrior engineer commands: Python313/python.exe reproduce.py exit0 (six asserted observations); Python313/python.exe -m unittest discover -s scripts -p test_debt_ratchet.py exit0 (11 tests OK). [Authenticated receipt](/PER/issues/PER-1276#comment-58319bf2-f2fc-45c1-aa1a-665c22a99d67), [archive](/api/attachments/0d805c28-9117-4c1a-80a5-300fc69742a3/content?download=1), 3128 bytes, SHA256 eb480d21cd4836ac0eb7c8339e6526c04e3b6bf485137436b28d3cabf3ab1c98. Attributed prior receipts, not current Intake probe executions; no hosted/guest or live protection proof.\n\nOriginal report: .audit/postmortem-20261003/wave-a/audit-ci.md; SHA256 b33f047e8347f53dd26992daf9f767c5dd1435cd4843c450146c5b2eea94bd86; finding97a7a67747b82653. Preserve original broader benchmark/security assertions as claims.\n\n## Semantic dedup verdict\n\nNEW GitHub canonical issue needed; reuse existing implementation task PER-1276. No same-root issue/PR found in query-bounded current searches, not an exhaustive historical guarantee.\n\nGitHub queries repo:omg-cli/omg with debt, ratchet, \"debt-ratchet\", \"baseline\" \"floor\", \"baseline\" \"editable\", \"floor\" \"ratchet\", \"PER-1276\"; debt explicitly searched both open and closed. All-state PR debt and debt-ratchet searches. 100-result ceiling, all returned fewer; issue lists 6 debt/6 ratchet/2 debt-ratchet/1 baseline+floor/0 baseline+editable/1 floor+ratchet/0 task identifier; PR lists30 debt/14 debt-ratchet.\n\n[PR612](https://github.com/omg-cli/omg/pull/612) introduction, merged a302d62dcd2e429181f7705a8f721ee1e8bbaa25; [issue618](https://github.com/omg-cli/omg/issues/618) closed cleanup, not floor independence; [PR777](https://github.com/omg-cli/omg/pull/777) lint parser, distinct root. Broader issue611 and616 are audit/test-matrix backlogs, not a same-root implementation.\n\nPaperclip debt ratchet/debt-ratchet/baseline/97a7a677 queries identify original PER-383 and existing PER-1276; no second same-root fix identified. [PER-999](/PER/issues/PER-999) Makefile/fuzz claims and [PER-962](/PER/issues/PER-962) performance raw-record provenance are distinct. Preserve duplicate citations here rather than creating another implementation.\n\n## Acceptance\n\nRegression must fail on increased debt plus manually increased candidate floor; unchanged/decrease controls pass. Verify CI event base identity, retrieve independent baseline, reject candidate floor increases, fail closed on missing/unverifiable base. Preserve explicit standalone seeding/refresh contracts and historical tests. No ignores, weakened floors/assertions or assumed guest passes.\n\nExisting source-native CI/Guest independent review then Delivery approval remain mandatory. Implementing PR/commit/current validation pending. Keep product issue open until linked PR, exact-head required success and verified Delivery merge receipt.\n",
+      "state": "open",
+      "user": {
+        "login": "PyRo1121",
+        "name": "PyRo1121",
+        "email": null,
+        "avatar_url": "https://avatars.githubusercontent.com/u/32664069?v=4",
+        "id": 32664069
+      },
+      "assignees": null,
+      "labels": null,
+      "milestone": null,
+      "state_reason": null,
+      "comments": 0,
+      "created_at": "2026-10-06T04:29:51Z",
+      "updated_at": "2026-10-06T04:29:51Z",
+      "closed_at": null,
+      "display_url": "https://github.com/omg-cli/omg/issues/861",
+      "display_title": "fix(ci): compare debt against a verified base floor and reject candidate baseline increases"
+    },
+    {
+      "url": "https://github.com/omg-cli/omg/issues/862",
+      "title": "fix(security): recognize encrypted PKCS8 private-key armor",
+      "issue_number": 862,
+      "body": "<!-- omg-paperclip:canonical:PER-1265:encrypted-pkcs8:v1 -->\n\nSecret scanning omits the standard encrypted PKCS#8 private-key armor label.\n\nCanonical implementation: [PER-1265](/PER/issues/PER-1265). Accepted/narrowed P3 adjudication: [PER-415](/PER/issues/PER-415#comment-d5346976-af1b-4ed2-9df5-30fd8b565b29). Linkage prerequisite: [PER-1269](/PER/issues/PER-1269).\n\nAt source `4f57eec8cc4a08587de217cc1485714a067ee7d8`, [secrets.rs:151–152](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/core/security/secrets.rs#L151-L152) includes RSA/EC/DSA/OPENSSH/empty prefixes but omits ENCRYPTED. [scan_content:300–329](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/core/security/secrets.rs#L300-L329) consumes that matcher. [RFC 7468 §11](https://www.rfc-editor.org/rfc/rfc7468.html#section-11) defines the ENCRYPTED PRIVATE KEY label.\n\nExpected: an inert `-----BEGIN ENCRYPTED PRIVATE KEY-----` marker receives private-key coverage. Actual prior exact-source probe: zero findings; PRIVATE KEY and OPENSSH PRIVATE KEY controls each produce one. Root cause is missing marker coverage. Prior analyzer command `python probes.py` exited 0 with assertions proving the mismatch; this is an attributed historical source-bound probe, not a new production or guest test. [Prior evidence archive](/api/attachments/815e25be-2e24-4f55-bfe6-9b1e19cd0719/content?download=1), SHA256 `0b8fcde85c0473dd3c5cbee0a6235b12071ef96665d51b697062bb748745899f`. Initial harness failures remain HARNESS_ERROR. Intake has not replayed the probe or rebound that archive.\n\nPreserved source: `.audit/sec-sweep-20261003/REPORT.md`, report SHA256 `cc26ab5ddc3bf6bf2f2c5403448b3fd1f5e83f17612c3bc4575499a409825277`, observation `0cbba5b4e6d34791`. Original reported P2/Critical-impact claim was narrowed to P3: encrypted material does not prove access without a passphrase. PGP armor is outside this bounded fix. Retain this evidence even if later canonical duplicate evidence appears.\n\nAcceptance: add a failing inert encrypted-marker regression, extend the bounded matcher, retain unencrypted/OpenSSH controls and unrelated-header negatives, and verify classification/redaction independently. No real secrets in fixtures. Assigned Security engineer owns the preserved branch; native Independent Security review then Delivery approval remain required. PR, implementation commit, exact-head required checks and actual merge receipt are pending. This issue stays open until linked delivery and verified merge.",
+      "state": "open",
+      "user": {
+        "login": "PyRo1121",
+        "name": "PyRo1121",
+        "email": null,
+        "avatar_url": "https://avatars.githubusercontent.com/u/32664069?v=4",
+        "id": 32664069
+      },
+      "assignees": null,
+      "labels": null,
+      "milestone": null,
+      "state_reason": null,
+      "comments": 0,
+      "created_at": "2026-10-06T04:50:37Z",
+      "updated_at": "2026-10-06T04:50:37Z",
+      "closed_at": null,
+      "display_url": "https://github.com/omg-cli/omg/issues/862",
+      "display_title": "fix(security): recognize encrypted PKCS8 private-key armor"
+    },
+    {
+      "url": "https://github.com/omg-cli/omg/issues/863",
+      "title": "fix(usage): scale install savings estimates by tracked package count",
+      "issue_number": 863,
+      "body": "Successful installs credit a flat 1500 ms regardless of tracked package count, while the repository defines the estimate per package and scales updates by count.\n\nCanonical implementation: [PER-1264](http://127.0.0.1:3100/PER/issues/PER-1264). Intake prerequisite: [PER-1273](http://127.0.0.1:3100/PER/issues/PER-1273). Accepted/narrowed source: [PER-134](http://127.0.0.1:3100/PER/issues/PER-134), adjudication [PER-1241](http://127.0.0.1:3100/PER/issues/PER-1241).\n\nSource inspected: 4f57eec8cc4a08587de217cc1485714a067ee7d8, clean isolated task worktree.\n- [Per-package estimate](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/core/usage.rs#L24-L33): INSTALL_MS=1500; UPDATE_MS uses the same per-package saving.\n- [Install call site](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/core/usage.rs#L628-L644) supplies INSTALL_MS once.\n- [Update scaling](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/core/usage.rs#L691-L698) multiplies by count.\n- [Accumulation](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/core/usage.rs#L265-L291) adds the supplied credit to daily/lifetime totals and records one command event.\n- [Success gate](https://github.com/omg-cli/omg/blob/4f57eec8cc4a08587de217cc1485714a067ee7d8/src/core/usage.rs#L675-L680) excludes failed installs from tracking.\n\nSource-arithmetic reproduction: successful tracked installs with N=0/1/50 should credit 0/1500/75000 ms; current call supplies 1500/1500/1500 ms. Root cause: inconsistent unit scaling at the install call site. This is estimated usage accounting, not measured speedup, financial value, remote dashboard persistence, production build or CI/guest proof.\n\nVerification performed by Intake: git status --short (empty), git rev-parse HEAD (SHA above), git show SHA:src/core/usage.rs with numbered inspection of the cited lines. No code edits or production persistence test performed. Prior adjudication archive SHA256 0b8fcde85c0473dd3c5cbee0a6235b12071ef96665d51b697062bb748745899f remains on PER-1264 under its original provenance.\n\nDedup verdict: no same-root candidate found in bounded all-state issue queries \"install\" \"savings\", \"time_saved\" \"install\", \"INSTALL_MS\", \"PER-1264\", \"savings\" \"package\", plus \"usage\" \"credit\"; PR query savings install. Preserve candidates: #468 is usage-directory permissions/skipped persistence; #601 is CI cache eviction; PR #721 is daemon/guest/setup. Different triggers/root causes. Search is not proof of global uniqueness.\n\nAcceptance: Core adds failed-before/passed-after regression for zero/one/multiple packages, daily/lifetime totals and failed installs; apply saturating count conversion/arithmetic while preserving one command/install event and existing tests. Link implementation PR, commit and exact-head required checks. Independent native Rust review and Delivery admission remain required. Keep this issue open until a linked PR and verified merge receipt establish delivery.\n\nCTO publication verification (2026-10-06): fetched all 860 issue/PR records with gh api --paginate repos/omg-cli/omg/issues?state=all&per_page=100, searched all-state title/body for root markers and usage/install/count/credit/savings terms, and inspected candidates. No same-root duplicate found. #468/#474 concern permissions/persistence; #290/#301/#343 ownership; #146 opt-out; #102 sync redaction; #601/#721 cache/daemon/guest work. Other keyword matches concern unrelated package, CI, docs or dependency changes. This snapshot does not prove global uniqueness or search comments. CTO rechecked clean HEAD and all cited source lines at the exact SHA above. Original Intake evidence retains its provenance.\n\n<!-- paperclip:canonical PER-1264; publication PER-1306 -->\nFresh all-state GitHub search also completed the seven original query families (including indexed comments): five issue queries returned zero or unrelated #601/#468; PR query returned unrelated #721; each result set was complete (incomplete_results=false, total_count <=100).",
+      "state": "open",
+      "user": {
+        "login": "PyRo1121",
+        "name": "PyRo1121",
+        "email": null,
+        "avatar_url": "https://avatars.githubusercontent.com/u/32664069?v=4",
+        "id": 32664069
+      },
+      "assignees": null,
+      "labels": null,
+      "milestone": null,
+      "state_reason": null,
+      "comments": 0,
+      "created_at": "2026-10-06T05:05:50Z",
+      "updated_at": "2026-10-06T05:05:50Z",
+      "closed_at": null,
+      "display_url": "https://github.com/omg-cli/omg/issues/863",
+      "display_title": "fix(usage): scale install savings estimates by tracked package count"
+    }
+  ]
+}
