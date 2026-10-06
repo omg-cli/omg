@@ -691,6 +691,7 @@ if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]
   cp "$here/qemu-osv-check.sh" "$here/qemu-osv-positive-oracle.py" "$work/"
 fi
 cp "$here/qemu-daemon-check.sh" "$work/qemu-daemon-check.sh"
+cp "$here/provision-qemu-crash-channel.py" "$here/check-qemu-health.py" "$work/"
 cp "$here/qemu-apt-abi.py" "$work/qemu-apt-abi.py"
 cp "$here/qemu-aur-check.sh" "$here/qemu-aur-fixture.py" "$work/"
 cp "$here/qemu-doctor-connectivity-check.sh" "$here/qemu-doctor-connectivity-fixture.py" "$work/"
@@ -784,8 +785,8 @@ fi
 # while the package databases and installed fixture are available.
 guest_tools=(jq openssl)
 case "$distro" in
-  arch|fedora) guest_tools+=(libcap) ;;
-  debian|ubuntu) guest_tools+=(libcap2-bin) ;;
+  arch|fedora) guest_tools+=(libcap systemd) ;;
+  debian|debian-trixie|ubuntu) guest_tools+=(libcap2-bin systemd-coredump) ;;
 esac
 [[ "$distro" != fedora ]] || guest_tools+=(createrepo_c gnupg2)
 if [[ "$distro" == arch ]]; then guest_tools+=(python); else guest_tools+=(python3); fi
@@ -795,6 +796,8 @@ case "$distro" in
   debian|debian-trixie|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${guest_tools[@]}" || exit 120 ;;
   fedora) sudo -n dnf install -y "${guest_tools[@]}" || exit 120 ;;
 esac
+timeout --kill-after=5s 90s sudo -n python3 "$HOME/provision-qemu-crash-channel.py" \
+  > evidence/crash-channel-provision.json 2> evidence/crash-channel-provision.log || exit 120
 printf 'daemon lifecycle start accel=%s timeout=%s\n' "$accel" "$daemon_timeout"
 OMG_QEMU_ACCEL="$accel" timeout --kill-after=5s "$daemon_timeout" bash "$HOME/qemu-daemon-check.sh" "$bin" "$HOME/evidence"
 doctor_probe_rc=0
@@ -906,6 +909,8 @@ opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHo
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
+timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
+  /work/provision-qemu-crash-channel.py /work/check-qemu-health.py bench@127.0.0.1:
 if [[ "$distro" == debian-trixie ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-apt-abi.py bench@127.0.0.1:qemu-apt-abi.py
 fi

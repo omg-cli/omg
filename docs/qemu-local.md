@@ -86,6 +86,17 @@ defines the returned action; it is separate from guest network readiness.
 
 ## What to run
 
+Before transaction baselines are frozen, the disposable guest installs its
+systemd crash collector and runs `provision-qemu-crash-channel.py` as guest
+root. The provisioner refuses other virtualization environments. It persists
+only the vendor's validated `core_pattern` and positive `core_pipe_limit`,
+starts the real coredump socket and verifies the current boot's capability.
+Debian's exact vendor RLIMIT literal is accepted in the same handler ABI as
+`%c`; arbitrary handlers, argument literals, missing sockets and failed
+processors remain refused. No host sysctl or journal is changed. Each trial
+and the resumed guest must independently pass the boot-scoped health gate;
+collector installation alone is not health or product acceptance.
+
 The x86-64 QEMU `all` profile selects Arch, Debian 12, Debian 13 (Trixie),
 Ubuntu and Fedora. The ARM `all` profile selects Debian 12, Ubuntu and Fedora;
 Arch and Trixie ARM are unsupported. The suite creates one result row for

@@ -118,6 +118,7 @@ jobs:
           python3 -m unittest discover -s scripts -p test_qemu_transaction_summary.py
           python3 -m unittest discover -s scripts -p test_ci_smoke_report.py
           sudo -n python3 -m unittest discover -s scripts -p test_qemu_health.py
+          python3 -m unittest discover -s scripts -p test_qemu_crash_provision.py
           python3 -m unittest discover -s scripts -p test_qemu_network_scope.py
           python3 -m unittest discover -s scripts -p test_qemu_storage_faults.py
           python3 -m unittest discover -s scripts -p test_qemu_egress.py

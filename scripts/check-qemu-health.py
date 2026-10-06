@@ -27,7 +27,9 @@ FATAL = re.compile(
 BOOT_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 CORE_PATTERN = re.compile(
     r"\|(/(?:usr/)?lib(?:64)?/systemd/systemd-coredump)"
-    r" %P %u %g %s %t %c %h(?: %d(?: %F(?: %I)?)?)?"
+    # Debian's vendor configuration replaces %c with this exact RLIMIT value.
+    # Preserve the same handler and positional ABI; arbitrary literals refuse.
+    r" %P %u %g %s %t (?:%c|9223372036854775808) %h(?: %d(?: %F(?: %I)?)?)?"
 )
 CAPABILITY_PROPERTIES = "Id,LoadState,ActiveState,SubState,Result,UnitFileState"
 

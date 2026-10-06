@@ -27,6 +27,15 @@ def channel_fixture(boot):
 
 
 class HealthTests(unittest.TestCase):
+    def test_debian_vendor_limit_keeps_crash_capability_required(self):
+        boot = "12345678-1234-1234-1234-123456789abc"
+        channel = channel_fixture(boot)
+        channel["core_pattern"] = channel["core_pattern"].replace("%c", "9223372036854775808") + " %d"
+        HEALTH.validate_crash_channel(channel, boot)
+        channel["core_pattern"] = channel["core_pattern"].replace("9223372036854775808", "42")
+        with self.assertRaises(ValueError):
+            HEALTH.validate_crash_channel(channel, boot)
+
     def test_final_driver_uses_active_serial_and_expected_boot(self):
         source = Path(__file__).with_name("benchmark-qemu.sh").read_text()
         begin = source.index("health_rc=0\n")
