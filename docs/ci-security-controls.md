@@ -81,6 +81,9 @@ Missing packages, disabled/masked units, alternate handlers (including the newer
 kernel socket protocol), failed queries or a changing channel fail admission.
 The collector observes capability; it does not install packages, change sysctls
 or start services. Guest preparation must establish this contract before trials.
+The host helper test checks explicit collector refusal when its native handler is
+unsupported. That negative control is not positive crash-observation evidence;
+actual guest collection and admission still require the complete schema 2 receipt.
 This is configured-capability evidence, not an injected-crash delivery receipt
 or proof that the channel was enabled throughout earlier workload execution.
 Exact-head hosted guest gates remain required. No core contents, command lines,

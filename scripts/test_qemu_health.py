@@ -179,9 +179,42 @@ docker() {
     @unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0
                          and shutil.which("journalctl"), "Native root journal query runs in Linux QEMU preparation")
     def test_native_systemd_collection(self):
+        # Hosted helper runners can use apport or a plain core-file pattern.
+        # Verify fail-closed behavior there; positive guest admission remains
+        # mandatory in the launcher's actual collect/verify path.
+        pattern = HEALTH.query(["cat", "/proc/sys/kernel/core_pattern"]).strip()
+        if not HEALTH.CORE_PATTERN.fullmatch(pattern):
+            with self.assertRaisesRegex(ValueError, "unsupported kernel crash handler"):
+                HEALTH.collect()
+            return
         receipt = HEALTH.collect()
         self.assertTrue(receipt["complete"])
         self.assertGreater(receipt["kernel_bytes"], 0)
+
+    def test_native_host_probe_requires_collection_or_explicit_refusal(self):
+        decorated = type(self).test_native_systemd_collection
+        probe = getattr(decorated, "__wrapped__", decorated)
+        for pattern in ("core", "|/usr/share/apport/apport %p %s %c %d %P"):
+            with self.subTest(pattern=pattern), \
+                    patch.object(HEALTH, "query", return_value=pattern), \
+                    patch.object(HEALTH, "collect", side_effect=ValueError(
+                        "unsupported kernel crash handler")) as collect:
+                probe(self)
+                collect.assert_called_once_with()
+        with patch.object(HEALTH, "query", return_value="core"), \
+                patch.object(HEALTH, "collect", return_value=self.payload):
+            with self.assertRaises(AssertionError):
+                probe(self)
+        with patch.object(HEALTH, "query", return_value=channel_fixture(
+                self.payload["boot_id"])["core_pattern"]), \
+                patch.object(HEALTH, "collect", return_value=self.payload) as collect:
+            probe(self)
+            collect.assert_called_once_with()
+        with patch.object(HEALTH, "query", return_value=channel_fixture(
+                self.payload["boot_id"])["core_pattern"]), \
+                patch.object(HEALTH, "collect", side_effect=ValueError("missing socket")):
+            with self.assertRaisesRegex(ValueError, "missing socket"):
+                probe(self)
 
     def test_collector_binds_optional_boot_argument_and_accepts_no_crashes(self):
         with patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
