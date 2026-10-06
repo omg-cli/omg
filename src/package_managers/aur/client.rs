@@ -1089,11 +1089,17 @@ struct AurResponse {
     results: Vec<AurJsonPackage>,
 }
 
+/// Request diagnostics safe to retain without remote text or transport URLs.
+#[derive(Debug, thiserror::Error)]
+enum AurRpcRequestError {
+    #[error("AUR RPC request to {AUR_RPC_URL} returned HTTP {0}")]
+    Http(reqwest::StatusCode),
+    #[error("AUR RPC transport failed. Check your internet connection.")]
+    Transport,
+}
+
 fn ensure_aur_rpc_success(status: reqwest::StatusCode) -> Result<()> {
-    anyhow::ensure!(
-        status.is_success(),
-        "AUR RPC request to {AUR_RPC_URL} returned HTTP {status}"
-    );
+    anyhow::ensure!(status.is_success(), AurRpcRequestError::Http(status));
     Ok(())
 }
 
@@ -1114,12 +1120,17 @@ fn decode_aur_rpc_body<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
 
 async fn decode_aur_rpc_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
     ensure_aur_rpc_success(response.status())?;
-    let body = response.bytes().await.map_err(redact_aur_transport_error)?;
+    let body = crate::core::http::bounded_metadata_body(response)
+        .await
+        .map_err(|error| match error.downcast::<reqwest::Error>() {
+            Ok(error) => redact_aur_transport_error(error),
+            Err(error) => error,
+        })?;
     decode_aur_rpc_body(&body)
 }
 
 fn redact_aur_transport_error(_: reqwest::Error) -> anyhow::Error {
-    anyhow::anyhow!("AUR RPC transport failed. Check your internet connection.")
+    AurRpcRequestError::Transport.into()
 }
 
 impl AurClient {
@@ -1599,9 +1610,12 @@ impl AurClient {
                         continue;
                     }
                     ensure_aur_rpc_success(response.status())?;
-                    match response.bytes().await {
+                    match crate::core::http::bounded_metadata_body(response).await {
                         Ok(body) => return decode_aur_rpc_body(&body),
-                        Err(error) => last_error = Some(redact_aur_transport_error(error)),
+                        Err(error) => match error.downcast::<reqwest::Error>() {
+                            Ok(error) => last_error = Some(redact_aur_transport_error(error)),
+                            Err(error) => return Err(error),
+                        },
                     }
                 }
                 Err(error) if crate::core::http::is_retryable_error(&error) => {
@@ -1617,19 +1631,34 @@ impl AurClient {
         &self,
         packages: &[String],
     ) -> Result<Vec<(String, Version, Version)>> {
+        self.query_aur_updates_at(AUR_RPC_URL, packages).await
+    }
+
+    async fn query_aur_updates_at(
+        &self,
+        endpoint: &str,
+        packages: &[String],
+    ) -> Result<Vec<(String, Version, Version)>> {
         let mut updates = Vec::with_capacity(packages.len() / 10 + 1);
         let chunked_names = Self::chunk_aur_names(packages);
         // Network I/O bound - use higher concurrency
         let concurrency = self.settings.aur.build_concurrency.clamp(4, 16);
 
         let mut stream = futures::stream::iter(chunked_names)
-            .map(|chunk| async move { Self::rpc_info_chunk(&chunk).await })
+            .map(|chunk| async move { Self::rpc_info_chunk_at(endpoint, &chunk).await })
             .buffer_unordered(concurrency);
 
         while let Some(res) = stream.next().await {
             let response = res.map_err(|e| {
-                tracing::warn!("AUR update check failed: {}", e);
-                anyhow::anyhow!("Failed to check AUR updates. Check your internet connection.")
+                // Decoder errors can contain arbitrary server-provided strings.
+                // Retain only request causes constructed from safe local data.
+                let error = if e.is::<AurRpcRequestError>() {
+                    e
+                } else {
+                    anyhow::anyhow!("AUR RPC response was invalid or reported an error")
+                };
+                tracing::warn!("AUR update check failed: {}", error);
+                error.context("Failed to check AUR updates")
             })?;
             let chunk_updates = tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
                 let mut updates = Vec::new();
@@ -4580,6 +4609,190 @@ fn compiler_job_flags(
 #[expect(clippy::unwrap_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
     use super::*;
+
+    async fn rpc_body_server(
+        body: Vec<u8>,
+        chunked: bool,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/rpc", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 4096];
+            anyhow::ensure!(stream.read(&mut request).await? > 0, "empty request");
+            let mut wire = if chunked {
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    .to_vec()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes()
+            };
+            if chunked {
+                for chunk in body.chunks(8192) {
+                    wire.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                    wire.extend_from_slice(chunk);
+                    wire.extend_from_slice(b"\r\n");
+                }
+                wire.extend_from_slice(b"0\r\n\r\n");
+            } else {
+                wire.extend_from_slice(&body);
+            }
+            // Size rejection may close the connection before the fixture is sent.
+            if let Err(error) = stream.write_all(&wire).await {
+                anyhow::ensure!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "fixture write failed: {error}"
+                );
+            }
+            anyhow::Ok(())
+        });
+        Ok((endpoint, server))
+    }
+
+    fn rpc_json_of_size(size: usize) -> Vec<u8> {
+        let mut body = br#"{"type":"info","results":[],"padding":""#.to_vec();
+        body.resize(size - 2, b'x');
+        body.extend_from_slice(b"\"}");
+        body
+    }
+
+    #[tokio::test]
+    async fn aur_rpc_body_limit_rejects_declared_and_chunked_oversized_json() -> Result<()> {
+        for chunked in [false, true] {
+            let (endpoint, server) =
+                rpc_body_server(rpc_json_of_size(16 * 1024 * 1024 + 1), chunked).await?;
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()?
+                .get(endpoint)
+                .send()
+                .await?;
+            let error = decode_aur_rpc_response::<AurResponse>(response)
+                .await
+                .expect_err("oversized valid JSON must be rejected");
+            assert!(error.to_string().contains("16 MiB"), "{error:#}");
+            server.await??;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aur_rpc_body_limit_applies_to_update_info_chunks() -> Result<()> {
+        for chunked in [false, true] {
+            let (endpoint, server) =
+                rpc_body_server(rpc_json_of_size(16 * 1024 * 1024 + 1), chunked).await?;
+            let error = AurClient::rpc_info_chunk_at(&endpoint, &["example".to_string()])
+                .await
+                .expect_err("update responses must use the metadata limit");
+            assert!(error.to_string().contains("16 MiB"), "{error:#}");
+            server.await??;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aur_rpc_body_limit_rejects_chunked_json_without_content_length() -> Result<()> {
+        let (endpoint, server) =
+            rpc_body_server(rpc_json_of_size(16 * 1024 * 1024 + 1), true).await?;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()?
+            .get(endpoint)
+            .send()
+            .await?;
+        assert_eq!(response.content_length(), None);
+        let error = decode_aur_rpc_response::<AurResponse>(response)
+            .await
+            .expect_err("streamed oversized JSON must be rejected without Content-Length");
+        assert!(error.to_string().contains("16 MiB"), "{error:#}");
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aur_rpc_body_limit_accepts_exact_limit_json() -> Result<()> {
+        let (endpoint, server) = rpc_body_server(rpc_json_of_size(16 * 1024 * 1024), true).await?;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()?
+            .get(endpoint)
+            .send()
+            .await?;
+        assert!(
+            decode_aur_rpc_response::<AurResponse>(response)
+                .await?
+                .results
+                .is_empty()
+        );
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aur_rpc_body_limit_preserves_rpc_error_envelopes() -> Result<()> {
+        let (endpoint, server) = rpc_body_server(
+            br#"{"type":"error","error":"fixture RPC error"}"#.to_vec(),
+            true,
+        )
+        .await?;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()?
+            .get(endpoint)
+            .send()
+            .await?;
+        let error = decode_aur_rpc_response::<AurResponse>(response)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "AUR RPC returned an error: fixture RPC error"
+        );
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aur_rpc_body_limit_redacts_body_transport_errors() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/rpc?arg=private-query", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 2048];
+            anyhow::ensure!(stream.read(&mut request).await? > 0, "empty request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n{")
+                .await?;
+            stream.shutdown().await?;
+            anyhow::Ok(())
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()?
+            .get(endpoint)
+            .send()
+            .await?;
+        let error = decode_aur_rpc_response::<AurResponse>(response)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "AUR RPC transport failed. Check your internet connection."
+        );
+        assert!(!format!("{error:#}").contains("private-query"));
+        server.await??;
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -7781,6 +7994,110 @@ mod empty_rpc_result_tests {
             "AUR empty-info completed request={}",
             request.lines().next().unwrap_or_default()
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod update_error_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn update_error_from_reply(
+        reply: Option<&[u8]>,
+        attempts: usize,
+    ) -> Result<anyhow::Error> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/rpc", listener.local_addr()?);
+        let reply = reply.map(<[u8]>::to_vec);
+        let server = tokio::spawn(async move {
+            for _ in 0..attempts {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    anyhow::ensure!(request.len() < 8192, "fixture request too large");
+                    let mut buffer = [0; 1024];
+                    let count = stream.read(&mut buffer).await?;
+                    anyhow::ensure!(count > 0, "fixture request incomplete");
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                if let Some(reply) = &reply {
+                    stream.write_all(reply).await?;
+                }
+                stream.shutdown().await?;
+            }
+            anyhow::Ok(())
+        });
+        let client = AurClient {
+            build_dir: PathBuf::new(),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.query_aur_updates_at(&endpoint, &["private-package-query".to_owned()]),
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(5), server).await???;
+        let error = result.expect_err("failed RPC must fail update discovery");
+        for cause in error.chain() {
+            let message = cause.to_string();
+            assert!(!message.contains("private-package-query"), "{message}");
+            assert!(!message.contains("remote-secret"), "{message}");
+            assert!(!message.contains(&endpoint), "{message}");
+        }
+        Ok(error)
+    }
+
+    #[tokio::test]
+    async fn rate_limited_updates_preserve_http_cause_and_cooldown_guidance() -> Result<()> {
+        let error = update_error_from_reply(Some(
+            b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 13\r\nConnection: close\r\n\r\nremote-secret",
+        ), 3)
+        .await?;
+        assert_eq!(
+            crate::core::error::suggest_for_anyhow(&error),
+            Some("Wait for the cooldown period, then retry your request")
+        );
+        assert!(format!("{error:#}").contains("HTTP 429"), "{error:#}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_update_transport_preserves_redaction_and_network_guidance() -> Result<()> {
+        let error = update_error_from_reply(None, 1).await?;
+        assert_eq!(
+            crate::core::error::suggest_for_anyhow(&error),
+            Some("Check your internet connection and try again")
+        );
+        assert!(
+            format!("{error:#}").contains("AUR RPC transport failed"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_update_http_status_does_not_invent_network_guidance() -> Result<()> {
+        let error = update_error_from_reply(Some(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ), 3).await?;
+        assert!(format!("{error:#}").contains("HTTP 503"), "{error:#}");
+        assert_eq!(crate::core::error::suggest_for_anyhow(&error), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_update_remote_envelope_does_not_leak_or_inject_guidance() -> Result<()> {
+        let body = br#"{"type":"error","error":"remote-secret: permission denied","results":[]}"#;
+        // This response is deliberately outside the retryable status path.
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let error = update_error_from_reply(Some(reply.as_bytes()), 1).await?;
+        assert_eq!(crate::core::error::suggest_for_anyhow(&error), None);
         Ok(())
     }
 }
