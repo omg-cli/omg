@@ -1157,7 +1157,7 @@ jobs:
   ci-success:
     name: "CI Success"
     needs: [quick-gate, standalone-suites, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
-    if: always()
+    if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
