@@ -5890,6 +5890,10 @@ mod tests {
                 "timeout" => "native_build_timeout_terminates_descendants",
                 "capture" => "native_build_capture_failure_terminates_descendants",
                 "cancel" => "native_build_cancellation_terminates_descendants",
+                "cancel-delayed" => {
+                    "native_build_delayed_startup_cancellation_terminates_descendants"
+                }
+                "startup-failure" => "native_build_startup_failure_reports_exit_status",
                 "status" => "native_build_preserves_exit_status",
                 _ => anyhow::bail!("unknown native probe mode: {mode}"),
             };
@@ -5914,12 +5918,12 @@ mod tests {
         let fixture = directory.path().join("makepkg");
         std::fs::write(
             &fixture,
-            "#!/bin/sh\nif [ \"$1\" = status ]; then exit 23; fi\nsleep 5 &\nchild=$!\ncat /proc/$$/stat > session\ncat /proc/$$/status > status\nprintf '%s %s\\n' $$ $child > identities\nif [ \"$1\" = capture ]; then head -c 4096 /dev/zero; fi\nwait\n",
+            "#!/bin/sh\ncase \"$1\" in status|startup-failure) exit 23;; cancel-delayed) sleep 3;; esac\nsleep 30 &\nchild=$!\ncat /proc/$$/stat > session\ncat /proc/$$/status > status\ncat /proc/$child/stat > descendant\nprintf '%s %s\\n' $$ $child > identities.tmp\nmv identities.tmp identities\nif [ \"$1\" = capture ]; then head -c 4096 /dev/zero; fi\nwait\n",
         )?;
         std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))?;
         let path = directory.path().to_path_buf();
         let task_path = path.clone();
-        let worker = tokio::spawn(async move {
+        let mut worker = tokio::spawn(async move {
             let client = AurClient {
                 build_dir: task_path.clone(),
                 settings: Settings::default(),
@@ -5937,6 +5941,8 @@ mod tests {
                     64,
                     if mode == "timeout" {
                         Duration::from_millis(300)
+                    } else if mode.starts_with("cancel") {
+                        Duration::from_secs(30)
                     } else {
                         Duration::from_secs(3)
                     },
@@ -5948,12 +5954,51 @@ mod tests {
             assert_eq!(worker.await??.code(), Some(23));
             return Ok(());
         }
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // Cancellation starts after the fixture publishes its complete identity,
+        // not after an assumed two-second launcher startup. Its build deadline
+        // stays separate from the unchanged two-second kill/reap deadline below.
+        let startup_budget = if mode.starts_with("cancel") {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(2)
+        };
+        let ready = tokio::time::timeout(startup_budget, async {
             while !path.join("identities").exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                if mode.starts_with("cancel") || mode == "startup-failure" {
+                    tokio::select! {
+                        result = &mut worker => {
+                            let status = result.context("native probe worker failed before readiness")?
+                                .context("native build failed before fixture readiness")?;
+                            anyhow::bail!("native build exited before fixture readiness: {status}");
+                        }
+                        () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
+                } else {
+                    // Capture/timeout intentionally finish before this loop
+                    // observes readiness. Preserve their result for the oracle.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
+            Ok::<_, anyhow::Error>(())
         })
-        .await?;
+        .await
+        .context("native build fixture did not become ready")
+        .and_then(std::convert::identity);
+        if ready.is_err() && !worker.is_finished() {
+            worker.abort();
+            assert!(
+                (&mut worker)
+                    .await
+                    .expect_err("startup worker aborted")
+                    .is_cancelled()
+            );
+        }
+        if mode == "startup-failure" {
+            let error = ready.expect_err("early fixture exit must fail readiness");
+            assert!(format!("{error:#}").contains("exit status: 23"));
+            return Ok(());
+        }
+        ready?;
         let identities = std::fs::read_to_string(path.join("identities"))?;
         let pids = identities
             .split_whitespace()
@@ -5961,7 +6006,15 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(pids.len(), 2);
         let leader_stat = std::fs::read_to_string(path.join("session"))?;
-        if mode == "cancel" {
+        let descendant_stat = std::fs::read_to_string(path.join("descendant"))?;
+        let descendant_fields: Vec<_> = descendant_stat.split_whitespace().collect();
+        assert_ne!(
+            descendant_fields[2], "Z",
+            "fixture descendant started alive"
+        );
+        assert_eq!(descendant_fields[3], pids[0].to_string());
+        assert_eq!(descendant_fields[4], pids[0].to_string());
+        if mode.starts_with("cancel") {
             worker.abort();
             assert!(worker.await.expect_err("worker aborted").is_cancelled());
         } else {
@@ -5983,34 +6036,21 @@ mod tests {
             .collect();
         // Clean up the known disposable session even when the regression fails.
         terminate_build_group(pids[0])?;
-        // The runner owns and reaps makepkg; this isolated fixture owns the
-        // orphaned sleep child. Only wait for that PID, never Tokio's child.
+        // The runner owns makepkg. Its shell can reap sleep before dying;
+        // otherwise this isolated subreaper adopts and reaps that exact PID.
+        // ECHILD alone is insufficient: the PID must also be absent from proc.
         let descendant = nix::unistd::Pid::from_raw(i32::try_from(pids[1])?);
-        let reaped = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match nix::sys::wait::waitpid(
+        if let Some(reaped) = reap_native_probe_child(descendant, Duration::from_secs(2)).await? {
+            assert_eq!(
+                reaped,
+                nix::sys::wait::WaitStatus::Signaled(
                     descendant,
-                    Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-                ) {
-                    // Adoption can lag the parent's kill signal. ECHILD is
-                    // transient until the kernel reparents this known PID.
-                    Ok(nix::sys::wait::WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    status => return status,
-                }
-            }
-        })
-        .await??;
-        assert_eq!(
-            reaped,
-            nix::sys::wait::WaitStatus::Signaled(
-                descendant,
-                nix::sys::signal::Signal::SIGKILL,
-                false
-            ),
-            "fixture must adopt and reap its terminated descendant"
-        );
+                    nix::sys::signal::Signal::SIGKILL,
+                    false
+                ),
+                "adopted descendant must have been terminated"
+            );
+        }
         assert!(
             running.is_empty(),
             "native {mode} left running PIDs {running:?}; initial identity {leader_stat:?}"
@@ -6042,6 +6082,54 @@ mod tests {
         Ok(())
     }
 
+    async fn reap_native_probe_child(
+        pid: nix::unistd::Pid,
+        budget: Duration,
+    ) -> Result<Option<nix::sys::wait::WaitStatus>> {
+        tokio::time::timeout(budget, async {
+            loop {
+                match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                    Err(nix::errno::Errno::ECHILD) => {
+                        match std::fs::symlink_metadata(format!("/proc/{pid}")) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(anyhow::Error::from(error)),
+                            Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                        }
+                    }
+                    Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    result => return result.map(Some).map_err(anyhow::Error::from),
+                }
+            }
+        })
+        .await
+        .context("native fixture descendant remains present or unreaped")?
+    }
+
+    #[tokio::test]
+    async fn native_probe_accepts_an_already_reaped_child() -> Result<()> {
+        let mut child = Command::new("/usr/bin/sleep").arg("30").spawn()?;
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id().context("child PID")?)?);
+        child.kill().await?;
+        assert!(
+            reap_native_probe_child(pid, Duration::from_millis(100))
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_probe_rejects_echild_while_pid_still_exists() {
+        let error = reap_native_probe_child(nix::unistd::getpid(), Duration::from_millis(100))
+            .await
+            .expect_err("ECHILD must never certify a present process as reaped");
+        assert!(format!("{error:#}").contains("remains present or unreaped"));
+    }
+
     #[tokio::test]
     async fn native_build_timeout_terminates_descendants() -> Result<()> {
         native_build_cleanup_probe("timeout").await
@@ -6055,6 +6143,16 @@ mod tests {
     #[tokio::test]
     async fn native_build_cancellation_terminates_descendants() -> Result<()> {
         native_build_cleanup_probe("cancel").await
+    }
+
+    #[tokio::test]
+    async fn native_build_delayed_startup_cancellation_terminates_descendants() -> Result<()> {
+        native_build_cleanup_probe("cancel-delayed").await
+    }
+
+    #[tokio::test]
+    async fn native_build_startup_failure_reports_exit_status() -> Result<()> {
+        native_build_cleanup_probe("startup-failure").await
     }
 
     #[tokio::test]
