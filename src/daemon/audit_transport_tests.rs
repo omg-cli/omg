@@ -187,7 +187,7 @@ async fn real_server_fetches_scores_and_rejects_failed_scans_before_recovery() -
             )?;
             anyhow::Ok((status, out, err))
         };
-        let (status, out, err) = match timeout(Duration::from_secs(60), capture).await {
+        let (status, out, err) = match timeout(Duration::from_mins(1), capture).await {
             Ok(Ok(output)) => output,
             failure => {
                 if child.try_wait()?.is_none() {
