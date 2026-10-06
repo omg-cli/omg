@@ -1584,6 +1584,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_quarantines_corrupt_log_before_fresh_append() {
+        if crate::core::testing::run_isolated_test(
+            "core::security::audit::tests::init_quarantines_corrupt_log_before_fresh_append",
+        ) {
+            return;
+        }
         if crate::core::is_root() {
             // Elevated processes resolve data paths to real system
             // directories regardless of OMG_DATA_DIR, so concurrent fixture
@@ -2176,6 +2181,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn global_writer_lazy_initializes_and_persists_events() {
+        if crate::core::testing::run_isolated_test(
+            "core::security::audit::tests::global_writer_lazy_initializes_and_persists_events",
+        ) {
+            return;
+        }
         if crate::core::is_root() {
             // Same elevated-path isolation as
             // init_quarantines_corrupt_log_before_fresh_append.
