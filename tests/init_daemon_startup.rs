@@ -36,6 +36,9 @@ impl Fixture {
         let mut child = Command::new(path.join("omg"))
             .args(["init", "--defaults", "--skip-shell"])
             .env_clear()
+            // Keep instrumented child profiles outside the disposable state
+            // directory so llvm-cov can include the actual CLI execution.
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|path| ("LLVM_PROFILE_FILE", path)))
             .env("PATH", "/usr/bin:/bin")
             .current_dir(path)
             .env("HOME", path)
@@ -90,8 +93,18 @@ fn init_reports_child_failure_and_continues_setup() -> Result<()> {
 
 #[test]
 fn init_reports_synchronous_spawn_failure_and_continues() -> Result<()> {
-    // An existing executable file with no recognized executable format.
-    let fixture = Fixture::new("not an executable format\n")?;
+    // ENOEXEC may fall back to a shell on macOS. A non-executable sibling
+    // fails at spawn on every unprivileged Unix runner.
+    let fixture = Fixture::new("#!/bin/sh\nexit 0\n")?;
+    let daemon = fixture.directory.path().join("omgd");
+    std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o600))?;
+    assert_eq!(
+        Command::new(&daemon)
+            .spawn()
+            .expect_err("fixture must refuse execution")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
     let output = fixture.run()?;
     let stdout = String::from_utf8(output.stdout)?;
     assert!(output.status.success(), "{stdout}");
