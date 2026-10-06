@@ -231,6 +231,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn initialization_errors_are_returned_to_the_caller() {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::alpm_worker::tests::initialization_errors_are_returned_to_the_caller",
+        ) {
+            return;
+        }
         if crate::core::is_root() {
             // Elevated processes ignore OMG_PACMAN_* overrides, so this
             // fixture test only applies to unprivileged runs.

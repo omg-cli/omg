@@ -2136,6 +2136,11 @@ mod tests {
     #[cfg(feature = "arch")]
     #[serial_test::serial]
     fn daemon_native_initializer_does_not_block_the_async_executor() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "daemon::handlers::tests::daemon_native_initializer_does_not_block_the_async_executor",
+        ) {
+            return Ok(());
+        }
         if crate::core::is_root() {
             eprintln!("skipped: native path overrides require an unprivileged fixture run");
             return Ok(());
@@ -2183,6 +2188,11 @@ mod tests {
     #[cfg(feature = "arch")]
     #[serial_test::serial]
     fn daemon_native_retirement_releases_backend_lock_and_executor() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "daemon::handlers::tests::daemon_native_retirement_releases_backend_lock_and_executor",
+        ) {
+            return Ok(());
+        }
         if crate::core::is_root() {
             eprintln!("skipped: native path overrides require an unprivileged fixture run");
             return Ok(());
@@ -2246,6 +2256,11 @@ mod tests {
     #[serial_test::serial]
     fn daemon_native_cancelled_request_retains_serialization_until_work_finishes()
     -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "daemon::handlers::tests::daemon_native_cancelled_request_retains_serialization_until_work_finishes",
+        ) {
+            return Ok(());
+        }
         if crate::core::is_root() {
             eprintln!("skipped: native path overrides require an unprivileged fixture run");
             return Ok(());
@@ -2352,6 +2367,11 @@ mod tests {
     #[cfg(feature = "arch")]
     #[serial_test::serial]
     fn daemon_native_retirement_keeps_final_join_off_the_request_executor() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "daemon::handlers::tests::daemon_native_retirement_keeps_final_join_off_the_request_executor",
+        ) {
+            return Ok(());
+        }
         if crate::core::is_root() {
             eprintln!("skipped: native path overrides require an unprivileged fixture run");
             return Ok(());

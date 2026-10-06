@@ -791,6 +791,11 @@ mod tests {
 
     #[test]
     fn pacman_environment_overrides_cannot_control_root_paths() {
+        if crate::core::testing::run_isolated_test(
+            "core::paths::tests::pacman_environment_overrides_cannot_control_root_paths",
+        ) {
+            return;
+        }
         let overrides = [
             "OMG_PACMAN_CONF",
             "OMG_PACMAN_ROOT",
@@ -1083,6 +1088,11 @@ mod tests {
 
     #[test]
     fn pacman_root_default_is_absolute() {
+        if crate::core::testing::run_isolated_test(
+            "core::paths::tests::pacman_root_default_is_absolute",
+        ) {
+            return;
+        }
         temp_env::with_var_unset("OMG_PACMAN_ROOT", || {
             let root = pacman_root();
             assert_eq!(root, PathBuf::from("/"));
@@ -1093,6 +1103,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pacman_paths_honor_rootdir_and_dbpath_from_configuration() {
+        if crate::core::testing::run_isolated_test(
+            "core::paths::tests::pacman_paths_honor_rootdir_and_dbpath_from_configuration",
+        ) {
+            return;
+        }
         if crate::core::is_root() {
             // Elevated processes ignore OMG_PACMAN_* overrides, so this
             // fixture test only applies to unprivileged runs.
@@ -1145,6 +1160,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn privileged_pacman_override_rejects_writable_and_symlinked_directories() {
+        if crate::core::testing::run_isolated_test(
+            "core::paths::tests::privileged_pacman_override_rejects_writable_and_symlinked_directories",
+        ) {
+            return;
+        }
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         let temp = tempfile::tempdir().expect("temporary pacman path");
@@ -1169,6 +1189,11 @@ mod tests {
 
     #[test]
     fn pacman_db_dir_defaults_under_the_root() {
+        if crate::core::testing::run_isolated_test(
+            "core::paths::tests::pacman_db_dir_defaults_under_the_root",
+        ) {
+            return;
+        }
         temp_env::with_var_unset("OMG_PACMAN_DB_DIR", || {
             let db = pacman_db_dir();
             assert_eq!(db, PathBuf::from("/var/lib/pacman"));
@@ -1177,6 +1202,11 @@ mod tests {
 
     #[test]
     fn pacman_sync_dir_defaults_under_the_db_dir() {
+        if crate::core::testing::run_isolated_test(
+            "core::paths::tests::pacman_sync_dir_defaults_under_the_db_dir",
+        ) {
+            return;
+        }
         temp_env::with_var_unset("OMG_PACMAN_SYNC_DIR", || {
             let sync = pacman_sync_dir();
             assert_eq!(sync, pacman_db_dir().join("sync"));
@@ -1185,6 +1215,11 @@ mod tests {
 
     #[test]
     fn pacman_local_dir_defaults_under_the_db_dir() {
+        if crate::core::testing::run_isolated_test(
+            "core::paths::tests::pacman_local_dir_defaults_under_the_db_dir",
+        ) {
+            return;
+        }
         temp_env::with_var_unset("OMG_PACMAN_LOCAL_DIR", || {
             let local = pacman_local_dir();
             assert_eq!(local, pacman_db_dir().join("local"));
