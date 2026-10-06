@@ -1,0 +1,893 @@
+{
+  "prs": [
+    {
+      "number": 859,
+      "url": "https://github.com/omg-cli/omg/pull/859",
+      "state": "open",
+      "merged": false,
+      "head": "85227b798d4ffa35b4f500f81f9f0a342b9bc75b",
+      "merged_at": null,
+      "merge_commit_sha": "e68eae42245eb469891e17eded72fd28a3b96d9d",
+      "canonical": [
+        "PER-1033"
+      ]
+    },
+    {
+      "number": 858,
+      "url": "https://github.com/omg-cli/omg/pull/858",
+      "state": "open",
+      "merged": false,
+      "head": "fe1129420a69895c15491686824bd4d4d4ac74e9",
+      "merged_at": null,
+      "merge_commit_sha": "f1229eeb9504f3e1e64141d8a72e55e802a62a8f",
+      "canonical": [
+        "PER-1004",
+        "PER-1004",
+        "PER-999",
+        "PER-999",
+        "PER-1004"
+      ]
+    },
+    {
+      "number": 856,
+      "url": "https://github.com/omg-cli/omg/pull/856",
+      "state": "open",
+      "merged": false,
+      "head": "a009ff8847e47cac691e2dfdac7b4826a33e050b",
+      "merged_at": null,
+      "merge_commit_sha": "d5b570d9f1e860ed6ed8801e2f9638c764d8774d",
+      "canonical": [
+        "PER-985",
+        "PER-985",
+        "PER-985"
+      ]
+    },
+    {
+      "number": 855,
+      "url": "https://github.com/omg-cli/omg/pull/855",
+      "state": "open",
+      "merged": false,
+      "head": "c6dcad3edd220bcadaf5e95e7a34be2968cd1334",
+      "merged_at": null,
+      "merge_commit_sha": "52d0be6b3359050545783991b9371b399b4af80f",
+      "canonical": [
+        "PER-933",
+        "PER-933",
+        "PER-930",
+        "PER-930",
+        "PER-933",
+        "PER-935",
+        "PER-935",
+        "PER-822",
+        "PER-822",
+        "PER-933"
+      ]
+    },
+    {
+      "number": 854,
+      "url": "https://github.com/omg-cli/omg/pull/854",
+      "state": "open",
+      "merged": false,
+      "head": "2ecebe7aab68181a85c6c0d874e7d22f0af8d0b3",
+      "merged_at": null,
+      "merge_commit_sha": "f0e3c42956e25ece9c4314001e1d7648b99ccb7b",
+      "canonical": [
+        "PER-44",
+        "PER-44",
+        "PER-885",
+        "PER-885",
+        "PER-886",
+        "PER-886",
+        "PER-44"
+      ]
+    },
+    {
+      "number": 853,
+      "url": "https://github.com/omg-cli/omg/pull/853",
+      "state": "open",
+      "merged": false,
+      "head": "aebcb0743190356030ebdae5a846a887ee37a6f8",
+      "merged_at": null,
+      "merge_commit_sha": "4ad69bc6a81ba54abb4dd317077fea79d7e8b764",
+      "canonical": [
+        "PER-849",
+        "PER-849",
+        "PER-859",
+        "PER-859",
+        "PER-849",
+        "PER-849"
+      ]
+    },
+    {
+      "number": 852,
+      "url": "https://github.com/omg-cli/omg/pull/852",
+      "state": "open",
+      "merged": false,
+      "head": "19bd11204bda8d9e245f3f2e0eecf50e660a6941",
+      "merged_at": null,
+      "merge_commit_sha": "b86d252e10b7f2a8ba3a5b1452973089bd78346d",
+      "canonical": [
+        "PER-851",
+        "PER-851",
+        "PER-851",
+        "PER-855",
+        "PER-855",
+        "PER-164",
+        "PER-115",
+        "PER-851"
+      ]
+    },
+    {
+      "number": 851,
+      "url": "https://github.com/omg-cli/omg/pull/851",
+      "state": "open",
+      "merged": false,
+      "head": "1f7383bcaaf61bc2cef61fb1e3cb16deec93241e",
+      "merged_at": null,
+      "merge_commit_sha": "f5d8de8cf7f1af1aecbee636f27f5543f2a2dc16",
+      "canonical": [
+        "PER-848",
+        "PER-848",
+        "PER-848"
+      ]
+    },
+    {
+      "number": 850,
+      "url": "https://github.com/omg-cli/omg/pull/850",
+      "state": "open",
+      "merged": false,
+      "head": "b5140618985c3b113a954a8fcab3a0ce36351b5d",
+      "merged_at": null,
+      "merge_commit_sha": "2a00a1fea53d3bbf7070f8b05bf608a407bb976b",
+      "canonical": [
+        "PER-833",
+        "PER-833",
+        "PER-833",
+        "PER-837",
+        "PER-837",
+        "PER-833"
+      ]
+    },
+    {
+      "number": 849,
+      "url": "https://github.com/omg-cli/omg/pull/849",
+      "state": "open",
+      "merged": false,
+      "head": "c61f2c614134ba185a111e8b2b0675ce97715932",
+      "merged_at": null,
+      "merge_commit_sha": "02a59993324e4c90d4eb50b6d4e2bf5664c142d0",
+      "canonical": [
+        "PER-813",
+        "PER-813",
+        "PER-392",
+        "PER-392",
+        "PER-813",
+        "PER-813"
+      ]
+    },
+    {
+      "number": 848,
+      "url": "https://github.com/omg-cli/omg/pull/848",
+      "state": "open",
+      "merged": false,
+      "head": "2f670e58484ab2ba8428b3ee83db487072853051",
+      "merged_at": null,
+      "merge_commit_sha": "cb1d98cf9ec1e420ec7fba1df5de04f29e911ed1",
+      "canonical": [
+        "PER-803",
+        "PER-469"
+      ]
+    },
+    {
+      "number": 845,
+      "url": "https://github.com/omg-cli/omg/pull/845",
+      "state": "open",
+      "merged": false,
+      "head": "fd96cabd28abe66c24fa46e66c5c89efa890fdf3",
+      "merged_at": null,
+      "merge_commit_sha": "3d031ce0c49112797e06f23f7250b21185408e47",
+      "canonical": [
+        "PER-43",
+        "PER-43"
+      ]
+    },
+    {
+      "number": 844,
+      "url": "https://github.com/omg-cli/omg/pull/844",
+      "state": "open",
+      "merged": false,
+      "head": "e60c4c5f480edb8b7e70456a41967b680431d9db",
+      "merged_at": null,
+      "merge_commit_sha": "8376d9921f1a905d18ec5ed8c297baa0e6db68e7",
+      "canonical": [
+        "PER-46",
+        "PER-46",
+        "PER-644",
+        "PER-644",
+        "PER-46"
+      ]
+    },
+    {
+      "number": 841,
+      "url": "https://github.com/omg-cli/omg/pull/841",
+      "state": "open",
+      "merged": false,
+      "head": "1ff3510d1ea0f50c7006032974d1064763f8a595",
+      "merged_at": null,
+      "merge_commit_sha": "b760230a45cf8cdffa7e645a56159734d824d8c6",
+      "canonical": []
+    },
+    {
+      "number": 839,
+      "url": "https://github.com/omg-cli/omg/pull/839",
+      "state": "open",
+      "merged": false,
+      "head": "c4091314c02a7ad57fea83724923099f71ae28c8",
+      "merged_at": null,
+      "merge_commit_sha": "ddb091eeaf10b96d023966ffa35b8ffda4a2c39c",
+      "canonical": []
+    },
+    {
+      "number": 837,
+      "url": "https://github.com/omg-cli/omg/pull/837",
+      "state": "open",
+      "merged": false,
+      "head": "457172782572ccf905a3d642ce7825ca69f44a11",
+      "merged_at": null,
+      "merge_commit_sha": "4e0070bfd074685ac3da48b8169d7320b23d88eb",
+      "canonical": []
+    },
+    {
+      "number": 836,
+      "url": "https://github.com/omg-cli/omg/pull/836",
+      "state": "open",
+      "merged": false,
+      "head": "a042d44ed68f6f40991d4182ccac70a3e5afdc5c",
+      "merged_at": null,
+      "merge_commit_sha": "3cbde548408b6ce1c3f43402aa3e00684bf09b51",
+      "canonical": [
+        "PER-41",
+        "PER-41",
+        "PER-591",
+        "PER-591"
+      ]
+    },
+    {
+      "number": 835,
+      "url": "https://github.com/omg-cli/omg/pull/835",
+      "state": "open",
+      "merged": false,
+      "head": "4cd4d7003f671f8b8b577a01660a84623778226c",
+      "merged_at": null,
+      "merge_commit_sha": "dd7ade771be3f33df44ada33c75e21f5cb163a1a",
+      "canonical": [
+        "PER-37",
+        "PER-37"
+      ]
+    },
+    {
+      "number": 834,
+      "url": "https://github.com/omg-cli/omg/pull/834",
+      "state": "open",
+      "merged": false,
+      "head": "110d5b1cc1cac9ac9743c10661705cd5fe9ce5bf",
+      "merged_at": null,
+      "merge_commit_sha": "6d9752c80bd604d863d8ccb12bd3314755288fb6",
+      "canonical": [
+        "PER-42",
+        "PER-42"
+      ]
+    },
+    {
+      "number": 828,
+      "url": "https://github.com/omg-cli/omg/pull/828",
+      "state": "open",
+      "merged": false,
+      "head": "8263c72832bddbc250ccd96b46b67cb2c9833bf7",
+      "merged_at": null,
+      "merge_commit_sha": "4c30e06c5358b6c999f61a3cc0217303ad5f605e",
+      "canonical": [
+        "PER-40",
+        "PER-40",
+        "PER-485",
+        "PER-485"
+      ]
+    },
+    {
+      "number": 825,
+      "url": "https://github.com/omg-cli/omg/pull/825",
+      "state": "open",
+      "merged": false,
+      "head": "6f242c6b03a70f832675f31a1290abae52b8f56d",
+      "merged_at": null,
+      "merge_commit_sha": "d0d1736a622642615f0b5cc3cdd9eadb18702336",
+      "canonical": [
+        "PER-45",
+        "PER-45"
+      ]
+    },
+    {
+      "number": 822,
+      "url": "https://github.com/omg-cli/omg/pull/822",
+      "state": "open",
+      "merged": false,
+      "head": "6e82693b594712e03c4589d99c788bf9f368a015",
+      "merged_at": null,
+      "merge_commit_sha": "3196350fa38792a02accb64cfd581753af20204a",
+      "canonical": [
+        "PER-32",
+        "PER-32",
+        "PER-456",
+        "PER-456",
+        "PER-460",
+        "PER-460"
+      ]
+    },
+    {
+      "number": 821,
+      "url": "https://github.com/omg-cli/omg/pull/821",
+      "state": "open",
+      "merged": false,
+      "head": "d0acc2f8addd10518326d374d7940539bb649631",
+      "merged_at": null,
+      "merge_commit_sha": "eeb1a34ef6952d8e8199037282ea072921018b66",
+      "canonical": [
+        "PER-31",
+        "PER-31"
+      ]
+    },
+    {
+      "number": 796,
+      "url": "https://github.com/omg-cli/omg/pull/796",
+      "state": "open",
+      "merged": false,
+      "head": "385414d67018b4b099c58d817aedb03087e8aace",
+      "merged_at": null,
+      "merge_commit_sha": "c692846d03c7a740d16431d906f13a8562a5779b",
+      "canonical": []
+    },
+    {
+      "number": 789,
+      "url": "https://github.com/omg-cli/omg/pull/789",
+      "state": "open",
+      "merged": false,
+      "head": "b398c7030b6938cfcb1e6d7411f59844f482ec0c",
+      "merged_at": null,
+      "merge_commit_sha": "71caa97cf22e4c6a2979cc40667a8990bd1fe348",
+      "canonical": []
+    },
+    {
+      "number": 787,
+      "url": "https://github.com/omg-cli/omg/pull/787",
+      "state": "open",
+      "merged": false,
+      "head": "cb97c6d987e351161522f6c015334c2bad97c0d4",
+      "merged_at": null,
+      "merge_commit_sha": "33f881301a594c25d9f273f451c3553c8023be17",
+      "canonical": []
+    },
+    {
+      "repo": "omg-cli/omg",
+      "number": 843,
+      "url": "https://github.com/omg-cli/omg/pull/843",
+      "state": "open",
+      "merged": false,
+      "head": "8a51aea536d5c2a63e66570a4c1a2c9aff677ac7",
+      "merged_at": null
+    },
+    {
+      "repo": "PyRo1121/paperclip-local",
+      "number": 2,
+      "url": "https://github.com/PyRo1121/paperclip-local/pull/2",
+      "state": "open",
+      "merged": false,
+      "head": "c5814adc59027f37cc0714d75083ab4bf48abcd4",
+      "merged_at": null
+    }
+  ],
+  "issues": [
+    {
+      "number": 857,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "priority:p3",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/857"
+    },
+    {
+      "number": 847,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "url": "https://github.com/omg-cli/omg/issues/847"
+    },
+    {
+      "number": 842,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "github_actions",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/842"
+    },
+    {
+      "number": 820,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/820"
+    },
+    {
+      "number": 819,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/819"
+    },
+    {
+      "number": 818,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/818"
+    },
+    {
+      "number": 817,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/817"
+    },
+    {
+      "number": 816,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p1",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/816"
+    },
+    {
+      "number": 815,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "security",
+        "priority:p1",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/815"
+    },
+    {
+      "number": 814,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/814"
+    },
+    {
+      "number": 813,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/813"
+    },
+    {
+      "number": 812,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/812"
+    },
+    {
+      "number": 811,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/811"
+    },
+    {
+      "number": 810,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/810"
+    },
+    {
+      "number": 807,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/807"
+    },
+    {
+      "number": 806,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "priority:p1",
+        "type:ci"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/806"
+    },
+    {
+      "number": 805,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p1",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/805"
+    },
+    {
+      "number": 802,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "qa-failure"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/802"
+    },
+    {
+      "number": 801,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "qa-failure"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/801"
+    },
+    {
+      "number": 800,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "qa-failure",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/800"
+    },
+    {
+      "number": 791,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr",
+        "status:needs-evidence"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/791"
+    },
+    {
+      "number": 785,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "rust",
+        "priority:p2",
+        "type:ci"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/785"
+    },
+    {
+      "number": 772,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:ci-blocked"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/772"
+    },
+    {
+      "number": 770,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/770"
+    },
+    {
+      "number": 764,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/764"
+    },
+    {
+      "number": 757,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "qa-failure",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/757"
+    },
+    {
+      "number": 665,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "qa-failure",
+        "priority:p1",
+        "type:ci",
+        "status:needs-evidence"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/665"
+    },
+    {
+      "number": 626,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "bug",
+        "priority:p1",
+        "status:has-pr",
+        "status:needs-evidence"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/626"
+    },
+    {
+      "number": 623,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "qa-failure",
+        "priority:p2",
+        "type:ci",
+        "status:needs-evidence"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/623"
+    },
+    {
+      "number": 616,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "enhancement",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr",
+        "status:needs-evidence"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/616"
+    },
+    {
+      "number": 611,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "enhancement",
+        "priority:p2",
+        "type:ci",
+        "status:has-pr",
+        "status:needs-evidence"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/611"
+    },
+    {
+      "number": 452,
+      "repo": "omg-cli/omg",
+      "state": "open",
+      "closed_at": null,
+      "labels": [
+        "qa-failure",
+        "priority:p1",
+        "type:ci",
+        "status:needs-evidence"
+      ],
+      "url": "https://github.com/omg-cli/omg/issues/452"
+    },
+    {
+      "number": 1,
+      "repo": "PyRo1121/paperclip-local",
+      "state": "open",
+      "url": "https://github.com/PyRo1121/paperclip-local/issues/1"
+    }
+  ],
+  "auditArchiveRows": [
+    {
+      "id": "cb7219df1ab91a0a",
+      "archiveDisposition": "accepted-open-issue",
+      "observations": 2,
+      "canonicalIndexLines": [
+        "| [PER-35](/PER/issues/PER-35) | medium | GitHub #809: fix(aur): discover explicitly requested debug-named package outputs |"
+      ],
+      "location": "src/package_managers/aur/client.rs:2608-2611 (inside `find_package_in_dir`, called from `find_built_packages` at src/package_managers/aur/client.rs:2572)"
+    },
+    {
+      "id": "04222660b3269ab4",
+      "archiveDisposition": "awaiting-review",
+      "observations": 1,
+      "canonicalIndexLines": [
+        "| [PER-58](/PER/issues/PER-58) | high | Triage: The coverage gate has no patch awareness: new untested code can ship while the gate passes [04222660] |"
+      ],
+      "location": "scripts/check-line-coverage.py:93-101 (invoked by .github/workflows/coverage.yml:222-226); defect surfaces as .github/workflows/coverage.yml:226"
+    },
+    {
+      "id": "3a6dce6104e61587",
+      "archiveDisposition": "accepted-open-issue",
+      "observations": 2,
+      "canonicalIndexLines": [
+        "| [PER-32](/PER/issues/PER-32) | high | GitHub #806: fix(qemu): require positive crash-channel capability before health admission |"
+      ],
+      "location": "scripts/check-qemu-health.py:91-93, :101-105, :107-109"
+    },
+    {
+      "id": "3dbed682ff75a28d",
+      "archiveDisposition": "accepted-open-issue",
+      "observations": 2,
+      "canonicalIndexLines": [
+        "| [PER-36](/PER/issues/PER-36) | medium | GitHub #810: fix(aur): retain same-base build and check dependencies in output planning |"
+      ],
+      "location": "src/package_managers/aur_deps.rs:88 (`dependency_plan`)"
+    },
+    {
+      "id": "ec0a9778d736fe7d",
+      "archiveDisposition": "accepted-open-issue",
+      "observations": 1,
+      "canonicalIndexLines": [
+        "| [PER-42](/PER/issues/PER-42) | high | GitHub #816: fix(debian-pure): retain removal locks and journal until blocking mutation ends |"
+      ],
+      "location": "src/package_managers/debian_db/transaction.rs:1039-1044"
+    },
+    {
+      "id": "80537b1096502eb7",
+      "archiveDisposition": "awaiting-review",
+      "observations": 1,
+      "canonicalIndexLines": [
+        "| [PER-59](/PER/issues/PER-59) | high | Triage: `finish` records nothing when the harness is killed by a signal [80537b10] |"
+      ],
+      "location": "scripts/qemu-transactions.sh:59 (`local code=$?`), scripts/qemu-transactions.sh:61 (`if [[ $code != 0 ]]`), scripts/qemu-transactions.sh:69 (`trap finish EXIT`)"
+    },
+    {
+      "id": "816c8138963dfe84",
+      "archiveDisposition": "accepted-open-issue",
+      "observations": 1,
+      "canonicalIndexLines": [
+        "| [PER-44](/PER/issues/PER-44) | medium | GitHub #818: fix(qemu): preserve the previous transaction summary when serialization fails |"
+      ],
+      "location": "scripts/qemu-transactions.sh:49-50 (`> \"$output/summary.next.json\"` then `mv`), called from scripts/qemu-transactions.sh:65 (`write_summary false || printf ...`)"
+    },
+    {
+      "id": "4856889e442474d8",
+      "archiveDisposition": "accepted-open-issue",
+      "observations": 1,
+      "canonicalIndexLines": [
+        "| [PER-34](/PER/issues/PER-34) | medium | GitHub #808: fix(cli): preserve error causes when selecting recovery guidance |"
+      ],
+      "location": "src/core/error.rs:11"
+    },
+    {
+      "id": "3d5e0b22132b83ff",
+      "archiveDisposition": "awaiting-review",
+      "observations": 1,
+      "canonicalIndexLines": [
+        "| [PER-60](/PER/issues/PER-60) | high | Triage: Network suggestion is misattributed to local socket timeouts, telling users to check the internet when their daemon is wedged [3d5e0b22] |"
+      ],
+      "location": "src/core/error.rs:22"
+    },
+    {
+      "id": "bcc043060caedc63",
+      "archiveDisposition": "awaiting-review",
+      "observations": 1,
+      "canonicalIndexLines": [
+        "| [PER-61](/PER/issues/PER-61) | high | Triage: fast_status_path() escapes the socket's own directory via with_file_name on a file-less path [bcc04306] |"
+      ],
+      "location": "src/core/paths.rs:709 (with `src/core/paths.rs:536` and `src/core/fast_status.rs:148`)"
+    }
+  ],
+  "findingsSha256": "be203abf580fc6ebcadbbfa710ab97d731149a4f41dc2cee1f8486c2499623fe",
+  "runId": "9301513b-4025-44eb-8703-66db3dec0ad8",
+  "observedAt": "2026-10-06T04:42:19.542706+00:00"
+}
