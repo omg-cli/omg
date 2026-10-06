@@ -148,8 +148,9 @@ static RE_SLACK_WEBHOOK: LazyLock<Regex> = LazyLock::new(|| {
         r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]+/B[a-zA-Z0-9_]+/[a-zA-Z0-9_]+",
     )
 });
-static RE_PRIVATE_KEY: LazyLock<Regex> =
-    LazyLock::new(|| compile_pattern(r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"));
+static RE_PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    compile_pattern(r"-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")
+});
 static RE_JWT: LazyLock<Regex> =
     LazyLock::new(|| compile_pattern(r"eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*"));
 static RE_GOOGLE_API_KEY: LazyLock<Regex> =
@@ -617,6 +618,56 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f.secret_type, SecretType::PrivateKey))
         );
+    }
+
+    #[test]
+    fn encrypted_pkcs8_armor_is_detected_and_redacted() {
+        let scanner = SecretScanner::new();
+        // Inert marker fixture: no private key or passphrase.
+        let content = "fixture\n-----BEGIN ENCRYPTED PRIVATE KEY-----\ninert\n-----END ENCRYPTED PRIVATE KEY-----";
+        let findings = scanner.scan_content(content, "encrypted.pem");
+
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert_eq!(finding.secret_type, SecretType::PrivateKey);
+        assert_eq!(finding.severity, SecretSeverity::Critical);
+        assert_eq!(finding.file_path, "encrypted.pem");
+        assert_eq!(finding.line_number, 2);
+        assert_eq!(finding.redacted, "----**********...----");
+    }
+
+    #[test]
+    fn existing_private_key_armor_remains_detected() {
+        let scanner = SecretScanner::new();
+        for label in [
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+        ] {
+            let content = format!("-----BEGIN {label}-----\ninert\n-----END {label}-----");
+            let findings = scanner.scan_content(&content, "key.pem");
+            assert_eq!(findings.len(), 1, "{label}");
+            assert_eq!(findings[0].secret_type, SecretType::PrivateKey, "{label}");
+        }
+    }
+
+    #[test]
+    fn unrelated_armor_is_not_a_private_key() {
+        let scanner = SecretScanner::new();
+        for label in [
+            "PUBLIC KEY",
+            "CERTIFICATE",
+            "ENCRYPTED PUBLIC KEY",
+            "PGP PRIVATE KEY BLOCK",
+        ] {
+            let content = format!("-----BEGIN {label}-----\ninert\n-----END {label}-----");
+            assert!(
+                scanner.scan_content(&content, "fixture.pem").is_empty(),
+                "{label}"
+            );
+        }
     }
 
     #[test]
