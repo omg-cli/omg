@@ -14,7 +14,8 @@ from test_native_contracts import NATIVE
 class RequiredResultsTests(unittest.TestCase):
     def test_final_jobs_allow_cancellation_without_skipping_failure_evaluation(self):
         for filename, job in (("ci.yml", "ci-success"),
-                              ("coverage.yml", "coverage-result")):
+                              ("coverage.yml", "coverage-result"),
+                              ("mutation.yml", "mutation-result")):
             with self.subTest(workflow=filename):
                 block = job_block((CI_YML.parent / filename).read_text(encoding="utf-8"), job)
                 condition = next(line.strip() for line in block.splitlines()

@@ -158,7 +158,7 @@ jobs:
   mutation-result:
     name: cargo-mutants
     needs: mutation
-    if: always()
+    if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
