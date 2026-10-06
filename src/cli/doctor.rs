@@ -1864,7 +1864,10 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (delivered, delivery) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
+        // Socket readiness can arrive while the Tokio executor is idle.
+        let (ready, readiness) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
+            readiness.await.expect("external socket readiness");
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             let mut chunk = [0_u8; 1024];
@@ -1883,16 +1886,42 @@ mod tests {
             .build()
             .expect("local stalled mirror client");
         let deadline = Duration::from_secs(5);
+        // A blocking task inhibits paused-time auto-advance while the real
+        // socket is becoming ready. Dropping the sender also releases it if
+        // an assertion fails, so runtime shutdown cannot wait forever.
+        let (keep_clock_paused, clock_paused) = tokio::sync::oneshot::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || {
+            let _ = clock_paused.blocking_recv();
+        });
+        let started_at = tokio::time::Instant::now();
+        let readiness_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = ready.send(());
+        });
         let check = check_mirror(&client, "local stalled mirror", &url, false, deadline);
         tokio::pin!(check);
         tokio::select! {
             arrived = delivery => { arrived.expect("complete mirror request delivered"); }
             result = &mut check => panic!("mirror finished before the outer deadline: {result}"),
         }
-        tokio::time::advance(deadline).await;
+        assert_eq!(started_at.elapsed(), Duration::ZERO);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(
+            futures::poll!(check.as_mut()).is_pending(),
+            "mirror must remain pending before the outer deadline"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(keep_clock_paused);
+        clock_guard.await.expect("paused-clock guard");
         assert_eq!(check.await, 1, "outer deadline must count one Doctor issue");
+        assert_eq!(
+            started_at.elapsed(),
+            deadline,
+            "outer deadline must finish before the 30-second client timeout"
+        );
         release.send(()).unwrap();
         finish_probe_server(server).await;
+        readiness_thread.join().expect("socket readiness thread");
     }
 
     #[tokio::test]
