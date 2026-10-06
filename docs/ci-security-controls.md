@@ -58,6 +58,41 @@ Missing, malformed or oversized required evidence fails admission. Only selected
 crash identity fields are queried; core dumps and process environments are not
 uploaded. These checks detect specified failure classes, not every possible bug.
 
+Health receipt schema 2 requires positive `crash_channel` evidence for the same
+boot. The supported channel is the systemd pipe handler: the running kernel's
+`core_pattern` must name an executable `systemd-coredump` under `/usr/lib`,
+`/usr/lib64`, `/lib` or `/lib64`, with `%P %u %g %s %t %c %h` and optional
+trailing `%d`, `%d %F` or `%d %F %I` arguments. `systemd-coredump.socket` must be loaded, active,
+listening and successful; an inert processor instance must load the unmasked
+template, remain inactive/dead and report success. Both units must be static
+or enabled. These observations must agree before and after journal collection;
+the boot identity must also remain unchanged. Existing pending/failed processor
+checks still run on both sides of journal collection. Old receipts without
+capability evidence are rejected, including preparation and transaction receipts.
+
+| Guest | Supported crash observation contract |
+| --- | --- |
+| Arch | systemd pipe handler, socket and processor template as above |
+| Debian bookworm / trixie | `systemd-coredump` package providing the same channel |
+| Ubuntu | `systemd-coredump` channel; apport alone is unsupported |
+| Fedora | systemd pipe channel; ABRT alone is unsupported |
+
+Missing packages, disabled/masked units, alternate handlers (including the newer
+kernel socket protocol), failed queries or a changing channel fail admission.
+The collector observes capability; it does not install packages, change sysctls
+or start services. Guest preparation must establish this contract before trials.
+The host helper test checks explicit collector refusal when its native handler is
+unsupported. That negative control is not positive crash-observation evidence;
+actual guest collection and admission still require the complete schema 2 receipt.
+This is configured-capability evidence, not an injected-crash delivery receipt
+or proof that the channel was enabled throughout earlier workload execution.
+Exact-head hosted guest gates remain required. No core contents, command lines,
+environments or backtraces are read to establish capability.
+
+Primary contracts: [systemd handler and socket invocation](https://github.com/systemd/systemd/blob/v257/man/systemd-coredump.xml),
+[kernel pipe routing](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/kernel.html#core-pattern),
+and [Debian's systemd-coredump package](https://packages.debian.org/bookworm/systemd-coredump).
+
 `tests/qemu-inventory-policy.json` indexes reviewed inventory digests and pins
 the SHA-256 of each separately bounded file in `tests/qemu-inventory-policy.d/`.
 Each file retains the selected tiers, network scopes and permitted per-case

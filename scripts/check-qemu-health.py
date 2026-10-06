@@ -22,6 +22,58 @@ FATAL = re.compile(
     r"(?:omg|omgd)\[[0-9]+\]: (?:segfault|general protection fault))"
 )
 BOOT_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+CORE_PATTERN = re.compile(
+    r"\|(/(?:usr/)?lib(?:64)?/systemd/systemd-coredump)"
+    r" %P %u %g %s %t %c %h(?: %d(?: %F(?: %I)?)?)?"
+)
+CAPABILITY_PROPERTIES = "Id,LoadState,ActiveState,SubState,Result,UnitFileState"
+
+
+def validate_crash_channel(channel, boot_id):
+    if (not isinstance(channel, dict)
+            or channel.get("kind") != "systemd-coredump-pipe"
+            or channel.get("boot_id") != boot_id
+            or not isinstance(channel.get("core_pattern"), str)
+            or not CORE_PATTERN.fullmatch(channel["core_pattern"])
+            or channel.get("handler_executable") is not True):
+        raise ValueError("missing or unsupported crash channel capability")
+    for name, identity, active, substate in (
+        ("socket", "systemd-coredump.socket", "active", "listening"),
+        ("processor", "systemd-coredump@omg-health.service", "inactive", "dead"),
+    ):
+        fields = channel.get(name)
+        if (not isinstance(fields, dict)
+                or set(fields) != set(CAPABILITY_PROPERTIES.split(","))
+                or fields["Id"] != identity or fields["LoadState"] != "loaded"
+                or fields["ActiveState"] != active or fields["SubState"] != substate
+                or fields["Result"] != "success"
+                or fields["UnitFileState"] not in ("static", "enabled", "enabled-runtime")):
+            raise ValueError("crash channel is absent, disabled, pending or failed")
+
+
+def crash_channel_capability(boot_id):
+    pattern = query(["cat", "/proc/sys/kernel/core_pattern"]).strip()
+    match = CORE_PATTERN.fullmatch(pattern)
+    if not match:
+        raise ValueError("unsupported kernel crash handler")
+    # Check executable availability without invoking the handler or reading cores.
+    query(["test", "-x", match[1]])
+    channel = {"kind": "systemd-coredump-pipe", "boot_id": boot_id,
+               "core_pattern": pattern, "handler_executable": True}
+    for name, unit in (("socket", "systemd-coredump.socket"),
+                       ("processor", "systemd-coredump@omg-health.service")):
+        # An inert instance loads the template without starting a processor.
+        evidence = query(["systemctl", "show", "--all",
+                          "--property=" + CAPABILITY_PROPERTIES, unit])
+        fields = {}
+        for line in evidence.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or key not in CAPABILITY_PROPERTIES.split(",") or key in fields:
+                raise ValueError("invalid crash channel capability evidence")
+            fields[key] = value
+        channel[name] = fields
+    validate_crash_channel(channel, boot_id)
+    return channel
 
 
 def bounded_file(path, errors="strict"):
@@ -84,6 +136,7 @@ def collect():
         raise ValueError("invalid guest boot identity")
     # /proc uses UUID hyphens; journalctl's boot descriptor requires 32 hex digits.
     journal_boot = boot_id.replace("-", "")
+    channel = crash_channel_capability(boot_id)
     refuse_pending_crash_processing()
     kernel = query(["journalctl", "--boot=" + journal_boot, "--dmesg", "--quiet", "--no-pager", "--output=cat"])
     if not kernel.strip() or kernel.strip() == "-- No entries --":
@@ -104,14 +157,18 @@ def collect():
                 raise ValueError("invalid crash signal")
             crashes.append({"process": process, "signal": int(signal)})
     refuse_pending_crash_processing()
-    return {"schema_version": 1, "complete": True, "boot_id": boot_id,
+    if (crash_channel_capability(boot_id) != channel
+            or Path("/proc/sys/kernel/random/boot_id").read_text().strip() != boot_id):
+        raise ValueError("crash channel or guest boot changed during collection")
+    return {"schema_version": 2, "complete": True, "boot_id": boot_id,
+            "crash_channel": channel,
             "kernel_bytes": len(kernel.encode()), "fatal_signatures": crash_signatures(kernel),
             "product_crashes": crashes}
 
 
 def verify_guest(guest, serial, boot_id=None):
     payload = json.loads(bounded_file(guest))
-    if (not isinstance(payload, dict) or payload.get("schema_version") != 1
+    if (not isinstance(payload, dict) or payload.get("schema_version") != 2
             or payload.get("complete") is not True
             or not isinstance(payload.get("boot_id"), str)
             or not BOOT_ID.fullmatch(payload["boot_id"])
@@ -120,6 +177,7 @@ def verify_guest(guest, serial, boot_id=None):
             or payload.get("fatal_signatures") != []
             or payload.get("product_crashes") != []):
         raise ValueError("guest crash or incomplete health evidence")
+    validate_crash_channel(payload.get("crash_channel"), payload["boot_id"])
     # Serial consoles are byte streams, not a UTF-8 protocol. A torn terminal
     # glyph must not invalidate otherwise complete health evidence. Preserve
     # invalid bytes as escapes; never discard surrounding crash signatures.
