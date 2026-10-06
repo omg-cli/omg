@@ -19,7 +19,10 @@ FATAL = re.compile(
     r"(?:Kernel panic - not syncing:|BUG: (?:unable to handle|kernel NULL|soft lockup)|"
     r"Oops:|watchdog: BUG: soft lockup|NMI watchdog: Watchdog detected hard LOCKUP|"
     r"Out of memory: Killed process|Memory cgroup out of memory: Killed process|"
-    r"(?:omg|omgd)\[[0-9]+\]: (?:segfault|general protection fault))"
+    r"(?:omg|omgd)\[[0-9]+\]: (?:segfault|general protection fault)|"
+    # Linux x86 show_signal emits comm[pid] trap description without a colon.
+    # Require the known identity and IP field; publish no addresses or VMA path.
+    r"(?<![\w.-])(?:omg|omgd)\[[0-9]+\] trap (?:invalid opcode|divide error)(?= ip:[0-9a-f]))"
 )
 BOOT_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 CORE_PATTERN = re.compile(

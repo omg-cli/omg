@@ -250,6 +250,44 @@ docker() {
         self.serial.write_text("Kernel panic handler installed\nOOM killer enabled\n")
         self.assertEqual(self.verify(), 0)
 
+    def test_known_product_x86_traps_fail_cli_admission(self):
+        command = [sys.executable, str(Path(__file__).with_name("check-qemu-health.py")),
+                   "verify", "--guest", str(self.guest), "--serial", str(self.serial),
+                   "--controller", str(self.controller), "--boot-id", self.payload["boot_id"]]
+        for process in ("omg", "omgd"):
+            for trap in ("invalid opcode", "divide error"):
+                with self.subTest(process=process, trap=trap):
+                    self.serial.write_text(
+                        f"[  2.345] traps: {process}[123] trap {trap} "
+                        f"ip:123 sp:456 error:0 in {process}[100+100]\n")
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("fatal guest signature", result.stderr)
+
+    def test_x86_trap_attribution_and_benign_controls_pass(self):
+        for message in ("traps: unrelated[123] trap invalid opcode ip:123 sp:456 error:0",
+                        "traps: notomg[123] trap divide error ip:123 sp:456 error:0",
+                        "traps: omg-worker[123] trap invalid opcode ip:123 sp:456 error:0",
+                        "traps: omg[123] trap invalid opcode handler installed",
+                        "traps: omgd[123] trap divide error handler installed",
+                        "omg: Bus error"):
+            with self.subTest(message=message):
+                self.serial.write_text(message + "\n")
+                self.assertEqual(self.verify(), 0)
+
+    def test_x86_trap_signatures_redact_adjacent_evidence(self):
+        for process in ("omg", "omgd"):
+            for trap in ("invalid opcode", "divide error"):
+                signature = f"{process}[123] trap {trap}"
+                text = f"traps: {signature} ip:123 sp:456 error:0 in /private/path\n"
+                self.assertEqual(HEALTH.crash_signatures(text), [signature])
+
+    def test_product_coredump_signal6_still_rejects_admission(self):
+        self.payload["product_crashes"] = [{"process": "omg", "signal": 6}]
+        self.guest.write_text(json.dumps(self.payload))
+        with self.assertRaisesRegex(ValueError, "guest crash"):
+            self.verify()
+
     def test_serial_torn_utf8_does_not_hide_crash_signatures(self):
         self.serial.write_bytes(b"Linux version 6.12\n\xe2Reached target\n")
         self.assertEqual(self.verify(), 0)
