@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 task_dir=$(mktemp -d "${PAPERCLIP_RUN_SCRATCH_DIR:-${TMPDIR:-/tmp}}/installer-source.XXXXXX")
 trap 'rm -rf "$task_dir"' EXIT
 
-for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch fedora macos ubuntu-retry; do
+for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch arch-missing-libarchive fedora macos ubuntu-retry; do
   fixture="$task_dir/$scenario"
   mkdir -p "$fixture/source" "$fixture/tools" "$fixture/home"
   distro=ubuntu
@@ -16,7 +16,7 @@ for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch 
   case "$scenario" in
     ubuntu22-*) version=22.04 ;;
     debian) distro=debian; version=12 ;;
-    arch) distro=arch ;;
+    arch*) distro=arch ;;
     fedora) distro=fedora ;;
     macos) system=Darwin ;;
   esac
@@ -54,17 +54,29 @@ for binary in omg omgd; do
   chmod +x "$CARGO_TARGET_DIR/$FIXTURE_TARGET/release/$binary"
 done
 EOF
+  # Native-library availability is fixture input, not a dependency on the host.
+  cat > "$fixture/tools/pkg-config" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  '--exists libarchive') [[ "$FIXTURE_MISSING_LIBARCHIVE" == 0 ]] ;;
+  '--exists openssl') exit 0 ;;
+  *) exit 2 ;;
+esac
+EOF
   chmod +x "$fixture/tools/"*
   target="$machine-unknown-linux-gnu"
   [[ "$system" != Darwin ]] || target="$machine-apple-darwin"
   retry=0
   [[ "$scenario" != ubuntu-retry ]] || retry=1
+  missing_libarchive=0
+  [[ "$scenario" != arch-missing-libarchive ]] || missing_libarchive=1
   status=0
   env -u BASH_ENV -u ENV -u OMG_UNINSTALL \
     HOME="$fixture/home" SHELL=/bin/sh TERM= \
     PATH="$fixture/tools:$PATH" FIXTURE="$fixture" \
     FIXTURE_SYSTEM="$system" FIXTURE_MACHINE="$machine" \
     FIXTURE_TARGET="$target" FIXTURE_RETRY="$retry" \
+    FIXTURE_MISSING_LIBARCHIVE="$missing_libarchive" \
     INSTALL_DIR="$fixture/bin" XDG_CONFIG_HOME="$fixture/config" \
     XDG_DATA_HOME="$fixture/data" CARGO_TARGET_DIR="$fixture/target" \
     OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 \
@@ -72,10 +84,17 @@ EOF
   # The diagnostic retry exits 1 even when its second build succeeds.
   expected_status=0
   [[ "$retry" == 0 ]] || expected_status=1
+  [[ "$missing_libarchive" == 0 ]] || expected_status=1
   if [[ "$status" != "$expected_status" ]]; then
     cat "$fixture/output" >&2
     printf '%s: expected exit %s, got %s\n' "$scenario" "$expected_status" "$status" >&2
     exit 1
+  fi
+  if [[ "$missing_libarchive" == 1 ]]; then
+    grep -Fq 'Missing dependencies: libarchive' "$fixture/output"
+    [[ ! -e "$fixture/cargo-argv" && ! -e "$fixture/bin/omg" ]]
+    printf '%s: missing native library refused before build\n' "$scenario"
+    continue
   fi
   expected_features=debian,license,pgp
   case "$scenario" in
