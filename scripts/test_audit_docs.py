@@ -5,7 +5,6 @@ tests keep it from silently degrading into a no-op that always exits 0.
 """
 
 import importlib.util
-import os
 import subprocess
 import sys
 import tempfile
@@ -22,7 +21,7 @@ SPEC.loader.exec_module(AUDIT)
 
 class AuditDocumentReadTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_SCRATCH_DIR"))
+        self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name)
         (self.repo / "docs").mkdir()
