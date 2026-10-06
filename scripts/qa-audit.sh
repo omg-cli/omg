@@ -7,6 +7,8 @@
 # the exact filing command for each file with failures. Excerpts go
 # through the same secret scrubber as issue filing, so the output is
 # safe to paste to an agent.
+# Exit status: 0 for clean evidence, 1 for failing or invalid evidence,
+# 2 for configuration errors or no discovered results.json files.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +42,7 @@ for path in "${paths[@]}"; do
       < <(find "$path" -name results.json -not -path '*/node_modules/*' 2>/dev/null | sort)
   else printf 'error: not found: %s\n' "$path" >&2; exit 2; fi
 done
-[[ ${#files[@]} -gt 0 ]] || { printf 'No results.json files found.\n'; exit 0; }
+[[ ${#files[@]} -gt 0 ]] || { printf 'No results.json files found.\n'; exit 2; }
 
 command_for() {
   # Print the TSV command line for a row id, if --tsv can say. Tries the

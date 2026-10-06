@@ -424,6 +424,11 @@ of that pushed commit closes it. A local pass does not.
 ./scripts/qa-audit.sh target/release-smoke
 ```
 
+The audit exits `0` for clean evidence, `1` for failing rows or invalid evidence,
+and `2` for configuration errors or no discovered `results.json` files. An
+existing empty evidence directory prints `No results.json files found.` and
+exits `2`, so it cannot be mistaken for a successful audit.
+
 Bring that output back: it is the input to the code/command audit —
 no pending-row flips, no expectation edits, just errors.
 
