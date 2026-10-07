@@ -1,0 +1,3 @@
+# Two inert key-header test strings in this historical commit were matched across
+# intervening Rust source. They contain no key material. Keep future findings scanned.
+e9a2f51a054035318e907496baa05d13c8d39416:src/core/security/secrets.rs:private-key:727

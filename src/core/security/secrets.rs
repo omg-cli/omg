@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn scan_directory_selects_source_sensitive_and_key_files() {
         let temp = tempfile::TempDir::new().unwrap();
-        let marker = "-----BEGIN RSA PRIVATE KEY-----\n";
+        let marker = concat!("-----BEGIN ", "RSA PRIVATE KEY-----\n");
         let selected = ["module.rs", ".npmrc", "id_ed25519"];
         for name in selected.into_iter().chain(["image.png"]) {
             std::fs::write(temp.path().join(name), marker).unwrap();
@@ -751,7 +751,7 @@ mod tests {
         }
         std::fs::create_dir_all(&path).unwrap();
         let file = path.join("tail.pem");
-        std::fs::write(&file, "-----BEGIN RSA PRIVATE KEY-----\n").unwrap();
+        std::fs::write(&file, concat!("-----BEGIN ", "RSA PRIVATE KEY-----\n")).unwrap();
         let findings = SecretScanner::new().scan_directory(temp.path()).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].file_path, file.display().to_string());
