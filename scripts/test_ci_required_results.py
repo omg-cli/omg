@@ -12,12 +12,22 @@ from test_native_contracts import NATIVE
 
 
 class RequiredResultsTests(unittest.TestCase):
+    def test_final_jobs_allow_cancellation_without_skipping_failure_evaluation(self):
+        for filename, job in (("ci.yml", "ci-success"),
+                              ("coverage.yml", "coverage-result"),
+                              ("mutation.yml", "mutation-result")):
+            with self.subTest(workflow=filename):
+                block = job_block((CI_YML.parent / filename).read_text(encoding="utf-8"), job)
+                condition = next(line.strip() for line in block.splitlines()
+                                 if line.startswith("    if:"))
+                self.assertEqual(condition, "if: always() && !cancelled()")
+
     def evaluate(self, required, overrides=None):
         block = job_block(CI_YML.read_text(encoding="utf-8"), "ci-success")
         script = textwrap.dedent(block.split("        run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, QUICK_GATE="success", BUILD_REQUIRED=required,
-                       PORTABLE="success", LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
+                       STANDALONE_SUITES="success", PORTABLE="success", LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
                        FEATURE_INTERSECTIONS="success", MACOS="success", MACOS_NEXTEST_SOURCE="success", UBUNTU="success",
                        DOCS_AUDIT="success", RUNTIME_USAGE="success",
                        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"))
@@ -30,21 +40,35 @@ class RequiredResultsTests(unittest.TestCase):
             return subprocess.run([bash, "-c", script], env=env, capture_output=True, text=True, timeout=15)
 
     def test_required_job_skips_fail(self):
-        for job in ("PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE"):
+        for job in ("STANDALONE_SUITES", "PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE"):
             with self.subTest(job=job):
                 self.assertNotEqual(self.evaluate("true", {job: "skipped"}).returncode, 0)
 
     def test_docs_only_skips_pass(self):
-        jobs = ("PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE")
+        jobs = ("STANDALONE_SUITES", "PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE")
         self.assertEqual(self.evaluate("false", {job: "skipped" for job in jobs}).returncode, 0)
 
     def test_all_success_passes_and_failure_never_does(self):
         self.assertEqual(self.evaluate("true").returncode, 0)
         for required in ("true", "false"):
             for state in ("failure", "cancelled", ""):
-                for job in ("PORTABLE", "RUNTIME_USAGE"):
+                for job in ("STANDALONE_SUITES", "PORTABLE", "RUNTIME_USAGE"):
                     with self.subTest(required=required, state=state, job=job):
                         self.assertNotEqual(self.evaluate(required, {job: state}).returncode, 0)
+
+    def test_standalone_result_rejection_identifies_the_failed_owner(self):
+        for required in ("true", "false"):
+            for state in ("failure", "cancelled", "", None):
+                with self.subTest(required=required, state=state):
+                    result = self.evaluate(required, {"STANDALONE_SUITES": state})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Standalone suites did not succeed:", result.stdout)
+        result = self.evaluate("true", {"STANDALONE_SUITES": "skipped"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Standalone suites did not succeed: skipped", result.stdout)
+        self.assertEqual(
+            self.evaluate("false", {"STANDALONE_SUITES": "skipped"}).returncode, 0
+        )
 
     def test_docs_audit_failure_always_fails_the_gate(self):
         for required in ("true", "false"):

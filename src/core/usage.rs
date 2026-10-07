@@ -637,7 +637,8 @@ pub fn track_install(packages: &[String]) {
 
         stats.record_specialized_command(
             "install",
-            time_saved::INSTALL_MS,
+            time_saved::INSTALL_MS
+                .saturating_mul(u64::try_from(packages.len()).unwrap_or(u64::MAX)),
             DailyOperation::Install,
         );
     });

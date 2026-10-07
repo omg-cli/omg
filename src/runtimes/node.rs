@@ -211,16 +211,9 @@ impl NodeManager {
     /// Fetch SHA256 checksum from nodejs.org
     async fn fetch_checksum(&self, version: &str, filename: &str) -> Result<String> {
         let url = format!("{NODE_DIST_URL}/v{version}/SHASUMS256.txt");
-        let text = self
-            .client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await?
-            .error_for_status()
-            .context("Failed to fetch Node.js checksum manifest")?
-            .bounded_text()
-            .await?;
+        let text = crate::core::http::fetch_metadata_text(self.client, &url)
+            .await
+            .context("Failed to fetch Node.js checksum manifest")?;
         let digest_line = text
             .lines()
             .find(|line| line.split_whitespace().nth(1) == Some(filename))
@@ -290,6 +283,119 @@ pub(crate) fn get_lts_name(version: &NodeVersion) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metadata_retry_recovers_node_checksum_without_skipping_integrity() -> Result<()> {
+        let filename = "node-v24.21.0-linux-x64.tar.xz";
+        let digest = "a".repeat(64);
+        let path = "/dist/v24.21.0/SHASUMS256.txt";
+        let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
+            "nodejs.org",
+            vec![
+                (path.into(), 503, b"temporarily unavailable".to_vec()),
+                (
+                    path.into(),
+                    200,
+                    format!("{digest}  {filename}\n").into_bytes(),
+                ),
+            ],
+        )
+        .await?;
+        let directory = tempfile::tempdir()?;
+        let client = fixture.client(true)?;
+        let manager = NodeManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(client)),
+        };
+        assert_eq!(manager.fetch_checksum("24.21.0", filename).await?, digest);
+        assert_eq!(
+            fixture.finish().await?,
+            vec![format!("GET {path} HTTP/1.1"); 2]
+        );
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_retry_does_not_retry_invalid_node_checksum() -> Result<()> {
+        let path = "/dist/v24.21.0/SHASUMS256.txt";
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "nodejs.org",
+            vec![(
+                path.into(),
+                b"invalid node-v24.21.0-linux-x64.tar.xz\n".to_vec(),
+            )],
+        )
+        .await?;
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        assert!(
+            manager
+                .fetch_checksum("24.21.0", "node-v24.21.0-linux-x64.tar.xz")
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.finish().await?.len(), 1);
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_retry_recovers_real_connection_interruption() -> Result<()> {
+        let path = "/dist/v24.21.0/SHASUMS256.txt";
+        let interrupted = super::super::test_https::HttpsFixture::new_with_statuses(
+            "nodejs.org",
+            vec![(path.into(), 0, vec![])],
+        )
+        .await?;
+        let error = interrupted
+            .client(true)?
+            .get(format!("https://nodejs.org{path}"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            error.is_connect(),
+            "expected actual connection failure: {error}"
+        );
+        assert_eq!(
+            interrupted.finish().await?,
+            ["CONNECT nodejs.org:443 HTTP/1.1"]
+        );
+
+        let filename = "node-v24.21.0-linux-x64.tar.xz";
+        let digest = "b".repeat(64);
+        let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
+            "nodejs.org",
+            vec![
+                (path.into(), 0, vec![]),
+                (
+                    path.into(),
+                    200,
+                    format!("{digest}  {filename}\n").into_bytes(),
+                ),
+            ],
+        )
+        .await?;
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        assert_eq!(manager.fetch_checksum("24.21.0", filename).await?, digest);
+        assert_eq!(
+            fixture.finish().await?,
+            [
+                "CONNECT nodejs.org:443 HTTP/1.1".to_owned(),
+                format!("GET {path} HTTP/1.1"),
+            ]
+        );
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
 
     #[test]
     fn incomplete_node_install_is_not_published_and_can_be_retried() -> Result<()> {

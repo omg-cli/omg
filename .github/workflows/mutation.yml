@@ -135,7 +135,7 @@ jobs:
             --report mutants-report/runner-health.jsonl --interval 30 -- \
             cargo mutants "${common[@]}" \
             --baseline run --shard "$SHARD_INDEX/16" --sharding slice \
-            --timeout 60 --jobs 2 --output mutants-report
+            --timeout 120 --jobs 2 --output mutants-report
           mutants_exit=$?
           set -e
           case "$mutants_exit" in
@@ -158,7 +158,7 @@ jobs:
   mutation-result:
     name: cargo-mutants
     needs: mutation
-    if: always()
+    if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

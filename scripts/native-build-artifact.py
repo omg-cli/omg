@@ -143,16 +143,61 @@ def validate_producer_run(run, expected):
             'producer was cancelled or did not complete normally')
 
 
-def api(path, limit=1024 * 1024):
+def api(path, limit=1024 * 1024, *, include_status=False, timeout=90):
+    command = ['gh', 'api', path]
+    if include_status:
+        command.append('--include')
     with tempfile.TemporaryFile() as output:
-        subprocess.run(['gh', 'api', path], stdout=output, check=True, timeout=90)
+        try:
+            subprocess.run(command, stdout=output, check=True, timeout=timeout)
+        except subprocess.CalledProcessError as error:
+            if include_status:
+                require(output.tell() <= limit, 'GitHub response exceeds limit')
+                output.seek(0)
+                error.output = output.read(limit + 1)
+            raise
         require(output.tell() <= limit, 'GitHub response exceeds limit')
         output.seek(0)
         return output.read(limit + 1)
 
 
+def metadata_response(data):
+    parts = re.split(rb'\r?\n\r?\n', data, maxsplit=1)
+    require(len(parts) == 2 and len(parts[0]) <= 64 * 1024, 'invalid GitHub response headers')
+    headers, body = parts
+    status_line, *fields = headers.splitlines()
+    status = re.fullmatch(rb'HTTP/(?:1\.[01]|2(?:\.0)?|3(?:\.0)?) ([1-5][0-9]{2})(?: [^\r\n]*)?', status_line)
+    require(status is not None and all(b':' in field for field in fields), 'invalid GitHub response headers')
+    require(len(body) <= 1024 * 1024, 'GitHub response exceeds limit')
+    retry_after = any(field.split(b':', 1)[0].lower() == b'retry-after' for field in fields)
+    return int(status[1]), body, retry_after
+
+
 def api_json(path):
-    return json.loads(api(path), object_pairs_hook=unique_object, parse_constant=reject_constant)
+    # Metadata GETs share one deadline and attempt budget across transport failures.
+    # A fresh temporary output prevents partial/error bodies from entering admission.
+    deadline = time.monotonic() + 90
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, 'GitHub metadata request deadline exhausted')
+        try:
+            data = api(path, 1024 * 1024 + 64 * 1024, include_status=True, timeout=remaining)
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+            if isinstance(error, subprocess.CalledProcessError):
+                if not error.output or not error.output.startswith(b'HTTP/'):
+                    raise
+                status, _, retry_after = metadata_response(error.output)
+                # Leave rate limits and server-directed delays as explicit failures.
+                if status not in (502, 503, 504) or retry_after:
+                    raise
+            delay = 2 ** attempt
+            if attempt == 2 or deadline - time.monotonic() <= delay:
+                raise
+            time.sleep(delay)
+        else:
+            status, body, _ = metadata_response(data)
+            require(200 <= status < 300, 'unsuccessful GitHub metadata response')
+            return json.loads(body, object_pairs_hook=unique_object, parse_constant=reject_constant)
 
 
 def download_artifact(path):

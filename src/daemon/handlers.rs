@@ -86,6 +86,18 @@ impl SystemBackendAccess {
         matches!(self, Self::Production { .. })
     }
 
+    fn retire(self) {
+        #[cfg(feature = "arch")]
+        if let Self::Production {
+            alpm_worker: Some(alpm_worker),
+        } = self
+        {
+            retire_alpm_worker(alpm_worker, pause_native_retirement);
+        }
+        #[cfg(not(feature = "arch"))]
+        let _ = self;
+    }
+
     #[cfg(feature = "arch")]
     fn has_alpm_worker(&self) -> bool {
         matches!(
@@ -95,25 +107,6 @@ impl SystemBackendAccess {
             }
         )
     }
-}
-
-#[cfg_attr(
-    not(feature = "arch"),
-    allow(
-        clippy::needless_pass_by_value,
-        reason = "native retirement must consume backend ownership on Arch"
-    )
-)]
-fn retire_system_backend(backends: SystemBackendAccess) {
-    #[cfg(feature = "arch")]
-    if let SystemBackendAccess::Production {
-        alpm_worker: Some(alpm_worker),
-    } = backends
-    {
-        retire_alpm_worker(alpm_worker, pause_native_retirement);
-    }
-    #[cfg(not(feature = "arch"))]
-    let _ = backends;
 }
 
 #[cfg(feature = "arch")]
@@ -267,7 +260,7 @@ impl DaemonState {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     std::mem::replace(&mut *current, replacement)
                 };
-                retire_system_backend(retired);
+                retired.retire();
                 Ok(refresh_guard)
             })
             .await
@@ -291,7 +284,7 @@ impl DaemonState {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     std::mem::replace(&mut *current, SystemBackendAccess::Isolated)
                 };
-                retire_system_backend(retired);
+                retired.retire();
                 drop(refresh_guard);
             }).await.context("Native backend retirement task panicked")?;
             self.native_tasks.wait().await;
@@ -2143,6 +2136,11 @@ mod tests {
     #[cfg(feature = "arch")]
     #[serial_test::serial]
     fn daemon_native_initializer_does_not_block_the_async_executor() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "daemon::handlers::tests::daemon_native_initializer_does_not_block_the_async_executor",
+        ) {
+            return Ok(());
+        }
         if crate::core::is_root() {
             eprintln!("skipped: native path overrides require an unprivileged fixture run");
             return Ok(());
@@ -2190,6 +2188,11 @@ mod tests {
     #[cfg(feature = "arch")]
     #[serial_test::serial]
     fn daemon_native_retirement_releases_backend_lock_and_executor() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "daemon::handlers::tests::daemon_native_retirement_releases_backend_lock_and_executor",
+        ) {
+            return Ok(());
+        }
         if crate::core::is_root() {
             eprintln!("skipped: native path overrides require an unprivileged fixture run");
             return Ok(());
@@ -2253,6 +2256,11 @@ mod tests {
     #[serial_test::serial]
     fn daemon_native_cancelled_request_retains_serialization_until_work_finishes()
     -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "daemon::handlers::tests::daemon_native_cancelled_request_retains_serialization_until_work_finishes",
+        ) {
+            return Ok(());
+        }
         if crate::core::is_root() {
             eprintln!("skipped: native path overrides require an unprivileged fixture run");
             return Ok(());
@@ -2359,6 +2367,11 @@ mod tests {
     #[cfg(feature = "arch")]
     #[serial_test::serial]
     fn daemon_native_retirement_keeps_final_join_off_the_request_executor() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "daemon::handlers::tests::daemon_native_retirement_keeps_final_join_off_the_request_executor",
+        ) {
+            return Ok(());
+        }
         if crate::core::is_root() {
             eprintln!("skipped: native path overrides require an unprivileged fixture run");
             return Ok(());

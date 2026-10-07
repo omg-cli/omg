@@ -176,35 +176,116 @@ fn unquoted_braces(line: &str) -> (u32, u32) {
     (opens, closes)
 }
 
-fn array_expression_complete(value: &str) -> Result<bool> {
-    let mut quote = None;
-    let mut escaped = false;
-    let mut depth = 0_u32;
+#[derive(Default)]
+struct ArrayCompletion {
+    quote: Option<char>,
+    escaped: bool,
+    depth: u32,
+}
 
-    for character in value.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' && quote != Some('\'') {
-            escaped = true;
-            continue;
-        }
-        match quote {
-            Some(delimiter) if character == delimiter => quote = None,
-            None if character == '\'' || character == '"' => quote = Some(character),
-            None if character == '(' => depth = depth.saturating_add(1),
-            None if character == ')' => {
-                anyhow::ensure!(depth > 0, "unexpected closing parenthesis in array");
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(true);
-                }
+impl ArrayCompletion {
+    fn scan(&mut self, value: &str) -> Result<bool> {
+        for character in value.chars() {
+            #[cfg(test)]
+            tests::ARRAY_SCAN_BYTES.with(|count| count.set(count.get() + character.len_utf8()));
+            if self.escaped {
+                self.escaped = false;
+                continue;
             }
-            Some(_) | None => {}
+            if character == '\\' && self.quote != Some('\'') {
+                self.escaped = true;
+                continue;
+            }
+            match self.quote {
+                Some(delimiter) if character == delimiter => self.quote = None,
+                None if character == '\'' || character == '"' => self.quote = Some(character),
+                None if character == '(' => self.depth = self.depth.saturating_add(1),
+                None if character == ')' => {
+                    anyhow::ensure!(self.depth > 0, "unexpected closing parenthesis in array");
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        return Ok(true);
+                    }
+                }
+                Some(_) | None => {}
+            }
         }
+        Ok(false)
     }
-    Ok(false)
+}
+
+#[derive(Default)]
+struct SubstitutionNode {
+    children: HashMap<u8, usize>,
+    index: Option<usize>,
+}
+
+/// Find only replacement passes that can change the value. This is an index
+/// over the existing ordered passes, not shell token expansion: bare names
+/// still match prefixes and inserted references only run in later passes.
+struct SubstitutionIndex {
+    nodes: Vec<SubstitutionNode>,
+}
+
+impl SubstitutionIndex {
+    fn new(substitutions: &[(&String, &String)]) -> Self {
+        let mut nodes = vec![SubstitutionNode::default()];
+        for (index, (key, _)) in substitutions.iter().enumerate() {
+            let mut node = 0;
+            for byte in key.bytes() {
+                #[cfg(test)]
+                tests::SUBSTITUTION_SCAN_BYTES.with(|count| count.set(count.get() + 1));
+                node = if let Some(&child) = nodes[node].children.get(&byte) {
+                    child
+                } else {
+                    let child = nodes.len();
+                    nodes.push(SubstitutionNode::default());
+                    nodes[node].children.insert(byte, child);
+                    child
+                };
+            }
+            nodes[node].index = Some(index);
+        }
+        Self { nodes }
+    }
+
+    fn next(&self, value: &str, minimum: usize) -> Option<usize> {
+        #[cfg(test)]
+        tests::SUBSTITUTION_SCAN_BYTES.with(|count| count.set(count.get() + value.len()));
+        let mut next = None;
+        for (offset, _) in value.match_indices('$') {
+            // The parser historically admits an empty assignment name; its
+            // bare pattern is "$", including the start of braced references.
+            if let Some(index) = self.nodes[0].index
+                && index >= minimum
+            {
+                next = Some(next.map_or(index, |previous: usize| previous.min(index)));
+            }
+            let mut tail = &value.as_bytes()[offset + 1..];
+            let braced = tail.first() == Some(&b'{');
+            if braced {
+                tail = &tail[1..];
+            }
+            let mut node = 0;
+            loop {
+                if let Some(index) = self.nodes[node].index
+                    && index >= minimum
+                    && (!braced || tail.first() == Some(&b'}'))
+                {
+                    next = Some(next.map_or(index, |previous: usize| previous.min(index)));
+                }
+                let Some(byte) = tail.first() else { break };
+                #[cfg(test)]
+                tests::SUBSTITUTION_SCAN_BYTES.with(|count| count.set(count.get() + 1));
+                let Some(&child) = self.nodes[node].children.get(byte) else {
+                    break;
+                };
+                node = child;
+                tail = &tail[1..];
+            }
+        }
+        next
+    }
 }
 
 impl PkgBuild {
@@ -292,12 +373,16 @@ impl PkgBuild {
 
             if val.starts_with('(') {
                 let mut array_content = val.to_string();
-                while !array_expression_complete(&array_content)? {
+                let mut completion = ArrayCompletion::default();
+                let mut complete = completion.scan(val)?;
+                while !complete {
                     let Some(next_line) = lines.next() else {
                         anyhow::bail!("unterminated array assignment for {key}");
                     };
+                    let start = array_content.len();
                     array_content.push(' ');
                     array_content.push_str(strip_inline_comment(next_line));
+                    complete = completion.scan(&array_content[start..])?;
                 }
                 vars.insert(key.to_string(), array_content);
             } else {
@@ -317,15 +402,32 @@ impl PkgBuild {
         // names cannot partially replace longer names.
         let mut substitutions: Vec<_> = vars.iter().collect();
         substitutions.sort_by_key(|(key, _)| std::cmp::Reverse(key.len()));
+        let substitution_index = SubstitutionIndex::new(&substitutions);
         let substitute = |val: &str| -> Result<String> {
             let mut result = val.to_string();
-            for (key, value) in &substitutions {
+            let mut minimum = 0;
+            while minimum < substitutions.len() {
+                // Preserve the original guard's first failing pass even for
+                // oversized parse_content callers whose next match is later.
+                let index = if result.len() > MAX_SUBSTITUTED_VALUE_BYTES {
+                    minimum
+                } else if let Some(index) = substitution_index.next(&result, minimum) {
+                    index
+                } else {
+                    break;
+                };
+                let (key, value) = substitutions[index];
+                #[cfg(test)]
+                tests::SUBSTITUTION_SCAN_BYTES.with(|count| count.set(count.get() + result.len()));
                 result = result.replace(&format!("${key}"), value);
+                #[cfg(test)]
+                tests::SUBSTITUTION_SCAN_BYTES.with(|count| count.set(count.get() + result.len()));
                 result = result.replace(&format!("${{{key}}}"), value);
                 anyhow::ensure!(
                     result.len() <= MAX_SUBSTITUTED_VALUE_BYTES,
                     "PKGBUILD variable '{key}' expands beyond {MAX_SUBSTITUTED_VALUE_BYTES} bytes"
                 );
+                minimum = index + 1;
             }
             Ok(result)
         };
@@ -427,6 +529,120 @@ fn parse_array(value: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        pub(super) static SUBSTITUTION_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static ARRAY_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn unrelated_assignments_do_not_multiply_metadata_scan_work() {
+        use std::fmt::Write as _;
+
+        for assignments in [0, 3200, 32000] {
+            for reference in ["", "$zzzzzzzzzz", "${unknown}"] {
+                let mut content = String::from("pkgname=demo\npkgver=1\npkgrel=1\nzzzzzzzzzz=ok\n");
+                for index in 0..assignments {
+                    writeln!(content, "a{index:07}=x").expect("fixture");
+                }
+                let description = "z".repeat(524_288);
+                writeln!(content, "pkgdesc='{description}{reference}'").expect("fixture");
+                assert!(content.len() < MAX_PKGBUILD_BYTES as usize);
+                SUBSTITUTION_SCAN_BYTES.with(|count| count.set(0));
+                let directory = tempfile::tempdir().expect("tempdir");
+                let path = directory.path().join("PKGBUILD");
+                std::fs::write(&path, &content).expect("fixture");
+                let package = PkgBuild::parse(&path).expect("admitted metadata");
+                assert_eq!(
+                    package.description,
+                    format!(
+                        "{description}{}",
+                        if reference == "$zzzzzzzzzz" {
+                            "ok"
+                        } else {
+                            reference
+                        }
+                    )
+                );
+                let work = SUBSTITUTION_SCAN_BYTES.with(std::cell::Cell::get);
+                assert!(
+                    work <= 8 * content.len(),
+                    "scanned {work} bytes for {} input bytes",
+                    content.len()
+                );
+                println!(
+                    "substitution assignments={assignments} reference={reference:?} input_bytes={} work_bytes={work}",
+                    content.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn array_continuations_scan_each_appended_byte_once() {
+        for lines in [2000, 8000, 100_000] {
+            let content = format!(
+                "pkgname=demo\npkgver=1\npkgrel=1\ndepends=(\n{}",
+                " ( \n".repeat(lines)
+            );
+            ARRAY_SCAN_BYTES.with(|count| count.set(0));
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("PKGBUILD");
+            std::fs::write(&path, &content).expect("fixture");
+            let error = PkgBuild::parse(&path).expect_err("unterminated array");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unterminated array assignment for depends")
+            );
+            let work = ARRAY_SCAN_BYTES.with(std::cell::Cell::get);
+            assert!(
+                work <= content.len(),
+                "scanned {work} bytes for {} input bytes",
+                content.len()
+            );
+            println!(
+                "array lines={lines} input_bytes={} work_bytes={work}",
+                content.len()
+            );
+        }
+    }
+
+    #[test]
+    fn substitutions_preserve_prefixes_and_ordered_inserted_references() {
+        let package = PkgBuild::parse_content(
+            "longname='$a'\na=X\npkgdesc='$longname ${longname} $ax ${ax} $missing'\nsource=('$longname' '${a}')\n",
+        ).expect("ordered references");
+        assert_eq!(package.description, "X X Xx ${ax} $missing");
+        assert_eq!(package.sources, ["X", "X"]);
+
+        let package = PkgBuild::parse_content("longname=Y\na='$longname'\npkgdesc='$a ${a}'\n")
+            .expect("references to already processed names stay literal");
+        assert_eq!(package.description, "$longname $longname");
+
+        let package = PkgBuild::parse_content("a='${a}'\npkgdesc='$a'\n")
+            .expect("bare pass followed by braced pass");
+        assert_eq!(package.description, "${a}");
+    }
+
+    #[test]
+    fn empty_assignment_name_preserves_bare_dollar_replacement() {
+        let package = PkgBuild::parse_content("=Q\npkgdesc='${x}'\n")
+            .expect("historically admitted empty name");
+        assert_eq!(package.description, "Q{x}");
+    }
+
+    #[test]
+    fn array_continuations_preserve_quote_escape_and_nesting_state() {
+        let package = PkgBuild::parse_content(
+            "depends=(\n\"left (\nright )\"\n'quoted ( )'\n((nested))\nescaped\\\n\\)\n) # ignored closing comment\npkgdesc=after\n",
+        ).expect("complete multi-line array");
+        assert_eq!(
+            package.depends,
+            ["left ( right )", "quoted ( )", "((nested))", "escaped )"]
+        );
+        assert_eq!(package.description, "after");
+    }
 
     #[test]
     fn oversized_pkgbuild_file_is_rejected_before_parsing() {

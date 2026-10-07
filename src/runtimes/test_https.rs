@@ -23,6 +23,20 @@ async fn headers(stream: &mut (impl AsyncRead + Unpin)) -> Result<String> {
 
 impl HttpsFixture {
     pub(super) async fn new(host: &str, routes: Vec<(String, Vec<u8>)>) -> Result<Self> {
+        Self::new_with_statuses(
+            host,
+            routes
+                .into_iter()
+                .map(|(path, body)| (path, 200, body))
+                .collect(),
+        )
+        .await
+    }
+
+    pub(super) async fn new_with_statuses(
+        host: &str,
+        routes: Vec<(String, u16, Vec<u8>)>,
+    ) -> Result<Self> {
         let signed = rcgen::generate_simple_self_signed(vec![host.to_owned()])?;
         let certificate = reqwest::Certificate::from_der(signed.cert.der())?;
         // Reqwest installs its normal provider; the fixture adds no crypto provider feature.
@@ -37,7 +51,7 @@ impl HttpsFixture {
         let host = host.to_owned();
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for (path, body) in routes {
+            for (path, status, body) in routes {
                 let (mut stream, _) =
                     tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
                 let connect =
@@ -49,6 +63,11 @@ impl HttpsFixture {
                 stream
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await?;
+                // Zero interrupts the real TLS connection before any HTTP response.
+                if status == 0 {
+                    requests.push(format!("CONNECT {host}:443 HTTP/1.1"));
+                    continue;
+                }
                 let mut stream =
                     tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream)).await??;
                 let request =
@@ -62,7 +81,7 @@ impl HttpsFixture {
                 stream
                     .write_all(
                         format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
                         )
                         .as_bytes(),

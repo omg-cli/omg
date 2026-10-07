@@ -251,6 +251,7 @@ pub fn validate() -> Result<()> {
         println!("{} Configuration is valid!", style::success("✓"));
     } else {
         println!("{} Found {} issue(s)", style::warning("⚠"), issues);
+        anyhow::bail!("Configuration validation failed: {issues} issue(s)");
     }
 
     Ok(())

@@ -14,7 +14,28 @@ HEALTH = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HEALTH)
 
 
+def channel_fixture(boot):
+    return {"kind": "systemd-coredump-pipe", "boot_id": boot,
+            "core_pattern": "|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h",
+            "handler_executable": True,
+            "socket": {"Id": "systemd-coredump.socket", "LoadState": "loaded",
+                       "ActiveState": "active", "SubState": "listening",
+                       "Result": "success", "UnitFileState": "static"},
+            "processor": {"Id": "systemd-coredump@omg-health.service", "LoadState": "loaded",
+                          "ActiveState": "inactive", "SubState": "dead",
+                          "Result": "success", "UnitFileState": "static"}}
+
+
 class HealthTests(unittest.TestCase):
+    def test_debian_vendor_limit_keeps_crash_capability_required(self):
+        boot = "12345678-1234-1234-1234-123456789abc"
+        channel = channel_fixture(boot)
+        channel["core_pattern"] = channel["core_pattern"].replace("%c", "9223372036854775808") + " %d"
+        HEALTH.validate_crash_channel(channel, boot)
+        channel["core_pattern"] = channel["core_pattern"].replace("9223372036854775808", "42")
+        with self.assertRaises(ValueError):
+            HEALTH.validate_crash_channel(channel, boot)
+
     def test_final_driver_uses_active_serial_and_expected_boot(self):
         source = Path(__file__).with_name("benchmark-qemu.sh").read_text()
         begin = source.index("health_rc=0\n")
@@ -39,8 +60,9 @@ class HealthTests(unittest.TestCase):
                     boot = "00000000-1111-2222-3333-555555555555"
                     observed = "00000000-1111-2222-3333-666666666666" if stale_boot else boot
                     (root / "receipt.json").write_text(json.dumps(dict(
-                        schema_version=1, complete=True, boot_id=observed,
-                        kernel_bytes=100, fatal_signatures=[], product_crashes=[]
+                        schema_version=2, complete=True, boot_id=observed,
+                        kernel_bytes=100, fatal_signatures=[], product_crashes=[],
+                        crash_channel=channel_fixture(observed)
                     )))
                     setup = '''set -euo pipefail
 work="$PWD"
@@ -75,9 +97,10 @@ docker() {
         self.guest = self.root / "guest.json"
         self.serial = self.root / "serial.log"
         self.controller = self.root / "controller.json"
-        self.payload = {"schema_version": 1, "complete": True,
+        self.payload = {"schema_version": 2, "complete": True,
                         "boot_id": "00000000-1111-2222-3333-444444444444",
                         "kernel_bytes": 100, "fatal_signatures": [], "product_crashes": []}
+        self.payload["crash_channel"] = channel_fixture(self.payload["boot_id"])
         self.guest.write_text(json.dumps(self.payload))
         self.serial.write_text("Linux version 6.12\nReached target Multi-User System.\n")
         self.controller.write_text('{"Running":true,"OOMKilled":false,"ExitCode":0}')
@@ -103,7 +126,8 @@ docker() {
             boot = "00000000-1111-2222-3333-" + digit * 12
             prefix = transactions / f"prepare-{operation}"
             Path(str(prefix) + "-boot-id.txt").write_text(boot + "\n")
-            Path(str(prefix) + "-health.json").write_text(json.dumps(dict(self.payload, boot_id=boot)))
+            Path(str(prefix) + "-health.json").write_text(json.dumps(dict(
+                self.payload, boot_id=boot, crash_channel=channel_fixture(boot))))
 
     def test_clean_distinct_preparation_boots_pass(self):
         self.preparation_fixtures()
@@ -164,9 +188,42 @@ docker() {
     @unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0
                          and shutil.which("journalctl"), "Native root journal query runs in Linux QEMU preparation")
     def test_native_systemd_collection(self):
+        # Hosted helper runners can use apport or a plain core-file pattern.
+        # Verify fail-closed behavior there; positive guest admission remains
+        # mandatory in the launcher's actual collect/verify path.
+        pattern = HEALTH.query(["cat", "/proc/sys/kernel/core_pattern"]).strip()
+        if not HEALTH.CORE_PATTERN.fullmatch(pattern):
+            with self.assertRaisesRegex(ValueError, "unsupported kernel crash handler"):
+                HEALTH.collect()
+            return
         receipt = HEALTH.collect()
         self.assertTrue(receipt["complete"])
         self.assertGreater(receipt["kernel_bytes"], 0)
+
+    def test_native_host_probe_requires_collection_or_explicit_refusal(self):
+        decorated = type(self).test_native_systemd_collection
+        probe = getattr(decorated, "__wrapped__", decorated)
+        for pattern in ("core", "|/usr/share/apport/apport %p %s %c %d %P"):
+            with self.subTest(pattern=pattern), \
+                    patch.object(HEALTH, "query", return_value=pattern), \
+                    patch.object(HEALTH, "collect", side_effect=ValueError(
+                        "unsupported kernel crash handler")) as collect:
+                probe(self)
+                collect.assert_called_once_with()
+        with patch.object(HEALTH, "query", return_value="core"), \
+                patch.object(HEALTH, "collect", return_value=self.payload):
+            with self.assertRaises(AssertionError):
+                probe(self)
+        with patch.object(HEALTH, "query", return_value=channel_fixture(
+                self.payload["boot_id"])["core_pattern"]), \
+                patch.object(HEALTH, "collect", return_value=self.payload) as collect:
+            probe(self)
+            collect.assert_called_once_with()
+        with patch.object(HEALTH, "query", return_value=channel_fixture(
+                self.payload["boot_id"])["core_pattern"]), \
+                patch.object(HEALTH, "collect", side_effect=ValueError("missing socket")):
+            with self.assertRaisesRegex(ValueError, "missing socket"):
+                probe(self)
 
     def test_collector_binds_optional_boot_argument_and_accepts_no_crashes(self):
         with patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
@@ -175,7 +232,12 @@ docker() {
         self.assertTrue(receipt["complete"])
         self.assertEqual(receipt["product_crashes"], [])
         for call in query.call_args_list:
+            if call.args[0][0] in ("cat", "test"):
+                continue
             if call.args[0][0] == "systemctl":
+                if call.args[0][-1] != "systemd-coredump@*.service":
+                    self.assertIn("--property=Id,LoadState,ActiveState,SubState,Result,UnitFileState", call.args[0])
+                    continue
                 self.assertIn("--property=Id,ActiveState,SubState,Result", call.args[0])
                 self.assertIn("systemd-coredump@*.service", call.args[0])
                 continue
@@ -197,6 +259,44 @@ docker() {
         self.serial.write_text("Kernel panic handler installed\nOOM killer enabled\n")
         self.assertEqual(self.verify(), 0)
 
+    def test_known_product_x86_traps_fail_cli_admission(self):
+        command = [sys.executable, str(Path(__file__).with_name("check-qemu-health.py")),
+                   "verify", "--guest", str(self.guest), "--serial", str(self.serial),
+                   "--controller", str(self.controller), "--boot-id", self.payload["boot_id"]]
+        for process in ("omg", "omgd"):
+            for trap in ("invalid opcode", "divide error"):
+                with self.subTest(process=process, trap=trap):
+                    self.serial.write_text(
+                        f"[  2.345] traps: {process}[123] trap {trap} "
+                        f"ip:123 sp:456 error:0 in {process}[100+100]\n")
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("fatal guest signature", result.stderr)
+
+    def test_x86_trap_attribution_and_benign_controls_pass(self):
+        for message in ("traps: unrelated[123] trap invalid opcode ip:123 sp:456 error:0",
+                        "traps: notomg[123] trap divide error ip:123 sp:456 error:0",
+                        "traps: omg-worker[123] trap invalid opcode ip:123 sp:456 error:0",
+                        "traps: omg[123] trap invalid opcode handler installed",
+                        "traps: omgd[123] trap divide error handler installed",
+                        "omg: Bus error"):
+            with self.subTest(message=message):
+                self.serial.write_text(message + "\n")
+                self.assertEqual(self.verify(), 0)
+
+    def test_x86_trap_signatures_redact_adjacent_evidence(self):
+        for process in ("omg", "omgd"):
+            for trap in ("invalid opcode", "divide error"):
+                signature = f"{process}[123] trap {trap}"
+                text = f"traps: {signature} ip:123 sp:456 error:0 in /private/path\n"
+                self.assertEqual(HEALTH.crash_signatures(text), [signature])
+
+    def test_product_coredump_signal6_still_rejects_admission(self):
+        self.payload["product_crashes"] = [{"process": "omg", "signal": 6}]
+        self.guest.write_text(json.dumps(self.payload))
+        with self.assertRaisesRegex(ValueError, "guest crash"):
+            self.verify()
+
     def test_serial_torn_utf8_does_not_hide_crash_signatures(self):
         self.serial.write_bytes(b"Linux version 6.12\n\xe2Reached target\n")
         self.assertEqual(self.verify(), 0)
@@ -214,10 +314,13 @@ docker() {
                 patch.object(HEALTH, "query", side_effect=self.processing_query(["", ""], core)):
             receipt = HEALTH.collect()
         self.assertEqual(receipt["product_crashes"], [{"process": "omg", "signal": 11}])
+        self.guest.write_text(json.dumps(receipt))
+        with self.assertRaises(ValueError):
+            self.verify()
         self.assertNotIn("private", json.dumps(receipt))
         self.assertNotIn("/home/bench", json.dumps(receipt))
 
-    def processing_query(self, processors, core_rows=None):
+    def processing_query(self, processors, core_rows=None, capability=None):
         """Return normal journals and successive systemd processing observations."""
         observations = iter(processors)
         if core_rows is None:
@@ -225,6 +328,20 @@ docker() {
                                     "COREDUMP_EXE": "/usr/bin/python3.14", "COREDUMP_SIGNAL": "6"})
 
         def query(argv):
+            if argv[0] == "cat":
+                return "|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h\n"
+            if argv[0] == "test":
+                return ""
+            if argv[-1] in ("systemd-coredump.socket", "systemd-coredump@omg-health.service"):
+                if isinstance(capability, Exception):
+                    raise capability
+                if capability is not None:
+                    return capability
+                if argv[-1].endswith(".socket"):
+                    return ("Id=systemd-coredump.socket\nLoadState=loaded\nActiveState=active\n"
+                            "SubState=listening\nResult=success\nUnitFileState=static\n")
+                return ("Id=systemd-coredump@omg-health.service\nLoadState=loaded\n"
+                        "ActiveState=inactive\nSubState=dead\nResult=success\nUnitFileState=static\n")
             if argv[0] == "systemctl":
                 observed = next(observations)
                 if isinstance(observed, Exception):
@@ -233,6 +350,98 @@ docker() {
             return "Linux version 6.12\n" if "--dmesg" in argv else core_rows
 
         return query
+
+    def test_empty_journal_without_crash_capability_is_incomplete(self):
+        for capability in ("", "Id=systemd-coredump.socket\nLoadState=not-found\n",
+                           "Id=systemd-coredump.socket\nLoadState=masked\n",
+                           ValueError("crash capability query failed")):
+            with self.subTest(capability=capability), \
+                    patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
+                    patch.object(HEALTH, "query", side_effect=self.processing_query(["", ""], "", capability)):
+                with self.assertRaises(ValueError):
+                    HEALTH.collect()
+
+    def test_legacy_empty_crash_receipt_cannot_admit(self):
+        self.guest.write_text(json.dumps(dict(self.payload, schema_version=1)))
+        with self.assertRaises(ValueError):
+            self.verify()
+        self.payload.pop("crash_channel", None)
+        self.guest.write_text(json.dumps(self.payload))
+        with self.assertRaises(ValueError):
+            self.verify()
+
+    def test_unhealthy_socket_or_template_cannot_admit_empty_journal(self):
+        for unit in ("systemd-coredump.socket", "systemd-coredump@omg-health.service"):
+            for field, value in (("LoadState", "not-found"), ("LoadState", "masked"),
+                                 ("UnitFileState", "disabled"), ("ActiveState", "activating"),
+                                 ("ActiveState", "failed"), ("Result", "exit-code"),
+                                 ("SubState", "failed")):
+                original = self.processing_query(["", ""], "")
+
+                def query(argv):
+                    result = original(argv)
+                    if argv[-1] == unit:
+                        lines = dict(line.split("=", 1) for line in result.splitlines())
+                        lines[field] = value
+                        return "\n".join(f"{key}={item}" for key, item in lines.items())
+                    return result
+
+                with self.subTest(unit=unit, field=field, value=value), \
+                        patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
+                        patch.object(HEALTH, "query", side_effect=query):
+                    with self.assertRaises(ValueError):
+                        HEALTH.collect()
+
+    def test_wrong_handler_or_missing_executable_cannot_admit(self):
+        for pattern, unavailable in (("core", False), ("|/usr/share/apport/apport %p", False),
+                                     ("|/usr/lib/systemd/systemd-coredump --backtrace", False),
+                                     ("|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h %I %d", False),
+                                     (channel_fixture(self.payload["boot_id"])["core_pattern"], True)):
+            original = self.processing_query(["", ""], "")
+
+            def query(argv):
+                if argv[0] == "cat":
+                    return pattern
+                if argv[0] == "test" and unavailable:
+                    raise ValueError("crash handler unavailable")
+                return original(argv)
+
+            with self.subTest(pattern=pattern, unavailable=unavailable), \
+                    patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
+                    patch.object(HEALTH, "query", side_effect=query):
+                with self.assertRaises(ValueError):
+                    HEALTH.collect()
+
+    def test_capability_loss_or_boot_change_during_collection_cannot_admit(self):
+        for changed_boot in (False, True):
+            original = self.processing_query(["", ""], "")
+            sockets = 0
+
+            def query(argv):
+                nonlocal sockets
+                result = original(argv)
+                if argv[-1] == "systemd-coredump.socket":
+                    sockets += 1
+                    if sockets == 2 and not changed_boot:
+                        return result.replace("ActiveState=active", "ActiveState=inactive")
+                return result
+
+            with self.subTest(changed_boot=changed_boot), \
+                    patch.object(HEALTH.Path, "read_text", side_effect=[self.payload["boot_id"],
+                                 "00000000-1111-2222-3333-555555555555"]), \
+                    patch.object(HEALTH, "query", side_effect=query):
+                with self.assertRaises(ValueError):
+                    HEALTH.collect()
+
+    def test_receipt_requires_positive_same_boot_capability(self):
+        for field, value in (("boot_id", "00000000-1111-2222-3333-555555555555"),
+                             ("handler_executable", False), ("socket", {}),
+                             ("processor", {}), ("core_pattern", "core"), ("kind", "unknown")):
+            channel = channel_fixture(self.payload["boot_id"])
+            channel[field] = value
+            self.guest.write_text(json.dumps(dict(self.payload, crash_channel=channel)))
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.verify()
 
     def test_pending_or_failed_processor_cannot_admit_clean_journals(self):
         for state, substate, result in (("activating", "start-pre", "success"),

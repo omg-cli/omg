@@ -94,7 +94,7 @@ pub fn is_private_or_local_host(host: Option<&str>) -> bool {
 pub(crate) fn is_public_address(address: std::net::IpAddr) -> bool {
     match address {
         std::net::IpAddr::V4(ip) => {
-            let [a, b, _, _] = ip.octets();
+            let [a, b, c, _] = ip.octets();
             !ip.is_private()
                 && !ip.is_loopback()
                 && !ip.is_link_local()
@@ -104,7 +104,7 @@ pub(crate) fn is_public_address(address: std::net::IpAddr) -> bool {
                 && a != 0
                 && a < 224
                 && !(a == 100 && (64..=127).contains(&b))
-                && !(a == 192 && b == 0)
+                && !(a == 192 && b == 0 && c == 0)
                 && !(a == 198 && (18..=19).contains(&b))
         }
         std::net::IpAddr::V6(ip) => {
@@ -481,6 +481,49 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn resolved_download_addresses_preserve_ipv4_special_use_boundaries() {
+        // IANA's IPv4 Special-Purpose registry. Preserve this downloader's
+        // conservative whole-192.0.0.0/24 exclusion, including its exceptions.
+        for raw in [
+            "1.0.0.1",
+            "8.0.0.1",
+            "191.255.255.254",
+            "192.0.1.1",
+            "192.1.0.1",
+            "198.17.255.254",
+            "198.20.0.1",
+            "223.255.255.254",
+        ] {
+            assert!(is_public_address(raw.parse().unwrap()), "{raw}");
+        }
+        for raw in [
+            "0.0.0.0",
+            "0.255.255.255",
+            "10.0.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.0.0.0",
+            "192.0.0.8",
+            "192.0.0.9",
+            "192.0.0.10",
+            "192.0.0.255",
+            "192.0.2.1",
+            "192.168.0.1",
+            "198.18.0.0",
+            "198.19.255.255",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.0",
+            "239.255.255.255",
+            "240.0.0.0",
+            "255.255.255.255",
+        ] {
+            assert!(!is_public_address(raw.parse().unwrap()), "{raw}");
+        }
+    }
+
     #[tokio::test]
     async fn download_client_allows_long_transfers_that_keep_progressing() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -653,6 +696,54 @@ pub(crate) trait BoundedResponseExt {
     async fn bounded_text(self) -> anyhow::Result<String>;
 }
 
+/// Retry a metadata GET at most three times under one thirty-second budget.
+/// Each attempt includes the bounded body read; permanent errors retain their
+/// cause. Reuse the caller's client so trust and redirect policy stay intact.
+pub(crate) async fn fetch_metadata_text(client: &Client, url: &str) -> anyhow::Result<String> {
+    fetch_metadata_text_with_budget(client, url, Duration::from_secs(30)).await
+}
+
+async fn fetch_metadata_text_with_budget(
+    client: &Client,
+    url: &str,
+    total: Duration,
+) -> anyhow::Result<String> {
+    tokio::time::timeout(total, async {
+        for attempt in 0..3 {
+            let result = async {
+                client
+                    .get(url)
+                    .timeout(total)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .bounded_text()
+                    .await
+            }
+            .await;
+            match result {
+                Err(error)
+                    if attempt < 2
+                        && error.chain().any(|source| {
+                            source
+                                .downcast_ref::<reqwest::Error>()
+                                .is_some_and(|cause| {
+                                    is_retryable_error(cause)
+                                        || cause.status().is_some_and(is_retryable_status)
+                                })
+                        }) =>
+                {
+                    tokio::time::sleep(retry_backoff(Duration::from_millis(100), attempt)).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("last metadata attempt returns its result")
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Metadata request exceeded its total deadline"))?
+}
+
 pub(crate) async fn bounded_metadata_body(
     mut response: reqwest::Response,
 ) -> anyhow::Result<Vec<u8>> {
@@ -691,6 +782,171 @@ impl BoundedResponseExt for reqwest::Response {
 mod metadata_limit_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct RetryFixture {
+        url: String,
+        task: Option<tokio::task::JoinHandle<anyhow::Result<Vec<String>>>>,
+    }
+
+    impl RetryFixture {
+        async fn new(responses: Vec<Vec<u8>>, stall: bool) -> anyhow::Result<Self> {
+            Self::new_with_body_delay(responses, stall, Duration::ZERO).await
+        }
+
+        async fn new_with_body_delay(
+            responses: Vec<Vec<u8>>,
+            stall: bool,
+            body_delay: Duration,
+        ) -> anyhow::Result<Self> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/manifest", listener.local_addr()?);
+            let task = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                let response_count = responses.len();
+                for (index, response) in responses.into_iter().enumerate() {
+                    let (mut stream, _) = listener.accept().await?;
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        anyhow::ensure!(headers.len() < 8192, "fixture header bound");
+                        headers.push(stream.read_u8().await?);
+                    }
+                    let request = String::from_utf8(headers)?;
+                    let line = request.lines().next().unwrap().to_owned();
+                    anyhow::ensure!(line == "GET /manifest HTTP/1.1", "unexpected request");
+                    requests.push(line);
+                    let header_end = response
+                        .windows(4)
+                        .position(|bytes| bytes == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    stream.write_all(&response[..header_end]).await?;
+                    tokio::time::sleep(body_delay).await;
+                    stream.write_all(&response[header_end..]).await?;
+                    if stall && index + 1 == response_count {
+                        std::future::pending::<()>().await;
+                    }
+                    stream.shutdown().await?;
+                }
+                Ok(requests)
+            });
+            Ok(Self {
+                url,
+                task: Some(task),
+            })
+        }
+
+        async fn finish(mut self) -> anyhow::Result<Vec<String>> {
+            let task = self.task.as_mut().unwrap();
+            let requests = tokio::time::timeout(Duration::from_secs(5), task).await???;
+            self.task = None;
+            Ok(requests)
+        }
+    }
+
+    impl Drop for RetryFixture {
+        fn drop(&mut self) {
+            if let Some(task) = &self.task {
+                task.abort();
+            }
+        }
+    }
+
+    fn metadata_client() -> Client {
+        Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn metadata_retry_retries_truncated_body_and_limits_attempts() -> anyhow::Result<()> {
+        let truncated =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nx".to_vec();
+        let healthy =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+        let fixture = RetryFixture::new(vec![truncated, healthy], false).await?;
+        assert_eq!(
+            fetch_metadata_text(&metadata_client(), &fixture.url).await?,
+            "ok"
+        );
+        assert_eq!(fixture.finish().await?.len(), 2);
+
+        let unavailable =
+            b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let fixture = RetryFixture::new(vec![unavailable; 3], false).await?;
+        let error = fetch_metadata_text(&metadata_client(), &fixture.url)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<reqwest::Error>().unwrap().status(),
+            Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(fixture.finish().await?.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_retry_refuses_permanent_status_size_and_encoding() -> anyhow::Result<()> {
+        for response in [
+            b"HTTP/1.1 404 Missing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 16777217\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n\xff".to_vec(),
+        ] {
+            let fixture = RetryFixture::new(vec![response], false).await?;
+            let error = fetch_metadata_text(&metadata_client(), &fixture.url)
+                .await
+                .unwrap_err();
+            assert!(
+                !error.to_string().contains("connect"),
+                "terminal error must retain its cause: {error}"
+            );
+            assert_eq!(fixture.finish().await?.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_retry_total_deadline_includes_body_and_backoff() -> anyhow::Result<()> {
+        let fixture = RetryFixture::new(
+            vec![
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nx".to_vec(),
+            ],
+            true,
+        )
+        .await?;
+        let start = tokio::time::Instant::now();
+        let error = fetch_metadata_text_with_budget(
+            &metadata_client(),
+            &fixture.url,
+            Duration::from_millis(250),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("total deadline"), "got: {error}");
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(fixture);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_retry_preserves_slow_healthy_body_budget() -> anyhow::Result<()> {
+        let budget = Duration::from_millis(600);
+        let fixture = RetryFixture::new_with_body_delay(
+            vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()],
+            false,
+            Duration::from_millis(250),
+        )
+        .await?;
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            fetch_metadata_text_with_budget(&metadata_client(), &fixture.url, budget).await?,
+            "ok"
+        );
+        assert!(start.elapsed() > budget / 3);
+        assert!(start.elapsed() < budget);
+        assert_eq!(fixture.finish().await?.len(), 1);
+        Ok(())
+    }
 
     async fn response(bytes: Vec<u8>) -> reqwest::Response {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -740,5 +996,184 @@ mod metadata_limit_tests {
                 .to_string()
                 .contains("16 MiB")
         );
+    }
+
+    #[test]
+    fn unspecified_ipv6_must_not_be_a_public_host_or_redirect() {
+        assert!(is_private_or_local_host(Some("::")));
+        for mapped in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.1.1",
+            "::ffff:0.0.0.0",
+        ] {
+            assert!(
+                is_private_or_local_host(Some(mapped)),
+                "{mapped}: mapped local address must refuse"
+            );
+        }
+        assert!(is_private_or_local_host(Some("[::]")));
+        let target = Url::parse("https://[::]/private").unwrap();
+        assert_eq!(
+            validate_redirect(&[], &target),
+            Err("refusing redirect to a private or local address")
+        );
+    }
+
+    #[test]
+    #[expect(unsafe_code)] // Process-wide environment is changed only in the isolated child.
+    fn loopback_download_exception_requires_explicit_test_mode() {
+        if crate::core::testing::run_isolated_test(
+            "core::http::metadata_limit_tests::loopback_download_exception_requires_explicit_test_mode",
+        ) {
+            return;
+        }
+        // SAFETY: this is a fresh single-test child with no concurrent environment users.
+        unsafe {
+            std::env::set_var("OMG_TEST_MODE", "0");
+        }
+        for url in [
+            "http://127.0.0.1/archive",
+            "http://localhost/archive",
+            "http://[::1]/archive",
+        ] {
+            assert!(
+                validate_download_url(url).is_err(),
+                "{url}: mode0 must refuse"
+            );
+        }
+        // SAFETY: the same isolated single-test child remains the sole environment user.
+        unsafe {
+            std::env::set_var("OMG_TEST_MODE", "1");
+        }
+        for url in [
+            "http://127.0.0.1/archive",
+            "http://localhost/archive",
+            "http://[::1]/archive",
+        ] {
+            assert!(
+                validate_download_url(url).is_ok(),
+                "{url}: mode1 fixture must work"
+            );
+        }
+        for url in [
+            "ftp://localhost/archive",
+            "http://8.8.8.8/archive",
+            "https://127.0.0.1/archive",
+        ] {
+            assert!(
+                validate_download_url(url).is_err(),
+                "{url}: exception must stay confined"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_request_builders_are_not_retryable_transport_failures() {
+        let error = shared_client()
+            .get("://invalid")
+            .build()
+            .expect_err("invalid URL must refuse");
+        assert!(error.is_builder());
+        assert!(!is_retryable_error(&error), "builder errors must not retry");
+    }
+
+    async fn assert_private_redirect_is_refused(client: &Client) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let destination_address = destination.local_addr().unwrap();
+        let contacted = Arc::new(AtomicBool::new(false));
+        let observed = contacted.clone();
+        let destination_task = tokio::spawn(async move {
+            let (mut stream, _) = destination.accept().await.unwrap();
+            observed.store(true, Ordering::SeqCst);
+            let mut request = [0; 4096];
+            let mut received = 0;
+            loop {
+                assert!(
+                    received < request.len(),
+                    "fixture request header exceeds its bound"
+                );
+                let count = stream.read(&mut request[received..]).await.unwrap();
+                assert!(
+                    count > 0,
+                    "fixture peer closed before sending a request header"
+                );
+                received += count;
+                if request[..received]
+                    .windows(4)
+                    .any(|part| part == b"\r\n\r\n")
+                {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let mut received = 0;
+            loop {
+                assert!(
+                    received < request.len(),
+                    "fixture request header exceeds its bound"
+                );
+                let count = stream.read(&mut request[received..]).await.unwrap();
+                assert!(
+                    count > 0,
+                    "fixture peer closed before sending a request header"
+                );
+                received += count;
+                if request[..received]
+                    .windows(4)
+                    .any(|part| part == b"\r\n\r\n")
+                {
+                    break;
+                }
+            }
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{destination_address}/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(redirect.as_bytes()).await.unwrap();
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .get(format!("http://{origin_address}/redirect"))
+                .send(),
+        )
+        .await;
+        origin_task.abort();
+        destination_task.abort();
+        let _ = origin_task.await;
+        let _ = destination_task.await;
+        assert!(
+            matches!(&response, Ok(Err(error)) if error.is_redirect()),
+            "private redirect must be refused: {response:?}"
+        );
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "private target must receive no connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_shared_client_refuses_a_redirect_to_a_private_listener() {
+        assert_private_redirect_is_refused(shared_client()).await;
+    }
+
+    #[tokio::test]
+    async fn actual_download_client_refuses_a_redirect_to_a_private_listener() {
+        assert_private_redirect_is_refused(download_client()).await;
     }
 }

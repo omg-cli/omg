@@ -243,7 +243,7 @@ def cargo_test_args(features):
     active = COVERAGE.strings(features.split(','))
     suites = ['cli_surface', 'git_hooks_contract', 'coverage_10', 'coverage_18',
               'e2e_runtime_management', 'env_lockfile_integrity',
-              'daemon_e2e_caching', 'daemon_e2e_concurrency']
+              'daemon_e2e_caching', 'daemon_e2e_concurrency', 'init_daemon_startup']
     if active & {'arch', 'debian', 'debian-pure', 'fedora'}:
         suites.append('cli_comprehensive')
     if active & {'arch', 'debian', 'fedora'}:

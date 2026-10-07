@@ -1,0 +1,47 @@
+name: Optional QEMU vsock host observation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/probe-qemu-vsock.py
+      - scripts/qemu-vsock-capability.c
+      - scripts/test_qemu_vsock_probe.py
+      - .github/workflows/qemu-vsock-capability.yml
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    name: Ordinary host capability (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify real process ownership controls
+        run: python3 -B scripts/test_qemu_vsock_probe.py
+      - name: Record capability without changing host policy
+        env:
+          OBSERVATION_RUNNER: ${{ matrix.runner }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B scripts/probe-qemu-vsock.py \
+            --repository "$GITHUB_REPOSITORY" --source-sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --runner-label "$OBSERVATION_RUNNER" > vsock-capability.json
+      - name: Preserve the actual observation verdict
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vsock-host-${{ matrix.runner }}-${{ github.run_attempt }}
+          path: vsock-capability.json
+          if-no-files-found: error
+          retention-days: 30

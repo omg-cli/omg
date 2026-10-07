@@ -96,6 +96,7 @@ jobs:
           python3 -m unittest discover -s tests -p test_qemu_workflow.py
           python3 -m unittest discover -s tests -p test_qemu_verdict.py
           python3 -m unittest discover -s scripts -p test_prepare_qemu_release.py
+          python3 -m unittest discover -s scripts -p test_qemu_arch_preparation.py
           python3 -m unittest discover -s scripts -p test_qemu_daemon_contract.py
           python3 -m unittest discover -s scripts -p test_qemu_apt_abi.py
           python3 -m unittest discover -s scripts -p test_qemu_apt_abi_evidence.py
@@ -114,8 +115,10 @@ jobs:
           ./scripts/test-qa-open-pr.sh
           python3 -m unittest discover -s scripts -p test_qemu_reporting.py
           python3 -m unittest discover -s scripts -p test_qemu_backend_mismatch.py
+          python3 -m unittest discover -s scripts -p test_qemu_transaction_summary.py
           python3 -m unittest discover -s scripts -p test_ci_smoke_report.py
           sudo -n python3 -m unittest discover -s scripts -p test_qemu_health.py
+          python3 -m unittest discover -s scripts -p test_qemu_crash_provision.py
           python3 -m unittest discover -s scripts -p test_qemu_network_scope.py
           python3 -m unittest discover -s scripts -p test_qemu_storage_faults.py
           python3 -m unittest discover -s scripts -p test_qemu_egress.py

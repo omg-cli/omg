@@ -72,8 +72,11 @@ jobs:
       - name: Validate change classification
         run: python3 -m unittest discover -s scripts -p test_ci_change_scope.py
 
+      - name: Test debt baseline guards
+        run: python3 -m unittest discover -s scripts -p 'test_debt*.py'
+
       - name: Debt ratchet (gating)
-        run: python3 scripts/debt-ratchet.py
+        run: python3 scripts/debt-ratchet.py --ci
 
       - name: Install Rust
         if: steps.changes.outputs.required == 'true'
@@ -98,6 +101,34 @@ jobs:
         # Standalone binary: the machete scan needs no Rust toolchain, so it
         # still runs on changes that skip compilation.
         run: cargo-machete
+
+  standalone-suites:
+    name: "Standalone suites (${{ matrix.os }})"
+    needs: quick-gate
+    if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.95.0"
+
+      # These independent workspaces include production modules directly;
+      # root cargo test does not select them or require native package backends.
+      - name: Test mise compatibility
+        run: cargo test --manifest-path tests/mise-compat/Cargo.toml --locked
+
+      - name: Test portable environment planner
+        run: cargo test --manifest-path tests/env-portable/Cargo.toml --locked
 
   portable:
     name: "Portable Rust"
@@ -1125,8 +1156,8 @@ jobs:
 
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
-    if: always()
+    needs: [quick-gate, standalone-suites, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
+    if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -1136,6 +1167,7 @@ jobs:
         env:
           BUILD_REQUIRED: ${{ needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' }}
           QUICK_GATE: ${{ needs.quick-gate.result }}
+          STANDALONE_SUITES: ${{ needs.standalone-suites.result }}
           PORTABLE: ${{ needs.portable.result }}
           LINUX_MATRIX: ${{ needs.linux-matrix.result }}
           SANDBOX_CANCELLATION: ${{ needs.sandbox-cancellation.result }}
@@ -1153,6 +1185,7 @@ jobs:
           echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Quick Gate | $QUICK_GATE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Standalone suites | $STANDALONE_SUITES |" >> $GITHUB_STEP_SUMMARY
           echo "| Portable Rust | $PORTABLE |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux Matrix | $LINUX_MATRIX |" >> $GITHUB_STEP_SUMMARY
           echo "| AUR Sandbox Cancellation | $SANDBOX_CANCELLATION |" >> $GITHUB_STEP_SUMMARY
@@ -1180,6 +1213,7 @@ jobs:
           fi
 
           declare -A required_results=(
+            ["Standalone suites"]="$STANDALONE_SUITES"
             ["Portable Rust"]="$PORTABLE"
             ["Linux Matrix"]="$LINUX_MATRIX"
             ["AUR Sandbox Cancellation"]="$SANDBOX_CANCELLATION"

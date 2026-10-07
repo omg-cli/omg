@@ -118,6 +118,7 @@ fn detect_installed_runtime(
         "node" => "node",
         "python" => "python3",
         "rust" => "rustc",
+        "go" => "go",
         other => panic!("unsupported detection fixture runtime: {other}"),
     };
     let versions = project.data_dir.path().join("versions").join(runtime);
@@ -1413,14 +1414,14 @@ mod version_detection {
 
     #[test]
     fn test_go_version_file_detection() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         // Use .go-version which is the standard version file
         let mut f = File::create(temp_dir.path().join(".go-version")).unwrap();
         writeln!(f, "1.21.0").unwrap();
 
-        let result = run_omg_in_dir(&["use", "go"], temp_dir.path());
-        // Falsifiable: the EXACT version from the file must appear (detection
-        // prints it even if a subsequent install step fails).
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "go", "1.21.0");
+        // Require detection and activation of the exact installed version without
+        // depending on a vendor download or accepting a subsequent install error.
         result.assert_stdout_contains("1.21.0");
     }
 

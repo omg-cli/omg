@@ -12,6 +12,9 @@
 //! `is_enhanced_telemetry_enabled()` cannot be true in a test process.
 //! The gate itself IS tested below from the disabled side.
 
+#[path = "../src/core/testing/isolated.rs"]
+mod isolated_fixture;
+
 pub mod common;
 use common::*;
 
@@ -184,6 +187,9 @@ fn tracing_diagnostics_do_not_contaminate_config_stdout() {
 #[test]
 #[serial]
 fn opt_out_env_values_and_settings_file_gate_telemetry() {
+    if isolated_fixture::run_isolated_test("opt_out_env_values_and_settings_file_gate_telemetry") {
+        return;
+    }
     let config_dir = TempDir::new().expect("temp config dir");
     let config_str = config_dir.path().to_string_lossy().into_owned();
 
@@ -309,6 +315,11 @@ fn opt_out_env_values_and_settings_file_gate_telemetry() {
 #[test]
 #[serial]
 fn install_marker_round_trips_id_through_ping_even_when_endpoint_unreachable() {
+    if isolated_fixture::run_isolated_test(
+        "install_marker_round_trips_id_through_ping_even_when_endpoint_unreachable",
+    ) {
+        return;
+    }
     let data_dir = TempDir::new().expect("temp data dir");
     let marker_path = data_dir.path().join(".installed");
 
@@ -379,6 +390,11 @@ fn marker_does_not_exist(path: &Path) -> bool {
 #[test]
 #[serial]
 fn gated_out_telemetry_api_never_persists_queue_or_session_state() {
+    if isolated_fixture::run_isolated_test(
+        "gated_out_telemetry_api_never_persists_queue_or_session_state",
+    ) {
+        return;
+    }
     // Session ids must be stable within the process and well-formed UUIDs.
     let first = get_session_id();
     let second = get_session_id();
@@ -527,4 +543,14 @@ fn timer_reports_at_least_the_slept_duration_in_milliseconds() {
     // finish() routes into the gated performance tracker; it must be safe
     // to call unconditionally (no license, no panic, no output).
     Timer::new("cov10_finish").finish();
+}
+
+#[test]
+fn telemetry_fixture_isolation_preserves_parent_test_mode() {
+    common::init_test_env();
+    assert!(omg_lib::core::paths::test_mode());
+    assert!(isolated_fixture::run_isolated_test(
+        "opt_out_env_values_and_settings_file_gate_telemetry"
+    ));
+    assert!(omg_lib::core::paths::test_mode());
 }

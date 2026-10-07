@@ -51,7 +51,7 @@ GUEST_FILES = {
     "daemon-direct-duplicate.txt", "daemon-foreground-duplicate.txt",
     "daemon-direct-launcher.txt", "daemon-foreground-launcher.txt",
     "exit-code", "audit-directory-after.txt", "audit-directory-metadata.txt",
-    "index-update.txt", "search.txt", "omg-info.txt", "native-info.txt",
+    "arch-system-upgrade.txt", "index-update.txt", "search.txt", "omg-info.txt", "native-info.txt",
     "local-package.sha256", "local-consent.txt", "system-audit-verify.txt",
     "installed-after.txt", "repository-hashes.txt", "guest-metadata.txt",
     "inventory-setup.txt", "container-engine.txt", "rust-toolchain.txt",

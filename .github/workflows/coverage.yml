@@ -188,7 +188,7 @@ jobs:
   coverage-result:
     name: Generate Coverage Report
     needs: [changes, coverage]
-    if: always()
+    if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

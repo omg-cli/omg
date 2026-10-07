@@ -111,4 +111,39 @@ mod tests {
     fn test_find_in_path_returns_none_for_nonexistent() {
         assert!(find_in_path("this-binary-definitely-does-not-exist-12345").is_none());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_nvm_alias_propagates_non_directory_root_error() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("nvm-file");
+        std::fs::write(&root, b"not a directory")?;
+        let error = resolve_nvm_alias(&root, "default")
+            .expect_err("an inaccessible alias root must not become a missing alias");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotADirectory)
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_nvm_alias_propagates_non_directory_alias_parent_error() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let aliases = directory.path().join("alias");
+        std::fs::create_dir(&aliases)?;
+        std::fs::write(aliases.join("ordinary-file"), b"v22.0.0")?;
+        let error = resolve_nvm_alias(directory.path(), "ordinary-file/child")
+            .expect_err("an inaccessible alias candidate must not become a missing alias");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotADirectory)
+        );
+        Ok(())
+    }
 }

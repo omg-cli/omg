@@ -35,7 +35,7 @@ def read_json(path):
 def metadata(args, index):
     return dict(source_sha=args.source_sha, run_id=args.run_id,
                 run_attempt=args.run_attempt, shard_index=index, shard_count=args.shards,
-                cargo_mutants_version=VERSION, files=FILES, test_timeout_seconds=60,
+                cargo_mutants_version=VERSION, files=FILES, test_timeout_seconds=120,
                 jobs=2, job_timeout_minutes=120, baseline="run", no_default_features=True,
                 features=["pgp", "license"], shuffling=False, sharding="slice")
 

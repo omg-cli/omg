@@ -97,7 +97,7 @@ pub fn default_socket_path() -> PathBuf {
 /// }
 /// ```
 pub struct DaemonClient {
-    framed: Framed<UnixStream, LengthDelimitedCodec>,
+    framed: Option<Framed<UnixStream, LengthDelimitedCodec>>,
     request_id: AtomicU64,
 }
 
@@ -157,7 +157,7 @@ impl DaemonClient {
                             .new_codec(),
                     );
                     return Ok(Self {
-                        framed,
+                        framed: Some(framed),
                         request_id: AtomicU64::new(1),
                     });
                 }
@@ -195,7 +195,6 @@ impl DaemonClient {
     /// Send a request and get response
     pub async fn call(&mut self, request: Request) -> Result<ResponseResult> {
         let id = request.id();
-        let framed = &mut self.framed;
 
         // Encode and send (versioned frame). The send shares the same timeout
         // budget as the read: a wedged daemon that stops draining its socket
@@ -203,6 +202,11 @@ impl DaemonClient {
         // See https://docs.rs/tokio/latest/tokio/time/fn.timeout.html
         let request_bytes =
             crate::daemon::protocol::encode_frame(&request).context("Failed to encode request")?;
+        // The in-flight call owns the stream so cancellation also closes it.
+        // Only a decoded, correlated reply makes this connection reusable.
+        let mut framed = self.framed.take().ok_or_else(|| {
+            anyhow::anyhow!("Daemon connection interrupted; reconnect before another request")
+        })?;
         tokio::time::timeout(REQUEST_TIMEOUT, framed.send(request_bytes.into()))
             .await
             .context("Timed out sending request to daemon")??;
@@ -212,7 +216,9 @@ impl DaemonClient {
             .await
             .context("Timed out waiting for daemon response")?
             .ok_or_else(|| anyhow::anyhow!("Daemon disconnected"))??;
-        decode_response(&response_bytes, id)
+        let response = decode_correlated_response(&response_bytes, id)?;
+        self.framed = Some(framed);
+        response_result(response)
     }
 
     /// Ping the daemon
@@ -312,29 +318,28 @@ pub async fn refresh_daemon_after_catalog_write() -> Result<()> {
 /// version check, bitcode deserialization, ID correlation, and error
 /// propagation all live here instead of being duplicated per transport.
 fn decode_response(frame: &[u8], expected_id: u64) -> Result<ResponseResult> {
+    response_result(decode_correlated_response(frame, expected_id)?)
+}
+
+fn decode_correlated_response(frame: &[u8], expected_id: u64) -> Result<Response> {
     let (_, payload) = crate::daemon::protocol::split_frame(frame)
         .map_err(|e| anyhow::anyhow!("Daemon protocol error: {e}"))?;
     let response: Response = bitcode::deserialize(payload)
         .map_err(|e| anyhow::anyhow!("Failed to deserialize daemon response: {e}"))?;
 
+    let resp_id = match &response {
+        Response::Success { id, .. } | Response::Error { id, .. } => *id,
+    };
+    if resp_id != expected_id {
+        anyhow::bail!("Request ID mismatch: sent {expected_id}, got {resp_id}");
+    }
+    Ok(response)
+}
+
+fn response_result(response: Response) -> Result<ResponseResult> {
     match response {
-        Response::Success {
-            id: resp_id,
-            result,
-        } => {
-            if resp_id != expected_id {
-                anyhow::bail!("Request ID mismatch: sent {expected_id}, got {resp_id}");
-            }
-            Ok(result)
-        }
-        Response::Error {
-            id: resp_id,
-            code,
-            message,
-        } => {
-            if resp_id != expected_id {
-                anyhow::bail!("Request ID mismatch: sent {expected_id}, got {resp_id}");
-            }
+        Response::Success { result, .. } => Ok(result),
+        Response::Error { code, message, .. } => {
             anyhow::bail!("Daemon error ({code}): {message}");
         }
     }
@@ -485,6 +490,180 @@ impl SyncDaemonClient {
 #[cfg(test)]
 mod tests {
     use super::is_truthy_env_value;
+
+    fn stream_pair() -> (
+        super::DaemonClient,
+        super::Framed<super::UnixStream, super::LengthDelimitedCodec>,
+    ) {
+        let (client, server) = super::UnixStream::pair().unwrap();
+        (
+            super::DaemonClient {
+                framed: Some(super::Framed::new(
+                    client,
+                    super::LengthDelimitedCodec::new(),
+                )),
+                request_id: super::AtomicU64::new(1),
+            },
+            super::Framed::new(server, super::LengthDelimitedCodec::new()),
+        )
+    }
+
+    fn reply(id: u64) -> Vec<u8> {
+        crate::daemon::protocol::encode_frame(&super::Response::Success {
+            id,
+            result: super::ResponseResult::Ping("pong".to_owned()),
+        })
+        .unwrap()
+    }
+
+    async fn refuses_interrupted_stream(client: &mut super::DaemonClient) {
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), client.ping())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("reconnect"), "{err:#}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_stream_read_timeout_refuses_late_response_reuse() {
+        use super::{SinkExt, StreamExt};
+        let (mut client, mut server) = stream_pair();
+        {
+            let call = client.call(super::Request::Ping { id: 100 });
+            tokio::pin!(call);
+            tokio::select! {
+                received = server.next() => { received.unwrap().unwrap(); }
+                result = &mut call => panic!("request completed before its reply: {result:?}"),
+            }
+            tokio::time::advance(super::REQUEST_TIMEOUT).await;
+            assert!(
+                call.await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Timed out waiting")
+            );
+        }
+        let _late_delivery = server.send(reply(100).into()).await;
+        refuses_interrupted_stream(&mut client).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_stream_cancelled_read_requires_fresh_connection() {
+        use super::{SinkExt, StreamExt};
+        let (mut client, mut server) = stream_pair();
+        {
+            let call = client.call(super::Request::Ping { id: 100 });
+            tokio::pin!(call);
+            tokio::select! {
+                received = server.next() => { received.unwrap().unwrap(); }
+                result = &mut call => panic!("request completed before cancellation: {result:?}"),
+            }
+        }
+        let _late_delivery = server.send(reply(100).into()).await;
+        refuses_interrupted_stream(&mut client).await;
+        let (mut fresh, mut server) = stream_pair();
+        let responder = async move {
+            server.next().await.unwrap().unwrap();
+            server.send(reply(1).into()).await.unwrap();
+        };
+        let (answer, ()) = tokio::join!(fresh.ping(), responder);
+        assert_eq!(answer.unwrap(), "pong");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_stream_send_timeout_refuses_reuse() {
+        let (mut client, _server) = stream_pair();
+        let request = super::Request::Search {
+            id: 100,
+            query: "x".repeat(super::MAX_FRAME_SIZE / 2),
+            limit: None,
+        };
+        let err = client.call(request).await.unwrap_err();
+        assert!(err.to_string().contains("Timed out sending"), "{err:#}");
+        refuses_interrupted_stream(&mut client).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_stream_cancelled_partial_send_refuses_reuse() {
+        let (mut client, server) = stream_pair();
+        {
+            let mut call = Box::pin(client.call(super::Request::Search {
+                id: 100,
+                query: "x".repeat(super::MAX_FRAME_SIZE / 2),
+                limit: None,
+            }));
+            tokio::select! {
+                ready = server.get_ref().readable() => { ready.unwrap(); }
+                result = &mut call => panic!("request completed before partial-send cancellation: {result:?}"),
+            }
+        }
+        let mut prefix = [0_u8; 64];
+        assert!(server.get_ref().try_read(&mut prefix).unwrap() > 0);
+        refuses_interrupted_stream(&mut client).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_stream_invalid_or_missing_reply_refuses_reuse() {
+        use super::{SinkExt, StreamExt};
+        for malformed in [Some(vec![0xff]), Some(reply(999)), None] {
+            let (mut client, mut server) = stream_pair();
+            let responder = async move {
+                server.next().await.unwrap().unwrap();
+                if let Some(bytes) = malformed {
+                    server.send(bytes.into()).await.unwrap();
+                }
+            };
+            let (answer, ()) = tokio::join!(client.ping(), responder);
+            assert!(answer.is_err());
+            refuses_interrupted_stream(&mut client).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_stream_valid_daemon_error_and_success_allow_reuse() {
+        use super::{SinkExt, StreamExt};
+        let (mut client, mut server) = stream_pair();
+        let responder = async move {
+            server.next().await.unwrap().unwrap();
+            let error = crate::daemon::protocol::encode_frame(&super::Response::Error {
+                id: 1,
+                code: 42,
+                message: "refused".to_owned(),
+            })
+            .unwrap();
+            server.send(error.into()).await.unwrap();
+            for id in [2, 3] {
+                server.next().await.unwrap().unwrap();
+                server.send(reply(id).into()).await.unwrap();
+            }
+        };
+        let operations = async {
+            assert!(
+                client
+                    .ping()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Daemon error (42)")
+            );
+            assert_eq!(client.ping().await.unwrap(), "pong");
+            assert_eq!(client.ping().await.unwrap(), "pong");
+        };
+        tokio::join!(operations, responder);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_stream_unpolled_call_keeps_connection_usable() {
+        use super::{SinkExt, StreamExt};
+        let (mut client, mut server) = stream_pair();
+        drop(client.call(super::Request::Ping { id: 100 }));
+        let responder = async move {
+            server.next().await.unwrap().unwrap();
+            server.send(reply(1).into()).await.unwrap();
+        };
+        let (answer, ()) = tokio::join!(client.ping(), responder);
+        assert_eq!(answer.unwrap(), "pong");
+    }
 
     #[test]
     fn daemon_disable_values_are_case_insensitive_and_explicit() {

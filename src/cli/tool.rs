@@ -804,6 +804,10 @@ pub async fn install(name: &str) -> Result<()> {
     }
 }
 
+// Admit at most one managed installation per process, including workers whose
+// async caller has been dropped. Waiting callers do not consume blocking threads.
+static MANAGED_INSTALL_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 async fn install_managed(
     manager: &str,
     pkg: &str,
@@ -813,10 +817,14 @@ async fn install_managed(
 ) -> Result<()> {
     crate::core::security::validate_package_name(install_name)?;
     validate_managed_package(manager, pkg)?;
+    let permit = MANAGED_INSTALL_PERMITS
+        .acquire()
+        .await
+        .context("Managed installation admission closed")?;
     // Keep storage flat and keyed by the user-facing registry name. Package
     // identifiers such as Go module paths are installer inputs, not paths.
     let install_dir = tools_dir.join(manager).join(install_name);
-    let has_previous_install = match fs::symlink_metadata(&install_dir) {
+    let has_previous_install = match tokio::fs::symlink_metadata(&install_dir).await {
         Ok(metadata) if metadata.is_dir() => true,
         Ok(_) => {
             anyhow::bail!(
@@ -841,6 +849,42 @@ async fn install_managed(
         return crate::cli::packages::install(&[pkg.to_string()], false, false, false).await;
     }
 
+    let manager = manager.to_owned();
+    let pkg = pkg.to_owned();
+    let install_name = install_name.to_owned();
+    let tools_dir = tools_dir.to_path_buf();
+    let bin_dir = bin_dir.to_path_buf();
+    // A started blocking task cannot be aborted. Keep the complete transaction
+    // and its permit in the worker: caller cancellation must not orphan a child,
+    // remove its staging tree early, or interrupt verification/rollback.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let outcome = install_managed_blocking(
+            &manager,
+            &pkg,
+            &install_name,
+            &tools_dir,
+            &bin_dir,
+            has_previous_install,
+        );
+        if let Err(error) = &outcome {
+            tracing::warn!(%manager, %pkg, %error, "managed tool installation failed");
+        }
+        outcome
+    })
+    .await
+    .context("Managed tool installation worker failed")?
+}
+
+fn install_managed_blocking(
+    manager: &str,
+    pkg: &str,
+    install_name: &str,
+    tools_dir: &Path,
+    bin_dir: &Path,
+    has_previous_install: bool,
+) -> Result<()> {
+    let install_dir = tools_dir.join(manager).join(install_name);
     for variable in active_security_overrides(manager, pkg) {
         eprintln!(
             "{} {variable} weakens install security for {manager}:{pkg}",
@@ -1517,6 +1561,282 @@ pub fn registry() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn with_managed_fixture_environment(path: &std::ffi::OsStr, test: impl FnOnce()) {
+        temp_env::with_vars(
+            [
+                ("PATH", Some(path)),
+                (ALLOW_NPM_SCRIPTS_ENV, None),
+                (ALLOW_PIP_SDISTS_ENV, None),
+                (ALLOW_CARGO_UNLOCKED_ENV, None),
+                (ALLOW_HOST_ENV, None),
+                (ALLOW_UNVERIFIED_ENV, None),
+                (ALLOW_GO_CGO_ENV, None),
+                (ALLOW_GO_TOOLCHAIN_ENV, None),
+            ],
+            test,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_successful_managed_install_still_verifies_and_activates() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::dropping_successful_managed_install_still_verifies_and_activates",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().expect("fixture directory");
+        let managers = temp.path().join("managers");
+        let tools = temp.path().join("tools");
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&managers).expect("manager directory");
+        let npm = managers.join("npm");
+        fs::write(
+            &npm,
+            br#"#!/bin/sh
+fixture=$(dirname "$0")
+case "$1" in
+  install)
+    mkdir -p "$3/node_modules/.bin"
+    printf '#!/bin/sh\necho new-version\n' > "$3/node_modules/.bin/fixture-tool"
+    chmod 755 "$3/node_modules/.bin/fixture-tool"
+    printf started > "$fixture/started"
+    sleep 1
+    ;;
+  audit)
+    test -f "$4/node_modules/.bin/fixture-tool" || exit 1
+    printf verified > "$fixture/verified"
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+        .expect("disposable manager");
+        fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).expect("manager permissions");
+        let install_dir = tools.join("npm/fixture-tool");
+        let previous = install_dir.join("bin/fixture-tool");
+        fs::create_dir_all(previous.parent().expect("previous directory"))
+            .expect("previous installation");
+        fs::write(&previous, b"previous version").expect("previous tool");
+        fs::create_dir_all(&bin).expect("shared bin");
+        symlink(&previous, bin.join("fixture-tool")).expect("previous link");
+        let mut paths = vec![managers.clone()];
+        paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
+        let path = std::env::join_paths(paths).expect("fixture PATH");
+        with_managed_fixture_environment(&path, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            runtime.block_on(async {
+                let install = install_managed("npm", "fixture-tool", "fixture-tool", &tools, &bin);
+                {
+                    tokio::pin!(install);
+                    tokio::select! {
+                        biased;
+                        outcome = &mut install => panic!("install completed before cancellation: {outcome:?}"),
+                        () = async {
+                            tokio::time::timeout(Duration::from_millis(500), async {
+                                while !managers.join("started").exists() {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                            }).await.expect("manager must start without blocking the executor");
+                        } => {}
+                    }
+                }
+                assert!(!managers.join("verified").exists(), "verification has not run yet");
+                assert_eq!(fs::read(bin.join("fixture-tool")).expect("previous link"), b"previous version");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while fs::read(bin.join("fixture-tool")).ok().as_deref() != Some(b"#!/bin/sh\necho new-version\n")
+                        || fs::read_dir(tools.join("npm")).expect("manager directory").count() != 1
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("owned worker must finish verification and activation");
+                assert!(managers.join("verified").exists(), "signatures checked before publication");
+                assert_eq!(fs::read_link(bin.join("fixture-tool")).expect("new link"), install_dir.join("node_modules/.bin/fixture-tool"));
+            });
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_managed_install_keeps_child_and_cleanup_owned() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::dropping_managed_install_keeps_child_and_cleanup_owned",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().expect("fixture directory");
+        let managers = temp.path().join("managers");
+        let tools = temp.path().join("tools");
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&managers).expect("manager directory");
+        let npm = managers.join("npm");
+        fs::write(
+            &npm,
+            b"#!/bin/sh\nfixture=$(dirname \"$0\")\nprintf started > \"$fixture/started\"\nsleep 1\nprintf finished > \"$fixture/finished\"\nexit 1\n",
+        )
+        .expect("disposable manager");
+        fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).expect("manager permissions");
+        let previous = tools.join("npm/fixture-tool/bin/fixture-tool");
+        fs::create_dir_all(previous.parent().expect("previous directory"))
+            .expect("previous installation");
+        fs::write(&previous, b"previous version").expect("previous tool");
+
+        let mut paths = vec![managers.clone()];
+        paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
+        let path = std::env::join_paths(paths).expect("fixture PATH");
+        with_managed_fixture_environment(&path, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            runtime.block_on(async {
+                let install = install_managed("npm", "fixture-tool", "fixture-tool", &tools, &bin);
+                {
+                    tokio::pin!(install);
+                    tokio::select! {
+                        biased;
+                        outcome = &mut install => panic!("install completed before cancellation: {outcome:?}"),
+                        () = async {
+                            tokio::time::timeout(Duration::from_millis(500), async {
+                                while !managers.join("started").exists() {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                            }).await.expect("manager must start without blocking the executor");
+                        } => {}
+                    }
+                } // Drop the caller while the worker still owns its child and staging tree.
+                assert!(!managers.join("finished").exists(), "child is still running");
+                assert_eq!(fs::read(&previous).expect("previous tool"), b"previous version");
+                assert_eq!(fs::read_dir(tools.join("npm")).expect("manager directory").count(), 2);
+                // Caller cancellation must not release the worker's admission
+                // permit while its child is still running. A queued, cancelled
+                // install must not create another staging tree or child.
+                let queued = install_managed("npm", "fixture-tool", "queued-tool", &tools, &bin);
+                {
+                    tokio::pin!(queued);
+                    tokio::select! {
+                        biased;
+                        outcome = &mut queued => panic!("queued install ran before the worker finished: {outcome:?}"),
+                        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    }
+                }
+                assert_eq!(
+                    fs::read_dir(tools.join("npm")).expect("manager directory").count(),
+                    2,
+                    "cancelled queued install must not create staging",
+                );
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !managers.join("finished").exists()
+                        || fs::read_dir(tools.join("npm")).expect("manager directory").count() != 1
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("owned worker must wait for the child and clean staging");
+                assert_eq!(fs::read(&previous).expect("previous tool"), b"previous version");
+            });
+        });
+    }
+
+    /// A slow disposable manager must not delay unrelated current-thread work.
+    /// Exercise the real installation path without contacting a registry.
+    #[cfg(unix)]
+    #[test]
+    fn slow_managed_install_does_not_starve_current_thread_timer() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::slow_managed_install_does_not_starve_current_thread_timer",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().expect("fixture directory");
+        let managers = temp.path().join("managers");
+        let tools = temp.path().join("tools");
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&managers).expect("manager directory");
+        for executable in ["npm", "cargo", "python3", "go"] {
+            let program = managers.join(executable);
+            fs::write(
+                &program,
+                b"#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf started > \"$(dirname \"$0\")/started\"\nsleep 1\nexit 1\n",
+            )
+            .expect("disposable manager");
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+                .expect("manager permissions");
+        }
+        fs::create_dir_all(&bin).expect("shared bin directory");
+
+        let mut paths = vec![managers.clone()];
+        paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
+        let path = std::env::join_paths(paths).expect("fixture PATH");
+        with_managed_fixture_environment(&path, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            let mut starved_managers = Vec::new();
+            for (manager, expected_error) in [
+                ("npm", "NPM install"),
+                ("cargo", "Cargo install"),
+                ("pip", "Failed to create python venv"),
+                ("go", "Go install"),
+            ] {
+                let previous = tools.join(manager).join("fixture-tool/bin/fixture-tool");
+                fs::create_dir_all(previous.parent().expect("previous tool directory"))
+                    .expect("previous installation");
+                fs::write(&previous, b"previous version").expect("previous tool");
+                runtime.block_on(async {
+                    let started = Instant::now();
+                    let (outcome, tick_elapsed) = tokio::join!(
+                        biased;
+                        install_managed(manager, "fixture-tool", "fixture-tool", &tools, &bin),
+                        async {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            started.elapsed()
+                        },
+                    );
+                    let error = outcome.expect_err("fixture manager deliberately fails");
+                    assert!(
+                        error.to_string().contains(expected_error),
+                        "{manager}: {error:#}"
+                    );
+                    assert!(managers.join("started").is_file(), "fixture must run");
+                    fs::remove_file(managers.join("started")).expect("reset manager marker");
+                    assert_eq!(
+                        fs::read(&previous).expect("previous tool"),
+                        b"previous version"
+                    );
+                    assert_eq!(
+                        fs::read_dir(tools.join(manager))
+                            .expect("manager installation directory")
+                            .count(),
+                        1,
+                        "failed installation must remove staging and retain the old tool",
+                    );
+                    eprintln!("{manager}: 50ms timer completed at {tick_elapsed:?}");
+                    if tick_elapsed >= Duration::from_millis(500) {
+                        starved_managers.push((manager, tick_elapsed));
+                    }
+                });
+            }
+            assert!(
+                starved_managers.is_empty(),
+                "50ms timer was starved by managers: {starved_managers:?}",
+            );
+        });
+    }
 
     #[test]
     fn virtualenv_activation_scripts_are_not_linkable_tools() {

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from scripts.test_qemu_health import channel_fixture
 
 
 class CargoFixtureTests(unittest.TestCase):
@@ -27,8 +28,8 @@ class CargoFixtureTests(unittest.TestCase):
                 shutil.copyfile(Path(__file__).with_name('check-qemu-health.py'), root / 'check-qemu-health.py')
                 for operation, digit in (('remove', '5'), ('install', '6')):
                     boot = '00000000-1111-2222-3333-' + digit * 12
-                    receipt = dict(schema_version=1, complete=True, boot_id=boot, kernel_bytes=100,
-                                   fatal_signatures=[], product_crashes=[])
+                    receipt = dict(schema_version=2, complete=True, boot_id=boot, kernel_bytes=100,
+                                   fatal_signatures=[], product_crashes=[], crash_channel=channel_fixture(boot))
                     if operation == failed_operation:
                         if mode == 'crash': receipt['product_crashes'] = [{'process': 'omg', 'signal': 6}]
                         if mode == 'mismatch': receipt['boot_id'] = '00000000-1111-2222-3333-777777777777'

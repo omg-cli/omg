@@ -2670,16 +2670,11 @@ fn dependencies_from_status(content: &str, package_name: &str) -> (Vec<String>, 
         }
 
         let mut current_pkg = String::new();
-        let mut current_deps = Vec::new();
+        let current_deps = status_dependency_names(paragraph, &["Depends", "Pre-Depends"]);
 
         for line in paragraph.lines() {
             if let Some(pkg) = line.strip_prefix("Package: ") {
                 current_pkg = pkg.trim().to_string();
-            } else if let Some(deps_str) = line
-                .strip_prefix("Depends: ")
-                .or_else(|| line.strip_prefix("Pre-Depends: "))
-            {
-                append_dependency_names(deps_str, &mut current_deps);
             }
         }
 
@@ -2691,6 +2686,38 @@ fn dependencies_from_status(content: &str, package_name: &str) -> (Vec<String>, 
     }
 
     (dependencies, reverse_deps)
+}
+
+/// Unfold selected dependency fields before parsing names so line breaks within
+/// alternatives or version constraints cannot create spurious package names.
+fn status_dependency_names(paragraph: &str, fields: &[&str]) -> Vec<String> {
+    let mut dependencies = Vec::new();
+    let mut value = String::new();
+    let mut selected = false;
+    for line in paragraph.lines() {
+        if line.starts_with([' ', '\t']) {
+            if selected {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        if selected {
+            append_dependency_names(&value, &mut dependencies);
+            value.clear();
+        }
+        selected = false;
+        if let Some((name, contents)) = line.split_once(':')
+            && fields.iter().any(|field| name.eq_ignore_ascii_case(field))
+        {
+            selected = true;
+            value.push_str(contents.trim());
+        }
+    }
+    if selected {
+        append_dependency_names(&value, &mut dependencies);
+    }
+    dependencies
 }
 
 /// Extract dependency package names from a `Depends:`/`Pre-Depends:` value,
@@ -3025,16 +3052,11 @@ fn dependency_map_from_status(content: &str) -> HashMap<String, Vec<String>> {
 
     for paragraph in status_paragraphs(content) {
         let mut current_pkg = String::new();
-        let mut current_deps: Vec<String> = Vec::new();
+        let mut current_deps =
+            status_dependency_names(paragraph, &["Depends", "Pre-Depends", "Recommends"]);
         for line in paragraph.lines() {
             if let Some(pkg) = line.strip_prefix("Package: ") {
                 current_pkg = pkg.trim().to_string();
-            } else if let Some(deps_str) = line
-                .strip_prefix("Depends: ")
-                .or_else(|| line.strip_prefix("Pre-Depends: "))
-                .or_else(|| line.strip_prefix("Recommends: "))
-            {
-                append_dependency_names(deps_str, &mut current_deps);
             }
         }
 
@@ -4001,6 +4023,45 @@ mod tests {
         let dependencies = dependency_map_from_status(content);
         assert!(!dependencies.contains_key("partial"));
         assert_eq!(dependencies["complete"], ["libc6"]);
+    }
+
+    #[test]
+    fn status_dependencies_unfold_forward_and_reverse_edges() {
+        let content = "Package: app\nStatus: install ok installed\nDepends: first (>= 1),\n second:any |\n\tthird (= 2)\nPre-Depends: prefirst,\n\tpresecond:native\nDescription: unrelated\n ghost\nRecommends: softfirst,\n softsecond\n\nPackage: removed\nStatus: deinstall ok config-files\nDepends: first,\n second\n";
+        assert_eq!(
+            dependencies_from_status(content, "app").0,
+            ["first", "second", "third", "prefirst", "presecond"]
+        );
+        assert_eq!(dependencies_from_status(content, "second").1, ["app"]);
+        assert_eq!(dependencies_from_status(content, "presecond").1, ["app"]);
+    }
+
+    #[test]
+    fn status_dependency_map_unfolds_recommends_without_description_leaks() {
+        let content = "Package: app\nStatus: install ok installed\nDepends: first,\n\tsecond:any | third\nPre-Depends: prefirst,\n presecond\nRecommends: softfirst,\n\tsoftsecond\nDescription: unrelated\n ghost\n\nPackage: partial\nStatus: install ok half-installed\nDepends: first,\n second\n";
+        let dependencies = dependency_map_from_status(content);
+        assert_eq!(
+            dependencies["app"],
+            [
+                "first",
+                "second",
+                "third",
+                "prefirst",
+                "presecond",
+                "softfirst",
+                "softsecond"
+            ]
+        );
+        assert!(!dependencies.contains_key("partial"));
+    }
+
+    #[test]
+    fn status_dependencies_fold_version_constraints_and_alternatives_as_one_value() {
+        let content = "Package: app\r\nStatus: install ok installed\r\nDepends: first (>=\r\n 1), second\r\n | third:any\r\n\r\nPackage: client\r\nStatus: install ok installed\r\nPre-Depends: first,\r\n app\r\n";
+        let (dependencies, reverse) = dependencies_from_status(content, "app");
+        assert_eq!(dependencies, ["first", "second", "third"]);
+        assert_eq!(reverse, ["client"]);
+        assert_eq!(dependency_map_from_status(content)["app"], dependencies);
     }
 
     #[test]

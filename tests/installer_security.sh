@@ -17,6 +17,7 @@ wait_until_dead() {
   return 1
 }
 cd "$(dirname "$0")/.."
+bash tests/installer_source_features.sh
 task_dir=$(mktemp -d)
 trap 'rm -rf "$task_dir"' EXIT
 sed '$d' install.sh > "$task_dir/functions.sh"
@@ -359,4 +360,5 @@ fi
   cmp "$CONFIG_DIR/config.toml" "$task_dir/config-before"
   cmp "$CONFIG_DIR/policy.toml" "$task_dir/policy-before"
 )
+python3 tests/test_shell_backup_safety.py
 printf 'Installer security scenarios passed\n'

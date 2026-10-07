@@ -28,8 +28,18 @@ if ! endpoint="$(jq -ner 'env.OMG_SMOKE_SENTRY_DSN | capture("^https://[A-Za-z0-
 fi
 release="${OMG_SMOKE_RELEASE:-unknown}"
 [[ "$release" == unknown || "$release" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
-run_id="$(basename "$(dirname "$1")")"
+run_id="${OMG_SMOKE_RUN_ID:-$(basename "$(dirname "$1")")}"
 [[ "$run_id" =~ ^[A-Za-z0-9_-]{1,100}$ ]] || exit 2
+source_sha="${OMG_SMOKE_SOURCE_SHA:-}"
+run_attempt="${OMG_SMOKE_RUN_ATTEMPT:-}"
+if [[ -n "${OMG_SMOKE_RUN_ID+x}${OMG_SMOKE_SOURCE_SHA+x}${OMG_SMOKE_RUN_ATTEMPT+x}" ]]; then
+  [[ "${OMG_SMOKE_RUN_ID:-}" =~ ^[1-9][0-9]{0,19}$ &&
+     "$source_sha" =~ ^[0-9a-f]{40}$ &&
+     "$run_attempt" =~ ^[1-9][0-9]{0,3}$ ]] || {
+    printf 'Invalid or incomplete hosted Sentry run identity\n' >&2
+    exit 2
+  }
+fi
 
 failures="$(jq -ce '
   def identifier: type == "string" and test("^[a-z0-9][a-z0-9-]{0,127}$");
@@ -44,6 +54,8 @@ failures="$(jq -ce '
                      "ci-non-qemu-workflow")))) and
     (.result | IN("PASS", "SKIPPED", "EXPECTED_REJECTION", "PRODUCT_FAIL", "HARNESS_ERROR", "FAIL", "BLOCKED")) and
     (.exit_code | type == "number" and floor == . and . >= -1 and . <= 255) and
+    # PASS requires an executed exit; inventory expectations may be nonzero.
+    (.result != "PASS" or .exit_code >= 0) and
     (.elapsed_seconds | type == "number" and . >= 0 and . <= 86400))
   then . else error("invalid result fields") end |
   map(select(.result == "PRODUCT_FAIL" or .result == "HARNESS_ERROR" or .result == "FAIL") |
@@ -61,12 +73,15 @@ http_code="$({
   jq -cn --arg id "$event_id" '{event_id:$id,dsn:env.OMG_SMOKE_SENTRY_DSN}'
   printf '{"type":"event"}\n'
   jq -cn --arg id "$event_id" --arg release "$release" --arg run_id "$run_id" \
+    --arg source_sha "$source_sha" --arg run_attempt "$run_attempt" \
     --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson failures "$failures" \
     --arg environment "$environment" \
     '{event_id:$id,timestamp:$timestamp,platform:"other",level:"error",logger:"omg-smoke",
       environment:$environment,release:$release,message:"OMG release smoke run has failures",
       fingerprint:["omg-smoke",$release,($failures | map(.distro+":"+.case_id+":"+.result) | sort | join(","))],
-      tags:{run_id:$run_id,reporter:"post-run"},extra:{failures:$failures}}'
+      tags:({run_id:$run_id,reporter:"post-run"} +
+        if $source_sha == "" then {} else {source_sha:$source_sha,run_attempt:$run_attempt} end),
+      extra:{failures:$failures}}'
 } | curl --silent --show-error --connect-timeout 3 --max-time 8 --proto '=https' \
   -H 'Content-Type: application/x-sentry-envelope' --data-binary @- \
   --output /dev/null --write-out '%{http_code}' "$endpoint")" || {

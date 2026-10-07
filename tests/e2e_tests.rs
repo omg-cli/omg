@@ -359,6 +359,82 @@ mod usage_tests {
         Ok(())
     }
 
+    /// Successful installs persist per-package estimates but one command event.
+    #[test]
+    #[serial]
+    fn install_estimates_scale_with_tracked_packages() -> Result<()> {
+        use omg_lib::core::usage::{track_install_result, track_search};
+
+        for (count, expected_credit) in [(50, 75_000), (1, 1_500), (0, 0)] {
+            let env = E2ETestEnv::new()?;
+            let data_dir = env.data_path().to_string_lossy().into_owned();
+            let packages: Vec<String> = (0..count).map(|i| format!("package-{i}")).collect();
+            with_test_env(
+                &[("OMG_DATA_DIR", &data_dir), ("OMG_TEST_MODE", "1")],
+                || {
+                    track_search();
+                    track_install_result(&packages, true);
+                },
+            );
+
+            let stats = with_test_env(
+                &[("OMG_DATA_DIR", &data_dir), ("OMG_TEST_MODE", "1")],
+                UsageStats::load,
+            )?;
+            assert_eq!(stats.time_saved_ms, 127 + expected_credit, "count={count}");
+            assert_eq!(
+                stats.time_saved_today_ms,
+                127 + expected_credit,
+                "count={count}"
+            );
+            assert_eq!(stats.total_commands, 2);
+            assert_eq!(stats.queries_today, 2);
+            assert_eq!(stats.queries_this_month, 2);
+            assert_eq!(stats.installs_today, 1);
+            assert_eq!(stats.commands.get("install"), Some(&1));
+            assert_eq!(stats.installed_packages.len(), count);
+            for package in &packages {
+                assert_eq!(stats.installed_packages.get(package), Some(&1));
+            }
+        }
+        Ok(())
+    }
+
+    /// Failed installs neither create usage state nor change existing credit.
+    #[test]
+    #[serial]
+    fn failed_installs_preserve_usage_credit() -> Result<()> {
+        use omg_lib::core::usage::track_install_result;
+
+        let env = E2ETestEnv::new()?;
+        let data_dir = env.data_path().to_string_lossy().into_owned();
+        let packages = ["firefox".to_string(), "vim".to_string()];
+        let path = env.data_path().join("usage.json");
+        with_test_env(
+            &[("OMG_DATA_DIR", &data_dir), ("OMG_TEST_MODE", "1")],
+            || {
+                track_install_result(&packages, false);
+            },
+        );
+        assert!(!path.exists());
+
+        with_test_env(
+            &[("OMG_DATA_DIR", &data_dir), ("OMG_TEST_MODE", "1")],
+            || {
+                track_install_result(&packages[..1], true);
+            },
+        );
+        let before = fs::read(&path)?;
+        with_test_env(
+            &[("OMG_DATA_DIR", &data_dir), ("OMG_TEST_MODE", "1")],
+            || {
+                track_install_result(&packages, false);
+            },
+        );
+        assert_eq!(fs::read(&path)?, before);
+        Ok(())
+    }
+
     /// Verify `runtime_usage_counts` tracking through the product path:
     /// `track_runtime_switch` increments counters and persists them
     /// (src/core/usage.rs:573).

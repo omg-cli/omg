@@ -64,7 +64,7 @@ class MutationReportsTests(unittest.TestCase):
             metadata = {"source_sha": SOURCE, "run_id": "123", "run_attempt": "1",
                         "shard_index": index, "shard_count": shards,
                         "cargo_mutants_version": "27.1.0", "files": FILES,
-                        "test_timeout_seconds": 60, "jobs": 2,
+                        "test_timeout_seconds": 120, "jobs": 2,
                         "job_timeout_minutes": 120, "baseline": "run",
                         "no_default_features": True, "features": ["pgp", "license"],
                         "shuffling": False, "sharding": "slice"}
@@ -158,10 +158,14 @@ class MutationReportsTests(unittest.TestCase):
         (self.root / "shard-1/metadata.json").unlink()
         self.assert_rejected("metadata")
 
+    def test_previous_sixty_second_receipt_cannot_admit_new_budget(self):
+        self.change("shard-0/metadata.json", lambda value: value.update(test_timeout_seconds=60))
+        self.assert_rejected("metadata")
+
     def test_metadata_revisions_run_attempt_and_limits_are_bound(self):
         changes = {"source_sha": "b" * 40, "run_id": "124", "run_attempt": "2",
                    "shard_index": 1, "shard_count": 3, "baseline": "skip",
-                   "jobs": 3, "test_timeout_seconds": 61, "job_timeout_minutes": 121,
+                   "jobs": 3, "test_timeout_seconds": 121, "job_timeout_minutes": 121,
                    "files": FILES[:-1], "features": ["pgp"], "shuffling": True,
                    "sharding": "round-robin", "cargo_mutants_version": "28.0.0"}
         path = self.root / "shard-0/metadata.json"

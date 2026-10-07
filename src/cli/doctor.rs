@@ -1946,21 +1946,24 @@ mod tests {
         assert_eq!(status.diagnostic(), "HTTP 500");
         finish_probe_server(server).await;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("refused probe listener");
-        let url = format!(
-            "http://{}",
-            listener.local_addr().expect("listener address")
-        );
-        // Close the listener: a bound, non-listening socket need not refuse on every OS.
-        drop(listener);
-        let refused = probe_endpoint(&client, &url, Duration::from_secs(1)).await;
+        // An explicit empty DNS override exercises the real connector's error
+        // classification without external DNS or a platform-specific TCP state.
+        let disconnected_client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve_to_addrs("connect-failure.invalid", &[])
+            .build()
+            .expect("controlled connection-failure client");
+        let failed = probe_endpoint(
+            &disconnected_client,
+            "https://connect-failure.invalid",
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(
-            matches!(refused, EndpointProbe::ConnectFailure(_)),
-            "closed loopback listener must refuse the connection: {refused:?}"
+            matches!(failed, EndpointProbe::ConnectFailure(_)),
+            "a connector with no destination addresses must report a connection failure: {failed:?}"
         );
-        assert!(refused.diagnostic().starts_with("connection error: "));
+        assert!(failed.diagnostic().starts_with("connection error: "));
 
         let deadline = Duration::from_millis(50);
         let (url, server) = serve_probe_response(OK, Duration::from_millis(250)).await;
@@ -1990,6 +1993,39 @@ mod tests {
         assert!(matches!(malformed, EndpointProbe::RequestFailure(_)));
         assert!(malformed.diagnostic().starts_with("request error: "));
         finish_probe_server(server).await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn reserved_non_listening_port_preserves_kernel_probe_outcome() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local probe client");
+        let reservation = tokio::net::TcpSocket::new_v4().expect("reserved probe socket");
+        reservation
+            .bind("127.0.0.1:0".parse().unwrap())
+            .expect("reserve probe address");
+        let url = format!(
+            "http://{}",
+            reservation.local_addr().expect("reserved address")
+        );
+        // Keep the socket bound throughout the probe to prevent port reuse.
+        // Linux rejects this connection; Darwin drops TCP input for the closed
+        // PCB, so the outer deadline must remain distinct from a connect error.
+        let deadline = Duration::from_secs(1);
+        let outcome = probe_endpoint(&client, &url, deadline).await;
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                matches!(outcome, EndpointProbe::ConnectFailure(_)),
+                "{outcome:?}"
+            );
+            assert!(outcome.diagnostic().starts_with("connection error: "));
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(outcome, EndpointProbe::DeadlineExceeded(deadline));
+        drop(reservation);
     }
 
     #[tokio::test]

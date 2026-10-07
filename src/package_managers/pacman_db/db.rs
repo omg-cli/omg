@@ -2119,6 +2119,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn sync_database_order_follows_pacman_configuration() {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::pacman_db::db::tests::sync_database_order_follows_pacman_configuration",
+        ) {
+            return;
+        }
         if crate::config::Settings::rerun_test_unprivileged(
             "package_managers::pacman_db::db::tests::sync_database_order_follows_pacman_configuration",
         ) {
@@ -2155,6 +2160,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_collect_sync_db_paths_excludes_sig_files() {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::pacman_db::db::tests::test_collect_sync_db_paths_excludes_sig_files",
+        ) {
+            return;
+        }
         if crate::config::Settings::rerun_test_unprivileged(
             "package_managers::pacman_db::db::tests::test_collect_sync_db_paths_excludes_sig_files",
         ) {
@@ -2237,6 +2247,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_collect_sync_db_paths_unreadable_dir_errors() {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::pacman_db::db::tests::test_collect_sync_db_paths_unreadable_dir_errors",
+        ) {
+            return;
+        }
         if crate::config::Settings::rerun_test_unprivileged(
             "package_managers::pacman_db::db::tests::test_collect_sync_db_paths_unreadable_dir_errors",
         ) {
@@ -3223,6 +3238,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn fast_path_and_libalpm_counts_agree_on_fixture_local_db() {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_agree_on_fixture_local_db",
+        ) {
+            return;
+        }
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
         let db_dir = root.join("var/lib/pacman");
