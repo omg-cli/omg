@@ -2058,4 +2058,49 @@ mod tests {
         );
         Ok(())
     }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn prepared_transaction_requires_advisory_evidence_for_explicit_policy() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::policy::tests::prepared_transaction_requires_advisory_evidence_for_explicit_policy";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        assert!(!crate::core::privilege::is_root());
+        let directory = tempfile::tempdir()?;
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_TEST_DISTRO", Some(std::ffi::OsStr::new("fedora"))),
+            ],
+            || -> anyhow::Result<()> {
+                assert_eq!(
+                    crate::core::env::distro::detect_distro(),
+                    crate::core::env::distro::Distro::Fedora
+                );
+                let package = || {
+                    vec![(
+                        "candidate".into(),
+                        crate::package_managers::parse_version_or_zero("1.0"),
+                        false,
+                        Some("MIT".into()),
+                    )]
+                };
+                check_prepared_packages(package())?;
+                let path = directory.path().join("policy.toml");
+                let bytes = toml::to_string(&SecurityPolicy::default())?;
+                fs::write(&path, &bytes)?;
+                let error = check_prepared_packages(package()).expect_err("explicit policy requires available advisory evidence even when all fields have their default values");
+                assert!(
+                    matches!(error.downcast_ref::<VulnerabilityError>(), Some(VulnerabilityError::Unavailable { reason }) if reason == "OSV has no configured ecosystem for the running package backend")
+                );
+                assert_eq!(fs::read_to_string(&path)?, bytes);
+                Ok(())
+            },
+        )
+    }
 }
