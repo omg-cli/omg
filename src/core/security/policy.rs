@@ -1787,6 +1787,11 @@ mod tests {
         ) {
             return Ok(());
         }
+        if crate::config::Settings::rerun_test_unprivileged(
+            "core::security::policy::tests::policy_handoff_preserves_absence_explicit_policy_and_refusals",
+        ) {
+            return Ok(());
+        }
         assert!(
             !crate::core::privilege::is_root(),
             "fixture must be unprivileged"
@@ -1858,6 +1863,11 @@ mod tests {
     #[test]
     fn default_policy_and_unprivileged_handoff_refusal_are_preserved() -> anyhow::Result<()> {
         if crate::core::testing::run_isolated_test(
+            "core::security::policy::tests::default_policy_and_unprivileged_handoff_refusal_are_preserved",
+        ) {
+            return Ok(());
+        }
+        if crate::config::Settings::rerun_test_unprivileged(
             "core::security::policy::tests::default_policy_and_unprivileged_handoff_refusal_are_preserved",
         ) {
             return Ok(());
