@@ -1955,7 +1955,7 @@ mod tests {
             .expect("controlled connection-failure client");
         let failed = probe_endpoint(
             &disconnected_client,
-            "http://connect-failure.invalid",
+            "https://connect-failure.invalid",
             Duration::from_secs(1),
         )
         .await;
