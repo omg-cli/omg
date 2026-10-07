@@ -371,58 +371,17 @@ async fn request_runtime_download(
     url: &str,
     resume: Option<ResumeRequest>,
 ) -> Result<reqwest::Response> {
-    retry_runtime_request(url, || {
-        let resume = resume.clone();
-        async move {
-            if let Some(resume) = resume {
-                crate::core::http::fetch_public_download_with_range(
-                    url,
-                    GITHUB_USER_AGENT,
-                    resume.offset,
-                    resume.validator,
-                )
-                .await
-            } else {
-                crate::core::http::fetch_public_download(url, GITHUB_USER_AGENT).await
-            }
-        }
-    })
-    .await
-}
-
-async fn retry_runtime_request<F, Fut>(url: &str, mut request: F) -> Result<reqwest::Response>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<reqwest::Response>>,
-{
-    let parsed_url = reqwest::Url::parse(url).ok();
-    let host = parsed_url
-        .as_ref()
-        .and_then(reqwest::Url::host_str)
-        .unwrap_or("unknown");
-    for attempt in 0..3 {
-        match request().await {
-            Err(error)
-                if attempt < 2
-                    && error
-                        .downcast_ref::<reqwest::Error>()
-                        .is_some_and(crate::core::http::is_retryable_error) =>
-            {
-                tracing::warn!(
-                    attempt = attempt + 1,
-                    host,
-                    "Runtime download connection failed; retrying bounded GET request"
-                );
-                tokio::time::sleep(crate::core::http::retry_backoff(
-                    std::time::Duration::from_millis(100),
-                    attempt,
-                ))
-                .await;
-            }
-            result => return result,
-        }
+    if let Some(resume) = resume {
+        crate::core::http::fetch_public_download_with_range(
+            url,
+            GITHUB_USER_AGENT,
+            resume.offset,
+            resume.validator,
+        )
+        .await
+    } else {
+        crate::core::http::fetch_public_download(url, GITHUB_USER_AGENT).await
     }
-    unreachable!("final request attempt always returns")
 }
 
 /// Number of attempts for one runtime artifact download: the initial try plus
@@ -2374,52 +2333,74 @@ mod tests {
     -> anyhow::Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
-        for (stall_first, status, expected_requests) in [
-            (true, "200 OK", 2),
-            (false, "404 Not Found", 1),
-            (false, "403 Forbidden", 1),
+        for (stalled_requests, status, expected_requests) in [
+            (1, "200 OK", 2),
+            (0, "404 Not Found", 1),
+            (0, "403 Forbidden", 1),
+            (usize::MAX, "200 OK", 3),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let url = format!("http://{}/archive", listener.local_addr()?);
             let client = reqwest::Client::builder()
                 .no_proxy()
-                // Keep the deliberate first stall, while giving the later
-                // loopback response room for scheduling on loaded CI runners.
                 .timeout(std::time::Duration::from_millis(500))
                 .build()?;
+            let directory = tempfile::tempdir()?;
+            let dest = directory.path().join("runtime.tar.gz");
+            let requests = std::sync::atomic::AtomicUsize::new(0);
+            let mut held = Vec::new();
             let server = async {
-                let mut held = Vec::new();
-                for attempt in 1..=expected_requests {
+                loop {
                     let (mut stream, _) = listener.accept().await?;
                     let mut request = [0; 4096];
                     let length = stream.read(&mut request).await?;
                     anyhow::ensure!(request[..length].starts_with(b"GET /archive HTTP/1.1\r\n"));
-                    if stall_first && attempt == 1 {
-                        held.push(stream); // Keep the first request pending until its client deadline.
+                    let attempt = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if attempt <= stalled_requests {
+                        held.push(stream);
                     } else {
                         stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfixture").as_bytes()).await?;
                     }
                 }
-                Ok::<_, anyhow::Error>(held)
             };
-            let request = async {
-                let response = super::retry_runtime_request(&url, || {
-                    let client = &client;
-                    let url = &url;
-                    async move { Ok(client.get(url).send().await?) }
-                })
-                .await?;
-                assert_eq!(response.status().as_u16(), status[..3].parse::<u16>()?);
-                assert_eq!(response.text().await?, "fixture");
-                Ok::<_, anyhow::Error>(())
-            };
-            let (server, request) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    tokio::join!(server, request)
-                })
-                .await?;
-            drop(server?);
-            request?;
+            let download = stream_runtime_download_to_temp::<Sha256, _, _>(
+                "127.0.0.1",
+                |_resume| async { Ok(client.get(&url).send().await?) },
+                &dest,
+            );
+            let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                tokio::select! {
+                    result = download => result,
+                    result = server => { let result: anyhow::Result<()> = result; result?; anyhow::bail!("fixture server stopped") }
+                }
+            }).await?;
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                expected_requests
+            );
+            assert_eq!(held.len(), stalled_requests.min(expected_requests));
+            drop(held);
+            if stalled_requests == usize::MAX {
+                let error =
+                    result.expect_err("connection failures must exhaust three shared attempts");
+                assert!(error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_timeout)
+                }));
+            } else if status == "200 OK" {
+                let (temporary, digest) = result?;
+                assert_eq!(fs::read(&temporary)?, b"fixture");
+                assert_eq!(digest, hex::encode(Sha256::digest(b"fixture")));
+                drop(temporary);
+            } else {
+                assert!(
+                    format!("{:#}", result.expect_err("HTTP refusal must remain fatal"))
+                        .contains(&status[..3])
+                );
+            }
+            assert!(!dest.exists());
+            assert_eq!(fs::read_dir(directory.path())?.count(), 0);
         }
         Ok(())
     }
