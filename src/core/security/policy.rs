@@ -1834,4 +1834,55 @@ mod tests {
             },
         )
     }
+
+    #[test]
+    fn policy_file_accepts_exact_byte_limit_and_refuses_larger_files() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let file = directory.path().join("policy.toml");
+        let allowed = "x".repeat(1_048_576);
+        fs::write(&file, &allowed)?;
+        assert_eq!(
+            read_policy_file(&file)?,
+            allowed,
+            "exactly 1 MiB must be retained"
+        );
+        for extra in [1, 2] {
+            fs::write(&file, "x".repeat(1_048_576 + extra))?;
+            let error = read_policy_file(&file).expect_err("larger policy must refuse");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("exceeds 1 MiB limit"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn default_policy_and_unprivileged_handoff_refusal_are_preserved() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "core::security::policy::tests::default_policy_and_unprivileged_handoff_refusal_are_preserved",
+        ) {
+            return Ok(());
+        }
+        assert!(
+            !crate::core::privilege::is_root(),
+            "fixture must be unprivileged"
+        );
+        let policy: SecurityPolicy = toml::from_str("")?;
+        assert_eq!(
+            policy,
+            SecurityPolicy::default(),
+            "omitted fields retain defaults"
+        );
+        assert!(policy.allow_aur, "the default allows AUR");
+        let argument = format!(
+            "{POLICY_MARKER}{}",
+            hex::encode(serde_json::to_vec(&policy)?)
+        );
+        let error = inherit_policy(&argument).expect_err("unprivileged handoff must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("Only an elevated child can inherit policy")
+        );
+        Ok(())
+    }
 }
