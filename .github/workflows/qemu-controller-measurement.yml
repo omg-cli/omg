@@ -1,0 +1,131 @@
+name: Optional QEMU controller image measurement
+
+on:
+  pull_request:
+    paths:
+      - scripts/qemu-controller.Dockerfile
+      - scripts/qemu-controller-image.py
+      - scripts/measure-qemu-controller.py
+      - scripts/test_qemu_controller_image.py
+      - scripts/test_controller_measurement.py
+      - .github/workflows/qemu-controller-measurement.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: controller-measurement-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      archive_sha: ${{ steps.build.outputs.archive_sha256 }}
+      config_sha: ${{ steps.build.outputs.config_sha256 }}
+      packet_sha: ${{ steps.build.outputs.packet_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: |
+          python3 -B scripts/test_qemu_controller_image.py
+          python3 -B scripts/test_controller_measurement.py
+      - id: build
+        run: python3 -B scripts/measure-qemu-controller.py build --architecture amd64 --source "$GITHUB_SHA" --output controller-build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: success()
+        with:
+          name: controller-image-amd64
+          path: |
+            controller-build/image.tar
+            controller-build/image.json
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: controller-build-evidence-amd64
+          path: |
+            controller-build/*.log
+            controller-build/steps.json
+          retention-days: 7
+
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    outputs:
+      archive_sha: ${{ steps.build.outputs.archive_sha256 }}
+      config_sha: ${{ steps.build.outputs.config_sha256 }}
+      packet_sha: ${{ steps.build.outputs.packet_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: |
+          python3 -B scripts/test_qemu_controller_image.py
+          python3 -B scripts/test_controller_measurement.py
+      - id: build
+        run: python3 -B scripts/measure-qemu-controller.py build --architecture arm64 --source "$GITHUB_SHA" --output controller-build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: success()
+        with:
+          name: controller-image-arm64
+          path: |
+            controller-build/image.tar
+            controller-build/image.json
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: controller-build-evidence-arm64
+          path: |
+            controller-build/*.log
+            controller-build/steps.json
+          retention-days: 7
+
+  measure:
+    needs: [build-amd64, build-arm64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            producer: build-amd64
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            producer: build-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: controller-image-${{ matrix.architecture }}
+          path: controller-input
+      - name: Verify before loading and measure controller setup
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          ARCHIVE_SHA: ${{ needs[matrix.producer].outputs.archive_sha }}
+          CONFIG_SHA: ${{ needs[matrix.producer].outputs.config_sha }}
+          PACKET_SHA: ${{ needs[matrix.producer].outputs.packet_sha }}
+        run: >-
+          python3 -B scripts/measure-qemu-controller.py consume
+          --architecture "$ARCHITECTURE" --source "$GITHUB_SHA"
+          --input controller-input --output controller-measurement
+          --archive-sha "$ARCHIVE_SHA" --config-sha "$CONFIG_SHA" --packet-sha "$PACKET_SHA"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: controller-measurement-${{ matrix.architecture }}
+          path: controller-measurement
+          retention-days: 7
+          if-no-files-found: error
