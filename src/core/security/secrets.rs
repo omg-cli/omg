@@ -760,9 +760,9 @@ mod tests {
         let mut temp = tempfile::NamedTempFile::new().expect("temporary scan file");
         let marker = b"\n-----BEGIN RSA PRIVATE KEY-----\n";
         temp.as_file()
-            .set_len(SecretScanner::MAX_FILE_BYTES)
+            .set_len(10_485_760_u64)
             .expect("exact supported file size");
-        let offset = SecretScanner::MAX_FILE_BYTES
+        let offset = 10_485_760_u64
             .checked_sub(u64::try_from(marker.len()).expect("marker length fits u64"))
             .expect("marker fits inside the supported limit");
         temp.seek(SeekFrom::Start(offset))
@@ -770,7 +770,7 @@ mod tests {
         temp.write_all(marker).expect("write final secret marker");
         assert_eq!(
             temp.as_file().metadata().expect("fixture metadata").len(),
-            SecretScanner::MAX_FILE_BYTES
+            10_485_760_u64
         );
 
         let findings = SecretScanner::new()
@@ -779,14 +779,14 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(matches!(findings[0].secret_type, SecretType::PrivateKey));
         assert_eq!(findings[0].line_number, 2);
+        assert_eq!(findings[0].secret_type.to_string(), "Private Key");
+        assert_eq!(findings[0].severity.to_string(), "CRITICAL");
     }
 
     #[test]
     fn scan_file_rejects_files_over_the_bounded_read_limit() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        temp.as_file()
-            .set_len(SecretScanner::MAX_FILE_BYTES + 1)
-            .unwrap();
+        temp.as_file().set_len(10_485_760_u64 + 1).unwrap();
 
         let error = SecretScanner::new()
             .scan_file(temp.path())
