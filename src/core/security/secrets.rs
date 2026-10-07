@@ -710,6 +710,54 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_prefixes_are_independently_ignored() {
+        let scanner = SecretScanner::new();
+        for prefix in ["your_", "my_", "example_", "sample_", "placeholder_"] {
+            let content = format!("api_key = '{prefix}api_key_here'");
+            assert!(
+                scanner.scan_content(&content, "config.py").is_empty(),
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_directory_selects_source_sensitive_and_key_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let marker = "-----BEGIN RSA PRIVATE KEY-----\n";
+        let selected = ["module.rs", ".npmrc", "id_ed25519"];
+        for name in selected.into_iter().chain(["image.png"]) {
+            std::fs::write(temp.path().join(name), marker).unwrap();
+        }
+        let findings = SecretScanner::new().scan_directory(temp.path()).unwrap();
+        assert_eq!(findings.len(), selected.len());
+        for name in selected {
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.file_path == temp.path().join(name).display().to_string()
+                        && finding.secret_type == SecretType::PrivateKey
+                }),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_directory_includes_files_at_the_depth_limit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut path = temp.path().to_path_buf();
+        for _ in 0..64 {
+            path = path.join("d");
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        let file = path.join("tail.pem");
+        std::fs::write(&file, "-----BEGIN RSA PRIVATE KEY-----\n").unwrap();
+        let findings = SecretScanner::new().scan_directory(temp.path()).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].file_path, file.display().to_string());
+    }
+
+    #[test]
     fn test_redaction() {
         let secret = "secret_token_1234567890abcdef";
         let redacted = SecretScanner::redact(secret);

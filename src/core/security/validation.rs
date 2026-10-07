@@ -525,6 +525,7 @@ mod tests {
 
     #[test]
     fn test_valid_versions() {
+        assert!(validate_version(&"1".repeat(128)).is_ok());
         assert!(validate_version("1.0.0").is_ok());
         assert!(validate_version("2.3.4-rc1").is_ok());
         assert!(validate_version("1:2.3.4").is_ok()); // epoch
