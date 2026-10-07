@@ -146,4 +146,52 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn resolve_nvm_alias_rejects_invalid_paths_before_lookup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let missing_root = directory.path().join("missing-nvm");
+        for alias in [
+            "",
+            ".",
+            "..",
+            "../missing",
+            "nested/../../missing",
+            "/missing",
+        ] {
+            let error = resolve_nvm_alias(&missing_root, alias)
+                .expect_err("invalid alias must not become an absent optional alias");
+            assert!(
+                matches!(
+                    error.downcast_ref::<NvmAliasRejection>(),
+                    Some(NvmAliasRejection::InvalidPath(value)) if value == alias
+                ),
+                "wrong invalid-path result for {alias:?}: {error:#}"
+            );
+        }
+        assert!(!missing_root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_nvm_alias_rejects_invalid_chained_target() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let aliases = directory.path().join("alias");
+        std::fs::create_dir(&aliases)?;
+        let path = aliases.join("default");
+        for target in ["..", "../missing", "nested/../../missing", "/missing"] {
+            std::fs::write(&path, target)?;
+            let error = resolve_nvm_alias(directory.path(), "default")
+                .expect_err("invalid chained target must not become a version result");
+            assert!(
+                matches!(
+                    error.downcast_ref::<NvmAliasRejection>(),
+                    Some(NvmAliasRejection::InvalidPath(value)) if value == target
+                ),
+                "wrong chained invalid-path result for {target:?}: {error:#}"
+            );
+            assert_eq!(std::fs::read_to_string(&path)?, target);
+        }
+        Ok(())
+    }
 }

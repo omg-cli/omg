@@ -1895,4 +1895,64 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn missing_policy_diagnostic_is_emitted_once_per_process() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "core::security::policy::tests::missing_policy_diagnostic_is_emitted_once_per_process",
+        ) {
+            return Ok(());
+        }
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("diagnostic capture")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || Capture(writer.clone()))
+            .finish();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("policy.toml");
+        tracing::subscriber::with_default(subscriber, || -> anyhow::Result<()> {
+            assert_eq!(
+                SecurityPolicy::load_optional(&path)?,
+                SecurityPolicy::default()
+            );
+            let first = captured.lock().expect("diagnostic capture").clone();
+            let text = std::str::from_utf8(&first)?;
+            assert_eq!(
+                text.matches("No policy file; using permissive built-in default (AUR allowed)")
+                    .count(),
+                1
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    SecurityPolicy::load_optional(&path)?,
+                    SecurityPolicy::default()
+                );
+            }
+            assert_eq!(
+                *captured.lock().expect("diagnostic capture"),
+                first,
+                "repeated missing policy checks must not repeat diagnostics"
+            );
+            assert!(!path.exists());
+            Ok(())
+        })
+    }
 }
