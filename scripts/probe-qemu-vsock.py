@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import errno
+import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -115,12 +117,26 @@ def report() -> dict[str, object]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ('repository', 'source-sha', 'run-id', 'run-attempt', 'runner-label'):
+        parser.add_argument('--' + name)
+    args = parser.parse_args()
+    hosted = dict(repository=args.repository, source_sha=args.source_sha, run_id=args.run_id,
+                  run_attempt=args.run_attempt, runner_label=args.runner_label)
+    if any(value is not None for value in hosted.values()):
+        patterns = dict(repository=r'[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}',
+                        source_sha=r'[0-9a-f]{40}', run_id=r'[1-9][0-9]{0,19}',
+                        run_attempt=r'[1-9][0-9]{0,3}', runner_label=r'[a-z0-9][a-z0-9-]{0,63}')
+        if any(value is None or re.fullmatch(patterns[key], value) is None for key, value in hosted.items()):
+            parser.error('hosted identity requires a complete valid repository/source/run/attempt/runner tuple')
     try:
         receipt = report()
     except (OSError, ValueError, TimeoutError, KeyError, IndexError) as error:
         receipt = {'schema_version': 1, 'kind': 'qemu-vsock-host-capability', 'complete': False,
                    'status': 'harness_error', 'reason': str(error), 'ordinary_host_proven': False,
                    'guest_cid_assigned': False, 'guest_transport_proven': False, 'default_transport_changed': False}
+    if args.repository is not None:
+        receipt['hosted_identity'] = hosted
     print(json.dumps(receipt, sort_keys=True))
     return 0 if receipt['complete'] else 2
 

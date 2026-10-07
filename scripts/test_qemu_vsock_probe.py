@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import signal
+import subprocess
 import unittest
 from unittest import mock
 
@@ -18,6 +19,23 @@ spec.loader.exec_module(probe)
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux process-group ownership contract')
 class ChildBoundaryTests(unittest.TestCase):
+    def test_partial_or_malformed_hosted_identity_refuses_before_probe(self):
+        valid = ['--repository', 'omg-cli/omg', '--source-sha', 'a' * 40,
+                 '--run-id', '10', '--run-attempt', '1', '--runner-label', 'ubuntu-24.04']
+        invalid = [valid[:2], valid[:-2]]
+        for index, value in ((1, 'bad/repo/extra'), (3, 'bad'), (5, '0'),
+                             (7, '10000'), (9, 'unsafe/runner')):
+            changed = list(valid)
+            changed[index] = value
+            invalid.append(changed)
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, '-B', str(Path(probe.__file__)), *arguments],
+                                        capture_output=True, timeout=5, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b'')
+                self.assertIn(b'hosted identity requires', result.stderr)
+
     def test_fast_parent_exit_kills_and_reaps_remaining_descendant(self):
         libc = ctypes.CDLL(None, use_errno=True)
         original = ctypes.c_int()
