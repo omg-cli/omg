@@ -2,6 +2,9 @@
 
 //! Compiled init reporting with disposable executable and IPC fixtures.
 
+#[path = "../src/core/testing/isolated.rs"]
+mod isolated;
+
 use anyhow::Result;
 use omg_lib::daemon::protocol::{Request, Response, ResponseResult, encode_frame, split_frame};
 use std::io::{Read, Write};
@@ -71,6 +74,9 @@ impl Fixture {
 
 #[test]
 fn init_reports_child_failure_and_continues_setup() -> Result<()> {
+    if isolated::run_isolated_test("init_reports_child_failure_and_continues_setup") {
+        return Ok(());
+    }
     let fixture = Fixture::new("#!/bin/sh\nprintf executed > child-marker\nexit 37\n")?;
     let marker = fixture.directory.path().join("child-marker");
     let control = Command::new(fixture.directory.path().join("omgd"))
@@ -93,6 +99,9 @@ fn init_reports_child_failure_and_continues_setup() -> Result<()> {
 
 #[test]
 fn init_reports_synchronous_spawn_failure_and_continues() -> Result<()> {
+    if isolated::run_isolated_test("init_reports_synchronous_spawn_failure_and_continues") {
+        return Ok(());
+    }
     // ENOEXEC may fall back to a shell on macOS. A non-executable sibling
     // fails at spawn on every unprivileged Unix runner.
     let fixture = Fixture::new("#!/bin/sh\nexit 0\n")?;
@@ -206,6 +215,11 @@ impl Drop for Server {
 
 #[test]
 fn init_accepts_healthy_existing_daemon_despite_redundant_child_exit() -> Result<()> {
+    if isolated::run_isolated_test(
+        "init_accepts_healthy_existing_daemon_despite_redundant_child_exit",
+    ) {
+        return Ok(());
+    }
     let fixture = Fixture::new("#!/bin/sh\nexit 37\n")?;
     let server = Server::start(&fixture, Duration::ZERO, true)?;
     let output = fixture.run()?;
@@ -222,6 +236,9 @@ fn init_accepts_healthy_existing_daemon_despite_redundant_child_exit() -> Result
 
 #[test]
 fn init_waits_for_readiness_after_spawn() -> Result<()> {
+    if isolated::run_isolated_test("init_waits_for_readiness_after_spawn") {
+        return Ok(());
+    }
     let fixture = Fixture::new("#!/bin/sh\nexec sleep 5\n")?;
     let server = Server::start(&fixture, Duration::from_millis(300), true)?;
     let output = fixture.run()?;
@@ -238,6 +255,9 @@ fn init_waits_for_readiness_after_spawn() -> Result<()> {
 
 #[test]
 fn init_bounds_stalled_ping_and_continues_setup() -> Result<()> {
+    if isolated::run_isolated_test("init_bounds_stalled_ping_and_continues_setup") {
+        return Ok(());
+    }
     let fixture = Fixture::new("#!/bin/sh\nexec sleep 5\n")?;
     let server = Server::start(&fixture, Duration::ZERO, false)?;
     let started = Instant::now();
