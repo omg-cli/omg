@@ -23,26 +23,24 @@ def bounded_run(command: list[str], directory: Path, label: str, seconds: float)
         child = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
         deadline = time.monotonic() + seconds
         try:
-            while child.poll() is None:
+            while os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(label + ' exceeded its deadline')
                 if os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size > OUTPUT_LIMIT:
                     raise ValueError(label + ' exceeded its output limit')
                 time.sleep(0.02)
-            if os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size > OUTPUT_LIMIT:
-                raise ValueError(label + ' exceeded its output limit')
-            stdout.seek(0)
-            stderr.seek(0)
-            return child.returncode, stdout.read(OUTPUT_LIMIT), stderr.read(OUTPUT_LIMIT)
         finally:
-            if child.poll() is None:
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    # The owned group exited between poll and the signal.
-                    child.wait()
-                else:
-                    child.wait()
+            # Keep the leader waitable until its exclusively owned group is stopped.
+            # Its PID cannot be recycled while surviving descendants are cleaned up.
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            finally:
+                child.wait()
+        if os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size > OUTPUT_LIMIT:
+            raise ValueError(label + ' exceeded its output limit')
+        stdout.seek(0)
+        stderr.seek(0)
+        return child.returncode, stdout.read(OUTPUT_LIMIT), stderr.read(OUTPUT_LIMIT)
 
 
 def report() -> dict[str, object]:
