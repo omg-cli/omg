@@ -710,6 +710,54 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_prefixes_are_independently_ignored() {
+        let scanner = SecretScanner::new();
+        for prefix in ["your_", "my_", "example_", "sample_", "placeholder_"] {
+            let content = format!("api_key = '{prefix}api_key_here'");
+            assert!(
+                scanner.scan_content(&content, "config.py").is_empty(),
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_directory_selects_source_sensitive_and_key_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let marker = concat!("-----BEGIN ", "RSA PRIVATE KEY-----\n");
+        let selected = ["module.rs", ".npmrc", "id_ed25519"];
+        for name in selected.into_iter().chain(["image.png"]) {
+            std::fs::write(temp.path().join(name), marker).unwrap();
+        }
+        let findings = SecretScanner::new().scan_directory(temp.path()).unwrap();
+        assert_eq!(findings.len(), selected.len());
+        for name in selected {
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.file_path == temp.path().join(name).display().to_string()
+                        && finding.secret_type == SecretType::PrivateKey
+                }),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_directory_includes_files_at_the_depth_limit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut path = temp.path().to_path_buf();
+        for _ in 0..64 {
+            path = path.join("d");
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        let file = path.join("tail.pem");
+        std::fs::write(&file, concat!("-----BEGIN ", "RSA PRIVATE KEY-----\n")).unwrap();
+        let findings = SecretScanner::new().scan_directory(temp.path()).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].file_path, file.display().to_string());
+    }
+
+    #[test]
     fn test_redaction() {
         let secret = "secret_token_1234567890abcdef";
         let redacted = SecretScanner::redact(secret);
@@ -760,9 +808,9 @@ mod tests {
         let mut temp = tempfile::NamedTempFile::new().expect("temporary scan file");
         let marker = b"\n-----BEGIN RSA PRIVATE KEY-----\n";
         temp.as_file()
-            .set_len(SecretScanner::MAX_FILE_BYTES)
+            .set_len(10_485_760_u64)
             .expect("exact supported file size");
-        let offset = SecretScanner::MAX_FILE_BYTES
+        let offset = 10_485_760_u64
             .checked_sub(u64::try_from(marker.len()).expect("marker length fits u64"))
             .expect("marker fits inside the supported limit");
         temp.seek(SeekFrom::Start(offset))
@@ -770,7 +818,7 @@ mod tests {
         temp.write_all(marker).expect("write final secret marker");
         assert_eq!(
             temp.as_file().metadata().expect("fixture metadata").len(),
-            SecretScanner::MAX_FILE_BYTES
+            10_485_760_u64
         );
 
         let findings = SecretScanner::new()
@@ -779,14 +827,14 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(matches!(findings[0].secret_type, SecretType::PrivateKey));
         assert_eq!(findings[0].line_number, 2);
+        assert_eq!(findings[0].secret_type.to_string(), "Private Key");
+        assert_eq!(findings[0].severity.to_string(), "CRITICAL");
     }
 
     #[test]
     fn scan_file_rejects_files_over_the_bounded_read_limit() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        temp.as_file()
-            .set_len(SecretScanner::MAX_FILE_BYTES + 1)
-            .unwrap();
+        temp.as_file().set_len(10_485_760_u64 + 1).unwrap();
 
         let error = SecretScanner::new()
             .scan_file(temp.path())

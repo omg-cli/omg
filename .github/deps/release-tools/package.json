@@ -4,5 +4,10 @@
   "description": "Lockfile-pinned tools used by release.yml for R2 publication.",
   "devDependencies": {
     "wrangler": "4.143.1"
+  },
+  "overrides": {
+    "miniflare": {
+      "sharp": "0.35.5"
+    }
   }
 }

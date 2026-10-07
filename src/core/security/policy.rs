@@ -1132,6 +1132,9 @@ mod tests {
             "DocumentRef-x:LicenseRef-y:z OR MIT",
             "MIT++",
             "M+IT",
+            "MIT++ OR MIT",
+            "M+IT OR MIT",
+            "+ OR MIT",
             "MIT OR",
             "MIT WITH",
             "MIT WITH OR GPL2",
@@ -1894,5 +1897,210 @@ mod tests {
                 .contains("Only an elevated child can inherit policy")
         );
         Ok(())
+    }
+
+    #[test]
+    fn missing_policy_diagnostic_is_emitted_once_per_process() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "core::security::policy::tests::missing_policy_diagnostic_is_emitted_once_per_process",
+        ) {
+            return Ok(());
+        }
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("diagnostic capture")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || Capture(writer.clone()))
+            .finish();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("policy.toml");
+        tracing::subscriber::with_default(subscriber, || -> anyhow::Result<()> {
+            assert_eq!(
+                SecurityPolicy::load_optional(&path)?,
+                SecurityPolicy::default()
+            );
+            let first = captured.lock().expect("diagnostic capture").clone();
+            let text = std::str::from_utf8(&first)?;
+            assert_eq!(
+                text.matches("No policy file; using permissive built-in default (AUR allowed)")
+                    .count(),
+                1
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    SecurityPolicy::load_optional(&path)?,
+                    SecurityPolicy::default()
+                );
+            }
+            assert_eq!(
+                *captured.lock().expect("diagnostic capture"),
+                first,
+                "repeated missing policy checks must not repeat diagnostics"
+            );
+            assert!(!path.exists());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn mutation_combined_license_exact_size() {
+        let single = "x".repeat(4094);
+        assert_eq!(
+            combined_license_expression([single.as_str()]),
+            Some(format!("({single})"))
+        );
+        assert!(combined_license_expression([format!("{single}x").as_str()]).is_none());
+        let second = "x".repeat(4084);
+        assert_eq!(
+            combined_license_expression(["MIT", second.as_str()]),
+            Some(format!("(MIT) AND ({second})"))
+        );
+        assert!(combined_license_expression(["MIT", format!("{second}x").as_str()]).is_none());
+    }
+
+    #[test]
+    fn mutation_prepared_entry_points_preserve_explicit_policy() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::policy::tests::mutation_prepared_entry_points_preserve_explicit_policy";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        assert!(!crate::core::privilege::is_root());
+        let directory = tempfile::tempdir()?;
+        temp_env::with_var(
+            "OMG_CONFIG_DIR",
+            Some(directory.path()),
+            || -> anyhow::Result<()> {
+                require_native_plan_support("fixture-backend")?;
+                check_prepared_packages(Vec::new())?;
+                let path = directory.path().join("policy.toml");
+                let policy = SecurityPolicy {
+                    banned_packages: vec!["blocked-dependency".into()],
+                    ..SecurityPolicy::default()
+                };
+                let bytes = toml::to_string(&policy)?;
+                fs::write(&path, &bytes)?;
+                let error = require_native_plan_support("fixture-backend")
+                    .expect_err("explicit policy requires prepared-plan support");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("fixture-backend cannot enforce an explicit OMG policy")
+                );
+                let error = check_prepared_packages(vec![(
+                    "blocked-dependency".into(),
+                    crate::package_managers::parse_version_or_zero("1.0"),
+                    false,
+                    Some("MIT".into()),
+                )])
+                .expect_err("resolved banned dependencies must refuse before scanning");
+                assert!(
+                    matches!(error.downcast_ref::<PolicyError>(), Some(PolicyError::Banned { name }) if name == "blocked-dependency")
+                );
+                assert_eq!(fs::read_to_string(&path)?, bytes);
+                fs::write(&path, "require_pgp = 'invalid'")?;
+                assert!(require_native_plan_support("fixture-backend").is_err());
+                assert!(check_prepared_packages(Vec::new()).is_err());
+                assert_eq!(fs::read_to_string(&path)?, "require_pgp = 'invalid'");
+                Ok(())
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn mutation_prepared_grade_preserves_official_identity() -> anyhow::Result<()> {
+        let policy = SecurityPolicy {
+            minimum_grade: SecurityGrade::Verified,
+            ..SecurityPolicy::default()
+        };
+        let package = |community| {
+            vec![(
+                "candidate".into(),
+                crate::package_managers::parse_version_or_zero("1.0"),
+                community,
+                Some("MIT".into()),
+            )]
+        };
+        check_prepared_with_source(&policy, package(false), &EmptyVulns).await?;
+        let error = check_prepared_with_source(&policy, package(true), &EmptyVulns)
+            .await
+            .expect_err("community identity cannot become official");
+        assert!(matches!(
+            error.downcast_ref::<PolicyError>(),
+            Some(PolicyError::GradeTooLow {
+                grade: SecurityGrade::Community,
+                ..
+            })
+        ));
+        assert!(
+            check_prepared_with_source(&policy, package(false), &FailingVulns)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn prepared_transaction_requires_advisory_evidence_for_explicit_policy() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::policy::tests::prepared_transaction_requires_advisory_evidence_for_explicit_policy";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        assert!(!crate::core::privilege::is_root());
+        let directory = tempfile::tempdir()?;
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_TEST_DISTRO", Some(std::ffi::OsStr::new("fedora"))),
+            ],
+            || -> anyhow::Result<()> {
+                assert_eq!(
+                    crate::core::env::distro::detect_distro(),
+                    crate::core::env::distro::Distro::Fedora
+                );
+                let package = || {
+                    vec![(
+                        "candidate".into(),
+                        crate::package_managers::parse_version_or_zero("1.0"),
+                        false,
+                        Some("MIT".into()),
+                    )]
+                };
+                check_prepared_packages(package())?;
+                let path = directory.path().join("policy.toml");
+                let bytes = toml::to_string(&SecurityPolicy::default())?;
+                fs::write(&path, &bytes)?;
+                let error = check_prepared_packages(package()).expect_err("explicit policy requires available advisory evidence even when all fields have their default values");
+                assert!(
+                    matches!(error.downcast_ref::<VulnerabilityError>(), Some(VulnerabilityError::Unavailable { reason }) if reason == "OSV has no configured ecosystem for the running package backend")
+                );
+                assert_eq!(fs::read_to_string(&path)?, bytes);
+                Ok(())
+            },
+        )
     }
 }
