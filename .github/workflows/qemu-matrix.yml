@@ -139,7 +139,7 @@ jobs:
                 "distro": "debian",
                 "image": "debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931",
                 "features": "debian,pgp,license",
-                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
+                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
               },
               {
                 "distro": "debian-trixie",
@@ -160,7 +160,7 @@ jobs:
                 "distro": "debian",
                 "image": "debian:bookworm@sha256:5eac3978974cfa26a880057766c683e55c5763355d30a8beecbd263e0e1621d9",
                 "features": "debian,pgp,license",
-                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
+                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
               },
               {
                 "distro": "fedora",

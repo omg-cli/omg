@@ -86,6 +86,19 @@ exit "$rc"
             self.assertIn('libapt-pkg-dev', arguments)
             self.assertIn('python3-apt', arguments)
 
+    def test_debian_build_recipes_install_external_lock_probe(self):
+        for architecture in ('BUILD_X64', 'BUILD_ARM64'):
+            for recipe in json.loads(literal(PARENT, architecture, 10)):
+                if 'debian' not in recipe['features'].split(','):
+                    continue
+                with self.subTest(architecture=architecture, distro=recipe['distro']):
+                    capture = 'apt-get() { if [[ "$1" == install ]]; then printf "%s\\n" "$@"; fi; };\n'
+                    result = subprocess.run([self.bash, '-e', '-c', capture + recipe['setup']],
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('python3', result.stdout.splitlines(),
+                        'Debian transaction tests require an external Python POSIX lock probe')
+
     def copy_inventory_to_controller(self, root):
         repository = WORKFLOW.parents[2]
         source = (repository / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
