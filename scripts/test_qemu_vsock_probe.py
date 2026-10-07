@@ -2,6 +2,7 @@
 """Real child-process boundary checks for the optional vsock reporter."""
 import importlib.util
 import ctypes
+import json
 import os
 from pathlib import Path
 import sys
@@ -19,6 +20,20 @@ spec.loader.exec_module(probe)
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux process-group ownership contract')
 class ChildBoundaryTests(unittest.TestCase):
+    def test_complete_hosted_identity_accepts_real_dotted_runner_labels(self):
+        for runner in ('ubuntu-24.04', 'ubuntu-24.04-arm'):
+            with self.subTest(runner=runner):
+                result = subprocess.run(
+                    [sys.executable, '-B', str(Path(probe.__file__)),
+                     '--repository', 'omg-cli/omg', '--source-sha', 'a' * 40,
+                     '--run-id', '10', '--run-attempt', '1', '--runner-label', runner],
+                    capture_output=True, timeout=45, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                receipt = json.loads(result.stdout)
+                self.assertTrue(receipt['complete'])
+                self.assertEqual(receipt['hosted_identity']['runner_label'], runner)
+                self.assertFalse(receipt['guest_transport_proven'])
+
     def test_partial_or_malformed_hosted_identity_refuses_before_probe(self):
         valid = ['--repository', 'omg-cli/omg', '--source-sha', 'a' * 40,
                  '--run-id', '10', '--run-attempt', '1', '--runner-label', 'ubuntu-24.04']
