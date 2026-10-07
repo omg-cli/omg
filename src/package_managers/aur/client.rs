@@ -6253,17 +6253,7 @@ mod tests {
         // otherwise this isolated subreaper adopts and reaps that exact PID.
         // ECHILD alone is insufficient: the PID must also be absent from proc.
         let descendant = nix::unistd::Pid::from_raw(i32::try_from(pids[1])?);
-        if let Some(reaped) = reap_native_probe_child(descendant, Duration::from_secs(2)).await? {
-            assert_eq!(
-                reaped,
-                nix::sys::wait::WaitStatus::Signaled(
-                    descendant,
-                    nix::sys::signal::Signal::SIGKILL,
-                    false
-                ),
-                "adopted descendant must have been terminated"
-            );
-        }
+        checked_reap_native_probe_child(descendant, Duration::from_secs(2)).await?;
         assert!(
             running.is_empty(),
             "native {mode} left running PIDs {running:?}; initial identity {leader_stat:?}"
@@ -6295,6 +6285,21 @@ mod tests {
         Ok(())
     }
 
+    async fn checked_reap_native_probe_child(
+        pid: nix::unistd::Pid,
+        budget: Duration,
+    ) -> Result<Option<nix::sys::wait::WaitStatus>> {
+        let reaped = reap_native_probe_child(pid, budget).await?;
+        if let Some(status) = reaped {
+            assert_eq!(
+                status,
+                nix::sys::wait::WaitStatus::Signaled(pid, nix::sys::signal::Signal::SIGKILL, false),
+                "adopted descendant must have been terminated"
+            );
+        }
+        Ok(reaped)
+    }
+
     async fn reap_native_probe_child(
         pid: nix::unistd::Pid,
         budget: Duration,
@@ -6323,12 +6328,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_probe_reaps_a_killed_owned_child() -> Result<()> {
+        // A std child has no Tokio reaper competing for its wait status.
+        let child = std::process::Command::new("/usr/bin/sleep")
+            .arg("30")
+            .spawn()?;
+        let mut child = scopeguard::guard(child, |mut child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
+        child.kill()?;
+        let status = checked_reap_native_probe_child(pid, Duration::from_secs(2)).await?;
+        assert_eq!(
+            status,
+            Some(nix::sys::wait::WaitStatus::Signaled(
+                pid,
+                nix::sys::signal::Signal::SIGKILL,
+                false
+            ))
+        );
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_probe_accepts_an_already_reaped_child() -> Result<()> {
         let mut child = Command::new("/usr/bin/sleep").arg("30").spawn()?;
         let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id().context("child PID")?)?);
         child.kill().await?;
         assert!(
-            reap_native_probe_child(pid, Duration::from_millis(100))
+            checked_reap_native_probe_child(pid, Duration::from_millis(100))
                 .await?
                 .is_none()
         );
