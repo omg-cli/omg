@@ -126,7 +126,7 @@ def main() -> int:
     if any(value is not None for value in hosted.values()):
         patterns = dict(repository=r'[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}',
                         source_sha=r'[0-9a-f]{40}', run_id=r'[1-9][0-9]{0,19}',
-                        run_attempt=r'[1-9][0-9]{0,3}', runner_label=r'[a-z0-9][a-z0-9-]{0,63}')
+                        run_attempt=r'[1-9][0-9]{0,3}', runner_label=r'[a-z0-9][a-z0-9.-]{0,63}')
         if any(value is None or re.fullmatch(patterns[key], value) is None for key, value in hosted.items()):
             parser.error('hosted identity requires a complete valid repository/source/run/attempt/runner tuple')
     try:
