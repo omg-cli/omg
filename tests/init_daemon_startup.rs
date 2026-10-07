@@ -153,6 +153,9 @@ impl Server {
                     }
                     break;
                 }
+                // BSD may inherit the listener's nonblocking mode; read timeouts
+                // require a blocking accepted stream on every Unix platform.
+                stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(Duration::from_secs(1)))?;
                 let mut length = [0; 4];
                 stream.read_exact(&mut length)?;
