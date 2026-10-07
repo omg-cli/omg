@@ -1606,7 +1606,12 @@ case "$1" in
     printf '#!/bin/sh\necho new-version\n' > "$3/node_modules/.bin/fixture-tool"
     chmod 755 "$3/node_modules/.bin/fixture-tool"
     printf started > "$fixture/started"
-    sleep 1
+    attempts=0
+    while [ -f "$fixture/hold" ]; do
+      [ "$attempts" -lt 1000 ] || exit 124
+      attempts=$((attempts + 1))
+      sleep 0.01
+    done
     ;;
   audit)
     test -f "$4/node_modules/.bin/fixture-tool" || exit 1
@@ -1633,6 +1638,12 @@ esac
                 .enable_all()
                 .build()
                 .expect("current-thread runtime");
+            // Dropping the marker releases the child, including when assertions unwind.
+            let hold = tempfile::Builder::new()
+                .prefix("hold")
+                .rand_bytes(0)
+                .tempfile_in(&managers)
+                .expect("manager release gate");
             runtime.block_on(async {
                 let install = install_managed("npm", "fixture-tool", "fixture-tool", &tools, &bin);
                 {
@@ -1641,7 +1652,7 @@ esac
                         biased;
                         outcome = &mut install => panic!("install completed before cancellation: {outcome:?}"),
                         () = async {
-                            tokio::time::timeout(Duration::from_millis(500), async {
+                            tokio::time::timeout(Duration::from_secs(5), async {
                                 while !managers.join("started").exists() {
                                     tokio::time::sleep(Duration::from_millis(10)).await;
                                 }
@@ -1651,6 +1662,7 @@ esac
                 }
                 assert!(!managers.join("verified").exists(), "verification has not run yet");
                 assert_eq!(fs::read(bin.join("fixture-tool")).expect("previous link"), b"previous version");
+                drop(hold);
                 tokio::time::timeout(Duration::from_secs(5), async {
                     while fs::read(bin.join("fixture-tool")).ok().as_deref() != Some(b"#!/bin/sh\necho new-version\n")
                         || fs::read_dir(tools.join("npm")).expect("manager directory").count() != 1
@@ -1683,7 +1695,18 @@ esac
         let npm = managers.join("npm");
         fs::write(
             &npm,
-            b"#!/bin/sh\nfixture=$(dirname \"$0\")\nprintf started > \"$fixture/started\"\nsleep 1\nprintf finished > \"$fixture/finished\"\nexit 1\n",
+            br#"#!/bin/sh
+fixture=$(dirname "$0")
+printf started > "$fixture/started"
+attempts=0
+while [ -f "$fixture/hold" ]; do
+  [ "$attempts" -lt 1000 ] || exit 124
+  attempts=$((attempts + 1))
+  sleep 0.01
+done
+printf finished > "$fixture/finished"
+exit 1
+"#,
         )
         .expect("disposable manager");
         fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).expect("manager permissions");
@@ -1700,6 +1723,12 @@ esac
                 .enable_all()
                 .build()
                 .expect("current-thread runtime");
+            // Dropping the marker releases the child, including when assertions unwind.
+            let hold = tempfile::Builder::new()
+                .prefix("hold")
+                .rand_bytes(0)
+                .tempfile_in(&managers)
+                .expect("manager release gate");
             runtime.block_on(async {
                 let install = install_managed("npm", "fixture-tool", "fixture-tool", &tools, &bin);
                 {
@@ -1708,7 +1737,7 @@ esac
                         biased;
                         outcome = &mut install => panic!("install completed before cancellation: {outcome:?}"),
                         () = async {
-                            tokio::time::timeout(Duration::from_millis(500), async {
+                            tokio::time::timeout(Duration::from_secs(5), async {
                                 while !managers.join("started").exists() {
                                     tokio::time::sleep(Duration::from_millis(10)).await;
                                 }
@@ -1736,6 +1765,7 @@ esac
                     2,
                     "cancelled queued install must not create staging",
                 );
+                drop(hold);
                 tokio::time::timeout(Duration::from_secs(5), async {
                     while !managers.join("finished").exists()
                         || fs::read_dir(tools.join("npm")).expect("manager directory").count() != 1
