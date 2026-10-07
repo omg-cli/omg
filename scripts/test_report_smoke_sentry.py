@@ -15,7 +15,7 @@ SCRIPT = Path(__file__).with_name("report-smoke-sentry.sh")
 
 
 class SentryResultAdmissionTests(unittest.TestCase):
-    def run_rows(self, rows):
+    def run_rows(self, rows, identity=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             envelope = root / "envelope.jsonl"
@@ -30,12 +30,46 @@ class SentryResultAdmissionTests(unittest.TestCase):
                        OMG_SMOKE_ENVIRONMENT="qemu-matrix", OMG_SMOKE_RELEASE="unknown",
                        FIXTURE_ENVELOPE=str(envelope),
                        PATH=f"{root}{os.pathsep}{os.environ['PATH']}")
+            for key in ("OMG_SMOKE_RUN_ID", "OMG_SMOKE_SOURCE_SHA", "OMG_SMOKE_RUN_ATTEMPT"):
+                env.pop(key, None)
+            env.update(identity or {})
             result = subprocess.run(["bash", str(SCRIPT), str(results)],
                                     env=env, capture_output=True, text=True,
                                     check=False, timeout=20)
             sent = ([json.loads(line) for line in envelope.read_text().splitlines()]
                     if envelope.exists() else None)
             return result, sent
+
+    def test_explicit_hosted_identity_reaches_envelope_tags(self):
+        identity = dict(OMG_SMOKE_RUN_ID="37151792590", OMG_SMOKE_SOURCE_SHA="a" * 40,
+                        OMG_SMOKE_RUN_ATTEMPT="2")
+        result, envelope = self.run_rows([
+            dict(case_id="qemu-debian-trixie-lifecycle", distro="debian-trixie",
+                 result="HARNESS_ERROR", exit_code=120, elapsed_seconds=2)], identity)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(envelope[2]["tags"], dict(run_id="37151792590", reporter="post-run",
+                         source_sha="a" * 40, run_attempt="2"))
+
+    def test_partial_or_malformed_hosted_identity_refuses_transport(self):
+        valid = dict(OMG_SMOKE_RUN_ID="10", OMG_SMOKE_SOURCE_SHA="a" * 40,
+                     OMG_SMOKE_RUN_ATTEMPT="2")
+        invalid = [dict(valid, OMG_SMOKE_RUN_ID="tmp-unbound"),
+                   dict(valid, OMG_SMOKE_RUN_ID="0"),
+                   dict(valid, OMG_SMOKE_RUN_ID="1" * 21),
+                   dict(valid, OMG_SMOKE_SOURCE_SHA="bad"),
+                   dict(valid, OMG_SMOKE_RUN_ATTEMPT="0"),
+                   dict(valid, OMG_SMOKE_RUN_ATTEMPT="10000"),
+                   {key: "" for key in valid},
+                   {key: value for key, value in valid.items() if key != "OMG_SMOKE_SOURCE_SHA"},
+                   {key: value for key, value in valid.items() if key != "OMG_SMOKE_RUN_ATTEMPT"},
+                   {key: value for key, value in valid.items() if key != "OMG_SMOKE_RUN_ID"}]
+        for identity in invalid:
+            with self.subTest(identity=identity):
+                result, envelope = self.run_rows([
+                    dict(case_id="ci-non-qemu-workflow", distro="matrix",
+                         result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0)], identity)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(envelope)
 
     def run_report(self, case_id):
         rows = [dict(case_id=case_id, distro="matrix", result="HARNESS_ERROR",

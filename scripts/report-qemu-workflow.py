@@ -948,7 +948,10 @@ def main():
         if sentry_rows:
             results = Path(directory) / "results-all.json"
             results.write_text(json.dumps(sentry_rows) + "\n")
-            subprocess.run(["bash", "scripts/report-smoke-sentry.sh", str(results)], check=True, timeout=20)
+            subprocess.run(["bash", "scripts/report-smoke-sentry.sh", str(results)], check=True, timeout=20,
+                           env=dict(os.environ, OMG_SMOKE_RUN_ID=str(run_id),
+                                    OMG_SMOKE_SOURCE_SHA=run["head_sha"],
+                                    OMG_SMOKE_RUN_ATTEMPT=str(run["run_attempt"])))
     print(f"Reported run {run_id}, attempt {run['run_attempt']}, commit {run['head_sha']}")
     return 0
 

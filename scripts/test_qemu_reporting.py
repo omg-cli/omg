@@ -957,7 +957,7 @@ class ReportingBoundaryTests(unittest.TestCase):
                             no_artifacts=False, artifact_listing_error=False,
                             catalog_damage=None, jobs_payload=None, jobs_api_error=None,
                             artifacts_payload=None, published_damage=None,
-                            workflow_distros=None, artifact_distros=None):
+                            workflow_distros=None, artifact_distros=None, sender_envs=None):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -1099,6 +1099,8 @@ class ReportingBoundaryTests(unittest.TestCase):
             root = Path(argv[2]).parent
             transcripts = {path.parent.name: path.read_text() for path in root.glob("*/transcript.txt")}
             calls.append((argv[1], json.loads(Path(argv[2]).read_text()), transcripts, argv))
+            if sender_envs is not None and argv[1] == "scripts/report-smoke-sentry.sh":
+                sender_envs.append(kwargs.get("env", {}))
             if helper_fails and argv[1] == "scripts/qa-file-issue.sh":
                 raise REPORT.subprocess.CalledProcessError(1, argv)
         with tempfile.TemporaryDirectory() as directory:
@@ -1150,6 +1152,17 @@ class ReportingBoundaryTests(unittest.TestCase):
                     self.assertEqual(REPORT.main(), 0)
             catalog_path = path / "qemu-issue-report/failures.json"
             return calls, json.loads(catalog_path.read_text()) if catalog_path.exists() else None
+
+    def test_sentry_child_uses_triggering_run_identity(self):
+        environments = []
+        jobs = [dict(name="Docs audit", conclusion="failure", id=11, steps=[]),
+                dict(name="CI Success", conclusion="failure", id=12, steps=[])]
+        self.run_report_fixture([], workflow_path=".github/workflows/ci.yml", jobs=jobs,
+                                artifact_listing_error=True, sender_envs=environments)
+        self.assertEqual(len(environments), 1)
+        self.assertEqual(environments[0].get("OMG_SMOKE_RUN_ID"), "10")
+        self.assertEqual(environments[0].get("OMG_SMOKE_SOURCE_SHA"), "a" * 40)
+        self.assertEqual(environments[0].get("OMG_SMOKE_RUN_ATTEMPT"), "2")
 
     def test_verified_published_success_sends_case_and_workflow_recovery_to_helper(self):
         rows = [dict(self.row("PASS"), distro=distro, case_id=f"qemu-{distro}-search")
