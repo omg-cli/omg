@@ -997,4 +997,183 @@ mod metadata_limit_tests {
                 .contains("16 MiB")
         );
     }
+
+    #[test]
+    fn unspecified_ipv6_must_not_be_a_public_host_or_redirect() {
+        assert!(is_private_or_local_host(Some("::")));
+        for mapped in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.1.1",
+            "::ffff:0.0.0.0",
+        ] {
+            assert!(
+                is_private_or_local_host(Some(mapped)),
+                "{mapped}: mapped local address must refuse"
+            );
+        }
+        assert!(is_private_or_local_host(Some("[::]")));
+        let target = Url::parse("https://[::]/private").unwrap();
+        assert_eq!(
+            validate_redirect(&[], &target),
+            Err("refusing redirect to a private or local address")
+        );
+    }
+
+    #[test]
+    #[expect(unsafe_code)] // Process-wide environment is changed only in the isolated child.
+    fn loopback_download_exception_requires_explicit_test_mode() {
+        if crate::core::testing::run_isolated_test(
+            "core::http::metadata_limit_tests::loopback_download_exception_requires_explicit_test_mode",
+        ) {
+            return;
+        }
+        // SAFETY: this is a fresh single-test child with no concurrent environment users.
+        unsafe {
+            std::env::set_var("OMG_TEST_MODE", "0");
+        }
+        for url in [
+            "http://127.0.0.1/archive",
+            "http://localhost/archive",
+            "http://[::1]/archive",
+        ] {
+            assert!(
+                validate_download_url(url).is_err(),
+                "{url}: mode0 must refuse"
+            );
+        }
+        // SAFETY: the same isolated single-test child remains the sole environment user.
+        unsafe {
+            std::env::set_var("OMG_TEST_MODE", "1");
+        }
+        for url in [
+            "http://127.0.0.1/archive",
+            "http://localhost/archive",
+            "http://[::1]/archive",
+        ] {
+            assert!(
+                validate_download_url(url).is_ok(),
+                "{url}: mode1 fixture must work"
+            );
+        }
+        for url in [
+            "ftp://localhost/archive",
+            "http://8.8.8.8/archive",
+            "https://127.0.0.1/archive",
+        ] {
+            assert!(
+                validate_download_url(url).is_err(),
+                "{url}: exception must stay confined"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_request_builders_are_not_retryable_transport_failures() {
+        let error = shared_client()
+            .get("://invalid")
+            .build()
+            .expect_err("invalid URL must refuse");
+        assert!(error.is_builder());
+        assert!(!is_retryable_error(&error), "builder errors must not retry");
+    }
+
+    async fn assert_private_redirect_is_refused(client: &Client) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let destination_address = destination.local_addr().unwrap();
+        let contacted = Arc::new(AtomicBool::new(false));
+        let observed = contacted.clone();
+        let destination_task = tokio::spawn(async move {
+            let (mut stream, _) = destination.accept().await.unwrap();
+            observed.store(true, Ordering::SeqCst);
+            let mut request = [0; 4096];
+            let mut received = 0;
+            loop {
+                assert!(
+                    received < request.len(),
+                    "fixture request header exceeds its bound"
+                );
+                let count = stream.read(&mut request[received..]).await.unwrap();
+                assert!(
+                    count > 0,
+                    "fixture peer closed before sending a request header"
+                );
+                received += count;
+                if request[..received]
+                    .windows(4)
+                    .any(|part| part == b"\r\n\r\n")
+                {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let mut received = 0;
+            loop {
+                assert!(
+                    received < request.len(),
+                    "fixture request header exceeds its bound"
+                );
+                let count = stream.read(&mut request[received..]).await.unwrap();
+                assert!(
+                    count > 0,
+                    "fixture peer closed before sending a request header"
+                );
+                received += count;
+                if request[..received]
+                    .windows(4)
+                    .any(|part| part == b"\r\n\r\n")
+                {
+                    break;
+                }
+            }
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{destination_address}/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(redirect.as_bytes()).await.unwrap();
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .get(format!("http://{origin_address}/redirect"))
+                .send(),
+        )
+        .await;
+        origin_task.abort();
+        destination_task.abort();
+        let _ = origin_task.await;
+        let _ = destination_task.await;
+        assert!(
+            matches!(&response, Ok(Err(error)) if error.is_redirect()),
+            "private redirect must be refused: {response:?}"
+        );
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "private target must receive no connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_shared_client_refuses_a_redirect_to_a_private_listener() {
+        assert_private_redirect_is_refused(shared_client()).await;
+    }
+
+    #[tokio::test]
+    async fn actual_download_client_refuses_a_redirect_to_a_private_listener() {
+        assert_private_redirect_is_refused(download_client()).await;
+    }
 }

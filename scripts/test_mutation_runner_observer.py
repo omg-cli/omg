@@ -19,6 +19,57 @@ SPEC.loader.exec_module(OBSERVER)
 
 
 class MutationRunnerObserver(unittest.TestCase):
+    def test_invalid_scoped_and_unowned_records_do_not_fabricate_complete_rss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixtures = {
+                123: '123 (invalid-owned) S 9 123 123 0 -1 4194304 1 0 0 0 1 0 0 0 20 0 2 0 456 8192 -1',
+                124: '124 (valid-owned) S 123 123 123 0 -1 4194304 1 0 0 0 1 0 0 0 20 0 2 0 457 16384 4',
+                125: '125 (invalid-unowned) S 9 125 125 0 -1 4194304 1 0 0 0 1 0 0 0 20 0 2 0 458 8192 -1',
+                126: '999 (wrong-identity) S 9 123 123 0 -1 4194304 1 0 0 0 1 0 0 0 20 0 2 0 458 8192 2',
+                127: 'x' * 4097,
+            }
+            for pid, stat in fixtures.items():
+                (root / str(pid)).mkdir()
+                (root / str(pid) / 'stat').write_text(stat)
+            with patch.object(OBSERVER, 'PROC_ROOT', root):
+                sample = OBSERVER.command_processes(123)
+            self.assertEqual(sample['availability'], 'partial')
+            self.assertEqual(sample['invalid_processes'], 4)
+            self.assertFalse(sample['rss_sum_is_complete'])
+            self.assertEqual(sample['process_count'], 1)
+            self.assertEqual(sample['rss_sum_bytes'], 4 * os.sysconf('SC_PAGE_SIZE'))
+            self.assertEqual([row['pid'] for row in sample['largest']], [124])
+
+    def test_invalid_process_samples_preserve_real_child_completion_and_partial_evidence(self):
+        for stat in (
+            '123 (transient) S 9 123 123 0 -1 4194304 1 0 0 0 1 0 0 0 20 0 2 0 456 8192 -1',
+            '123 (truncated) S 9',
+        ):
+            with self.subTest(stat=stat), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'proc'
+                (root / '123').mkdir(parents=True)
+                (root / '123' / 'stat').write_text(stat)
+                report = Path(directory) / 'health.jsonl'
+                marker = Path(directory) / 'completed'
+                code = (
+                    'import time;from pathlib import Path;time.sleep(0.1);'
+                    f'Path({str(marker)!r}).touch();raise SystemExit(17)'
+                )
+                with patch.object(OBSERVER, 'PROC_ROOT', root):
+                    result = OBSERVER.observe([sys.executable, '-c', code], report, 0.02)
+                self.assertEqual(result, 17)
+                self.assertTrue(marker.exists())
+                rows = [json.loads(line) for line in report.read_text().splitlines()]
+                self.assertEqual(rows[-1]['phase'], 'finish')
+                self.assertEqual(rows[-1]['child_returncode'], 17)
+                self.assertIsNone(rows[-1]['cancellation_signal'])
+                samples = [row['command_processes'] for row in rows[1:]]
+                self.assertTrue(all(sample['availability'] == 'partial' for sample in samples))
+                self.assertTrue(all(sample['invalid_processes'] == 1 for sample in samples))
+                self.assertTrue(all(not sample['rss_sum_is_complete'] for sample in samples))
+                self.assertTrue(all(sample['largest'] == [] for sample in samples))
+
     def test_process_stat_preserves_parentheses_in_names_and_uses_rss_pages(self):
         text = '123 (rustc ) worker) S 9 123 123 0 -1 4194304 1 0 0 0 1 0 0 0 20 0 2 0 456 8192 2'
         self.assertEqual(OBSERVER.process_stat(text, 4096), dict(

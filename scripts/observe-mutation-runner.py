@@ -43,7 +43,7 @@ def command_processes(session_id):
         return dict(session_id=None, availability='not-started', process_count=0,
                     rss_sum_bytes=0, largest=[])
     rows = []
-    scanned = vanished = denied = 0
+    scanned = vanished = denied = invalid = 0
     limited = False
     page_size = os.sysconf('SC_PAGE_SIZE')
     for path in PROC_ROOT.iterdir():
@@ -62,15 +62,23 @@ def command_processes(session_id):
         except PermissionError:
             denied += 1
             continue
-        if len(text) > 4096:
-            raise ValueError('process stat exceeds its byte bound')
-        row = process_stat(text, page_size)
-        if row['pid'] != int(path.name):
-            raise ValueError('process identity differs from proc path')
+        try:
+            if len(text) > 4096:
+                raise ValueError('process stat exceeds its byte bound')
+            row = process_stat(text, page_size)
+            if row['pid'] != int(path.name):
+                raise ValueError('process identity differs from proc path')
+        except (ValueError, IndexError):
+            # A transient or malformed proc record is missing evidence. Keep
+            # the command running and explicitly mark the sample incomplete.
+            invalid += 1
+            continue
         if row['session_id'] == session_id:
             rows.append(row)
-    return dict(session_id=session_id, availability='partial' if limited or denied or vanished else 'observed',
+    complete = not (limited or denied or vanished or invalid)
+    return dict(session_id=session_id, availability='observed' if complete else 'partial',
                 process_count=len(rows), rss_sum_bytes=sum(row['rss_bytes'] for row in rows),
+                rss_sum_is_complete=complete, invalid_processes=invalid,
                 largest=sorted(rows, key=lambda row: (-row['rss_bytes'], row['pid']))[:MAX_REPORTED_PROCESSES],
                 scanned_processes=scanned, vanished_processes=vanished,
                 denied_processes=denied, scan_limited=limited)

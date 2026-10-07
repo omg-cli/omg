@@ -1779,4 +1779,59 @@ mod tests {
             assert!(validate_inherited_policy(&weakened).is_err());
         });
     }
+
+    #[test]
+    fn policy_handoff_preserves_absence_explicit_policy_and_refusals() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "core::security::policy::tests::policy_handoff_preserves_absence_explicit_policy_and_refusals",
+        ) {
+            return Ok(());
+        }
+        assert!(
+            !crate::core::privilege::is_root(),
+            "fixture must be unprivileged"
+        );
+        let directory = tempfile::tempdir()?;
+        temp_env::with_var(
+            "OMG_CONFIG_DIR",
+            Some(directory.path()),
+            || -> anyhow::Result<()> {
+                assert_eq!(policy_handoff()?, None, "an absent policy needs no handoff");
+                let policy = SecurityPolicy {
+                    minimum_grade: SecurityGrade::Verified,
+                    allow_aur: false,
+                    require_pgp: true,
+                    allowed_licenses: vec!["MIT".into()],
+                    banned_packages: vec!["blocked-fixture-package".into()],
+                };
+                let file = directory.path().join("policy.toml");
+                fs::write(&file, toml::to_string(&policy)?)?;
+                let handoff = policy_handoff()?.expect("explicit policy must be handed off");
+                let encoded = handoff
+                    .strip_prefix(POLICY_MARKER)
+                    .expect("bounded policy marker");
+                let decoded: SecurityPolicy = serde_json::from_slice(&hex::decode(encoded)?)?;
+                assert_eq!(decoded, policy, "every explicit policy field must survive");
+
+                fs::write(&file, "require_pgp = 'not-a-boolean'")?;
+                assert!(
+                    policy_handoff().is_err(),
+                    "malformed explicit policy must fail closed"
+                );
+
+                let oversized = SecurityPolicy {
+                    banned_packages: vec!["x".repeat(32769)],
+                    ..policy
+                };
+                fs::write(&file, toml::to_string(&oversized)?)?;
+                let error = policy_handoff().expect_err("oversized handoff must refuse");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Security policy exceeds elevation handoff limit")
+                );
+                Ok(())
+            },
+        )
+    }
 }
