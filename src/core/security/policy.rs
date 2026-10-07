@@ -1958,4 +1958,104 @@ mod tests {
             Ok(())
         })
     }
+
+    #[test]
+    fn mutation_combined_license_exact_size() {
+        let single = "x".repeat(4094);
+        assert_eq!(
+            combined_license_expression([single.as_str()]),
+            Some(format!("({single})"))
+        );
+        assert!(combined_license_expression([format!("{single}x").as_str()]).is_none());
+        let second = "x".repeat(4084);
+        assert_eq!(
+            combined_license_expression(["MIT", second.as_str()]),
+            Some(format!("(MIT) AND ({second})"))
+        );
+        assert!(combined_license_expression(["MIT", format!("{second}x").as_str()]).is_none());
+    }
+
+    #[test]
+    fn mutation_prepared_entry_points_preserve_explicit_policy() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::policy::tests::mutation_prepared_entry_points_preserve_explicit_policy";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        assert!(!crate::core::privilege::is_root());
+        let directory = tempfile::tempdir()?;
+        temp_env::with_var(
+            "OMG_CONFIG_DIR",
+            Some(directory.path()),
+            || -> anyhow::Result<()> {
+                require_native_plan_support("fixture-backend")?;
+                check_prepared_packages(Vec::new())?;
+                let path = directory.path().join("policy.toml");
+                let policy = SecurityPolicy {
+                    banned_packages: vec!["blocked-dependency".into()],
+                    ..SecurityPolicy::default()
+                };
+                let bytes = toml::to_string(&policy)?;
+                fs::write(&path, &bytes)?;
+                let error = require_native_plan_support("fixture-backend")
+                    .expect_err("explicit policy requires prepared-plan support");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("fixture-backend cannot enforce an explicit OMG policy")
+                );
+                let error = check_prepared_packages(vec![(
+                    "blocked-dependency".into(),
+                    crate::package_managers::parse_version_or_zero("1.0"),
+                    false,
+                    Some("MIT".into()),
+                )])
+                .expect_err("resolved banned dependencies must refuse before scanning");
+                assert!(
+                    matches!(error.downcast_ref::<PolicyError>(), Some(PolicyError::Banned { name }) if name == "blocked-dependency")
+                );
+                assert_eq!(fs::read_to_string(&path)?, bytes);
+                fs::write(&path, "require_pgp = 'invalid'")?;
+                assert!(require_native_plan_support("fixture-backend").is_err());
+                assert!(check_prepared_packages(Vec::new()).is_err());
+                assert_eq!(fs::read_to_string(&path)?, "require_pgp = 'invalid'");
+                Ok(())
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn mutation_prepared_grade_preserves_official_identity() -> anyhow::Result<()> {
+        let policy = SecurityPolicy {
+            minimum_grade: SecurityGrade::Verified,
+            ..SecurityPolicy::default()
+        };
+        let package = |community| {
+            vec![(
+                "candidate".into(),
+                crate::package_managers::parse_version_or_zero("1.0"),
+                community,
+                Some("MIT".into()),
+            )]
+        };
+        check_prepared_with_source(&policy, package(false), &EmptyVulns).await?;
+        let error = check_prepared_with_source(&policy, package(true), &EmptyVulns)
+            .await
+            .expect_err("community identity cannot become official");
+        assert!(matches!(
+            error.downcast_ref::<PolicyError>(),
+            Some(PolicyError::GradeTooLow {
+                grade: SecurityGrade::Community,
+                ..
+            })
+        ));
+        assert!(
+            check_prepared_with_source(&policy, package(false), &FailingVulns)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
 }
