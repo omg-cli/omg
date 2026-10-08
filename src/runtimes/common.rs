@@ -471,6 +471,12 @@ where
 
     for attempt in 0..MAX_DOWNLOAD_ATTEMPTS {
         let requested = resume.clone();
+        let started = tokio::time::Instant::now();
+        tracing::info!(
+            attempt = attempt + 1,
+            host,
+            "Runtime download request started"
+        );
         let response = match request(requested.clone()).await {
             Ok(response) => response,
             Err(error) => {
@@ -495,6 +501,13 @@ where
             }
         };
 
+        tracing::info!(
+            attempt = attempt + 1,
+            host,
+            status = response.status().as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "Runtime download headers received"
+        );
         if !response.status().is_success() {
             let status = response.status();
             if attempt + 1 < MAX_DOWNLOAD_ATTEMPTS && crate::core::http::is_retryable_status(status)
@@ -605,8 +618,25 @@ where
         let mut stream = response.bytes_stream();
         let mut received_this_attempt: u64 = 0;
         let mut failure: Option<reqwest::Error> = None;
+        let period = std::time::Duration::from_secs(30);
+        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tracing::info!(
+            attempt = attempt + 1,
+            host,
+            downloaded,
+            "Runtime download body started"
+        );
 
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = tokio::select! {
+                item = stream.next() => item,
+                _ = heartbeat.tick() => {
+                    tracing::info!(attempt = attempt + 1, host, bytes_received = received_this_attempt, downloaded, elapsed_ms = started.elapsed().as_millis(), "Runtime download body progress");
+                    continue;
+                }
+            };
+            let Some(item) = item else { break };
             let chunk = match item {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -688,6 +718,13 @@ where
             .await
             .with_context(|| format!("Failed to sync download to: {}", dest.display()))?;
         drop(file);
+        tracing::info!(
+            attempt = attempt + 1,
+            host,
+            downloaded,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Runtime download body complete"
+        );
 
         let digest = hex::encode(hasher.finalize());
         task.finish(Outcome::Done);
@@ -709,7 +746,7 @@ pub(crate) async fn download_to_temp_for_signature(
 ) -> Result<tempfile::TempPath> {
     crate::core::http::validate_download_url(url)?;
     let (temporary_path, _) = stream_runtime_download_to_temp::<Sha256, _, _>(
-        extract_domain(url),
+        &extract_domain(url),
         |resume| request_runtime_download(client, url, resume),
         dest,
     )
@@ -730,7 +767,7 @@ pub async fn download_with_progress(
     crate::core::http::validate_download_url(url)?;
 
     let (temporary_path, actual) = stream_runtime_download_to_temp::<Sha256, _, _>(
-        extract_domain(url),
+        &extract_domain(url),
         |resume| request_runtime_download(client, url, resume),
         dest,
     )
@@ -765,7 +802,7 @@ pub async fn download_with_progress_sha512(
     crate::core::http::validate_download_url(url)?;
 
     let (temporary_path, actual) = stream_runtime_download_to_temp::<Sha512, _, _>(
-        extract_domain(url),
+        &extract_domain(url),
         |resume| request_runtime_download(client, url, resume),
         dest,
     )
@@ -2011,12 +2048,12 @@ pub(crate) fn parse_sha512_digest(value: &str, source: &str) -> Result<String> {
     Ok(digest.to_ascii_lowercase())
 }
 
-/// Extract domain from URL for error messages
-fn extract_domain(url: &str) -> &str {
-    url.split("://")
-        .nth(1)
-        .and_then(|s| s.split('/').next())
-        .unwrap_or(url)
+/// Extract only the parsed host for diagnostics, never URL credentials or tokens.
+fn extract_domain(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown-host".to_owned())
 }
 
 /// Print installation success message
@@ -2090,6 +2127,131 @@ pub(crate) fn harden_untrusted_runtime_command(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
+    #[tokio::test]
+    async fn runtime_download_reports_stalled_body_without_exposing_urls() -> anyhow::Result<()> {
+        for url in [
+            "https://example.com/private-path?token=private-token",
+            "https://example.com?token=private-token",
+            "https://example.com#private-fragment",
+            "https://private-user:private-password@example.com/archive",
+            "invalid-private-url",
+        ] {
+            assert_runtime_download_logs_are_redacted(url).await?;
+        }
+        Ok(())
+    }
+
+    async fn assert_runtime_download_logs_are_redacted(host_url: &str) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone)]
+        struct Capture {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            body_started: Arc<tokio::sync::Notify>,
+            progress: Arc<tokio::sync::Notify>,
+        }
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let mut captured = self.bytes.lock().unwrap();
+                captured.extend_from_slice(bytes);
+                let text = String::from_utf8_lossy(&captured);
+                if text.contains("Runtime download body started") {
+                    self.body_started.notify_one();
+                }
+                if text.contains("Runtime download body progress") {
+                    self.progress.notify_one();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Capture {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+            body_started: Arc::new(tokio::sync::Notify::new()),
+            progress: Arc::new(tokio::sync::Notify::new()),
+        };
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let directory = tempfile::tempdir()?;
+        let dest = directory.path().join("private-filename.tar.gz");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!(
+            "http://{}/private-path?token=private-token",
+            listener.local_addr()?
+        );
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = async {
+            let (mut socket, _) = listener.accept().await?;
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await?);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\na")
+                .await?;
+            released.await?;
+            socket.write_all(b"bcd").await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let host = extract_domain(host_url);
+        let download = stream_runtime_download_to_temp::<Sha256, _, _>(
+            &host,
+            |_| async { Ok(client.get(&url).send().await?) },
+            &dest,
+        )
+        .with_subscriber(subscriber);
+        let observe = async {
+            // Keep real socket setup independent of virtual-clock scheduling.
+            captured.body_started.notified().await;
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(31)).await;
+            captured.progress.notified().await;
+            let logs = String::from_utf8(captured.bytes.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains("Runtime download body progress"), "{logs}");
+            assert!(!logs.contains("Runtime download body complete"));
+            tokio::time::resume();
+            release.send(()).unwrap();
+            Ok::<_, anyhow::Error>(())
+        };
+        let ((), (temporary, digest), ()) =
+            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                tokio::try_join!(server, download, observe)
+            })
+            .await
+            .expect("download phase evidence must arrive")?;
+        assert_eq!(fs::read(&temporary)?, b"abcd");
+        assert_eq!(digest, hex::encode(Sha256::digest(b"abcd")));
+        let logs = String::from_utf8(captured.bytes.lock().unwrap().clone())?;
+        assert!(logs.contains("request started") && logs.contains("body complete"));
+        assert!(logs.contains("downloaded=4"));
+        for secret in [
+            "private-path",
+            "private-token",
+            "private-filename",
+            "private-fragment",
+            "private-user",
+            "private-password",
+            "invalid-private-url",
+        ] {
+            assert!(!logs.contains(secret));
+        }
+        assert!(!dest.exists());
+        drop(temporary);
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
     async fn runtime_status_download_fixture(
         statuses: &[u16],
         dest: &Path,
@@ -3434,8 +3596,21 @@ mod tests {
             "nodejs.org"
         );
         assert_eq!(extract_domain("https://github.com/foo/bar"), "github.com");
-        // Invalid URLs return the original string (no :// separator)
-        assert_eq!(extract_domain("invalid-url"), "invalid-url");
+        assert_eq!(
+            extract_domain("https://user:secret@example.com/file"),
+            "example.com"
+        );
+        assert_eq!(
+            extract_domain("https://example.com?token=secret"),
+            "example.com"
+        );
+        assert_eq!(extract_domain("https://example.com#secret"), "example.com");
+        assert_eq!(
+            extract_domain("https://example.com:8443/file"),
+            "example.com"
+        );
+        assert_eq!(extract_domain("invalid-url"), "unknown-host");
+        assert_eq!(extract_domain("file:///private-path"), "unknown-host");
     }
 
     #[test]

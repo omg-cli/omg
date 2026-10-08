@@ -26,7 +26,7 @@ class RequiredResultsTests(unittest.TestCase):
         block = job_block(CI_YML.read_text(encoding="utf-8"), "ci-success")
         script = textwrap.dedent(block.split("        run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
-            env = dict(os.environ, QUICK_GATE="success", BUILD_REQUIRED=required,
+            env = dict(os.environ, QUICK_GATE="success", WORKFLOW_CHECKS="success", BUILD_REQUIRED=required,
                        STANDALONE_SUITES="success", PORTABLE="success", LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
                        FEATURE_INTERSECTIONS="success", MACOS="success", MACOS_NEXTEST_SOURCE="success", UBUNTU="success",
                        DOCS_AUDIT="success", RUNTIME_USAGE="success",

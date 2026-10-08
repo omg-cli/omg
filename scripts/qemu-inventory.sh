@@ -2944,7 +2944,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$case" == runtime-python-install || "$case" == runtime-node-install || "$case" == runtime-go-install ]]; then
     runtime_version=$(jq -r '.[2]' <<< "$args_json")
     runtime_name=$(jq -r '.[1]' <<< "$args_json")
-    remote+="; umask 0002; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install"); $(declare -f check_runtime_usage)"
+    remote+="; umask 0002; export RUST_LOG=warn,omg_lib::runtimes::common=info; export OMG_DATA_DIR=\"\$rowdir/runtime-data\" OMG_CACHE_DIR=\"\$rowdir/runtime-cache\" OMG_CONFIG_DIR=\"\$rowdir/runtime-config\" OMG_TEST_MODE=0; $(declare -f "check_${runtime_name}_install"); $(declare -f check_runtime_usage)"
   fi
   if [[ "$case" == runtime-rust-install ]]; then
     rust_oracle=$(jq -rn --rawfile fixture "$(dirname "$0")/qemu-rust-install-oracle.py" '$fixture | @sh')

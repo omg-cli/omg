@@ -3,7 +3,7 @@
 #
 # Key Features:
 # - PR path filtering: Avoid redundant platform builds for documentation
-# - Quick gate: Fast checks run first, gate expensive builds
+# - Quick gate: Classify changes before independent checks and builds
 # - Matrix strategy: native Linux distro and ABI checks in parallel
 # - cargo-nextest: 10-35% faster test execution
 # - Artifact caching: Shared caches across jobs
@@ -49,16 +49,16 @@ env:
 jobs:
   #############################################################################
   # STAGE 1: Quick Gate
-  # Formatting, shell syntax and policy tests gate platform builds.
-  # Portable Rust owns portable Clippy and fuzz compilation, so these
-  # independent checks do not delay every platform behind a second build.
+  # Only change classification precedes platform builds. The complete
+  # workflow checks run alongside builds and remain required by CI Success.
   #############################################################################
   quick-gate:
     name: "Quick Gate"
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
     outputs:
       should-build: ${{ github.event_name == 'push' || steps.changes.outputs.required == 'true' }}
+      checks-required: ${{ steps.changes.outputs.required }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,6 +72,17 @@ jobs:
       - name: Validate change classification
         run: python3 -m unittest discover -s scripts -p test_ci_change_scope.py
 
+  workflow-checks:
+    name: "Workflow checks"
+    needs: quick-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
       - name: Test debt baseline guards
         run: python3 -m unittest discover -s scripts -p 'test_debt*.py'
 
@@ -79,14 +90,14 @@ jobs:
         run: python3 scripts/debt-ratchet.py --ci
 
       - name: Install Rust
-        if: steps.changes.outputs.required == 'true'
+        if: needs.quick-gate.outputs.checks-required == 'true'
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.95.0"
           components: rustfmt
 
       - name: Run quick workflow checks
-        if: steps.changes.outputs.required == 'true'
+        if: needs.quick-gate.outputs.checks-required == 'true'
         run: make ci-workflow-quick
 
       - name: Verify installer destination safety
@@ -166,6 +177,28 @@ jobs:
           # PRs restore main's cache; merge-ref writes only benefit that PR's reruns.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install portable compiler cache
+        if: >-
+          vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: sccache@0.18.0
+
+      - name: Configure portable R2 cache
+        id: r2-cache
+        if: >-
+          vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          OMG_R2_CACHE_ENABLED: ${{ vars.OMG_R2_CACHE_ENABLED }}
+          OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
+        run: python3 scripts/ci-r2-cache.py
+
       - name: Clippy
         run: |
           cargo clippy --all-targets --no-default-features --features pgp,license \
@@ -225,6 +258,12 @@ jobs:
 
       - name: Verify portable environment CLI round-trip
         run: cargo nextest run --test env_portability_cli --no-default-features --features pgp,license --locked --profile ci
+
+      - name: Report portable compiler cache
+        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        run: |
+          trap 'sccache --stop-server' EXIT
+          sccache --show-stats
 
   #############################################################################
   # STAGE 2: Platform Matrix (Linux containers)
@@ -315,7 +354,7 @@ jobs:
               test "$(uname -m)" = x86_64
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt jq \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               ldconfig -p | grep -F 'libapt-pkg.so.7'
               curl --proto '=https' --tlsv1.2 -fsSL \
@@ -967,6 +1006,11 @@ jobs:
           toolchain: "1.95.0"
           components: clippy
 
+      # rust-cache hashes every installed toolchain, including the runner's
+      # unused floating stable. Keep its version out of our pinned build key.
+      - name: Remove unused runner toolchain
+        run: rustup toolchain uninstall stable
+
       - name: Setup cache
         if: inputs.skip-cache != true
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1156,7 +1200,7 @@ jobs:
 
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, standalone-suites, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
+    needs: [quick-gate, workflow-checks, standalone-suites, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -1167,6 +1211,7 @@ jobs:
         env:
           BUILD_REQUIRED: ${{ needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' }}
           QUICK_GATE: ${{ needs.quick-gate.result }}
+          WORKFLOW_CHECKS: ${{ needs.workflow-checks.result }}
           STANDALONE_SUITES: ${{ needs.standalone-suites.result }}
           PORTABLE: ${{ needs.portable.result }}
           LINUX_MATRIX: ${{ needs.linux-matrix.result }}
@@ -1185,6 +1230,7 @@ jobs:
           echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Quick Gate | $QUICK_GATE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Workflow checks | $WORKFLOW_CHECKS |" >> $GITHUB_STEP_SUMMARY
           echo "| Standalone suites | $STANDALONE_SUITES |" >> $GITHUB_STEP_SUMMARY
           echo "| Portable Rust | $PORTABLE |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux Matrix | $LINUX_MATRIX |" >> $GITHUB_STEP_SUMMARY
@@ -1209,6 +1255,11 @@ jobs:
 
           if [[ "$QUICK_GATE" != "success" ]]; then
             echo "::error::Quick gate failed"
+            exit 1
+          fi
+
+          if [[ "$WORKFLOW_CHECKS" != "success" ]]; then
+            echo "::error::Workflow checks did not succeed: $WORKFLOW_CHECKS"
             exit 1
           fi
 
