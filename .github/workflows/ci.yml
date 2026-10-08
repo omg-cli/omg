@@ -1006,6 +1006,11 @@ jobs:
           toolchain: "1.95.0"
           components: clippy
 
+      # rust-cache hashes every installed toolchain, including the runner's
+      # unused floating stable. Keep its version out of our pinned build key.
+      - name: Remove unused runner toolchain
+        run: rustup toolchain uninstall stable
+
       - name: Setup cache
         if: inputs.skip-cache != true
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

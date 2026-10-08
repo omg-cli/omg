@@ -32,6 +32,19 @@ cancellation, skipped, and missing results. Actual end-to-end improvement must
 be measured on the candidate commit; queueing, package mirrors, cold caches,
 and the longest native/QEMU lane still affect elapsed time.
 
+The Ubuntu 24.04 cache also depended on the runner's unused floating `stable`
+toolchain. The baseline restored a 1.19 GB cache with environment hash
+`14b3fdf5`; the candidate missed with `07d0ea9c`. Recomputing the pinned cache
+action's hash reproduced both values by changing only that unused compiler
+from Rust 1.99.0 to 1.98.1, while the actual build compiler stayed at 1.95.0.
+The action [hashes all installed toolchains](https://github.com/Swatinem/rust-cache/blob/6323deb102c322ba6fcbdcafc7e3dddab59af2b6/src/config.ts#L358-L382).
+After installing pinned Rust, this job now removes the unused `stable`
+installation from its disposable runner before cache setup. Compiler,
+environment, and lockfile hashing remain enabled, and the native producer
+still verifies the pinned compiler. This creates a new cache identity: the
+first main run must populate it before warm-cache improvements can be measured.
+PRs continue to restore without writing the main cache.
+
 ## Optional portable compiler cache
 
 The portable job supports a private R2-backed sccache cache. It is disabled unless
