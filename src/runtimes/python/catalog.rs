@@ -23,7 +23,7 @@ struct Entry {
 }
 
 pub(super) async fn fetch(client: &reqwest::Client, target: &str) -> Result<Vec<Download>> {
-    fetch_from(client, "https://raw.githubusercontent.com/astral-sh/uv/main/crates/uv-python/download-metadata.json", target).await
+    fetch_from(client, "https://raw.githubusercontent.com/astral-sh/uv/main/crates/uv-python-managed/download-metadata.json", target).await
 }
 
 async fn fetch_from(client: &reqwest::Client, url: &str, target: &str) -> Result<Vec<Download>> {
@@ -303,6 +303,7 @@ mod tests {
         for (status, body, succeeds) in [
             ("200 OK", valid.as_str(), true),
             ("403 Forbidden", valid.as_str(), false),
+            ("404 Not Found", "404: Not Found", false),
             ("500 Internal Server Error", valid.as_str(), false),
             ("200 OK", "broken-json", false),
             ("200 OK", "{}", false),
