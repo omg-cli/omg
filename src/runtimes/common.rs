@@ -2127,7 +2127,7 @@ pub(crate) fn harden_untrusted_runtime_command(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn runtime_download_reports_stalled_body_without_exposing_urls() -> anyhow::Result<()> {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
@@ -2135,17 +2135,33 @@ mod tests {
         use tracing::instrument::WithSubscriber;
 
         #[derive(Clone)]
-        struct Capture(Arc<Mutex<Vec<u8>>>);
+        struct Capture {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            body_started: Arc<tokio::sync::Notify>,
+            progress: Arc<tokio::sync::Notify>,
+        }
         impl Write for Capture {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
+                let mut captured = self.bytes.lock().unwrap();
+                captured.extend_from_slice(bytes);
+                let text = String::from_utf8_lossy(&captured);
+                if text.contains("Runtime download body started") {
+                    self.body_started.notify_one();
+                }
+                if text.contains("Runtime download body progress") {
+                    self.progress.notify_one();
+                }
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
         }
-        let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+        let captured = Capture {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+            body_started: Arc::new(tokio::sync::Notify::new()),
+            progress: Arc::new(tokio::sync::Notify::new()),
+        };
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
@@ -2182,29 +2198,27 @@ mod tests {
         )
         .with_subscriber(subscriber);
         let observe = async {
-            // Real socket delivery can require several reactor turns. Advance
-            // the clock only after the actual downloader starts its body timer.
-            for _ in 0..10000 {
-                if String::from_utf8_lossy(&captured.0.lock().unwrap()).contains("body started") {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert!(String::from_utf8_lossy(&captured.0.lock().unwrap()).contains("body started"));
+            // Keep real socket setup independent of virtual-clock scheduling.
+            captured.body_started.notified().await;
+            tokio::time::pause();
             tokio::time::advance(std::time::Duration::from_secs(31)).await;
-            for _ in 0..100 {
-                tokio::task::yield_now().await;
-            }
-            let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            captured.progress.notified().await;
+            let logs = String::from_utf8(captured.bytes.lock().unwrap().clone()).unwrap();
             assert!(logs.contains("Runtime download body progress"), "{logs}");
             assert!(!logs.contains("Runtime download body complete"));
+            tokio::time::resume();
             release.send(()).unwrap();
             Ok::<_, anyhow::Error>(())
         };
-        let ((), (temporary, digest), ()) = tokio::try_join!(server, download, observe)?;
+        let ((), (temporary, digest), ()) =
+            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                tokio::try_join!(server, download, observe)
+            })
+            .await
+            .expect("download phase evidence must arrive")?;
         assert_eq!(fs::read(&temporary)?, b"abcd");
         assert_eq!(digest, hex::encode(Sha256::digest(b"abcd")));
-        let logs = String::from_utf8(captured.0.lock().unwrap().clone())?;
+        let logs = String::from_utf8(captured.bytes.lock().unwrap().clone())?;
         assert!(logs.contains("request started") && logs.contains("body complete"));
         assert!(logs.contains("downloaded=4"));
         for secret in ["private-path", "private-token", "private-filename"] {
