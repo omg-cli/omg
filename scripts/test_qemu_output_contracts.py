@@ -18,6 +18,29 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipIf(os.name == 'nt', 'native preview assertions require POSIX bash')
 class NativeRemovalContracts(unittest.TestCase):
+    def test_runtime_guest_enables_only_download_phase_diagnostics(self):
+        source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
+        line = next(line.strip() for line in source.splitlines()
+                    if line.strip().startswith('remote+="; umask 0002;'))
+        with tempfile.TemporaryDirectory() as directory:
+            for runtime in ('go', 'python', 'node'):
+                with self.subTest(runtime=runtime):
+                    command = (
+                        'remote=:; runtime_name=$1; rowdir=$2; '
+                        f'check_{runtime}_install() {{ :; }}; '
+                        'check_runtime_usage() { :; };\n' + line + '\n'
+                        'eval "$remote"; '
+                        'printf "%s\\n" "$RUST_LOG" "$OMG_TEST_MODE" "$OMG_DATA_DIR"'
+                    )
+                    result = subprocess.run(
+                        [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                         command, '_', runtime, directory], capture_output=True,
+                        text=True, timeout=5, env={**os.environ, 'RUST_LOG': 'error'})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines(), [
+                        'warn,omg_lib::runtimes::common=info', '0',
+                        str(Path(directory) / 'runtime-data')])
+
     def test_trixie_doctor_backend_reference_preserves_os_and_lane_identity(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('# BEGIN DOCTOR BACKEND ORACLE')

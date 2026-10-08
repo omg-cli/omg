@@ -471,6 +471,12 @@ where
 
     for attempt in 0..MAX_DOWNLOAD_ATTEMPTS {
         let requested = resume.clone();
+        let started = tokio::time::Instant::now();
+        tracing::info!(
+            attempt = attempt + 1,
+            host,
+            "Runtime download request started"
+        );
         let response = match request(requested.clone()).await {
             Ok(response) => response,
             Err(error) => {
@@ -495,6 +501,13 @@ where
             }
         };
 
+        tracing::info!(
+            attempt = attempt + 1,
+            host,
+            status = response.status().as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "Runtime download headers received"
+        );
         if !response.status().is_success() {
             let status = response.status();
             if attempt + 1 < MAX_DOWNLOAD_ATTEMPTS && crate::core::http::is_retryable_status(status)
@@ -605,8 +618,25 @@ where
         let mut stream = response.bytes_stream();
         let mut received_this_attempt: u64 = 0;
         let mut failure: Option<reqwest::Error> = None;
+        let period = std::time::Duration::from_secs(30);
+        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tracing::info!(
+            attempt = attempt + 1,
+            host,
+            downloaded,
+            "Runtime download body started"
+        );
 
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = tokio::select! {
+                item = stream.next() => item,
+                _ = heartbeat.tick() => {
+                    tracing::info!(attempt = attempt + 1, host, bytes_received = received_this_attempt, downloaded, elapsed_ms = started.elapsed().as_millis(), "Runtime download body progress");
+                    continue;
+                }
+            };
+            let Some(item) = item else { break };
             let chunk = match item {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -688,6 +718,13 @@ where
             .await
             .with_context(|| format!("Failed to sync download to: {}", dest.display()))?;
         drop(file);
+        tracing::info!(
+            attempt = attempt + 1,
+            host,
+            downloaded,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Runtime download body complete"
+        );
 
         let digest = hex::encode(hasher.finalize());
         task.finish(Outcome::Done);
@@ -2090,6 +2127,95 @@ pub(crate) fn harden_untrusted_runtime_command(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn runtime_download_reports_stalled_body_without_exposing_urls() -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let directory = tempfile::tempdir()?;
+        let dest = directory.path().join("private-filename.tar.gz");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!(
+            "http://{}/private-path?token=private-token",
+            listener.local_addr()?
+        );
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = async {
+            let (mut socket, _) = listener.accept().await?;
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await?);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\na")
+                .await?;
+            released.await?;
+            socket.write_all(b"bcd").await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let download = stream_runtime_download_to_temp::<Sha256, _, _>(
+            "127.0.0.1",
+            |_| async { Ok(client.get(&url).send().await?) },
+            &dest,
+        )
+        .with_subscriber(subscriber);
+        let observe = async {
+            // Real socket delivery can require several reactor turns. Advance
+            // the clock only after the actual downloader starts its body timer.
+            for _ in 0..10000 {
+                if String::from_utf8_lossy(&captured.0.lock().unwrap()).contains("body started") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(String::from_utf8_lossy(&captured.0.lock().unwrap()).contains("body started"));
+            tokio::time::advance(std::time::Duration::from_secs(31)).await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains("Runtime download body progress"), "{logs}");
+            assert!(!logs.contains("Runtime download body complete"));
+            release.send(()).unwrap();
+            Ok::<_, anyhow::Error>(())
+        };
+        let ((), (temporary, digest), ()) = tokio::try_join!(server, download, observe)?;
+        assert_eq!(fs::read(&temporary)?, b"abcd");
+        assert_eq!(digest, hex::encode(Sha256::digest(b"abcd")));
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone())?;
+        assert!(logs.contains("request started") && logs.contains("body complete"));
+        assert!(logs.contains("downloaded=4"));
+        for secret in ["private-path", "private-token", "private-filename"] {
+            assert!(!logs.contains(secret));
+        }
+        assert!(!dest.exists());
+        drop(temporary);
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
     async fn runtime_status_download_fixture(
         statuses: &[u16],
         dest: &Path,
