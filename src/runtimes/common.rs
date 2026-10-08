@@ -746,7 +746,7 @@ pub(crate) async fn download_to_temp_for_signature(
 ) -> Result<tempfile::TempPath> {
     crate::core::http::validate_download_url(url)?;
     let (temporary_path, _) = stream_runtime_download_to_temp::<Sha256, _, _>(
-        extract_domain(url),
+        &extract_domain(url),
         |resume| request_runtime_download(client, url, resume),
         dest,
     )
@@ -767,7 +767,7 @@ pub async fn download_with_progress(
     crate::core::http::validate_download_url(url)?;
 
     let (temporary_path, actual) = stream_runtime_download_to_temp::<Sha256, _, _>(
-        extract_domain(url),
+        &extract_domain(url),
         |resume| request_runtime_download(client, url, resume),
         dest,
     )
@@ -802,7 +802,7 @@ pub async fn download_with_progress_sha512(
     crate::core::http::validate_download_url(url)?;
 
     let (temporary_path, actual) = stream_runtime_download_to_temp::<Sha512, _, _>(
-        extract_domain(url),
+        &extract_domain(url),
         |resume| request_runtime_download(client, url, resume),
         dest,
     )
@@ -2048,12 +2048,12 @@ pub(crate) fn parse_sha512_digest(value: &str, source: &str) -> Result<String> {
     Ok(digest.to_ascii_lowercase())
 }
 
-/// Extract domain from URL for error messages
-fn extract_domain(url: &str) -> &str {
-    url.split("://")
-        .nth(1)
-        .and_then(|s| s.split('/').next())
-        .unwrap_or(url)
+/// Extract only the parsed host for diagnostics, never URL credentials or tokens.
+fn extract_domain(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown-host".to_owned())
 }
 
 /// Print installation success message
@@ -2129,6 +2129,19 @@ pub(crate) fn harden_untrusted_runtime_command(
 mod tests {
     #[tokio::test]
     async fn runtime_download_reports_stalled_body_without_exposing_urls() -> anyhow::Result<()> {
+        for url in [
+            "https://example.com/private-path?token=private-token",
+            "https://example.com?token=private-token",
+            "https://example.com#private-fragment",
+            "https://private-user:private-password@example.com/archive",
+            "invalid-private-url",
+        ] {
+            assert_runtime_download_logs_are_redacted(url).await?;
+        }
+        Ok(())
+    }
+
+    async fn assert_runtime_download_logs_are_redacted(host_url: &str) -> anyhow::Result<()> {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2191,8 +2204,9 @@ mod tests {
             socket.write_all(b"bcd").await?;
             Ok::<_, anyhow::Error>(())
         };
+        let host = extract_domain(host_url);
         let download = stream_runtime_download_to_temp::<Sha256, _, _>(
-            "127.0.0.1",
+            &host,
             |_| async { Ok(client.get(&url).send().await?) },
             &dest,
         )
@@ -2221,7 +2235,15 @@ mod tests {
         let logs = String::from_utf8(captured.bytes.lock().unwrap().clone())?;
         assert!(logs.contains("request started") && logs.contains("body complete"));
         assert!(logs.contains("downloaded=4"));
-        for secret in ["private-path", "private-token", "private-filename"] {
+        for secret in [
+            "private-path",
+            "private-token",
+            "private-filename",
+            "private-fragment",
+            "private-user",
+            "private-password",
+            "invalid-private-url",
+        ] {
             assert!(!logs.contains(secret));
         }
         assert!(!dest.exists());
@@ -3574,8 +3596,21 @@ mod tests {
             "nodejs.org"
         );
         assert_eq!(extract_domain("https://github.com/foo/bar"), "github.com");
-        // Invalid URLs return the original string (no :// separator)
-        assert_eq!(extract_domain("invalid-url"), "invalid-url");
+        assert_eq!(
+            extract_domain("https://user:secret@example.com/file"),
+            "example.com"
+        );
+        assert_eq!(
+            extract_domain("https://example.com?token=secret"),
+            "example.com"
+        );
+        assert_eq!(extract_domain("https://example.com#secret"), "example.com");
+        assert_eq!(
+            extract_domain("https://example.com:8443/file"),
+            "example.com"
+        );
+        assert_eq!(extract_domain("invalid-url"), "unknown-host");
+        assert_eq!(extract_domain("file:///private-path"), "unknown-host");
     }
 
     #[test]
