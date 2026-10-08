@@ -62,7 +62,8 @@ class QuickGateOfflineTests(unittest.TestCase):
         self.assertNotIn("Swatinem/rust-cache", gate)
         self.assertNotIn("cargo check", gate)
         self.assertNotIn("cargo clippy", gate)
-        self.assertIn("components: rustfmt", gate)
+        self.assertNotIn("rust-toolchain@", gate)
+        self.assertIn("components: rustfmt", job_block(text, "workflow-checks"))
         portable = job_block(text, "portable")
         self.assertIn(
             "shell_completion.zsh",
@@ -193,22 +194,22 @@ class QemuConcurrencyTests(unittest.TestCase):
 class LocalCiGateExecutesTests(unittest.TestCase):
     def test_local_ci_gate_executes_recipes_instead_of_dry_run(self) -> None:
         text = CI_YML.read_text(encoding="utf-8")
-        gate = job_block(text, "quick-gate")
+        gate = job_block(text, "workflow-checks")
         self.assertNotIn(
             "make -n",
             gate,
-            "quick-gate must not use `make -n` dry-run: it never executes recipes",
+            "workflow checks must not use `make -n` dry-run: it never executes recipes",
         )
         self.assertRegex(
             gate,
             r"run:\s*make ci-workflow-quick",
-            "quick-gate must really execute `make ci-workflow-quick`",
+            "workflow checks must really execute `make ci-workflow-quick`",
         )
 
 
 class CiDeduplicationTests(unittest.TestCase):
-    def test_quick_gate_executes_shared_checks_only_once(self) -> None:
-        gate = job_block(CI_YML.read_text(encoding="utf-8"), "quick-gate")
+    def test_workflow_checks_execute_shared_checks_only_once(self) -> None:
+        gate = job_block(CI_YML.read_text(encoding="utf-8"), "workflow-checks")
         self.assertEqual(gate.count("run: make ci-workflow-quick"), 1)
         result = subprocess.run(
             ["make", "--no-print-directory", "--dry-run", "ci-workflow-quick"],

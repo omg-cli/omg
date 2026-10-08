@@ -284,7 +284,7 @@ debt-check:
 debt-refresh:
 	python3 scripts/debt-ratchet.py --refresh
 
-# Hosted prerequisite: no compilation before independent platform jobs.
+# Required hosted checks run alongside independent platform jobs.
 ci-workflow-quick: check-shell-syntax
 	cargo fmt --all -- --check
 	python3 -m unittest discover -s scripts -p 'test_*.py'
