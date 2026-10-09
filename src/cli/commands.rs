@@ -1705,7 +1705,9 @@ pub fn stats(json: bool) -> Result<()> {
         println!(
             "  {} {}",
             style::dim("Tip:"),
-            style::dim("omg account link <token>  — optional, attributes usage to your dashboard")
+            style::dim(
+                "omg account link --token-stdin  — optional, attributes usage to your dashboard"
+            )
         );
     }
 

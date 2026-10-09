@@ -297,7 +297,7 @@ pub async fn members(_ctx: &CliContext) -> Result<()> {
             Cmd::header("Team Members", "No members found"),
             Cmd::spacer(),
             Cmd::info(
-                "Team members appear here after machines link with `omg account link <token>`",
+                "Team members appear here after machines link with `omg account link --token-stdin`",
             ),
         ]))?;
         return Ok(());
