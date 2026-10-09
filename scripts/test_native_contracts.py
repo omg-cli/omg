@@ -537,7 +537,7 @@ class NativeReceipts(unittest.TestCase):
             ('pgp,license', set()), ('arch,pgp,license', {'security_daemon_optional'}),
             ('debian,pgp,license', common_debian | {'security_daemon_optional', 'apt_version_ordering'}),
             ('debian-pure', common_debian | {'debian_pure_integration'}),
-            ('fedora,pgp,license', {'fedora_tests', 'security_daemon_optional'}),
+            ('fedora,pgp,license', {'fedora_tests', 'security_daemon_optional', 'metadata_backend_routing'}),
         ):
             with self.subTest(features=features):
                 args = NATIVE.cargo_test_args(features)

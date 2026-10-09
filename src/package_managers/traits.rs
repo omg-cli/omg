@@ -7,6 +7,14 @@ use anyhow::Result;
 
 use crate::core::Package;
 
+/// A retained observation of the installed inventory used by a package index.
+///
+/// Repository metadata is outside this observation and needs explicit refresh.
+/// Observation checks can perform native I/O; callers must use a blocking task.
+pub trait InstalledCatalogObservation: Send + Sync {
+    fn is_current(&self) -> Result<bool>;
+}
+
 /// Trait for package manager backends (object-safe for dynamic dispatch)
 ///
 /// Uses manually desugared async methods (returning `Pin<Box<dyn Future>>`)
@@ -14,6 +22,15 @@ use crate::core::Package;
 pub trait PackageManager: Send + Sync {
     /// Get the name of this package manager
     fn name(&self) -> &'static str;
+
+    /// Capture installed inventory state for an index publication. `None` means
+    /// that this backend cannot certify installed catalog freshness cheaply.
+    /// Call on a blocking task, as native database observation may perform I/O.
+    fn installed_catalog_observation(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn InstalledCatalogObservation>>> {
+        Ok(None)
+    }
 
     /// Preserve installed package identities for security exports. Backends
     /// override this when their ordinary package view omits native identity.

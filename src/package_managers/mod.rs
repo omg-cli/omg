@@ -496,7 +496,7 @@ pub use pacman_db::{
 };
 #[cfg(feature = "arch")]
 pub use parallel_sync::sync_databases_parallel;
-pub use traits::PackageManager;
+pub use traits::{InstalledCatalogObservation, PackageManager};
 pub use types::{LocalPackage, SyncPackage};
 
 /// Selected live package backend. Mock is available only under explicit test mode.

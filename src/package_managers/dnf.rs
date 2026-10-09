@@ -121,6 +121,17 @@ struct RpmDatabaseObservation {
     data_version: i64,
 }
 
+struct RpmInstalledCatalogObservation {
+    path: PathBuf,
+    database: RpmDatabaseObservation,
+}
+
+impl super::InstalledCatalogObservation for RpmInstalledCatalogObservation {
+    fn is_current(&self) -> Result<bool> {
+        Ok(self.database.is_current(&self.path))
+    }
+}
+
 impl RpmDatabaseObservation {
     fn read(path: &Path) -> Option<Self> {
         let before_open = RpmDatabaseIdentity::read(path)?;
@@ -183,6 +194,17 @@ impl InstalledPackage {
             "{}-{}-{}.{}",
             self.name, self.version, self.release, self.architecture
         )
+    }
+
+    fn matches_selector(&self, selector: &str) -> bool {
+        self.name == selector
+            || self.identity() == selector
+            || self.nevra() == selector
+            || (!self.version.contains(':')
+                && format!(
+                    "{}-0:{}-{}.{}",
+                    self.name, self.version, self.release, self.architecture
+                ) == selector)
     }
 }
 
@@ -542,9 +564,11 @@ impl DnfPackageManager {
             .filter(|snapshot| snapshot.observation.is_current(&self.rpm_db_path))
             .map(|snapshot| {
                 snapshot.packages.contains_key(package)
-                    || snapshot.packages.values().flatten().any(|installed| {
-                        installed.identity() == package || installed.nevra() == package
-                    })
+                    || snapshot
+                        .packages
+                        .values()
+                        .flatten()
+                        .any(|installed| installed.matches_selector(package))
             });
         if let Some(installed) = cached {
             return Ok(installed);
@@ -552,11 +576,7 @@ impl DnfPackageManager {
         Ok(self
             .load_installed_packages_blocking()?
             .iter()
-            .any(|installed| {
-                installed.name == package
-                    || installed.identity() == package
-                    || installed.nevra() == package
-            }))
+            .any(|installed| installed.matches_selector(package)))
     }
 
     async fn apply_current_install_reasons(packages: &mut [InstalledPackage]) -> Result<()> {
@@ -749,6 +769,22 @@ impl DnfPackageManager {
             let tag = entry.tag.get();
             let tag_type = entry.tag_type.get();
             let count = entry.count.get() as usize;
+
+            if matches!(
+                tag,
+                rpm_tags::NAME | rpm_tags::VERSION | rpm_tags::RELEASE | rpm_tags::ARCH
+            ) {
+                anyhow::ensure!(
+                    tag_type == 6 && count == 1,
+                    "RPM identity tag {tag} must be a single string"
+                );
+            }
+            if tag == rpm_tags::EPOCH {
+                anyhow::ensure!(
+                    tag_type == 4 && count == 1,
+                    "RPM EPOCH identity tag must be a single INT32"
+                );
+            }
 
             anyhow::ensure!(
                 (1..=9).contains(&tag_type),
@@ -1032,7 +1068,7 @@ impl DnfPackageManager {
     /// through as text instead of a tab, which also fails parsing.
     fn repository_query_format(query: &RepositoryQuery<'_>) -> &'static str {
         match query {
-            RepositoryQuery::Available(_) => "%{name}\t%{evr}\t%{summary}\\n",
+            RepositoryQuery::Available(_) => "%{name}.%{arch}\t%{evr}\t%{summary}\\n",
             RepositoryQuery::InstalledSizes(_) => "%{full_nevra}\t%{installsize}\\n",
             RepositoryQuery::InstalledReasons(_) => "%{full_nevra}\t%{reason}\\n",
             RepositoryQuery::InstalledDetails(_) => "%{name}\t%{evr}\t%{full_nevra}\t%{reason}\\n",
@@ -1108,10 +1144,55 @@ impl DnfPackageManager {
             | RepositoryQuery::InstalledSizes(InstalledSizeQuery::All) => None,
         };
         if let Some(name) = package {
-            crate::core::security::validate_package_name(name)?;
+            Self::validate_query_selector(name)?;
             args.push(name.to_owned());
         }
         Ok(args)
+    }
+
+    /// Validate a read-only DNF package name, architecture identity, or full NEVRA.
+    /// RPM version syntax is local to this backend; generic package validators
+    /// continue to reject epochs and RPM prerelease/postrelease modifiers.
+    pub fn validate_query_selector(selector: &str) -> Result<()> {
+        if !selector.contains([':', '~', '^']) {
+            return crate::core::security::validate_package_name(selector).map_err(Into::into);
+        }
+        let (nvr, architecture) = selector
+            .rsplit_once('.')
+            .context("DNF selector lacks architecture")?;
+        let (nv, release) = nvr.rsplit_once('-').context("DNF selector lacks release")?;
+        let (name, version) = nv.rsplit_once('-').context("DNF selector lacks version")?;
+        crate::core::security::validate_package_name(name)?;
+        crate::core::security::validate_package_name(architecture)?;
+        anyhow::ensure!(
+            [name, architecture].iter().all(|field| field
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte))),
+            "Invalid DNF selector name or architecture"
+        );
+        let version = if let Some((epoch, version)) = version.split_once(':') {
+            anyhow::ensure!(
+                !epoch.is_empty() && epoch.bytes().all(|byte| byte.is_ascii_digit()),
+                "Invalid DNF selector epoch"
+            );
+            epoch
+                .parse::<u32>()
+                .context("DNF selector epoch exceeds RPM range")?;
+            version
+        } else {
+            version
+        };
+        for field in [version, release] {
+            anyhow::ensure!(
+                !field.is_empty()
+                    && field.len() <= 128
+                    && field
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._+~^".contains(&byte)),
+                "Invalid DNF selector version or release"
+            );
+        }
+        Ok(())
     }
 
     async fn query_output(command: tokio::process::Command) -> Result<Vec<u8>> {
@@ -1600,6 +1681,16 @@ impl DnfPackageManager {
 }
 
 impl PackageManager for DnfPackageManager {
+    fn installed_catalog_observation(
+        &self,
+    ) -> Result<Option<Arc<dyn super::InstalledCatalogObservation>>> {
+        let database = RpmDatabaseObservation::read(&self.rpm_db_path)
+            .context("Cannot observe RPM SQLite inventory for daemon catalog")?;
+        Ok(Some(Arc::new(RpmInstalledCatalogObservation {
+            path: self.rpm_db_path.clone(),
+            database,
+        })))
+    }
     fn security_inventory(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<super::types::SecurityPackage>>> + Send + '_>> {
@@ -1852,11 +1943,12 @@ impl PackageManager for DnfPackageManager {
     ) -> Pin<Box<dyn Future<Output = Result<Option<Package>>> + Send + '_>> {
         let package = package.to_string();
         Box::pin(async move {
+            Self::validate_query_selector(&package)?;
             let installed = self.load_installed_packages().await?;
 
             let matches = installed
                 .iter()
-                .filter(|p| p.name == package || p.identity() == package || p.nevra() == package)
+                .filter(|p| p.matches_selector(&package))
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 matches.len() <= 1,
@@ -1872,10 +1964,12 @@ impl PackageManager for DnfPackageManager {
                 }));
             }
 
-            Ok(Self::available_packages(Some(&package))
-                .await?
-                .into_iter()
-                .find(|candidate| candidate.name == package))
+            let available = Self::available_packages(Some(&package)).await?;
+            anyhow::ensure!(
+                available.len() <= 1,
+                "Package '{package}' has multiple available builds; specify the full NEVRA"
+            );
+            Ok(available.into_iter().next())
         })
     }
 
@@ -2135,6 +2229,36 @@ mod tests {
         );
         assert!(manager.is_installed("example.i686").await?);
         assert!(manager.is_installed("example-2:1.0-1.fc44.i686").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installed_catalog_observation_survives_manager_cache_republication() -> Result<()> {
+        let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
+        let directory = write_packages_db(&[native.as_slice()]);
+        let mut manager = DnfPackageManager::new();
+        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let observed = manager
+            .installed_catalog_observation()?
+            .expect("SQLite observation available");
+        assert!(observed.is_current()?);
+        assert_eq!(
+            manager.list_installed().await?[0].name,
+            "publicsuffix-list-dafsa.noarch"
+        );
+        let database = Connection::open(&manager.rpm_db_path)?;
+        database.execute("DELETE FROM Packages", [])?;
+        assert!(manager.list_installed().await?.is_empty());
+        assert!(
+            !observed.is_current()?,
+            "refreshing manager cache must not validate a prior daemon index"
+        );
+        assert!(
+            manager
+                .installed_catalog_observation()?
+                .expect("replacement observation")
+                .is_current()?
+        );
         Ok(())
     }
 
@@ -2526,6 +2650,42 @@ mod tests {
     }
 
     #[test]
+    fn repository_selectors_preserve_native_rpm_version_characters() -> Result<()> {
+        for selector in [
+            "widget-0:1.0_git-1.fc43.x86_64",
+            "widget-1:2.0^a-1_git.x86_64",
+            "widget-name-1:2.0~rc1-1^a.noarch",
+            "widget-2.0^a-1_git.x86_64",
+        ] {
+            let args = DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(
+                selector,
+            )))?;
+            assert_eq!(args.last().map(String::as_str), Some(selector));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repository_selectors_reject_malformed_native_forms_before_spawning() {
+        for selector in [
+            "--config=untrusted",
+            "widget-:2-1.x86_64",
+            "widget-x:2-1.x86_64",
+            "widget-1:2:3-1.x86_64",
+            "widget-4294967296:2-1.x86_64",
+            "widget-1:2-1:9.x86_64",
+            "widget-1:2-1./tmp",
+            "widget-1:2-1.x86_64\n--config=untrusted",
+            "../widget-1:2-1.x86_64",
+            "widget-1:2;id-1.x86_64",
+        ] {
+            DnfPackageManager::available_packages(Some(selector))
+                .await
+                .expect_err("malformed selector must fail before native spawning");
+        }
+    }
+
+    #[test]
     fn available_repository_rows_preserve_epoch_and_uninstalled_state() {
         let packages = DnfPackageManager::parse_available_packages(
             b"tree\t2:2.2.1-4.fc44\tDirectory listing\n",
@@ -2616,6 +2776,98 @@ mod tests {
             packages[0].summary,
             "Cross-vendor public domain suffix database in DAFSA form"
         );
+    }
+
+    #[test]
+    fn rpm_epoch_native_singleton_preserves_version_identity() {
+        let native = include_bytes!("../../tests/data/fedora-xz-libs.rpmhdr");
+        let directory = write_packages_db(&[native.as_slice()]);
+        let packages = DnfPackageManager::read_rpm_sqlite(&directory.path().join("rpmdb.sqlite"))
+            .expect("unmodified native RPM EPOCH singleton must decode");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(
+            (
+                packages[0].name.as_str(),
+                packages[0].version.as_str(),
+                packages[0].release.as_str(),
+                packages[0].architecture.as_str()
+            ),
+            ("xz-libs", "1:5.8.2", "2.fc44", "x86_64")
+        );
+    }
+
+    #[test]
+    fn rpm_epoch_inventory_rejects_native_identity_with_wrong_schema() {
+        let native = include_bytes!("../../tests/data/fedora-xz-libs.rpmhdr");
+        let entries = u32::from_be_bytes(native[..4].try_into().unwrap()) as usize;
+        let entry = (8..8 + entries * 16)
+            .step_by(16)
+            .find(|&offset| {
+                u32::from_be_bytes(native[offset..offset + 4].try_into().unwrap())
+                    == rpm_tags::EPOCH
+            })
+            .expect("native fixture contains EPOCH");
+        assert_eq!(
+            u32::from_be_bytes(native[entry + 4..entry + 8].try_into().unwrap()),
+            4
+        );
+        assert_eq!(
+            u32::from_be_bytes(native[entry + 12..entry + 16].try_into().unwrap()),
+            1
+        );
+        // Preserve the same four payload bytes, changing only type/count.
+        // librpm rejects the BIN/INT16/INT8 variants in the retained native
+        // probe; empty and array epochs also violate the singleton schema.
+        for (kind, count) in [(7u32, 4u32), (3, 2), (2, 4), (4, 0), (4, 2)] {
+            let mut changed = native.to_vec();
+            changed[entry + 4..entry + 8].copy_from_slice(&kind.to_be_bytes());
+            changed[entry + 12..entry + 16].copy_from_slice(&count.to_be_bytes());
+            let directory = write_packages_db(&[changed.as_slice()]);
+            assert!(
+                DnfPackageManager::read_rpm_sqlite(&directory.path().join("rpmdb.sqlite")).is_err(),
+                "inventory accepted EPOCH type {kind} count {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpm_inventory_rejects_identity_tags_declared_as_binary() {
+        let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
+        for tag in [
+            rpm_tags::NAME,
+            rpm_tags::VERSION,
+            rpm_tags::RELEASE,
+            rpm_tags::ARCH,
+        ] {
+            let mut blob = native.to_vec();
+            let count = u32::from_be_bytes(blob[..4].try_into().unwrap()) as usize;
+            let data_start = 8 + count * 16;
+            let entry = (8..data_start)
+                .step_by(16)
+                .find(|&offset| {
+                    u32::from_be_bytes(blob[offset..offset + 4].try_into().unwrap()) == tag
+                })
+                .expect("native fixture contains identity tag");
+            let offset =
+                u32::from_be_bytes(blob[entry + 8..entry + 12].try_into().unwrap()) as usize;
+            let length = blob[data_start + offset..]
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap();
+            blob[entry + 4..entry + 8].copy_from_slice(&7_u32.to_be_bytes());
+            blob[entry + 12..entry + 16].copy_from_slice(&(length as u32).to_be_bytes());
+            let directory = write_packages_db(&[blob.as_slice()]);
+            let result = DnfPackageManager::read_rpm_sqlite(&directory.path().join("rpmdb.sqlite"));
+            assert!(
+                result.is_err(),
+                "binary tag {tag} must not enter installed inventory: {result:?}"
+            );
+        }
+        let directory = write_packages_db(&[native.as_slice()]);
+        let packages = DnfPackageManager::read_rpm_sqlite(&directory.path().join("rpmdb.sqlite"))
+            .expect("unmodified native header remains valid");
+        assert_eq!(packages[0].name, "publicsuffix-list-dafsa");
+        assert_eq!(packages[0].architecture, "noarch");
     }
 
     #[tokio::test]

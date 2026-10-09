@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "linux", feature = "fedora"))]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use omg_lib::package_managers::{DnfPackageManager, PackageManager};
 
 pub mod common;
@@ -130,6 +130,7 @@ mod dnf_integration {
     #[tokio::test]
     async fn repository_lookup_finds_uninstalled_package() -> Result<()> {
         let package = uninstalled_repository_package()?;
+        let expected_name = format!("{package}.{}", std::env::consts::ARCH);
         let pm = DnfPackageManager::new();
         assert!(
             !pm.list_installed()
@@ -142,13 +143,13 @@ mod dnf_integration {
         assert!(
             search
                 .iter()
-                .any(|result| result.name == package && !result.installed)
+                .any(|result| result.name == expected_name && !result.installed)
         );
         let info = pm
             .info(package)
             .await?
             .expect("available repository package");
-        assert_eq!(info.name, package);
+        assert_eq!(info.name, expected_name);
         assert!(!info.installed);
 
         for arguments in [vec!["info", package], vec!["--json", "info", package]] {
@@ -162,6 +163,161 @@ mod dnf_integration {
             );
             assert!(String::from_utf8_lossy(&output.stdout).contains(package));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repository_info_resolves_architecture_and_nevra_selectors() -> Result<()> {
+        let package = uninstalled_repository_package()?;
+        let native = std::process::Command::new("dnf")
+            .args([
+                "--cacheonly",
+                "repoquery",
+                "--available",
+                "--latest-limit=1",
+                "--queryformat",
+                "%{name}.%{arch}\t%{full_nevra}\t%{evr}\\n",
+                package,
+            ])
+            .output()?;
+        anyhow::ensure!(native.status.success(), "native available selection failed");
+        let text = std::str::from_utf8(&native.stdout)?;
+        let fields: Vec<_> = text
+            .lines()
+            .next()
+            .context("available fixture missing")?
+            .split('\t')
+            .collect();
+        anyhow::ensure!(fields.len() == 3, "invalid native available fixture");
+        let manager = DnfPackageManager::new();
+        for selector in [&fields[0], &fields[1]] {
+            let info = manager
+                .info(selector)
+                .await?
+                .expect("native selector resolves an available package");
+            assert_eq!(info.name, fields[0]);
+            assert_eq!(info.version.to_string(), fields[2]);
+            assert!(!info.installed);
+        }
+        assert!(manager.info("omg-no-such-package.x86_64").await?.is_none());
+        Ok(())
+    }
+
+    fn installed_bash_full_nevra() -> Result<(String, String, String)> {
+        let output = std::process::Command::new("/usr/bin/rpm")
+            .args(["-q", "--queryformat", "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\t%{NAME}.%{ARCH}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n", "bash"])
+            .output()?;
+        anyhow::ensure!(output.status.success(), "native bash fixture query failed");
+        let text = std::str::from_utf8(&output.stdout)?;
+        let fields: Vec<_> = text
+            .lines()
+            .next()
+            .context("native bash missing")?
+            .split('\t')
+            .collect();
+        anyhow::ensure!(fields.len() == 3, "invalid native bash identity");
+        let version = fields[2].strip_prefix("0:").unwrap_or(fields[2]);
+        Ok((fields[0].into(), fields[1].into(), version.into()))
+    }
+
+    #[tokio::test]
+    async fn installed_info_resolves_native_full_nevra_with_zero_epoch() -> Result<()> {
+        let (selector, name, version) = installed_bash_full_nevra()?;
+        let info = DnfPackageManager::new()
+            .info(&selector)
+            .await?
+            .expect("installed native full NEVRA");
+        assert_eq!(
+            (info.name, info.version.to_string(), info.installed),
+            (name, version, true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installed_status_resolves_native_full_nevra_with_zero_epoch() -> Result<()> {
+        let (selector, name, _) = installed_bash_full_nevra()?;
+        let manager = DnfPackageManager::new();
+        assert!(
+            manager.is_installed(&selector).await?,
+            "cold RPM observation must resolve explicit zero epoch"
+        );
+        assert!(
+            manager.is_installed(&name).await?,
+            "native name.arch stays installed"
+        );
+        assert!(
+            manager.is_installed(&selector).await?,
+            "warm RPM observation must resolve explicit zero epoch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_info_resolves_native_full_nevra() -> Result<()> {
+        let (selector, name, version) = installed_bash_full_nevra()?;
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["info", &selector])
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("OMG_TEST_DISTRO")
+            .env_remove("OMG_TEST_BACKEND")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "plain CLI selector failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout)?;
+        assert!(
+            text.contains(&name) && text.contains(&version),
+            "native installed metadata absent: {text}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_json_info_resolves_native_full_nevra() -> Result<()> {
+        let (selector, name, version) = installed_bash_full_nevra()?;
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["--json", "info", &selector])
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("OMG_TEST_DISTRO")
+            .env_remove("OMG_TEST_BACKEND")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "JSON CLI selector failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(value["name"], name);
+        assert_eq!(value["version"], version);
+        assert_eq!(value["installed"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repository_search_has_one_installed_row_per_architecture() -> Result<()> {
+        let manager = DnfPackageManager::new();
+        let search = manager.search("bash").await?;
+        let installed = manager.list_installed().await?;
+        let expected: Vec<_> = installed
+            .iter()
+            .filter(|package| package.name.starts_with("bash."))
+            .map(|package| (package.name.clone(), true))
+            .collect();
+        anyhow::ensure!(!expected.is_empty(), "native bash fixture missing");
+        let actual: Vec<_> = search
+            .iter()
+            .filter(|package| package.name == "bash" || package.name.starts_with("bash."))
+            .map(|package| (package.name.clone(), package.installed))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "repository rows must retain the installed identity and state"
+        );
         Ok(())
     }
 

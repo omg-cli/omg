@@ -16,7 +16,9 @@ use super::protocol::{
 };
 use crate::core::metrics::GLOBAL_METRICS;
 use crate::core::security::{AuditEventType, AuditSeverity, audit_log_nonblocking};
-use crate::package_managers::{PackageManager, VersionDisplay, get_package_manager};
+use crate::package_managers::{
+    InstalledCatalogObservation, PackageManager, VersionDisplay, get_package_manager,
+};
 #[cfg(feature = "arch")]
 use crate::package_managers::{alpm_worker::AlpmWorker, search_detailed};
 use std::sync::RwLock;
@@ -30,6 +32,59 @@ const DAEMON_INFO_BACKEND_TIMEOUT: std::time::Duration = std::time::Duration::fr
 #[cfg(feature = "arch")]
 const DAEMON_INFO_AUR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+const CATALOG_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn observe_installed_catalog(
+    manager: Arc<dyn PackageManager>,
+    budget: Arc<tokio::sync::Semaphore>,
+) -> anyhow::Result<Option<Arc<dyn InstalledCatalogObservation>>> {
+    tokio::time::timeout(CATALOG_OBSERVATION_TIMEOUT, async move {
+        let permit = budget.acquire_owned().await?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            manager.installed_catalog_observation()
+        })
+        .await
+        .context("Installed catalog observation task failed")?
+    })
+    .await
+    .context("Installed catalog observation exceeded its deadline")?
+}
+
+async fn installed_catalog_is_current(
+    observation: Arc<dyn InstalledCatalogObservation>,
+    budget: Arc<tokio::sync::Semaphore>,
+) -> anyhow::Result<bool> {
+    tokio::time::timeout(CATALOG_OBSERVATION_TIMEOUT, async move {
+        let permit = budget.acquire_owned().await?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            observation.is_current()
+        })
+        .await
+        .context("Installed catalog check task failed")?
+    })
+    .await
+    .context("Installed catalog check exceeded its deadline")?
+}
+
+async fn load_observed_index(
+    manager: Arc<dyn PackageManager>,
+    budget: Arc<tokio::sync::Semaphore>,
+) -> anyhow::Result<(PackageIndex, Option<Arc<dyn InstalledCatalogObservation>>)> {
+    for _ in 0..3 {
+        let observation =
+            observe_installed_catalog(Arc::clone(&manager), Arc::clone(&budget)).await?;
+        let index = PackageIndex::for_package_manager(Arc::clone(&manager)).await?;
+        if let Some(observation) = &observation
+            && !installed_catalog_is_current(Arc::clone(observation), Arc::clone(&budget)).await?
+        {
+            continue;
+        }
+        return Ok((index, observation));
+    }
+    anyhow::bail!("Installed inventory changed during three package index rebuild attempts")
+}
 
 #[derive(Default)]
 struct RefreshDebounce {
@@ -136,6 +191,7 @@ fn retire_alpm_worker(alpm_worker: Arc<AlpmWorker>, mut wait_for_lease: impl FnM
 /// Index contents and their source observation are one publication unit.
 struct PublishedIndex {
     index: Arc<PackageIndex>,
+    installed_observation: Option<Arc<dyn InstalledCatalogObservation>>,
     #[cfg(feature = "arch")]
     epoch: crate::package_managers::pacman_db::AlpmCatalogEpoch,
 }
@@ -159,6 +215,7 @@ pub struct DaemonState {
     /// a worker that predates `omg sync` serves a frozen update list forever.
     system_backends: Arc<RwLock<SystemBackendAccess>>,
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    catalog_observation_budget: Arc<tokio::sync::Semaphore>,
     native_tasks: tokio_util::task::TaskTracker,
     refresh_debounce: RefreshDebounce,
     index_generation: AtomicU64,
@@ -201,9 +258,24 @@ impl DaemonState {
     }
 
     /// Atomically publish a rebuilt index and invalidate derived caches.
+    #[cfg(test)]
     pub(super) fn replace_index(
         &self,
         index: PackageIndex,
+        #[cfg(feature = "arch")] epoch: crate::package_managers::pacman_db::AlpmCatalogEpoch,
+    ) -> usize {
+        self.replace_observed_index(
+            index,
+            None,
+            #[cfg(feature = "arch")]
+            epoch,
+        )
+    }
+
+    fn replace_observed_index(
+        &self,
+        index: PackageIndex,
+        installed_observation: Option<Arc<dyn InstalledCatalogObservation>>,
         #[cfg(feature = "arch")] epoch: crate::package_managers::pacman_db::AlpmCatalogEpoch,
     ) -> usize {
         let package_count = index.len();
@@ -213,6 +285,7 @@ impl DaemonState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *current = PublishedIndex {
             index: Arc::new(index),
+            installed_observation,
             #[cfg(feature = "arch")]
             epoch,
         };
@@ -320,7 +393,11 @@ impl DaemonState {
         } else {
             crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH
         };
-        let index = PackageIndex::for_package_manager(Arc::clone(&self.package_manager)).await?;
+        let (index, installed_observation) = load_observed_index(
+            Arc::clone(&self.package_manager),
+            Arc::clone(&self.catalog_observation_budget),
+        )
+        .await?;
         let _refresh_guard = self
             .refresh_system_backends(
                 refresh_guard,
@@ -335,12 +412,62 @@ impl DaemonState {
                     .context("Failed to observe ALPM catalog after index and backend rebuild")?,
             )?;
         }
-        let packages = self.replace_index(
+        if let Some(observation) = &installed_observation {
+            anyhow::ensure!(
+                installed_catalog_is_current(
+                    Arc::clone(observation),
+                    Arc::clone(&self.catalog_observation_budget)
+                )
+                .await?,
+                "Installed inventory changed before package index publication"
+            );
+        }
+        let packages = self.replace_observed_index(
             index,
+            installed_observation,
             #[cfg(feature = "arch")]
             epoch,
         );
         Ok(packages)
+    }
+
+    async fn installed_catalog_needs_heal(&self) -> anyhow::Result<bool> {
+        let observation = self
+            .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .installed_observation
+            .clone();
+        match observation {
+            Some(observation) => Ok(!installed_catalog_is_current(
+                observation,
+                Arc::clone(&self.catalog_observation_budget),
+            )
+            .await?),
+            None => Ok(observe_installed_catalog(
+                Arc::clone(&self.package_manager),
+                Arc::clone(&self.catalog_observation_budget),
+            )
+            .await?
+            .is_some()),
+        }
+    }
+
+    /// RPM observation covers installed rows. Repository changes are admitted
+    /// by explicit refresh, since RPM alone cannot certify repository freshness.
+    async fn heal_installed_catalog_if_changed(&self) -> anyhow::Result<()> {
+        if !self.uses_production_backends() || self.package_manager.name() != "dnf" {
+            return Ok(());
+        }
+        if !self.installed_catalog_needs_heal().await? {
+            return Ok(());
+        }
+        let guard = Arc::clone(&self.refresh_lock).lock_owned().await;
+        if !self.installed_catalog_needs_heal().await? {
+            return Ok(());
+        }
+        self.rebuild_production_index(guard).await?;
+        Ok(())
     }
 
     /// Rebuild catalog state when the observed sync/local identity differs
@@ -397,13 +524,32 @@ impl DaemonState {
         let data_dir = crate::core::paths::daemon_data_dir();
         let persistent = Self::open_persistent_cache(&data_dir)?;
         let package_manager = get_package_manager()?;
-        let load_catalog = || -> anyhow::Result<(PackageIndex, SystemBackendAccess)> {
-            let index = PackageIndex::for_package_manager_blocking(Arc::clone(&package_manager))
-                .context("Failed to build package index. Ensure package databases are synced (run 'omg sync').")?;
-            Ok((index, SystemBackendAccess::production()?))
+        let load_catalog = || -> anyhow::Result<_> {
+            let (index, observation) = if package_manager.name() == "dnf" {
+                let manager = Arc::clone(&package_manager);
+                std::thread::Builder::new()
+                    .name("omg-catalog-init".into())
+                    .spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        runtime.block_on(load_observed_index(
+                            manager,
+                            Arc::new(tokio::sync::Semaphore::new(1)),
+                        ))
+                    })?
+                    .join()
+                    .map_err(|_| {
+                        anyhow::anyhow!("Package catalog initialization worker panicked")
+                    })??
+            } else {
+                (PackageIndex::for_package_manager_blocking(Arc::clone(&package_manager))
+                    .context("Failed to build package index. Ensure package databases are synced (run 'omg sync').")?, None)
+            };
+            Ok((index, SystemBackendAccess::production()?, observation))
         };
         #[cfg(feature = "arch")]
-        let ((index, system_backends), index_epoch) =
+        let ((index, system_backends, installed_observation), index_epoch) =
             if selected_backend == crate::package_managers::Backend::Arch {
                 crate::package_managers::pacman_db::AlpmCatalogEpoch::load_stable(
                     crate::package_managers::pacman_db::AlpmCatalogEpoch::observe,
@@ -418,7 +564,7 @@ impl DaemonState {
         #[cfg(not(feature = "arch"))]
         let _ = selected_backend;
         #[cfg(not(feature = "arch"))]
-        let (index, system_backends) = load_catalog()?;
+        let (index, system_backends, installed_observation) = load_catalog()?;
 
         Ok(Self::from_index(
             crate::core::paths::data_dir(),
@@ -426,6 +572,7 @@ impl DaemonState {
             index,
             package_manager,
             system_backends,
+            installed_observation,
             #[cfg(feature = "arch")]
             index_epoch,
         ))
@@ -448,6 +595,7 @@ impl DaemonState {
             index,
             package_manager,
             SystemBackendAccess::Isolated,
+            None,
             #[cfg(feature = "arch")]
             crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
         ))
@@ -488,6 +636,7 @@ impl DaemonState {
         index: PackageIndex,
         package_manager: Arc<dyn PackageManager>,
         system_backends: SystemBackendAccess,
+        installed_observation: Option<Arc<dyn InstalledCatalogObservation>>,
         #[cfg(feature = "arch")] index_epoch: crate::package_managers::pacman_db::AlpmCatalogEpoch,
     ) -> Self {
         tracing::info!("Package index loaded: {} packages", index.len());
@@ -532,6 +681,7 @@ impl DaemonState {
             package_manager,
             index: RwLock::new(PublishedIndex {
                 index: Arc::new(index),
+                installed_observation,
                 #[cfg(feature = "arch")]
                 epoch: index_epoch,
             }),
@@ -542,6 +692,7 @@ impl DaemonState {
             background_security_scans,
             system_backends: Arc::new(RwLock::new(system_backends)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            catalog_observation_budget: Arc::new(tokio::sync::Semaphore::new(1)),
             native_tasks: tokio_util::task::TaskTracker::new(),
             refresh_debounce: RefreshDebounce::default(),
             index_generation: AtomicU64::new(0),
@@ -603,6 +754,22 @@ pub async fn handle_request(state: Arc<DaemonState>, request: Request) -> Respon
             code: error_codes::RATE_LIMITED,
             message: "Rate limit exceeded. Please slow down.".to_string(),
         };
+    }
+
+    if let Request::Search { query, .. } | Request::Suggest { query, .. } = &request {
+        if query.len() > MAX_QUERY_LENGTH {
+            let message = match &request {
+                Request::Suggest { .. } => "Query too long".to_string(),
+                _ => format!("Query too long (max {MAX_QUERY_LENGTH} characters)"),
+            };
+            return validation_error(request.id(), message);
+        }
+        if let Err(error) = state.heal_installed_catalog_if_changed().await {
+            return internal_error(
+                request.id(),
+                format!("Failed to refresh stale installed package index: {error:#}"),
+            );
+        }
     }
 
     #[cfg(feature = "arch")]
@@ -690,6 +857,7 @@ async fn handle_refresh_index(state: Arc<DaemonState>, id: RequestId) -> Respons
     if state
         .refresh_debounce
         .should_skip(std::time::Instant::now(), disk_newer_than_loaded)
+        && state.package_manager.name() != "dnf"
     {
         if let Err(error) = state
             .refresh_system_backends(
@@ -959,7 +1127,17 @@ async fn handle_info(state: Arc<DaemonState>, id: RequestId, package: String) ->
     GLOBAL_METRICS.inc_info_requests();
 
     // SECURITY: Validate package name to prevent command injection
-    if let Err(e) = crate::core::security::validate_package_name(&package) {
+    let validate_generic =
+        || crate::core::security::validate_package_name(&package).map_err(anyhow::Error::from);
+    #[cfg(feature = "fedora")]
+    let validation = if state.package_manager.name() == "dnf" {
+        crate::package_managers::DnfPackageManager::validate_query_selector(&package)
+    } else {
+        validate_generic()
+    };
+    #[cfg(not(feature = "fedora"))]
+    let validation = validate_generic();
+    if let Err(e) = validation {
         return validation_error(id, format!("Invalid package name: {e}"));
     }
 
@@ -1619,14 +1797,67 @@ mod tests {
         inner: crate::package_managers::mock::MockPackageManager,
         backend_name: &'static str,
         replies: std::collections::HashMap<&'static str, InfoReply>,
+        catalog_revision: Option<Arc<AtomicU64>>,
+        catalog_builds: Arc<AtomicU64>,
+        catalog_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+        catalog_fault: Arc<AtomicU64>,
+    }
+
+    struct MutableCatalogObservation {
+        revision: Arc<AtomicU64>,
+        observed: u64,
+        fault: Arc<AtomicU64>,
+    }
+
+    impl InstalledCatalogObservation for MutableCatalogObservation {
+        fn is_current(&self) -> anyhow::Result<bool> {
+            anyhow::ensure!(
+                self.fault.load(Ordering::Acquire) != 1,
+                "inventory unreadable"
+            );
+            Ok(self.revision.load(Ordering::Acquire) == self.observed)
+        }
     }
 
     impl PackageManager for InfoSelectionBackend {
+        fn installed_catalog_observation(
+            &self,
+        ) -> anyhow::Result<Option<Arc<dyn InstalledCatalogObservation>>> {
+            anyhow::ensure!(
+                self.catalog_fault.load(Ordering::Acquire) != 1,
+                "inventory unreadable"
+            );
+            Ok(self.catalog_revision.as_ref().map(|revision| {
+                Arc::new(MutableCatalogObservation {
+                    revision: Arc::clone(revision),
+                    observed: revision.load(Ordering::Acquire),
+                    fault: Arc::clone(&self.catalog_fault),
+                }) as Arc<dyn InstalledCatalogObservation>
+            }))
+        }
         fn name(&self) -> &'static str {
             self.backend_name
         }
         fn search(&self, query: &str) -> BackendFuture<'_, Vec<crate::core::Package>> {
             self.inner.search(query)
+        }
+        fn package_index(&self) -> BackendFuture<'_, Vec<crate::core::Package>> {
+            Box::pin(async move {
+                let previous = self.catalog_builds.fetch_add(1, Ordering::AcqRel);
+                let packages = self.inner.search("").await?;
+                if previous == 0
+                    && let Some(gate) = &self.catalog_gate
+                {
+                    gate.0.notify_one();
+                    gate.1.notified().await;
+                }
+                if self.catalog_fault.load(Ordering::Acquire) == 2
+                    && let Some(revision) = &self.catalog_revision
+                {
+                    revision.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(packages)
+            })
         }
         fn install(&self, packages: &[String]) -> BackendFuture<'_, ()> {
             self.inner.install(packages)
@@ -1695,6 +1926,10 @@ mod tests {
             ),
             backend_name,
             replies: replies.into_iter().collect(),
+            catalog_revision: None,
+            catalog_builds: Arc::new(AtomicU64::new(0)),
+            catalog_gate: None,
+            catalog_fault: Arc::new(AtomicU64::new(0)),
         };
         let state = DaemonState::new_isolated(
             directory.path(),
@@ -1702,6 +1937,511 @@ mod tests {
             Arc::new(backend),
         )?;
         Ok((directory, Arc::new(state)))
+    }
+
+    #[cfg(feature = "fedora")]
+    fn mutable_fedora_catalog(
+        observe: bool,
+        gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+    ) -> anyhow::Result<(
+        tempfile::TempDir,
+        Arc<DaemonState>,
+        crate::package_managers::mock::MockPackageDb,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    )> {
+        let directory = tempfile::tempdir()?;
+        let inner =
+            crate::package_managers::mock::MockPackageManager::new_in("fedora", directory.path());
+        let database = inner.db.clone();
+        database.packages.lock().unwrap().clear();
+        database.add_package("retired-tool.x86_64", "1.0-1", "Before", "fedora");
+        let revision = Arc::new(AtomicU64::new(0));
+        let builds = Arc::new(AtomicU64::new(0));
+        let fault = Arc::new(AtomicU64::new(0));
+        let backend = InfoSelectionBackend {
+            inner,
+            backend_name: "dnf",
+            replies: std::collections::HashMap::new(),
+            catalog_revision: observe.then(|| Arc::clone(&revision)),
+            catalog_builds: Arc::clone(&builds),
+            catalog_gate: gate,
+            catalog_fault: Arc::clone(&fault),
+        };
+        let state = DaemonState::new_isolated(
+            directory.path(),
+            PackageIndex::from_records(&[("retired-tool.x86_64", "1.0-1", "Before")]),
+            Arc::new(backend),
+        )?;
+        *state.system_backends.write().unwrap() = SystemBackendAccess::Production {
+            #[cfg(feature = "arch")]
+            alpm_worker: None,
+        };
+        Ok((
+            directory,
+            Arc::new(state),
+            database,
+            revision,
+            builds,
+            fault,
+        ))
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_catalog_search_observes_external_update_and_removal() -> anyhow::Result<()> {
+        let (_directory, state, database, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        let search = |query: &str| Request::Search {
+            id: 1,
+            query: query.into(),
+            limit: Some(10),
+        };
+        let Response::Success {
+            result: ResponseResult::Search(before),
+            ..
+        } = handle_request(Arc::clone(&state), search("retired-tool")).await
+        else {
+            panic!("initial search failed")
+        };
+        assert_eq!(
+            (
+                before.packages[0].name.as_str(),
+                before.packages[0].version.as_str()
+            ),
+            ("retired-tool.x86_64", "1.0-1")
+        );
+        database.add_package("retired-tool.x86_64", "2.0-1", "After", "fedora");
+        revision.fetch_add(1, Ordering::AcqRel);
+        let Response::Success {
+            result: ResponseResult::Search(updated),
+            ..
+        } = handle_request(Arc::clone(&state), search("retired-tool")).await
+        else {
+            panic!("updated search failed")
+        };
+        assert_eq!(
+            (
+                updated.packages[0].name.as_str(),
+                updated.packages[0].version.as_str(),
+                updated.packages[0].description.as_str()
+            ),
+            ("retired-tool.x86_64", "2.0-1", "After")
+        );
+        database.packages.lock().unwrap().clear();
+        database.add_package("replacement-tool.x86_64", "3.0-1", "Replacement", "fedora");
+        revision.fetch_add(1, Ordering::AcqRel);
+        let Response::Success {
+            result: ResponseResult::Search(removed),
+            ..
+        } = handle_request(Arc::clone(&state), search("retired-tool")).await
+        else {
+            panic!("removed search failed")
+        };
+        assert_eq!(removed.total, 0);
+        let Response::Success {
+            result: ResponseResult::Search(replacement),
+            ..
+        } = handle_request(state, search("replacement-tool")).await
+        else {
+            panic!("replacement search failed")
+        };
+        assert_eq!(
+            (
+                replacement.packages[0].name.as_str(),
+                replacement.packages[0].version.as_str()
+            ),
+            ("replacement-tool.x86_64", "3.0-1")
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_catalog_suggest_observes_external_removal() -> anyhow::Result<()> {
+        let (_directory, state, database, revision, _, _) = mutable_fedora_catalog(true, None)?;
+        let suggest = |query: &str| Request::Suggest {
+            id: 1,
+            query: query.into(),
+            limit: Some(10),
+        };
+        let Response::Success {
+            result: ResponseResult::Suggest(before),
+            ..
+        } = handle_request(Arc::clone(&state), suggest("retired-tool")).await
+        else {
+            panic!("initial suggest failed")
+        };
+        assert_eq!(before, ["retired-tool.x86_64"]);
+        database.packages.lock().unwrap().clear();
+        database.add_package("replacement-tool.x86_64", "2.0-1", "Replacement", "fedora");
+        revision.fetch_add(1, Ordering::AcqRel);
+        let Response::Success {
+            result: ResponseResult::Suggest(after),
+            ..
+        } = handle_request(Arc::clone(&state), suggest("retired-tool")).await
+        else {
+            panic!("removed suggest failed")
+        };
+        assert_eq!(after, Vec::<String>::new());
+        let Response::Success {
+            result: ResponseResult::Suggest(replacement),
+            ..
+        } = handle_request(state, suggest("replacement-tool")).await
+        else {
+            panic!("replacement suggest failed")
+        };
+        assert_eq!(replacement, ["replacement-tool.x86_64"]);
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_catalog_sequential_refresh_does_not_acknowledge_an_old_catalog()
+    -> anyhow::Result<()> {
+        for observe in [true, false] {
+            let (_directory, state, database, revision, _, _) =
+                mutable_fedora_catalog(observe, None)?;
+            assert!(matches!(
+                handle_request(Arc::clone(&state), Request::RefreshIndex { id: 1 }).await,
+                Response::Success {
+                    result: ResponseResult::IndexRefreshed { packages: 1 },
+                    ..
+                }
+            ));
+            database.packages.lock().unwrap().clear();
+            database.add_package("replacement-tool.x86_64", "2.0-1", "Replacement", "fedora");
+            database.add_package("new-dependency.noarch", "1.0-1", "Dependency", "fedora");
+            revision.fetch_add(1, Ordering::AcqRel);
+            let response =
+                handle_request(Arc::clone(&state), Request::RefreshIndex { id: 2 }).await;
+            assert!(
+                matches!(
+                    response,
+                    Response::Success {
+                        result: ResponseResult::IndexRefreshed { packages: 2 },
+                        ..
+                    }
+                ),
+                "second sequential refresh must publish both current packages: {response:?}, observation={observe}"
+            );
+            let Response::Success {
+                result: ResponseResult::Search(current),
+                ..
+            } = handle_request(
+                state,
+                Request::Search {
+                    id: 3,
+                    query: "replacement-tool".into(),
+                    limit: None,
+                },
+            )
+            .await
+            else {
+                panic!("refreshed search failed")
+            };
+            assert_eq!(
+                (
+                    current.packages[0].name.as_str(),
+                    current.packages[0].version.as_str()
+                ),
+                ("replacement-tool.x86_64", "2.0-1")
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_catalog_concurrent_refreshes_coalesce_one_publication() -> anyhow::Result<()> {
+        let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let (_directory, state, database, revision, builds, _) =
+            mutable_fedora_catalog(true, Some(Arc::clone(&gate)))?;
+        let stale_snapshot = state.index_snapshot();
+        state.cache.insert_arc(
+            "retired-tool".into(),
+            Arc::new(stale_snapshot.search("retired-tool", 10)),
+        );
+        database.packages.lock().unwrap().clear();
+        database.add_package("replacement-tool.x86_64", "2.0-1", "Replacement", "fedora");
+        revision.fetch_add(1, Ordering::AcqRel);
+        let first = tokio::spawn(handle_request(
+            Arc::clone(&state),
+            Request::RefreshIndex { id: 1 },
+        ));
+        gate.0.notified().await;
+        let mut second = Box::pin(handle_request(
+            Arc::clone(&state),
+            Request::RefreshIndex { id: 2 },
+        ));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        gate.1.notify_one();
+        for response in [first.await?, second.await] {
+            assert!(matches!(
+                response,
+                Response::Success {
+                    result: ResponseResult::IndexRefreshed { packages: 1 },
+                    ..
+                }
+            ));
+        }
+        assert_eq!(builds.load(Ordering::Acquire), 1);
+        assert!(!state.with_current_index(&stale_snapshot, || {
+            state.cache.insert_arc(
+                "retired-tool".into(),
+                Arc::new(stale_snapshot.search("retired-tool", 10)),
+            );
+        }));
+        let Response::Success {
+            result: ResponseResult::Search(removed),
+            ..
+        } = handle_request(
+            Arc::clone(&state),
+            Request::Search {
+                id: 4,
+                query: "retired-tool".into(),
+                limit: None,
+            },
+        )
+        .await
+        else {
+            panic!("removed cache search failed")
+        };
+        assert_eq!(removed.total, 0);
+        let Response::Success {
+            result: ResponseResult::Search(current),
+            ..
+        } = handle_request(
+            state,
+            Request::Search {
+                id: 3,
+                query: "replacement-tool".into(),
+                limit: None,
+            },
+        )
+        .await
+        else {
+            panic!("coalesced search failed")
+        };
+        assert_eq!(
+            (
+                current.packages[0].name.as_str(),
+                current.packages[0].version.as_str()
+            ),
+            ("replacement-tool.x86_64", "2.0-1")
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_catalog_queued_refresh_coalesces_then_search_observes_later_change()
+    -> anyhow::Result<()> {
+        let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let (_directory, state, database, revision, _, _) =
+            mutable_fedora_catalog(true, Some(Arc::clone(&gate)))?;
+        let first = tokio::spawn(handle_request(
+            Arc::clone(&state),
+            Request::RefreshIndex { id: 1 },
+        ));
+        gate.0.notified().await;
+        let mut second = Box::pin(handle_request(
+            Arc::clone(&state),
+            Request::RefreshIndex { id: 2 },
+        ));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        gate.1.notify_one();
+        assert!(matches!(
+            first.await?,
+            Response::Success {
+                result: ResponseResult::IndexRefreshed { packages: 1 },
+                ..
+            }
+        ));
+        database.packages.lock().unwrap().clear();
+        database.add_package("replacement-tool.x86_64", "5.0-1", "Later", "fedora");
+        database.add_package("new-dependency.noarch", "1.0-1", "Dependency", "fedora");
+        revision.fetch_add(1, Ordering::AcqRel);
+        // The second invocation overlaps the first publication, which is a
+        // valid linearization point even if RPM changes before its response.
+        assert!(matches!(
+            second.await,
+            Response::Success {
+                result: ResponseResult::IndexRefreshed { packages: 1 },
+                ..
+            }
+        ));
+        let Response::Success {
+            result: ResponseResult::Search(current),
+            ..
+        } = handle_request(
+            state,
+            Request::Search {
+                id: 3,
+                query: "replacement-tool".into(),
+                limit: None,
+            },
+        )
+        .await
+        else {
+            panic!("queued refresh current search failed")
+        };
+        assert_eq!(
+            (current.total, current.packages[0].version.as_str()),
+            (1, "5.0-1")
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_catalog_retries_a_change_during_build_before_publication() -> anyhow::Result<()>
+    {
+        let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let (_directory, state, database, revision, builds, _) =
+            mutable_fedora_catalog(true, Some(Arc::clone(&gate)))?;
+        let refresh = tokio::spawn(handle_request(
+            Arc::clone(&state),
+            Request::RefreshIndex { id: 1 },
+        ));
+        gate.0.notified().await;
+        database.packages.lock().unwrap().clear();
+        database.add_package("replacement-tool.x86_64", "4.0-1", "Latest", "fedora");
+        revision.fetch_add(1, Ordering::AcqRel);
+        gate.1.notify_one();
+        assert!(matches!(
+            refresh.await?,
+            Response::Success {
+                result: ResponseResult::IndexRefreshed { packages: 1 },
+                ..
+            }
+        ));
+        let Response::Success {
+            result: ResponseResult::Search(current),
+            ..
+        } = handle_request(
+            state,
+            Request::Search {
+                id: 2,
+                query: "replacement-tool".into(),
+                limit: None,
+            },
+        )
+        .await
+        else {
+            panic!("stable replacement search failed")
+        };
+        assert_eq!(
+            (
+                current.total,
+                current.packages[0].name.as_str(),
+                current.packages[0].version.as_str()
+            ),
+            (1, "replacement-tool.x86_64", "4.0-1")
+        );
+        assert_eq!(builds.load(Ordering::Acquire), 2);
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_catalog_refuses_continuous_changes_without_publishing() -> anyhow::Result<()> {
+        let (_directory, state, database, _, builds, fault) = mutable_fedora_catalog(true, None)?;
+        let previous = state.index_snapshot();
+        database.add_package("replacement-tool.x86_64", "4.0-1", "Latest", "fedora");
+        fault.store(2, Ordering::Release);
+        let response = handle_request(Arc::clone(&state), Request::RefreshIndex { id: 1 }).await;
+        assert!(
+            matches!(response, Response::Error { code: error_codes::INTERNAL_ERROR, ref message, .. } if message.contains("three package index rebuild attempts"))
+        );
+        assert!(Arc::ptr_eq(&previous, &state.index_snapshot()));
+        assert_eq!(builds.load(Ordering::Acquire), 3);
+        fault.store(0, Ordering::Release);
+        let Response::Success {
+            result: ResponseResult::Search(recovered),
+            ..
+        } = handle_request(
+            state,
+            Request::Search {
+                id: 2,
+                query: "replacement-tool".into(),
+                limit: None,
+            },
+        )
+        .await
+        else {
+            panic!("stable recovery failed")
+        };
+        assert_eq!(
+            (recovered.total, recovered.packages[0].version.as_str()),
+            (1, "4.0-1")
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn fedora_catalog_unreadable_inventory_refuses_stale_rows_after_validation()
+    -> anyhow::Result<()> {
+        let (_directory, state, _, _, builds, fault) = mutable_fedora_catalog(true, None)?;
+        let previous = state.index_snapshot();
+        fault.store(1, Ordering::Release);
+        let response = handle_request(
+            Arc::clone(&state),
+            Request::Search {
+                id: 1,
+                query: "x".repeat(MAX_QUERY_LENGTH + 1),
+                limit: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            response,
+            Response::Error {
+                code: error_codes::INVALID_PARAMS,
+                ..
+            }
+        ));
+        for request in [
+            Request::Search {
+                id: 2,
+                query: "retired-tool".into(),
+                limit: None,
+            },
+            Request::Suggest {
+                id: 3,
+                query: "retired".into(),
+                limit: None,
+            },
+            Request::RefreshIndex { id: 4 },
+        ] {
+            assert!(
+                matches!(handle_request(Arc::clone(&state), request).await, Response::Error { code: error_codes::INTERNAL_ERROR, ref message, .. } if message.contains("inventory unreadable"))
+            );
+        }
+        assert!(Arc::ptr_eq(&previous, &state.index_snapshot()));
+        assert_eq!(builds.load(Ordering::Acquire), 0);
+        fault.store(0, Ordering::Release);
+        let Response::Success {
+            result: ResponseResult::Search(healthy),
+            ..
+        } = handle_request(
+            state,
+            Request::Search {
+                id: 5,
+                query: "retired-tool".into(),
+                limit: None,
+            },
+        )
+        .await
+        else {
+            panic!("observable inventory recovery failed")
+        };
+        assert_eq!(
+            (healthy.total, healthy.packages[0].version.as_str()),
+            (1, "1.0-1")
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1749,6 +2489,69 @@ mod tests {
                 assert_eq!(info.source, WirePackageSource::Official);
                 assert_eq!(info.repo, "official");
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn dnf_info_accepts_native_epoch_selectors_at_request_boundary() -> anyhow::Result<()> {
+        for query in [
+            "widget-0:2.0-1.fc43.x86_64",
+            "widget-1:2.0_git-1.fc43.x86_64",
+            "widget-1:2.0^a-1_git.x86_64",
+        ] {
+            let (_directory, state) = info_selection_state(
+                "dnf",
+                &[],
+                [(
+                    query,
+                    InfoReply::Found(installed_info("widget.x86_64", "1:2.0-1.fc43")),
+                )],
+            )?;
+            let response = handle_info(state, 1, query.into()).await;
+            let Response::Success {
+                result: ResponseResult::Info(info),
+                ..
+            } = response
+            else {
+                panic!("native selector must reach backend: {query}: {response:?}");
+            };
+            assert_eq!(
+                (info.name.as_str(), info.version.as_str()),
+                ("widget.x86_64", "1:2.0-1.fc43")
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fedora")]
+    #[tokio::test]
+    async fn info_native_selector_validation_preserves_other_backends_and_rejects_injection()
+    -> anyhow::Result<()> {
+        for (backend, query) in [
+            ("pacman", "widget-1:2.0-1.x86_64"),
+            ("apt", "widget-1:2.0-1.x86_64"),
+            ("dnf", "widget-1:2.0;id-1.x86_64"),
+            ("dnf", "--config=untrusted"),
+            ("dnf", "widget-x:2-1.x86_64"),
+        ] {
+            let (_directory, state) = info_selection_state(
+                backend,
+                &[],
+                [(
+                    query,
+                    InfoReply::Found(installed_info("widget.x86_64", "1:2.0-1.fc43")),
+                )],
+            )?;
+            let Response::Error { code, message, .. } = handle_info(state, 1, query.into()).await
+            else {
+                panic!(
+                    "invalid selector must be rejected before backend lookup: {backend}/{query}"
+                );
+            };
+            assert_eq!(code, error_codes::INVALID_PARAMS);
+            assert!(message.starts_with("Invalid package name:"), "{message}");
         }
         Ok(())
     }

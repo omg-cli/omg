@@ -21,11 +21,19 @@ const DAEMON_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "arch")]
 const AUR_INFO_TIMEOUT: Duration = Duration::from_secs(8);
 
+fn validate_info_selector(package: &str) -> Result<()> {
+    #[cfg(feature = "fedora")]
+    if crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Fedora {
+        return crate::package_managers::DnfPackageManager::validate_query_selector(package);
+    }
+    crate::core::security::validate_package_name(package).map_err(Into::into)
+}
+
 /// Show package information (Synchronous fast-path)
 pub fn info_sync(package: &str) -> Result<bool> {
     let backend = crate::package_managers::resolve_backend()?;
     // SECURITY: Validate package name
-    if let Err(e) = crate::core::security::validate_package_name(package) {
+    if let Err(e) = validate_info_selector(package) {
         anyhow::bail!("Invalid package name: {e}");
     }
 
@@ -167,7 +175,7 @@ pub async fn info(package: &str) -> Result<()> {
 }
 
 pub async fn info_with_json(package: &str, json: bool) -> Result<()> {
-    if let Err(error) = crate::core::security::validate_package_name(package) {
+    if let Err(error) = validate_info_selector(package) {
         anyhow::bail!("Invalid package name: {error}");
     }
 
