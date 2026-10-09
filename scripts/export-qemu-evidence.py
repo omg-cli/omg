@@ -138,6 +138,7 @@ TRANSACTION_FILES = {
 def benchmark_file(name):
     return name in BENCH_FILES or re.fullmatch(
         r"(?:info|search|explicit|status|install|remove|update)(?:\.commands)?\.(?:json|md)"
+        r"|(?:info|search|explicit|status|install|remove|update)\.raw\.json"
         r"|(?:omg|native|extra)-(?:info|identity)(?:-after)?\.(?:stdout|stderr|tsv)"
         r"|(?:search|explicit|count)-(?:omg|native|extra)-(?:before|after)\.(?:stdout|stderr|names)"
         r"|native-cache-prepare\.(?:stdout|stderr)", name
