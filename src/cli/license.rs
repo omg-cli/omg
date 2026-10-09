@@ -87,7 +87,7 @@ fn report_activation(result: Result<license::StoredLicense>) -> Result<()> {
                 e
             );
             println!(
-                "\n  Get a dashboard token from your OMG dashboard, then run `omg account link <token>`."
+                "\n  Get a dashboard token from your OMG dashboard, then run `omg account link --token-stdin`."
             );
             Err(e)
         }
