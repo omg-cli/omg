@@ -374,7 +374,7 @@ jobs:
               timeout -k 10s 12m dnf \
                 --setopt='*.skip_if_unavailable=False' \
                 install -y --setopt=install_weak_deps=False \
-                git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 \
+                git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 zsh fish \
                 rpm dnf sqlite yum-utils fedora-release
               rpm --initdb
               curl --proto '=https' --tlsv1.2 -fsSL \
@@ -497,6 +497,16 @@ jobs:
 
       - name: Run unit tests
         run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
+
+      - name: Test emitted shell hooks
+        if: matrix.platform == 'fedora'
+        env:
+          OMG_HOOK_TEST_BINARY: ${{ github.workspace }}/target/debug/omg
+          OMG_HOOK_TEST_REQUIRE_SHELLS: bash,zsh,fish
+        run: |
+          test -x "$OMG_HOOK_TEST_BINARY"
+          python3 -m unittest discover -s tests -p test_shell_hook_behavior.py
+          python3 -m unittest discover -s tests -p test_shell_hook_ci.py
 
       - name: Run serial library and binary contracts
         if: matrix.platform != 'debian-trixie' && matrix.platform != 'ubuntu-2604'
