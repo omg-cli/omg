@@ -30,8 +30,25 @@ TRANSACTION_PRIVATE = (
     "command.json.bak", "private-identity-before.tsv", "client-key", "overlay.qcow2",
 )
 
+FEDORA_EXCLUSION_DIAGNOSTICS = (
+    "excluded-dnf.conf",
+    "native-excluded-default-list.stdout", "native-excluded-default-list.stderr",
+    "native-excluded-override-list.stdout", "native-excluded-override-list.stderr",
+    "native-excluded-override-info.stdout", "native-excluded-override-info.stderr",
+)
+
 
 class AllowlistTests(unittest.TestCase):
+    def test_fedora_exclusion_controls_are_limited_to_the_advisory_root(self):
+        prefix = ("run-test", "guest", "evidence", "fedora-advisory")
+        for name in FEDORA_EXCLUSION_DIAGNOSTICS:
+            with self.subTest(name=name):
+                self.assertTrue(exporter.allowed_file((*prefix, name)))
+                self.assertFalse(exporter.allowed_file((*prefix, name + ".bak")))
+                self.assertFalse(exporter.allowed_file((*prefix, "private", name)))
+                self.assertFalse(exporter.allowed_file((*prefix[:-1], name)))
+        self.assertFalse(exporter.allowed_file((*prefix, "native-excluded-secrets.stdout")))
+
     def test_apt_abi_exports_only_its_bound_guest_receipt_and_raw_inputs(self):
         prefix = ('run-test', 'guest', 'evidence', 'apt-abi')
         for name in ('receipt.json', 'os-release', 'omg-loader.log', 'omgd-loader.log'):
@@ -245,6 +262,24 @@ class DescriptorTests(unittest.TestCase):
         status = exporter.export(str(self.source), str(self.destination), os.getuid(), os.getgid(), **limits)
         report = json.loads((self.destination / "export-report.json").read_text())
         return status, report
+
+    def test_fedora_exclusion_diagnostics_copy_without_private_neighbors(self):
+        prefix = "run-test/guest/evidence/fedora-advisory/"
+        expected = {prefix + name: ("native-exclusion-diagnostic:" + name + "\n").encode()
+                    for name in FEDORA_EXCLUSION_DIAGNOSTICS}
+        for name, content in expected.items():
+            self.fixture(name, content)
+        for name in FEDORA_EXCLUSION_DIAGNOSTICS:
+            self.fixture(prefix + name + ".bak", b"private-backup")
+            self.fixture(prefix + "private/" + name, b"private-state")
+        self.fixture(prefix + "native-excluded-secrets.stdout", b"private-neighbor")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(set(report["copied"]), set(expected))
+        for name, content in expected.items():
+            self.assertEqual((self.destination / name).read_bytes(), content)
+        self.assertFalse((self.destination / (prefix + "private")).exists())
+        self.assertFalse((self.destination / (prefix + "native-excluded-secrets.stdout")).exists())
 
     def test_private_state_is_never_opened_and_results_remain_readable(self):
         self.fixture("run-test/results.json", b"[]")

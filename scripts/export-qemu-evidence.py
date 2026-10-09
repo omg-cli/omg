@@ -99,13 +99,14 @@ ARCH_ADVISORY_FILES = OSV_FILES | {
 FEDORA_ADVISORY_FILES = {
     "receipt.json", "native-query.tsv", "os-release", "daemon.log", "worker.log",
     "parent-system-before.sha256", "parent-system-after.sha256", "commands.json",
-    "native-version-comparison.txt", "native-dnf-before.conf", "private-dnf.conf",
+    "native-version-comparison.txt", "native-dnf-before.conf", "private-dnf.conf", "excluded-dnf.conf",
     "fixture.repo", "fixture-key.asc", "updateinfo.xml", "updateinfo.xml.gz", "repomd.xml", "repomd.xml.asc",
 }
 FEDORA_ADVISORY_FILES.update(
     phase + "." + stream
     for phase in ("untrusted-metadata", "direct-plain", "direct-findings", "daemon-plain", "daemon-findings", "daemon-before", "daemon-after",
-                  "native-advisory-list", "native-advisory-info", "native-repository", "verify")
+                  "native-advisory-list", "native-advisory-info", "native-repository", "verify",
+                  "native-excluded-default-list", "native-excluded-override-list", "native-excluded-override-info")
     for stream in ("stdout", "stderr")
 )
 BENCH_FILES = {

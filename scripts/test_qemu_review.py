@@ -1,8 +1,11 @@
 from datetime import date
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
+import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +45,63 @@ class ReviewTests(unittest.TestCase):
         self.assertNotIn("contents: write", workflow)
         self.assertIn("persist-credentials: false", workflow)
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
+
+    def maintenance_request(self, scenario):
+        workflow = (ROOT / ".github/workflows/qemu-maintenance.yml").read_text()
+        script = textwrap.dedent(workflow.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            calls = folder / "calls.jsonl"
+            gh = folder / "gh"
+            gh.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open(os.environ['CALLS'], 'a') as stream:
+    stream.write(json.dumps(args) + '\\n')
+if args[:2] == ['issue', 'list']:
+    scenario = os.environ['SCENARIO']
+    if scenario == 'query-failure':
+        sys.exit(73)
+    search = args[args.index('--search') + 1]
+    title = 'chore(security): renew reviewed QEMU image provenance'
+    # Model the independently verified GitHub phrase-search behavior, then
+    # the exact-title --jq filter. Similar titles must not supply an issue.
+    if scenario == 'exact' and ('"' + title + '" in:title') == search:
+        print('889')
+elif args[:2] == ['issue', 'create']:
+    body = Path(args[args.index('--body-file') + 1]).read_text()
+    if 'Do not extend the date without completing the review' not in body:
+        sys.exit(74)
+    print('https://github.com/example/omg/issues/900')
+else:
+    sys.exit(75)
+''')
+            gh.chmod(0o755)
+            result = subprocess.run(
+                ['bash', '-c', script], capture_output=True, text=True, timeout=15,
+                env=dict(os.environ, PATH=str(folder) + os.pathsep + os.environ['PATH'],
+                         CALLS=str(calls), SCENARIO=scenario, RUNNER_TEMP=str(folder)),
+            )
+            return result, [json.loads(line) for line in calls.read_text().splitlines()]
+
+    def test_due_review_reuses_exact_open_issue(self):
+        result, calls = self.maintenance_request('exact')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[:2] for call in calls], [['issue', 'list']])
+
+    def test_due_review_creates_once_when_no_exact_issue_exists(self):
+        for scenario in ('empty', 'similar'):
+            with self.subTest(scenario=scenario):
+                result, calls = self.maintenance_request(scenario)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([call[:2] for call in calls],
+                                 [['issue', 'list'], ['issue', 'create']])
+
+    def test_failed_issue_query_does_not_create_request(self):
+        result, calls = self.maintenance_request('query-failure')
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertEqual([call[:2] for call in calls], [['issue', 'list']])
 
 
 if __name__ == "__main__":

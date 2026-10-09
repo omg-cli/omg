@@ -35,7 +35,7 @@ jobs:
         run: |
           set -euo pipefail
           title='chore(security): renew reviewed QEMU image provenance'
-          existing=$(gh issue list --state open --search "$title in:title" --json title,number \
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json title,number \
             --jq '.[] | select(.title == "chore(security): renew reviewed QEMU image provenance") | .number')
           if [[ -z "$existing" ]]; then
             cat > "$RUNNER_TEMP/qemu-pin-review.md" <<'BODY'

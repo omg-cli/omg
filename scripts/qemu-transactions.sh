@@ -53,8 +53,8 @@ write_summary() {
 set_result() {
   jq --arg id "$current_id" --arg result "$1" --argjson code "$2" \
     'map(if .id==$id then .result=$result | .exit_code=$code else . end)' \
-    "$output/results.json" > "$output/results.next.json"
-  mv "$output/results.next.json" "$output/results.json"
+    "$output/results.json" > "$output/results.next.json" || return "$?"
+  mv "$output/results.next.json" "$output/results.json" || return "$?"
 }
 finish() {
   local code=$?
