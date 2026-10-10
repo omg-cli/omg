@@ -448,7 +448,8 @@ if [[ "$GUEST_MODE" == true ]]; then
                 expected_name="tree." arch;
                 sub(/^0:/, "", version);
                 expected_installed=(phase == "installed" ? "yes" : "no");
-                if (name != expected_name || version != expected_evr ||
+                if ((name != expected_name && !(phase == "available" && name == "tree")) ||
+                    version != expected_evr ||
                     installed_fields != 1 || installed != expected_installed ||
                     architectures > 1 || (architectures == 1 && architecture != arch) ||
                     releases > 1 || epochs > 1 || (epochs == 1 && epoch != expected_epoch)) exit 1;

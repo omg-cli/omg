@@ -821,10 +821,31 @@ class FedoraBenchmarkIdentityTests(unittest.TestCase):
             self.assertEqual((evidence / name).read_text(), "tree.x86_64\t2.2.1-4.fc44\n")
         self.assertEqual((evidence / "omg-info-before.stdout").read_text(), available)
 
-    def test_available_product_refuses_unqualified_or_foreign_identity(self) -> None:
+    def test_published_available_name_preserves_exact_native_identity(self) -> None:
+        # Actual v0.1.224, verified official archive SHA256
+        # e662941133def3df5ed9daf6848af5e0bcffbbc9e3697647dc3c64ab19f5c122.
+        available = '\n  | Info\n    tree\n          Name: tree\n       Version: 2.2.1-4.fc44\n        Source: Official repository (dnf)\n     Installed: no\n   Description: File system tree viewer\n'
+        self.assertEqual(hashlib.sha256(available.encode()).hexdigest(),
+                         "580ec8f9d54fa0a14eb87113564de9c08c79c16a375ccf1ba80586bf8eb28e8e")
+        result = self.normalize(available, phase="available")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "tree.x86_64\t2.2.1-4.fc44\n")
+        self.assertNotEqual(self.normalize(available, phase="installed").returncode, 0)
+        for value in (
+            available.replace("2.2.1-4.fc44", "2.2.2-4.fc44"),
+            available + "Architecture: i686\n",
+            available + "Name: tree\n",
+            available + "Installed: no\n",
+        ):
+            with self.subTest(value=value):
+                rejected = self.normalize(value, phase="available")
+                self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+                self.assertEqual(rejected.stdout, "")
+
+    def test_available_product_refuses_foreign_identity(self) -> None:
         available = self.PRODUCT.replace("Installed: yes", "Installed: no")
         for value in (
-            available.replace("tree.x86_64", "tree"),
+            available.replace("tree.x86_64", "tree.addon"),
             available.replace("tree.x86_64", "tree.i686"),
             available.replace("2.2.1-4.fc44", "2.2.2-4.fc44"),
             available + "Name: tree.x86_64\n",
