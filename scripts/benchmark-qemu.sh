@@ -523,12 +523,14 @@ if [[ "$1" == uefi ]]; then
   [[ -f "$vm_vars" ]] || exit 2
   firmware=(-drive if=pflash,format=raw,readonly=on,file="$3" -drive if=pflash,format=raw,file="$vm_vars")
 fi
+legacy_apic=()
+case "$6" in q35|q35,*) legacy_apic=(-global apic-common.vapic=false) ;; esac
 accel=$7
 [[ "$accel" != tcg ]] || accel=tcg,thread=multi
 nohup "$5" -machine "$6" -accel "$accel" -cpu "$8" -smp 2 -m 1536 \
   -run-with user=65534:65534 \
   -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny \
-  -monitor none \
+  -monitor none "${legacy_apic[@]}" \
   "${firmware[@]}" -display none -serial "file:$vm_serial" \
   -drive "file=$vm_disk,if=virtio,format=qcow2" -drive file=seed.img,if=virtio,format=raw \
   -netdev user,id=n,ipv6=off,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n,romfile= \
