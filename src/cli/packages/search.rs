@@ -188,6 +188,20 @@ struct DisplayPackage {
 }
 
 impl DisplayPackage {
+    #[cfg(unix)]
+    fn from_wire(p: crate::daemon::protocol::PackageInfo) -> Self {
+        Self {
+            name: p.name,
+            version: p.version,
+            description: p.description,
+            source: PackageSource::from(p.source).to_string(),
+            votes: None,
+            popularity: None,
+            maintainer: None,
+            out_of_date: None,
+        }
+    }
+
     fn from_package(p: Package) -> Self {
         Self {
             name: p.name,
@@ -381,16 +395,7 @@ async fn search_official_packages(
                 return Ok((
                     res.packages
                         .into_iter()
-                        .map(|pkg| DisplayPackage {
-                            name: pkg.name,
-                            version: pkg.version,
-                            description: pkg.description,
-                            source: pkg.source.label().to_string(),
-                            votes: None,
-                            popularity: None,
-                            maintainer: None,
-                            out_of_date: None,
-                        })
+                        .map(DisplayPackage::from_wire)
                         .collect(),
                     res.total,
                 ));
@@ -517,16 +522,7 @@ fn search_sync_official_only(query: &str, limit: usize, name_kind: SearchNameKin
         let mut packages: Vec<DisplayPackage> = res
             .packages
             .into_iter()
-            .map(|pkg| DisplayPackage {
-                name: pkg.name,
-                version: pkg.version,
-                description: pkg.description,
-                source: pkg.source.label().to_string(),
-                votes: None,
-                popularity: None,
-                maintainer: None,
-                out_of_date: None,
-            })
+            .map(DisplayPackage::from_wire)
             .collect();
         packages = present_search_results(query, packages, false, limit, name_kind);
 
@@ -607,6 +603,72 @@ fn write_package_line<W: Write>(w: &mut W, pkg: &DisplayPackage) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn assert_wire_search_json_source(
+        wire_source: crate::daemon::protocol::WirePackageSource,
+        expected_source: &str,
+    ) {
+        let package = DisplayPackage::from_wire(crate::daemon::protocol::PackageInfo {
+            name: "tree.x86_64".to_string(),
+            version: "2:2.2.1-4.fc44".to_string(),
+            description: "List \"directories\"\nrecursively".to_string(),
+            source: wire_source,
+        });
+        let actual =
+            serde_json::to_value(package).expect("serialize real wire-derived display row");
+        assert_eq!(
+            actual,
+            serde_json::json!({
+                "name": "tree.x86_64",
+                "version": "2:2.2.1-4.fc44",
+                "description": "List \"directories\"\nrecursively",
+                "source": expected_source,
+            }),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_json_source_official_wire_record() {
+        assert_wire_search_json_source(
+            crate::daemon::protocol::WirePackageSource::Official,
+            "Official",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_json_source_aur_wire_record() {
+        assert_wire_search_json_source(crate::daemon::protocol::WirePackageSource::Aur, "AUR");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_json_source_apt_wire_record() {
+        assert_wire_search_json_source(crate::daemon::protocol::WirePackageSource::Apt, "Official");
+    }
+
+    #[test]
+    #[cfg(not(feature = "arch"))]
+    fn search_json_source_native_record() {
+        let package = DisplayPackage::from_package(Package {
+            name: "tree.x86_64".to_string(),
+            version: crate::package_managers::types::Version::new("2:2.2.1-4.fc44"),
+            description: "List \"directories\"\nrecursively".to_string(),
+            source: PackageSource::Official,
+            installed: false,
+        });
+        assert_eq!(
+            serde_json::to_value(package).expect("serialize real native display row"),
+            serde_json::json!({
+                "name": "tree.x86_64",
+                "version": "2:2.2.1-4.fc44",
+                "description": "List \"directories\"\nrecursively",
+                "source": "Official",
+            }),
+        );
+    }
 
     /// Format a package through the real production writer so the tests
     /// assert the exact output users see instead of a duplicated format
