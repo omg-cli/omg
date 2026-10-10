@@ -109,16 +109,44 @@ impl RpmDatabaseIdentity {
         let wal = RpmFileIdentity::read(Path::new(&wal_path)).ok()?;
         Some(Self { database, wal })
     }
+
+    fn same_inventory_files(self, observed: Self) -> bool {
+        if self.database != observed.database {
+            return false;
+        }
+        match (self.wal, observed.wal) {
+            (None, None) => true,
+            (Some(current), Some(previous)) => {
+                // Native SQLite readers reapply WAL permissions, changing
+                // ctime without changing inventory. Keep inode, size and
+                // mtime checks; the observer also checks SQLite generation
+                // and package contents when that generation changes.
+                (
+                    current.device,
+                    current.inode,
+                    current.size,
+                    current.modified,
+                ) == (
+                    previous.device,
+                    previous.inode,
+                    previous.size,
+                    previous.modified,
+                )
+            }
+            _ => false,
+        }
+    }
 }
 
 /// SQLite's data_version is connection-local. Keep the same read-only observer
 /// alive for the snapshot instead of comparing values from fresh connections.
-/// Each PRAGMA finishes its own read; no transaction is retained between calls.
+/// No read transaction is retained between observation calls.
 #[derive(Debug, Clone)]
 struct RpmDatabaseObservation {
     identity: RpmDatabaseIdentity,
     connection: Arc<Mutex<Connection>>,
     data_version: i64,
+    inventory_fingerprint: [u8; 32],
 }
 
 struct RpmInstalledCatalogObservation {
@@ -133,39 +161,90 @@ impl super::InstalledCatalogObservation for RpmInstalledCatalogObservation {
 }
 
 impl RpmDatabaseObservation {
+    fn fingerprint_inventory(connection: &Connection) -> Result<[u8; 32]> {
+        use sha2::{Digest as _, Sha256};
+
+        // One SELECT holds a coherent read snapshot while its cursor exists.
+        // Length/domain framing binds row identities, every header byte, and
+        // the row count without retaining the entire installed RPM database.
+        let mut digest = Sha256::new();
+        digest.update(b"OMG RPM Packages inventory v1\0");
+        let mut statement = connection.prepare("SELECT hnum, blob FROM Packages ORDER BY hnum")?;
+        let mut rows = statement.query([])?;
+        let mut count = 0_u64;
+        while let Some(row) = rows.next()? {
+            let hnum: i64 = row.get(0)?;
+            let blob = row.get_ref(1)?.as_blob()?;
+            digest.update([1]);
+            digest.update(hnum.to_be_bytes());
+            digest.update(u64::try_from(blob.len())?.to_be_bytes());
+            digest.update(blob);
+            count = count
+                .checked_add(1)
+                .context("RPM inventory row count overflow")?;
+        }
+        digest.update([0]);
+        digest.update(count.to_be_bytes());
+        Ok(digest.finalize().into())
+    }
+
     fn read(path: &Path) -> Option<Self> {
         let before_open = RpmDatabaseIdentity::read(path)?;
         let connection =
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-        let data_version = connection
+        let transaction = connection.unchecked_transaction().ok()?;
+        let data_version = transaction
             .query_row("PRAGMA data_version", [], |row| row.get(0))
             .ok()?;
+        let inventory_fingerprint = Self::fingerprint_inventory(&transaction).ok()?;
+        transaction.commit().ok()?;
         // The first read of a WAL database can create its empty WAL file,
         // even through a read-only connection. Capture that initialized WAL
         // identity while still rejecting replacement of the main database.
-        // Concurrent commits remain covered by data_version at publication.
+        // The baseline read is finished before returning; concurrent commits
+        // are covered by generation/content checks at publication.
         let identity = RpmDatabaseIdentity::read(path)?;
         if identity.database != before_open.database {
+            return None;
+        }
+        let initialized_empty_wal =
+            before_open.wal.is_none() && identity.wal.is_some_and(|wal| wal.size == 0);
+        if !identity.same_inventory_files(before_open) && !initialized_empty_wal {
             return None;
         }
         Some(Self {
             identity,
             connection: Arc::new(Mutex::new(connection)),
             data_version,
+            inventory_fingerprint,
         })
     }
 
     fn is_current(&self, path: &Path) -> bool {
-        if RpmDatabaseIdentity::read(path) != Some(self.identity) {
+        if !RpmDatabaseIdentity::read(path)
+            .is_some_and(|current| current.same_inventory_files(self.identity))
+        {
             return false;
         }
         let Ok(connection) = self.connection.lock() else {
             return false;
         };
-        connection
+        let generation_matches = connection
             .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
-            .is_ok_and(|version| version == self.data_version)
-            && RpmDatabaseIdentity::read(path) == Some(self.identity)
+            .map(|version| version == self.data_version);
+        let contents_match = match generation_matches {
+            Ok(true) => true,
+            // Read-only, unwritable SHM with an empty WAL causes SQLite to
+            // invalidate its page cache (and data_version) on every read.
+            // Accept only identical, cryptographically fingerprinted package
+            // rows; real inventory changes and query/schema errors fail closed.
+            Ok(false) => Self::fingerprint_inventory(&connection)
+                .is_ok_and(|fingerprint| fingerprint == self.inventory_fingerprint),
+            Err(_) => false,
+        };
+        contents_match
+            && RpmDatabaseIdentity::read(path)
+                .is_some_and(|current| current.same_inventory_files(self.identity))
     }
 }
 
@@ -2262,6 +2341,130 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn installed_catalog_observation_survives_readonly_wal_permission_reapplication() -> Result<()>
+    {
+        let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
+        let directory = write_packages_db(&[native.as_slice()]);
+        let mut manager = DnfPackageManager::new();
+        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let database = Connection::open(&manager.rpm_db_path)?;
+        database.pragma_update(None, "journal_mode", "WAL")?;
+        let observed = manager
+            .installed_catalog_observation()?
+            .expect("SQLite observation");
+        assert!(observed.is_current()?);
+        let wal = directory.path().join("rpmdb.sqlite-wal");
+        let before = RpmFileIdentity::read(&wal)?.expect("observed WAL");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::set_permissions(&wal, std::fs::metadata(&wal)?.permissions())?;
+        let after = RpmFileIdentity::read(&wal)?.expect("WAL retained");
+        assert_eq!(
+            (after.device, after.inode, after.size, after.modified),
+            (before.device, before.inode, before.size, before.modified)
+        );
+        assert_ne!(
+            after.changed, before.changed,
+            "model native SQLite chmod noise"
+        );
+        assert!(
+            observed.is_current()?,
+            "reapplying WAL permissions cannot change installed catalogue contents"
+        );
+        database.execute("DELETE FROM Packages", [])?;
+        assert!(
+            !observed.is_current()?,
+            "a real SQLite commit must still invalidate the observation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installed_catalog_observation_rejects_wal_replacement() -> Result<()> {
+        let directory = write_packages_db(&[]);
+        let mut manager = DnfPackageManager::new();
+        manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
+        let database = Connection::open(&manager.rpm_db_path)?;
+        database.pragma_update(None, "journal_mode", "WAL")?;
+        let observed = manager
+            .installed_catalog_observation()?
+            .expect("SQLite observation");
+        assert!(observed.is_current()?);
+        let wal = directory.path().join("rpmdb.sqlite-wal");
+        std::fs::rename(&wal, directory.path().join("previous-wal"))?;
+        std::fs::File::create(&wal)?;
+        assert!(
+            !observed.is_current()?,
+            "replaced WAL identity cannot certify an old installed inventory"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installed_catalog_observation_accepts_content_preserving_commits() -> Result<()> {
+        for mode in ["DELETE", "WAL"] {
+            let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
+            let directory = write_packages_db(&[native.as_slice()]);
+            let path = directory.path().join("rpmdb.sqlite");
+            let database = Connection::open(&path)?;
+            database.pragma_update(None, "journal_mode", mode)?;
+            let mut observed = RpmDatabaseObservation::read(&path).expect("SQLite observation");
+            database.execute("CREATE TABLE ObservationNoise (revision INTEGER)", [])?;
+            database.execute("INSERT INTO ObservationNoise VALUES (1)", [])?;
+            let current_generation: i64 =
+                observed
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            assert_ne!(
+                current_generation, observed.data_version,
+                "the content-preserving write must exercise generation invalidation in {mode}"
+            );
+            // Isolate the generation signal, as with the existing equal-stat
+            // commit regression. The installed inventory did not change.
+            observed.identity = RpmDatabaseIdentity::read(&path).expect("current identity");
+            assert!(
+                observed.is_current(&path),
+                "unchanged package bytes in {mode}"
+            );
+            let busy: i64 =
+                database.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+            assert_eq!(busy, 0, "observer must release its transaction in {mode}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn installed_catalog_observation_rejects_changed_rows_at_matching_metadata() -> Result<()> {
+        for change in ["blob", "hnum", "schema"] {
+            let native = include_bytes!("../../tests/data/fedora-publicsuffix.rpmhdr");
+            let directory = write_packages_db(&[native.as_slice()]);
+            let path = directory.path().join("rpmdb.sqlite");
+            let database = Connection::open(&path)?;
+            database.pragma_update(None, "journal_mode", "WAL")?;
+            let mut observed = RpmDatabaseObservation::read(&path).expect("SQLite observation");
+            match change {
+                "blob" => {
+                    let mut changed = native.to_vec();
+                    let last = changed.len() - 2;
+                    changed[last] ^= 1;
+                    database.execute("UPDATE Packages SET blob = ?1", [changed])?;
+                }
+                "hnum" => {
+                    database.execute("UPDATE Packages SET hnum = hnum + 10", [])?;
+                }
+                "schema" => {
+                    database.execute("DROP TABLE Packages", [])?;
+                }
+                _ => unreachable!(),
+            }
+            observed.identity = RpmDatabaseIdentity::read(&path).expect("current identity");
+            assert!(!observed.is_current(&path), "must reject changed {change}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn native_advisory_identity_excludes_patched_versions_and_other_architectures() {
         let package = |version: &str, architecture: &str| super::super::types::SecurityPackage {
@@ -3710,8 +3913,11 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let db = dir.path().join("rpmdb.sqlite");
         let conn = Connection::open(&db).expect("open sqlite");
-        conn.execute("CREATE TABLE Packages (blob BLOB NOT NULL)", [])
-            .expect("create Packages");
+        conn.execute(
+            "CREATE TABLE Packages (hnum INTEGER PRIMARY KEY, blob BLOB NOT NULL)",
+            [],
+        )
+        .expect("create Packages");
         for blob in blobs {
             conn.execute("INSERT INTO Packages (blob) VALUES (?1)", [blob.to_vec()])
                 .expect("insert blob");
