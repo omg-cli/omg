@@ -326,10 +326,41 @@ def runtime_contract(case, data, stdout):
         require(stdout.strip() == 'node 24.21.0', 'which did not resolve project runtime pin')
     elif case == 'hook-env':
         selected = str(base / 'node/24.21.0/bin')
-        probe = subprocess.run(['bash', '-c', 'source "$1"; printf "%s\\n%s" "$PATH" "${QEMU_MUST_NOT_AUTO_APPLY-unset}"', '_', 'command.stdout.log'],
-                               env=dict(os.environ, PATH='/usr/bin:/bin', _OMG_PATH_BASE='/usr/bin:/bin'), capture_output=True, text=True, timeout=5)
-        require(probe.returncode == 0 and probe.stdout == selected + ':/usr/bin:/bin\nunset', 'hook-env did not select confined PATH or applied project environment')
-        require(stdout.strip() == 'export PATH=' + shlex.quote(selected) + ':"${_OMG_PATH_BASE:-$PATH}"' or stdout.strip() == "export PATH='" + selected + "':\"${_OMG_PATH_BASE:-$PATH}\"", 'hook-env emitted unexpected shell operations')
+        quoted = "'" + selected.replace("'", "'\\''") + "'"
+        expected = '\n'.join([
+            '_OMG_PATH_ADDITIONS=(' + quoted + ')',
+            '_omg_base=${_OMG_PATH_BASE-$PATH}',
+            'export PATH="${_OMG_PATH_PREFIX:+${_OMG_PATH_PREFIX}:}"' + quoted + '"${_omg_base:+:${_omg_base}}"',
+            'unset _omg_base',
+        ])
+        # Published v0.1.224 emits this exact single operation. Its historical
+        # normal-base semantics do not include the newer prefix/empty-base contract.
+        legacy = 'export PATH=' + quoted + ':"${_OMG_PATH_BASE:-$PATH}"'
+        # Reject extra operations before executing any emitted shell code. Feed
+        # those validated bytes directly; another file must not supply the code.
+        current = stdout.strip() == expected
+        require(current or stdout.strip() == legacy, 'hook-env emitted unexpected shell operations')
+        cases = [('/usr/bin:/bin', ''), (None, '')]
+        if current:
+            cases += [('', ''), ('/usr/bin:/bin', '/private/prefix'), ('', '/private/prefix')]
+        for path_base, prefix in cases:
+            environment = dict(os.environ, PATH='/usr/bin:/bin', _OMG_PATH_PREFIX=prefix)
+            for name in ('_OMG_PATH_BASE', 'QEMU_MUST_NOT_AUTO_APPLY', '_omg_base',
+                         '_OMG_PATH_ADDITIONS', 'BASH_ENV'):
+                environment.pop(name, None)
+            if path_base is not None:
+                environment['_OMG_PATH_BASE'] = path_base
+            probe = subprocess.run(
+                ['/bin/bash', '-c', stdout + '\nprintf "%s\\n%s\\n%s\\n%s\\n%s" "$PATH" '
+                 '"${QEMU_MUST_NOT_AUTO_APPLY-unset}" "${_omg_base-unset}" '
+                 '"${_OMG_PATH_ADDITIONS[*]}" "${#_OMG_PATH_ADDITIONS[@]}"'],
+                env=environment, capture_output=True, text=True, timeout=5)
+            expected_path = ':'.join(part for part in (
+                prefix, selected, '/usr/bin:/bin' if path_base is None else path_base
+            ) if part)
+            expected_additions = selected + '\n1' if current else '\n0'
+            require(probe.returncode == 0 and probe.stdout == expected_path + '\nunset\nunset\n' + expected_additions,
+                    'hook-env did not select confined PATH or applied project environment')
     elif case == 'list':
         entries = re.findall(r'\b(node|python) ([\d.]+)([^\n]*)', stdout)
         require({(name, version): '(active)' in rest for name, version, rest in entries} == {('node', '24.21.0'): True, ('node', '22.16.0'): False, ('python', '3.12.14'): True} and len(entries) == 3, 'installed list disagrees with fixture versions/active state')
