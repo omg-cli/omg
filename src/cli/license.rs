@@ -67,10 +67,10 @@ fn report_activation(result: Result<license::StoredLicense>) -> Result<()> {
                 style::maybe_color("✓", |t| t.green().to_string())
             );
             if let Some(customer) = &stored.customer {
-                println!("  Account: {customer}");
+                println!("  Account: {}", style::sanitize_terminal_text(customer));
             }
             if let Some(expires) = &stored.expires_at {
-                println!("  Expires: {expires}");
+                println!("  Expires: {}", style::sanitize_terminal_text(expires));
             }
             println!(
                 "\n  {}",
@@ -119,10 +119,10 @@ pub fn status() -> Result<()> {
             StoredLicenseStatus::Active => {
                 println!("  Status: {} ✓", style::version("Linked"));
                 if let Some(customer) = &stored.customer {
-                    println!("  Account: {customer}");
+                    println!("  Account: {}", style::sanitize_terminal_text(customer));
                 }
                 if let Some(expires) = &stored.expires_at {
-                    println!("  Expires: {expires}");
+                    println!("  Expires: {}", style::sanitize_terminal_text(expires));
                 }
             }
             StoredLicenseStatus::Invalid => {
@@ -133,7 +133,10 @@ pub fn status() -> Result<()> {
                         .to_string())
                 );
                 if let Some(expires) = &stored.expires_at {
-                    println!("  Stored expiry: {expires}");
+                    println!(
+                        "  Stored expiry: {}",
+                        style::sanitize_terminal_text(expires)
+                    );
                 }
                 println!("  Relink: {}", style::dim("omg account link --token-stdin"));
             }
@@ -169,6 +172,62 @@ pub fn deactivate() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_metadata_output_neutralizes_terminal_controls() -> Result<()> {
+        const CHILD: &str = "OMG_ACCOUNT_OUTPUT_CONTRACT_CHILD";
+        const NAME: &str =
+            "cli::license::tests::activation_metadata_output_neutralizes_terminal_controls";
+        if std::env::var(CHILD).as_deref() == Ok(NAME) {
+            // This exercises the successful presentation path only. It does
+            // not simulate signed-token authentication or contact the API.
+            for (customer, expires_at) in [
+                ("Normal Customer", "2030-01-01"),
+                (
+                    "\u{1b}]52;c;fixture\u{7}Customer\u{202e}",
+                    "\u{1b}[31mexpiry\u{2066}",
+                ),
+            ] {
+                report_activation(Ok(StoredLicense {
+                    key: "private-account-fixture-key".into(),
+                    tier: "free".into(),
+                    features: Vec::new(),
+                    customer: Some(customer.into()),
+                    expires_at: Some(expires_at.into()),
+                    validated_at: 0,
+                    token: None,
+                    machine_id: None,
+                }))?;
+            }
+            println!("ACCOUNT_OUTPUT_CONTRACT_COMPLETED");
+            return Ok(());
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CHILD, NAME)
+            .env("NO_COLOR", "1")
+            .output()?;
+        let stdout = String::from_utf8(output.stdout)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "presentation child failed: {stdout}"
+        );
+        anyhow::ensure!(
+            stdout.contains("ACCOUNT_OUTPUT_CONTRACT_COMPLETED")
+                && stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "presentation child did not execute: {stdout}"
+        );
+        assert!(stdout.contains("Account: Normal Customer"), "{stdout:?}");
+        assert!(stdout.contains("Expires: 2030-01-01"), "{stdout:?}");
+        assert!(!stdout.contains("private-account-fixture-key"));
+        for forbidden in ['\u{1b}', '\u{7}', '\u{202e}', '\u{2066}'] {
+            assert!(
+                !stdout.contains(forbidden),
+                "unsafe account output: {stdout:?}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn invalid_stored_license_is_not_displayed_as_active() {

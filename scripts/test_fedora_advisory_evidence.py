@@ -5,12 +5,14 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import tempfile
 import unittest
 import subprocess
 import sys
+import shutil
 
 spec = importlib.util.spec_from_file_location('fedora_evidence', Path(__file__).with_name('qemu-fedora-advisory-evidence.py'))
 checker = importlib.util.module_from_spec(spec)
@@ -101,6 +103,36 @@ class FedoraEvidenceTests(unittest.TestCase):
         try: admitted = self.check()
         except ValueError as error: self.fail('complete native metadata must replay: '+str(error))
         self.assertEqual(admitted, self.receipt)
+
+    @unittest.skipUnless(shutil.which('bash') and shutil.which('install'), 'requires Linux evidence-copy tools')
+    def test_guest_copy_loop_preserves_complete_native_advisory_evidence(self):
+        wrapper = Path(__file__).with_name('qemu-fedora-advisory-check.sh').read_text()
+        copy_loop = wrapper[wrapper.index('files=('):wrapper.index('if ! cmp -s')]
+        copy_loop = copy_loop.replace('/tmp/omg-fedora-advisory-qemu-616/evidence/',
+                                      '${OMG_ADVISORY_COPY_FIXTURE}/')
+        copied = self.root/'copied'
+        destination = copied/'fedora-advisory'
+        destination.mkdir(parents=True)
+        for phase in ('before', 'after'):
+            filename = 'parent-system-'+phase+'.sha256'
+            shutil.copyfile(self.evidence/filename, destination/filename)
+        commands = self.root/'commands'
+        commands.mkdir()
+        sudo = commands/'sudo'
+        sudo.write_text('#!/bin/sh\n[ "$1" != -n ] || shift\nexec "$@"\n')
+        sudo.chmod(0o700)
+        result = subprocess.run(['bash', '-euo', 'pipefail', '-c',
+                                 'evidence=$1\n'+copy_loop, 'evidence-copy', str(copied)],
+                                env=dict(os.environ, PATH=str(commands)+os.pathsep+os.environ['PATH'],
+                                         OMG_ADVISORY_COPY_FIXTURE=str(self.evidence)),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for filename in ('excluded-dnf.conf', 'native-excluded-default-list.stdout',
+                         'native-excluded-override-list.stdout', 'native-excluded-override-info.stdout'):
+            with self.subTest(filename=filename):
+                self.assertTrue((destination/filename).is_file(), 'guest evidence was not copied')
+                self.assertEqual((destination/filename).read_bytes(), (self.evidence/filename).read_bytes())
+        self.assertEqual(checker.validate_structure(destination, self.archive, self.fixture), self.receipt)
 
     def test_missing_excluded_installed_package_controls_are_refused(self):
         # Native installed-package advisories must stay visible even when

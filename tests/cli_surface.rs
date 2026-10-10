@@ -8,6 +8,183 @@ use clap::{Arg, ArgAction, ArgGroup, Command, CommandFactory, Parser, error::Err
 use omg_lib::cli::{Cli, Commands};
 use serde_json::{Value, json};
 
+#[cfg(feature = "license")]
+fn account_expiry_output_fixture(expiry: &str) -> anyhow::Result<String> {
+    let project = common::TestProject::new();
+    let path = project.data_dir.path().join("license.json");
+    let bytes = serde_json::to_vec(&json!({
+        "key": "private-account-fixture-key",
+        "tier": "free",
+        "features": [],
+        "customer": null,
+        "expires_at": expiry,
+        "validated_at": 0,
+        "token": null,
+        "machine_id": null
+    }))?;
+    std::fs::write(&path, &bytes)?;
+    let result = project.run(&["account", "status"]);
+    let after = std::fs::read(path)?;
+    project.close_checked();
+    assert_eq!(after, bytes, "account status must preserve stored metadata");
+    assert!(result.success, "{}", result.combined_output());
+    assert!(result.stdout.contains("Stored token is invalid or expired"));
+    assert!(!result.stdout.contains("private-account-fixture-key"));
+    Ok(result.stdout)
+}
+
+#[cfg(feature = "license")]
+#[test]
+fn account_status_neutralizes_stored_expiry_terminal_controls() -> anyhow::Result<()> {
+    let output = account_expiry_output_fixture("\u{1b}]52;c;fixture\u{7}expiry\u{1b}[31m\u{202e}")?;
+    assert!(output.contains("Stored expiry:"), "{output:?}");
+    for forbidden in ['\u{1b}', '\u{7}', '\u{202e}'] {
+        assert!(
+            !output.contains(forbidden),
+            "unsafe account output: {output:?}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "license")]
+#[test]
+fn account_status_preserves_normal_expiry_text_and_storage() -> anyhow::Result<()> {
+    let output = account_expiry_output_fixture("2030-01-01")?;
+    assert!(output.contains("Stored expiry: 2030-01-01"), "{output}");
+    Ok(())
+}
+
+fn audit_output_entry() -> omg_lib::core::security::audit::AuditEntry {
+    use omg_lib::core::security::audit::{AuditEntry, AuditEventType, AuditSeverity};
+    AuditEntry {
+        id: "fixture-entry".into(),
+        timestamp: "2030-01-01T00:00:00Z".into(),
+        event_type: AuditEventType::SecurityAudit,
+        severity: AuditSeverity::Info,
+        user: "fixture-user".into(),
+        resource: "normal-resource".into(),
+        description: "normal-description".into(),
+        metadata: None,
+        prev_hash: "genesis".into(),
+        hash_version: 1,
+        hash: None,
+    }
+}
+
+fn audit_output_project(
+    entry: &omg_lib::core::security::audit::AuditEntry,
+) -> anyhow::Result<(common::TestProject, std::path::PathBuf, Vec<u8>)> {
+    let project = common::TestProject::new();
+    let path = project.data_dir.path().join("audit/audit.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut bytes = serde_json::to_vec(entry)?;
+    bytes.push(b'\n');
+    std::fs::write(&path, &bytes)?;
+    Ok((project, path, bytes))
+}
+
+fn audit_log_output_fixture(field: &str) -> anyhow::Result<()> {
+    let mut entry = audit_output_entry();
+    let hostile = "\u{1b}]52;c;fixture\u{7}visible\u{1b}[31m\nforged\u{202e}";
+    match field {
+        "timestamp" => entry.timestamp = hostile.into(),
+        "description" => entry.description = hostile.into(),
+        "resource" => entry.resource = hostile.into(),
+        _ => panic!("unknown fixture field"),
+    }
+    entry.hash = Some(entry.compute_hash());
+    let (project, path, before) = audit_output_project(&entry)?;
+    let result = project.run(&["audit", "log"]);
+    let after = std::fs::read(path)?;
+    project.close_checked();
+    assert_eq!(
+        after, before,
+        "display must preserve hash-bearing audit bytes"
+    );
+    assert!(result.success, "{}", result.combined_output());
+    assert!(result.stdout.contains("visible"), "{:?}", result.stdout);
+    for forbidden in ['\u{1b}', '\u{7}', '\u{202e}'] {
+        assert!(
+            !result.stdout.contains(forbidden),
+            "unsafe {field}: {:?}",
+            result.stdout
+        );
+    }
+    assert!(!result.stdout.contains("\nforged"), "{:?}", result.stdout);
+    Ok(())
+}
+
+#[test]
+fn audit_log_display_neutralizes_timestamp_controls() -> anyhow::Result<()> {
+    audit_log_output_fixture("timestamp")
+}
+
+#[test]
+fn audit_log_display_neutralizes_description_controls() -> anyhow::Result<()> {
+    audit_log_output_fixture("description")
+}
+
+#[test]
+fn audit_log_display_neutralizes_resource_controls() -> anyhow::Result<()> {
+    audit_log_output_fixture("resource")
+}
+
+#[test]
+fn audit_verify_display_neutralizes_invalid_entry_id() -> anyhow::Result<()> {
+    let mut entry = audit_output_entry();
+    entry.id = "\u{1b}]52;c;fixture\u{7}Invalid\u{1b}[31m\nforged\u{2066}".into();
+    entry.hash = Some("incorrect-hash".into());
+    let (project, path, before) = audit_output_project(&entry)?;
+    let result = project.run(&["audit", "verify"]);
+    let after = std::fs::read(path)?;
+    project.close_checked();
+    assert_eq!(after, before);
+    assert!(!result.success, "bad hash must remain an integrity failure");
+    assert!(result.stdout.contains("Audit log integrity FAILED"));
+    assert!(result.stdout.contains("First Invalid:"));
+    for forbidden in ['\u{1b}', '\u{7}', '\u{2066}'] {
+        assert!(
+            !result.stdout.contains(forbidden),
+            "unsafe ID: {:?}",
+            result.stdout
+        );
+    }
+    assert!(!result.stdout.contains("\nforged"), "{:?}", result.stdout);
+    Ok(())
+}
+
+#[test]
+fn audit_exports_preserve_raw_evidence_fields_and_source() -> anyhow::Result<()> {
+    let mut entry = audit_output_entry();
+    let raw = "\u{1b}]52;c;fixture\u{7}raw\u{1b}[31m\nsecond-line";
+    entry.timestamp = raw.into();
+    entry.description = raw.into();
+    entry.resource = raw.into();
+    entry.hash = Some(entry.compute_hash());
+    let (project, path, before) = audit_output_project(&entry)?;
+    for format in ["json", "csv"] {
+        let output = project.path().join(format!("evidence.{format}"));
+        let result = project.run(&["audit", "log", "--export", output.to_str().unwrap()]);
+        assert!(result.success, "{}", result.combined_output());
+        let bytes = std::fs::read(output)?;
+        if format == "json" {
+            let exported: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(exported, json!([entry]));
+        } else {
+            let mut reader = csv::Reader::from_reader(bytes.as_slice());
+            let rows = reader.records().collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(rows.len(), 1);
+            for index in [0, 3, 4] {
+                assert_eq!(rows[0].get(index), Some(raw));
+            }
+        }
+        assert_eq!(std::fs::read(&path)?, before);
+    }
+    project.close_checked();
+    Ok(())
+}
+
 #[cfg(unix)]
 fn doctor_eol_fixture(version: Option<&str>) -> anyhow::Result<common::CommandResult> {
     let project = common::TestProject::new();
