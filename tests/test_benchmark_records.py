@@ -760,7 +760,7 @@ class FedoraBenchmarkIdentityTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
 
     def test_available_shape_is_explicit_and_epoch_remains_bound(self) -> None:
-        available = self.PRODUCT.replace("tree.x86_64", "tree").replace("Installed: yes", "Installed: no")
+        available = self.PRODUCT.replace("Installed: yes", "Installed: no")
         for value, native in ((available, False), (self.NATIVE, True)):
             result = self.normalize(value, native, "available")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -773,6 +773,67 @@ class FedoraBenchmarkIdentityTests(unittest.TestCase):
         self.assertEqual(self.normalize(self.NATIVE + "Epoch: 2\n", True, evr="2:2.2.1-4.fc44").stdout,
                          "tree.x86_64\t2:2.2.1-4.fc44\n")
         self.assertNotEqual(self.normalize(self.NATIVE + "Epoch: 1\n", True, evr="2:2.2.1-4.fc44").returncode, 0)
+
+    def test_recorded_available_info_reaches_transaction_identity_verification(self) -> None:
+        # CI38012420409, artifact11655081916, verified ZIP SHA256
+        # 04d7577b1fbecbd681fa71a035a03f8c9840a523b227b5005ae735f26e10bc8b.
+        available = self.PRODUCT.replace("Installed: yes", "Installed: no")
+        self.assertEqual(hashlib.sha256(available.encode()).hexdigest(),
+                         "9e9c189cc32640cd193986b3b2b07efc99383de8629815fe164cff8ff9c3a10c")
+        product = self.directory / "product-info.txt"
+        product.write_text(available, encoding="utf-8")
+        native = self.directory / "native-info.txt"
+        native.write_text(self.NATIVE, encoding="utf-8")
+        tools = self.directory / "tools"
+        tools.mkdir()
+        for name, body in (
+            ("omg", 'cat -- "$PRODUCT_INFO"'),
+            ("rpm", "printf 'x86_64\\n'"),
+            ("dnf", 'if [ "$1" = --cacheonly ]; then '
+                    "printf 'tree\\tx86_64\\t0:2.2.1-4.fc44\\n'; "
+                    'else cat -- "$NATIVE_INFO"; fi'),
+        ):
+            executable = tools / name
+            executable.write_text("#!/bin/sh\nset -eu\n" + body + "\n", encoding="utf-8")
+            executable.chmod(0o700)
+        evidence = self.directory / "evidence"
+        evidence.mkdir()
+        text = self.script.read_text(encoding="utf-8")
+        marker = "        verify_tree_identity() {\n"
+        body = text.split(marker, 1)[1].split("\n        }\n", 1)[0]
+        definitions = "".join(self.definition(name) for name in (
+            "fedora_identity_from_query", "capture_fedora_info_identity",
+            "prepare_info_reference", "normalize_info",
+        )) + "verify_tree_identity() {\n" + body + "\n}\n"
+        invocation = ('set -euo pipefail\ndistro=fedora\nGUEST_TRANSACTION=install\n'
+                      'expected_version=2.2.1-4.fc44\nEXPORT_DIR=$1\nOMG=$2\n'
+                      'privileged=()\nnative=(dnf -C info tree)\n'
+                      + definitions + 'verify_tree_identity before\n')
+        result = subprocess.run(
+            ["/bin/bash", "-s", "--", str(evidence), str(tools / "omg")],
+            input=invocation, cwd=self.directory,
+            env={**os.environ, "PATH": str(tools) + ":" + os.environ["PATH"],
+                 "PRODUCT_INFO": str(product), "NATIVE_INFO": str(native)},
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in ("omg-identity-before.tsv", "native-identity-before.tsv", "expected-identity.tsv"):
+            self.assertEqual((evidence / name).read_text(), "tree.x86_64\t2.2.1-4.fc44\n")
+        self.assertEqual((evidence / "omg-info-before.stdout").read_text(), available)
+
+    def test_available_product_refuses_unqualified_or_foreign_identity(self) -> None:
+        available = self.PRODUCT.replace("Installed: yes", "Installed: no")
+        for value in (
+            available.replace("tree.x86_64", "tree"),
+            available.replace("tree.x86_64", "tree.i686"),
+            available.replace("2.2.1-4.fc44", "2.2.2-4.fc44"),
+            available + "Name: tree.x86_64\n",
+            available + "Installed: no\n",
+        ):
+            with self.subTest(value=value):
+                result = self.normalize(value, phase="available")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "")
 
     def test_machine_query_pins_one_installed_or_exact_available_candidate(self) -> None:
         installed = "tree\tx86_64\t0:2.2.1-4.fc44\n"

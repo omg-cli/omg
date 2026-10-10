@@ -445,7 +445,7 @@ if [[ "$GUEST_MODE" == true ]]; then
                 }
                 if (version "-" release != base_evr) exit 1;
               } else if (rpm_release == "false") {
-                expected_name=(phase == "installed" ? "tree." arch : "tree");
+                expected_name="tree." arch;
                 sub(/^0:/, "", version);
                 expected_installed=(phase == "installed" ? "yes" : "no");
                 if (name != expected_name || version != expected_evr ||
