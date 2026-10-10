@@ -254,6 +254,218 @@ fn smoke_node(version_dir: &Path, expected: &str) -> Result<()> {
     })?
 }
 
+#[cfg(any(target_os = "macos", test))]
+mod terminal_group {
+    use anyhow::{Context, Result, ensure};
+
+    pub(super) const CAPACITY: usize = 16;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct Identity {
+        pub pid: u32,
+        pub pgid: u32,
+        pub ppid: u32,
+        pub uid: u32,
+        pub ruid: u32,
+        pub start_sec: u64,
+        pub start_usec: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum State {
+        Zombie,
+        Other(u32),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct Member {
+        pub identity: Identity,
+        pub state: State,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct OwnedLeader(Identity);
+
+    pub(super) fn member_count(count: i32) -> Result<usize> {
+        let count = usize::try_from(count).context("Failed to list Node.js probe group")?;
+        ensure!(
+            count > 0 && count < CAPACITY,
+            "Incomplete Node.js probe group observation"
+        );
+        Ok(count)
+    }
+
+    pub(super) fn info_size(actual: i32, expected: usize) -> Result<()> {
+        ensure!(
+            usize::try_from(actual).ok() == Some(expected),
+            "Incomplete Node.js probe process identity"
+        );
+        Ok(())
+    }
+
+    pub(super) fn validate_member(member: &Member, pid: i32, pgid: i32) -> Result<()> {
+        let identity = member.identity;
+        ensure!(pid > 0 && pgid > 0, "Invalid Node.js probe process ID");
+        ensure!(
+            identity.pid == u32::try_from(pid)? && identity.pgid == u32::try_from(pgid)?,
+            "Node.js probe process identity changed"
+        );
+        ensure!(
+            identity.start_sec > 0 && identity.start_usec < 1_000_000,
+            "Invalid Node.js probe process start time"
+        );
+        Ok(())
+    }
+
+    pub(super) fn capture_owned(
+        member: Member,
+        pgid: i32,
+        parent: u32,
+        uid: u32,
+        ruid: u32,
+    ) -> Result<OwnedLeader> {
+        validate_member(&member, pgid, pgid)?;
+        ensure!(
+            member.identity.ppid == parent
+                && member.identity.uid == uid
+                && member.identity.ruid == ruid,
+            "Node.js probe leader is not owned by this caller"
+        );
+        // Initial status may be live or already zombie; identity pins the
+        // direct child, while later complete observations prove terminal state.
+        Ok(OwnedLeader(member.identity))
+    }
+
+    fn observation(owned: &OwnedLeader, members: &[Member]) -> Result<Vec<Member>> {
+        member_count(i32::try_from(members.len())?)?;
+        let mut members = members.to_vec();
+        members.sort_unstable_by_key(|member| member.identity.pid);
+        ensure!(
+            members
+                .windows(2)
+                .all(|pair| pair[0].identity.pid != pair[1].identity.pid),
+            "Duplicate Node.js probe group member"
+        );
+        for member in &members {
+            validate_member(
+                member,
+                i32::try_from(member.identity.pid)?,
+                i32::try_from(owned.0.pgid)?,
+            )?;
+            ensure!(
+                member.state == State::Zombie,
+                "Node.js probe group still has a nonterminal member"
+            );
+            ensure!(
+                member.identity.uid == owned.0.uid && member.identity.ruid == owned.0.ruid,
+                "Node.js probe group has a foreign owner"
+            );
+        }
+        ensure!(
+            members.iter().any(|member| member.identity == owned.0),
+            "Owned Node.js probe leader is missing or changed"
+        );
+        Ok(members)
+    }
+
+    pub(super) fn verify(
+        owned: Result<&OwnedLeader, &anyhow::Error>,
+        first: &[Member],
+        second: &[Member],
+    ) -> Result<()> {
+        let owned = owned
+            .map_err(|error| anyhow::anyhow!("Node.js probe ownership unavailable: {error:#}"))?;
+        let first = observation(owned, first)?;
+        let second = observation(owned, second)?;
+        ensure!(
+            first == second,
+            "Node.js probe group changed between observations"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) mod macos {
+        use super::*;
+        use nix::libc;
+
+        fn read_member(pid: i32, pgid: i32) -> Result<Member> {
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>();
+            // SAFETY: the pointer targets a writable typed buffer of exactly
+            // the supplied byte size. Arg 1 admits the unreaped zombie leader.
+            let actual = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    1,
+                    info.as_mut_ptr().cast(),
+                    i32::try_from(size)?,
+                )
+            };
+            info_size(actual, size)?;
+            // SAFETY: only an exact-sized successful BSDINFO response is read.
+            let info = unsafe { info.assume_init() };
+            let member = Member {
+                identity: Identity {
+                    pid: info.pbi_pid,
+                    pgid: info.pbi_pgid,
+                    ppid: info.pbi_ppid,
+                    uid: info.pbi_uid,
+                    ruid: info.pbi_ruid,
+                    start_sec: info.pbi_start_tvsec,
+                    start_usec: info.pbi_start_tvusec,
+                },
+                state: if info.pbi_status == libc::SZOMB {
+                    State::Zombie
+                } else {
+                    State::Other(info.pbi_status)
+                },
+            };
+            validate_member(&member, pid, pgid)?;
+            Ok(member)
+        }
+
+        pub(in crate::runtimes::node) fn capture(pgid: i32) -> Result<OwnedLeader> {
+            // SAFETY: these identity queries have no arguments or pointers.
+            let (uid, ruid) = unsafe { (libc::geteuid(), libc::getuid()) };
+            capture_owned(
+                read_member(pgid, pgid)?,
+                pgid,
+                std::process::id(),
+                uid,
+                ruid,
+            )
+        }
+
+        fn snapshot(pgid: i32) -> Result<Vec<Member>> {
+            let mut pids = [0_i32; CAPACITY];
+            let bytes = i32::try_from(std::mem::size_of_val(&pids))?;
+            // SAFETY: initialized PID buffer, with its capacity supplied in
+            // bytes. libproc returns a PID count, not a byte count.
+            let count = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes) };
+            let count = member_count(count)?;
+            pids[..count]
+                .iter()
+                .map(|&pid| read_member(pid, pgid))
+                .collect()
+        }
+
+        pub(in crate::runtimes::node) fn prove(
+            owned: &Result<OwnedLeader>,
+            pgid: i32,
+        ) -> Result<()> {
+            // Fail closed before querying a group if initial ownership failed.
+            let leader = owned.as_ref().map_err(|error| {
+                anyhow::anyhow!("Node.js probe ownership unavailable: {error:#}")
+            })?;
+            let first = snapshot(pgid)?;
+            let second = snapshot(pgid)?;
+            verify(Ok(leader), &first, &second)
+        }
+    }
+}
+
 async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Duration) -> Result<()> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt as _;
@@ -290,6 +502,8 @@ async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Durat
             return Err(error).context("Node.js probe process ID exceeded i32");
         }
     };
+    #[cfg(target_os = "macos")]
+    let owned_leader = terminal_group::macos::capture(group.as_raw());
     // Keep the leader unreaped until group cleanup. Its PID then cannot be
     // recycled while a descendant still holds a probe output pipe open.
     let mut exit_observer = tokio::task::spawn_blocking(move || {
@@ -339,6 +553,12 @@ async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Durat
     // leader, including bounded-read failures and inherited-pipe timeouts.
     let group_cleanup = match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        #[cfg(target_os = "macos")]
+        Err(nix::errno::Errno::EPERM)
+            if terminal_group::macos::prove(&owned_leader, group.as_raw()).is_ok() =>
+        {
+            Ok(())
+        }
         Err(error) => Err(error).context("Failed to terminate Node.js probe process group"),
     };
     let leader_cleanup = if group_cleanup.is_err() {
@@ -425,6 +645,269 @@ pub(crate) fn get_lts_name(version: &NodeVersion) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod terminal_group_tests {
+        use super::super::terminal_group::{self, Identity, Member, State};
+        use anyhow::Result;
+
+        fn leader() -> Member {
+            Member {
+                identity: Identity {
+                    pid: 40,
+                    pgid: 40,
+                    ppid: 20,
+                    uid: 501,
+                    ruid: 501,
+                    start_sec: 100,
+                    start_usec: 123,
+                },
+                state: State::Zombie,
+            }
+        }
+
+        fn owned(member: Member) -> Result<terminal_group::OwnedLeader> {
+            terminal_group::capture_owned(member, 40, 20, 501, 501)
+        }
+
+        fn descendant(pid: u32) -> Member {
+            Member {
+                identity: Identity {
+                    pid,
+                    ppid: 1,
+                    start_sec: 101,
+                    ..leader().identity
+                },
+                ..leader()
+            }
+        }
+
+        #[test]
+        fn terminal_group_accepts_complete_stable_owned_zombies() -> Result<()> {
+            let leader = leader();
+            let owned = owned(Member {
+                state: State::Other(1),
+                ..leader
+            })?;
+            terminal_group::verify(Ok(&owned), &[leader], &[leader])?;
+            let members = [leader, descendant(41), descendant(42)];
+            terminal_group::verify(Ok(&owned), &members, &[members[2], members[0], members[1]])?;
+            let maximum: Vec<_> = std::iter::once(leader)
+                .chain((41..55).map(descendant))
+                .collect();
+            terminal_group::verify(Ok(&owned), &maximum, &maximum)?;
+            Ok(())
+        }
+
+        #[test]
+        fn terminal_group_refuses_failed_capture_and_wrong_owned_identity() -> Result<()> {
+            let leader = leader();
+            let failed = anyhow::anyhow!("actual initial identity query failed");
+            assert!(terminal_group::verify(Err(&failed), &[leader], &[leader]).is_err());
+            for identity in [
+                Identity {
+                    pid: 41,
+                    ..leader.identity
+                },
+                Identity {
+                    pgid: 41,
+                    ..leader.identity
+                },
+                Identity {
+                    ppid: 21,
+                    ..leader.identity
+                },
+                Identity {
+                    uid: 502,
+                    ..leader.identity
+                },
+                Identity {
+                    ruid: 502,
+                    ..leader.identity
+                },
+                Identity {
+                    start_sec: 0,
+                    ..leader.identity
+                },
+                Identity {
+                    start_usec: 1_000_000,
+                    ..leader.identity
+                },
+            ] {
+                assert!(
+                    owned(Member { identity, ..leader }).is_err(),
+                    "accepted {identity:?}"
+                );
+            }
+            owned(Member {
+                state: State::Other(u32::MAX),
+                ..leader
+            })?;
+            Ok(())
+        }
+
+        #[test]
+        fn terminal_group_refuses_incomplete_api_responses_and_mismatched_rows() -> Result<()> {
+            for count in [i32::MIN, -1, 0, 16, 17, i32::MAX] {
+                assert!(
+                    terminal_group::member_count(count).is_err(),
+                    "accepted count {count}"
+                );
+            }
+            for count in 1..16 {
+                assert_eq!(terminal_group::member_count(count)?, count as usize);
+            }
+            for size in [-1, 0, 127, 129, i32::MAX] {
+                assert!(
+                    terminal_group::info_size(size, 128).is_err(),
+                    "accepted bytes {size}"
+                );
+            }
+            terminal_group::info_size(128, 128)?;
+            let leader = leader();
+            terminal_group::validate_member(&leader, 40, 40)?;
+            for (pid, pgid) in [(-1, 40), (0, 40), (40, 0), (41, 40), (40, 41)] {
+                assert!(terminal_group::validate_member(&leader, pid, pgid).is_err());
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn terminal_group_refuses_missing_duplicate_live_foreign_and_malformed_members()
+        -> Result<()> {
+            let leader = leader();
+            let owned = owned(leader)?;
+            for members in [
+                vec![],
+                vec![descendant(41)],
+                vec![leader, leader],
+                vec![leader; 16],
+            ] {
+                assert!(
+                    terminal_group::verify(Ok(&owned), &members, &members).is_err(),
+                    "accepted {members:?}"
+                );
+            }
+            let child = descendant(41);
+            let mut invalid = vec![
+                Member {
+                    identity: Identity {
+                        pid: 0,
+                        ..child.identity
+                    },
+                    ..child
+                },
+                Member {
+                    identity: Identity {
+                        pid: u32::MAX,
+                        ..child.identity
+                    },
+                    ..child
+                },
+                Member {
+                    identity: Identity {
+                        pgid: 41,
+                        ..child.identity
+                    },
+                    ..child
+                },
+                Member {
+                    identity: Identity {
+                        uid: 502,
+                        ..child.identity
+                    },
+                    ..child
+                },
+                Member {
+                    identity: Identity {
+                        ruid: 502,
+                        ..child.identity
+                    },
+                    ..child
+                },
+                Member {
+                    identity: Identity {
+                        start_sec: 0,
+                        ..child.identity
+                    },
+                    ..child
+                },
+                Member {
+                    identity: Identity {
+                        start_usec: 1_000_000,
+                        ..child.identity
+                    },
+                    ..child
+                },
+            ];
+            invalid.extend([0, 1, 2, 3, 4, u32::MAX].map(|state| Member {
+                state: State::Other(state),
+                ..child
+            }));
+            for member in invalid {
+                let members = [leader, member];
+                assert!(
+                    terminal_group::verify(Ok(&owned), &members, &members).is_err(),
+                    "accepted {member:?}"
+                );
+            }
+            for identity in [
+                Identity {
+                    ppid: 21,
+                    ..leader.identity
+                },
+                Identity {
+                    start_sec: 101,
+                    ..leader.identity
+                },
+                Identity {
+                    start_usec: 124,
+                    ..leader.identity
+                },
+            ] {
+                let changed = [Member { identity, ..leader }];
+                assert!(terminal_group::verify(Ok(&owned), &changed, &changed).is_err());
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn terminal_group_refuses_membership_or_identity_churn() -> Result<()> {
+            let leader = leader();
+            let owned = owned(leader)?;
+            let child = descendant(41);
+            let first = [leader, child];
+            for identity in [
+                Identity {
+                    pid: 42,
+                    ..child.identity
+                },
+                Identity {
+                    ppid: 2,
+                    ..child.identity
+                },
+                Identity {
+                    start_sec: 102,
+                    ..child.identity
+                },
+                Identity {
+                    start_usec: 124,
+                    ..child.identity
+                },
+            ] {
+                let second = [leader, Member { identity, ..child }];
+                assert!(
+                    terminal_group::verify(Ok(&owned), &first, &second).is_err(),
+                    "accepted churn {identity:?}"
+                );
+            }
+            assert!(terminal_group::verify(Ok(&owned), &first, &[leader]).is_err());
+            assert!(
+                terminal_group::verify(Ok(&owned), &first, &[leader, child, descendant(42)])
+                    .is_err()
+            );
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn metadata_retry_recovers_node_checksum_without_skipping_integrity() -> Result<()> {
