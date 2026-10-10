@@ -23,6 +23,7 @@ static int (*busy_timeout)(sqlite3 *, int);
 static int (*close_db)(sqlite3 *);
 static const char *(*version)(void);
 static const char *(*source_id)(void);
+static const char *(*error_message)(sqlite3 *);
 static atomic_int stopped, worker_error;
 static atomic_long committed;
 static sqlite3 *writer;
@@ -41,9 +42,14 @@ static void sql(sqlite3 *db, const char *query) {
 }
 static long count(sqlite3 *db, const char *query) {
   sqlite3_stmt *s = 0;
-  if (prepare(db, query, -1, &s, 0) != SQLITE_OK)
+  int rc = prepare(db, query, -1, &s, 0);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "query_prepare rc=%d message=%s\n", rc, error_message(db));
     return -1;
-  int rc = step(s);
+  }
+  rc = step(s);
+  if (rc != SQLITE_ROW)
+    fprintf(stderr, "query_step rc=%d message=%s\n", rc, error_message(db));
   long value = rc == SQLITE_ROW ? (long)integer(s, 0) : -1;
   finalize(s);
   return value;
@@ -86,6 +92,7 @@ int main(int argc, char **argv) {
   LOAD(close_db, "sqlite3_close");
   LOAD(version, "sqlite3_libversion");
   LOAD(source_id, "sqlite3_sourceid");
+  LOAD(error_message, "sqlite3_errmsg");
   printf("sqlite_version=%s\nsource_id=%s\n", version(), source_id());
   sqlite3 *reader = 0, *helper = 0;
   require(open_db(argv[2], &reader) == SQLITE_OK, "open reader");
