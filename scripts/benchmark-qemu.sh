@@ -133,7 +133,7 @@ pins_for() {
   firmware=bios
   ssh_service=sshd
   qemu_bin=qemu-system-x86_64
-  qemu_machine=q35
+  qemu_machine=q35,sata=off
   qemu_pkg=qemu-system-x86
   firmware_pkg=ovmf
   firmware_code=/usr/share/OVMF/OVMF_CODE_4M.fd

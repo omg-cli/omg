@@ -10,6 +10,22 @@ BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
 
 
 class QemuProcessIsolationTests(unittest.TestCase):
+    def test_machine_selection_disables_unused_x86_sata_without_changing_arm(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        function = 'pins_for() {' + source.split('pins_for() {', 1)[1].split('\n# Lifecycle case ids', 1)[0]
+        for distro, arch in [('arch', 'x86_64'), ('debian', 'x86_64'),
+                             ('debian-trixie', 'x86_64'), ('ubuntu', 'x86_64'),
+                             ('fedora', 'x86_64'), ('debian', 'aarch64'),
+                             ('ubuntu', 'aarch64'), ('fedora', 'aarch64')]:
+            with self.subTest(distro=distro, arch=arch):
+                command = ('set -euo pipefail\ncontroller_image_x86_64=x86\n'
+                           'controller_image_aarch64=arm\n' + function
+                           + '\npins_for "$1" "$2"\nprintf "%s\\n" "$qemu_machine"\n')
+                result = subprocess.run([BASH, '-c', command, 'machine-selection', distro, arch],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), 'q35,sata=off' if arch == 'x86_64' else 'virt')
+
     def test_launch_uses_supported_privilege_drop_without_root_fallback(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         self.assertIn('-run-with user=65534:65534', source)
