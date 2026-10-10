@@ -214,7 +214,27 @@ impl UsageStats {
     }
 
     fn load_from(path: &std::path::Path) -> Result<Self> {
-        let content = match std::fs::read_to_string(path) {
+        let read = || -> std::io::Result<String> {
+            use std::io::Read as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.custom_flags(nix::libc::O_NONBLOCK);
+            }
+            let mut file = options.open(path)?;
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "usage storage must be a regular file",
+                ));
+            }
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            Ok(content)
+        };
+        let content = match read() {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
@@ -766,6 +786,87 @@ pub async fn sync_usage_now() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stats_refuses_usage_fifo_without_waiting() -> Result<()> {
+        const NAME: &str = "core::usage::tests::stats_refuses_usage_fifo_without_waiting";
+        const CHILD: &str = "OMG_USAGE_FIFO_CONTRACT_CHILD";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        anyhow::ensure!(!crate::core::is_root(), "fixture must run as ordinary user");
+        if std::env::var(CHILD).as_deref() == Ok(NAME) {
+            let error = crate::cli::commands::stats(true)
+                .expect_err("stats must reject a usage FIFO without waiting for a writer");
+            anyhow::ensure!(format!("{error:#}").contains("regular file"), "{error:#}");
+            println!("USAGE_FIFO_CONTRACT_COMPLETED {NAME}");
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        nix::unistd::mkfifo(
+            &directory.path().join("usage.json"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, NAME)
+            .env("OMG_DATA_DIR", directory.path())
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .current_dir(directory.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let timed_out = loop {
+            if child.try_wait()?.is_some() {
+                break false;
+            }
+            if std::time::Instant::now() >= deadline {
+                break true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        if timed_out {
+            child.kill()?;
+        }
+        let output = child.wait_with_output()?;
+        anyhow::ensure!(
+            !timed_out,
+            "stats blocked on private usage FIFO; isolated child killed and reaped"
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "usage child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(
+            stdout.contains(&format!("USAGE_FIFO_CONTRACT_COMPLETED {NAME}"))
+                && stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "usage child did not execute: {stdout}"
+        );
+        println!("{stdout}");
+        directory.close()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_regular_symlink_read_retains_compatibility() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("regular.json");
+        let stats = UsageStats {
+            total_commands: 7,
+            ..UsageStats::default()
+        };
+        std::fs::write(&target, serde_json::to_vec(&stats)?)?;
+        let path = directory.path().join("usage.json");
+        std::os::unix::fs::symlink("regular.json", &path)?;
+        assert_eq!(UsageStats::load_from(&path)?.total_commands, 7);
+        directory.close()?;
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires isolated user/mount namespaces with the state fixture mounted at /var/lib"]
