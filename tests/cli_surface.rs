@@ -8,6 +8,63 @@ use clap::{Arg, ArgAction, ArgGroup, Command, CommandFactory, Parser, error::Err
 use omg_lib::cli::{Cli, Commands};
 use serde_json::{Value, json};
 
+#[test]
+fn status_failure_keeps_error_for_reporter_without_rendering_it() {
+    use omg_lib::cli::tea::{Cmd, Model, StatusModel, StatusMsg, View};
+
+    let mut model = StatusModel::new();
+    let cause = "private-status-failure-sentinel";
+    let command = model.update(StatusMsg::Error(cause.to_string()));
+    assert_eq!(model.error.as_deref(), Some(cause));
+    let Cmd::View(View::Error(message)) = command else {
+        panic!("status failure must propagate its error to the process reporter");
+    };
+    assert_eq!(message, format!("Status check failed: {cause}"));
+    assert!(
+        model.view().trim().is_empty(),
+        "status must leave failure output to the process reporter"
+    );
+}
+
+#[test]
+fn status_reports_malformed_private_state_once_and_preserves_bytes() -> anyhow::Result<()> {
+    let project = common::TestProject::for_distro("fedora");
+    let path = project.data_dir.path().join("mock_state_dnf.json");
+    let valid = serde_json::to_vec(&json!({
+        "installed": {"git": "2.43.0"},
+        "available": {"git": "2.43.0"}
+    }))?;
+    std::fs::write(&path, &valid)?;
+    let control = project.run_with_env(&["status"], &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "10")]);
+    assert!(control.success, "{}", control.combined_output());
+    assert_eq!(control.exit_code, 0);
+    assert!(control.stdout.contains("1 packages installed"));
+    assert!(control.stderr.is_empty(), "{:?}", control.stderr);
+    assert_eq!(std::fs::read(&path)?, valid);
+
+    let malformed = b"invalid private status fixture json\n";
+    std::fs::write(&path, malformed)?;
+    let failed = project.run_with_env(&["status"], &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "10")]);
+    assert_eq!(std::fs::read(&path)?, malformed);
+    project.close_checked();
+    assert!(!failed.success);
+    assert_eq!(failed.exit_code, 1, "{}", failed.combined_output());
+    let cause = "failed to parse mock state";
+    assert!(failed.stderr.contains("Status check failed"));
+    assert_eq!(
+        failed.stderr.matches(cause).count(),
+        1,
+        "{:?}",
+        failed.stderr
+    );
+    assert!(
+        !failed.stdout.contains("Status failed") && !failed.stdout.contains(cause),
+        "status rendered a second failure: {:?}",
+        failed.stdout
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 fn run_team_hook_fixture(
     project: &common::TestProject,
