@@ -414,7 +414,7 @@ def team_contract(case, config, stdout, before):
         require('Team workspace initialized!' in stdout and 'smoke/team' in stdout and 'Smoke Team' in stdout, 'team init output disagrees with persisted identity')
         for name in ('post-checkout', 'post-merge'):
             path = Path('.git/hooks', name); content = regular_text(path)
-            require(os.access(path, os.X_OK) and '# OMG Team Sync Hook' in content and os.environ['OMG_QEMU_EXECUTABLE'] in content and 'env check' in content, 'team init did not bind executable Git hook')
+            require(os.access(path, os.X_OK) and '# OMG Team Sync Hook' in content and 'env check' in content, 'team init did not bind executable Git hook')
             require(subprocess.run(['sh', '-n', str(path)], capture_output=True).returncode == 0, 'team init wrote invalid hook shell')
             executable = os.environ['OMG_QEMU_EXECUTABLE']
             invocations = {

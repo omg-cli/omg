@@ -1323,6 +1323,63 @@ elif case=='init':
                 self.assertEqual([item['result'] for item in evidence], [expected], f'{result.stdout}\n{result.stderr}\n{logs}')
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_team_hook_literal_quote_preserves_apostrophe_path(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('team-init\t'))
+        product = self.local_fixture_product() + r"""python3 - <<'PY'
+import os,pathlib
+exe=os.environ['OMG_QEMU_EXECUTABLE']
+quote=chr(39)+exe.replace(chr(39),chr(39)+chr(92)+chr(39)+chr(39))+chr(39)
+for name in ('post-checkout','post-merge'):
+    path=pathlib.Path('.git/hooks')/name
+    path.write_text(path.read_text().replace(chr(34)+exe+chr(34),quote))
+PY
+"""
+        for binary_name in ('product path', "product's path"):
+            with self.subTest(binary_name=binary_name):
+                result, evidence, logs = self.run_inventory(
+                    self.local_fixture_with_workspace(product), [row], binary_name=binary_name)
+                self.assertEqual([item['result'] for item in evidence], ['PASS'], str(logs))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_team_hook_quoting_preserves_active_binding_guard_and_arguments(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('team-init\t'))
+        refusals = {
+            'comment-only': 'team hook executable binding exists only in comments or invokes another binary',
+            'wrong-binary': 'team hook executable binding exists only in comments or invokes another binary',
+            'duplicate': 'team hook executable binding exists only in comments or invokes another binary',
+            'extra-argument': 'team hook did not execute guarded env check',
+            'missing-guard': 'team hook runs without its guarded lock',
+            'invalid-shell': 'team init wrote invalid hook shell',
+        }
+        for mutation, refusal in refusals.items():
+            product = self.local_fixture_product() + r"""python3 - <<'PY'
+import os,pathlib
+exe=os.environ['OMG_QEMU_EXECUTABLE']
+invocation=chr(34)+exe+chr(34)+' env check'
+mutation='MUTATION'
+for name in ('post-checkout','post-merge'):
+    path=pathlib.Path('.git/hooks')/name
+    content=path.read_text()
+    if mutation=='comment-only': content=content.replace('  '+invocation,'  :\n  # '+invocation)
+    elif mutation=='wrong-binary': content=content.replace(invocation,chr(34)+exe+'-wrong'+chr(34)+' env check')+'\n# '+invocation+'\n'
+    elif mutation=='duplicate': content=content.replace('  '+invocation, '  '+invocation+' 2>/dev/null || true\n  '+invocation)
+    elif mutation=='extra-argument': content=content.replace(invocation,invocation+' unexpected')
+    elif mutation=='missing-guard': content=content.replace('if [ -f omg.lock ]; then\n','').replace('fi\n','')
+    elif mutation=='invalid-shell': content+='if\n'
+    path.write_text(content)
+PY
+""".replace('MUTATION', mutation)
+            with self.subTest(mutation=mutation):
+                result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(product), [row])
+                self.assertEqual([item['result'] for item in evidence], ['FAIL'], str(logs))
+                self.assertEqual(evidence[0]['exit_code'], 0, str(logs))
+                self.assertRegex(logs['team-init.stdout.log'], r'(?m)^OMG_QEMU_RECEIPT:product:0:[0-9]+$')
+                self.assertNotIn('SyntaxError', logs['team-init.stderr.log'])
+                self.assertIn(refusal, logs['team-init.stderr.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_team_init_accepts_single_quoted_pinned_executable(self):
         product = self.local_fixture_product() + """python3 - <<'PY'
 import os,pathlib
