@@ -6366,6 +6366,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_probe_rejects_a_live_owned_child() -> Result<()> {
+        let child = std::process::Command::new("/usr/bin/sleep")
+            .arg("30")
+            .spawn()?;
+        let mut child = scopeguard::guard(child, |mut child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
+        let error = reap_native_probe_child(pid, Duration::from_millis(100))
+            .await
+            .expect_err("a live owned child must not be certified as reaped");
+        assert!(format!("{error:#}").contains("remains present or unreaped"));
+        assert!(child.try_wait()?.is_none(), "the child must still be alive");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_probe_rejects_echild_while_pid_still_exists() {
         let error = reap_native_probe_child(nix::unistd::getpid(), Duration::from_millis(100))
             .await
