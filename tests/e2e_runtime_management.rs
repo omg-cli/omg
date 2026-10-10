@@ -1082,9 +1082,10 @@ fn test_hook_fish_generates_script() {
     let result = run_omg(&["hook", "fish"]);
 
     result.assert_success();
-    // Fish uses function definitions with event handlers, not eval hooks.
+    // Fish registers the hook for directory changes and interactive prompts.
     result.assert_stdout_contains("function _omg_hook");
-    result.assert_stdout_contains("set -gx PATH $_OMG_PATH_BASE");
+    result.assert_stdout_contains("--on-variable PWD");
+    result.assert_stdout_contains("--on-event fish_prompt");
 }
 
 #[test]
