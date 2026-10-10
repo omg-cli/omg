@@ -11,6 +11,54 @@ BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
 
 
 class QemuProcessIsolationTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'production nohup launch requires POSIX executable paths')
+    def test_launch_disables_legacy_vapic_only_for_x86_and_preserves_guest_devices(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        launch = 'firmware=()' + source.split('firmware=()', 1)[1].split('\n# Launch from the controller', 1)[0]
+        for machine in ('q35', 'q35,sata=off', 'virt'):
+            for firmware in ('bios', 'uefi'):
+                with self.subTest(machine=machine, firmware=firmware), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    recorder = root / 'record-qemu'
+                    recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARG_FILE"\n')
+                    recorder.chmod(0o755)
+                    (root / 'vars.fd').write_bytes(b'firmware-fixture')
+                    script = ('set -euo pipefail\ninitial=false\nvm_vars=vars.fd\n'
+                              'vm_disk=disk.qcow2\nvm_serial=serial.log\n' + launch + '\nwait\n')
+                    result = subprocess.run(
+                        [BASH, '-c', script, 'launch', firmware, 'sshd', 'code.fd', 'vars.fd',
+                         str(recorder), machine, 'kvm', 'host'], cwd=root,
+                        env={**os.environ, 'ARG_FILE': str(root / 'arguments')},
+                        capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    arguments = (root / 'arguments').read_text().splitlines()
+                    self.assertEqual(arguments.count('apic-common.vapic=false'), 0 if machine == 'virt' else 1)
+                    if machine != 'virt':
+                        self.assertEqual(arguments[arguments.index('-global') + 1], 'apic-common.vapic=false')
+                    else:
+                        self.assertNotIn('-global', arguments)
+                    for retained in ('user=65534:65534', 'on,obsolete=deny,spawn=deny,resourcecontrol=deny',
+                                     'file:serial.log', 'file=disk.qcow2,if=virtio,format=qcow2',
+                                     'file=seed.img,if=virtio,format=raw', 'virtio-net-pci,netdev=n,romfile='):
+                        self.assertIn(retained, arguments)
+                    self.assertEqual('if=pflash,format=raw,file=vars.fd' in arguments, firmware == 'uefi')
+
+    def test_machine_selection_disables_unused_x86_sata_without_changing_arm(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        function = 'pins_for() {' + source.split('pins_for() {', 1)[1].split('\n# Lifecycle case ids', 1)[0]
+        for distro, arch in [('arch', 'x86_64'), ('debian', 'x86_64'),
+                             ('debian-trixie', 'x86_64'), ('ubuntu', 'x86_64'),
+                             ('fedora', 'x86_64'), ('debian', 'aarch64'),
+                             ('ubuntu', 'aarch64'), ('fedora', 'aarch64')]:
+            with self.subTest(distro=distro, arch=arch):
+                command = ('set -euo pipefail\ncontroller_image_x86_64=x86\n'
+                           'controller_image_aarch64=arm\n' + function
+                           + '\npins_for "$1" "$2"\nprintf "%s\\n" "$qemu_machine"\n')
+                result = subprocess.run([BASH, '-c', command, 'machine-selection', distro, arch],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), 'q35,sata=off' if arch == 'x86_64' else 'virt')
+
     @unittest.skipIf(os.name == 'nt', 'launch fixture requires POSIX executable scripts')
     def test_headless_launch_disables_vga_and_preserves_serial_and_network(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
