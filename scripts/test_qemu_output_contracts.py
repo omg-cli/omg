@@ -415,6 +415,44 @@ class OutputContracts(unittest.TestCase):
                 self.assertIn('identity=' + native_name, logs['info.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
+    def test_fedora_info_uses_native_dnf5_field_and_record_separators(self):
+        row = 'info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tinfo-native-package\ttempdir-drop'
+        cases = (
+            ('native identity', [('pacman', 'x86_64', '7.0.0-6.fc44')], 'PASS'),
+            ('noarch identity', [('pacman', 'noarch', '7.0.0-6.fc44')], 'PASS'),
+            ('duplicate identity', [('pacman', 'x86_64', '7.0.0-6.fc44')] * 2, 'BLOCKED'),
+            ('multiple architectures', [('pacman', 'x86_64', '7.0.0-6.fc44'), ('pacman', 'i686', '7.0.0-6.fc44')], 'BLOCKED'),
+            ('invalid EVR', [('pacman', 'x86_64', 'unknown')], 'BLOCKED'),
+        )
+        for label, records, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                observed = Path(directory) / 'native-argv.json'
+                native = self.receiver_native()
+                # Native DNF5 preserves literal backslash-t, expands backslash-n,
+                # and does not append a newline. This fixture records the real
+                # receiver argv and renders external records, not its parser.
+                native['dnf'] = (
+                    'exec /usr/bin/python3 - ' + shlex.quote(str(observed)) + ' "$@" <<\'PY\'\n'
+                    'import json, sys\nfrom pathlib import Path\n'
+                    'argv = sys.argv[2:]\n'
+                    'Path(sys.argv[1]).write_text(json.dumps(argv))\n'
+                    'assert len(argv) == 6 and argv[:5] == ["--cacheonly", "repoquery", "pacman", "--latest-limit=1", "--queryformat"]\n'
+                    'records = ' + repr(records) + '\n'
+                    'for name, arch, evr in records:\n'
+                    '    rendered = argv[5].replace("%{name}", name).replace("%{arch}", arch).replace("%{evr}", evr)\n'
+                    '    sys.stdout.write(rendered.replace(r"\\n", "\\n"))\nPY\n'
+                )
+                shown = 'pacman.noarch' if label == 'noarch identity' else 'pacman.x86_64'
+                result, evidence, logs = self.run_inventory(
+                    'printf %s ' + shlex.quote(self.receiver_info_output(shown)) + '\n',
+                    [row], distro='fedora', native_commands=native)
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1, logs)
+                argv = json.loads(observed.read_text())
+                self.assertEqual(argv[:5], ['--cacheonly', 'repoquery', 'pacman', '--latest-limit=1', '--queryformat'])
+                self.assertEqual(argv[5].encode('ascii'), b'%{name}.%{arch}\t%{evr}\n')
+
+    @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
     def test_fedora_info_refuses_wrong_identity_evr_source_and_nonunique_fields(self):
         row = 'info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tinfo-native-package\ttempdir-drop'
         good = self.receiver_info_output()
@@ -500,7 +538,7 @@ class OutputContracts(unittest.TestCase):
                     self.assertEqual(evidence[0]['result'], expected, logs)
                     self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1, logs)
 
-    INFO_QUERY_FORMAT = r'%{name}.%{arch}\t%{evr}'  # Migrated to identity+EVR only after original-name RED.
+    INFO_QUERY_FORMAT = '%{name}.%{arch}\t%{evr}\n'
 
     @staticmethod
     def receiver_native(reference='pacman.x86_64\t7.0.0-6.fc44\n', metadata='compatible archs : x86_64 noarch i686\n', *, rpm_status=0, dnf_status=0):

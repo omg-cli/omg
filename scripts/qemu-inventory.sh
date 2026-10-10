@@ -517,7 +517,7 @@ check_info_native_package() {
       source='Official repository (apt)' ;;
     fedora)
       rpm_arches=$(rpm_compatible_arches) || { printf 'native info RPM architecture compatibility unavailable\n' >&2; return 2; }
-      timeout --kill-after=2s 30 dnf --cacheonly repoquery pacman --latest-limit=1 --queryformat '%{name}.%{arch}\t%{evr}' > native-info.raw 2> native-info.stderr || status=$?
+      timeout --kill-after=2s 30 dnf --cacheonly repoquery pacman --latest-limit=1 --queryformat $'%{name}.%{arch}\t%{evr}\n' > native-info.raw 2> native-info.stderr || status=$?
       if [[ "$status" == 0 ]]; then
         native_reference=$(awk -F '\t' -v arches="$rpm_arches" '
           BEGIN { count=split(arches, values, /[[:space:]]+/); for (i=1; i<=count; i++) supported[values[i]]=1 }
