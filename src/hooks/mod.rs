@@ -682,7 +682,7 @@ fn validated_runtime_bin_dir(data_dir: &Path, runtime: &str, version: &str) -> O
 
 /// Render `value` as a POSIX single-quoted shell word (`'` becomes `'\''`),
 /// so no `$`, backtick, or double-quote inside can alter the emitted command.
-fn posix_single_quoted(value: &str) -> String {
+pub(crate) fn posix_single_quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 

@@ -8,6 +8,138 @@ use clap::{Arg, ArgAction, ArgGroup, Command, CommandFactory, Parser, error::Err
 use omg_lib::cli::{Cli, Commands};
 use serde_json::{Value, json};
 
+#[cfg(unix)]
+fn run_team_hook_fixture(
+    project: &common::TestProject,
+    program: &std::path::Path,
+    args: &[&str],
+) -> anyhow::Result<std::process::Output> {
+    use std::os::unix::process::CommandExt as _;
+    use std::time::{Duration, Instant};
+    let stdout = tempfile::tempfile()?;
+    let stderr = tempfile::tempfile()?;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .current_dir(project.path())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", project.home_dir.path())
+        .env("XDG_DATA_HOME", project.data_dir.path())
+        .env("XDG_CONFIG_HOME", project.config_dir.path())
+        .env("OMG_DATA_DIR", project.data_dir.path())
+        .env("OMG_CONFIG_DIR", project.config_dir.path())
+        .env("OMG_TEST_MODE", "1")
+        .env("OMG_DISABLE_TELEMETRY", "1")
+        .env("OMG_DISABLE_DAEMON", "1")
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .process_group(0)
+        .spawn()?;
+    let group = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if start.elapsed() >= Duration::from_secs(10) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => return Err(error.into()),
+    }
+    child.wait()?;
+    let status = status.ok_or_else(|| anyhow::anyhow!("team hook fixture timed out"))?;
+    use std::io::{Read as _, Seek as _};
+    let read_output = |mut file: std::fs::File| -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            file.metadata()?.len() <= 262_144,
+            "fixture output too large"
+        );
+        file.rewind()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: read_output(stdout)?,
+        stderr: read_output(stderr)?,
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn team_hooks_execute_the_pinned_cli_with_literal_path_bytes() -> anyhow::Result<()> {
+    let source = common::fixture_cli_path();
+    let hash = common::fixture_program_hash(&source);
+    for name in [
+        "omg-normal",
+        "omg space'apostrophe",
+        "omg$(touch hook-marker)",
+        "omg`touch hook-marker`",
+        "omg\";touch hook-marker;#",
+    ] {
+        let project = common::TestProject::new();
+        let copied = project.path().join(name);
+        std::fs::copy(&source, &copied)?;
+        assert_eq!(common::fixture_program_hash(&copied), hash);
+        std::fs::create_dir_all(project.path().join(".git/hooks"))?;
+        let init = run_team_hook_fixture(&project, &copied, &["team", "init", "fixture-team"])?;
+        assert!(init.status.success(), "{name}: {init:?}");
+        let lock = project.path().join("omg.lock");
+        let lock_bytes = b"deliberately invalid fixture lock\n";
+        std::fs::write(&lock, lock_bytes)?;
+        let direct = run_team_hook_fixture(&project, &copied, &["env", "check"])?;
+        assert!(!direct.status.success(), "invalid lock must fail");
+        let direct_stdout = String::from_utf8(direct.stdout)?;
+        assert!(direct_stdout.contains("Checking for environment drift"));
+        for hook in ["post-merge", "post-checkout"] {
+            let hook_path = project.path().join(".git/hooks").join(hook);
+            let before = std::fs::read(&hook_path)?;
+            let output = run_team_hook_fixture(
+                &project,
+                std::path::Path::new("/bin/sh"),
+                &[hook_path.to_str().unwrap()],
+            )?;
+            assert!(output.status.success(), "{name}/{hook}: {output:?}");
+            assert!(
+                !project.path().join("hook-marker").exists(),
+                "{name}/{hook} evaluated executable path bytes"
+            );
+            let stdout = String::from_utf8(output.stdout)?;
+            assert!(stdout.contains(&direct_stdout), "{name}/{hook}: {stdout:?}");
+            assert_eq!(std::fs::read(&hook_path)?, before);
+            assert_eq!(std::fs::read(&lock)?, lock_bytes);
+        }
+        project.close_checked();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn team_initialization_preserves_existing_git_hooks() -> anyhow::Result<()> {
+    let project = common::TestProject::new();
+    let hooks = project.path().join(".git/hooks");
+    std::fs::create_dir_all(&hooks)?;
+    let sentinel = b"#!/bin/sh\nprintf 'existing private automation\\n'\n";
+    for name in ["post-merge", "post-checkout"] {
+        std::fs::write(hooks.join(name), sentinel)?;
+    }
+    let result = project.run(&["team", "init", "fixture-team"]);
+    assert!(result.success, "{}", result.combined_output());
+    for name in ["post-merge", "post-checkout"] {
+        assert_eq!(std::fs::read(hooks.join(name))?, sentinel);
+    }
+    project.close_checked();
+    Ok(())
+}
+
 #[cfg(feature = "license")]
 fn account_expiry_output_fixture(expiry: &str) -> anyhow::Result<String> {
     let project = common::TestProject::new();
