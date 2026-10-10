@@ -329,7 +329,15 @@ def runtime_contract(case, data, stdout):
         probe = subprocess.run(['bash', '-c', 'source "$1"; printf "%s\\n%s" "$PATH" "${QEMU_MUST_NOT_AUTO_APPLY-unset}"', '_', 'command.stdout.log'],
                                env=dict(os.environ, PATH='/usr/bin:/bin', _OMG_PATH_BASE='/usr/bin:/bin'), capture_output=True, text=True, timeout=5)
         require(probe.returncode == 0 and probe.stdout == selected + ':/usr/bin:/bin\nunset', 'hook-env did not select confined PATH or applied project environment')
-        require(stdout.strip() == 'export PATH=' + shlex.quote(selected) + ':"${_OMG_PATH_BASE:-$PATH}"' or stdout.strip() == "export PATH='" + selected + "':\"${_OMG_PATH_BASE:-$PATH}\"", 'hook-env emitted unexpected shell operations')
+        quotes = {shlex.quote(selected), "'" + selected.replace("'", "'\\''") + "'"}
+        exports = {'export PATH=' + quoted + ':"${_OMG_PATH_BASE:-$PATH}"' for quoted in quotes}
+        exports.update('\n'.join([
+            '_OMG_PATH_ADDITIONS=(' + quoted + ')',
+            '_omg_base=${_OMG_PATH_BASE-$PATH}',
+            'export PATH="${_OMG_PATH_PREFIX:+${_OMG_PATH_PREFIX}:}"' + quoted + '"${_omg_base:+:${_omg_base}}"',
+            'unset _omg_base',
+        ]) for quoted in quotes)
+        require(stdout.strip() in exports, 'hook-env emitted unexpected shell operations')
     elif case == 'list':
         entries = re.findall(r'\b(node|python) ([\d.]+)([^\n]*)', stdout)
         require({(name, version): '(active)' in rest for name, version, rest in entries} == {('node', '24.21.0'): True, ('node', '22.16.0'): False, ('python', '3.12.14'): True} and len(entries) == 3, 'installed list disagrees with fixture versions/active state')
@@ -385,9 +393,16 @@ def team_contract(case, config, stdout, before):
             path = Path('.git/hooks', name); content = regular_text(path)
             require(os.access(path, os.X_OK) and '# OMG Team Sync Hook' in content and os.environ['OMG_QEMU_EXECUTABLE'] in content and 'env check' in content, 'team init did not bind executable Git hook')
             require(subprocess.run(['sh', '-n', str(path)], capture_output=True).returncode == 0, 'team init wrote invalid hook shell')
-            invocation = '"' + os.environ['OMG_QEMU_EXECUTABLE'] + '" env check'
+            executable = os.environ['OMG_QEMU_EXECUTABLE']
+            invocations = {
+                '"' + executable + '" env check',
+                shlex.quote(executable) + ' env check',
+                "'" + executable.replace("'", "'\\''") + "' env check",
+            }
             active = [line.strip() for line in content.splitlines() if not line.lstrip().startswith('#')]
-            require(sum(line.startswith(invocation + ' ') for line in active) == 1, 'team hook executable binding exists only in comments or invokes another binary')
+            bindings = [invocation for invocation in invocations for line in active if line.startswith(invocation + ' ')]
+            require(len(bindings) == 1, 'team hook executable binding exists only in comments or invokes another binary')
+            invocation = bindings[0]
             probe = Path('.qemu-team-hook-probe.sh').absolute()
             write(probe, '#!/bin/sh\nprintf "%s\\n" "$@" > .qemu-team-hook-called\n', 0o755)
             copied = Path('.qemu-team-hook-copy.sh')

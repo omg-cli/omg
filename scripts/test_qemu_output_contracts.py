@@ -1262,6 +1262,45 @@ elif case=='init':
 ''' + '\nPY\n'
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_hook_env_accepts_confined_path_with_tracked_additions(self):
+        product = self.local_fixture_product()
+        old = next(line for line in product.splitlines() if "elif case=='hook-env': print(" in line)
+        replacement = """    elif case=='hook-env':
+        selected=str(data/'versions/node'/version/'bin')
+        quote=lambda value: "'"+value.replace("'", "'\\\\''")+"'"
+        print('_OMG_PATH_ADDITIONS=('+quote(selected)+')')
+        print('_omg_base=${_OMG_PATH_BASE-$PATH}')
+        print('export PATH="${_OMG_PATH_PREFIX:+${_OMG_PATH_PREFIX}:}"'+quote(selected)+'"${_omg_base:+:${_omg_base}}"')
+        print('unset _omg_base')"""
+        product = product.replace(old, replacement)
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('hook-env\t'))
+        producers = (
+            (product, 'PASS'),
+            (product.replace("mutant = 'none'", "mutant = 'version'"), 'FAIL'),
+            (product.replace("print('unset _omg_base')", "print('unset _omg_base'); print('true')"), 'FAIL'),
+        )
+        for producer, expected in producers:
+            with self.subTest(expected=expected, producer=producer):
+                result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(producer), [row])
+                self.assertEqual([item['result'] for item in evidence], [expected], f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_team_init_accepts_single_quoted_pinned_executable(self):
+        product = self.local_fixture_product() + """python3 - <<'PY'
+import os,pathlib
+for name in ('post-checkout','post-merge'):
+    path=pathlib.Path('.git/hooks')/name
+    executable=os.environ['OMG_QEMU_EXECUTABLE']
+    path.write_text(path.read_text().replace(chr(34)+executable+chr(34),chr(39)+executable+chr(39)))
+PY
+"""
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('team-init\t'))
+        result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(product), [row])
+        self.assertEqual([item['result'] for item in evidence], ['PASS'], f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_local_family_contracts_accept_matching_output_and_state(self):
         rows = []
         for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()[1:]:
