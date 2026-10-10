@@ -32,6 +32,20 @@ TRANSACTION_PRIVATE = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_hyperfine_raw_exports_stay_at_benchmark_roots(self):
+        roots = (("run-test", "guest", "evidence", "benchmarks"),
+                 ("run-test", "transactions", "trials", "install-omg-001", "transaction-trial"))
+        for prefix in roots:
+            for scenario in ("info", "search", "explicit", "status", "install", "remove", "update"):
+                name = scenario + ".raw.json"
+                with self.subTest(prefix=prefix, name=name):
+                    self.assertTrue(exporter.allowed_file((*prefix, name)))
+                    for neighbor in (("cache", name), ("config", name), (name + ".bak",),
+                                     (scenario + ".raw.md",), (scenario + ".commands.raw.json",)):
+                        self.assertFalse(exporter.allowed_file((*prefix, *neighbor)))
+        self.assertFalse(exporter.allowed_file(("run-test", "guest", "evidence", "info.raw.json")))
+        self.assertFalse(exporter.allowed_file((*roots[0], "credentials.raw.json")))
+
     def test_apt_abi_exports_only_its_bound_guest_receipt_and_raw_inputs(self):
         prefix = ('run-test', 'guest', 'evidence', 'apt-abi')
         for name in ('receipt.json', 'os-release', 'omg-loader.log', 'omgd-loader.log'):
@@ -245,6 +259,27 @@ class DescriptorTests(unittest.TestCase):
         status = exporter.export(str(self.source), str(self.destination), os.getuid(), os.getgid(), **limits)
         report = json.loads((self.destination / "export-report.json").read_text())
         return status, report
+
+    def test_hyperfine_raw_exports_copy_byte_for_byte_without_private_neighbors(self):
+        prefixes = ("run-test/guest/evidence/benchmarks/",
+                    "run-test/transactions/trials/install-omg-001/transaction-trial/")
+        content = b'{\n  "schema_version": 2, "results": []\n}\n'
+        expected = []
+        excluded = []
+        for prefix in prefixes:
+            expected.append(prefix + "info.raw.json")
+            self.fixture(expected[-1], content)
+            for neighbor in ("cache/info.raw.json", "config/info.raw.json", "info.raw.json.bak",
+                             "info.raw.md", "info.commands.raw.json", "credentials.raw.json"):
+                excluded.append(prefix + neighbor)
+                self.fixture(excluded[-1], b"private-neighbor")
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(set(report["copied"]), set(expected))
+        for name in expected:
+            self.assertEqual((self.destination / name).read_bytes(), content)
+        for name in excluded:
+            self.assertFalse((self.destination / name).exists())
 
     def test_private_state_is_never_opened_and_results_remain_readable(self):
         self.fixture("run-test/results.json", b"[]")

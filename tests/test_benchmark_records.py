@@ -309,7 +309,7 @@ class BenchmarkAdmissionTests(unittest.TestCase):
     def test_guest_mode_refuses_implicit_source_build(self) -> None:
         tools = self.source / "tools"
         tools.mkdir()
-        for name in ("dirname", "mkdir"):
+        for name in ("dirname", "mkdir", "jq"):
             executable = shutil.which(name)
             if executable is None:
                 raise RuntimeError(f"Missing fixture prerequisite: {name}")
@@ -354,6 +354,7 @@ class BenchmarkAdmissionTests(unittest.TestCase):
             "tr",
             "python3",
             "tail",
+            "jq",
         ):
             executable = shutil.which(name)
             if executable is None:
@@ -362,7 +363,7 @@ class BenchmarkAdmissionTests(unittest.TestCase):
         stubs = {
             "omg": '#!/bin/bash\ncase "$1" in ec) echo 1;; *) echo firefox;; esac\n',
             "omgd": "#!/bin/bash\nexec /usr/bin/sleep 60\n",
-            "hyperfine": "#!/bin/bash\nexit 0\n",
+            "hyperfine": '#!/bin/bash\nwhile [[ $# -gt 0 ]]; do\n  if [[ $1 == --export-json ]]; then printf \'{"results":[]}\\n\' > "$2"; break; fi\n  shift\ndone\n',
         }
         for name, content in stubs.items():
             path = tools / name
@@ -876,6 +877,125 @@ class TrixieBenchmarkIdentityTests(unittest.TestCase):
             "search": ["OMG", "apt-cache", "apt"],
             "explicit": ["OMG", "apt-mark"],
         })
+
+
+class HyperfineExportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory(prefix="hyperfine-export-")
+        self.addCleanup(self.directory.cleanup)
+        self.output = Path(self.directory.name)
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "benchmark-hyperfine.sh").read_text()
+        self.definition = "run_hyperfine() {" + script.split("run_hyperfine() {", 1)[1].split("\ncommand_json()", 1)[0]
+        self.recorder = load_recorder()
+
+    def fixture(self, count: int = 2) -> dict:
+        summary = {
+            "unit": "second", "count": count, "mean": 0.2,
+            "median": 0.2, "min": 0.2, "max": 0.2,
+            "stddev": 0.0 if count > 1 else None,
+        }
+        return {
+            "schema_version": 2, "primary_metric": "time_wall_clock",
+            "results": [{
+                "name": "OMG", "command": "/tmp/omg info tree",
+                "measurements": [{
+                    "time_wall_clock": {"value": 0.2, "unit": "second"},
+                    "time_user": {"value": 0.01, "unit": "second"},
+                    "time_system": {"value": 0.02, "unit": "second"},
+                    "exit_code": 0,
+                } for _ in range(count)],
+                "summary": {
+                    "time_wall_clock": summary,
+                    "time_user": {**summary, "mean": 0.01},
+                    "time_system": {**summary, "mean": 0.02},
+                },
+            }],
+        }
+
+    def export(self, payload: dict, producer_exit: int = 0) -> subprocess.CompletedProcess[str]:
+        fixture = self.output / "input.json"
+        fixture.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        producer = '''
+hyperfine() {
+    while [[ $# -gt 0 ]]; do
+        if [[ $1 == --export-json ]]; then cp -- "$FIXTURE" "$2"; break; fi
+        shift
+    done
+    return "$PRODUCER_EXIT"
+}
+'''
+        invocation = "set -euo pipefail\nWARMUP=3\nMIN_RUNS=20\nMAX_RUNS=50\n" + producer + self.definition
+        # Exercise conditional callers too: errexit is disabled inside a function
+        # invoked in an OR-list, so producer and conversion errors need propagation.
+        invocation += '\nrc=0\nrun_hyperfine search.json search.md --command-name OMG "omg info tree" || rc=$?\nexit "$rc"\n'
+        return subprocess.run(
+            ["/bin/bash", "-s"], input=invocation, cwd=self.output,
+            env={**os.environ, "FIXTURE": str(fixture), "PRODUCER_EXIT": str(producer_exit)},
+            text=True, capture_output=True, timeout=10, check=False,
+        )
+
+    def test_legacy_export_is_byte_identical(self) -> None:
+        result = self.export({"results": [measurement("OMG", 0.2)]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.output / "search.json").read_bytes(), (self.output / "input.json").read_bytes())
+        self.assertFalse((self.output / "search.raw.json").exists())
+        self.assertEqual(self.recorder.validate_results(self.output), [])
+
+    def test_v2_preserves_raw_export_labels_samples_and_statistics(self) -> None:
+        result = self.export(self.fixture())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.output / "search.raw.json").read_bytes(), (self.output / "input.json").read_bytes())
+        payload = json.loads((self.output / "search.json").read_text())
+        self.assertEqual(payload["source_schema_version"], 2)
+        self.assertEqual(payload["results"], [measurement("OMG", 0.2) | {"user": 0.01, "system": 0.02}])
+        self.assertEqual(self.recorder.validate_results(self.output), [])
+        self.assertEqual(self.recorder.summarize_scenario(payload)[0]["mean_ms"], 200.0)
+
+    def test_v2_single_sample_keeps_unknown_deviation(self) -> None:
+        result = self.export(self.fixture(count=1))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads((self.output / "search.json").read_text())
+        self.assertIsNone(payload["results"][0]["stddev"])
+        self.assertIsNone(self.recorder.summarize_scenario(payload)[0]["stddev_ms"])
+
+    def test_failed_samples_remain_failed(self) -> None:
+        payload = self.fixture()
+        payload["results"][0]["measurements"][1]["exit_code"] = 17
+        result = self.export(payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        converted = json.loads((self.output / "search.json").read_text())
+        self.assertEqual(converted["results"][0]["exit_codes"], [0, 17])
+        self.assertTrue(any("non-zero exit" in error for error in self.recorder.validate_results(self.output)))
+
+    def test_fabricated_summary_remains_rejected(self) -> None:
+        payload = self.fixture()
+        payload["results"][0]["summary"]["time_wall_clock"]["mean"] = 0.001
+        result = self.export(payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any("mean does not match" in error for error in self.recorder.validate_results(self.output)))
+
+    def test_unsupported_or_incomplete_exports_fail(self) -> None:
+        cases = [self.fixture() for _ in range(7)]
+        cases[0]["schema_version"] = 3
+        cases[1]["primary_metric"] = "time_user"
+        cases[2]["results"][0]["summary"]["time_wall_clock"]["unit"] = "millisecond"
+        cases[3]["results"][0]["summary"]["time_user"]["count"] = 1
+        cases[4]["results"][0]["measurements"][0]["time_wall_clock"]["unit"] = "millisecond"
+        cases[5]["results"][0]["name"] = ""
+        cases[6]["results"][0]["measurements"] = []
+        for payload in cases:
+            with self.subTest(payload=payload):
+                result = self.export(payload)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((self.output / "search.json").read_bytes(), (self.output / "input.json").read_bytes())
+                self.assertFalse((self.output / "search.raw.json").exists())
+
+    def test_producer_failure_retains_exact_exit_and_raw_file(self) -> None:
+        result = self.export(self.fixture(), producer_exit=77)
+        self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
+        self.assertEqual((self.output / "search.json").read_bytes(), (self.output / "input.json").read_bytes())
+        self.assertFalse((self.output / "search.raw.json").exists())
 
 
 if __name__ == "__main__":
