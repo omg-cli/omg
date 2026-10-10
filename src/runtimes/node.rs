@@ -580,6 +580,10 @@ mod tests {
         publication: bool,
         expected_error: &str,
     ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if body.contains("(/bin/sleep 30)") && run_node_descendant_test_in_child()? {
+            return Ok(());
+        }
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
             versions_dir: directory.path().to_path_buf(),
@@ -630,7 +634,7 @@ mod tests {
         assert_eq!(manager.current_version(), Some("20.0.0".to_owned()));
         assert_eq!(fs::read(previous.join("bin/node"))?, original);
         assert_eq!(fs::read(candidate.join("bin/node"))?, candidate_bytes);
-        assert_probe_dead(&candidate)?;
+        assert_probe_dead(&candidate, body.contains("(/bin/sleep 30)"))?;
         if publication {
             drop(staging);
             assert!(!candidate.exists());
@@ -698,16 +702,187 @@ mod tests {
     node_refusal_tests!(
         node_publication_rejects_pipe_holding_descendant,
         node_activation_rejects_pipe_holding_descendant,
-        "(/bin/sleep 30) & printf '%s\\n' \"$!\" > probe.pid; printf 'v22.0.0\\n'",
+        "printf '%s\\n' \"$$\" > probe-leader.pid; (/bin/sleep 30) & printf '%s\\n' \"$!\" > probe.pid; printf 'v22.0.0\\n'",
         true,
         "timed out"
     );
 
+    #[cfg(target_os = "linux")]
+    fn run_node_descendant_test_in_child() -> Result<bool> {
+        let test = std::thread::current()
+            .name()
+            .context("Node descendant fixture requires its exact test name")?
+            .to_owned();
+        if std::env::var_os("OMG_NODE_DESCENDANT_CHILD").as_deref()
+            == Some(std::ffi::OsStr::new(&test))
+        {
+            nix::sys::prctl::set_child_subreaper(true)?;
+            return Ok(false);
+        }
+        // This supervisor bounds the direct harness child. The controlled probe
+        // descendant is cleaned up by its adopted-PID guard inside that child.
+        let output = crate::cli::tea::run_blocking_future(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut child = tokio::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", &test, "--nocapture"])
+                .env("OMG_NODE_DESCENDANT_CHILD", &test)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut stdout = child.stdout.take().context("Missing fixture stdout")?;
+            let mut stderr = child.stderr.take().context("Missing fixture stderr")?;
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                tokio::try_join!(
+                    child.wait(),
+                    stdout.read_to_end(&mut out),
+                    stderr.read_to_end(&mut err)
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok((status, _, _))) => Ok((status, out, err)),
+                failure => {
+                    let kill = child.start_kill();
+                    let wait = child.wait().await;
+                    kill.context("Failed to terminate descendant fixture")?;
+                    wait.context("Failed to reap descendant fixture")?;
+                    anyhow::bail!("Node descendant fixture failed its bound: {failure:?}")
+                }
+            }
+        })??;
+        println!("{}", String::from_utf8_lossy(&output.1));
+        eprintln!("{}", String::from_utf8_lossy(&output.2));
+        anyhow::ensure!(output.0.success(), "Owned Node descendant fixture failed");
+        let stdout = String::from_utf8_lossy(&output.1);
+        anyhow::ensure!(
+            stdout.contains("NODE_DESCENDANT_OWNED_REAP_ESRCH")
+                && stdout.contains("NODE_LEADER_REAP_ESRCH")
+                && stdout.contains("test result: ok. 1 passed;"),
+            "Owned Node descendant inner test did not execute its proof"
+        );
+        Ok(true)
+    }
+
+    // The child harness alone adopts this fixture orphan. Its cleanup is armed
+    // only after PPID, process identity, group and wait ownership are proven.
+    #[cfg(target_os = "linux")]
+    fn reap_owned_node_descendant(pid: nix::unistd::Pid, leader: nix::unistd::Pid) -> Result<()> {
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        use std::time::{Duration, Instant};
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        println!("NODE_DESCENDANT_BEFORE_REAP {stat}");
+        let fields = stat
+            .rsplit_once(')')
+            .context("Malformed descendant stat")?
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        anyhow::ensure!(fields.len() > 19, "Incomplete descendant stat");
+        anyhow::ensure!(
+            fields[1].parse::<u32>()? == std::process::id(),
+            "Descendant is not adopted by this fixture"
+        );
+        anyhow::ensure!(
+            fields[2].parse::<i32>()? == leader.as_raw(),
+            "Descendant left the expected probe group"
+        );
+        let starttime = fields[19].to_owned();
+        rustix::process::waitid(
+            rustix::process::WaitId::Pid(
+                rustix::process::Pid::from_raw(pid.as_raw()).context("Invalid descendant PID")?,
+            ),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT,
+        )
+        .context("Descendant is not waitable by this fixture")?;
+        let reaped = std::cell::Cell::new(false);
+        let _cleanup = scopeguard::guard(pid, |pid| {
+            if !reaped.get() {
+                let owned = fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        let fields = stat
+                            .rsplit_once(')')?
+                            .1
+                            .split_whitespace()
+                            .collect::<Vec<_>>();
+                        Some(
+                            fields.len() > 19
+                                && fields[1] == std::process::id().to_string()
+                                && fields[19] == starttime,
+                        )
+                    })
+                    .unwrap_or(false);
+                if !owned {
+                    eprintln!("NODE_DESCENDANT_FAILED_PROOF_CLEANUP_REFUSED_UNOWNED {pid}");
+                    return;
+                }
+                let kill = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                println!("NODE_DESCENDANT_FAILED_PROOF_CLEANUP kill={kill:?}");
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let result = waitpid(pid, Some(WaitPidFlag::WNOHANG));
+                    println!("NODE_DESCENDANT_FAILED_PROOF_REAP {result:?}");
+                    if result != Ok(WaitStatus::StillAlive) || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = waitpid(pid, Some(WaitPidFlag::WNOHANG))?;
+            match status {
+                WaitStatus::StillAlive => {
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "Node descendant remained alive before fixture cleanup"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                terminal @ (WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)) => {
+                    reaped.set(true);
+                    println!("NODE_DESCENDANT_PRODUCTION_STATUS {terminal:?}");
+                    assert_eq!(
+                        terminal,
+                        WaitStatus::Signaled(pid, nix::sys::signal::Signal::SIGKILL, false)
+                    );
+                    assert_eq!(
+                        nix::sys::signal::kill(pid, None),
+                        Err(nix::errno::Errno::ESRCH)
+                    );
+                    println!("NODE_DESCENDANT_OWNED_REAP_ESRCH {pid}");
+                    return Ok(());
+                }
+                unexpected => anyhow::bail!("Unexpected owned descendant state: {unexpected:?}"),
+            }
+        }
+    }
+
     #[cfg(unix)]
-    fn assert_probe_dead(directory: &Path) -> Result<()> {
+    fn assert_probe_dead(directory: &Path, descendant: bool) -> Result<()> {
         if directory.join("probe.pid").try_exists()? {
             let pid = fs::read_to_string(directory.join("probe.pid"))?;
             let pid = nix::unistd::Pid::from_raw(pid.trim().parse()?);
+            #[cfg(target_os = "linux")]
+            if descendant {
+                let leader = fs::read_to_string(directory.join("probe-leader.pid"))?;
+                let leader = nix::unistd::Pid::from_raw(leader.trim().parse()?);
+                assert_eq!(
+                    nix::sys::signal::kill(leader, None),
+                    Err(nix::errno::Errno::ESRCH)
+                );
+                println!("NODE_LEADER_REAP_ESRCH {leader}");
+                return reap_owned_node_descendant(pid, leader);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = descendant;
             assert_eq!(
                 nix::sys::signal::kill(pid, None),
                 Err(nix::errno::Errno::ESRCH),
