@@ -3741,6 +3741,202 @@ mod tests {
             "healthy"
         );
     }
+
+    #[tokio::test]
+    async fn fedora_search_parity_handler_cold_warm_limits_preserve_rows_and_counters() {
+        const CHILD: &str = "OMG_SEARCH_PARITY_HANDLER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "daemon::handlers::tests::fedora_search_parity_handler_cold_warm_limits_preserve_rows_and_counters", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("search parity child exceeded deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use crate::daemon::index::search_parity_fixture::{EXPECTED, RECORDS};
+        let directory = tempfile::tempdir().unwrap();
+        let manager: Arc<dyn PackageManager> = Arc::new(
+            crate::package_managers::mock::MockPackageManager::new_in("fedora", directory.path()),
+        );
+        let mut records = RECORDS.to_vec();
+        records.reverse();
+        let state = Arc::new(
+            DaemonState::new_isolated(
+                directory.path(),
+                PackageIndex::from_rpm_records(&records),
+                manager,
+            )
+            .unwrap(),
+        );
+        let before = GLOBAL_METRICS.snapshot();
+        let mut cached = None;
+        for (id, limit) in [(1, 1), (2, 1), (3, 20), (4, MAX_SEARCH_LIMIT)] {
+            let response = handle_request(
+                Arc::clone(&state),
+                Request::Search {
+                    id,
+                    query: "tree".into(),
+                    limit: Some(limit),
+                },
+            )
+            .await;
+            let Response::Success {
+                id: actual_id,
+                result: ResponseResult::Search(result),
+            } = response
+            else {
+                panic!("search response {response:?}");
+            };
+            assert_eq!(actual_id, id);
+            assert_eq!(result.total, RECORDS.len());
+            assert_eq!(result.packages.len(), limit.min(RECORDS.len()));
+            for (row, &(name, version, description)) in result.packages.iter().zip(EXPECTED) {
+                assert_eq!(
+                    (&*row.name, &*row.version, &*row.description),
+                    (name, version, description),
+                    "request{id} limit{limit}"
+                );
+                assert_eq!(row.source, WirePackageSource::Official);
+            }
+            let current = state.cache.get("tree").expect("full bounded prefix cached");
+            assert_eq!(current.len(), RECORDS.len());
+            if let Some(previous) = &cached {
+                assert!(
+                    Arc::ptr_eq(previous, &current),
+                    "warm request rebuilt cache"
+                );
+            }
+            cached = Some(current);
+            println!(
+                "SEARCH_PARITY_REQUEST id={id} limit={limit} rows={} total={}",
+                result.packages.len(),
+                result.total
+            );
+        }
+        let after = GLOBAL_METRICS.snapshot();
+        assert_eq!(after.cache_misses - before.cache_misses, 1);
+        assert_eq!(after.cache_hits - before.cache_hits, 3);
+        assert_eq!(after.search_requests - before.search_requests, 4);
+        let stale = state.index_snapshot();
+        state.replace_index(
+            PackageIndex::from_rpm_records(RECORDS),
+            #[cfg(feature = "arch")]
+            crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+        );
+        assert!(state.cache.get("tree").is_none());
+        assert!(!state.with_current_index(&stale, || panic!("stale generation must not publish")));
+        let response = handle_request(
+            state,
+            Request::Search {
+                id: 5,
+                query: "tree".into(),
+                limit: Some(20),
+            },
+        )
+        .await;
+        let Response::Success {
+            result: ResponseResult::Search(result),
+            ..
+        } = response
+        else {
+            panic!("refresh response {response:?}");
+        };
+        assert_eq!(
+            result
+                .packages
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            EXPECTED.iter().map(|row| row.0).collect::<Vec<_>>()
+        );
+        let refreshed = GLOBAL_METRICS.snapshot();
+        assert_eq!(refreshed.cache_misses - before.cache_misses, 2);
+        assert_eq!(refreshed.cache_hits - before.cache_hits, 3);
+        println!("SEARCH_PARITY_CACHE misses=2 hits=3 refresh=1");
+    }
+
+    #[tokio::test]
+    async fn fedora_search_parity_handler_scores_late_description_before_cached_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager: Arc<dyn PackageManager> = Arc::new(
+            crate::package_managers::mock::MockPackageManager::new_in("fedora", directory.path()),
+        );
+        let names: Vec<_> = (0..1200)
+            .rev()
+            .map(|i| format!("zzztree-i18n-aa{i:04}.noarch"))
+            .collect();
+        let mut records: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), "1", "name substring"))
+            .collect();
+        records.push((
+            "t-r-e-e.noarch",
+            "7:8-9.fc44",
+            "tree viewer from description",
+        ));
+        let state = Arc::new(
+            DaemonState::new_isolated(
+                directory.path(),
+                PackageIndex::from_rpm_records(&records),
+                manager,
+            )
+            .unwrap(),
+        );
+        for (id, limit) in [(1, 1), (2, 1), (3, 20), (4, MAX_SEARCH_LIMIT)] {
+            let response = handle_request(
+                Arc::clone(&state),
+                Request::Search {
+                    id,
+                    query: "tree".into(),
+                    limit: Some(limit),
+                },
+            )
+            .await;
+            let Response::Success {
+                result: ResponseResult::Search(result),
+                ..
+            } = response
+            else {
+                panic!("search response {response:?}");
+            };
+            assert_eq!(
+                result.total, MAX_SEARCH_LIMIT,
+                "protocol retains its existing bounded-prefix total"
+            );
+            assert_eq!(result.packages.len(), limit);
+            assert_eq!(
+                (
+                    &*result.packages[0].name,
+                    &*result.packages[0].version,
+                    &*result.packages[0].description
+                ),
+                (
+                    "t-r-e-e.noarch",
+                    "7:8-9.fc44",
+                    "tree viewer from description"
+                )
+            );
+            assert_eq!(result.packages[0].source, WirePackageSource::Official);
+            assert_eq!(state.cache.get("tree").unwrap().len(), MAX_SEARCH_LIMIT);
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

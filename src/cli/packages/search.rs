@@ -5,57 +5,17 @@ use serde::Serialize;
 
 use crate::cli::packages::common::validate_search_query;
 use crate::cli::{style, ui};
+use crate::core::packages::search::SearchRanker;
 use crate::core::{Package, PackageSource};
 use crate::package_managers::{SearchNameKind, VersionDisplay, get_package_manager};
-use nucleo_matcher::{
-    Config, Matcher, Utf32String,
-    pattern::{CaseMatching, Normalization, Pattern},
-};
-
-/// Display tier for one search hit. Lower sorts first. A single table owns
-/// result ordering for the daemon, native, and AUR paths together.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum MatchTier {
-    Exact,
-    RpmBasenameExact,
-    Prefix,
-    WordBoundary,
-    Fuzzy,
-    Substring,
-}
 
 pub(crate) const DEFAULT_SEARCH_LIMIT: usize = crate::cli::modern_ui::SUMMARY_LIST_CAP;
-
-/// Language packs flood generic queries (`firefox` matches hundreds of
-/// `firefox-*-i18n-*`). They sort after real packages in every tier and
-/// collapse into one group row unless the query names them directly.
-fn is_langpack(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower.contains("-i18n-")
-        || lower.ends_with("-i18n")
-        || lower.ends_with("-l10n")
-        || lower.ends_with("-lang")
-        || lower.ends_with("-locale")
-}
 
 /// Base name for grouping: `firefox-developer-edition-i18n-ach` groups
 /// under `firefox-developer-edition-i18n`.
 fn group_base(name: &str) -> Option<&str> {
     name.find("-i18n-")
         .map(|index| &name[..index + "-i18n-".len() - 1])
-}
-
-fn match_tier(query: &str, name: &str) -> MatchTier {
-    if name == query {
-        return MatchTier::Exact;
-    }
-    if name.starts_with(query) {
-        return MatchTier::Prefix;
-    }
-    if name.split(['-', '_', ' ']).any(|word| word == query) {
-        return MatchTier::WordBoundary;
-    }
-    MatchTier::Substring
 }
 
 /// Order display packages so the user sees intent first: exact name, name
@@ -66,11 +26,9 @@ fn rank_display_packages(
     packages: &mut Vec<DisplayPackage>,
     name_kind: SearchNameKind,
 ) {
-    let query_lower = query.to_lowercase();
-    let pattern = Pattern::parse(&query_lower, CaseMatching::Ignore, Normalization::Smart);
-    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut ranker = SearchRanker::new(query);
     let owned = std::mem::take(packages);
-    let mut scored: Vec<((MatchTier, bool, u32), DisplayPackage)> = owned
+    let mut scored: Vec<_> = owned
         .into_iter()
         .map(|pkg| {
             let name_lower = pkg.name.to_lowercase();
@@ -79,27 +37,10 @@ fn rank_display_packages(
             } else {
                 SearchNameKind::Literal
             };
-            let exact_key = kind.exact_key(&query_lower, &name_lower);
-            let mut tier = if name_lower != query_lower && exact_key.is_some() {
-                MatchTier::RpmBasenameExact
-            } else {
-                match_tier(&query_lower, &name_lower)
-            };
-            let haystack = Utf32String::from(exact_key.unwrap_or(&name_lower));
-            let fuzzy = pattern.score(haystack.slice(..), &mut matcher).unwrap_or(0);
-            if tier == MatchTier::Substring && fuzzy > 0 {
-                tier = MatchTier::Fuzzy;
-            }
-            ((tier, is_langpack(&name_lower), fuzzy), pkg)
+            (ranker.score(&name_lower, kind), pkg)
         })
         .collect();
-    scored.sort_by(|a, b| {
-        a.0.0
-            .cmp(&b.0.0)
-            .then_with(|| a.0.1.cmp(&b.0.1))
-            .then_with(|| b.0.2.cmp(&a.0.2))
-            .then_with(|| a.1.name.cmp(&b.1.name))
-    });
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
     packages.extend(scored.into_iter().map(|(_, pkg)| pkg));
 }
 
@@ -1105,5 +1046,79 @@ mod tests {
         assert!(!search_sync_cli("../passwd", false, true).unwrap());
 
         assert!(!search_sync_cli("test;ls", false, true).unwrap());
+    }
+
+    #[test]
+    fn fedora_search_parity_cli_native_literal_rows_are_the_expected_prefix() {
+        use crate::daemon::index::search_parity_fixture::{EXPECTED, RECORDS};
+        let packages = RECORDS
+            .iter()
+            .rev()
+            .map(|&(name, version, description)| DisplayPackage {
+                name: name.into(),
+                version: version.into(),
+                description: description.into(),
+                source: "Official".into(),
+                votes: None,
+                popularity: None,
+                maintainer: None,
+                out_of_date: None,
+            })
+            .collect();
+        let actual =
+            present_search_results("tree", packages, true, 20, SearchNameKind::RpmIdentity);
+        assert_eq!(actual.len(), 20);
+        for (row, &(name, version, description)) in actual.iter().zip(EXPECTED) {
+            assert_eq!(
+                (&*row.name, &*row.version, &*row.description),
+                (name, version, description)
+            );
+            assert_eq!(row.source, "Official");
+        }
+    }
+
+    #[test]
+    fn fedora_search_parity_cli_description_witness_precedes_language_packs() {
+        let mut packages: Vec<_> = (0..1200)
+            .rev()
+            .map(|i| DisplayPackage {
+                name: format!("zzztree-i18n-aa{i:04}.noarch"),
+                version: "1".into(),
+                description: "name substring".into(),
+                source: "Official".into(),
+                votes: None,
+                popularity: None,
+                maintainer: None,
+                out_of_date: None,
+            })
+            .collect();
+        packages.push(DisplayPackage {
+            name: "t-r-e-e.noarch".into(),
+            version: "7:8-9.fc44".into(),
+            description: "tree viewer from description".into(),
+            source: "Official".into(),
+            votes: None,
+            popularity: None,
+            maintainer: None,
+            out_of_date: None,
+        });
+        let actual =
+            present_search_results("tree", packages, true, 1000, SearchNameKind::RpmIdentity);
+        assert_eq!(actual.len(), 1000);
+        assert_eq!(
+            (
+                &*actual[0].name,
+                &*actual[0].version,
+                &*actual[0].description
+            ),
+            (
+                "t-r-e-e.noarch",
+                "7:8-9.fc44",
+                "tree viewer from description"
+            )
+        );
+        for (i, row) in actual.iter().skip(1).enumerate() {
+            assert_eq!(row.name, format!("zzztree-i18n-aa{i:04}.noarch"));
+        }
     }
 }
