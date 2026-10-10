@@ -634,6 +634,65 @@ class FedoraBenchmarkIdentityTests(unittest.TestCase):
         body = text.split(marker, 1)[1].split("\n    }\n", 1)[0]
         return name + "() {\n" + body + "\n}\n"
 
+    def search_result(self, value: str, native: bool = False, distro: str = "fedora",
+                      arch: str = "x86_64", kind: str = "search") -> subprocess.CompletedProcess[str]:
+        path = self.directory / "search-input.txt"
+        path.write_text(value, encoding="utf-8")
+        invocation = ('set -euo pipefail\ndistro=$1\nhost_arch=$2\n'
+                      'uname() { printf "%s\\n" "$host_arch"; }\n'
+                      + self.definition("omg_names") + self.definition("search_names")
+                      + ('search_names dnf "$3"\n' if native else 'omg_names "$4" "$3"\n'))
+        return subprocess.run(["/bin/bash", "-s", "--", distro, arch, str(path), kind],
+                              input=invocation, cwd=self.directory, capture_output=True,
+                              text=True, check=False, timeout=10)
+
+    def test_recorded_fedora_search_reaches_required_package_and_native_equivalence(self) -> None:
+        # Run38009788242 artifact11652634624, ZIP SHA0ce89c5d02105ab9205a08214480df7d6697623b7a41a59cc26b89af67fe4113.
+        product = json.dumps([{"name": name} for name in
+                              ("ripgrep-edit-emacs.noarch", "ripgrep-edit.x86_64", "ripgrep.x86_64")])
+        native = ("Matched fields: name (exact)\n ripgrep.x86_64\tLine-oriented search tool\n"
+                  "Matched fields: name, summary\n ripgrep-edit.x86_64\tEdit ripgrep search results across multiple files\n"
+                  " ripgrep-edit-emacs.noarch\tUse Emacs to edit ripgrep search results across multiple files\n")
+        expected = "ripgrep\nripgrep-edit\nripgrep-edit-emacs\n"
+        for value, is_native in ((product, False), (native, True)):
+            with self.subTest(native=is_native):
+                result = self.search_result(value, is_native)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+                self.assertIn("ripgrep", result.stdout.splitlines())
+
+    def test_fedora_search_preserves_dotted_names_and_deduplicates_host_and_noarch(self) -> None:
+        value = json.dumps([{"name": name} for name in
+                            ("ripgrep.aarch64", "ripgrep.noarch", "ripgrep.plugin.aarch64")])
+        result = self.search_result(value, arch="aarch64")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ripgrep\nripgrep.plugin\n")
+
+    def test_fedora_search_refuses_foreign_or_unqualified_names_before_output(self) -> None:
+        for name in ("ripgrep.i686", "ripgrep.aarch64", "ripgrep", "ripgrep.x86-64", ".x86_64"):
+            with self.subTest(name=name):
+                value = json.dumps([{"name": "ripgrep.x86_64"}, {"name": name}])
+                result = self.search_result(value)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "")
+
+    def test_search_refuses_empty_malformed_and_potentially_truncated_product_sets(self) -> None:
+        for value in ("[]", "{}", '[{"name": null}]', '[{"name": "bad name"}]', "[",
+                      json.dumps([{"name": "ripgrep.x86_64"}] * 100000)):
+            with self.subTest(length=len(value)):
+                result = self.search_result(value)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "")
+
+    def test_other_distro_and_explicit_name_sets_retain_existing_identity(self) -> None:
+        for distro in ("arch", "debian", "ubuntu"):
+            result = self.search_result('[{"name":"ripgrep.plugin.x86_64"}]', distro=distro)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "ripgrep.plugin.x86_64\n")
+        result = self.search_result('{"packages":["ripgrep.plugin","ripgrep.x86_64"]}', kind="explicit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ripgrep.plugin\nripgrep.x86_64\n")
+
     def normalize(self, value: str, native: bool = False, phase: str = "installed",
                   arch: str = "x86_64", evr: str = "2.2.1-4.fc44") -> subprocess.CompletedProcess[str]:
         path = self.directory / "input.txt"

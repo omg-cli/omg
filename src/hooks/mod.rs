@@ -877,7 +877,7 @@ fi
 zmodload zsh/datetime
 
 _omg_reset_path() {
-  local _omg_path=":$PATH:" _omg_owned _omg_virtual_path _omg_venv_path="${VIRTUAL_ENV:-}/bin"
+  local _omg_path=":$PATH:" _omg_owned _omg_virtual_path="" _omg_venv_path="${VIRTUAL_ENV:-}/bin"
   if [[ -n "${VIRTUAL_ENV:-}" && -n "${_OLD_VIRTUAL_PATH+x}" ]]; then
     _omg_virtual_path=":$_OLD_VIRTUAL_PATH:"
   fi
@@ -1026,7 +1026,7 @@ if [[ $- == *i* && -z ${_OMG_NOTICE_STARTED+x} ]]; then
 fi
 
 _omg_reset_path() {
-  local _omg_path=":$PATH:" _omg_owned _omg_virtual_path _omg_venv_path="${VIRTUAL_ENV:-}/bin"
+  local _omg_path=":$PATH:" _omg_owned _omg_virtual_path="" _omg_venv_path="${VIRTUAL_ENV:-}/bin"
   if [[ -n "${VIRTUAL_ENV:-}" && -n "${_OLD_VIRTUAL_PATH+x}" ]]; then
     _omg_virtual_path=":$_OLD_VIRTUAL_PATH:"
   fi

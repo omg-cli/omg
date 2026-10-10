@@ -36,7 +36,7 @@ class FedoraAdvisoryTests(unittest.TestCase):
         for result in (SimpleNamespace(returncode=0, stdout=stdout, stderr="Error: Vulnerability scan found 1 finding(s)\n"),
                        SimpleNamespace(returncode=1, stdout=stdout.replace("Important", "High"), stderr="Error: Vulnerability scan found 1 finding(s)\n"),
                        SimpleNamespace(returncode=1, stdout=stdout+" [Score: 9.8]\n", stderr="Error: Vulnerability scan found 1 finding(s)\n")):
-            with self.subTest(result=result), self.assertRaises(AssertionError): oracle.verify_native_result(result, True)
+            with self.subTest(result=result), self.assertRaises(ValueError): oracle.verify_native_result(result, True)
 
 
 if __name__ == "__main__":
