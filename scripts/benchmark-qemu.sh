@@ -529,7 +529,7 @@ nohup "$5" -machine "$6" -accel "$accel" -cpu "$8" -smp 2 -m 1536 \
   -run-with user=65534:65534 \
   -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny \
   -monitor none \
-  "${firmware[@]}" -display none -serial "file:$vm_serial" \
+  "${firmware[@]}" -display none -vga none -serial "file:$vm_serial" \
   -drive "file=$vm_disk,if=virtio,format=qcow2" -drive file=seed.img,if=virtio,format=raw \
   -netdev user,id=n,ipv6=off,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n,romfile= \
   -pidfile qemu.pid > qemu-startup.log 2>&1 < /dev/null &
