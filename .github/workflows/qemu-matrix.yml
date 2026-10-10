@@ -103,6 +103,8 @@ jobs:
           python3 -m unittest discover -s scripts -p test_qemu_guest_profile.py
           python3 -m unittest discover -s scripts -p test_qemu_image_provenance.py
           python3 -m unittest discover -s scripts -p test_qemu_image_cache.py
+          python3 -m unittest discover -s scripts -p test_qemu_review.py
+          python3 -m unittest discover -s scripts -p test_qemu_maintenance_request.py
           python3 -m unittest discover -s scripts -p test_qemu_process_isolation.py
           python3 -m unittest discover -s scripts -p test_qemu_runner_isolation.py
           python3 -m unittest discover -s scripts -p test_qemu_controller_floor.py

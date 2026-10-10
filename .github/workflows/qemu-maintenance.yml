@@ -35,13 +35,14 @@ jobs:
         run: |
           set -euo pipefail
           title='chore(security): renew reviewed QEMU image provenance'
-          existing=$(gh issue list --state open --search "\"$title\" in:title" --json title,number \
-            --jq '.[] | select(.title == "chore(security): renew reviewed QEMU image provenance") | .number')
+          existing=$(gh api --paginate "repos/$GH_REPO/issues?state=open&per_page=100" \
+            --jq '.[] | select(.pull_request == null and .title == "chore(security): renew reviewed QEMU image provenance") | .number')
           if [[ -z "$existing" ]]; then
             cat > "$RUNNER_TEMP/qemu-pin-review.md" <<'BODY'
           The reviewed QEMU image pins expire within seven days or have already expired. The image verifier rejects expired reviews before parsing an image.
 
           Follow docs/qemu-image-renewal.md. Review current publisher signatures, pinned key fingerprints, image availability and controller security advisories. Submit the manifest, verification material and any driver pin changes together in a PR, then attach successful QEMU evidence. Do not extend the date without completing the review or silently replace a signing key. Close this request with the merged PR and its verification run.
           BODY
-            gh issue create --title "$title" --body-file "$RUNNER_TEMP/qemu-pin-review.md"
+            gh issue create --title "$title" --label 'security,type:maintenance,priority:p2' \
+              --body-file "$RUNNER_TEMP/qemu-pin-review.md"
           fi
