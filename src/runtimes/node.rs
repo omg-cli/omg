@@ -1,6 +1,6 @@
 //! Native Node.js runtime manager
 //!
-//! Downloads and manages Node.js versions - PURE RUST, NO SUBPROCESS.
+//! Downloads and extracts Node.js in Rust, then verifies candidate execution.
 //!
 //! Features:
 //! - Automatic LTS detection
@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::common::{
-    activate_version, begin_download, begin_staged_install, complete_staged_install,
+    activate_version_with_lease, begin_download, begin_staged_install, complete_staged_install,
     download_with_progress, extract_tar_xz, normalize_version, parse_sha256_digest,
     print_already_installed, print_installed, print_using,
 };
@@ -145,7 +145,7 @@ impl NodeManager {
         Ok(result)
     }
 
-    /// Install Node.js - PURE RUST, NO SUBPROCESS
+    /// Download, verify, extract, and execution-test Node.js before publication.
     pub async fn install(&self, version: &str) -> Result<()> {
         let version = self.resolve_alias(version).await?;
         let version = self.resolve_requested_version(&version).await?;
@@ -189,6 +189,7 @@ impl NodeManager {
 
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_regular_file(&staging.path().join("bin/node"))?;
+        smoke_node(staging.path(), version)?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
@@ -224,7 +225,16 @@ impl NodeManager {
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
-        activate_version(&self.versions_dir, &version, Path::new("bin/node"))?;
+        crate::core::security::validate_runtime_version(&version)?;
+        let lease = super::common::try_lock_runtime_file(&self.versions_dir, ".mutation.lock")?;
+        let version_dir = self.versions_dir.join(&version);
+        anyhow::ensure!(
+            super::common::is_valid_version_dir(&version_dir),
+            "Node.js version {version} is not installed as a valid directory"
+        );
+        super::common::require_regular_file(&version_dir.join("bin/node"))?;
+        smoke_node(&version_dir, &version)?;
+        activate_version_with_lease(&self.versions_dir, &version, Path::new("bin/node"), &lease)?;
         print_using("Node.js", &version, &self.versions_dir.join("current/bin"));
         Ok(())
     }
@@ -234,6 +244,138 @@ impl NodeManager {
         let version = normalize_version(version);
         super::common::uninstall_version(&self.versions_dir, &version)
     }
+}
+
+fn smoke_node(version_dir: &Path, expected: &str) -> Result<()> {
+    let directory = fs::canonicalize(version_dir).context("Failed to resolve Node.js candidate")?;
+    let expected = expected.to_owned();
+    crate::cli::tea::run_blocking_future(async move {
+        probe_node(&directory, &expected, std::time::Duration::from_secs(5)).await
+    })?
+}
+
+async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Duration) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt as _;
+
+    const OUTPUT_LIMIT: u64 = 4096;
+    let binary = directory.join("bin/node");
+    let mut command = std::process::Command::new(&binary);
+    super::common::harden_untrusted_runtime_command(&mut command, directory);
+    command
+        .arg("--version")
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut command = tokio::process::Command::from(command);
+    command.process_group(0).kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("Failed to execute Node.js version probe")?;
+    let Some(id) = child.id() else {
+        child
+            .wait()
+            .await
+            .context("Failed to reap Node.js version probe")?;
+        anyhow::bail!("Node.js version probe has no process ID");
+    };
+    let group = match i32::try_from(id) {
+        Ok(group) => nix::unistd::Pid::from_raw(group),
+        Err(error) => {
+            child
+                .kill()
+                .await
+                .context("Failed to terminate invalid Node.js probe process")?;
+            return Err(error).context("Node.js probe process ID exceeded i32");
+        }
+    };
+    // Keep the leader unreaped until group cleanup. Its PID then cannot be
+    // recycled while a descendant still holds a probe output pipe open.
+    let mut exit_observer = tokio::task::spawn_blocking(move || {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        let pid = Pid::from_raw(group.as_raw()).context("Invalid Node.js probe process ID")?;
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        )
+        .context("Failed to observe Node.js probe exit")?
+        .context("Node.js probe exit was not reported")?;
+        Ok::<_, anyhow::Error>(())
+    });
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let read_output = |stream: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>| async move {
+        let mut bytes = Vec::new();
+        stream
+            .take(OUTPUT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() <= OUTPUT_LIMIT as usize,
+            "Node.js version probe output exceeds {OUTPUT_LIMIT} bytes"
+        );
+        Ok::<_, anyhow::Error>(bytes)
+    };
+    let mut exit_observed = false;
+    let capture = tokio::time::timeout(deadline, async {
+        let stdout = stdout.context("Missing Node.js version probe stdout")?;
+        let stderr = stderr.context("Missing Node.js version probe stderr")?;
+        tokio::try_join!(
+            read_output(Box::pin(stdout)),
+            read_output(Box::pin(stderr)),
+            async {
+                let result = (&mut exit_observer).await;
+                exit_observed = true;
+                result.context("Node.js probe exit observer panicked")?
+            }
+        )
+    })
+    .await
+    .context("Node.js version probe timed out")
+    .and_then(std::convert::identity);
+
+    // Every post-spawn path terminates the isolated group before reaping the
+    // leader, including bounded-read failures and inherited-pipe timeouts.
+    let group_cleanup = match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error).context("Failed to terminate Node.js probe process group"),
+    };
+    let leader_cleanup = if group_cleanup.is_err() {
+        child.start_kill()
+    } else {
+        Ok(())
+    };
+    let observer_cleanup = if exit_observed {
+        Ok(())
+    } else {
+        exit_observer
+            .await
+            .context("Node.js probe exit observer panicked")
+            .and_then(std::convert::identity)
+    };
+    let status = child
+        .wait()
+        .await
+        .context("Failed to reap Node.js version probe");
+    group_cleanup?;
+    leader_cleanup.context("Failed to terminate Node.js probe leader")?;
+    observer_cleanup?;
+    let status = status?;
+    let (stdout, stderr, ()) = capture?;
+    anyhow::ensure!(
+        status.success(),
+        "Node.js version probe failed ({status}): {}",
+        style::sanitize_terminal_text(&String::from_utf8_lossy(&stderr))
+    );
+    let actual = std::str::from_utf8(&stdout)
+        .context("Node.js version output is not UTF-8")?
+        .trim();
+    anyhow::ensure!(
+        actual == format!("v{expected}"),
+        "Node.js artifact version {actual:?} does not match requested v{expected}"
+    );
+    Ok(())
 }
 
 // Generate common runtime manager methods (list_installed, current_version)
@@ -412,9 +554,252 @@ mod tests {
 
         let staging = begin_staged_install(directory.path())?;
         fs::create_dir(staging.path().join("bin"))?;
-        fs::write(staging.path().join("bin/node"), "fixture")?;
+        write_node_probe(staging.path(), "printf 'v22.0.0\\n'", true)?;
         manager.publish_install(&staging, "22.0.0")?;
         assert_eq!(manager.list_installed()?, vec!["22.0.0"]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn write_node_probe(directory: &Path, body: &str, executable: bool) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::create_dir_all(directory.join("bin"))?;
+        let binary = directory.join("bin/node");
+        fs::write(&binary, format!("#!/bin/sh\n{body}\n"))?;
+        fs::set_permissions(
+            binary,
+            fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn assert_node_candidate_refused(
+        body: &str,
+        executable: bool,
+        publication: bool,
+        expected_error: &str,
+    ) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: download_client(),
+        };
+        let previous = directory.path().join("20.0.0");
+        write_node_probe(&previous, "printf 'v20.0.0\\n'", true)?;
+        manager.use_version("20.0.0")?;
+        let original = fs::read(previous.join("bin/node"))?;
+        let staging = begin_staged_install(directory.path())?;
+        let candidate = if publication {
+            staging.path().to_path_buf()
+        } else {
+            directory.path().join("22.0.0")
+        };
+        write_node_probe(&candidate, body, executable)?;
+        let candidate_bytes = fs::read(candidate.join("bin/node"))?;
+        let result = if publication {
+            manager.publish_install(&staging, "22.0.0")
+        } else {
+            manager.use_version("22.0.0")
+        };
+        assert!(
+            result.is_err(),
+            "accepted unusable candidate; publication={publication}"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error:#}").contains(expected_error),
+            "wrong refusal: {error:#}"
+        );
+        if body.contains("exit 127") {
+            assert!(
+                format!("{error:#}").contains("exit status: 127"),
+                "loader exit was not retained: {error:#}"
+            );
+        }
+        if body.contains("probe.pid") {
+            assert!(
+                candidate.join("probe.pid").is_file(),
+                "probe did not execute"
+            );
+        }
+        if publication {
+            assert!(!directory.path().join("22.0.0").exists());
+            assert!(!staging.path().join(".omg-install-complete").exists());
+        }
+        assert_eq!(manager.current_version(), Some("20.0.0".to_owned()));
+        assert_eq!(fs::read(previous.join("bin/node"))?, original);
+        assert_eq!(fs::read(candidate.join("bin/node"))?, candidate_bytes);
+        assert_probe_dead(&candidate)?;
+        if publication {
+            drop(staging);
+            assert!(!candidate.exists());
+            assert!(!directory.path().join("22.0.0").exists());
+            assert_eq!(manager.current_version(), Some("20.0.0".to_owned()));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    macro_rules! node_refusal_tests {
+        ($publish:ident, $activate:ident, $body:expr, $executable:expr, $error:expr) => {
+            #[test]
+            fn $publish() -> Result<()> {
+                assert_node_candidate_refused(&$body, $executable, true, $error)
+            }
+            #[test]
+            fn $activate() -> Result<()> {
+                assert_node_candidate_refused(&$body, $executable, false, $error)
+            }
+        };
+    }
+
+    #[cfg(unix)]
+    node_refusal_tests!(
+        node_publication_rejects_loader_failure,
+        node_activation_rejects_loader_failure,
+        "printf 'libatomic.so.1: cannot open shared object file\\n' >&2; exit 127",
+        true,
+        "libatomic.so.1"
+    );
+    #[cfg(unix)]
+    node_refusal_tests!(
+        node_publication_rejects_version_mismatch,
+        node_activation_rejects_version_mismatch,
+        "printf 'v21.0.0\\n'",
+        true,
+        "does not match requested"
+    );
+    #[cfg(unix)]
+    node_refusal_tests!(
+        node_publication_rejects_nonexecutable,
+        node_activation_rejects_nonexecutable,
+        "printf 'v22.0.0\\n'",
+        false,
+        "Failed to execute"
+    );
+    #[cfg(unix)]
+    node_refusal_tests!(
+        node_publication_rejects_timeout,
+        node_activation_rejects_timeout,
+        "printf '%s\\n' \"$$\" > probe.pid; exec /bin/sleep 30",
+        true,
+        "timed out"
+    );
+    #[cfg(unix)]
+    node_refusal_tests!(
+        node_publication_rejects_oversize,
+        node_activation_rejects_oversize,
+        format!("printf '%s' '{}'", "x".repeat(5000)),
+        true,
+        "exceeds 4096"
+    );
+    #[cfg(unix)]
+    node_refusal_tests!(
+        node_publication_rejects_pipe_holding_descendant,
+        node_activation_rejects_pipe_holding_descendant,
+        "(/bin/sleep 30) & printf '%s\\n' \"$!\" > probe.pid; printf 'v22.0.0\\n'",
+        true,
+        "timed out"
+    );
+
+    #[cfg(unix)]
+    fn assert_probe_dead(directory: &Path) -> Result<()> {
+        if directory.join("probe.pid").try_exists()? {
+            let pid = fs::read_to_string(directory.join("probe.pid"))?;
+            let pid = nix::unistd::Pid::from_raw(pid.trim().parse()?);
+            assert_eq!(
+                nix::sys::signal::kill(pid, None),
+                Err(nix::errno::Errno::ESRCH),
+                "probe survived refusal"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_activation_holds_the_mutation_lease_during_execution_validation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: download_client(),
+        };
+        let previous = directory.path().join("20.0.0");
+        write_node_probe(&previous, "printf 'v20.0.0\\n'", true)?;
+        manager.use_version("20.0.0")?;
+        let candidate = directory.path().join("22.0.0");
+        write_node_probe(
+            &candidate,
+            "printf ready > ready; while [ ! -f release ]; do /bin/sleep 0.01; done; printf 'v22.0.0\\n'",
+            true,
+        )?;
+        let worker = std::thread::spawn(move || manager.use_version("22.0.0"));
+        let start = std::time::Instant::now();
+        while !candidate.join("ready").try_exists()?
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ready = candidate.join("ready").is_file();
+        let refusal = super::super::common::uninstall_version(directory.path(), "22.0.0");
+        fs::write(candidate.join("release"), "continue")?;
+        let activation = worker.join().expect("activation worker panicked");
+        assert!(ready, "candidate execution never reached held probe");
+        assert!(format!("{:#}", refusal.unwrap_err()).contains("Another runtime mutation"));
+        activation?;
+        assert_eq!(
+            super::super::common::get_current_version(directory.path()),
+            Some("22.0.0".to_owned())
+        );
+        assert!(candidate.join("bin/node").is_file());
+        assert!(previous.join("bin/node").is_file());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_activation_rejects_unsafe_version_before_executing_and_preserves_selection()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: download_client(),
+        };
+        write_node_probe(
+            &directory.path().join("20.0.0"),
+            "printf 'v20.0.0\\n'",
+            true,
+        )?;
+        manager.use_version("20.0.0")?;
+        let outside = tempfile::tempdir()?;
+        write_node_probe(
+            outside.path(),
+            "printf 'executed' > invoked; printf 'v22.0.0\\n'",
+            true,
+        )?;
+        std::os::unix::fs::symlink(outside.path(), directory.path().join("22.0.0"))?;
+        for version in ["22.0.0", "../22.0.0", "bad;version", "missing"] {
+            assert!(manager.use_version(version).is_err());
+            assert_eq!(manager.current_version(), Some("20.0.0".to_owned()));
+            assert!(!outside.path().join("invoked").exists());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn node_sync_activation_works_inside_current_thread_runtime() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: download_client(),
+        };
+        let staging = begin_staged_install(directory.path())?;
+        write_node_probe(staging.path(), "printf 'v22.0.0\\n'", true)?;
+        manager.publish_install(&staging, "22.0.0")?;
+        manager.use_version("22.0.0")?;
+        assert_eq!(manager.current_version(), Some("22.0.0".to_owned()));
         Ok(())
     }
 

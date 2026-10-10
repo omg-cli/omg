@@ -1484,7 +1484,7 @@ pub(crate) fn try_lock_runtime_install(versions_dir: &Path, version: &str) -> Re
     try_lock_runtime_file(versions_dir, &format!(".install-{version}.lock"))
 }
 
-fn try_lock_runtime_file(versions_dir: &Path, name: &str) -> Result<File> {
+pub(crate) fn try_lock_runtime_file(versions_dir: &Path, name: &str) -> Result<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     crate::core::paths::create_private_data_directory(versions_dir)?;
     let lock = fs::OpenOptions::new()
