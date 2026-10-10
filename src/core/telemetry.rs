@@ -22,10 +22,10 @@
 //! Events are persisted in a bounded local queue and sent on CLI exit. Failed
 //! batches remain queued for a later invocation.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -317,7 +317,7 @@ struct PersistedEventQueue {
 /// Event queue for batching telemetry events
 #[derive(Debug)]
 struct EventQueue {
-    events: VecDeque<TelemetryEvent>,
+    events: VecDeque<Arc<TelemetryEvent>>,
     events_since_persist: AtomicU32,
     last_persist: AtomicI64,
     persistence_enabled: bool,
@@ -347,7 +347,7 @@ impl EventQueue {
             );
         }
 
-        self.events.push_back(event);
+        self.events.push_back(Arc::new(event));
         self.events_since_persist.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -359,12 +359,16 @@ impl EventQueue {
         events_count >= PERSIST_EVERY_N_EVENTS || (now - last_persist) >= PERSIST_INTERVAL_SECS
     }
 
-    fn snapshot(&self) -> Vec<TelemetryEvent> {
+    fn snapshot(&self) -> Vec<Arc<TelemetryEvent>> {
         self.events.iter().cloned().collect()
     }
 
-    fn confirm_sent(&mut self, count: usize) {
-        self.events.drain(..count.min(self.events.len()));
+    fn confirm_sent(&mut self, sent: &[Arc<TelemetryEvent>]) {
+        // Retained snapshot Arcs prevent pointer reuse. A new occurrence of an
+        // identical payload therefore cannot be acknowledged by an older batch.
+        let identities: HashSet<_> = sent.iter().map(Arc::as_ptr).collect();
+        self.events
+            .retain(|event| !identities.contains(&Arc::as_ptr(event)));
     }
 
     fn path() -> Result<PathBuf> {
@@ -410,7 +414,7 @@ impl EventQueue {
         );
         let now = jiff::Timestamp::now().as_second();
         Ok(Self {
-            events: persisted.events.into(),
+            events: persisted.events.into_iter().map(Arc::new).collect(),
             events_since_persist: AtomicU32::new(0),
             last_persist: AtomicI64::new(now),
             persistence_enabled: true,
@@ -425,7 +429,11 @@ impl EventQueue {
         let path = Self::path()?;
         let persisted = PersistedEventQueue {
             format_version: QUEUE_FORMAT_VERSION,
-            events: self.events.iter().cloned().collect(),
+            events: self
+                .events
+                .iter()
+                .map(|event| event.as_ref().clone())
+                .collect(),
         };
         let content =
             serde_json::to_vec(&persisted).context("Failed to serialize telemetry queue")?;
@@ -782,7 +790,15 @@ pub async fn flush_events() {
     }
 
     let _flush_guard = FLUSH_LOCK.lock().await;
-    let events = match get_event_queue().lock() {
+    flush_queue(get_event_queue(), crate::core::telemetry_client::send_batch).await;
+}
+
+async fn flush_queue<SendBatch, Sending>(queue: &Mutex<EventQueue>, send_batch: SendBatch)
+where
+    SendBatch: FnOnce(Vec<TelemetryEvent>) -> Sending,
+    Sending: std::future::Future<Output = Result<()>>,
+{
+    let events = match queue.lock() {
         Ok(queue) => queue.snapshot(),
         Err(error) => {
             tracing::warn!("Failed to lock telemetry queue: {error}");
@@ -794,11 +810,11 @@ pub async fn flush_events() {
     }
 
     tracing::debug!("Flushing {} telemetry events", events.len());
-    let event_count = events.len();
-    match crate::core::telemetry_client::send_batch(events).await {
+    let payloads = events.iter().map(|event| event.as_ref().clone()).collect();
+    match send_batch(payloads).await {
         Ok(()) => {
-            if let Ok(mut queue) = get_event_queue().lock() {
-                queue.confirm_sent(event_count);
+            if let Ok(mut queue) = queue.lock() {
+                queue.confirm_sent(&events);
                 if let Err(error) = queue.save() {
                     tracing::warn!("Failed to persist telemetry queue after flush: {error}");
                 }
@@ -806,7 +822,7 @@ pub async fn flush_events() {
         }
         Err(error) => {
             tracing::debug!("Failed to flush telemetry events: {error}");
-            if let Ok(queue) = get_event_queue().lock()
+            if let Ok(queue) = queue.lock()
                 && let Err(persist_error) = queue.save()
             {
                 tracing::warn!(
@@ -984,10 +1000,176 @@ mod tests {
             "queue must not grow beyond its configured capacity"
         );
 
-        let queued = queue.snapshot().len();
+        let snapshot = queue.snapshot();
+        let queued = snapshot.len();
         let confirmed = queued / 2;
-        queue.confirm_sent(confirmed);
+        queue.confirm_sent(&snapshot[..confirmed]);
         assert_eq!(queue.events.len(), queued - confirmed);
+    }
+
+    fn overlap_event(id: u64) -> TelemetryEvent {
+        TelemetryEvent::Performance(PerformanceEvent {
+            metric_type: "overlap-event".to_string(),
+            duration_ms: id,
+        })
+    }
+
+    fn overlap_event_ids<Event: std::borrow::Borrow<TelemetryEvent>>(events: &[Event]) -> Vec<u64> {
+        events
+            .iter()
+            .map(|event| match std::borrow::Borrow::borrow(event) {
+                TelemetryEvent::Performance(event) if event.metric_type == "overlap-event" => {
+                    event.duration_ms
+                }
+                _ => panic!("unexpected overlap fixture event"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn telemetry_acknowledgement_retains_unsent_event_after_cap_eviction() {
+        let mut queue = EventQueue::default();
+        for id in 0..MAX_QUEUE_SIZE as u64 {
+            queue.push(overlap_event(id));
+        }
+        // These are the actual queue operations on either side of send_batch's
+        // await in flush_events. The held batch never contains this new event.
+        let sent = queue.snapshot();
+        assert_eq!(overlap_event_ids(&sent), (0..5000).collect::<Vec<_>>());
+        queue.push(overlap_event(5000));
+        queue.confirm_sent(&sent);
+        assert_eq!(overlap_event_ids(&queue.snapshot()), vec![5000]);
+    }
+
+    #[test]
+    fn telemetry_acknowledgement_retains_unsent_event_without_eviction() {
+        let mut queue = EventQueue::default();
+        for id in [10, 11, 12] {
+            queue.push(overlap_event(id));
+        }
+        let sent = queue.snapshot();
+        assert_eq!(overlap_event_ids(&sent), vec![10, 11, 12]);
+        queue.push(overlap_event(13));
+        queue.confirm_sent(&sent);
+        assert_eq!(overlap_event_ids(&queue.snapshot()), vec![13]);
+    }
+
+    #[test]
+    fn telemetry_acknowledgement_failure_preserves_remaining_unsent_events() {
+        let mut queue = EventQueue::default();
+        for id in 0..MAX_QUEUE_SIZE as u64 {
+            queue.push(overlap_event(id));
+        }
+        let sent = queue.snapshot();
+        assert_eq!(overlap_event_ids(&sent), (0..5000).collect::<Vec<_>>());
+        queue.push(overlap_event(5000));
+        // A rejected batch has no acknowledgement. Only the documented oldest
+        // quarter eviction may remove records; the newly queued event survives.
+        assert_eq!(
+            overlap_event_ids(&queue.snapshot()),
+            (1250..=5000).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn telemetry_acknowledgement_distinguishes_identical_unsent_payloads() {
+        let mut queue = EventQueue::default();
+        for _ in 0..MAX_QUEUE_SIZE {
+            queue.push(overlap_event(777));
+        }
+        let sent = queue.snapshot();
+        queue.push(overlap_event(777));
+        queue.confirm_sent(&sent);
+        assert_eq!(overlap_event_ids(&queue.snapshot()), vec![777]);
+    }
+
+    #[test]
+    fn telemetry_acknowledgement_partial_evicted_batch_keeps_other_events() {
+        let mut queue = EventQueue::default();
+        for id in 0..MAX_QUEUE_SIZE as u64 {
+            queue.push(overlap_event(id));
+        }
+        let sent = queue.snapshot();
+        queue.push(overlap_event(5000));
+        // These acknowledged occurrences were already removed by capacity
+        // eviction. Their acknowledgement must not remove different records.
+        queue.confirm_sent(&sent[..1250]);
+        assert_eq!(
+            overlap_event_ids(&queue.snapshot()),
+            (1250..=5000).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn telemetry_acknowledgement_after_purge_keeps_new_occurrence() {
+        let directory = tempfile::tempdir().expect("queue purge fixture");
+        let path = directory.path().join("queue.json");
+        let mut queue = EventQueue::default();
+        queue.push(overlap_event(777));
+        let sent = queue.snapshot();
+        let queue = Mutex::new(queue);
+        purge_queue(Some(&queue), &path).expect("purge captured queue");
+        let mut queue = queue.lock().expect("lock replacement queue");
+        queue.push(overlap_event(777));
+        queue.confirm_sent(&sent);
+        assert_eq!(overlap_event_ids(&queue.snapshot()), vec![777]);
+    }
+
+    async fn held_flush_result(initial_count: usize, accepted: bool) -> Vec<u64> {
+        use tokio::sync::oneshot;
+
+        let mut state = EventQueue {
+            // Fixture never resolves production filesystem paths; save refuses
+            // locally. The real flush still applies its memory acknowledgement.
+            persistence_enabled: false,
+            ..EventQueue::default()
+        };
+        for id in 0..initial_count as u64 {
+            state.push(overlap_event(id));
+        }
+        let queue = std::sync::Arc::new(Mutex::new(state));
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let flush_queue_state = queue.clone();
+        let task = tokio::spawn(async move {
+            flush_queue(&flush_queue_state, |events| async move {
+                snapshot_tx
+                    .send(overlap_event_ids(&events))
+                    .expect("publish actual sent batch");
+                release_rx.await.expect("sender release");
+                anyhow::ensure!(accepted, "fixture sender rejected batch");
+                Ok(())
+            })
+            .await;
+        });
+        let sent = snapshot_rx.await.expect("flush reached held sender");
+        assert_eq!(sent, (0..initial_count as u64).collect::<Vec<_>>());
+        queue
+            .lock()
+            .expect("lock producer queue")
+            .push(overlap_event(initial_count as u64));
+        release_tx.send(()).expect("release sender");
+        task.await.expect("joined actual flush");
+        let remaining = queue.lock().expect("lock completed queue").snapshot();
+        overlap_event_ids(&remaining)
+    }
+
+    #[tokio::test]
+    async fn telemetry_flush_retains_unsent_event_after_cap_eviction() {
+        assert_eq!(held_flush_result(5000, true).await, vec![5000]);
+    }
+
+    #[tokio::test]
+    async fn telemetry_flush_retains_unsent_event_without_eviction() {
+        assert_eq!(held_flush_result(3, true).await, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn telemetry_flush_sender_failure_preserves_remaining_events() {
+        assert_eq!(
+            held_flush_result(5000, false).await,
+            (1250..=5000).collect::<Vec<_>>()
+        );
     }
 
     #[test]
