@@ -416,9 +416,16 @@ def team_contract(case, config, stdout, before):
             path = Path('.git/hooks', name); content = regular_text(path)
             require(os.access(path, os.X_OK) and '# OMG Team Sync Hook' in content and os.environ['OMG_QEMU_EXECUTABLE'] in content and 'env check' in content, 'team init did not bind executable Git hook')
             require(subprocess.run(['sh', '-n', str(path)], capture_output=True).returncode == 0, 'team init wrote invalid hook shell')
-            invocation = '"' + os.environ['OMG_QEMU_EXECUTABLE'] + '" env check'
+            executable = os.environ['OMG_QEMU_EXECUTABLE']
+            invocations = {
+                '"' + executable + '" env check',
+                shlex.quote(executable) + ' env check',
+                "'" + executable.replace("'", "'\\''") + "' env check",
+            }
             active = [line.strip() for line in content.splitlines() if not line.lstrip().startswith('#')]
-            require(sum(line.startswith(invocation + ' ') for line in active) == 1, 'team hook executable binding exists only in comments or invokes another binary')
+            bindings = [invocation for invocation in invocations for line in active if line.startswith(invocation + ' ')]
+            require(len(bindings) == 1, 'team hook executable binding exists only in comments or invokes another binary')
+            invocation = bindings[0]
             probe = Path('.qemu-team-hook-probe.sh').absolute()
             write(probe, '#!/bin/sh\nprintf "%s\\n" "$@" > .qemu-team-hook-called\n', 0o755)
             copied = Path('.qemu-team-hook-copy.sh')
