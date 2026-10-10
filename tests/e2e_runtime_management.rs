@@ -112,9 +112,16 @@ fn seed_installed_runtime(project: &TestProject, runtime: &str, version: &str, e
         .path()
         .join(format!("versions/{runtime}/{version}/bin/{executable}"));
     std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    // Node activation validates the executable's exact release identity.
+    // Keep ordinary invocation output as the selection oracle for all runtimes.
+    let version_probe = if runtime == "node" {
+        format!("if [ \"${{1:-}}\" = '--version' ]; then printf '%s\\n' 'v{version}'; exit 0; fi\n")
+    } else {
+        String::new()
+    };
     std::fs::write(
         &binary,
-        format!("#!/bin/sh\nprintf '%s\\n' 'fixture-{runtime}-{version}'\n"),
+        format!("#!/bin/sh\n{version_probe}printf '%s\\n' 'fixture-{runtime}-{version}'\n"),
     )
     .unwrap();
     #[cfg(unix)]
@@ -404,13 +411,7 @@ fn test_use_node_with_version() {
 #[test]
 fn successful_runtime_switch_is_visible_at_default_verbosity() {
     let project = TestProject::new();
-    let binary = project
-        .data_dir
-        .path()
-        .join("versions/node/20.10.0/bin/node");
-    std::fs::create_dir_all(binary.parent().expect("runtime bin directory"))
-        .expect("create runtime version");
-    std::fs::write(&binary, b"#!/bin/sh\n").expect("write runtime binary");
+    seed_installed_runtime(&project, "node", "20.10.0", "node");
 
     let result = project.run(&["use", "node", "20.10.0"]);
 
