@@ -1286,20 +1286,37 @@ mod tests {
             .chain(std::iter::once(("DNF10", Some("kept"))))
             .collect::<Vec<_>>();
         temp_env::with_vars(values, || {
+            // BSD printenv reads one name; GNU printenv accepts several. Query
+            // each name through the actual native child on both platforms.
+            for variable in &variables {
+                let output = super::system_command("printenv")
+                    .unwrap()
+                    .arg(variable)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.stdout.is_empty(),
+                    "legacy repository variable {variable} must not reach native commands"
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "removed variable {variable} stays absent"
+                );
+            }
             let output = super::system_command("printenv")
                 .unwrap()
-                .args(&variables)
                 .arg("DNF10")
                 .output()
                 .unwrap();
             assert_eq!(
                 output.stdout, b"kept\n",
-                "legacy repository variables must not reach native commands"
+                "unrelated repository variables must reach native commands"
             );
             assert_eq!(
                 output.status.code(),
-                Some(1),
-                "removed variables stay absent"
+                Some(0),
+                "unrelated variables stay present"
             );
         });
     }

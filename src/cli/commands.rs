@@ -1756,11 +1756,13 @@ mod tests {
         std::fs::create_dir(&config).unwrap();
         std::fs::write(config.join("config.toml"), "telemetry_enabled = true\n").unwrap();
         let fixture = directory.path().to_str().unwrap();
+        let config = config.to_str().unwrap();
         let data = data.to_str().unwrap();
         temp_env::with_vars(
             [
                 ("HOME", Some(fixture)),
                 ("XDG_CONFIG_HOME", Some(fixture)),
+                ("OMG_CONFIG_DIR", Some(config)),
                 ("XDG_DATA_HOME", Some(fixture)),
                 ("OMG_DATA_DIR", Some(data)),
                 ("OMG_NATIVE_TEST_DATA_DIR", Some("1")),
@@ -1777,46 +1779,57 @@ mod tests {
                 ("OMG_DASHBOARD_TOKEN", None),
                 ("NO_COLOR", Some("1")),
             ],
-            || match case.as_str() {
-                "stats-stored" | "stats-unlinked" | "stats-tokenless" | "stats-invalid" => {
-                    if case != "stats-unlinked" {
-                        let record = crate::core::license::StoredLicense {
-                            key: "fixture-only".to_string(),
-                            tier: "free".to_string(),
-                            features: Vec::new(),
-                            customer: None,
-                            expires_at: None,
-                            validated_at: 0,
-                            token: (case == "stats-invalid")
-                                .then(|| "fixture-invalid-token".to_string()),
-                            machine_id: None,
-                        };
-                        std::fs::write(
-                            std::path::Path::new(data).join("license.json"),
-                            serde_json::to_vec(&record).unwrap(),
-                        )
-                        .unwrap();
+            || {
+                assert_eq!(
+                    crate::config::Settings::config_path().unwrap(),
+                    std::path::Path::new(config).join("config.toml"),
+                    "presentation fixture must use its private configuration"
+                );
+                assert!(
+                    crate::config::Settings::load().unwrap().telemetry_enabled,
+                    "private settings must preserve explicit telemetry consent"
+                );
+                match case.as_str() {
+                    "stats-stored" | "stats-unlinked" | "stats-tokenless" | "stats-invalid" => {
+                        if case != "stats-unlinked" {
+                            let record = crate::core::license::StoredLicense {
+                                key: "fixture-only".to_string(),
+                                tier: "free".to_string(),
+                                features: Vec::new(),
+                                customer: None,
+                                expires_at: None,
+                                validated_at: 0,
+                                token: (case == "stats-invalid")
+                                    .then(|| "fixture-invalid-token".to_string()),
+                                machine_id: None,
+                            };
+                            std::fs::write(
+                                std::path::Path::new(data).join("license.json"),
+                                serde_json::to_vec(&record).unwrap(),
+                            )
+                            .unwrap();
+                        }
+                        stats(false).unwrap();
                     }
-                    stats(false).unwrap();
+                    "env" | "new" => {
+                        println!("COMPLETIONS_BEGIN");
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(complete("bash", "", &case, Some(&format!("omg {case} "))))
+                            .unwrap();
+                        println!("COMPLETIONS_END");
+                    }
+                    "stats-valid-presentation" => {
+                        // Classification seam: signature verification is covered
+                        // by license tests, not bypassed in production stats.
+                        let telemetry_enabled = !crate::core::telemetry::is_telemetry_opt_out();
+                        assert!(telemetry_enabled, "private config must opt in");
+                        print_dashboard_sync_hint(telemetry_enabled, true);
+                    }
+                    _ => panic!("unknown presentation fixture {case}"),
                 }
-                "env" | "new" => {
-                    println!("COMPLETIONS_BEGIN");
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .block_on(complete("bash", "", &case, Some(&format!("omg {case} "))))
-                        .unwrap();
-                    println!("COMPLETIONS_END");
-                }
-                "stats-valid-presentation" => {
-                    // Classification seam: signature verification is covered
-                    // by license tests, not bypassed in production stats.
-                    let telemetry_enabled = !crate::core::telemetry::is_telemetry_opt_out();
-                    assert!(telemetry_enabled, "private config must opt in");
-                    print_dashboard_sync_hint(telemetry_enabled, true);
-                }
-                _ => panic!("unknown presentation fixture {case}"),
             },
         );
         println!("PRESENTATION_FIXTURE_COMPLETED");
