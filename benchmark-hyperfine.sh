@@ -21,8 +21,8 @@ fi
 # workload equivalence; guest comparisons check package identity and version.
 #
 # REQUIREMENTS:
-#   omg install hyperfine       # Arch Linux
-#   brew install hyperfine      # macOS
+#   omg install hyperfine jq    # Arch Linux
+#   brew install hyperfine jq   # macOS
 #
 # USAGE:
 #   ./benchmark-hyperfine.sh              # Full benchmark
@@ -175,6 +175,10 @@ if ! command -v hyperfine &>/dev/null; then
     echo "Benchmark not run: hyperfine is required; no substitute timer is used." >&2
     exit 3
 fi
+if ! command -v jq &>/dev/null; then
+    echo "Benchmark not run: jq is required to read Hyperfine exports." >&2
+    exit 3
+fi
 
 cleanup() {
     if [ -n "${DAEMON_PID:-}" ]; then
@@ -200,7 +204,49 @@ run_hyperfine() {
     hyperfine --shell=none --output=pipe \
         --warmup "$WARMUP" --min-runs "$MIN_RUNS" --max-runs "$MAX_RUNS" \
         --export-json "$json" --export-markdown "$md" \
-        "$@" < /dev/null
+        "$@" < /dev/null || return
+    local export_schema
+    export_schema=$(jq -er 'if has("schema_version") then .schema_version else 1 end' "$json") || return
+    case "$export_schema" in
+        1) ;;
+        2)
+            # Keep the original export byte-for-byte. Existing admission and
+            # reporting consume a timing view with the same labels and samples.
+            jq -e '
+              if .schema_version != 2 or .primary_metric != "time_wall_clock" then
+                error("unsupported Hyperfine timing schema")
+              else
+                {source_schema_version: 2, results: [.results[] |
+                  if (.name|type) != "string" or (.name|length) == 0 or
+                     (.measurements|type) != "array" or (.measurements|length) == 0 or
+                     .summary.time_wall_clock.unit != "second" or
+                     .summary.time_user.unit != "second" or
+                     .summary.time_system.unit != "second" or
+                     .summary.time_wall_clock.count != (.measurements|length) or
+                     .summary.time_user.count != (.measurements|length) or
+                     .summary.time_system.count != (.measurements|length) then
+                    error("incomplete Hyperfine timing measurements")
+                  else
+                    {command: .name,
+                     times: [.measurements[] |
+                       if .time_wall_clock.unit == "second" then .time_wall_clock.value
+                       else error("Hyperfine duration is not in seconds") end],
+                     exit_codes: [.measurements[].exit_code],
+                     mean: .summary.time_wall_clock.mean,
+                     median: .summary.time_wall_clock.median,
+                     min: .summary.time_wall_clock.min,
+                     max: .summary.time_wall_clock.max,
+                     stddev: .summary.time_wall_clock.stddev,
+                     user: .summary.time_user.mean,
+                     system: .summary.time_system.mean}
+                  end]}
+              end
+            ' "$json" > "$json.compat.tmp" || return
+            mv -- "$json" "${json%.json}.raw.json" || return
+            mv -- "$json.compat.tmp" "$json" || return
+            ;;
+        *) printf 'Unsupported Hyperfine export schema: %s\n' "$export_schema" >&2; return 1 ;;
+    esac
 }
 
 command_json() {
