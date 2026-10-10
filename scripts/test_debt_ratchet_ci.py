@@ -184,7 +184,11 @@ class DebtRatchetCITests(unittest.TestCase):
                                   'head': {'sha': candidate}}}
         self.assert_exit(self.run_ci('pull_request', event), 1)
         event['pull_request']['base']['sha'] = self.base
-        self.assert_exit(self.run_ci('pull_request', event), 4)
+        refused = self.run_ci('pull_request', event)
+        self.assert_exit(refused, 4)
+        self.assertIn(f'event base/head={self.base} {candidate}', refused.stderr)
+        self.assertIn(f'actual parents={base} {candidate}', refused.stderr)
+        self.assertIn(f'checkout={self.git("rev-parse", "HEAD")}', refused.stderr)
 
 
 if __name__ == '__main__':

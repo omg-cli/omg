@@ -251,8 +251,12 @@ def ci_base_revision(root):
             raise ValueError('PR base repository mismatch')
         source = commit_identity(pr['head']['sha'])
         base = commit_identity(pr['base']['sha'])
-        if git_output(root, 'show', '-s', '--format=%P', head).split() != [base, source]:
-            raise ValueError('PR merge parents do not match event base/head')
+        parents = git_output(root, 'show', '-s', '--format=%P', head).split()
+        if parents != [base, source]:
+            raise ValueError(
+                'PR merge parents do not match event base/head: '
+                f'event base/head={base} {source}; '
+                f'actual parents={" ".join(parents)}; checkout={head}')
         return base
     if kind == 'push':
         if event.get('after') != head:
