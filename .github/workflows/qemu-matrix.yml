@@ -106,6 +106,8 @@ jobs:
           python3 -m unittest discover -s scripts -p test_qemu_review.py
           python3 -m unittest discover -s scripts -p test_qemu_maintenance_request.py
           python3 -m unittest discover -s scripts -p test_qemu_process_isolation.py
+          python3 -m unittest discover -s scripts -p test_qemu_boot_diagnostics.py
+          python3 -m unittest discover -s scripts -p test_qemu_boot_timeout_budget.py
           python3 -m unittest discover -s scripts -p test_qemu_runner_isolation.py
           python3 -m unittest discover -s scripts -p test_qemu_controller_floor.py
 

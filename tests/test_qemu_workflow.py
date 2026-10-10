@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -32,6 +33,46 @@ def step(name):
 
 
 class QemuWorkflowTests(unittest.TestCase):
+    def test_prepare_executes_boot_observer_and_budget_regressions_before_selection(self):
+        # Execute the real prepare step. The private executables record the
+        # discovery payload and fail on demand; they do not run guests or sudo.
+        regression = step('Workflow selection regression checks')
+        self.assertLess(PARENT.index(regression), PARENT.index('      - name: Resolve selection\n'))
+        script = literal(regression, 'run', 8)
+        observer = ['-m', 'unittest', 'discover', '-s', 'scripts', '-p', 'test_qemu_boot_diagnostics.py']
+        budget = ['-m', 'unittest', 'discover', '-s', 'scripts', '-p', 'test_qemu_boot_timeout_budget.py']
+        for failed, expected in (('', 0), ('test_qemu_boot_diagnostics.py', 37),
+                                 ('test_qemu_boot_timeout_budget.py', 37)):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                capture = root / 'arguments.jsonl'
+                python = root / 'python3'
+                python.write_text(f'#!{sys.executable}\n' +
+                    'import json, os, sys\n'
+                    'with open(os.environ["CAPTURE"], "a") as stream:\n'
+                    '    stream.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                    'if os.environ["FAIL_TEST"] and sys.argv[-1] == os.environ["FAIL_TEST"]:\n'
+                    '    print("fixture regression failed", file=sys.stderr)\n'
+                    '    sys.exit(37)\n')
+                python.chmod(0o755)
+                sudo = root / 'sudo'
+                sudo.write_text('#!/bin/sh\n[ "$1" != -n ] || shift\nexec "$@"\n')
+                sudo.chmod(0o755)
+                result = subprocess.run([self.bash, '--noprofile', '--norc', '-euo', 'pipefail', '-c', script],
+                    cwd=WORKFLOW.parents[2], env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                    CAPTURE=str(capture), FAIL_TEST=failed), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                calls = [json.loads(line) for line in capture.read_text().splitlines()]
+                self.assertIn(observer, calls)
+                if failed == 'test_qemu_boot_diagnostics.py':
+                    self.assertEqual(calls[-1], observer)
+                    self.assertNotIn(budget, calls)
+                else:
+                    self.assertIn(budget, calls)
+                    self.assertLess(calls.index(observer), calls.index(budget))
+                    if failed:
+                        self.assertEqual(calls[-1], budget)
+
     def test_benchmark_all_runs_complete_arch_specific_profile(self):
         source = (WORKFLOW.parents[2] / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         defaults = source[:source.index('here=$(cd')]
