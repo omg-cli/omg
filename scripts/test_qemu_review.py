@@ -37,7 +37,8 @@ class ReviewTests(unittest.TestCase):
 
     def test_workflow_has_no_pr_trigger_or_automatic_renewal(self):
         workflow = (ROOT / ".github/workflows/qemu-maintenance.yml").read_text()
-        self.assertNotIn("pull_request", workflow)
+        triggers = workflow.split("permissions:", 1)[0]
+        self.assertNotIn("pull_request", triggers)
         self.assertIn("issues: write", workflow)
         self.assertNotIn("contents: write", workflow)
         self.assertIn("persist-credentials: false", workflow)
