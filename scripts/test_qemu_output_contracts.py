@@ -2524,6 +2524,32 @@ fi
                         self.assertIn('assertion failed: runtime', logs[case + '.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_runtime_switch_fixture_preserves_version_probe_and_generic_execution(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if re.match(r'^runtime-(node|python|go)-switch-installed\t', line)]
+        self.assertEqual(len(rows), 3)
+        versions = {'node': '24.21.0', 'python': '3.12.14', 'go': '1.27.1'}
+        launchers = {'node': 'node', 'python': 'python3', 'go': 'go'}
+        for row in rows:
+            runtime = row.split('\t', 1)[0].split('-')[1]
+            version = versions[runtime]
+            expected = f'v{version}' if runtime == 'node' else 'runtime-fixture'
+            executable = f'"$OMG_DATA_DIR/versions/{runtime}/{version}/bin/{launchers[runtime]}"'
+            product = (
+                f'[[ "$({executable} --version)" == {shlex.quote(expected)} ]] || '
+                '{ echo "assertion failed: emitted runtime fixture version probe" >&2; exit 67; }\n'
+                f'[[ "$({executable})" == runtime-fixture ]] || '
+                '{ echo "assertion failed: emitted runtime fixture generic execution" >&2; exit 68; }\n'
+                f'rm "$OMG_DATA_DIR/versions/{runtime}/current"; '
+                f'ln -s "$OMG_DATA_DIR/versions/{runtime}/{version}" "$OMG_DATA_DIR/versions/{runtime}/current"\n'
+                + self.runtime_usage_fixture(runtime))
+            with self.subTest(runtime=runtime):
+                result, evidence, logs = self.run_inventory(product, [row], tiers='container')
+                self.assertEqual(result.returncode, 0, result.stderr + str(logs))
+                self.assertEqual(evidence[0]['result'], 'PASS', logs)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_config_rows_require_private_persisted_state(self):
         rows = [
             'config-set\t["config","set","telemetry.enabled","true"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\tconfig-set-persisted\ttempdir-drop',

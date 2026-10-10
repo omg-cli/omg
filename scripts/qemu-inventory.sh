@@ -2969,6 +2969,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; versions=\"\$OMG_DATA_DIR/versions/$runtime_name\"; mkdir -p \"\$versions/$runtime_version/bin\" \"\$versions/$runtime_active\" \"\$versions/8.8.8\" \"\$rowdir/external-runtime\"; chmod 700 \"\$OMG_DATA_DIR\""
     remote+="; printf keep-selected > \"\$versions/$runtime_version/sentinel\"; printf keep-active > \"\$versions/$runtime_active/sentinel\"; printf keep-pending > \"\$versions/8.8.8/.omg-installing\"; printf keep-external > \"\$rowdir/external-runtime/sentinel\""
     remote+="; printf '#!/bin/sh\\nprintf runtime-fixture\\n' > \"\$versions/$runtime_version/bin/$runtime_launcher\"; chmod 755 \"\$versions/$runtime_version/bin/$runtime_launcher\"; ln -s \"\$rowdir/external-runtime\" \"\$versions/7.7.7\"; ln -s \"\$versions/$runtime_active\" \"\$versions/current\"; $(declare -f check_runtime_state); $(declare -f check_runtime_usage)"
+    if [[ "$runtime_name" == node ]]; then
+      # Node activation verifies the installed executable's exact version.
+      node_fixture=$(printf '%s\n' '#!/bin/sh' 'case "${1-}" in' \
+        "  --version) printf 'v$runtime_version\\n' ;;" \
+        '  *) printf runtime-fixture ;;' 'esac' | jq -Rrs '@sh')
+      remote+="; printf '%s' $node_fixture > \"\$versions/$runtime_version/bin/$runtime_launcher\""
+    fi
   fi
   if [[ "$distro" == arch && "$safety" == package-mutation && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     # A loopback repository exposes a versioned native ALPM upgrade while
