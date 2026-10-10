@@ -492,6 +492,7 @@ write_files:
       ExecStart=-/usr/bin/env ip -brief address
       ExecStart=-/usr/bin/env ip -statistics -statistics link
       ExecStart=-/usr/bin/env ip -4 route
+      ExecStart=-/usr/bin/env networkctl --no-pager --lines=0 --all status
       ExecStart=-/usr/bin/journalctl --boot --dmesg --lines=80 --no-pager
       ExecStart=-/usr/bin/journalctl --boot --unit=systemd-networkd --unit=NetworkManager --lines=80 --no-pager
       StandardOutput=tty
@@ -531,7 +532,7 @@ nohup "$5" -machine "$6" -accel "$accel" -cpu "$8" -smp 2 -m 1536 \
   -run-with user=65534:65534 \
   -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny \
   -monitor none "${legacy_apic[@]}" \
-  "${firmware[@]}" -display none -serial "file:$vm_serial" \
+  "${firmware[@]}" -display none -vga none -serial "file:$vm_serial" \
   -drive "file=$vm_disk,if=virtio,format=qcow2" -drive file=seed.img,if=virtio,format=raw \
   -netdev user,id=n,ipv6=off,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n,romfile= \
   -pidfile qemu.pid > qemu-startup.log 2>&1 < /dev/null &

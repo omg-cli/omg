@@ -1,5 +1,6 @@
 """Execute the production process-status gate against unsafe QEMU identities."""
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -57,6 +58,31 @@ class QemuProcessIsolationTests(unittest.TestCase):
                                         capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), 'q35,sata=off' if arch == 'x86_64' else 'virt')
+
+    @unittest.skipIf(os.name == 'nt', 'launch fixture requires POSIX executable scripts')
+    def test_headless_launch_disables_vga_and_preserves_serial_and_network(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        launch = 'nohup "$5"' + source.split('nohup "$5"', 1)[1].split('# Launch from the controller', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'qemu-fixture'
+            executable.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+            executable.chmod(0o755)
+            for machine in ('q35', 'virt'):
+                with self.subTest(machine=machine):
+                    command = ('set -- bios vars code firmware "$1" "$2" tcg max; '
+                               'accel=tcg; firmware=(); vm_serial=serial.log; vm_disk=disk.qcow2; '
+                               + launch + '\nwait $!\n')
+                    result = subprocess.run([BASH, '-c', command, '_', str(executable), machine],
+                                            cwd=root, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    arguments = json.loads((root / 'qemu-startup.log').read_text())
+                    self.assertIn('-vga', arguments)
+                    self.assertEqual(arguments[arguments.index('-vga') + 1], 'none')
+                    self.assertEqual(arguments[arguments.index('-serial') + 1], 'file:serial.log')
+                    self.assertIn('virtio-net-pci,netdev=n,romfile=', arguments)
+                    self.assertIn('user=65534:65534', arguments)
+                    self.assertIn('on,obsolete=deny,spawn=deny,resourcecontrol=deny', arguments)
 
     def test_launch_uses_supported_privilege_drop_without_root_fallback(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')

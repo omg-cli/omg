@@ -12,6 +12,37 @@ SCRIPT = Path(__file__).with_name("qemu-boot-diagnostics.sh")
 
 
 class BootDiagnostics(unittest.TestCase):
+    def test_serial_network_observer_retains_selected_network_and_setup_state(self):
+        launcher = SCRIPT.with_name("benchmark-qemu.sh").read_text()
+        unit = launcher.split("  - path: /etc/systemd/system/omg-boot-network.service\n", 1)[1]
+        unit = unit.split("  - path:", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            query = Path(directory) / "networkctl"
+            query.write_text(
+                '#!/bin/sh\n'
+                'case " $* " in *" status "*) ;; *) exit 2 ;; esac\n'
+                'printf "Network File: /run/systemd/network/10-cloud-init-eth0.network\\n"\n'
+                'printf "State: degraded (configuring)\\n"\n'
+            )
+            query.chmod(0o755)
+            output = []
+            for line in unit.splitlines():
+                if line.strip().startswith("ExecStart="):
+                    command = shlex.split(line.strip().split("=", 1)[1].removeprefix("-"))
+                    if "networkctl" not in command:
+                        continue
+                    self.assertIn("--all", command)
+                    self.assertIn("--no-pager", command)
+                    self.assertIn("--lines=0", command)
+                    result = subprocess.run(command, capture_output=True, text=True,
+                                            env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"]},
+                                            timeout=5, check=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    output.append(result.stdout)
+            observed = "\n".join(output)
+            self.assertIn("Network File: /run/systemd/network/10-cloud-init-eth0.network", observed)
+            self.assertIn("State: degraded (configuring)", observed)
+
     def test_serial_network_observer_emits_native_packet_counters(self):
         launcher = SCRIPT.with_name("benchmark-qemu.sh").read_text()
         unit = launcher.split("  - path: /etc/systemd/system/omg-boot-network.service\n", 1)[1]
