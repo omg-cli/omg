@@ -277,6 +277,187 @@ class DescriptorTests(unittest.TestCase):
         report = json.loads((self.destination / "export-report.json").read_text())
         return status, report
 
+    def test_mutation_refusal_diagnostics_copy_exactly_without_private_neighbors(self):
+        prefix = "run-test/mutation-refusal/"
+        names = ("executor.log", "cases.tsv", "inventory/results.json",
+                 "inventory/summary.json", "inventory/metadata.json",
+                 "inventory/input-sha256.txt", "inventory/rows/release-package-search-tree.stdout.log",
+                 "inventory/rows/release-package-search-tree.stderr.log",
+                 "inventory/rows/package-remove-refusal.log")
+        expected = {prefix + name: ("mutation diagnostic:" + name + "\n").encode()
+                    for name in names}
+        expected["run-test/inventory/results.json"] = b"normal inventory\n"
+        for name, content in expected.items():
+            self.fixture(name, content)
+        neighbors = ("guest/client-key", "guest/known_hosts", "config/executor.log",
+                     "data/results.json", "cache/results.json", "state.json", "executor.log.bak",
+                     "cleanup.log", "inventory/unknown.json", "inventory/results.json.bak",
+                     "inventory/private/metadata.json", "inventory/rows/Private.stdout.log",
+                     "inventory/rows/private/hidden.stdout.log", "inventory/rows/nope.raw.log")
+        private = [self.fixture(prefix + name, b"private source bytes") for name in neighbors]
+        private.append(self.fixture("mutation-refusal/executor.log", b"private source bytes"))
+        for path in private:
+            path.chmod(0)
+        real_open = os.open
+        opened = []
+
+        def record_open(name, flags, *args, **kwargs):
+            opened.append(name)
+            return real_open(name, flags, *args, **kwargs)
+
+        with patch.object(exporter.os, "open", side_effect=record_open):
+            status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(set(report["copied"]), set(expected))
+        self.assertEqual(report["bytes"], sum(map(len, expected.values())))
+        for name, content in expected.items():
+            copied = self.destination / name
+            self.assertEqual(copied.read_bytes(), content)
+            self.assertEqual(copied.stat().st_uid, os.getuid())
+            self.assertEqual(copied.stat().st_gid, os.getgid())
+            self.assertEqual(stat.S_IMODE(copied.stat().st_mode), 0o600)
+            self.assertEqual((self.source / name).read_bytes(), content)
+        for path in self.destination.rglob("*"):
+            self.assertEqual(path.stat().st_uid, os.getuid())
+            if path.is_dir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+        for path in private:
+            self.assertFalse((self.destination / path.relative_to(self.source)).exists())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0)
+            path.chmod(0o600)
+            self.assertEqual(path.read_bytes(), b"private source bytes")
+        for name in ("client-key", "known_hosts", "state.json", "executor.log.bak", "cleanup.log",
+                     "unknown.json", "Private.stdout.log", "nope.raw.log", "config", "data", "cache"):
+            self.assertNotIn(name, opened)
+
+    def test_mutation_refusal_linked_and_fifo_diagnostics_fail_closed(self):
+        external = self.root / "private"
+        external.write_bytes(b"outside secret")
+        rows = self.source / "run-test/mutation-refusal/inventory/rows"
+        rows.mkdir(parents=True)
+        executor = rows.parent.parent / "executor.log"
+        executor.symlink_to(external)
+        os.link(external, rows / "linked.stdout.log")
+        os.mkfifo(rows / "pipe.stderr.log")
+        status, report = self.run_export()
+        self.assertEqual(status, 1, report)
+        self.assertEqual(report["copied"], [])
+        self.assertEqual({item["path"] for item in report["errors"]}, {
+            "run-test/mutation-refusal/executor.log",
+            "run-test/mutation-refusal/inventory/rows/linked.stdout.log",
+            "run-test/mutation-refusal/inventory/rows/pipe.stderr.log"})
+        self.assertEqual(external.read_bytes(), b"outside secret")
+        self.assertTrue(executor.is_symlink())
+        self.assertEqual(external.stat().st_nlink, 2)
+        self.assertTrue(stat.S_ISFIFO((rows / "pipe.stderr.log").stat().st_mode))
+        self.assertNotIn("outside secret", (self.destination / "export-report.json").read_text())
+
+    def test_mutation_refusal_symlinked_diagnostic_ancestors_fail_closed(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "executor.log").write_bytes(b"outside secret")
+        expected_errors = set()
+        for index, relative in enumerate(("mutation-refusal", "mutation-refusal/inventory",
+                                          "mutation-refusal/inventory/rows")):
+            name = f"run-link-{index}/" + relative
+            link = self.source / name
+            link.parent.mkdir(parents=True)
+            link.symlink_to(outside, target_is_directory=True)
+            expected_errors.add(name)
+        status, report = self.run_export()
+        self.assertEqual(status, 1, report)
+        self.assertEqual(report["copied"], [])
+        self.assertEqual({item["path"] for item in report["errors"]}, expected_errors)
+        self.assertEqual((outside / "executor.log").read_bytes(), b"outside secret")
+        self.assertNotIn("outside secret", (self.destination / "export-report.json").read_text())
+
+    def test_mutation_refusal_source_ancestor_and_destination_refuse_reuse(self):
+        name = "run-test/mutation-refusal/executor.log"
+        source = self.fixture(name, b"original diagnostic")
+        alias = self.root / "alias"
+        alias.symlink_to(self.source, target_is_directory=True)
+        status = exporter.export(str(alias), str(self.destination), os.getuid(), os.getgid())
+        report = json.loads((self.destination / "export-report.json").read_text())
+        self.assertEqual(status, 1, report)
+        self.assertEqual(report["copied"], [])
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["path"], ".")
+        sentinel = self.destination / "keep"
+        sentinel.write_bytes(b"unchanged destination")
+        with self.assertRaises(FileExistsError):
+            self.run_export()
+        self.assertEqual(sentinel.read_bytes(), b"unchanged destination")
+        self.assertEqual(source.read_bytes(), b"original diagnostic")
+        self.assertFalse((self.destination / name).exists())
+
+    def test_mutation_refusal_directory_replacement_stays_descriptor_anchored(self):
+        name = "run-test/mutation-refusal/inventory/rows/search.stdout.log"
+        original = self.fixture(name, b"original row bytes")
+        outside = self.root / "outside"
+        (outside / "inventory/rows").mkdir(parents=True)
+        (outside / "inventory/rows/search.stdout.log").write_bytes(b"outside secret")
+        real_open = os.open
+        swapped = False
+
+        def swap_after_open(name, flags, *args, **kwargs):
+            nonlocal swapped
+            fd = real_open(name, flags, *args, **kwargs)
+            if name == "mutation-refusal" and flags & os.O_NONBLOCK and not swapped:
+                swapped = True
+                original.parents[2].rename(self.root / "retired")
+                (self.source / "run-test/mutation-refusal").symlink_to(outside, target_is_directory=True)
+            return fd
+
+        with patch.object(exporter.os, "open", side_effect=swap_after_open):
+            status, report = self.run_export()
+        self.assertTrue(swapped)
+        self.assertEqual(status, 0, report)
+        self.assertEqual(report["copied"], [name])
+        self.assertEqual((self.destination / name).read_bytes(), b"original row bytes")
+        self.assertEqual((self.root / "retired/inventory/rows/search.stdout.log").read_bytes(),
+                         b"original row bytes")
+        self.assertEqual((outside / "inventory/rows/search.stdout.log").read_bytes(), b"outside secret")
+
+    def test_mutation_refusal_file_budget_keeps_readable_manifest(self):
+        name = "run-test/mutation-refusal/executor.log"
+        source = self.fixture(name, b"0123456789")
+        status, report = self.run_export(max_file=4)
+        self.assertEqual(status, 1, report)
+        self.assertEqual(report["copied"], [])
+        self.assertEqual(report["bytes"], 0)
+        self.assertEqual(report["errors"][0]["path"], name)
+        self.assertIn("byte budget exceeded", report["errors"][0]["error"])
+        self.assertFalse((self.destination / name).exists())
+        self.assertEqual(source.read_bytes(), b"0123456789")
+
+    def test_mutation_refusal_total_budget_keeps_readable_manifest(self):
+        prefix = "run-test/mutation-refusal/inventory/rows/"
+        first = self.fixture(prefix + "first.stdout.log", b"four")
+        second = self.fixture(prefix + "second.stderr.log", b"five")
+        status, report = self.run_export(max_total=4)
+        self.assertEqual(status, 1, report)
+        self.assertEqual(len(report["copied"]), 1)
+        self.assertEqual(report["bytes"], 4)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn("byte budget exceeded", report["errors"][0]["error"])
+        self.assertEqual((self.destination / report["copied"][0]).read_bytes(), b"four"
+                         if report["copied"][0].endswith("first.stdout.log") else b"five")
+        self.assertEqual(first.read_bytes(), b"four")
+        self.assertEqual(second.read_bytes(), b"five")
+
+    def test_mutation_refusal_entry_budget_keeps_partial_readable_manifest(self):
+        prefix = "run-test/mutation-refusal/inventory/rows/"
+        first = self.fixture(prefix + "first.stdout.log", b"first")
+        second = self.fixture(prefix + "second.stderr.log", b"second")
+        status, report = self.run_export(max_entries=5)
+        self.assertEqual(status, 1, report)
+        self.assertEqual(len(report["copied"]), 1)
+        self.assertEqual(report["bytes"], len((self.destination / report["copied"][0]).read_bytes()))
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn("entry budget exceeded", report["errors"][0]["error"])
+        self.assertEqual(first.read_bytes(), b"first")
+        self.assertEqual(second.read_bytes(), b"second")
+
     def test_fedora_exclusion_diagnostics_copy_without_private_neighbors(self):
         prefix = "run-test/guest/evidence/fedora-advisory/"
         expected = {prefix + name: ("native-exclusion-diagnostic:" + name + "\n").encode()

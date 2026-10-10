@@ -154,7 +154,9 @@ def allowed_directory(parts):
     rest = parts[1:]
     return rest in ((), ("guest",), ("guest", "evidence"),
                     ("guest", "evidence", "benchmarks"), ("guest", "evidence", "apt-abi"), ("guest", "evidence", "osv"), ("guest", "evidence", "arch-advisory"), ("guest", "evidence", "fedora-advisory"), ("inventory",),
-                    ("inventory", "rows"), ("transactions",), ("transactions", "trials")) or (
+                    ("inventory", "rows"), ("mutation-refusal",),
+                    ("mutation-refusal", "inventory"), ("mutation-refusal", "inventory", "rows"),
+                    ("transactions",), ("transactions", "trials")) or (
         len(rest) in (3, 4) and rest[:2] == ("transactions", "trials")
         and re.fullmatch(NAME, rest[2]) is not None
         and (len(rest) == 3 or rest[3] == "transaction-trial")
@@ -181,9 +183,11 @@ def allowed_file(parts):
         return name in ARCH_ADVISORY_FILES
     if parent == ("guest", "evidence", "fedora-advisory"):
         return name in FEDORA_ADVISORY_FILES
-    if parent == ("inventory",):
+    if parent == ("mutation-refusal",):
+        return name in {"executor.log", "cases.tsv"}
+    if parent in (("inventory",), ("mutation-refusal", "inventory")):
         return name in {"results.json", "summary.json", "metadata.json", "input-sha256.txt"}
-    if parent == ("inventory", "rows"):
+    if parent in (("inventory", "rows"), ("mutation-refusal", "inventory", "rows")):
         return re.fullmatch(r"[a-z0-9][a-z0-9-]*(?:\.stdout|\.stderr)?\.log", name) is not None
     if parent == ("transactions",):
         return name in {"results.json", "summary.json", "bases.json", "boot-ids.txt",
