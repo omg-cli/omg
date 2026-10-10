@@ -1,10 +1,75 @@
-//! Compiled parser contracts. These prove grammar, not successful operations.
+//! Compiled parser contracts and isolated Doctor output contracts.
+//! Parser checks prove grammar; Doctor checks execute the CLI with local fixtures.
 #[path = "support/cli_surface.rs"]
 mod cli_surface;
+pub mod common;
 
 use clap::{Arg, ArgAction, ArgGroup, Command, CommandFactory, Parser, error::ErrorKind};
 use omg_lib::cli::{Cli, Commands};
 use serde_json::{Value, json};
+
+#[cfg(unix)]
+fn doctor_eol_fixture(version: Option<&str>) -> anyhow::Result<common::CommandResult> {
+    let project = common::TestProject::new();
+    if let Some(version) = version {
+        let versions = project.data_dir.path().join("versions/node");
+        std::fs::create_dir_all(versions.join(version).join("bin"))?;
+        std::os::unix::fs::symlink(version, versions.join("current"))?;
+    }
+    let result = project.run(&["doctor", "--eol"]);
+    project.close_checked();
+    Ok(result)
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_eol_unknown_cycle_does_not_claim_supported() -> anyhow::Result<()> {
+    let result = doctor_eol_fixture(Some("99.1.0"))?;
+    let output = result.combined_output();
+    assert!(
+        result.success,
+        "unknown lifecycle is not proven EOL: {output}"
+    );
+    assert!(
+        output.contains("node") && output.contains("99.1.0"),
+        "{output}"
+    );
+    assert!(output.contains("Support data unavailable"), "{output}");
+    assert!(
+        !output.contains("All detected runtimes are within support period"),
+        "{output}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_eol_empty_inventory_has_no_support_verdict() -> anyhow::Result<()> {
+    let result = doctor_eol_fixture(None)?;
+    let output = result.combined_output();
+    assert!(result.success, "{output}");
+    assert!(
+        output.contains("No managed runtimes were detected"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("All detected runtimes are within support period"),
+        "{output}"
+    );
+    assert!(!output.contains("Support data unavailable"), "{output}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_eol_known_expired_cycle_remains_an_issue() -> anyhow::Result<()> {
+    let result = doctor_eol_fixture(Some("16.1.0"))?;
+    let output = result.combined_output();
+    assert!(!result.success, "{output}");
+    assert!(output.contains("EOL since 2023-09-11"), "{output}");
+    assert!(!output.contains("Support data unavailable"), "{output}");
+    Ok(())
+}
 
 #[test]
 fn daemon_request_inventory_matches_every_compiled_variant() {

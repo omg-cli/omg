@@ -202,7 +202,7 @@ async fn test_oversized_query_is_rejected() {
             assert_eq!(code, error_codes::INVALID_PARAMS);
             // Search rejects oversized queries before backend dispatch.
             assert!(
-                message.contains("query too long"),
+                message.to_ascii_lowercase().contains("query too long"),
                 "error should name the oversized query, got: {message}"
             );
         }
