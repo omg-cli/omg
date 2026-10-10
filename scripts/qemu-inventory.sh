@@ -1986,13 +1986,40 @@ PY
       native-apt-orphan-removed|native-orphan-removed)
         check_native_orphan_removed "$distro" "$stdout" || return 1 ;;
       search-official-tree-output)
-        if ! awk '
+        local rpm_arches=''
+        if [[ "$distro" == fedora ]]; then
+          # RPM's install compatibility table includes multilib and noarch.
+          # Do not invent an ordering preference or infer it from uname.
+          rpm_arches=$(set -o pipefail; LC_ALL=C timeout --kill-after=2s 10s rpm --showrc | awk '
+            /^compatible archs[[:space:]]*:/ {
+              rows++
+              sub(/^[^:]*:[[:space:]]*/, "")
+              sub(/[[:space:]]*$/, "")
+              count=split($0, arch, /[[:space:]]+/)
+              if (count < 1 || count > 64 || length($0) > 1024) bad=1
+              for (i=1; i<=count; i++) {
+                if (arch[i] !~ /^[A-Za-z0-9_]+$/) bad=1
+              }
+              compatible=$0
+            }
+            END { if (rows != 1 || bad) exit 1; print compatible }
+          ') || { printf 'assertion failed: unavailable RPM architecture compatibility\n' >&2; return 1; }
+        fi
+        if ! awk -v distro="$distro" -v arches="$rpm_arches" '
+          BEGIN { count=split(arches, values, /[[:space:]]+/); for (i=1; i<=count; i++) supported[values[i]]=1 }
+          function exact(name) {
+            return name == "tree" || (distro == "fedora" && substr(name, 1, 5) == "tree." && (substr(name, 6) in supported))
+          }
           /^  [^[:space:]]+ [^[:space:]]+  / {
             results++
-            if (results == 1 && ($1 != "tree" || $3 != "Official" || NF != 3)) bad=1
-            if ($1 == "tree") trees++
+            if (results == 1 && (!exact($1) || $2 !~ /^[0-9]/ || $3 != "Official" || NF != 3)) bad=1
+            if (exact($1)) {
+              trees++
+              if (identities[$1]++) bad=1
+              if ($2 !~ /^[0-9]/ || $3 != "Official" || NF != 3) bad=1
+            }
           }
-          END { exit !(results > 0 && trees == 1 && !bad) }
+          END { exit !(results > 0 && trees > 0 && !bad) }
         ' "$stdout"; then
           printf 'assertion failed: search lacks a ranked official tree result\n' >&2; return 1
         fi ;;

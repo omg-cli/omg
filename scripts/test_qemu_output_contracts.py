@@ -3836,7 +3836,7 @@ esac
         self.assertEqual([row['result'] for row in evidence], ['PASS', 'FAIL', 'BLOCKED'])
         self.assertIn('regular JSON document', logs['refuse.log'])
 
-    def run_oracle(self, safety='read', assertion='-', code=0, stdout='', stderr='', artifact=None, hooks=None, distro='arch', tree_oracle_status=None):
+    def run_oracle(self, safety='read', assertion='-', code=0, stdout='', stderr='', artifact=None, hooks=None, distro='arch', tree_oracle_status=None, rpm_showrc=None, rpm_exit=0, timeout_exit=None):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('# BEGIN PRODUCT OUTPUT ORACLE')
         end = source.index('# END PRODUCT OUTPUT ORACLE', begin)
@@ -3855,11 +3855,32 @@ esac
                     path = root / '.git/hooks' / name
                     path.write_text(content, encoding='utf-8', newline='\n')
                     path.chmod(mode)
+            env = dict(os.environ)
+            if rpm_showrc is not None:
+                tools = root / 'tools'
+                tools.mkdir()
+                rpm = tools / 'rpm'
+                rpm.write_text(
+                    '#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = --showrc ] || exit 97\n'
+                    + 'printf %s ' + shlex.quote(rpm_showrc) + '\n'
+                    + f'exit {rpm_exit}\n', encoding='utf-8', newline='\n')
+                rpm.chmod(0o755)
+                if timeout_exit is not None:
+                    # Argument recorder, not a claim about a real elapsed timeout.
+                    deadline = tools / 'timeout'
+                    deadline.write_text(
+                        '#!/bin/sh\n[ "$#" = 4 ] && [ "$1" = --kill-after=2s ] '
+                        '&& [ "$2" = 10s ] && [ "$3" = rpm ] '
+                        '&& [ "$4" = --showrc ] || exit 97\n'
+                        + 'printf "TIMEOUT_ARGV %s\\n" "$*" >&2\n'
+                        + f'exit {timeout_exit}\n', encoding='utf-8', newline='\n')
+                    deadline.chmod(0o755)
+                env['PATH'] = str(tools) + os.pathsep + env['PATH']
             result = subprocess.run(
                 [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
                  function + '\ncheck_product_output "$@"', '_',
                  safety, assertion, str(code), 'stdout', 'stderr', distro],
-                cwd=root, capture_output=True, text=True, timeout=10)
+                cwd=root, capture_output=True, text=True, timeout=15, env=env)
             return result
 
     def test_exit_zero_without_help_is_not_success(self):
@@ -3899,6 +3920,114 @@ esac
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
                 if not accepted:
                     self.assertIn('changed DNF install reasons', result.stderr)
+
+
+    def test_release_search_accepts_native_compatible_rpm_exact_identities(self):
+        configurations = (
+            ('compatible archs      : x86_64_v3 x86_64_v2 x86_64 amd64 em64t athlon noarch i686 i586 i486 i386 fat\n',
+             ('tree.x86_64', 'tree.i686', 'tree.noarch', 'tree.x86_64_v3')),
+            ('compatible archs      : aarch64 noarch\n',
+             ('tree.aarch64', 'tree.noarch')),
+        )
+        for showrc, identities in configurations:
+            for identity in identities:
+                with self.subTest(identity=identity):
+                    output = f'  {identity} 2.2.1-4.fc44  Official\n  tree-sitter-cli.x86_64 0.26.11-1.fc44  Official\n'
+                    result = self.run_oracle(assertion='search-official-tree-output',
+                                             stdout=output, distro='fedora', rpm_showrc=showrc)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            # Multiarch exact names retain full identities and impose no native/noarch preference.
+            for ordered in (identities, tuple(reversed(identities))):
+                output = ''.join(f'  {identity} 2.2.1-4.fc44  Official\n' for identity in ordered)
+                with self.subTest(ordered=ordered):
+                    self.assertEqual(self.run_oracle(assertion='search-official-tree-output',
+                        stdout=output, distro='fedora', rpm_showrc=showrc).returncode, 0)
+        showrc = configurations[0][0]
+        # Catalog may contain foreign architectures; those later records do not disqualify the first exact match.
+        output = '  tree.x86_64 2.2.1-4.fc44  Official\n  tree.aarch64 2.2.1-4.fc44  Official\n'
+        self.assertEqual(self.run_oracle(assertion='search-official-tree-output',
+            stdout=output, distro='fedora', rpm_showrc=showrc).returncode, 0)
+        self.assertEqual(self.run_oracle(assertion='search-official-tree-output',
+            stdout='  tree 2.2.1-4.fc44  Official\n', distro='fedora', rpm_showrc=showrc).returncode, 0)
+
+    def test_release_search_rejects_unqualified_metadata_and_false_exact_names(self):
+        showrc = 'compatible archs      : x86_64 noarch i686\n'
+        invalid = (
+            '  tree.aarch64 2.2.1-4.fc44  Official\n',
+            '  tree.x86_64-extra 2.2.1-4.fc44  Official\n',
+            '  tree.x86_64.extra 2.2.1-4.fc44  Official\n',
+            '  tree.x86_64.aarch64 2.2.1-4.fc44  Official\n',
+            '  tree-sitter.x86_64 2.2.1-4.fc44  Official\n',
+            '  subtree.x86_64 2.2.1-4.fc44  Official\n',
+            '  tree. 2.2.1-4.fc44  Official\n',
+            '  tree.x86_64 not-a-version  Official\n',
+            '  tree.x86_64 2.2.1-4.fc44  AUR\n',
+            '  tree.x86_64 2.2.1-4.fc44  Official extra\n',
+            '  tree-sitter.x86_64 1.0  Official\n  tree.x86_64 2.2.1-4.fc44  Official\n',
+            '  tree.x86_64 2.2.1-4.fc44  Official\n  tree.x86_64 2.2.2-1.fc44  Official\n',
+        )
+        for output in invalid:
+            with self.subTest(output=output):
+                self.assertNotEqual(self.run_oracle(assertion='search-official-tree-output',
+                    stdout=output, distro='fedora', rpm_showrc=showrc).returncode, 0)
+        for metadata, status in (('', 0), (showrc, 7), (showrc + showrc, 0),
+                                 ('compatible archs : x86_64/extra\n', 0),
+                                 ('compatible build archs: x86_64 noarch\n', 0),
+                                 ('compatible archs : ' + ' '.join(['x86_64'] * 65) + '\n', 0)):
+            with self.subTest(metadata=metadata, status=status):
+                self.assertNotEqual(self.run_oracle(assertion='search-official-tree-output',
+                    stdout='  tree.x86_64 2.2.1-4.fc44  Official\n', distro='fedora',
+                    rpm_showrc=metadata, rpm_exit=status).returncode, 0)
+        for distro in ('arch', 'debian', 'debian-trixie', 'ubuntu'):
+            for identity, accepted in (('tree', True), ('tree.x86_64', False), ('tree.noarch', False)):
+                with self.subTest(distro=distro, identity=identity):
+                    result = self.run_oracle(assertion='search-official-tree-output',
+                        stdout=f'  {identity} 2.2.1-1  Official\n', distro=distro,
+                        rpm_showrc='', rpm_exit=99)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+
+    def test_release_search_fedora_metadata_is_bounded_and_required(self):
+        output = '  tree 2.2.1-4.fc44  Official\n'
+        showrc = 'compatible archs : x86_64 noarch i686\n'
+        cases = (('', 0), ('compatible archs : \n', 0), (showrc, 7),
+                 (showrc + showrc, 0), ('compatible archs : x86_64/extra\n', 0),
+                 ('compatible build archs : x86_64 noarch\n', 0),
+                 ('compatible archs : ' + ' '.join(['x86_64'] * 65) + '\n', 0),
+                 ('compatible archs : ' + 'a' * 1025 + '\n', 0))
+        for metadata, status in cases:
+            with self.subTest(metadata=metadata, status=status):
+                self.assertNotEqual(self.run_oracle(assertion='search-official-tree-output',
+                    stdout=output, distro='fedora', rpm_showrc=metadata, rpm_exit=status).returncode, 0)
+        # Enforce the actual timeout argv and refusal of its timeout status without sleeping.
+        result = self.run_oracle(assertion='search-official-tree-output', stdout=output,
+            distro='fedora', rpm_showrc=showrc, timeout_exit=124)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unavailable RPM architecture compatibility', result.stderr)
+        self.assertIn('TIMEOUT_ARGV --kill-after=2s 10s rpm --showrc', result.stderr)
+        # Original uniqueness contract is scoped to exact tree records.
+        output = ('  tree.x86_64 2.2.1-4.fc44  Official\n'
+                  '  tree-sitter.x86_64 1.0  Official\n'
+                  '  tree-sitter.x86_64 1.0  Official\n')
+        self.assertEqual(self.run_oracle(assertion='search-official-tree-output',
+            stdout=output, distro='fedora', rpm_showrc=showrc).returncode, 0)
+
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_release_search_fedora_runner_preserves_mutation_opt_out(self):
+        rows = [
+            'release-package-search-tree\t["search","tree"]\tread\t0\tpass\t-\tcontainer\tfedora:pass\tsearch-official-tree-output\tnone',
+            'search-mutation-guard\t["install","tree","--yes"]\tpackage-mutation\t0\tpass\t-\tcontainer\tfedora:pass\t-\tnone',
+        ]
+        product = '''[[ "$*" == 'search tree' ]] || exit 71
+printf '  tree.x86_64 2.2.1-4.fc44  Official\n  tree.i686 2.2.1-4.fc44  Official\n'
+'''
+        rpm = '[ "$#" = 1 ] && [ "$1" = --showrc ] || exit 97\nprintf "compatible archs : x86_64 noarch i686\\n"\n'
+        result, evidence, logs = self.run_inventory(product, rows, distro='fedora',
+            tiers='container', native_commands={'rpm': rpm})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([row['result'] for row in evidence], ['PASS', 'SKIPPED'], logs)
+        self.assertEqual([row['exit_code'] for row in evidence], [0, -1], logs)
 
     def test_release_search_requires_an_exact_ranked_official_result(self):
         valid = '  | Search\n    tree\n  tree 2.1.3  Official\n  tree-sitter 1.0  Official\n'
