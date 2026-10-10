@@ -1138,4 +1138,298 @@ mod tests {
         assert!(platform.contains('-'));
         assert!(!platform.starts_with("linux-") || std::env::consts::OS == "linux");
     }
+
+    #[cfg(target_os = "macos")]
+    mod native_zombie_cause {
+        use anyhow::{Context, Result, ensure};
+        use nix::{
+            errno::Errno,
+            libc,
+            sys::signal::{Signal, killpg},
+            unistd::Pid,
+        };
+        use std::{
+            mem::{MaybeUninit, size_of},
+            os::unix::process::CommandExt,
+            process::{Child, Command, Stdio},
+            time::{Duration, Instant},
+        };
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct Identity {
+            pid: u32,
+            pgid: u32,
+            ppid: u32,
+            status: u32,
+            uid: u32,
+            ruid: u32,
+            start_sec: u64,
+            start_usec: u64,
+        }
+
+        // Direct child ownership is armed immediately. This helper never signals a
+        // process group after releasing the leader's waitid(NOWAIT) identity pin.
+        struct OwnedLeader(Option<Child>);
+        impl Drop for OwnedLeader {
+            fn drop(&mut self) {
+                if self.0.is_some() {
+                    eprintln!("MAC_CAUSE_FIXTURE_FAILURE_CLEANUP fallback=true");
+                    if let Err(error) = self.cleanup(true) {
+                        // Drop cannot return an error. Explicit cleanup is mandatory
+                        // before a normal test return; this fallback accompanies an
+                        // existing proof failure/unwind, never a successful result.
+                        eprintln!("MAC_CAUSE_INCONCLUSIVE_CLEANUP {error:#}");
+                    }
+                }
+            }
+        }
+        impl OwnedLeader {
+            fn cleanup(&mut self, terminate: bool) -> Result<()> {
+                let child = self.0.as_mut().context("missing owned leader")?;
+                let end = Instant::now() + Duration::from_secs(2);
+                if terminate {
+                    // Exact still-owned direct Child only. No released process group
+                    // is signaled by this cleanup path. A kill error still permits
+                    // bounded try_wait to determine that it has already exited.
+                    let killed = child.kill();
+                    eprintln!(
+                        "MAC_CAUSE_EXACT_CHILD_KILL pid={} result={killed:?}",
+                        child.id()
+                    );
+                }
+                loop {
+                    match child
+                        .try_wait()
+                        .context("MAC_CAUSE_INCONCLUSIVE_CLEANUP owned causal leader try_wait")?
+                    {
+                        Some(status) => {
+                            self.0.take();
+                            eprintln!(
+                                "MAC_CAUSE_OWNED_LEADER_REAP {status:?} terminate={terminate}"
+                            );
+                            ensure!(
+                                terminate || status.success(),
+                                "MAC_CAUSE_INCONCLUSIVE_CLEANUP causal leader exited abnormally"
+                            );
+                            return Ok(());
+                        }
+                        None => {
+                            ensure!(
+                                Instant::now() < end,
+                                "MAC_CAUSE_INCONCLUSIVE_CLEANUP owned-child reap deadline exceeded"
+                            );
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                }
+            }
+        }
+
+        fn snapshot(pgid: i32) -> Result<Vec<Identity>> {
+            // Controlled fixture has ONE direct child and no descendants. A small
+            // 16-PID bound is below the pinned kernel's nprocs+20 internal bound;
+            // count < caller capacity alone is insufficient for arbitrarily large
+            // buffers if the kernel independently caps its allocation.
+            let mut pids = [0_i32; 16];
+            let bytes = i32::try_from(size_of::<[i32; 16]>())?;
+            // SAFETY: valid initialized writable array; capacity parameter is BYTES.
+            let count = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes) };
+            eprintln!(
+                "MAC_CAUSE_GROUP_COUNT pgid={pgid} pid_count={count} capacity=16 bytes={bytes}"
+            );
+            ensure!(
+                count > 0 && count < 16,
+                "empty/error/truncated group enumeration"
+            );
+            let ids = &mut pids[..usize::try_from(count)?];
+            ids.sort_unstable();
+            ensure!(ids.iter().all(|pid| *pid > 0), "invalid group PID");
+            ensure!(
+                ids.windows(2).all(|pair| pair[0] != pair[1]),
+                "duplicate PID"
+            );
+            let mut rows = Vec::new();
+            for pid in ids.iter().copied() {
+                let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+                let size = i32::try_from(size_of::<libc::proc_bsdinfo>())?;
+                // SAFETY: locked libc's typed buffer, exact capacity. arg=1 requests
+                // zombie lookup; never assume_init after an error/partial response.
+                let got = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        libc::PROC_PIDTBSDINFO,
+                        1,
+                        info.as_mut_ptr().cast(),
+                        size,
+                    )
+                };
+                ensure!(
+                    got == size,
+                    "BSDINFO incomplete: pid={pid} got={got} required={size}"
+                );
+                // SAFETY: the preceding exact-size response initialized this buffer.
+                let info = unsafe { info.assume_init() };
+                let row = Identity {
+                    pid: info.pbi_pid,
+                    pgid: info.pbi_pgid,
+                    ppid: info.pbi_ppid,
+                    status: info.pbi_status,
+                    uid: info.pbi_uid,
+                    ruid: info.pbi_ruid,
+                    start_sec: info.pbi_start_tvsec,
+                    start_usec: info.pbi_start_tvusec,
+                };
+                ensure!(
+                    row.pid == u32::try_from(pid)? && row.pgid == u32::try_from(pgid)?,
+                    "PID/group identity changed"
+                );
+                eprintln!("MAC_CAUSE_MEMBER {row:?}");
+                rows.push(row);
+            }
+            Ok(rows)
+        }
+
+        pub(super) fn emit_harness_identity() -> Result<()> {
+            use sha2::Digest as _;
+            use std::io::Read as _;
+            let exe =
+                std::env::current_exe().context("MAC_CAUSE_INCONCLUSIVE_HARNESS current_exe")?;
+            let mut file = std::fs::File::open(&exe)
+                .context("MAC_CAUSE_INCONCLUSIVE_HARNESS open current executable")?;
+            ensure!(
+                file.metadata()?.is_file(),
+                "MAC_CAUSE_INCONCLUSIVE_HARNESS nonregular executable"
+            );
+            let mut hash = sha2::Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            let mut observed_bytes = 0_u64;
+            loop {
+                let count = file
+                    .read(&mut buffer)
+                    .context("MAC_CAUSE_INCONCLUSIVE_HARNESS read current executable")?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buffer[..count]);
+                observed_bytes = observed_bytes
+                    .checked_add(u64::try_from(count)?)
+                    .context("MAC_CAUSE_INCONCLUSIVE_HARNESS byte count overflow")?;
+            }
+            ensure!(
+                observed_bytes == file.metadata()?.len(),
+                "MAC_CAUSE_INCONCLUSIVE_HARNESS executable length changed"
+            );
+            eprintln!(
+                "MAC_CAUSE_HARNESS_IDENTITY sha256={:x} bytes={observed_bytes} os={} arch={} path={exe:?}",
+                hash.finalize(),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
+            Ok(())
+        }
+
+        pub(super) fn prove_owned_native_cause() -> Result<()> {
+            let child = Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .context("spawn owned causal fixture")?;
+            let mut owner = OwnedLeader(Some(child));
+            let pgid = i32::try_from(owner.0.as_ref().context("missing leader")?.id())?;
+            let proof = (|| -> Result<()> {
+                use rustix::process::{Pid as WaitPid, WaitId, WaitIdOptions, waitid};
+                let pid = WaitPid::from_raw(pgid).context("invalid owned leader PID")?;
+                let end = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if waitid(
+                        WaitId::Pid(pid),
+                        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                    )?
+                    .is_some()
+                    {
+                        break;
+                    }
+                    ensure!(
+                        Instant::now() < end,
+                        "fixture exit observation exceeded deadline"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                // SAFETY: getuid/geteuid have no pointer or ownership requirements.
+                let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+                let caller = std::process::id();
+                eprintln!(
+                    "MAC_CAUSE_ACTOR uid={uid} euid={euid} ppid={caller} pgid={pgid} waitid_nowait=true"
+                );
+                ensure!(uid != 0 && uid == euid, "ordinary caller required");
+                let before = snapshot(pgid)?;
+                ensure!(before.len() == 1, "controlled one-member group changed");
+                for row in &before {
+                    ensure!(
+                        row.pid == u32::try_from(pgid)?
+                            && row.ppid == caller
+                            && row.status == libc::SZOMB
+                            && row.uid == euid
+                            && row.ruid == uid
+                            && row.start_sec > 0,
+                        "owned zombie leader proof failed"
+                    );
+                }
+                let raw = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+                eprintln!("MAC_CAUSE_RAW_GROUP_SIGKILL pgid={pgid} result={raw:?}");
+                let after = snapshot(pgid)?;
+                ensure!(
+                    before == after,
+                    "group identity/state changed across raw syscall"
+                );
+                eprintln!("MAC_CAUSE_GROUP_STABLE before_equals_after=true leader_pin_held=true");
+                ensure!(
+                    raw == Err(Errno::EPERM),
+                    "native zombie-only EPERM precondition absent"
+                );
+                Ok(())
+            })();
+            // Proof errors use the guard's exact owned-child cleanup; successful
+            // proof performs ordinary wait only after every group observation.
+            let cleaned = owner.cleanup(proof.is_err());
+            cleaned?;
+            proof?;
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn node_accepts_valid_candidate_after_native_zombie_group_cause_proof() -> Result<()> {
+        native_zombie_cause::emit_harness_identity()?;
+        native_zombie_cause::prove_owned_native_cause()?;
+        let directory = tempfile::tempdir()?;
+        write_node_probe(directory.path(), "printf 'v22.0.0\\n'", true)?;
+        let actual = probe_node(directory.path(), "22.0.0", Duration::from_secs(5)).await;
+        eprintln!("MAC_CAUSE_ACTUAL_NODE_PROBE {actual:?}");
+        if let Err(error) = &actual {
+            let exact_context = error.chain().any(|cause| {
+                cause.to_string() == "Failed to terminate Node.js probe process group"
+            });
+            let typed_eperm = error.chain().any(|cause| {
+                cause.downcast_ref::<nix::errno::Errno>() == Some(&nix::errno::Errno::EPERM)
+            });
+            if !exact_context || !typed_eperm {
+                anyhow::bail!(
+                    "MAC_CAUSE_INCONCLUSIVE_PRODUCTION_ERROR unexpected probe failure: {error:#}"
+                );
+            }
+            eprintln!("MAC_CAUSE_ACTUAL_PROBE_CLASSIFICATION EXPECTED_BASELINE_EPERM {error:#}");
+        } else {
+            eprintln!("MAC_CAUSE_ACTUAL_PROBE_CLASSIFICATION VALID_PROBE_ACCEPTED");
+        }
+        assert!(
+            actual.is_ok(),
+            "valid candidate refused after paired native cause proof: {actual:?}"
+        );
+        Ok(())
+    }
 }
