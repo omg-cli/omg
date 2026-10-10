@@ -1408,7 +1408,12 @@ mod tests {
         native_zombie_cause::prove_owned_native_cause()?;
         let directory = tempfile::tempdir()?;
         write_node_probe(directory.path(), "printf 'v22.0.0\\n'", true)?;
-        let actual = probe_node(directory.path(), "22.0.0", Duration::from_secs(5)).await;
+        let actual = probe_node(
+            directory.path(),
+            "22.0.0",
+            std::time::Duration::from_secs(5),
+        )
+        .await;
         eprintln!("MAC_CAUSE_ACTUAL_NODE_PROBE {actual:?}");
         if let Err(error) = &actual {
             let exact_context = error.chain().any(|cause| {
