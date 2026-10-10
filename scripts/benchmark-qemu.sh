@@ -762,7 +762,11 @@ installed() {
 }
 if installed >/dev/null 2>&1; then echo 'fixture requires tree absent' >&2; exit 120; fi
 "$bin" search tree > evidence/search.txt
-grep -Eqi '^[[:space:]]+tree[[:space:]]' evidence/search.txt
+if [[ "$distro" == fedora ]]; then
+  grep -Eq "^[[:space:]]+tree([.]${guest_arch})?[[:space:]]" evidence/search.txt
+else
+  grep -Eqi '^[[:space:]]+tree[[:space:]]' evidence/search.txt
+fi
 sudo -n "$bin" install --yes tree
 installed
 "$bin" info tree > evidence/omg-info.txt

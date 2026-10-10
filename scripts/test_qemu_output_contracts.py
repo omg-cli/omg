@@ -18,6 +18,43 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipIf(os.name == 'nt', 'native preview assertions require POSIX bash')
 class NativeRemovalContracts(unittest.TestCase):
+    def test_benchmark_search_smoke_accepts_only_exact_guest_package_identity(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        begin = source.index('"$bin" search tree > evidence/search.txt\n')
+        end = source.index('sudo -n "$bin" install --yes tree\n', begin)
+        assertion = source[begin:end].split('\n', 1)[1]
+        cases = (
+            ('fedora', 'x86_64', '  tree.x86_64 2.2.1-4.fc44  Official\n', True),
+            ('fedora', 'aarch64', '  tree.aarch64 2.2.1-4.fc44  Official\n', True),
+            ('fedora', 'x86_64', '  tree 2.2.1-4.fc44  Official\n', True),
+            ('fedora', 'x86_64', '\ttree.x86_64\t2.2.1-4.fc44\tOfficial\n', True),
+            ('fedora', 'x86_64', '  tree.i686 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree.aarch64 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree.noarch 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree-sitter-cli.x86_64 0.26.11  Official\n', False),
+            ('fedora', 'x86_64', '  subtree.x86_64 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree.x86_64-extra 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree.x86_64.extra 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree.x86_64', False),
+            ('fedora', 'x86_64', '', False),
+            ('arch', 'x86_64', '  tree 2.2.1-1  Official\n', True),
+            ('arch', 'x86_64', '  tree.x86_64 2.2.1-1  Official\n', False),
+            ('debian', 'x86_64', '  tree 2.2.1-1  Official\n', True),
+            ('debian', 'x86_64', '  tree.x86_64 2.2.1-1  Official\n', False),
+        )
+        for distro, guest_arch, output, accepted in cases:
+            with self.subTest(distro=distro, guest_arch=guest_arch, output=output):
+                with tempfile.TemporaryDirectory() as directory:
+                    evidence = Path(directory) / 'evidence'
+                    evidence.mkdir()
+                    (evidence / 'search.txt').write_text(output, encoding='utf-8')
+                    result = subprocess.run(
+                        [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                         assertion, '_'], cwd=directory, capture_output=True,
+                        text=True, timeout=5,
+                        env={**os.environ, 'distro': distro, 'guest_arch': guest_arch})
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
     def test_runtime_guest_enables_only_download_phase_diagnostics(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         line = next(line.strip() for line in source.splitlines()
