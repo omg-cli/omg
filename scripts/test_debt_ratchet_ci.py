@@ -185,10 +185,98 @@ class DebtRatchetCITests(unittest.TestCase):
         self.assert_exit(self.run_ci('pull_request', event), 1)
         event['pull_request']['base']['sha'] = self.base
         refused = self.run_ci('pull_request', event)
+        self.assert_exit(refused, 1)
+        self.assertIn(f'Verified debt base: {base}', refused.stdout)
+        event['pull_request']['head']['sha'] = self.base
+        refused = self.run_ci('pull_request', event)
         self.assert_exit(refused, 4)
-        self.assertIn(f'event base/head={self.base} {candidate}', refused.stderr)
+        self.assertIn(f'event base/head={self.base} {self.base}', refused.stderr)
         self.assertIn(f'actual parents={base} {candidate}', refused.stderr)
         self.assertIn(f'checkout={self.git("rev-parse", "HEAD")}', refused.stderr)
+
+    def advanced_merge(self, tighten=False):
+        self.git('checkout', '-b', 'candidate')
+        self.write('src/clean.py', '# clean candidate\n')
+        candidate = self.commit()
+        self.git('checkout', 'main')
+        if tighten:
+            self.write('src/a.py', '# cleaned base\n')
+            self.write('scripts/debt-ratchets/todo-markers.baseline', '')
+        else:
+            self.write('src/base.py', '# advanced base\n')
+        base = self.commit()
+        # Construct a real two-parent merge with the candidate tree. This also
+        # exercises a merge resolution that tries to retain the old debt floor.
+        merge = self.git('commit-tree', candidate + '^{tree}', '-p', base,
+                         '-p', candidate, '-m', 'synthetic PR merge')
+        self.git('checkout', '--detach', merge)
+        event = {'pull_request': {
+            'base': {'sha': self.base, 'repo': {'full_name': REPOSITORY}},
+            'head': {'sha': candidate}}}
+        return event, base, candidate, merge
+
+    def test_advanced_base_clean_merge_passes(self):
+        event, base, _, _ = self.advanced_merge()
+        result = self.run_ci('pull_request', event)
+        self.assert_exit(result, 0)
+        self.assertIn(f'Verified debt base: {base}', result.stdout)
+        self.assertIn(f'event={self.base}; merge={base}', result.stdout)
+
+    def test_advanced_base_uses_tightened_actual_floor(self):
+        event, base, _, _ = self.advanced_merge(tighten=True)
+        result = self.run_ci('pull_request', event)
+        self.assert_exit(result, 1)
+        self.assertIn(f'Verified debt base: {base}', result.stdout)
+        self.assertIn('ratchet todo-markers: fail', result.stdout)
+
+    def test_advanced_base_rejects_unrelated_event_base(self):
+        event, _, _, merge = self.advanced_merge()
+        self.git('checkout', '--orphan', 'unrelated')
+        self.write('src/unrelated.py', '# unrelated root\n')
+        unrelated = self.commit()
+        self.git('checkout', '--detach', merge)
+        event['pull_request']['base']['sha'] = unrelated
+        self.assert_exit(self.run_ci('pull_request', event), 4)
+
+    def test_advanced_base_rejects_reversed_parents(self):
+        event, base, candidate, _ = self.advanced_merge()
+        reversed_merge = self.git('commit-tree', candidate + '^{tree}',
+                                  '-p', candidate, '-p', base,
+                                  '-m', 'reversed PR merge')
+        self.git('checkout', '--detach', reversed_merge)
+        self.assert_exit(self.run_ci('pull_request', event), 4)
+
+    def test_advanced_base_rejects_nonmerge_checkout(self):
+        event, _, candidate, _ = self.advanced_merge()
+        self.git('checkout', '--detach', candidate)
+        self.assert_exit(self.run_ci('pull_request', event), 4)
+
+    def test_advanced_base_rejects_event_base_descendant(self):
+        event, _, _, merge = self.advanced_merge()
+        event['pull_request']['base']['sha'] = merge
+        self.assert_exit(self.run_ci('pull_request', event), 4)
+
+    def test_advanced_base_rejects_three_parents(self):
+        event, base, candidate, _ = self.advanced_merge()
+        merge = self.git('commit-tree', candidate + '^{tree}', '-p', base,
+                         '-p', candidate, '-p', self.base, '-m', 'three parents')
+        self.git('checkout', '--detach', merge)
+        self.assert_exit(self.run_ci('pull_request', event), 4)
+
+    def test_advanced_base_rejects_duplicate_source_parents(self):
+        event, _, candidate, _ = self.advanced_merge()
+        tree = self.git('rev-parse', candidate + '^{tree}')
+        commit_file = self.root / '.git/duplicate-parent-commit'
+        commit_file.write_text(
+            f'tree {tree}\nparent {candidate}\nparent {candidate}\n'
+            'author Debt regression <regression@example.invalid> 1 +0000\n'
+            'committer Debt regression <regression@example.invalid> 1 +0000\n'
+            '\nduplicate source parents\n', encoding='utf-8')
+        merge = self.git('hash-object', '-t', 'commit', '-w', str(commit_file))
+        self.git('checkout', '--detach', merge)
+        self.assertEqual(self.git('show', '-s', '--format=%P', merge).split(),
+                         [candidate, candidate])
+        self.assert_exit(self.run_ci('pull_request', event), 4)
 
 
 if __name__ == '__main__':
