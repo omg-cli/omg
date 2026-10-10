@@ -133,25 +133,25 @@ jobs:
                 "distro": "arch",
                 "image": "archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6",
                 "features": "arch,pgp,license",
-                "setup": "pacman -Syu --noconfirm\npacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq\n"
+                "setup": "pacman -Syu --noconfirm\npacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python fish\n"
               },
               {
                 "distro": "debian",
                 "image": "debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931",
                 "features": "debian,pgp,license",
-                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
+                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 python3-venv fish \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
               },
               {
                 "distro": "debian-trixie",
                 "image": "debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958",
                 "features": "debian,pgp,license",
-                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 python3-apt \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
+                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
               },
               {
                 "distro": "fedora",
                 "image": "fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
                 "features": "fedora,pgp,license",
-                "setup": "timeout -k 10s 12m dnf \\\n  --setopt='*.skip_if_unavailable=False' \\\n  install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\n"
+                "setup": "timeout -k 10s 12m dnf \\\n  --setopt='*.skip_if_unavailable=False' \\\n  install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 fish \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\n"
               }
             ]
           BUILD_ARM64: |
@@ -160,13 +160,13 @@ jobs:
                 "distro": "debian",
                 "image": "debian:bookworm@sha256:5eac3978974cfa26a880057766c683e55c5763355d30a8beecbd263e0e1621d9",
                 "features": "debian,pgp,license",
-                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
+                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 python3-venv fish \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
               },
               {
                 "distro": "fedora",
                 "image": "fedora:latest@sha256:e402cca673711fee025f9ce21c6c08b1bd25ee26b3c482119c8675fbaaedbc85",
                 "features": "fedora,pgp,license",
-                "setup": "timeout -k 10s 12m dnf \\\n  --setopt='*.skip_if_unavailable=False' \\\n  install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\n"
+                "setup": "timeout -k 10s 12m dnf \\\n  --setopt='*.skip_if_unavailable=False' \\\n  install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 fish \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\n"
               }
             ]
           REQUESTED_RELEASE_TAG: ${{ inputs.tag }}
@@ -355,7 +355,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libapt-pkg-dev \
+            libapt-pkg-dev python3-venv fish \
             pkg-config \
             libssl-dev \
             clang \

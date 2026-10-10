@@ -137,6 +137,8 @@ class FedoraSetupSourceTests(unittest.TestCase):
                         expected.append("procps-ng")
                     if workflow == "ci.yml":
                         expected.extend(["python3", "zsh", "fish"])
+                    elif workflow == "qemu-matrix.yml":
+                        expected.extend(["python3", "fish"])
                     expected.extend(["rpm", "dnf", "sqlite", "yum-utils", "fedora-release"])
                     self.assertEqual(arguments[package_index:], expected)
                     self.assertEqual(arguments.count("install"), 1)

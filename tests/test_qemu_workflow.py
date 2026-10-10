@@ -99,6 +99,30 @@ exit "$rc"
                     self.assertIn('python3', result.stdout.splitlines(),
                         'Debian transaction tests require an external Python POSIX lock probe')
 
+    def test_unit_build_recipes_install_python_venv_and_fish_prerequisites(self):
+        for architecture in ('BUILD_X64', 'BUILD_ARM64'):
+            for recipe in json.loads(literal(PARENT, architecture, 10)):
+                with self.subTest(architecture=architecture, distro=recipe['distro']):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        for name in ('apt-get', 'pacman', 'dnf', 'rpm'):
+                            tool = root / name
+                            tool.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$CAPTURE"\n')
+                            tool.chmod(0o755)
+                        result = subprocess.run(
+                            [self.bash, '-e', '-c', recipe['setup']],
+                            env=dict(os.environ, PATH=directory + ':' + os.environ['PATH'],
+                                     CAPTURE=str(root / 'args')),
+                            capture_output=True, text=True, timeout=15,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        arguments = (root / 'args').read_text().splitlines()
+                        required = ('python', 'fish') if recipe['distro'] == 'arch' else ('python3', 'fish')
+                        if 'debian' in recipe['features'].split(','):
+                            required += ('python3-venv',)
+                        for package in required:
+                            self.assertIn(package, arguments)
+
     def copy_inventory_to_controller(self, root):
         repository = WORKFLOW.parents[2]
         source = (repository / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
