@@ -509,6 +509,44 @@ pub enum Backend {
     Mock,
 }
 
+/// Search identity semantics selected from the live backend, never from a name alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchNameKind {
+    Literal,
+    RpmIdentity,
+}
+
+impl SearchNameKind {
+    pub(crate) const fn from_backend(backend: Backend) -> Self {
+        match backend {
+            Backend::Fedora => Self::RpmIdentity,
+            _ => Self::Literal,
+        }
+    }
+
+    pub(crate) fn for_manager(name: &str, test_mode: bool) -> Self {
+        if name == "dnf" && !test_mode {
+            Self::RpmIdentity
+        } else {
+            Self::Literal
+        }
+    }
+
+    /// Borrow the exact matching key while retaining the qualified display identity.
+    pub(crate) fn exact_key<'a>(self, query: &str, name: &'a str) -> Option<&'a str> {
+        if name == query {
+            return Some(name);
+        }
+        if self == Self::RpmIdentity {
+            let (basename, architecture) = name.rsplit_once('.')?;
+            if !basename.is_empty() && !architecture.is_empty() && basename == query {
+                return Some(basename);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CompiledBackends {
     arch: bool,
@@ -654,6 +692,54 @@ pub use dnf::DnfPackageManager;
 
 #[cfg(test)]
 mod backend_selection_tests {
+    #[test]
+    fn fedora_search_context_selection_and_exact_keys_are_explicit() {
+        use super::{Backend, SearchNameKind};
+        for backend in [
+            Backend::Arch,
+            Backend::Debian,
+            Backend::MacOS,
+            Backend::Mock,
+        ] {
+            assert_eq!(
+                SearchNameKind::from_backend(backend),
+                SearchNameKind::Literal
+            );
+        }
+        assert_eq!(
+            SearchNameKind::from_backend(Backend::Fedora),
+            SearchNameKind::RpmIdentity
+        );
+        for name in ["dnf", "apt", "pacman", "brew", "homebrew", "mock", "DNF"] {
+            for test_mode in [false, true] {
+                assert_eq!(
+                    SearchNameKind::for_manager(name, test_mode),
+                    if name == "dnf" && !test_mode {
+                        SearchNameKind::RpmIdentity
+                    } else {
+                        SearchNameKind::Literal
+                    }
+                );
+            }
+        }
+        for (query, name, expected) in [
+            ("tree", "tree.x86_64", Some("tree")),
+            ("python3.13", "python3.13.x86_64", Some("python3.13")),
+            ("tree.x86_64", "tree.x86_64", Some("tree.x86_64")),
+            ("tree", "tree", Some("tree")),
+            ("tree", "tree.", None),
+            ("", ".x86_64", None),
+            ("tree", "tree2.x86_64", None),
+            ("tree", "tree.x86_64.aarch64", None),
+        ] {
+            assert_eq!(SearchNameKind::RpmIdentity.exact_key(query, name), expected);
+            assert_eq!(
+                SearchNameKind::Literal.exact_key(query, name),
+                if name == query { Some(name) } else { None }
+            );
+        }
+    }
+
     use super::{Backend, CompiledBackends, resolve_for};
     use crate::core::env::distro::Distro;
 

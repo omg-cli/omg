@@ -3414,6 +3414,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fedora_search_request_ranks_before_cache_limits_and_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager: Arc<dyn PackageManager> = Arc::new(
+            crate::package_managers::mock::MockPackageManager::new_in("fedora", directory.path()),
+        );
+        let records = [
+            ("tree2.i686", "1", "prefix"),
+            ("tree.x86_64", "2", "exact RPM basename"),
+        ];
+        let index = PackageIndex::from_rpm_records(&records);
+        let state = Arc::new(DaemonState::new_isolated(directory.path(), index, manager).unwrap());
+        for (id, limit) in [(1, 1), (2, 1), (3, 10)] {
+            let response = handle_request(
+                Arc::clone(&state),
+                Request::Search {
+                    id,
+                    query: "tree".into(),
+                    limit: Some(limit),
+                },
+            )
+            .await;
+            let Response::Success {
+                result: ResponseResult::Search(results),
+                ..
+            } = response
+            else {
+                panic!("search response: {response:?}");
+            };
+            assert_eq!(results.total, 2);
+            assert_eq!(results.packages.len(), limit.min(2));
+            assert_eq!(results.packages[0].name, "tree.x86_64");
+            assert_eq!(results.packages[0].version, "2");
+            assert_eq!(results.packages[0].description, "exact RPM basename");
+        }
+        let stale = state.index_snapshot();
+        let replacement = PackageIndex::from_records(&records);
+        state.replace_index(
+            replacement,
+            #[cfg(feature = "arch")]
+            crate::package_managers::pacman_db::AlpmCatalogEpoch::UNIX_EPOCH,
+        );
+        assert!(state.cache.get("tree").is_none());
+        assert!(
+            !state.with_current_index(&stale, || panic!("stale index must not repopulate cache"))
+        );
+        let response = handle_request(
+            state,
+            Request::Search {
+                id: 4,
+                query: "tree".into(),
+                limit: Some(1),
+            },
+        )
+        .await;
+        let Response::Success {
+            result: ResponseResult::Search(results),
+            ..
+        } = response
+        else {
+            panic!("refresh response: {response:?}");
+        };
+        assert_eq!(
+            results.packages[0].name, "tree2.i686",
+            "fresh literal context must replace RPM context"
+        );
+    }
+
+    #[tokio::test]
+    async fn fedora_search_request_preserves_full_identity_priority_in_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager: Arc<dyn PackageManager> = Arc::new(
+            crate::package_managers::mock::MockPackageManager::new_in("fedora", directory.path()),
+        );
+        let index = PackageIndex::from_rpm_records(&[
+            ("tree.x86_64.aarch64", "1", "colliding RPM basename"),
+            ("tree.x86_64", "2", "literal full identity"),
+            ("tree.x86_64-extra.noarch", "3", "prefix"),
+        ]);
+        let state = Arc::new(DaemonState::new_isolated(directory.path(), index, manager).unwrap());
+        for (id, limit) in [(1, 1), (2, 1), (3, 10)] {
+            let response = handle_request(
+                Arc::clone(&state),
+                Request::Search {
+                    id,
+                    query: "tree.x86_64".into(),
+                    limit: Some(limit),
+                },
+            )
+            .await;
+            let Response::Success {
+                result: ResponseResult::Search(results),
+                ..
+            } = response
+            else {
+                panic!("search response: {response:?}");
+            };
+            assert_eq!(results.total, 3);
+            assert_eq!(results.packages.len(), limit.min(3));
+            assert_eq!(results.packages[0].name, "tree.x86_64");
+            assert_eq!(results.packages[0].version, "2");
+            if limit > 1 {
+                assert_eq!(results.packages[1].name, "tree.x86_64.aarch64");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn debian_search_cache_preserves_results_for_larger_limits() {
         let directory = tempfile::tempdir().expect("create isolated search directory");
         let package_manager: Arc<dyn PackageManager> = Arc::new(
