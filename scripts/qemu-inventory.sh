@@ -486,8 +486,26 @@ check_arch_doctor_graph() {
 # END DOCTOR BACKEND ORACLE
 
 # BEGIN INFO NATIVE PACKAGE ORACLE
+rpm_compatible_arches() {
+  set -o pipefail; LC_ALL=C timeout --kill-after=2s 10s rpm --showrc | awk '
+            /^compatible archs[[:space:]]*:/ {
+              rows++
+              sub(/^[^:]*:[[:space:]]*/, "")
+              sub(/[[:space:]]*$/, "")
+              count=split($0, arch, /[[:space:]]+/)
+              if (count < 1 || count > 64 || length($0) > 1024) bad=1
+              for (i=1; i<=count; i++) {
+                if (arch[i] !~ /^[A-Za-z0-9_]+$/) bad=1
+              }
+              compatible=$0
+            }
+            END { if (rows != 1 || bad) exit 1; print compatible }
+          '
+}
+
 check_info_native_package() {
-  local distro=$1 output=$2 status=0 version source actual_version actual_source
+  local distro=$1 output=$2 status=0 version='' source='' actual_name actual_version actual_source
+  local rpm_arches='' native_identity='' native_reference=''
   case "$distro" in
     arch)
       timeout --kill-after=2s 30 pacman -Si pacman > native-info.raw 2> native-info.stderr || status=$?
@@ -498,8 +516,20 @@ check_info_native_package() {
       version=$(awk '$1 == "Candidate:" {print $2}' native-info.raw)
       source='Official repository (apt)' ;;
     fedora)
-      timeout --kill-after=2s 30 dnf --cacheonly repoquery pacman --latest-limit=1 --queryformat '%{evr}' > native-info.raw 2> native-info.stderr || status=$?
-      version=$(cat native-info.raw)
+      rpm_arches=$(rpm_compatible_arches) || { printf 'native info RPM architecture compatibility unavailable\n' >&2; return 2; }
+      timeout --kill-after=2s 30 dnf --cacheonly repoquery pacman --latest-limit=1 --queryformat '%{name}.%{arch}\t%{evr}' > native-info.raw 2> native-info.stderr || status=$?
+      if [[ "$status" == 0 ]]; then
+        native_reference=$(awk -F '\t' -v arches="$rpm_arches" '
+          BEGIN { count=split(arches, values, /[[:space:]]+/); for (i=1; i<=count; i++) supported[values[i]]=1 }
+          {
+            rows++
+            if (NF != 2 || substr($1, 1, 7) != "pacman." || !(substr($1, 8) in supported) || $2 !~ /^[0-9][^[:space:]]*$/) bad=1
+            identity=$1; evr=$2
+          }
+          END { if (rows != 1 || bad) exit 1; print identity "\t" evr }
+        ' native-info.raw) || { printf 'native info reference has an invalid or ambiguous RPM identity and EVR\n' >&2; return 2; }
+        IFS=$'\t' read -r native_identity version <<< "$native_reference"
+      fi
       source='Official repository (dnf)' ;;
     *) return 2 ;;
   esac
@@ -508,16 +538,18 @@ check_info_native_package() {
     head -c 4096 native-info.stderr >&2
     return 2
   fi
-  if [[ $(grep -Ec '^[[:space:]]*Name: pacman$' "$output") != 1 \
-    || $(grep -Ec '^[[:space:]]*Version: ' "$output") != 1 \
-    || $(grep -Ec '^[[:space:]]*Source: ' "$output") != 1 ]]; then
+  if [[ $(grep -Ec '^[[:space:]]*Name:' "$output") != 1 \
+    || $(grep -Ec '^[[:space:]]*Version:' "$output") != 1 \
+    || $(grep -Ec '^[[:space:]]*Source:' "$output") != 1 ]]; then
     printf 'assertion failed: info omitted a unique pacman name, version, or source\n' >&2
     return 1
   fi
-  actual_version=$(awk '$1 == "Version:" {print $2}' "$output")
+  actual_name=$(awk '$1 == "Name:" && NF == 2 {print $2}' "$output")
+  actual_version=$(awk '$1 == "Version:" && NF == 2 {print $2}' "$output")
   actual_source=$(sed -n 's/^[[:space:]]*Source: //p' "$output")
-  printf 'native info %s expected=%s source=%s actual=%s source=%s\n' "$distro" "$version" "$source" "$actual_version" "$actual_source" >&2
-  if [[ "$actual_version" != "$version" || "$actual_source" != "$source" ]]; then
+  printf 'native info %s expected=%s identity=%s source=%s actual=%s identity=%s source=%s\n' "$distro" "$version" "$native_identity" "$source" "$actual_version" "$actual_name" "$actual_source" >&2
+  if [[ ( "$actual_name" != pacman && ( "$distro" != fedora || "$actual_name" != "$native_identity" ) ) \
+    || "$actual_version" != "$version" || "$actual_source" != "$source" ]]; then
     printf 'assertion failed: info disagrees with the native %s package catalog\n' "$distro" >&2
     return 1
   fi
@@ -1990,20 +2022,7 @@ PY
         if [[ "$distro" == fedora ]]; then
           # RPM's install compatibility table includes multilib and noarch.
           # Do not invent an ordering preference or infer it from uname.
-          rpm_arches=$(set -o pipefail; LC_ALL=C timeout --kill-after=2s 10s rpm --showrc | awk '
-            /^compatible archs[[:space:]]*:/ {
-              rows++
-              sub(/^[^:]*:[[:space:]]*/, "")
-              sub(/[[:space:]]*$/, "")
-              count=split($0, arch, /[[:space:]]+/)
-              if (count < 1 || count > 64 || length($0) > 1024) bad=1
-              for (i=1; i<=count; i++) {
-                if (arch[i] !~ /^[A-Za-z0-9_]+$/) bad=1
-              }
-              compatible=$0
-            }
-            END { if (rows != 1 || bad) exit 1; print compatible }
-          ') || { printf 'assertion failed: unavailable RPM architecture compatibility\n' >&2; return 1; }
+          rpm_arches=$(rpm_compatible_arches) || { printf 'assertion failed: unavailable RPM architecture compatibility\n' >&2; return 1; }
         fi
         if ! awk -v distro="$distro" -v arches="$rpm_arches" '
           BEGIN { count=split(arches, values, /[[:space:]]+/); for (i=1; i<=count; i++) supported[values[i]]=1 }
@@ -2024,15 +2043,25 @@ PY
           printf 'assertion failed: search lacks a ranked official tree result\n' >&2; return 1
         fi ;;
       search-firefox-results)
-        local target=firefox
+        local target=firefox rpm_arches=''
         [[ "$distro" != debian && "$distro" != debian-trixie ]] || target=firefox-esr
+        if [[ "$distro" == fedora ]]; then
+          rpm_arches=$(rpm_compatible_arches) || { printf 'assertion failed: unavailable RPM architecture compatibility\n' >&2; return 1; }
+        fi
         if [[ "$code" != 0 ]] || ! grep -Fxq '  | Search' "$stdout" \
           || ! grep -Fxq '    firefox' "$stdout" \
-          || ! awk -v target="$target" '
-            /^  [^[:space:]]+ [^[:space:]]+  / {
-              if ($1 == target && $2 ~ /^[0-9]/ && $3 == "Official" && NF == 3) matches++
+          || ! awk -v target="$target" -v distro="$distro" -v arches="$rpm_arches" '
+            BEGIN { count=split(arches, values, /[[:space:]]+/); for (i=1; i<=count; i++) supported[values[i]]=1 }
+            function exact(name) {
+              return name == target || (distro == "fedora" && substr(name, 1, 8) == "firefox." && (substr(name, 9) in supported))
             }
-            END { exit !(matches == 1) }
+            /^  [^[:space:]]/ {
+              if (exact($1)) {
+                matches++
+                if ($0 !~ /^  [^[:space:]]+ [^[:space:]]+  / || $2 !~ /^[0-9]/ || $3 != "Official" || NF != 3) bad=1
+              }
+            }
+            END { exit !(matches == 1 && !bad) }
           ' "$stdout"; then
           printf 'assertion failed: firefox search lacks its official package and version\n' >&2; return 1
         fi ;;
@@ -2831,7 +2860,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; mkdir -p project/critical; printf '%s%s\n' '-----BEGIN ' 'PRIVATE KEY-----' > project/critical/key.pem"
   fi
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
-  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_workspace_failure); $(declare -f check_product_output); $(declare -f check_workspace_state); $(declare -f check_bash_completion_artifact); $(declare -f check_man_artifacts); $(declare -f check_bash_hook_behavior); $(declare -f check_container_init_artifacts)"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_workspace_failure); $(declare -f rpm_compatible_arches); $(declare -f check_product_output); $(declare -f check_workspace_state); $(declare -f check_bash_completion_artifact); $(declare -f check_man_artifacts); $(declare -f check_bash_hook_behavior); $(declare -f check_container_init_artifacts)"
   if [[ "$assertions" == package-dry-run-* ]]; then
     remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f native_installed_identity); $(declare -f check_native_remove_preview)"
   fi
