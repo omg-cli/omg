@@ -8503,6 +8503,11 @@ mod tests {
             .output()
             .unwrap();
         assert!(
+            secrets.status.success(),
+            "failed to list package-scoped secret keys: {}",
+            String::from_utf8_lossy(&secrets.stderr)
+        );
+        assert!(
             !String::from_utf8_lossy(&secrets.stdout)
                 .lines()
                 .any(|line| line.starts_with("sec:")),
