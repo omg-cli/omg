@@ -949,6 +949,7 @@ class ReportingBoundaryTests(unittest.TestCase):
     def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
                            corrupt=False, expired=False, helper_fails=False, case_log=None,
                            log_case="search", main_shas=None, changed_attempt=False,
+                           advance_main_during_download=False,
                            workflow_path=".github/workflows/qemu-matrix.yml", all_distros=False,
                            latest_tag="v0.1.224", provenance_override=None, commit_shas=None,
                            jobs=None, prior_attempt_artifact=False,
@@ -1060,6 +1061,7 @@ class ReportingBoundaryTests(unittest.TestCase):
         actual_allowed.update(row["case_id"] for row in rows)
         calls = []
         main_refs = iter(main_shas or [run["head_sha"], run["head_sha"]])
+        current_main = [run["head_sha"]]
         tag_commits = iter(commit_shas or ["c" * 40, "c" * 40])
         run_reads = 0
         def api(path, *args):
@@ -1082,9 +1084,12 @@ class ReportingBoundaryTests(unittest.TestCase):
                 return json.dumps(artifacts_payload if artifacts_payload is not None else
                                   dict(total_count=len(artifacts), artifacts=artifacts))
             if "/artifacts/" in path and path.endswith("/zip"):
+                if advance_main_during_download:
+                    current_main[0] = "b" * 40
                 return payloads[int(path.split('/')[-2])]
             if path.endswith("/git/ref/heads/main"):
-                return json.dumps(dict(object=dict(sha=next(main_refs))))
+                return json.dumps(dict(object=dict(sha=(current_main[0]
+                    if advance_main_during_download else next(main_refs)))))
             if path.endswith("/releases/latest"):
                 return json.dumps(dict(tag_name=latest_tag))
             if path.endswith("/commits/v0.1.224"):
@@ -1192,6 +1197,23 @@ class ReportingBoundaryTests(unittest.TestCase):
             rows, conclusion="success", event_kind="schedule",
             all_distros=True, main_shas=["b" * 40])
         self.assertEqual(calls, [])
+        self.assertIsNone(catalog)
+
+    def test_main_advancing_after_admitted_download_blocks_recovery(self):
+        rows = [dict(self.row("PASS"), distro=distro,
+                     case_id=f"qemu-{distro}-search") for distro in REPORT.DISTROS]
+        expected = dict(case_id="qemu-arch-search", distro="arch", arch="x86_64",
+                        result="PASS", exit_code=0, elapsed_seconds=1)
+        calls, catalog = self.run_report_fixture(
+            rows, conclusion="success", event_kind="schedule", all_distros=True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "scripts/qa-file-issue.sh")
+        self.assertIn(expected, calls[0][1])
+        self.assertEqual(catalog["failures"], [])
+        calls, catalog = self.run_report_fixture(
+            rows, conclusion="success", event_kind="schedule", all_distros=True,
+            advance_main_during_download=True)
+        self.assertEqual(calls, [], "stale publication must not reach the issue helper")
         self.assertIsNone(catalog)
 
     def test_main_advancing_during_download_keeps_failures_but_blocks_recovery(self):

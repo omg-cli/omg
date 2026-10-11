@@ -9,6 +9,7 @@ import re
 import signal
 import stat
 import subprocess
+import sys
 import time
 
 import apt_pkg
@@ -71,12 +72,13 @@ def main():
     daemon_environment = dict(environment)
     daemon_environment.pop("OMG_DISABLE_DAEMON")
     process = None
+    socket = Path(environment["OMG_SOCKET_PATH"])
+    queries_validated = False
     try:
         started = time.monotonic()
         with (work / "daemon.log").open("wb") as log:
             process = subprocess.Popen([str(daemon_binary)], env=daemon_environment,
                                        stdout=log, stderr=subprocess.STDOUT)
-            socket = Path(environment["OMG_SOCKET_PATH"])
             deadline = started + 30
             while time.monotonic() < deadline:
                 assert process.poll() is None, "daemon exited before readiness"
@@ -103,17 +105,42 @@ def main():
             receipt["info_requests_delta"] = delta
             assert native_state() == before, "native package installation or reason state changed"
             receipt["native_state_unchanged"] = before
-            receipt["accepted"] = True
+            queries_validated = True
     finally:
-        if process is not None and process.poll() is None:
-            process.send_signal(signal.SIGINT)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-                raise
+        active_error = sys.exc_info()[1]
+        cleanup_error = None
+        try:
+            if process is not None:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGINT)
+                try:
+                    returncode = process.wait(timeout=5)
+                except subprocess.TimeoutExpired as error:
+                    process.kill()
+                    try:
+                        process.wait(timeout=5)
+                    except Exception as reap_error:
+                        error.add_note(f"daemon reap after kill failed: {reap_error}")
+                    raise
+                receipt["shutdown_returncode"] = returncode
+                assert returncode == 0, f"daemon shutdown exited {returncode}"
+                assert not os.path.lexists(socket), "daemon socket remains after shutdown"
+                receipt["socket_absent_after_shutdown"] = True
+            after_shutdown = native_state()
+            assert after_shutdown == before, "native package installation or reason state changed"
+            receipt["native_state_after_shutdown"] = after_shutdown
+        except Exception as error:
+            cleanup_error = error
+            receipt["cleanup_error"] = f"{type(error).__name__}: {error}"
+        if active_error is not None:
+            receipt["operation_error"] = f"{type(active_error).__name__}: {active_error}"
+        receipt["accepted"] = queries_validated and active_error is None and cleanup_error is None
         (work / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        if cleanup_error is not None:
+            if active_error is not None:
+                active_error.add_note(f"daemon cleanup also failed: {cleanup_error}")
+            else:
+                raise cleanup_error
     print(json.dumps(receipt))
 
 

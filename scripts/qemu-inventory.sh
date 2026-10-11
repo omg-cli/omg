@@ -218,7 +218,7 @@ check_native_counter() {
     debian:tc|debian-trixie:tc|ubuntu:tc) native=(dpkg-query -W '-f=${db:Status-Status}\n') ;;
     debian:ec|debian-trixie:ec|ubuntu:ec) native=(apt-mark showmanual) ;;
     debian:oc|debian-trixie:oc|ubuntu:oc) native=(apt-get -s autoremove) ;;
-    debian:uc|debian-trixie:uc|ubuntu:uc) native=(apt list --upgradable) ;;
+    debian:uc|debian-trixie:uc|ubuntu:uc) native=(env LC_ALL=C apt list --upgradable) ;;
     fedora:tc) native=(rpm -qa --qf '%{NAME}.%{ARCH}\n') ;;
     fedora:ec) native=(dnf --cacheonly repoquery --userinstalled --qf '%{name}\n') ;;
     fedora:oc) native=(dnf --cacheonly repoquery --unneeded --qf '%{name}.%{arch}\n') ;;
@@ -324,6 +324,30 @@ check_outdated_native_count() {
   fi
   printf '%s\n' "$actual" > native-count-observed
   check_native_counter "$distro" uc native-count-observed || oracle_rc=$?
+  if [[ "$oracle_rc" != 2 && "$format" == json ]]; then
+    case "$distro" in
+      debian|debian-trixie|ubuntu)
+        if ! jq -R -s -c '
+          split("\n") | map(select(. != "" and . != "Listing...")) |
+          map(if test("^[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?/[^[:space:]]+ [^[:space:]]+ [^[:space:]]+ \\[upgradable from: [^[:space:]]+\\]$")
+            then capture("^(?<name>[^/]+)/[^[:space:]]+ (?<new_version>[^[:space:]]+) (?<architecture>[^[:space:]]+) \\[upgradable from: (?<current_version>[^[:space:]]+)\\]$") |
+              [.name, .current_version, .new_version]
+            else error("malformed native APT update record") end) | sort
+        ' native-counter.raw > native-update-tuples.json; then
+          printf 'native APT update reference processing failed\n' >&2
+          return 2
+        fi
+        if ! jq -c 'map([.name, .current_version, .new_version]) | sort' "$output" > product-update-tuples.json; then
+          printf 'assertion failed: outdated JSON tuple processing failed\n' >&2
+          return 1
+        fi
+        if ! cmp -s native-update-tuples.json product-update-tuples.json; then
+          printf 'assertion failed: outdated update identities or versions disagree with native APT\n' >&2
+          return 1
+        fi
+        ;;
+    esac
+  fi
   if [[ "$oracle_rc" == 1 ]]; then
     printf 'assertion failed: outdated count disagrees with the native %s package manager\n' "$distro" >&2
   fi

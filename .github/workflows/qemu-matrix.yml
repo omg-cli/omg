@@ -111,6 +111,13 @@ jobs:
           python3 -m unittest discover -s scripts -p test_qemu_runner_isolation.py
           python3 -m unittest discover -s scripts -p test_qemu_controller_floor.py
 
+      - name: Verify update identity and daemon lifecycle rejection cases
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          python3 -B -m unittest discover -s scripts -p test_update_identity_runner.py -v
+          python3 -B -m unittest discover -s scripts -p test_debian_daemon_catalog_lifecycle.py -v
+
       - name: Verify harness and reporting fixtures before guest builds
         run: |
           ./scripts/test-release-smoke.sh
