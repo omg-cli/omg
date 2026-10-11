@@ -526,6 +526,61 @@ class DescriptorTests(unittest.TestCase):
         for name in TRANSACTION_PRIVATE:
             self.assertFalse((self.destination / (prefix + name)).exists())
 
+    def test_initial_qemu_startup_cli_exports_exact_bytes_without_private_neighbors(self):
+        name = "run-test/guest/qemu-startup.log"
+        content = b"qemu-system-x86_64: network backend failed\n"
+        source = self.fixture(name, content)
+        self.fixture("run-test/guest/serial.log", b"Booting Debian\n")
+        excluded = ("run-test/guest/client-key", "run-test/guest/overlay.qcow2",
+                    "run-test/guest/qemu-startup.log.bak", "run-test/guest/other.log",
+                    "run-test/guest/private/qemu-startup.log", "run-test/qemu-startup.log")
+        for neighbor in excluded:
+            self.fixture(neighbor, b"private-neighbor")
+        external = self.root / "private"
+        external.write_bytes(b"outside secret")
+        link = "run-test/guest/qemu-startup.log.link"
+        (self.source / link).symlink_to(external)
+        result = subprocess.run([
+            sys.executable, "-B", str(Path(__file__).with_name("export-qemu-evidence.py")),
+            "--source", str(self.source), "--destination", str(self.destination),
+            "--uid", str(os.getuid()), "--gid", str(os.getgid()),
+        ], capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads((self.destination / "export-report.json").read_text())
+        self.assertIn(name, report["copied"], "initial QEMU startup diagnostic was omitted")
+        self.assertEqual(set(report["copied"]), {name, "run-test/guest/serial.log"})
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["bytes"], len(content) + len(b"Booting Debian\n"))
+        self.assertEqual((self.destination / name).read_bytes(), content)
+        self.assertEqual(source.read_bytes(), content)
+        self.assertEqual(stat.S_IMODE((self.destination / name).stat().st_mode), 0o600)
+        self.assertEqual((self.destination / name).stat().st_uid, os.getuid())
+        for neighbor in (*excluded, link):
+            self.assertFalse((self.destination / neighbor).exists())
+        self.assertEqual(external.read_bytes(), b"outside secret")
+        self.assertNotIn("outside secret", (self.destination / "export-report.json").read_text())
+
+    def test_initial_qemu_startup_cli_refuses_a_link_at_the_exact_diagnostic_path(self):
+        external = self.root / "private"
+        external.write_bytes(b"outside secret")
+        name = "run-test/guest/qemu-startup.log"
+        path = self.source / name
+        path.parent.mkdir(parents=True)
+        path.symlink_to(external)
+        result = subprocess.run([
+            sys.executable, "-B", str(Path(__file__).with_name("export-qemu-evidence.py")),
+            "--source", str(self.source), "--destination", str(self.destination),
+            "--uid", str(os.getuid()), "--gid", str(os.getgid()),
+        ], capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        report = json.loads((self.destination / "export-report.json").read_text())
+        self.assertEqual(report["copied"], [])
+        self.assertEqual([item["path"] for item in report["errors"]], [name])
+        self.assertFalse((self.destination / name).exists())
+        self.assertEqual(external.read_bytes(), b"outside secret")
+        self.assertNotIn("outside secret", (self.destination / "export-report.json").read_text())
+
+
     def test_failed_clone_startup_log_survives_export_at_trial_root(self):
         name = "run-test/transactions/trials/remove-native-001/boot.qemu-startup.log"
         self.fixture(name, b"QEMU network backend failed")

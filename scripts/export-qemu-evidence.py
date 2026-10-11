@@ -172,7 +172,7 @@ def allowed_file(parts):
     if parent == ():
         return name in HOST_FILES
     if parent == ("guest",):
-        return name == "serial.log"
+        return name in {"serial.log", "qemu-startup.log"}
     if parent == ("guest", "evidence"):
         return name in GUEST_FILES
     if parent == ("guest", "evidence", "apt-abi"):
