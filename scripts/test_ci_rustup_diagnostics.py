@@ -110,4 +110,27 @@ class WorkflowBytesTests(unittest.TestCase):
   for first,second in [('Stage Rustup diagnostics','Install pinned Rust toolchain'),('Install pinned Rust toolchain','uses: actions/checkout@'),('Join Rustup diagnostic source before first proxy','Cache Rust dependencies')]:self.assertLess(block.index(first),block.index(second))
   self.assertLess(block.index('observe before_minimal'),block.index('"$RUSTUP_INSTALL"'))
   upload=block.split('      - name: Preserve Rustup diagnostics\n',1)[1].split('\n      # sccache',1)[0];self.assertIn('        if: always()\n',upload);self.assertIn('          if-no-files-found: error\n',upload)
+ def test_job_environment_contexts_and_private_diagnostic_path(self):
+  import re
+  text=(C/'.github/workflows/ci.yml').read_text()
+  allowed={'github','needs','strategy','matrix','vars','secrets','inputs'}
+  # GitHub's jobs.<job_id>.env context table excludes runner and env.
+  for job,body in re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)',text,re.M|re.S):
+   env=re.search(r'^    env:\n(.*?)(?=^    \S|\Z)',body,re.M|re.S)
+   if env:
+    for expression in re.findall(r'\$\{\{(.*?)\}\}',env.group(1),re.S):
+     roots=set(re.findall(r'\b([A-Za-z_]\w*)\s*[.\[]',expression))
+     self.assertLessEqual(roots,allowed,f'{job} job env uses unavailable contexts: {roots-allowed}')
+  block=text.split('  linux-matrix:',1)[1].split('\n  sandbox-cancellation:',1)[0]
+  template=re.search(r'^      RUSTUP_DIAGNOSTICS_DIR: (.+)$',block,re.M).group(1)
+  lanes=re.findall(r'^          - platform: (\S+)$',block,re.M)
+  self.assertEqual(len(lanes),5)
+  paths=[]
+  for run,attempt,lane in [(run,attempt,lane) for run in ['41','42'] for attempt in ['1','2'] for lane in lanes]:
+   values={'github.run_id':run,'github.run_attempt':attempt,'matrix.platform':lane}
+   rendered=re.sub(r'\$\{\{\s*(.*?)\s*\}\}',lambda match:values[match.group(1)],template)
+   path=pathlib.PurePosixPath(rendered)
+   self.assertTrue(path.is_absolute());self.assertEqual(path.parent,pathlib.PurePosixPath('/tmp'))
+   self.assertNotEqual(path.name,'');paths.append(str(path))
+  self.assertEqual(len(set(paths)),len(paths),'runs, attempts and matrix lanes must not share diagnostic output')
 if __name__=='__main__':unittest.main(verbosity=2)
