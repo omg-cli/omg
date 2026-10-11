@@ -101,6 +101,91 @@ class DiagnosticsTests(unittest.TestCase):
   for i,declared in enumerate(['a'*40,'', 'not-a-commit']):
    with patch.dict('os.environ',{'GITHUB_SHA':declared}):
     out=self.root/f'refused-{i}';self.assertFalse(m.join(repo,out));d=json.loads((out/'source-join.json').read_text());self.assertEqual(d['state'],'staging_error');self.assertIn('error',d)
+class BookkeepingTests(unittest.TestCase):
+ setUp=DiagnosticsTests.setUp
+ fixture=DiagnosticsTests.fixture
+ def bookkeeping_fixture(self):
+  self.fixture();meta=self.tc/'lib/rustlib'
+  (meta/'multirust-config.toml').write_text('config_version = "1"\n[[components]]\npkg = "rustfmt-preview"\ntarget = "x86_64-unknown-linux-gnu"\nis_extension = false\n')
+  (meta/'multirust-channel-manifest.toml').write_text('manifest-version = "2"\ndate = "2026-04-16"\n[pkg.rustfmt-preview.target.x86_64-unknown-linux-gnu]\navailable = true\n')
+  return meta
+ def test_actual_bookkeeping_capture_and_cofault(self):
+  meta=self.bookkeeping_fixture();m=helper();d=m.snapshot(self.tc);b=d['rustup_bookkeeping']
+  self.assertEqual(b['state'],'bookkeeping_observed')
+  self.assertEqual(b['rustfmt_config_membership'],{'rustfmt-preview-x86_64-unknown-linux-gnu':True})
+  for name in ('multirust-config.toml','multirust-channel-manifest.toml'):
+   f=b['files'][name];self.assertEqual(f['state'],'captured');self.assertEqual(f['sha256'],hashlib.sha256((meta/name).read_bytes()).hexdigest());self.assertEqual(f['metadata']['size'],(meta/name).stat().st_size)
+  (meta/'multirust-config.toml').write_text('config_version = "1"\ncomponents = []\n')
+  d=m.snapshot(self.tc)
+  self.assertEqual(d['classification']['cargo-fmt']['state'],'destination_and_registered_owner_consistent')
+  self.assertEqual(d['rustup_bookkeeping']['rustfmt_config_membership'],{'rustfmt-preview-x86_64-unknown-linux-gnu':False})
+  self.assertEqual(d['rustup_bookkeeping']['state'],'installer_rustfmt_not_in_config')
+ def test_missing_and_legacy_are_distinct(self):
+  meta=self.bookkeeping_fixture();m=helper()
+  for name in ('multirust-config.toml','multirust-channel-manifest.toml'):
+   path=meta/name;raw=path.read_bytes();path.unlink();b=m.snapshot(self.tc)['rustup_bookkeeping'];self.assertEqual(b['state'],'bookkeeping_file_absent');self.assertEqual(b['files'][name]['state'],'absent');path.write_bytes(raw)
+  out=self.root/'summary';out.mkdir();(out/'before_minimal.json').write_text(json.dumps({'snapshot':{'components':{}}}));m.summary(out)
+  self.assertEqual(json.loads((out/'stage-status.json').read_text())['bookkeeping_stages']['before_minimal'],'bookkeeping_not_collected')
+ def test_malformed_duplicate_unknown_and_rename_stay_unknown(self):
+  meta=self.bookkeeping_fixture();m=helper();config=meta/'multirust-config.toml';original=config.read_bytes()
+  cases=[('broken [','bookkeeping_parse_error'),('config_version="9"\ncomponents=[]','bookkeeping_unknown_schema'),('config_version="1"\ncomponents=[{pkg="rustfmt-preview",target="*"}]','bookkeeping_unknown_schema'),('config_version="1"\ncomponents=[{pkg="rustfmt-preview",target="x86_64-unknown-linux-gnu"},{pkg="rustfmt-preview",target="x86_64-unknown-linux-gnu"}]','bookkeeping_unknown_schema')]
+  for text,state in cases:
+   with self.subTest(text=text):config.write_text(text);self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],state)
+  config.write_bytes(original);manifest=meta/'multirust-channel-manifest.toml';manifest.write_text(manifest.read_text()+'\n[renames.rustfmt]\nto="rustfmt-preview"\n');self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],'bookkeeping_unknown_schema')
+ def test_actual_bookkeeping_read_identity_fault(self):
+  from unittest.mock import patch
+  meta=self.bookkeeping_fixture();m=helper();p=meta/'multirust-config.toml';replacement=self.root/'replacement';replacement.write_bytes(p.read_bytes());original=pathlib.Path.open
+  def changing(target,*args,**kwargs):
+   if target==p and args and args[0]=='rb' and replacement.exists():replacement.replace(p)
+   return original(target,*args,**kwargs)
+  with patch.object(pathlib.Path,'open',changing):
+   d=m.snapshot(self.tc);self.assertEqual(d['state'],'diagnostic_error');self.assertEqual(d['rustup_bookkeeping']['state'],'diagnostic_error');self.assertIn('changed during read',str(d['rustup_bookkeeping']['files'][p.name]['error']))
+  self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],'bookkeeping_observed')
+ def test_nonregular_symlink_and_oversize_bookkeeping_errors(self):
+  meta=self.bookkeeping_fixture();m=helper();p=meta/'multirust-config.toml';raw=p.read_bytes();p.unlink();p.mkdir();self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],'diagnostic_error');p.rmdir();p.symlink_to('multirust-channel-manifest.toml');self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],'diagnostic_error');p.unlink();p.write_bytes(b'x'*(1024*1024+1));self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],'diagnostic_error');p.write_bytes(raw);self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],'bookkeeping_observed')
+ def test_real_unreadable_bookkeeping_retains_error(self):
+  import os
+  meta=self.bookkeeping_fixture();self.root.chmod(0o755);p=meta/'multirust-config.toml';p.chmod(0);out=self.root/'out';out.mkdir();out.chmod(0o777)
+  prefix=['setpriv','--reuid=65534','--regid=65534','--clear-groups','--bounding-set=-all','--no-new-privs'] if os.geteuid()==0 else []
+  command=[*prefix,'python3','-B',str(C/'scripts/ci-rustup-diagnostics.py'),'capture','--toolchain',str(self.tc),'--stage','before_minimal','--out',str(out)]
+  try:r=subprocess.run(command,capture_output=True,text=True,timeout=10)
+  finally:p.chmod(0o644)
+  self.assertEqual(r.returncode,0,r.stderr);d=json.loads((out/'before_minimal.json').read_text());self.assertEqual(d['snapshot']['state'],'diagnostic_error');self.assertIn('PermissionError',d['snapshot']['rustup_bookkeeping']['files'][p.name]['error']);self.assertEqual(d['actor']['uid'],65534 if prefix else os.geteuid())
+ def test_disappearance_after_observation_is_error_not_absent(self):
+  from unittest.mock import patch
+  meta=self.bookkeeping_fixture();m=helper();p=meta/'multirust-config.toml';original=pathlib.Path.open
+  def disappearing(target,*args,**kwargs):
+   if target==p and args and args[0]=='rb':p.unlink()
+   return original(target,*args,**kwargs)
+  with patch.object(pathlib.Path,'open',disappearing):
+   b=m.snapshot(self.tc)['rustup_bookkeeping'];self.assertEqual(b['state'],'diagnostic_error');self.assertEqual(b['files'][p.name]['state'],'diagnostic_error')
+ def test_bookkeeping_fault_keeps_installer_manifest_and_bins(self):
+  meta=self.bookkeeping_fixture();p=meta/'multirust-config.toml';p.unlink();p.mkdir();d=helper().snapshot(self.tc)
+  self.assertEqual(d['state'],'diagnostic_error');self.assertEqual(d['rustup_bookkeeping']['state'],'diagnostic_error');self.assertEqual(d['components']['manifest-rustfmt-preview-x86_64-unknown-linux-gnu']['text'],'file:bin/cargo-fmt\nfile:bin/rustfmt\n')
+  self.assertTrue(d['bins']['cargo-fmt']['present']);self.assertEqual(d['bins']['cargo-fmt']['sha256'],hashlib.sha256(b'fixture').hexdigest());self.assertEqual(d['classification']['cargo-fmt']['state'],'destination_and_registered_owner_consistent')
+ def test_installer_fault_keeps_bookkeeping_and_unknown_membership(self):
+  meta=self.bookkeeping_fixture();p=meta/'components';p.unlink();p.mkdir();d=helper().snapshot(self.tc)
+  self.assertEqual(d['state'],'diagnostic_error');b=d['rustup_bookkeeping'];self.assertEqual(b['files']['multirust-config.toml']['state'],'captured');self.assertEqual(b['config_component_pairs'],[{'pkg':'rustfmt-preview','target':'x86_64-unknown-linux-gnu'}]);self.assertEqual(b['membership_state'],'installer_components_not_observed');self.assertNotIn('rustfmt_config_membership',b);self.assertTrue(d['bins']['cargo-fmt']['present']);self.assertNotIn('classification',d)
+ def test_bin_fault_keeps_other_bins_and_both_metadata_layers(self):
+  from unittest.mock import patch
+  self.bookkeeping_fixture();m=helper();original=m.destination
+  def failed(path):
+   if path.name=='cargo-fmt':raise OSError('controlled destination read fault')
+   return original(path)
+  with patch.object(m,'destination',failed):d=m.snapshot(self.tc)
+  self.assertEqual(d['state'],'diagnostic_error');self.assertEqual(d['bins']['cargo-fmt']['state'],'diagnostic_error');self.assertTrue(d['bins']['rustfmt']['present']);self.assertEqual(d['rustup_bookkeeping']['state'],'bookkeeping_observed');self.assertIn('manifest-rustfmt-preview-x86_64-unknown-linux-gnu',d['components']);self.assertNotIn('classification',d)
+ def test_actual_summary_legacy_unreached_and_malformed(self):
+  m=helper();out=self.root/'out';out.mkdir();(out/'before_minimal.json').write_text(json.dumps({'snapshot':{}}));(out/'after_minimal.json').write_text('{bad');(out/'after_components.json').write_text(json.dumps({'snapshot':{'rustup_bookkeeping':{'state':'diagnostic_error'}}}));m.summary(out);d=json.loads((out/'stage-status.json').read_text())
+  self.assertEqual(d['bookkeeping_stages'],{'before_minimal':'bookkeeping_not_collected','after_minimal':'diagnostic_error','after_components':'diagnostic_error','before_first_proxy':'not_reached'});self.assertIn('after_minimal',d['summary_errors'])
+ def test_actual_summary_unreadable_is_error_not_unreached(self):
+  import os
+  self.root.chmod(0o755);out=self.root/'out';out.mkdir();out.chmod(0o777);p=out/'before_minimal.json';p.write_text(json.dumps({'snapshot':{}}));p.chmod(0)
+  prefix=['setpriv','--reuid=65534','--regid=65534','--clear-groups','--bounding-set=-all','--no-new-privs'] if os.geteuid()==0 else []
+  try:r=subprocess.run([*prefix,'python3','-B',str(C/'scripts/ci-rustup-diagnostics.py'),'summary','--out',str(out)],capture_output=True,text=True,timeout=10)
+  finally:p.chmod(0o644)
+  self.assertEqual(r.returncode,0,r.stderr);d=json.loads((out/'stage-status.json').read_text());self.assertEqual(d['bookkeeping_stages']['before_minimal'],'diagnostic_error');self.assertIn('PermissionError',d['summary_errors']['before_minimal'])
+ def test_summary_large_envelope_and_explicit_bound(self):
+  m=helper();out=self.root/'out';out.mkdir();(out/'before_minimal.json').write_text(json.dumps({'snapshot':{'rustup_bookkeeping':{'state':'bookkeeping_observed'},'raw_fixture':'x'*(1024*1024)}}));(out/'after_minimal.json').write_text(json.dumps({'snapshot':{'raw_fixture':'x'*(4*1024*1024)}}));m.summary(out);d=json.loads((out/'stage-status.json').read_text());self.assertEqual(d['bookkeeping_stages']['before_minimal'],'bookkeeping_observed');self.assertEqual(d['bookkeeping_stages']['after_minimal'],'diagnostic_error');self.assertIn('metadata exceeds limit',d['summary_errors']['after_minimal'])
 class WorkflowBytesTests(unittest.TestCase):
  def test_embedded_helper_and_ordering(self):
   text=(C/'.github/workflows/ci.yml').read_text();block=text.split('  linux-matrix:',1)[1].split('\n  sandbox-cancellation:',1)[0]

@@ -428,6 +428,7 @@ jobs:
           import re
           import stat
           import subprocess
+          import tomllib
 
           STAGES = ('before_minimal', 'after_minimal', 'after_components', 'before_first_proxy')
 
@@ -437,17 +438,17 @@ jobs:
                       info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-          def read_regular(path):
+          def read_regular(path, limit=1024 * 1024):
               before = path.lstat()
               if not stat.S_ISREG(before.st_mode):
                   raise OSError(f'not a regular metadata file: {path}')
-              if before.st_size > 1024 * 1024:
+              if before.st_size > limit:
                   raise OSError(f'metadata exceeds limit: {path}')
               with path.open('rb') as stream:
-                  data = stream.read(1024 * 1024 + 1)
+                  data = stream.read(limit + 1)
                   opened = os.fstat(stream.fileno())
               after = path.lstat()
-              if stable(before) != stable(opened) or stable(before) != stable(after) or len(data) > 1024 * 1024:
+              if stable(before) != stable(opened) or stable(before) != stable(after) or len(data) > limit:
                   raise OSError(f'metadata changed during read: {path}')
               return {'text': data.decode('utf-8'), 'sha256': hashlib.sha256(data).hexdigest()}
 
@@ -501,35 +502,140 @@ jobs:
               return result
 
 
+          def bookkeeping(metadata, installer_components):
+              result = {'state': 'diagnostic_error', 'files': {}}
+              for name in ('multirust-config.toml', 'multirust-channel-manifest.toml'):
+                  path = metadata/name
+                  before = None
+                  try:
+                      before = path.lstat()
+                      item = read_regular(path)
+                      if stable(before) != stable(path.lstat()):
+                          raise OSError(f'metadata changed during read: {path}')
+                      item.update(state='captured', metadata=dict(uid=before.st_uid, gid=before.st_gid,
+                                  mode=oct(stat.S_IMODE(before.st_mode)), size=before.st_size,
+                                  inode=before.st_ino, device=before.st_dev,
+                                  mtime_ns=before.st_mtime_ns, ctime_ns=before.st_ctime_ns))
+                      result['files'][name] = item
+                  except FileNotFoundError as error:
+                      result['files'][name] = ({'state': 'absent'} if before is None else
+                                               {'state': 'diagnostic_error',
+                                                'error': f'FileNotFoundError: {error}'})
+                  except (OSError, ValueError, UnicodeError) as error:
+                      result['files'][name] = {'state': 'diagnostic_error',
+                                               'error': f'{type(error).__name__}: {error}'}
+              states = [item['state'] for item in result['files'].values()]
+              if 'diagnostic_error' in states:
+                  return result
+              if 'absent' in states:
+                  result['state'] = 'bookkeeping_file_absent'
+                  return result
+              try:
+                  config = tomllib.loads(result['files']['multirust-config.toml']['text'])
+                  manifest = tomllib.loads(result['files']['multirust-channel-manifest.toml']['text'])
+              except tomllib.TOMLDecodeError as error:
+                  result.update(state='bookkeeping_parse_error', error=str(error))
+                  return result
+              pairs = []
+              supported = config.get('config_version') == '1' and set(config) == {'config_version', 'components'}
+              components = config.get('components')
+              supported = supported and isinstance(components, list)
+              if supported:
+                  for item in components:
+                      if (not isinstance(item, dict) or not {'pkg', 'target'} <= set(item)
+                              or set(item) - {'pkg', 'target', 'is_extension'}
+                              or not isinstance(item.get('pkg'), str) or not isinstance(item.get('target'), str)
+                              or not re.fullmatch(r'[A-Za-z0-9_.-]+', item['pkg'])
+                              or not re.fullmatch(r'[A-Za-z0-9_.]+(?:-[A-Za-z0-9_.]+){2,}', item['target'])
+                              or ('is_extension' in item and not isinstance(item['is_extension'], bool))):
+                          supported = False
+                          break
+                      pairs.append((item['pkg'], item['target']))
+              supported = (supported and len(pairs) == len(set(pairs))
+                           and manifest.get('manifest-version') == '2'
+                           and isinstance(manifest.get('date'), str)
+                           and bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}', manifest['date']))
+                           and isinstance(manifest.get('pkg'), dict)
+                           and not manifest.get('renames'))
+              if supported:
+                  fmt_package = manifest['pkg'].get('rustfmt-preview')
+                  fmt_targets = fmt_package.get('target') if isinstance(fmt_package, dict) else None
+                  supported = (isinstance(fmt_targets, dict) and bool(fmt_targets)
+                               and all(isinstance(value, dict) and isinstance(value.get('available'), bool)
+                                       for value in fmt_targets.values()))
+              if not supported:
+                  result['state'] = 'bookkeeping_unknown_schema'
+                  return result
+              result['config_component_pairs'] = [dict(pkg=pkg, target=target) for pkg, target in pairs]
+              result['manifest_identity'] = dict(version='2', date=manifest['date'])
+              if installer_components is None:
+                  result.update(state='bookkeeping_observed', membership_state='installer_components_not_observed')
+                  return result
+              # Membership is an observed relation, not a model of Rustup update planning.
+              membership = {name: any(name == pkg+'-'+target for pkg, target in pairs)
+                            for name in installer_components if name.startswith('rustfmt-preview-')}
+              result['rustfmt_config_membership'] = membership
+              result['membership_state'] = 'observed'
+              result['state'] = ('installer_rustfmt_not_in_config' if not all(membership.values())
+                                 else 'bookkeeping_observed')
+              return result
+
+
           def snapshot(toolchain):
               toolchain = Path(toolchain)
-              result = dict(toolchain=str(toolchain), state='diagnostic_error', errors=[], components={}, bins={})
+              result = dict(toolchain=str(toolchain), state='diagnostic_error', errors=[], components={}, bins={},
+                            rustup_bookkeeping={'state': 'not_captured_due_snapshot_error', 'files': {}})
               try:
                   try:
                       info = toolchain.lstat()
                   except FileNotFoundError:
-                      return dict(toolchain=str(toolchain), state='toolchain_absent')
+                      return dict(toolchain=str(toolchain), state='toolchain_absent',
+                                  rustup_bookkeeping={'state': 'toolchain_absent', 'files': {
+                                      name: {'state': 'absent'} for name in
+                                      ('multirust-config.toml', 'multirust-channel-manifest.toml')}})
                   if not stat.S_ISDIR(info.st_mode):
                       raise OSError('toolchain is not a real directory')
                   for directory in (toolchain/'lib', toolchain/'lib/rustlib', toolchain/'bin'):
                       if not stat.S_ISDIR(directory.lstat().st_mode):
                           raise OSError(f'not a real directory: {directory}')
                   metadata = toolchain/'lib/rustlib'
-                  result['components']['components'] = read_regular(metadata/'components')
-                  names = result['components']['components']['text'].splitlines()
-                  if any(not re.fullmatch(r'[A-Za-z0-9_.-]+', name) for name in names) or len(names) != len(set(names)):
-                      raise ValueError('malformed or duplicate component name')
+                  names = None
+                  installer_errors = []
+                  try:
+                      result['components']['components'] = read_regular(metadata/'components')
+                      observed_names = result['components']['components']['text'].splitlines()
+                      if (any(not re.fullmatch(r'[A-Za-z0-9_.-]+', name) for name in observed_names)
+                              or len(observed_names) != len(set(observed_names))):
+                          raise ValueError('malformed or duplicate component name')
+                      names = observed_names
+                  except (OSError, ValueError, UnicodeError) as error:
+                      installer_errors.append(f'{type(error).__name__}: {error}')
+                  result['rustup_bookkeeping'] = bookkeeping(metadata, names)
+                  if result['rustup_bookkeeping']['state'] == 'diagnostic_error':
+                      result['errors'].extend(item['error'] for item in result['rustup_bookkeeping']['files'].values()
+                                              if item['state'] == 'diagnostic_error')
+                  elif result['rustup_bookkeeping']['state'] == 'bookkeeping_parse_error':
+                      result['errors'].append(result['rustup_bookkeeping']['error'])
                   for path in sorted(metadata.glob('manifest-*')):
-                      item = read_regular(path)
-                      if any(not line.startswith(('file:', 'dir:')) for line in item['text'].splitlines()):
-                          raise ValueError(f'malformed component manifest: {path.name}')
-                      result['components'][path.name] = item
-                  if any('manifest-'+name not in result['components'] for name in names):
-                      raise ValueError('registered component manifest is missing')
+                      try:
+                          item = read_regular(path)
+                          if any(not line.startswith(('file:', 'dir:')) for line in item['text'].splitlines()):
+                              raise ValueError(f'malformed component manifest: {path.name}')
+                          result['components'][path.name] = item
+                      except (OSError, ValueError, UnicodeError) as error:
+                          installer_errors.append(f'{type(error).__name__}: {error}')
+                  if names is not None and any('manifest-'+name not in result['components'] for name in names):
+                      installer_errors.append('ValueError: registered component manifest is missing')
+                  result['errors'].extend(installer_errors)
                   for name in ('cargo-fmt', 'rustfmt', 'rustc'):
-                      result['bins'][name] = destination(toolchain/'bin'/name)
-                  result['classification'] = classify(result)
-                  result['state'] = 'observed'
+                      try:
+                          result['bins'][name] = destination(toolchain/'bin'/name)
+                      except (OSError, ValueError) as error:
+                          result['bins'][name] = {'state': 'diagnostic_error', 'error': f'{type(error).__name__}: {error}'}
+                          result['errors'].append(result['bins'][name]['error'])
+                  if not installer_errors and all('present' in result['bins'][name] for name in ('cargo-fmt', 'rustfmt')):
+                      result['classification'] = classify(result)
+                  result['state'] = 'diagnostic_error' if result['errors'] else 'observed'
               except (OSError, ValueError, UnicodeError) as error:
                   result['errors'].append(f'{type(error).__name__}: {error}')
               return result
@@ -600,6 +706,28 @@ jobs:
               data = envelope()
               data['stages'] = {stage: 'recorded' if (Path(out)/(stage+'.json')).is_file() else 'not_reached'
                                 for stage in STAGES}
+              data['bookkeeping_stages'] = {}
+              for stage in STAGES:
+                  path = Path(out)/(stage+'.json')
+                  try:
+                      path.lstat()
+                  except FileNotFoundError:
+                      data['bookkeeping_stages'][stage] = 'not_reached'
+                      continue
+                  try:
+                      recorded = json.loads(read_regular(path, limit=4 * 1024 * 1024)['text'])
+                      if not isinstance(recorded, dict) or not isinstance(recorded.get('snapshot'), dict):
+                          raise ValueError('malformed snapshot envelope')
+                      item = recorded['snapshot'].get('rustup_bookkeeping')
+                      if item is None:
+                          data['bookkeeping_stages'][stage] = 'bookkeeping_not_collected'
+                      elif isinstance(item, dict) and isinstance(item.get('state'), str):
+                          data['bookkeeping_stages'][stage] = item['state']
+                      else:
+                          raise ValueError('malformed bookkeeping observation')
+                  except (OSError, ValueError, UnicodeError) as error:
+                      data['bookkeeping_stages'][stage] = 'diagnostic_error'
+                      data.setdefault('summary_errors', {})[stage] = f'{type(error).__name__}: {error}'
               write_once(out, 'stage-status.json', data)
 
 
@@ -627,7 +755,7 @@ jobs:
           if __name__ == '__main__':
               raise SystemExit(main())
           RUSTUP_DIAGNOSTICS_PY
-          echo "a5d10378f3a906be240f66d3b62ddcbe9d016c73e3affdb083137feafa0c9fe2  $RUSTUP_DIAGNOSTICS_DIR/helper.py" | sha256sum --check
+          echo "ff645fc3a2c9fb992e895ab663309c88b57634ee7f75c6975006bfc44ed30990  $RUSTUP_DIAGNOSTICS_DIR/helper.py" | sha256sum --check
 
       - name: Install pinned Rust toolchain
         env:
@@ -694,7 +822,7 @@ jobs:
         run: |
           mkdir -p "$RUSTUP_DIAGNOSTICS_DIR"
           if command -v python3 >/dev/null 2>&1 && \
-             echo "a5d10378f3a906be240f66d3b62ddcbe9d016c73e3affdb083137feafa0c9fe2  $RUSTUP_DIAGNOSTICS_DIR/helper.py" | sha256sum --check; then
+             echo "ff645fc3a2c9fb992e895ab663309c88b57634ee7f75c6975006bfc44ed30990  $RUSTUP_DIAGNOSTICS_DIR/helper.py" | sha256sum --check; then
             python3 "$RUSTUP_DIAGNOSTICS_DIR/helper.py" summary --out "$RUSTUP_DIAGNOSTICS_DIR"
           else
             printf '%s\n' 'staging_error: verified helper or Python unavailable; stage files may be missing' > "$RUSTUP_DIAGNOSTICS_DIR/diagnostics-unavailable.txt"
