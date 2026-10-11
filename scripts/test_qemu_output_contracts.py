@@ -3017,6 +3017,13 @@ esac
                         self.assertEqual(evidence[0]['result'], verdict, logs)
                         self.assertEqual(result.returncode, int(verdict == 'FAIL'), result.stderr)
                         self.assertIn(f'native counter {command} expected=2 actual={value}', logs[case + '.log'])
+                broken = {name: 'echo native-reference-failed >&2\nexit 17\n' for name in native}
+                with self.subTest(distro=distro, command=command, native_reference='failed'):
+                    result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
+                                                               native_commands=broken, distro=distro)
+                    self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('native counter reference failed', logs[case + '.log'])
             explicit = ['explicit\t["explicit","--count"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tnative-count\ttempdir-drop']
             for value, verdict in [('2', 'PASS'), ('0', 'FAIL')]:
                 with self.subTest(distro=distro, case='explicit', value=value):
@@ -3024,12 +3031,6 @@ esac
                         f'printf "{value}\\n"\n', explicit, native_commands=native, distro=distro)
                     self.assertEqual(evidence[0]['result'], verdict)
                     self.assertEqual(result.returncode, int(verdict == 'FAIL'))
-            broken = {name: 'echo native-reference-failed >&2\nexit 17\n' for name in native}
-            result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
-                                                       native_commands=broken, distro=distro)
-            self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn('native counter reference failed', logs[case + '.log'])
         rows = ['explicit-shortcut\t["ec"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tnative-count\ttempdir-drop']
         result, evidence, logs = self.run_inventory('printf "0\\n"\n', rows,
             native_commands=dict(native, sort='exit 17\n'))

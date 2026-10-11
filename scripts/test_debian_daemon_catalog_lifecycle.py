@@ -13,6 +13,8 @@ import types
 import unittest
 from unittest.mock import patch
 
+REAL_POPEN = subprocess.Popen
+
 SCRIPT = Path(__file__).with_name("test-debian-daemon-catalog.py")
 
 
@@ -76,6 +78,7 @@ class CatalogueCase:
         stdout.flush()
         class Process:
             returncode = None
+            shutdown_requested = False
             def poll(self):
                 if case.already_exited and case.counter >= 2:
                     self.returncode = case.shutdown_code
@@ -83,13 +86,14 @@ class CatalogueCase:
             def send_signal(self, value):
                 if value != signal.SIGINT:
                     raise AssertionError(value)
+                self.shutdown_requested = True
             def wait(self, timeout):
+                if self.returncode is None and (not self.shutdown_requested or case.shutdown_code == "timeout"):
+                    raise subprocess.TimeoutExpired(argv, timeout)
                 case.shutdown = True
                 case.listener.close()
                 if not case.leave_socket:
                     path.unlink(missing_ok=True)
-                if case.shutdown_code == "timeout" and self.returncode is None:
-                    raise subprocess.TimeoutExpired(argv, timeout)
                 if self.returncode is None:
                     self.returncode = case.shutdown_code
                 return self.returncode
@@ -247,6 +251,64 @@ class SupplementaryCatalogueLifecycle(unittest.TestCase):
             self.assertNotIn("operation_error", receipt)
             self.assertNotIn("cleanup_error", receipt)
             self.assertTrue(case.shutdown)
+
+
+class ChildProcessCase(CatalogueCase):
+    def popen(self, argv, env, stdout, stderr):
+        # A real owned child must receive SIGINT, clean its socket and exit.
+        # APT and CLI adapters remain synthetic; this is no native daemon proof.
+        self.environment = env
+        child = r"""
+import os
+from pathlib import Path
+import signal
+import socket
+import time
+stopping = False
+def stop(signum, frame):
+    global stopping
+    stopping = True
+signal.signal(signal.SIGINT, stop)
+path = Path(os.environ["OMG_SOCKET_PATH"])
+listener = socket.socket(socket.AF_UNIX)
+listener.bind(str(path))
+path.chmod(0o600)
+print("Package index loaded: 25000 packages", flush=True)
+try:
+    while not stopping:
+        time.sleep(0.01)
+finally:
+    listener.close()
+    path.unlink()
+"""
+        self.process = REAL_POPEN([sys.executable, "-B", "-c", child], env=env,
+                                  stdout=stdout, stderr=stderr)
+        return self.process
+
+    @contextlib.contextmanager
+    def module(self):
+        self.process = None
+        try:
+            with super().module() as module:
+                yield module
+        finally:
+            if self.process is not None and self.process.poll() is None:
+                self.process.kill()
+                self.process.wait(timeout=5)
+
+
+class ChildProcessShutdown(unittest.TestCase):
+    def test_owned_child_exits_cleanly_after_shutdown_request(self):
+        with tempfile.TemporaryDirectory(prefix="catalogue-child-") as directory:
+            case = ChildProcessCase(Path(directory))
+            with case.module() as module:
+                module.main()
+            receipt = case.receipt()
+            self.assertTrue(receipt["accepted"])
+            self.assertEqual(case.process.returncode, 0)
+            self.assertEqual(receipt["shutdown_returncode"], 0)
+            self.assertTrue(receipt["socket_absent_after_shutdown"])
+            self.assertFalse(Path(case.environment["OMG_SOCKET_PATH"]).exists())
 
 
 if __name__ == "__main__":
