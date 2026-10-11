@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
     'contract_coverage', Path(__file__).with_name('check-contract-coverage.py'))
@@ -399,6 +400,34 @@ class StrictEvidenceReader(unittest.TestCase):
             path.write_bytes(json.dumps(value + 'x').encode('utf-8'))
             with self.assertRaisesRegex(ValueError, '^oversized evidence file$'):
                 COVERAGE.read_json(path)
+
+    def test_growth_between_size_check_and_read_is_bounded(self):
+        original_open = Path.open
+        for initial_size, final_size, accepted in (
+            (COVERAGE.MAX_BYTES - 1, COVERAGE.MAX_BYTES, True),
+            (COVERAGE.MAX_BYTES, COVERAGE.MAX_BYTES + 1, False),
+        ):
+            with self.subTest(final_size=final_size), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'evidence.json'
+                path.write_bytes(json.dumps('x' * (initial_size - 2)).encode('utf-8'))
+                growth = []
+                value = 'x' * (final_size - 2)
+
+                def open_after_growth(file, mode='r', *args, **kwargs):
+                    if file == path and mode == 'rb':
+                        before = file.stat().st_size
+                        with original_open(file, 'wb') as stream:
+                            stream.write(json.dumps(value).encode('utf-8'))
+                        growth.append((before, file.stat().st_size))
+                    return original_open(file, mode, *args, **kwargs)
+
+                with patch.object(COVERAGE.Path, 'open', autospec=True, side_effect=open_after_growth):
+                    if accepted:
+                        self.assertEqual(COVERAGE.read_json(path), value)
+                    else:
+                        with self.assertRaisesRegex(ValueError, '^evidence exceeded limit$'):
+                            COVERAGE.read_json(path)
+                self.assertEqual(growth, [(initial_size, final_size)])
 
     def test_valid_json_is_read(self):
         with tempfile.TemporaryDirectory() as directory:

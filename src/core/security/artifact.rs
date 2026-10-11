@@ -387,15 +387,22 @@ mod tests {
     }
     #[test]
     fn forged_unsealed_handoff_is_rejected() -> Result<()> {
+        use rustix::fs::{MemfdFlags, memfd_create};
         use std::os::fd::AsRawFd;
-        let file = tempfile::tempfile()?;
+        let mut file = File::from(memfd_create(
+            "omg-unsealed-test",
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+        )?);
+        file.write_all(b"approved")?;
         let token = format!(
             "{PREFIX}{}/{}/{}/none/test.pkg.tar.zst",
             std::process::id(),
             file.as_raw_fd(),
-            "0".repeat(64)
+            "2687f86ed6784b8a5fca36e6c468e12aa44dc3c7e8137e3160d1a95079bdcd02"
         );
-        assert!(ArchiveSnapshot::from_handoff(&token).is_err());
+        let error = ArchiveSnapshot::from_handoff(&token)
+            .expect_err("an unsealed handoff must be rejected even with the correct digest");
+        assert_eq!(error.to_string(), "Package handoff is not immutable");
         Ok(())
     }
 

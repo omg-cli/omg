@@ -910,11 +910,21 @@ mod tests {
 
     #[tokio::test]
     async fn native_sync_executes_exact_apt_update_command() {
-        let (_directory, program) = fake_apt_script("[ \"$#\" -eq 1 ] && [ \"$1\" = update ]");
+        let (_directory, program) = fake_apt_script(
+            "printf '%s\n' \"$#\" \"$@\" >> \"$0.invocations\"\n[ \"$#\" -eq 1 ] && [ \"$1\" = update ]",
+        );
+        let invocations = program.with_extension("invocations");
+        std::fs::write(&invocations, []).expect("initialize private apt invocation record");
 
         update_apt_lists(&program, false)
             .await
             .expect("apt update command must succeed");
+
+        assert_eq!(
+            std::fs::read(&invocations).expect("read apt invocation record"),
+            b"1\nupdate\n",
+            "apt must run exactly once with the sole argument update",
+        );
     }
 
     #[tokio::test]
