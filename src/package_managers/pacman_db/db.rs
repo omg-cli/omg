@@ -1603,7 +1603,10 @@ pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
     Ok(updates)
 }
 
-fn compile_ignore_patterns(patterns: &[String], setting: &str) -> Result<globset::GlobSet> {
+pub(crate) fn compile_ignore_patterns(
+    patterns: &[String],
+    setting: &str,
+) -> Result<globset::GlobSet> {
     let mut builder = globset::GlobSetBuilder::new();
     for pattern in patterns {
         let glob = globset::Glob::new(pattern)
