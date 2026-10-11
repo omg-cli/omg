@@ -25,6 +25,8 @@ pub mod aur;
 pub mod aur_deps;
 #[cfg(feature = "arch")]
 mod aur_index;
+#[cfg(all(test, feature = "arch"))]
+pub(crate) use aur_index::{AurIndex as TestAurIndex, build_index as build_test_aur_index};
 #[cfg(feature = "arch")]
 pub mod aur_metadata;
 #[cfg(feature = "arch")]

@@ -1350,7 +1350,26 @@ impl AurClient {
             let query_owned = query.to_string();
             let result = tokio::task::spawn_blocking(move || -> Result<Vec<Package>> {
                 let index = AurIndex::open(&index_path)?;
-                let entries = index.search(&query_owned, 50)?;
+                // Install resolution consumes this bounded search: reserve its
+                // exact source/binary identities before substring matches fill it.
+                let binary_name = format!("{query_owned}-bin");
+                let mut entries = Vec::with_capacity(50);
+                for name in [query_owned.as_str(), binary_name.as_str()] {
+                    if let Some(entry) = index.get(name)? {
+                        entries.push(entry);
+                    }
+                }
+                for entry in index.search(&query_owned, 50)? {
+                    if entries.len() == 50 {
+                        break;
+                    }
+                    if !entries
+                        .iter()
+                        .any(|selected| selected.name.as_str() == entry.name.as_str())
+                    {
+                        entries.push(entry);
+                    }
+                }
                 Ok(entries
                     .into_iter()
                     .filter_map(|entry| {
