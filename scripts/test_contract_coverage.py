@@ -393,8 +393,11 @@ class StrictEvidenceReader(unittest.TestCase):
     def test_file_size_bound_is_enforced(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'evidence.json'
-            path.write_text(' ' * (COVERAGE.MAX_BYTES + 1))
-            with self.assertRaises(ValueError):
+            value = 'x' * (COVERAGE.MAX_BYTES - 2)
+            path.write_bytes(json.dumps(value).encode('utf-8'))
+            self.assertEqual(COVERAGE.read_json(path), value)
+            path.write_bytes(json.dumps(value + 'x').encode('utf-8'))
+            with self.assertRaisesRegex(ValueError, '^oversized evidence file$'):
                 COVERAGE.read_json(path)
 
     def test_valid_json_is_read(self):
