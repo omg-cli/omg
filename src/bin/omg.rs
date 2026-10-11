@@ -1289,7 +1289,10 @@ fn handle_container_command(command: &ContainerCommands) -> Result<()> {
             container: c,
             command: cmd,
         } => container::exec(c, cmd),
-        ContainerCommands::Init { base } => container::init(base.clone()),
+        ContainerCommands::Init {
+            base,
+            installer_digests,
+        } => container::init_with_installer_digests(base.clone(), installer_digests),
     }
 }
 

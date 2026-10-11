@@ -200,17 +200,15 @@ fn show_package_tree(package: &str) -> Result<Cmd<()>> {
     let mut total_dep_size: i64 = 0;
 
     for dep in pkg.depends() {
-        let dep_name = dep.name();
-        if visited.contains(dep_name) {
+        let Some(dep_pkg) = localdb.pkgs().find_satisfier(dep.to_string()) else {
+            continue;
+        };
+        if !visited.insert(dep_pkg.name().to_string()) {
             continue;
         }
-        visited.insert(dep_name.to_string());
-
-        if let Ok(dep_pkg) = localdb.pkg(dep_name) {
-            let size = dep_pkg.isize();
-            dep_sizes.push((dep_name.to_string(), size));
-            total_dep_size += size;
-        }
+        let size = dep_pkg.isize();
+        dep_sizes.push((dep_pkg.name().to_string(), size));
+        total_dep_size += size;
     }
 
     dep_sizes.sort_by_key(|&(_, size)| std::cmp::Reverse(size));

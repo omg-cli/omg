@@ -4538,6 +4538,103 @@ printf '  tree.x86_64 2.2.1-4.fc44  Official\n  tree.i686 2.2.1-4.fc44  Official
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual([row['result'] for row in evidence], ['FAIL', 'PASS', 'FAIL'])
 
+    @staticmethod
+    def container_digest_refusal_row():
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        return next(line for line in inventory.splitlines()
+                    if line.startswith('container-init-invalid-installer-digest\t'))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_complete_inventory_validates_unselected_installer_digest_refusal_before_guest_dispatch(self):
+        rows = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()[1:]
+        result, evidence, logs = self.run_inventory(
+            'exit 99\n', rows, tiers='nested-container',
+            ssh_body='printf "unexpected guest dispatch\\n" >&2; exit 97\n')
+        # These four rows are declarations, never guest execution or a pass.
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual([(entry['case_id'], entry['result']) for entry in evidence], [
+            ('qemu-arch-container-run-detached', 'SKIPPED'),
+            ('qemu-arch-container-run-interactive', 'SKIPPED'),
+            ('qemu-arch-container-shell-flags', 'SKIPPED'),
+            ('qemu-arch-container-build-flags', 'SKIPPED'),
+            ('qemu-arch-inventory-selection', 'HARNESS_ERROR'),
+        ])
+        self.assertEqual(logs, {})
+        self.assertNotIn('invalid inventory configuration', result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_installer_digest_refusal_rejects_malformed_rows_before_any_guest_action(self):
+        fields = self.container_digest_refusal_row().split('\t')
+        mutations = [
+            ('wrong identity', 0, 'other-installer-digest'),
+            ('wrong args', 1, '["container","init","--installer-digest","https://sh.rustup.rs=aaaa"]'),
+            ('wrong safety', 2, 'read'), ('wrong exit', 3, '0'),
+            ('wrong UX', 4, 'declared'), ('prerequisite', 5, 'help'),
+            ('wrong tier', 6, 'container'),
+            ('wrong target', 7, 'arch:pass,debian:pass,ubuntu:pass,fedora:pass'),
+            ('missing assertion', 8, '-'), ('unknown assertion', 8, 'unknown-fixture-token'),
+            ('wrong cleanup', 9, 'none'),
+        ]
+        help_row = 'help\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop'
+        for label, index, value in mutations:
+            with self.subTest(label=label):
+                altered = list(fields)
+                altered[index] = value
+                result, evidence, logs = self.run_inventory(
+                    'printf "Usage: fixture\\n"\n', [help_row, '\t'.join(altered)],
+                    ssh_body='printf "unexpected guest dispatch\\n" >&2; exit 97\n')
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(evidence, [])
+                self.assertEqual(logs, {})
+                self.assertIn('invalid inventory configuration', result.stderr)
+
+    def test_installer_digest_oracle_refuses_missing_scaffold_baseline(self):
+        result = self.run_oracle(
+            safety='controlled-error', assertion='container-installer-digest-refusal',
+            code=1, stderr='Error: Invalid installer digest: expected URL=SHA256\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('scaffold baseline', result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_actual_runner_requires_installer_digest_diagnostic_and_unchanged_scaffolds(self):
+        row = self.container_digest_refusal_row()
+        fields = row.split('\t')
+        self.assertEqual(json.loads(fields[1]), [
+            'container', 'init', '--base', 'debian:bookworm', '--installer-digest', 'missing-equals'])
+        refusal = ('[[ "$#" == 6 && "$1:$2:$3:$4:$5:$6" == '
+                   'container:init:--base:debian:bookworm:--installer-digest:missing-equals ]] || exit 96\n'
+                   'printf "Error: Invalid installer digest: expected URL=SHA256\\n" >&2\nexit 1\n')
+        cases = [
+            ('correct refusal', refusal, 'PASS'),
+            ('silent refusal', 'exit 1\n', 'FAIL'),
+            ('unrelated refusal', 'echo unrelated error >&2\nexit 1\n', 'FAIL'),
+            ('diagnostic only on stdout', 'echo "Invalid installer digest: expected URL=SHA256"\nexit 1\n', 'FAIL'),
+            ('wrong code', refusal.replace('exit 1\n', 'exit 2\n'), 'FAIL'),
+            ('false success', refusal.replace('exit 1\n', 'exit 0\n'), 'FAIL'),
+            ('created recipe', 'printf partial > Dockerfile.omg\n' + refusal, 'FAIL'),
+            ('changed root ignore', 'printf partial >> .dockerignore\n' + refusal, 'FAIL'),
+            ('changed BuildKit ignore', 'printf partial >> Dockerfile.omg.dockerignore\n' + refusal, 'FAIL'),
+            ('changed Podman ignore', 'printf partial >> .containerignore\n' + refusal, 'FAIL'),
+            ('removed ignore', 'rm .containerignore\n' + refusal, 'FAIL'),
+            ('changed permissions', 'chmod 600 .dockerignore\n' + refusal, 'FAIL'),
+            ('same-byte replacement', 'cp .dockerignore replacement; mv replacement .dockerignore\n' + refusal, 'FAIL'),
+            ('changed timestamp', 'touch -m -d @1 .dockerignore\n' + refusal, 'FAIL'),
+            ('symlink replacement', 'rm .dockerignore; ln -s .containerignore .dockerignore\n' + refusal, 'FAIL'),
+            ('directory replacement', 'rm .dockerignore; mkdir .dockerignore\n' + refusal, 'FAIL'),
+        ]
+        for label, product, expected in cases:
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stdout + result.stderr)
+                self.assertEqual(len(evidence), 1)
+                self.assertEqual(evidence[0]['case_id'], 'qemu-arch-container-init-invalid-installer-digest')
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                if expected == 'PASS':
+                    self.assertEqual(evidence[0]['exit_code'], 1)
+                    self.assertIn('scaffold_unchanged=true', logs['container-init-invalid-installer-digest.log'])
+                else:
+                    self.assertIn('assertion failed:', logs['container-init-invalid-installer-digest.log'])
+
 
 if __name__ == '__main__':
     unittest.main()

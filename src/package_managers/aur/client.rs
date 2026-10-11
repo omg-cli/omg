@@ -3994,7 +3994,12 @@ impl AurClient {
                 // A group leader makes util-linux setsid fork, losing the PID
                 // tracked below. Inherit our group so setsid execs in-place;
                 // makepkg then owns a detached session whose PGID is child.id().
-                command.process_group(nix::unistd::getpgrp().as_raw());
+                let parent_group = nix::unistd::getpgrp().as_raw();
+                // Zero can denote a group outside our PID namespace. Passing
+                // it to setpgid creates a child group instead of inheriting it.
+                if parent_group != 0 {
+                    command.process_group(parent_group);
+                }
             }
         }
         let child = command
@@ -6125,6 +6130,31 @@ mod tests {
                 "isolated native {mode} probe failed: {status}"
             );
             return Ok(());
+        }
+        // The exact probe child must observe the context being tested. A
+        // namespace wrapper's identity alone does not establish this child's
+        // inherited process group after the isolation subprocess is launched.
+        const EXPECT_PARENT_GROUP: &str = "OMG_NATIVE_BUILD_EXPECT_PARENT_PGRP";
+        let probe_pid = std::process::id();
+        let probe_uid = nix::unistd::getuid().as_raw();
+        let probe_group = nix::unistd::getpgrp().as_raw();
+        println!(
+            "[native-build-probe-context] mode={mode} pid={probe_pid} uid={probe_uid} pgrp={probe_group}"
+        );
+        if let Some(expected) = std::env::var_os(EXPECT_PARENT_GROUP) {
+            match expected.to_str() {
+                Some("zero") => anyhow::ensure!(
+                    probe_group == 0,
+                    "native {mode} probe expected inherited group zero; actual PID {probe_pid}, PGID {probe_group}"
+                ),
+                Some("nonzero") => anyhow::ensure!(
+                    probe_group > 0,
+                    "native {mode} probe expected a visible inherited group; actual PID {probe_pid}, PGID {probe_group}"
+                ),
+                _ => anyhow::bail!(
+                    "{EXPECT_PARENT_GROUP} must be 'zero' or 'nonzero' when configured"
+                ),
+            }
         }
         nix::sys::prctl::set_child_subreaper(true)?;
         let directory = tempfile::tempdir()?;

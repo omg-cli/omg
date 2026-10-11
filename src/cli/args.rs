@@ -1054,6 +1054,9 @@ pub enum ContainerCommands {
         /// Base image to use
         #[arg(short, long)]
         base: Option<String>,
+        /// Installer checksum to pin without fetching it (repeatable URL=SHA256)
+        #[arg(long = "installer-digest", value_name = "URL=SHA256")]
+        installer_digests: Vec<String>,
     },
 }
 

@@ -2935,6 +2935,23 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "arch")]
+    fn release_native_configuration_fixture(config: &Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        // Pair with the blocked native reader first. Publish the same bytes as
+        // a regular file before releasing it so later freshness reads need no
+        // additional writer. The gate tests executor/lifetime behavior, rather
+        // than depending on how many times native initialization reads config.
+        let mut gate = std::fs::OpenOptions::new().write(true).open(config)?;
+        let mut replacement = tempfile::NamedTempFile::new_in(
+            config.parent().context("fixture configuration parent")?,
+        )?;
+        replacement.write_all(NATIVE_FIXTURE_CONFIG.as_bytes())?;
+        replacement.persist(config).map_err(|error| error.error)?;
+        gate.write_all(NATIVE_FIXTURE_CONFIG.as_bytes())?;
+        Ok(())
+    }
+
     #[test]
     #[cfg(feature = "arch")]
     #[serial_test::serial]
@@ -2958,14 +2975,10 @@ mod tests {
             runtime.block_on(async move {
                 let (tick, ticks) = std::sync::mpsc::channel();
                 let controller = std::thread::spawn(move || -> anyhow::Result<bool> {
-                    use std::io::Write;
                     let responsive = ticks
                         .recv_timeout(std::time::Duration::from_secs(2))
                         .is_ok();
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(config)?
-                        .write_all(NATIVE_FIXTURE_CONFIG.as_bytes())?;
+                    release_native_configuration_fixture(&config)?;
                     Ok(responsive)
                 });
                 let ticker = tokio::spawn(async move {
@@ -3099,12 +3112,7 @@ mod tests {
                         "request cancellation must not admit another native replacement"
                     );
                     let controller = std::thread::spawn(move || -> anyhow::Result<()> {
-                        use std::io::Write;
-                        std::fs::OpenOptions::new()
-                            .write(true)
-                            .open(config)?
-                            .write_all(NATIVE_FIXTURE_CONFIG.as_bytes())?;
-                        Ok(())
+                        release_native_configuration_fixture(&config)
                     });
                     state
                         .drain_native_backends(std::time::Duration::from_secs(5))

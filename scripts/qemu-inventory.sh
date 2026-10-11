@@ -155,6 +155,47 @@ except (AssertionError, ValueError, OSError) as error:
 PY
 }
 
+container_scaffold_state() {
+  python3 - <<'PY'
+import json, pathlib, stat
+try:
+    state = {}
+    for name in ('Dockerfile.omg', '.dockerignore', 'Dockerfile.omg.dockerignore', '.containerignore'):
+        path = pathlib.Path(name)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            state[name] = None
+            continue
+        assert stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1048576, 'not a bounded regular scaffold: ' + name
+        state[name] = {
+            'contents': path.read_bytes().hex(), 'size': metadata.st_size,
+            'device': metadata.st_dev, 'inode': metadata.st_ino,
+            'mode': metadata.st_mode, 'uid': metadata.st_uid, 'gid': metadata.st_gid,
+            'links': metadata.st_nlink, 'mtime_ns': metadata.st_mtime_ns,
+            'ctime_ns': metadata.st_ctime_ns,
+        }
+    print(json.dumps(state, sort_keys=True, separators=(',', ':')))
+except (AssertionError, OSError) as error:
+    raise SystemExit(f'assertion failed: container installer digest scaffold state: {error}')
+PY
+}
+
+check_container_installer_digest_refusal() {
+  local code=$1 stderr=$2 after
+  if [[ "$code" != 1 || -z "${container_digest_before:-}" ]] \
+    || ! grep -Fq 'Invalid installer digest: expected URL=SHA256' "$stderr"; then
+    printf 'assertion failed: container installer digest refusal has the wrong cause or no scaffold baseline\n' >&2
+    return 1
+  fi
+  after=$(container_scaffold_state) || return 1
+  if [[ "$after" != "$container_digest_before" ]]; then
+    printf 'assertion failed: container installer digest refusal changed scaffold state\n' >&2
+    return 1
+  fi
+  printf '[container-installer-digest-fixture] exit=1 cause=expected_URL_SHA256 scaffold_unchanged=true\n' >&2
+}
+
 check_runtime_usage() {
   local runtime=$1 mode
   mode=$(stat -c %a "$OMG_DATA_DIR") || mode=""
@@ -1629,6 +1670,8 @@ check_product_output() {
     printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
   fi
   case "$assertion" in
+    container-installer-digest-refusal)
+      check_container_installer_digest_refusal "$code" "$stderr" || return 1 ;;
     workspace-missing-task|workspace-missing-lock)
       check_workspace_failure "$assertion" "$code" "$stdout" "$stderr" || return 1 ;;
     audit-log-filtered-export)
@@ -2396,7 +2439,15 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-capability-cleanup|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock|local:*|missing-lock-ci-refusal|missing-snapshot-refusal|invalid-runtime-refusal|missing-env-manifest-refusal|daemon-status-missing-socket|bash-hook-behavior|ci-cache-paths|container-init-artifacts|completion-env-capture|workspace-init-state|workspace-add-state|workspace-second-state|workspace-remove-state|workspace-list-state|workspace-status-state|bash-completion-stdout|bash-completion-installed|man-command-artifacts|search-firefox-results) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|container-installer-digest-refusal|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-capability-cleanup|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock|local:*|missing-lock-ci-refusal|missing-snapshot-refusal|invalid-runtime-refusal|missing-env-manifest-refusal|daemon-status-missing-socket|bash-hook-behavior|ci-cache-paths|container-init-artifacts|completion-env-capture|workspace-init-state|workspace-add-state|workspace-second-state|workspace-remove-state|workspace-list-state|workspace-status-state|bash-completion-stdout|bash-completion-installed|man-command-artifacts|search-firefox-results) ;; *) exit 2 ;; esac
+  if [[ "$id" == container-init-invalid-installer-digest ]]; then
+    [[ "$a" == container-installer-digest-refusal && "$s" == controlled-error
+      && "$e" == 1 && "$resolved" == 1 && "$u" == pass && "$r" == -
+      && "$t" == hermetic && "$tg" == hermetic:pass && "$cleanup" == tempdir-drop ]] || exit 2
+    jq -e '. == ["container","init","--base","debian:bookworm","--installer-digest","missing-equals"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == container-installer-digest-refusal ]]; then
+    exit 2
+  fi
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-list:workspace-list-state|workspace-remove:workspace-project-removed|workspace-remove:workspace-remove-state|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
@@ -2833,6 +2884,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == container-init-scaffold ]]; then
     remote+="; for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do printf '!.env\\n!secrets.key\\n' > \"\$ignore\"; done"
   fi
+  if [[ "$assertions" == container-installer-digest-refusal ]]; then
+    remote+="; for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do printf '!*\n# qemu-preserve-refusal\n' > \"\$ignore\"; chmod 644 \"\$ignore\"; done"
+  fi
   if [[ "$case" == run-all ]]; then
     remote+="; mkdir -p \"\$rowdir/run-all-bin\"; printf '#!/bin/sh\ncase \$1:\$2 in\n  --version:) echo 9.0.0 ;;\n  run:smoke) printf npm-smoke-task > npm-task.marker; echo npm-task-ok ;;\n  *) exit 96 ;;\nesac\n' > \"\$rowdir/run-all-bin/npm\"; printf '#!/bin/sh\necho v24.0.0\n' > \"\$rowdir/run-all-bin/node\"; chmod 755 \"\$rowdir/run-all-bin/npm\" \"\$rowdir/run-all-bin/node\"; export PATH=\"\$rowdir/run-all-bin:\$PATH\"; printf '%s\n' '{\"scripts\":{\"smoke\":\"echo npm-task-ok\"}}' > package.json"
   fi
@@ -2861,6 +2915,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   fi
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
   remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_workspace_failure); $(declare -f rpm_compatible_arches); $(declare -f check_product_output); $(declare -f check_workspace_state); $(declare -f check_bash_completion_artifact); $(declare -f check_man_artifacts); $(declare -f check_bash_hook_behavior); $(declare -f check_container_init_artifacts)"
+  if [[ "$assertions" == container-installer-digest-refusal ]]; then
+    remote+="; $(declare -f container_scaffold_state); $(declare -f check_container_installer_digest_refusal); container_digest_before=\$(container_scaffold_state)"
+  fi
   if [[ "$assertions" == package-dry-run-* ]]; then
     remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f native_installed_identity); $(declare -f check_native_remove_preview)"
   fi
