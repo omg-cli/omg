@@ -1053,9 +1053,19 @@ fn validate_package_security(command: &Commands) -> Result<()> {
         Commands::Remove { packages, .. } => {
             omg_lib::core::security::validate_package_names(packages)?;
         }
-        Commands::Info { package }
-        | Commands::Why { package, .. }
-        | Commands::Blame { package } => {
+        Commands::Info { package } => {
+            #[cfg(feature = "fedora")]
+            if omg_lib::package_managers::resolve_backend()?
+                == omg_lib::package_managers::Backend::Fedora
+            {
+                omg_lib::package_managers::DnfPackageManager::validate_query_selector(package)?;
+            } else {
+                omg_lib::core::security::validate_package_name(package)?;
+            }
+            #[cfg(not(feature = "fedora"))]
+            omg_lib::core::security::validate_package_name(package)?;
+        }
+        Commands::Why { package, .. } | Commands::Blame { package } => {
             omg_lib::core::security::validate_package_name(package)?;
         }
         _ => {}
@@ -1279,7 +1289,10 @@ fn handle_container_command(command: &ContainerCommands) -> Result<()> {
             container: c,
             command: cmd,
         } => container::exec(c, cmd),
-        ContainerCommands::Init { base } => container::init(base.clone()),
+        ContainerCommands::Init {
+            base,
+            installer_digests,
+        } => container::init_with_installer_digests(base.clone(), installer_digests),
     }
 }
 

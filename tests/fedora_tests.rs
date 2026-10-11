@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "linux", feature = "fedora"))]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use omg_lib::package_managers::{DnfPackageManager, PackageManager};
 
 pub mod common;
@@ -79,6 +79,266 @@ fn assert_installed_rpm_selection(
 mod dnf_integration {
     use super::*;
 
+    #[test]
+    fn native_daemon_starts_and_searches_without_installed_inventory_changes() -> Result<()> {
+        use omg_lib::daemon::protocol::{Request, Response, ResponseResult};
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        anyhow::ensure!(
+            cfg!(debug_assertions),
+            "native daemon fixture requires a debug binary for persistent-state isolation"
+        );
+
+        struct NativeDaemon(std::process::Child);
+        impl Drop for NativeDaemon {
+            fn drop(&mut self) {
+                if let Err(error) = self.0.kill()
+                    && error.kind() != std::io::ErrorKind::InvalidInput
+                {
+                    eprintln!("native daemon cleanup kill failed: {error}");
+                }
+                if let Err(error) = self.0.wait() {
+                    eprintln!("native daemon cleanup wait failed: {error}");
+                }
+            }
+        }
+
+        let rpm_inventory = || -> Result<Vec<u8>> {
+            let output = std::process::Command::new("/usr/bin/rpm")
+                .args(["-qa", "--queryformat", "%{NEVRA}\\n"])
+                .output()?;
+            anyhow::ensure!(output.status.success(), "native RPM inventory failed");
+            Ok(output.stdout)
+        };
+        let before = rpm_inventory()?;
+        let native = std::process::Command::new("/usr/bin/rpm")
+            .args([
+                "-q",
+                "bash",
+                "--queryformat",
+                "%{NAME}.%{ARCH}\t%{EPOCHNUM}\t%{VERSION}-%{RELEASE}",
+            ])
+            .output()?;
+        anyhow::ensure!(native.status.success(), "native bash fixture missing");
+        let native = std::str::from_utf8(&native.stdout)?;
+        let fields: Vec<_> = native.split('\t').collect();
+        anyhow::ensure!(fields.len() == 3, "unexpected native bash identity");
+        let version = if fields[1] == "0" {
+            fields[2].to_string()
+        } else {
+            format!("{}:{}", fields[1], fields[2])
+        };
+        let directory = tempfile::tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let data_dir = directory.path().join("data");
+        std::fs::create_dir(&data_dir)?;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))?;
+        let socket = directory.path().join("omg.sock");
+        let log_path = directory.path().join("daemon.log");
+        let log = std::fs::File::create(&log_path)?;
+        let mut child = NativeDaemon(
+            std::process::Command::new(assert_cmd::cargo::cargo_bin!("omgd"))
+                .arg("--socket")
+                .arg(&socket)
+                .env("OMG_TEST_MODE", "0")
+                .env("OMG_NATIVE_TEST_DATA_DIR", "1")
+                .env("OMG_DATA_DIR", &data_dir)
+                .env("OMG_DAEMON_DATA_DIR", &data_dir)
+                .env("OMG_DISABLE_TELEMETRY", "1")
+                .stdout(log.try_clone()?)
+                .stderr(log)
+                .spawn()?,
+        );
+        let outcome = (|| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut stream = loop {
+                anyhow::ensure!(
+                    child.0.try_wait()?.is_none(),
+                    "native daemon exited before serving its catalogue"
+                );
+                if let Ok(stream) = UnixStream::connect(&socket) {
+                    break stream;
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "native daemon startup exceeded deadline"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+            for request in [
+                Request::Ping { id: 1 },
+                Request::Search {
+                    id: 2,
+                    query: fields[0].into(),
+                    limit: Some(10),
+                },
+            ] {
+                let expected_id = request.id();
+                let frame = omg_lib::daemon::protocol::encode_frame(&request)?;
+                stream.write_all(&u32::try_from(frame.len())?.to_be_bytes())?;
+                stream.write_all(&frame)?;
+                let frame = omg_lib::daemon::protocol::read_frame(&mut stream)?;
+                let (_, payload) = omg_lib::daemon::protocol::split_frame(&frame)?;
+                let response: Response = bitcode::deserialize(payload)?;
+                match response {
+                    Response::Success {
+                        id: 1,
+                        result: ResponseResult::Ping(message),
+                    } if expected_id == 1 => {
+                        anyhow::ensure!(message == "pong", "native daemon ping mismatch");
+                    }
+                    Response::Success {
+                        id: 2,
+                        result: ResponseResult::Search(search),
+                    } if expected_id == 2 => anyhow::ensure!(
+                        search
+                            .packages
+                            .iter()
+                            .any(|package| package.name == fields[0] && package.version == version),
+                        "native daemon search differs from installed RPM identity"
+                    ),
+                    other => anyhow::bail!("unexpected native daemon response: {other:?}"),
+                }
+            }
+            Ok(())
+        })();
+        drop(child);
+        outcome.with_context(|| {
+            format!(
+                "native daemon startup log:\n{}",
+                std::fs::read_to_string(&log_path)
+                    .unwrap_or_else(|error| format!("log unreadable: {error}"))
+            )
+        })?;
+        anyhow::ensure!(
+            rpm_inventory()? == before,
+            "native daemon queries changed installed RPM inventory"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_catalog_observation_survives_readonly_rpm_and_dnf_queries() -> Result<()> {
+        let manager = DnfPackageManager::new();
+        let observed = manager
+            .installed_catalog_observation()?
+            .context("native SQLite observation missing")?;
+        anyhow::ensure!(
+            observed.is_current()?,
+            "new native observation is already stale"
+        );
+        for (program, arguments) in [
+            ("/usr/bin/rpm", vec!["-q", "bash"]),
+            ("/usr/bin/dnf", vec!["repoquery", "--available", "bash"]),
+        ] {
+            let output = std::process::Command::new(program)
+                .args(arguments)
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "read-only native query failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            anyhow::ensure!(
+                observed.is_current()?,
+                "read-only {program} query invalidated unchanged installed RPM inventory"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_catalog_observation_survives_ordinary_user_readonly_wal() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        const CHILD: &str = "OMG_NATIVE_OBSERVER_UID_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            anyhow::ensure!(
+                !omg_lib::core::is_root(),
+                "observer child must be unprivileged"
+            );
+            let manager = DnfPackageManager::new();
+            let observed = manager
+                .installed_catalog_observation()?
+                .context("native observer")?;
+            let started = std::time::Instant::now();
+            for _ in 0..20 {
+                anyhow::ensure!(
+                    observed.is_current()?,
+                    "unchanged ordinary-user inventory is stale"
+                );
+            }
+            println!(
+                "20 ordinary-user observation checks: {:?}",
+                started.elapsed()
+            );
+            return native_catalog_observation_survives_readonly_rpm_and_dnf_queries();
+        }
+        if !omg_lib::core::is_root() {
+            let manager = DnfPackageManager::new();
+            let observed = manager
+                .installed_catalog_observation()?
+                .context("native observer")?;
+            for _ in 0..20 {
+                anyhow::ensure!(
+                    observed.is_current()?,
+                    "unchanged ordinary-user inventory is stale"
+                );
+            }
+            return native_catalog_observation_survives_readonly_rpm_and_dnf_queries();
+        }
+        // Copy only this test runner into a private disposable fixture, since
+        // a root Cargo target may itself be inaccessible to the ordinary user.
+        let fixture = tempfile::tempdir()?;
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o755))?;
+        let executable = fixture.path().join("fedora-tests");
+        std::fs::copy(std::env::current_exe()?, &executable)?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home)?;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+        let ownership = std::process::Command::new("/usr/bin/chown")
+            .arg("1000:1000")
+            .arg(&home)
+            .status()?;
+        anyhow::ensure!(ownership.success(), "could not assign private child home");
+        let output = std::process::Command::new("/usr/bin/setpriv")
+            .args([
+                "--reuid=1000",
+                "--regid=1000",
+                "--clear-groups",
+                "--no-new-privs",
+            ])
+            .arg(&executable)
+            .args([
+                "--exact",
+                "dnf_integration::native_catalog_observation_survives_ordinary_user_readonly_wal",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", &home)
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("XDG_STATE_HOME")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "ordinary-user native observer failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("20 ordinary-user observation checks:"),
+            "ordinary-user child did not execute its observation checks"
+        );
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        Ok(())
+    }
+
     fn uninstalled_repository_package() -> Result<&'static str> {
         for candidate in ["tree", "htop", "nano", "rsync", "jq"] {
             let installed = std::process::Command::new("rpm")
@@ -130,6 +390,7 @@ mod dnf_integration {
     #[tokio::test]
     async fn repository_lookup_finds_uninstalled_package() -> Result<()> {
         let package = uninstalled_repository_package()?;
+        let expected_name = format!("{package}.{}", std::env::consts::ARCH);
         let pm = DnfPackageManager::new();
         assert!(
             !pm.list_installed()
@@ -142,13 +403,13 @@ mod dnf_integration {
         assert!(
             search
                 .iter()
-                .any(|result| result.name == package && !result.installed)
+                .any(|result| result.name == expected_name && !result.installed)
         );
         let info = pm
             .info(package)
             .await?
             .expect("available repository package");
-        assert_eq!(info.name, package);
+        assert_eq!(info.name, expected_name);
         assert!(!info.installed);
 
         for arguments in [vec!["info", package], vec!["--json", "info", package]] {
@@ -162,6 +423,161 @@ mod dnf_integration {
             );
             assert!(String::from_utf8_lossy(&output.stdout).contains(package));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repository_info_resolves_architecture_and_nevra_selectors() -> Result<()> {
+        let package = uninstalled_repository_package()?;
+        let native = std::process::Command::new("dnf")
+            .args([
+                "--cacheonly",
+                "repoquery",
+                "--available",
+                "--latest-limit=1",
+                "--queryformat",
+                "%{name}.%{arch}\t%{full_nevra}\t%{evr}\\n",
+                package,
+            ])
+            .output()?;
+        anyhow::ensure!(native.status.success(), "native available selection failed");
+        let text = std::str::from_utf8(&native.stdout)?;
+        let fields: Vec<_> = text
+            .lines()
+            .next()
+            .context("available fixture missing")?
+            .split('\t')
+            .collect();
+        anyhow::ensure!(fields.len() == 3, "invalid native available fixture");
+        let manager = DnfPackageManager::new();
+        for selector in [&fields[0], &fields[1]] {
+            let info = manager
+                .info(selector)
+                .await?
+                .expect("native selector resolves an available package");
+            assert_eq!(info.name, fields[0]);
+            assert_eq!(info.version.to_string(), fields[2]);
+            assert!(!info.installed);
+        }
+        assert!(manager.info("omg-no-such-package.x86_64").await?.is_none());
+        Ok(())
+    }
+
+    fn installed_bash_full_nevra() -> Result<(String, String, String)> {
+        let output = std::process::Command::new("/usr/bin/rpm")
+            .args(["-q", "--queryformat", "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\t%{NAME}.%{ARCH}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n", "bash"])
+            .output()?;
+        anyhow::ensure!(output.status.success(), "native bash fixture query failed");
+        let text = std::str::from_utf8(&output.stdout)?;
+        let fields: Vec<_> = text
+            .lines()
+            .next()
+            .context("native bash missing")?
+            .split('\t')
+            .collect();
+        anyhow::ensure!(fields.len() == 3, "invalid native bash identity");
+        let version = fields[2].strip_prefix("0:").unwrap_or(fields[2]);
+        Ok((fields[0].into(), fields[1].into(), version.into()))
+    }
+
+    #[tokio::test]
+    async fn installed_info_resolves_native_full_nevra_with_zero_epoch() -> Result<()> {
+        let (selector, name, version) = installed_bash_full_nevra()?;
+        let info = DnfPackageManager::new()
+            .info(&selector)
+            .await?
+            .expect("installed native full NEVRA");
+        assert_eq!(
+            (info.name, info.version.to_string(), info.installed),
+            (name, version, true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installed_status_resolves_native_full_nevra_with_zero_epoch() -> Result<()> {
+        let (selector, name, _) = installed_bash_full_nevra()?;
+        let manager = DnfPackageManager::new();
+        assert!(
+            manager.is_installed(&selector).await?,
+            "cold RPM observation must resolve explicit zero epoch"
+        );
+        assert!(
+            manager.is_installed(&name).await?,
+            "native name.arch stays installed"
+        );
+        assert!(
+            manager.is_installed(&selector).await?,
+            "warm RPM observation must resolve explicit zero epoch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_info_resolves_native_full_nevra() -> Result<()> {
+        let (selector, name, version) = installed_bash_full_nevra()?;
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["info", &selector])
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("OMG_TEST_DISTRO")
+            .env_remove("OMG_TEST_BACKEND")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "plain CLI selector failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout)?;
+        assert!(
+            text.contains(&name) && text.contains(&version),
+            "native installed metadata absent: {text}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_json_info_resolves_native_full_nevra() -> Result<()> {
+        let (selector, name, version) = installed_bash_full_nevra()?;
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
+            .args(["--json", "info", &selector])
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("OMG_TEST_DISTRO")
+            .env_remove("OMG_TEST_BACKEND")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "JSON CLI selector failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(value["name"], name);
+        assert_eq!(value["version"], version);
+        assert_eq!(value["installed"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repository_search_has_one_installed_row_per_architecture() -> Result<()> {
+        let manager = DnfPackageManager::new();
+        let search = manager.search("bash").await?;
+        let installed = manager.list_installed().await?;
+        let expected: Vec<_> = installed
+            .iter()
+            .filter(|package| package.name.starts_with("bash."))
+            .map(|package| (package.name.clone(), true))
+            .collect();
+        anyhow::ensure!(!expected.is_empty(), "native bash fixture missing");
+        let actual: Vec<_> = search
+            .iter()
+            .filter(|package| package.name == "bash" || package.name.starts_with("bash."))
+            .map(|package| (package.name.clone(), package.installed))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "repository rows must retain the installed identity and state"
+        );
         Ok(())
     }
 

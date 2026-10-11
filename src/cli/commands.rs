@@ -19,19 +19,8 @@ use crate::package_managers::get_system_status;
 
 // Const slices for completion - avoids allocation on every call
 const TOOL_COMMANDS: &[&str] = &["install", "list", "remove", "update", "search", "registry"];
-const ENV_COMMANDS: &[&str] = &["capture", "check", "share", "sync"];
-const NEW_TEMPLATES: &[&str] = &[
-    "rust",
-    "react",
-    "react-ts",
-    "node",
-    "ts",
-    "typescript",
-    "python",
-    "py",
-    "go",
-    "golang",
-];
+const ENV_COMMANDS: &[&str] = &["export", "plan", "capture", "check", "share", "sync"];
+const NEW_TEMPLATES: &[&str] = &["rust", "react", "node", "python", "go"];
 const SHELL_COMPLETIONS: &[&str] = &["bash", "zsh", "fish", "powershell", "elvish"];
 
 /// Convert runtime internal name to human-readable display label.
@@ -1698,24 +1687,256 @@ pub fn stats(json: bool) -> Result<()> {
 
     println!();
 
-    // Sync hint
-    if crate::core::license::load_license().is_some() {
-        println!("  {} Synced to dashboard", style::success("✓"));
-    } else {
-        println!(
-            "  {} {}",
-            style::dim("Tip:"),
-            style::dim("omg account link <token>  — optional, attributes usage to your dashboard")
-        );
-    }
+    // Configuration is known locally; displaying it does not prove an upload.
+    let telemetry_enabled = !crate::core::telemetry::is_telemetry_opt_out();
+    let dashboard_configured = telemetry_enabled
+        && crate::core::license::load_license().is_some_and(|license| license.is_token_valid());
+    print_dashboard_sync_hint(telemetry_enabled, dashboard_configured);
 
     println!();
     Ok(())
 }
 
+fn print_dashboard_sync_hint(telemetry_enabled: bool, dashboard_configured: bool) {
+    if !telemetry_enabled {
+        println!("  {}", style::dim("Dashboard sync disabled"));
+    } else if dashboard_configured {
+        println!("  {}", style::info("Dashboard sync configured"));
+    } else {
+        #[cfg(feature = "license")]
+        println!(
+            "  {} {}",
+            style::dim("Tip:"),
+            style::dim("omg account link --token-stdin  — read your dashboard token from stdin")
+        );
+        #[cfg(not(feature = "license"))]
+        println!("  {}", style::dim("Dashboard sync not configured"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn presentation_fixture_output(case: &str) -> String {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::commands::tests::presentation_fixture_child",
+                "--nocapture",
+            ])
+            .env("OMG_PRESENTATION_FIXTURE", case)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "presentation fixture failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("PRESENTATION_FIXTURE_COMPLETED"));
+        stdout
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn presentation_fixture_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(case) = std::env::var("OMG_PRESENTATION_FIXTURE") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let data = directory.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = directory.path().join("omg");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "telemetry_enabled = true\n").unwrap();
+        let fixture = directory.path().to_str().unwrap();
+        let config = config.to_str().unwrap();
+        let data = data.to_str().unwrap();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(fixture)),
+                ("XDG_CONFIG_HOME", Some(fixture)),
+                ("OMG_CONFIG_DIR", Some(config)),
+                ("XDG_DATA_HOME", Some(fixture)),
+                ("OMG_DATA_DIR", Some(data)),
+                ("OMG_NATIVE_TEST_DATA_DIR", Some("1")),
+                ("OMG_TEST_MODE", None),
+                (
+                    "OMG_DISABLE_TELEMETRY",
+                    if case == "stats-stored" {
+                        Some("1")
+                    } else {
+                        None
+                    },
+                ),
+                ("OMG_TELEMETRY", None),
+                ("OMG_DASHBOARD_TOKEN", None),
+                ("NO_COLOR", Some("1")),
+            ],
+            || {
+                assert_eq!(
+                    crate::config::Settings::config_path().unwrap(),
+                    std::path::Path::new(config).join("config.toml"),
+                    "presentation fixture must use its private configuration"
+                );
+                assert!(
+                    crate::config::Settings::load().unwrap().telemetry_enabled,
+                    "private settings must preserve explicit telemetry consent"
+                );
+                match case.as_str() {
+                    "stats-stored" | "stats-unlinked" | "stats-tokenless" | "stats-invalid" => {
+                        if case != "stats-unlinked" {
+                            let record = crate::core::license::StoredLicense {
+                                key: "fixture-only".to_string(),
+                                tier: "free".to_string(),
+                                features: Vec::new(),
+                                customer: None,
+                                expires_at: None,
+                                validated_at: 0,
+                                token: (case == "stats-invalid")
+                                    .then(|| "fixture-invalid-token".to_string()),
+                                machine_id: None,
+                            };
+                            std::fs::write(
+                                std::path::Path::new(data).join("license.json"),
+                                serde_json::to_vec(&record).unwrap(),
+                            )
+                            .unwrap();
+                        }
+                        stats(false).unwrap();
+                    }
+                    "env" | "new" => {
+                        println!("COMPLETIONS_BEGIN");
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(complete("bash", "", &case, Some(&format!("omg {case} "))))
+                            .unwrap();
+                        println!("COMPLETIONS_END");
+                    }
+                    "stats-valid-presentation" => {
+                        // Classification seam: signature verification is covered
+                        // by license tests, not bypassed in production stats.
+                        let telemetry_enabled = !crate::core::telemetry::is_telemetry_opt_out();
+                        assert!(telemetry_enabled, "private config must opt in");
+                        print_dashboard_sync_hint(telemetry_enabled, true);
+                    }
+                    _ => panic!("unknown presentation fixture {case}"),
+                }
+            },
+        );
+        println!("PRESENTATION_FIXTURE_COMPLETED");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stats_stored_license_does_not_claim_disabled_sync_succeeded() {
+        let output = presentation_fixture_output("stats-stored");
+        assert!(!output.contains("Synced to dashboard"), "{output}");
+        assert!(output.contains("Dashboard sync disabled"), "{output}");
+    }
+
+    #[cfg(all(unix, feature = "license"))]
+    #[test]
+    fn stats_unlinked_hint_uses_an_accepted_secret_input_option() {
+        use clap::Parser;
+
+        let output = presentation_fixture_output("stats-unlinked");
+        assert!(
+            output.contains("omg account link --token-stdin"),
+            "{output}"
+        );
+        assert!(!output.contains("<token>"), "{output}");
+        crate::cli::Cli::try_parse_from(["omg", "account", "link", "--token-stdin"])
+            .expect("the printed hint must parse without placing a token in argv");
+    }
+
+    #[cfg(all(unix, feature = "license"))]
+    #[test]
+    fn stats_tokenless_or_invalid_license_does_not_imply_dashboard_configuration() {
+        for case in ["stats-tokenless", "stats-invalid"] {
+            let output = presentation_fixture_output(case);
+            assert!(!output.contains("Synced to dashboard"), "{output}");
+            assert!(!output.contains("Dashboard sync configured"), "{output}");
+            assert!(
+                output.contains("omg account link --token-stdin"),
+                "{output}"
+            );
+            assert!(!output.contains("fixture-invalid-token"), "{output}");
+            assert!(!output.contains("fixture-only"), "{output}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stats_valid_configuration_is_not_presented_as_a_completed_upload() {
+        let output = presentation_fixture_output("stats-valid-presentation");
+        assert!(output.contains("Dashboard sync configured"), "{output}");
+        assert!(!output.contains("Synced to dashboard"), "{output}");
+        assert!(!output.contains("--token-stdin"), "{output}");
+    }
+
+    #[cfg(unix)]
+    fn emitted_completion_words(case: &str) -> Vec<String> {
+        let output = presentation_fixture_output(case);
+        output
+            .split_once("COMPLETIONS_BEGIN\n")
+            .unwrap()
+            .1
+            .split_once("COMPLETIONS_END")
+            .unwrap()
+            .0
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_completion_exposes_every_accepted_subcommand() {
+        use clap::{CommandFactory, Parser};
+
+        let words = emitted_completion_words("env");
+        let parser = crate::cli::Cli::command();
+        for command in parser.find_subcommand("env").unwrap().get_subcommands() {
+            assert!(
+                words.iter().any(|word| word == command.get_name()),
+                "missing {} in {words:?}",
+                command.get_name()
+            );
+        }
+        for (command, option) in [("export", "--source-target"), ("plan", "--target")] {
+            crate::cli::Cli::try_parse_from(["omg", "env", command, option, "fedora-x86_64"])
+                .expect("completed portable commands must accept Fedora");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_completion_only_offers_accepted_templates() {
+        use clap::{Parser, ValueEnum};
+
+        let words = emitted_completion_words("new");
+        for word in &words {
+            crate::cli::Cli::try_parse_from(["omg", "new", word, "fixture-project"])
+                .unwrap_or_else(|error| panic!("offered template {word} is rejected: {error}"));
+        }
+        for stack in crate::cli::args::ProjectStack::value_variants() {
+            let value = stack.to_possible_value().unwrap();
+            assert!(
+                words.iter().any(|word| word == value.get_name()),
+                "missing {} in {words:?}",
+                value.get_name()
+            );
+        }
+    }
 
     #[test]
     fn tool_subcommand_completion_matches_the_command_enum() {

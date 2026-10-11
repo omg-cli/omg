@@ -328,22 +328,16 @@ fn apply_telemetry_config(stdout: &mut io::Stdout, enabled: bool) -> Result<()> 
     let mut settings = Settings::load().context("Failed to load OMG settings")?;
     settings.telemetry_enabled = enabled;
 
-    if let Err(e) = settings.save() {
-        execute!(
-            stdout,
-            SetForegroundColor(Color::Yellow),
-            Print(format!(" (failed: {e})\n")),
-            ResetColor
-        )?;
-    } else {
-        let status = if enabled { "enabled" } else { "disabled" };
-        execute!(
-            stdout,
-            SetForegroundColor(Color::Green),
-            Print(format!(" ✓ ({status})\n")),
-            ResetColor
-        )?;
-    }
+    settings
+        .save()
+        .context("Failed to persist telemetry configuration")?;
+    let status = if enabled { "enabled" } else { "disabled" };
+    execute!(
+        stdout,
+        SetForegroundColor(Color::Green),
+        Print(format!(" ✓ ({status})\n")),
+        ResetColor
+    )?;
 
     Ok(())
 }
@@ -721,11 +715,31 @@ fn select_binary_menu(
 }
 
 fn read_optional_shell_rc(path: &str) -> Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => Ok(Some(content)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("Failed to read {path}")),
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NONBLOCK);
     }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("Failed to read {path}")),
+    };
+    if !file
+        .metadata()
+        .with_context(|| format!("Failed to inspect {path}"))?
+        .is_file()
+    {
+        anyhow::bail!("Shell configuration must be a regular file: {path}");
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .with_context(|| format!("Failed to read {path}"))?;
+    Ok(Some(content))
 }
 
 /// Expand the leading `~` of a shell config path using `$HOME`.
@@ -1150,6 +1164,154 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(content.contains("omg hook"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_rc_nonregular_nodes_are_rejected_without_blocking() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        if crate::core::testing::run_isolated_test(
+            "cli::init::tests::shell_rc_nonregular_nodes_are_rejected_without_blocking",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("private shell home");
+        let rc = directory.path().join(".bashrc");
+        nix::unistd::mkfifo(&rc, nix::sys::stat::Mode::S_IRWXU).expect("private rc FIFO");
+        read_optional_shell_rc(rc.to_str().expect("fixture path"))
+            .expect_err("a special shell rc must fail promptly rather than wait for a writer");
+        temp_env::with_var("HOME", Some(directory.path().as_os_str()), || {
+            assert!(!shell_rc_has_hook(Shell::Bash));
+            install_shell_hook(&mut io::stdout(), Shell::Bash, false)
+                .expect_err("init must refuse to append to a special shell rc");
+        });
+        assert!(
+            std::fs::symlink_metadata(&rc)
+                .expect("original rc remains")
+                .file_type()
+                .is_fifo(),
+            "inspection must preserve the user's special file"
+        );
+        let target = directory.path().join("linked-rc-fifo");
+        std::fs::rename(&rc, &target).expect("retain FIFO for symlink control");
+        std::os::unix::fs::symlink(&target, &rc).expect("linked special rc");
+        read_optional_shell_rc(rc.to_str().expect("fixture path"))
+            .expect_err("a symlink must not turn a special rc into a blocking read");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_rc_regular_symlink_remains_readable() {
+        let directory = tempfile::tempdir().expect("private rc fixture");
+        let target = directory.path().join("real-bashrc");
+        let rc = directory.path().join(".bashrc");
+        let content = "# user configuration\neval \"$(omg hook bash)\"\n";
+        std::fs::write(&target, content).expect("regular shell config");
+        std::os::unix::fs::symlink(&target, &rc).expect("regular rc symlink");
+        assert_eq!(
+            read_optional_shell_rc(rc.to_str().expect("fixture path"))
+                .expect("read a regular symlink")
+                .as_deref(),
+            Some(content)
+        );
+    }
+
+    #[cfg(unix)]
+    fn check_telemetry_persistence(test_name: &str, enabled: bool, writable: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if crate::core::testing::run_isolated_test(test_name)
+            || Settings::rerun_test_unprivileged(test_name)
+        {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "save denial requires an ordinary user"
+        );
+        let home = tempfile::tempdir().expect("private settings home");
+        let config = home.path().join("config");
+        std::fs::create_dir(&config).expect("settings directory");
+        let settings_path = config.join("config.toml");
+        let original = format!("telemetry_enabled = {}\n", !enabled);
+        std::fs::write(&settings_path, &original).expect("stored consent");
+        // Opening an existing writable lock works in the read-only directory;
+        // this tests the actual save error rather than lock creation failure.
+        std::fs::write(config.join("config.lock"), "").expect("existing mutation lock");
+        if !writable {
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o555))
+                .expect("deny directory writes");
+            let denial = std::fs::write(config.join("permission-control"), "unreachable")
+                .expect_err("ordinary-user fixture must deny a new file");
+            assert_eq!(denial.kind(), io::ErrorKind::PermissionDenied);
+        }
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+            ],
+            || {
+                let result = apply_telemetry_config(&mut io::stdout(), enabled);
+                std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700))
+                    .expect("restore private directory permissions");
+                if writable {
+                    result.expect("persist selected consent");
+                    assert_eq!(
+                        Settings::load()
+                            .expect("reload saved consent")
+                            .telemetry_enabled,
+                        enabled
+                    );
+                } else {
+                    assert_eq!(
+                        std::fs::read_to_string(&settings_path).expect("original settings remain"),
+                        original
+                    );
+                    result.expect_err("an unpersisted consent change must fail the init operation");
+                }
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn telemetry_opt_in_save_failure_returns_error_and_preserves_consent() {
+        check_telemetry_persistence(
+            "cli::init::tests::telemetry_opt_in_save_failure_returns_error_and_preserves_consent",
+            true,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn telemetry_opt_out_save_failure_returns_error_and_preserves_consent() {
+        check_telemetry_persistence(
+            "cli::init::tests::telemetry_opt_out_save_failure_returns_error_and_preserves_consent",
+            false,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn telemetry_opt_in_persists_in_writable_configuration() {
+        check_telemetry_persistence(
+            "cli::init::tests::telemetry_opt_in_persists_in_writable_configuration",
+            true,
+            true,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn telemetry_opt_out_persists_in_writable_configuration() {
+        check_telemetry_persistence(
+            "cli::init::tests::telemetry_opt_out_persists_in_writable_configuration",
+            false,
+            true,
+        );
     }
 
     #[cfg(unix)]

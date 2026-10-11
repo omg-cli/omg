@@ -60,6 +60,7 @@ def validate_structure(directory, archive, fixture):
                 or receipt.get('isolated_vm_mount_and_network') is not True
                 or type(receipt.get('ordinary_user_uid')) is not int or receipt['ordinary_user_uid'] <= 0
                 or receipt.get('daemon_shutdown') is not True
+                or receipt.get('excluded_installed_advisory_scope') is not True
                 or receipt.get('fixture_id') != 'OMG-QEMU-FEDORA-616' or receipt.get('expected_native_severity') != 'Important'
                 or receipt.get('scope') != 'native signed metadata-only advisory lifecycle; no package upgrade/download claim'
                 or receipt.get('native_archive_sha256') != bound.digest_file(archive)
@@ -100,6 +101,9 @@ def validate_structure(directory, archive, fixture):
         expected = {section:dict(values) for section,values in native_config.items()}
         expected.setdefault('main', {})['reposdir'] = ROOT+'/repos'
         if private_config != expected: raise ValueError('private DNF changed more than repository selection')
+        expected['main']['excludepkgs'] = 'glibc*'
+        if config(text('excluded-dnf.conf')) != expected:
+            raise ValueError('excluded-package scope did not retain private authenticated repository selection')
         repositories = config(text('fixture.repo'))
         required = {'enabled':'1','gpgcheck':'1','repo_gpgcheck':'1','localpkg_gpgcheck':'1','skip_if_unavailable':'false',
                     'baseurl':'file://'+ROOT+'/repo','gpgkey':'file://'+ROOT+'/fixture-key.asc'}
@@ -112,6 +116,9 @@ def validate_structure(directory, archive, fixture):
             'native-advisory-list': common+['--refresh', 'advisory', 'list', '--available', '--security', '--json'],
             'native-advisory-info': common+['--cacheonly', 'advisory', 'info', '--available', '--security', '--json'],
             'native-repository': common+['--cacheonly', 'repo', 'info', '--enabled', '--json'],
+            'native-excluded-default-list': common+['--cacheonly', 'advisory', 'list', '--available', '--security', '--json'],
+            'native-excluded-override-list': common+['--setopt=disable_excludes=*', '--cacheonly', 'advisory', 'list', '--available', '--security', '--json'],
+            'native-excluded-override-info': common+['--setopt=disable_excludes=*', '--cacheonly', 'advisory', 'info', '--available', '--security', '--json'],
             'dnf-key-admission': common+['--refresh', '-y', 'makecache'],
             'dnf-default-key-admission': ['dnf', '--setopt=*.skip_if_unavailable=false', '--refresh', '-y', 'makecache'],
             'private-config': ['mount', '--bind', ROOT+'/dnf.conf', '/etc/dnf/dnf.conf'],
@@ -136,6 +143,10 @@ def validate_structure(directory, archive, fixture):
                 or detail[0].get('collections',{}).get('packages') != [newer]
                 or not any(ref.get('Id')=='CVE-OMG-QEMU-616' and ref.get('Type')=='cve' and ref.get('Url')=='https://example.invalid/omg-qemu-616' for ref in detail[0].get('references',[]))):
             raise ValueError('native advisory details disagree with applicability')
+        if (decode('native-excluded-default-list.stdout') != []
+                or decode('native-excluded-override-list.stdout') != selected
+                or decode('native-excluded-override-info.stdout') != detail):
+            raise ValueError('native exclusion controls did not prove hidden then visible installed advisories')
         repository = decode('native-repository.stdout')
         required_repo = {'id':'omg-qemu-616','is_enabled':True,'skip_if_unavailable':False,'repo_gpgcheck':True,'pkg_gpgcheck':True,'available_pkgs':0,'pkgs':0,
                          'base_url':['file://'+ROOT+'/repo'],'gpg_key':['file://'+ROOT+'/fixture-key.asc']}

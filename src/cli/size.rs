@@ -23,19 +23,21 @@ use crate::cli::tea::Cmd;
     )
 )]
 pub async fn run(tree: Option<&str>, limit: usize) -> Result<()> {
+    let backend = crate::package_managers::resolve_backend()?;
     anyhow::ensure!(
-        crate::package_managers::resolve_backend()? != crate::package_managers::Backend::MacOS,
+        backend != crate::package_managers::Backend::MacOS,
         "Package size analysis is not implemented for Homebrew"
+    );
+    anyhow::ensure!(
+        backend != crate::package_managers::Backend::Mock,
+        "Package size analysis is not implemented for the mock backend"
     );
     if let Some(package) = tree {
         crate::core::security::validate_package_name(package)?;
     }
 
     #[cfg(feature = "fedora")]
-    if matches!(
-        crate::core::env::distro::detect_distro(),
-        crate::core::env::distro::Distro::Fedora
-    ) {
+    if backend == crate::package_managers::Backend::Fedora {
         crate::cli::tea::run_report(show_sizes_fedora(tree, limit).await?)?;
         return Ok(());
     }
@@ -198,17 +200,15 @@ fn show_package_tree(package: &str) -> Result<Cmd<()>> {
     let mut total_dep_size: i64 = 0;
 
     for dep in pkg.depends() {
-        let dep_name = dep.name();
-        if visited.contains(dep_name) {
+        let Some(dep_pkg) = localdb.pkgs().find_satisfier(dep.to_string()) else {
+            continue;
+        };
+        if !visited.insert(dep_pkg.name().to_string()) {
             continue;
         }
-        visited.insert(dep_name.to_string());
-
-        if let Ok(dep_pkg) = localdb.pkg(dep_name) {
-            let size = dep_pkg.isize();
-            dep_sizes.push((dep_name.to_string(), size));
-            total_dep_size += size;
-        }
+        let size = dep_pkg.isize();
+        dep_sizes.push((dep_pkg.name().to_string(), size));
+        total_dep_size += size;
     }
 
     dep_sizes.sort_by_key(|&(_, size)| std::cmp::Reverse(size));

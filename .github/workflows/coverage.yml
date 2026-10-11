@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          packages=(base-devel git curl pkgconf openssl libarchive clang cmake python)
+          packages=(base-devel git curl pkgconf openssl libarchive clang cmake python zsh fish)
           # One full upgrade/install transaction keeps the rolling container
           # consistent and avoids resolving the package graph twice.
           if pacman -Syu --noconfirm --needed "${packages[@]}" 2>&1 | tee /tmp/omg-pacman-setup.log; then
@@ -173,6 +173,21 @@ jobs:
           path: lcov.info
           retention-days: 14
           if-no-files-found: warn
+
+      - name: Generate region evidence
+        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
+        run: |
+          cargo llvm-cov report --json --output-path coverage-regions.json
+          gzip -9 coverage-regions.json
+
+      - name: Preserve region evidence
+        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-regions
+          path: coverage-regions.json.gz
+          retention-days: 3
+          if-no-files-found: error
 
       - name: Coverage summary
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}

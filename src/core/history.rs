@@ -269,7 +269,7 @@ impl HistoryManager {
         changes: Vec<PackageChange>,
         operation_result: Result<()>,
     ) -> Result<()> {
-        crate::core::security::audit::record_operation(
+        if let Err(audit_error) = crate::core::security::audit::record_operation(
             &transaction_type.to_string(),
             &changes
                 .iter()
@@ -280,8 +280,16 @@ impl HistoryManager {
             } else {
                 "failed"
             },
-        )
-        .context("Package operation finished but audit persistence failed")?;
+        ) {
+            return Err(match operation_result {
+                Ok(()) => {
+                    audit_error.context("Package operation finished but audit persistence failed")
+                }
+                Err(operation_error) => audit_error.context(format!(
+                    "Package operation failed: {operation_error:#}; audit persistence failed"
+                )),
+            });
+        }
         if crate::core::privilege::parent_owns_history() {
             return operation_result;
         }
@@ -474,6 +482,82 @@ impl HistoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_operation_preserves_backend_error_when_audit_also_fails() -> Result<()> {
+        const NAME: &str =
+            "core::history::tests::finish_operation_preserves_backend_error_when_audit_also_fails";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        anyhow::ensure!(!crate::core::is_root(), "fixture must run as ordinary user");
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let audit_path = directory.path().join("audit/audit.jsonl");
+        let manager = HistoryManager::new_in(directory.path().join("history.json"))?;
+        temp_env::with_var("OMG_DATA_DIR", Some(directory.path()), || -> Result<()> {
+            let backend_only = manager
+                .finish_operation(
+                    TransactionType::Install,
+                    Vec::new(),
+                    Err(anyhow::anyhow!("backend-alone-positive-control")),
+                )
+                .expect_err("backend failure with successful audit must remain visible");
+            assert_eq!(backend_only.to_string(), "backend-alone-positive-control");
+            let history = manager.load()?;
+            assert_eq!(history.len(), 1);
+            assert!(!history[0].success);
+            let original_audit = fs::read(&audit_path)?;
+            fs::rename(&audit_path, audit_path.with_extension("kept"))?;
+            crate::core::paths::create_private_data_directory(&audit_path)?;
+            fs::write(
+                audit_path.join("retained"),
+                b"private audit obstruction retained",
+            )?;
+            let audit_error =
+                crate::core::security::audit::record_operation("install", &[], "failed")
+                    .expect_err("directory obstruction must cause a real audit storage failure");
+            anyhow::ensure!(
+                audit_error
+                    .downcast_ref::<crate::core::security::audit::AuditError>()
+                    .is_some(),
+                "fixture must trigger the actual typed audit storage failure: {audit_error:#}"
+            );
+            let error = manager
+                .finish_operation(
+                    TransactionType::Install,
+                    Vec::new(),
+                    Err(anyhow::anyhow!("independent-backend-failure-sentinel")),
+                )
+                .expect_err("backend and real audit storage failures must be reported");
+            let diagnostic = format!("{error:#}");
+            anyhow::ensure!(
+                diagnostic.contains("audit persistence failed"),
+                "{diagnostic}"
+            );
+            anyhow::ensure!(
+                error
+                    .downcast_ref::<crate::core::security::audit::AuditError>()
+                    .is_some(),
+                "combined diagnostic must retain the typed audit source: {diagnostic}"
+            );
+            anyhow::ensure!(
+                diagnostic.contains("independent-backend-failure-sentinel"),
+                "audit failure hid the original backend error: {diagnostic}"
+            );
+            assert_eq!(fs::read(audit_path.with_extension("kept"))?, original_audit);
+            assert_eq!(
+                fs::read(audit_path.join("retained"))?,
+                b"private audit obstruction retained"
+            );
+            Ok(())
+        })?;
+        directory.close()?;
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

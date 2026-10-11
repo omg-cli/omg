@@ -1,10 +1,441 @@
-//! Compiled parser contracts. These prove grammar, not successful operations.
+//! Compiled parser contracts and isolated Doctor output contracts.
+//! Parser checks prove grammar; Doctor checks execute the CLI with local fixtures.
 #[path = "support/cli_surface.rs"]
 mod cli_surface;
+pub mod common;
 
 use clap::{Arg, ArgAction, ArgGroup, Command, CommandFactory, Parser, error::ErrorKind};
 use omg_lib::cli::{Cli, Commands};
 use serde_json::{Value, json};
+
+#[test]
+fn status_failure_keeps_error_for_reporter_without_rendering_it() {
+    use omg_lib::cli::tea::{Cmd, Model, StatusModel, StatusMsg, View};
+
+    let mut model = StatusModel::new();
+    let cause = "private-status-failure-sentinel";
+    let command = model.update(StatusMsg::Error(cause.to_string()));
+    assert_eq!(model.error.as_deref(), Some(cause));
+    let Cmd::View(View::Error(message)) = command else {
+        panic!("status failure must propagate its error to the process reporter");
+    };
+    assert_eq!(message, format!("Status check failed: {cause}"));
+    assert!(
+        model.view().trim().is_empty(),
+        "status must leave failure output to the process reporter"
+    );
+}
+
+#[test]
+fn status_reports_malformed_private_state_once_and_preserves_bytes() -> anyhow::Result<()> {
+    let project = common::TestProject::for_distro("fedora");
+    let path = project.data_dir.path().join("mock_state_dnf.json");
+    let valid = serde_json::to_vec(&json!({
+        "installed": {"git": "2.43.0"},
+        "available": {"git": "2.43.0"}
+    }))?;
+    std::fs::write(&path, &valid)?;
+    let control = project.run_with_env(&["status"], &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "10")]);
+    assert!(control.success, "{}", control.combined_output());
+    assert_eq!(control.exit_code, 0);
+    assert!(control.stdout.contains("1 packages installed"));
+    assert!(control.stderr.is_empty(), "{:?}", control.stderr);
+    assert_eq!(std::fs::read(&path)?, valid);
+
+    let malformed = b"invalid private status fixture json\n";
+    std::fs::write(&path, malformed)?;
+    let failed = project.run_with_env(&["status"], &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "10")]);
+    assert_eq!(std::fs::read(&path)?, malformed);
+    project.close_checked();
+    assert!(!failed.success);
+    assert_eq!(failed.exit_code, 1, "{}", failed.combined_output());
+    let cause = "failed to parse mock state";
+    assert!(failed.stderr.contains("Status check failed"));
+    assert_eq!(
+        failed.stderr.matches(cause).count(),
+        1,
+        "{:?}",
+        failed.stderr
+    );
+    assert!(
+        !failed.stdout.contains("Status failed") && !failed.stdout.contains(cause),
+        "status rendered a second failure: {:?}",
+        failed.stdout
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_team_hook_fixture(
+    project: &common::TestProject,
+    program: &std::path::Path,
+    args: &[&str],
+) -> anyhow::Result<std::process::Output> {
+    use std::os::unix::process::CommandExt as _;
+    use std::time::{Duration, Instant};
+    let stdout = tempfile::tempfile()?;
+    let stderr = tempfile::tempfile()?;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .current_dir(project.path())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", project.home_dir.path())
+        .env("XDG_DATA_HOME", project.data_dir.path())
+        .env("XDG_CONFIG_HOME", project.config_dir.path())
+        .env("OMG_DATA_DIR", project.data_dir.path())
+        .env("OMG_CONFIG_DIR", project.config_dir.path())
+        .env("OMG_TEST_MODE", "1")
+        .env("OMG_DISABLE_TELEMETRY", "1")
+        .env("OMG_DISABLE_DAEMON", "1")
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .process_group(0)
+        .spawn()?;
+    let group = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if start.elapsed() >= Duration::from_secs(10) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => return Err(error.into()),
+    }
+    child.wait()?;
+    let status = status.ok_or_else(|| anyhow::anyhow!("team hook fixture timed out"))?;
+    use std::io::{Read as _, Seek as _};
+    let read_output = |mut file: std::fs::File| -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            file.metadata()?.len() <= 262_144,
+            "fixture output too large"
+        );
+        file.rewind()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: read_output(stdout)?,
+        stderr: read_output(stderr)?,
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn team_hooks_execute_the_pinned_cli_with_literal_path_bytes() -> anyhow::Result<()> {
+    let source = common::fixture_cli_path();
+    let hash = common::fixture_program_hash(&source);
+    for name in [
+        "omg-normal",
+        "omg space'apostrophe",
+        "omg$(touch hook-marker)",
+        "omg`touch hook-marker`",
+        "omg\";touch hook-marker;#",
+    ] {
+        let project = common::TestProject::new();
+        let copied = project.path().join(name);
+        std::fs::copy(&source, &copied)?;
+        assert_eq!(common::fixture_program_hash(&copied), hash);
+        std::fs::create_dir_all(project.path().join(".git/hooks"))?;
+        let init = run_team_hook_fixture(&project, &copied, &["team", "init", "fixture-team"])?;
+        assert!(init.status.success(), "{name}: {init:?}");
+        let lock = project.path().join("omg.lock");
+        let lock_bytes = b"deliberately invalid fixture lock\n";
+        std::fs::write(&lock, lock_bytes)?;
+        let direct = run_team_hook_fixture(&project, &copied, &["env", "check"])?;
+        assert!(!direct.status.success(), "invalid lock must fail");
+        let direct_stdout = String::from_utf8(direct.stdout)?;
+        assert!(direct_stdout.contains("Checking for environment drift"));
+        for hook in ["post-merge", "post-checkout"] {
+            let hook_path = project.path().join(".git/hooks").join(hook);
+            let before = std::fs::read(&hook_path)?;
+            let output = run_team_hook_fixture(
+                &project,
+                std::path::Path::new("/bin/sh"),
+                &[hook_path.to_str().unwrap()],
+            )?;
+            assert!(output.status.success(), "{name}/{hook}: {output:?}");
+            assert!(
+                !project.path().join("hook-marker").exists(),
+                "{name}/{hook} evaluated executable path bytes"
+            );
+            let stdout = String::from_utf8(output.stdout)?;
+            assert!(stdout.contains(&direct_stdout), "{name}/{hook}: {stdout:?}");
+            assert_eq!(std::fs::read(&hook_path)?, before);
+            assert_eq!(std::fs::read(&lock)?, lock_bytes);
+        }
+        project.close_checked();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn team_initialization_preserves_existing_git_hooks() -> anyhow::Result<()> {
+    let project = common::TestProject::new();
+    let hooks = project.path().join(".git/hooks");
+    std::fs::create_dir_all(&hooks)?;
+    let sentinel = b"#!/bin/sh\nprintf 'existing private automation\\n'\n";
+    for name in ["post-merge", "post-checkout"] {
+        std::fs::write(hooks.join(name), sentinel)?;
+    }
+    let result = project.run(&["team", "init", "fixture-team"]);
+    assert!(result.success, "{}", result.combined_output());
+    for name in ["post-merge", "post-checkout"] {
+        assert_eq!(std::fs::read(hooks.join(name))?, sentinel);
+    }
+    project.close_checked();
+    Ok(())
+}
+
+#[cfg(feature = "license")]
+fn account_expiry_output_fixture(expiry: &str) -> anyhow::Result<String> {
+    let project = common::TestProject::new();
+    let path = project.data_dir.path().join("license.json");
+    let bytes = serde_json::to_vec(&json!({
+        "key": "private-account-fixture-key",
+        "tier": "free",
+        "features": [],
+        "customer": null,
+        "expires_at": expiry,
+        "validated_at": 0,
+        "token": null,
+        "machine_id": null
+    }))?;
+    std::fs::write(&path, &bytes)?;
+    let result = project.run(&["account", "status"]);
+    let after = std::fs::read(path)?;
+    project.close_checked();
+    assert_eq!(after, bytes, "account status must preserve stored metadata");
+    assert!(result.success, "{}", result.combined_output());
+    assert!(result.stdout.contains("Stored token is invalid or expired"));
+    assert!(!result.stdout.contains("private-account-fixture-key"));
+    Ok(result.stdout)
+}
+
+#[cfg(feature = "license")]
+#[test]
+fn account_status_neutralizes_stored_expiry_terminal_controls() -> anyhow::Result<()> {
+    let output = account_expiry_output_fixture("\u{1b}]52;c;fixture\u{7}expiry\u{1b}[31m\u{202e}")?;
+    assert!(output.contains("Stored expiry:"), "{output:?}");
+    for forbidden in ['\u{1b}', '\u{7}', '\u{202e}'] {
+        assert!(
+            !output.contains(forbidden),
+            "unsafe account output: {output:?}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "license")]
+#[test]
+fn account_status_preserves_normal_expiry_text_and_storage() -> anyhow::Result<()> {
+    let output = account_expiry_output_fixture("2030-01-01")?;
+    assert!(output.contains("Stored expiry: 2030-01-01"), "{output}");
+    Ok(())
+}
+
+fn audit_output_entry() -> omg_lib::core::security::audit::AuditEntry {
+    use omg_lib::core::security::audit::{AuditEntry, AuditEventType, AuditSeverity};
+    AuditEntry {
+        id: "fixture-entry".into(),
+        timestamp: "2030-01-01T00:00:00Z".into(),
+        event_type: AuditEventType::SecurityAudit,
+        severity: AuditSeverity::Info,
+        user: "fixture-user".into(),
+        resource: "normal-resource".into(),
+        description: "normal-description".into(),
+        metadata: None,
+        prev_hash: "genesis".into(),
+        hash_version: 1,
+        hash: None,
+    }
+}
+
+fn audit_output_project(
+    entry: &omg_lib::core::security::audit::AuditEntry,
+) -> anyhow::Result<(common::TestProject, std::path::PathBuf, Vec<u8>)> {
+    let project = common::TestProject::new();
+    let path = project.data_dir.path().join("audit/audit.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut bytes = serde_json::to_vec(entry)?;
+    bytes.push(b'\n');
+    std::fs::write(&path, &bytes)?;
+    Ok((project, path, bytes))
+}
+
+fn audit_log_output_fixture(field: &str) -> anyhow::Result<()> {
+    let mut entry = audit_output_entry();
+    let hostile = "\u{1b}]52;c;fixture\u{7}visible\u{1b}[31m\nforged\u{202e}";
+    match field {
+        "timestamp" => entry.timestamp = hostile.into(),
+        "description" => entry.description = hostile.into(),
+        "resource" => entry.resource = hostile.into(),
+        _ => panic!("unknown fixture field"),
+    }
+    entry.hash = Some(entry.compute_hash());
+    let (project, path, before) = audit_output_project(&entry)?;
+    let result = project.run(&["audit", "log"]);
+    let after = std::fs::read(path)?;
+    project.close_checked();
+    assert_eq!(
+        after, before,
+        "display must preserve hash-bearing audit bytes"
+    );
+    assert!(result.success, "{}", result.combined_output());
+    assert!(result.stdout.contains("visible"), "{:?}", result.stdout);
+    for forbidden in ['\u{1b}', '\u{7}', '\u{202e}'] {
+        assert!(
+            !result.stdout.contains(forbidden),
+            "unsafe {field}: {:?}",
+            result.stdout
+        );
+    }
+    assert!(!result.stdout.contains("\nforged"), "{:?}", result.stdout);
+    Ok(())
+}
+
+#[test]
+fn audit_log_display_neutralizes_timestamp_controls() -> anyhow::Result<()> {
+    audit_log_output_fixture("timestamp")
+}
+
+#[test]
+fn audit_log_display_neutralizes_description_controls() -> anyhow::Result<()> {
+    audit_log_output_fixture("description")
+}
+
+#[test]
+fn audit_log_display_neutralizes_resource_controls() -> anyhow::Result<()> {
+    audit_log_output_fixture("resource")
+}
+
+#[test]
+fn audit_verify_display_neutralizes_invalid_entry_id() -> anyhow::Result<()> {
+    let mut entry = audit_output_entry();
+    entry.id = "\u{1b}]52;c;fixture\u{7}Invalid\u{1b}[31m\nforged\u{2066}".into();
+    entry.hash = Some("incorrect-hash".into());
+    let (project, path, before) = audit_output_project(&entry)?;
+    let result = project.run(&["audit", "verify"]);
+    let after = std::fs::read(path)?;
+    project.close_checked();
+    assert_eq!(after, before);
+    assert!(!result.success, "bad hash must remain an integrity failure");
+    assert!(result.stdout.contains("Audit log integrity FAILED"));
+    assert!(result.stdout.contains("First Invalid:"));
+    for forbidden in ['\u{1b}', '\u{7}', '\u{2066}'] {
+        assert!(
+            !result.stdout.contains(forbidden),
+            "unsafe ID: {:?}",
+            result.stdout
+        );
+    }
+    assert!(!result.stdout.contains("\nforged"), "{:?}", result.stdout);
+    Ok(())
+}
+
+#[test]
+fn audit_exports_preserve_raw_evidence_fields_and_source() -> anyhow::Result<()> {
+    let mut entry = audit_output_entry();
+    let raw = "\u{1b}]52;c;fixture\u{7}raw\u{1b}[31m\nsecond-line";
+    entry.timestamp = raw.into();
+    entry.description = raw.into();
+    entry.resource = raw.into();
+    entry.hash = Some(entry.compute_hash());
+    let (project, path, before) = audit_output_project(&entry)?;
+    for format in ["json", "csv"] {
+        let output = project.path().join(format!("evidence.{format}"));
+        let result = project.run(&["audit", "log", "--export", output.to_str().unwrap()]);
+        assert!(result.success, "{}", result.combined_output());
+        let bytes = std::fs::read(output)?;
+        if format == "json" {
+            let exported: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(exported, json!([entry]));
+        } else {
+            let mut reader = csv::Reader::from_reader(bytes.as_slice());
+            let rows = reader.records().collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(rows.len(), 1);
+            for index in [0, 3, 4] {
+                assert_eq!(rows[0].get(index), Some(raw));
+            }
+        }
+        assert_eq!(std::fs::read(&path)?, before);
+    }
+    project.close_checked();
+    Ok(())
+}
+
+#[cfg(unix)]
+fn doctor_eol_fixture(version: Option<&str>) -> anyhow::Result<common::CommandResult> {
+    let project = common::TestProject::new();
+    if let Some(version) = version {
+        let versions = project.data_dir.path().join("versions/node");
+        std::fs::create_dir_all(versions.join(version).join("bin"))?;
+        std::os::unix::fs::symlink(version, versions.join("current"))?;
+    }
+    let result = project.run(&["doctor", "--eol"]);
+    project.close_checked();
+    Ok(result)
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_eol_unknown_cycle_does_not_claim_supported() -> anyhow::Result<()> {
+    let result = doctor_eol_fixture(Some("99.1.0"))?;
+    let output = result.combined_output();
+    assert!(
+        result.success,
+        "unknown lifecycle is not proven EOL: {output}"
+    );
+    assert!(
+        output.contains("node") && output.contains("99.1.0"),
+        "{output}"
+    );
+    assert!(output.contains("Support data unavailable"), "{output}");
+    assert!(
+        !output.contains("All detected runtimes are within support period"),
+        "{output}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_eol_empty_inventory_has_no_support_verdict() -> anyhow::Result<()> {
+    let result = doctor_eol_fixture(None)?;
+    let output = result.combined_output();
+    assert!(result.success, "{output}");
+    assert!(
+        output.contains("No managed runtimes were detected"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("All detected runtimes are within support period"),
+        "{output}"
+    );
+    assert!(!output.contains("Support data unavailable"), "{output}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_eol_known_expired_cycle_remains_an_issue() -> anyhow::Result<()> {
+    let result = doctor_eol_fixture(Some("16.1.0"))?;
+    let output = result.combined_output();
+    assert!(!result.success, "{output}");
+    assert!(output.contains("EOL since 2023-09-11"), "{output}");
+    assert!(!output.contains("Support data unavailable"), "{output}");
+    Ok(())
+}
 
 #[test]
 fn daemon_request_inventory_matches_every_compiled_variant() {

@@ -1,5 +1,6 @@
 """Execute the production process-status gate against unsafe QEMU identities."""
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,6 +11,79 @@ BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
 
 
 class QemuProcessIsolationTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'production nohup launch requires POSIX executable paths')
+    def test_launch_disables_legacy_vapic_only_for_x86_and_preserves_guest_devices(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        launch = 'firmware=()' + source.split('firmware=()', 1)[1].split('\n# Launch from the controller', 1)[0]
+        for machine in ('q35', 'q35,sata=off', 'virt'):
+            for firmware in ('bios', 'uefi'):
+                with self.subTest(machine=machine, firmware=firmware), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    recorder = root / 'record-qemu'
+                    recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARG_FILE"\n')
+                    recorder.chmod(0o755)
+                    (root / 'vars.fd').write_bytes(b'firmware-fixture')
+                    script = ('set -euo pipefail\ninitial=false\nvm_vars=vars.fd\n'
+                              'vm_disk=disk.qcow2\nvm_serial=serial.log\n' + launch + '\nwait\n')
+                    result = subprocess.run(
+                        [BASH, '-c', script, 'launch', firmware, 'sshd', 'code.fd', 'vars.fd',
+                         str(recorder), machine, 'kvm', 'host'], cwd=root,
+                        env={**os.environ, 'ARG_FILE': str(root / 'arguments')},
+                        capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    arguments = (root / 'arguments').read_text().splitlines()
+                    self.assertEqual(arguments.count('apic-common.vapic=false'), 0 if machine == 'virt' else 1)
+                    if machine != 'virt':
+                        self.assertEqual(arguments[arguments.index('-global') + 1], 'apic-common.vapic=false')
+                    else:
+                        self.assertNotIn('-global', arguments)
+                    for retained in ('user=65534:65534', 'on,obsolete=deny,spawn=deny,resourcecontrol=deny',
+                                     'file:serial.log', 'file=disk.qcow2,if=virtio,format=qcow2',
+                                     'file=seed.img,if=virtio,format=raw', 'virtio-net-pci,netdev=n,romfile='):
+                        self.assertIn(retained, arguments)
+                    self.assertEqual('if=pflash,format=raw,file=vars.fd' in arguments, firmware == 'uefi')
+
+    def test_machine_selection_disables_unused_x86_sata_without_changing_arm(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        function = 'pins_for() {' + source.split('pins_for() {', 1)[1].split('\n# Lifecycle case ids', 1)[0]
+        for distro, arch in [('arch', 'x86_64'), ('debian', 'x86_64'),
+                             ('debian-trixie', 'x86_64'), ('ubuntu', 'x86_64'),
+                             ('fedora', 'x86_64'), ('debian', 'aarch64'),
+                             ('ubuntu', 'aarch64'), ('fedora', 'aarch64')]:
+            with self.subTest(distro=distro, arch=arch):
+                command = ('set -euo pipefail\ncontroller_image_x86_64=x86\n'
+                           'controller_image_aarch64=arm\n' + function
+                           + '\npins_for "$1" "$2"\nprintf "%s\\n" "$qemu_machine"\n')
+                result = subprocess.run([BASH, '-c', command, 'machine-selection', distro, arch],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), 'q35,sata=off' if arch == 'x86_64' else 'virt')
+
+    @unittest.skipIf(os.name == 'nt', 'launch fixture requires POSIX executable scripts')
+    def test_headless_launch_disables_vga_and_preserves_serial_and_network(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        launch = 'nohup "$5"' + source.split('nohup "$5"', 1)[1].split('# Launch from the controller', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'qemu-fixture'
+            executable.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+            executable.chmod(0o755)
+            for machine in ('q35', 'virt'):
+                with self.subTest(machine=machine):
+                    command = ('set -- bios vars code firmware "$1" "$2" tcg max; '
+                               'accel=tcg; firmware=(); vm_serial=serial.log; vm_disk=disk.qcow2; '
+                               + launch + '\nwait $!\n')
+                    result = subprocess.run([BASH, '-c', command, '_', str(executable), machine],
+                                            cwd=root, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    arguments = json.loads((root / 'qemu-startup.log').read_text())
+                    self.assertIn('-vga', arguments)
+                    self.assertEqual(arguments[arguments.index('-vga') + 1], 'none')
+                    self.assertEqual(arguments[arguments.index('-serial') + 1], 'file:serial.log')
+                    self.assertIn('virtio-net-pci,netdev=n,romfile=', arguments)
+                    self.assertIn('user=65534:65534', arguments)
+                    self.assertIn('on,obsolete=deny,spawn=deny,resourcecontrol=deny', arguments)
+
     def test_launch_uses_supported_privilege_drop_without_root_fallback(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         self.assertIn('-run-with user=65534:65534', source)

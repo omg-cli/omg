@@ -256,7 +256,7 @@ def cargo_test_args(features):
     if 'debian' in active:
         suites.append('apt_version_ordering')
     if 'fedora' in active:
-        suites.append('fedora_tests')
+        suites.extend(['fedora_tests', 'metadata_backend_routing'])
     return ['--lib', '--bins'] + [arg for suite in suites for arg in ('--test', suite)] + [
         '--no-default-features', '--features', features,
         '--locked', '--profile', 'ci',

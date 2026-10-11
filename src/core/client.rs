@@ -308,19 +308,11 @@ pub async fn refresh_daemon_after_catalog_write() -> Result<()> {
     Ok(())
 }
 
-/// The single conversion point from a daemon response to a typed client
-/// result. Every accessor on [`DaemonClient`] and [`SyncDaemonClient`]
-/// funnels through here, so a protocol mismatch surfaces as one canonical
-/// error instead of a dozen ad-hoc bail sites.
-/// Decode one received frame into the [`ResponseResult`] answering
+/// Decode one received frame into the [`Response`] answering
 /// `expected_id`. Shared by the async [`DaemonClient::call`] path and the
 /// sync roundtrip so both wire paths enforce identical protocol rules:
 /// version check, bitcode deserialization, ID correlation, and error
 /// propagation all live here instead of being duplicated per transport.
-fn decode_response(frame: &[u8], expected_id: u64) -> Result<ResponseResult> {
-    response_result(decode_correlated_response(frame, expected_id)?)
-}
-
 fn decode_correlated_response(frame: &[u8], expected_id: u64) -> Result<Response> {
     let (_, payload) = crate::daemon::protocol::split_frame(frame)
         .map_err(|e| anyhow::anyhow!("Daemon protocol error: {e}"))?;
@@ -412,7 +404,7 @@ fn as_suggest(response: ResponseResult) -> Option<Vec<String>> {
 
 /// Serialize `request`, exchange one length-delimited frame with the daemon,
 /// and validate the response ID for [`SyncDaemonClient`].
-fn sync_roundtrip(stream: &mut SyncUnixStream, request: &Request) -> Result<ResponseResult> {
+fn sync_roundtrip(stream: &mut SyncUnixStream, request: &Request) -> Result<Response> {
     let id = request.id();
     let request_bytes = crate::daemon::protocol::encode_frame(request)
         .context("Failed to encode daemon request")?;
@@ -420,12 +412,12 @@ fn sync_roundtrip(stream: &mut SyncUnixStream, request: &Request) -> Result<Resp
         .context("Failed to write request to daemon socket")?;
     let resp_bytes = crate::daemon::protocol::read_frame(stream)
         .context("Failed to read response from daemon")?;
-    decode_response(&resp_bytes, id)
+    decode_correlated_response(&resp_bytes, id)
 }
 
 /// Synchronous client for non-async contexts
 pub struct SyncDaemonClient {
-    stream: SyncUnixStream,
+    stream: Option<SyncUnixStream>,
     request_id: AtomicU64,
 }
 
@@ -441,14 +433,21 @@ impl SyncDaemonClient {
             anyhow::bail!("Daemon disabled by environment");
         }
         Ok(Self {
-            stream: connect_sync_stream_with_timeout(timeout)?,
+            stream: Some(connect_sync_stream_with_timeout(timeout)?),
             request_id: AtomicU64::new(1),
         })
     }
 
     /// Send a request and get response
     pub fn call(&mut self, request: &Request) -> Result<ResponseResult> {
-        sync_roundtrip(&mut self.stream, request)
+        // Partial I/O or an invalid reply leaves this framed stream unusable.
+        // Restore ownership only after decoding a correlated response.
+        let mut stream = self.stream.take().ok_or_else(|| {
+            anyhow::anyhow!("Daemon connection interrupted; reconnect before another request")
+        })?;
+        let response = sync_roundtrip(&mut stream, request)?;
+        self.stream = Some(stream);
+        response_result(response)
     }
 
     /// Ping the daemon without an async runtime.
@@ -514,6 +513,126 @@ mod tests {
             result: super::ResponseResult::Ping("pong".to_owned()),
         })
         .unwrap()
+    }
+
+    fn sync_stream_pair() -> (super::SyncDaemonClient, super::SyncUnixStream) {
+        let (client, server) = super::SyncUnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        (
+            super::SyncDaemonClient {
+                stream: Some(client),
+                request_id: super::AtomicU64::new(1),
+            },
+            server,
+        )
+    }
+
+    fn read_sync_request(server: &mut super::SyncUnixStream) -> super::Request {
+        let frame = crate::daemon::protocol::read_frame(server).unwrap();
+        let (_, payload) = crate::daemon::protocol::split_frame(&frame).unwrap();
+        bitcode::deserialize(payload).unwrap()
+    }
+
+    #[test]
+    fn sync_interrupted_partial_response_requires_reconnect_without_second_request() {
+        use std::io::Write as _;
+        for prefix_length in [2, 6] {
+            let (mut client, mut server) = sync_stream_pair();
+            let responder = std::thread::spawn(move || {
+                assert!(matches!(
+                    read_sync_request(&mut server),
+                    super::Request::Ping { id: 1 }
+                ));
+                let payload = reply(1);
+                let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+                frame.extend(payload);
+                server.write_all(&frame[..prefix_length]).unwrap();
+                crate::daemon::protocol::read_frame(&mut server)
+            });
+            let interrupted = client.ping().unwrap_err();
+            assert!(
+                interrupted.to_string().contains("Failed to read response"),
+                "{interrupted:#}"
+            );
+            let second = client.ping().unwrap_err();
+            let next_request = responder.join().unwrap();
+            assert!(second.to_string().contains("reconnect"), "{second:#}");
+            assert_eq!(
+                next_request.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    #[test]
+    fn sync_invalid_or_uncorrelated_reply_requires_reconnect_without_second_request() {
+        for payload in [vec![0xff], reply(999)] {
+            let (mut client, mut server) = sync_stream_pair();
+            let responder = std::thread::spawn(move || {
+                assert!(matches!(
+                    read_sync_request(&mut server),
+                    super::Request::Ping { id: 1 }
+                ));
+                crate::daemon::protocol::write_frame(&mut server, &payload).unwrap();
+                crate::daemon::protocol::read_frame(&mut server)
+            });
+            assert!(client.ping().is_err());
+            let second = client.ping().unwrap_err();
+            let next_request = responder.join().unwrap();
+            assert!(second.to_string().contains("reconnect"), "{second:#}");
+            assert_eq!(
+                next_request.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    #[test]
+    fn sync_valid_daemon_error_allows_reuse_and_fresh_connection_returns_pong() {
+        let (mut client, mut server) = sync_stream_pair();
+        let responder = std::thread::spawn(move || {
+            assert!(matches!(
+                read_sync_request(&mut server),
+                super::Request::Ping { id: 1 }
+            ));
+            let error = crate::daemon::protocol::encode_frame(&super::Response::Error {
+                id: 1,
+                code: 42,
+                message: "refused".to_owned(),
+            })
+            .unwrap();
+            crate::daemon::protocol::write_frame(&mut server, &error).unwrap();
+            for id in [2, 3] {
+                assert_eq!(read_sync_request(&mut server).id(), id);
+                crate::daemon::protocol::write_frame(&mut server, &reply(id)).unwrap();
+            }
+        });
+        assert_eq!(
+            client.ping().unwrap_err().to_string(),
+            "Daemon error (42): refused"
+        );
+        assert_eq!(client.ping().unwrap(), "pong");
+        assert_eq!(client.ping().unwrap(), "pong");
+        responder.join().unwrap();
+
+        let (mut fresh, mut server) = sync_stream_pair();
+        let responder = std::thread::spawn(move || {
+            assert!(matches!(
+                read_sync_request(&mut server),
+                super::Request::Ping { id: 1 }
+            ));
+            crate::daemon::protocol::write_frame(&mut server, &reply(1)).unwrap();
+        });
+        assert_eq!(fresh.ping().unwrap(), "pong");
+        responder.join().unwrap();
     }
 
     async fn refuses_interrupted_stream(client: &mut super::DaemonClient) {

@@ -418,13 +418,18 @@ fn test_update_turbo_dry_run_rejected() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Dry-run removal of an installed package prints a Remove Preview naming the
-/// package, the freed space, and the non-mutating marker. `pacman` is used
-/// because it is guaranteed present on every Arch host the suite targets.
+/// package, the freed space, and the non-mutating marker. Installed metadata
+/// is seeded in the isolated mock backend; host packages are not consulted.
 #[test]
 fn test_remove_dry_run() {
-    init_test_env();
+    let project = TestProject::new();
+    project.mock_install("pacman", "6.0.2").unwrap();
+    let state_path = project.data_dir.path().join("mock_state_pacman.json");
+    let before = std::fs::read(&state_path).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(state["installed"]["pacman"].as_str(), Some("6.0.2"));
 
-    let result = run_omg(&["remove", "--dry-run", "pacman"]);
+    let result = project.run(&["remove", "--dry-run", "pacman"]);
 
     result.assert_success();
     let output = result.combined_output();
@@ -440,6 +445,9 @@ fn test_remove_dry_run() {
         output.contains("No changes made (dry run)"),
         "dry-run must state it is non-mutating. Got:\n{output}"
     );
+    result.assert_stdout_contains("6.0.2");
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    project.close_checked();
 }
 
 /// Removing a package that is not installed fails and names it.
@@ -461,9 +469,14 @@ fn test_remove_nonexistent_package() {
 /// invocation must not mention it, proving the flag actually changes the plan.
 #[test]
 fn test_remove_recursive_flag() {
-    init_test_env();
+    let project = TestProject::new();
+    project.mock_install("pacman", "6.0.2").unwrap();
+    let state_path = project.data_dir.path().join("mock_state_pacman.json");
+    let before = std::fs::read(&state_path).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(state["installed"]["pacman"].as_str(), Some("6.0.2"));
 
-    let plain = run_omg(&["remove", "--dry-run", "pacman"]);
+    let plain = project.run(&["remove", "--dry-run", "pacman"]);
     plain.assert_success();
     assert!(
         !plain.combined_output().contains("Orphaned dependencies"),
@@ -471,7 +484,16 @@ fn test_remove_recursive_flag() {
         plain.combined_output()
     );
 
-    let recursive = run_omg(&["remove", "--recursive", "--dry-run", "pacman"]);
+    plain.assert_stdout_contains("6.0.2");
+    plain.assert_stdout_contains("No changes made (dry run)");
+    assert!(
+        !plain
+            .combined_output()
+            .contains("Additional unneeded dependencies would also be removed")
+    );
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+
+    let recursive = project.run(&["remove", "--recursive", "--dry-run", "pacman"]);
     recursive.assert_success();
     let output = recursive.combined_output();
     assert!(
@@ -482,6 +504,10 @@ fn test_remove_recursive_flag() {
         output.contains("pacman"),
         "recursive preview must keep the base package. Got:\n{output}"
     );
+    recursive.assert_stdout_contains("6.0.2");
+    recursive.assert_stdout_contains("No changes made (dry run)");
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    project.close_checked();
 }
 
 /// Multiple seeded packages appear together in one removal preview.

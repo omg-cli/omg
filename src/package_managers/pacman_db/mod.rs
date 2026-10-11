@@ -5,6 +5,8 @@
 
 mod db;
 
+pub(crate) use db::compile_ignore_patterns;
+
 #[cfg(test)]
 pub(crate) use db::check_local_db_health;
 pub(crate) use db::{NativeLocalDbHealth, check_native_local_db_health};

@@ -28,17 +28,19 @@ const REVERSE_DEPENDENCY_DISPLAY_LIMIT: usize = 20;
     )
 )]
 pub async fn run(package: &str, reverse: bool) -> Result<()> {
+    let backend = crate::package_managers::resolve_backend()?;
     anyhow::ensure!(
-        crate::package_managers::resolve_backend()? != crate::package_managers::Backend::MacOS,
+        backend != crate::package_managers::Backend::MacOS,
         "Package dependency analysis is not implemented for Homebrew"
+    );
+    anyhow::ensure!(
+        backend != crate::package_managers::Backend::Mock,
+        "Package dependency analysis is not implemented for the mock backend"
     );
     crate::core::security::validate_package_name(package)?;
 
     #[cfg(feature = "fedora")]
-    if matches!(
-        crate::core::env::distro::detect_distro(),
-        crate::core::env::distro::Distro::Fedora
-    ) {
+    if backend == crate::package_managers::Backend::Fedora {
         crate::cli::tea::run_report(show_reason_fedora(package, reverse).await?)?;
         return Ok(());
     }

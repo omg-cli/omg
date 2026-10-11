@@ -402,9 +402,58 @@ fn nearest_version_file_wins_over_parent_directory() {
 // Shell emission (end-to-end through the real binary)
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Contract: `omg hook-env -s zsh` emits exactly one `export PATH=` line in
-/// which the data-dir path is POSIX single-quoted, with embedded apostrophes
-/// rendered as the `'\''` escape sequence and every other byte verbatim.
+fn assert_hook_env_path_round_trip(shell: &str, script: &str, bin: &std::path::Path) {
+    let executable = which::which(shell).unwrap_or_else(|error| {
+        panic!("{shell} is required to execute the hook quoting contract: {error}")
+    });
+    let fixture = tempfile::tempdir().unwrap();
+    let script_path = fixture.path().join("hook-env");
+    std::fs::write(&script_path, script).unwrap();
+    let node = bin.join("node");
+    std::fs::write(&node, "#!/bin/sh\nprintf 'quoted-runtime-executed\\n'\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let base = "user's added tools:/usr/bin:/bin";
+    let prefix = "virtual environment's bin";
+    let (startup, commands) = match shell {
+        "zsh" => (
+            "-f",
+            "source \"$HOOK_ENV_SCRIPT\"; printf '%s\\n' \"$PATH\"; node",
+        ),
+        "fish" => (
+            "--no-config",
+            "set -g _OMG_PATH_BASE (string split : -- \"$BASE_PATH\"); \
+             set -g _OMG_PATH_PREFIX \"$PREFIX_PATH\"; \
+             source \"$HOOK_ENV_SCRIPT\"; string join ':' -- $PATH; node",
+        ),
+        _ => panic!("unexpected quoting test shell {shell}"),
+    };
+    let expected = format!(
+        "{prefix}:{}:{base}\nquoted-runtime-executed\n",
+        bin.display()
+    );
+    assert_cmd::Command::new(executable)
+        .args([startup, "-c", commands])
+        .timeout(std::time::Duration::from_secs(15))
+        .env("HOME", fixture.path())
+        .env("PATH", base)
+        .env("BASE_PATH", base)
+        .env("PREFIX_PATH", prefix)
+        .env("_OMG_PATH_BASE", base)
+        .env("_OMG_PATH_PREFIX", prefix)
+        .env("HOOK_ENV_SCRIPT", script_path)
+        .env_remove("VIRTUAL_ENV")
+        .assert()
+        .success()
+        .stderr("")
+        .stdout(expected);
+}
+
+/// Executing the emitted Zsh code preserves apostrophes in the runtime path,
+/// the caller's base and prefix, and resolves the actual fixture executable.
 #[test]
 fn hook_env_zsh_quotes_apostrophe_data_dir_posix_style() {
     let tmp = tempfile::tempdir().unwrap();
@@ -422,30 +471,11 @@ fn hook_env_zsh_quotes_apostrophe_data_dir_posix_style() {
     );
     result.assert_success();
 
-    let stdout = &result.stdout;
-    let inner = stdout
-        .strip_prefix("export PATH='")
-        .and_then(|rest| rest.strip_suffix("':\"${_OMG_PATH_BASE:-$PATH}\"\n"))
-        .map(std::string::ToString::to_string);
-    let Some(inner) = inner else {
-        panic!("stdout must be exactly one quoted export line, got {stdout:?}");
-    };
-    // Round trip: undoing the '\'' escape reproduces the real path verbatim…
-    assert_eq!(
-        inner.replace("'\\''", "'"),
-        bin.display().to_string(),
-        "quoted word must round-trip to the raw path"
-    );
-    // …and the planted apostrophes were emitted as '\'' escapes.
-    assert!(
-        inner.contains("'\\''"),
-        "embedded apostrophe must be escaped as '\\'', got {inner:?}"
-    );
+    assert_hook_env_path_round_trip("zsh", &result.stdout, &bin);
 }
 
-/// Contract: `omg hook-env -s fish` emits one `fish_add_path -g '<word>'`
-/// line per addition, fish-style quoting (`'` becomes `\'`), everything else
-/// verbatim. The generated fish hook resets PATH before applying these lines.
+/// Executing the emitted Fish code preserves the quoted runtime path and
+/// caller's base/prefix, and resolves the actual fixture executable.
 #[test]
 fn hook_env_fish_emits_fish_quoted_add_path() {
     let tmp = tempfile::tempdir().unwrap();
@@ -462,20 +492,7 @@ fn hook_env_fish_emits_fish_quoted_add_path() {
     );
     result.assert_success();
 
-    let lines: Vec<&str> = result.stdout.lines().collect();
-    assert_eq!(lines.len(), 1, "exactly one fish_add_path line expected");
-    let Some(inner) = lines[0]
-        .strip_prefix("fish_add_path -g '")
-        .and_then(|rest| rest.strip_suffix('\''))
-    else {
-        panic!("line must be fish_add_path -g '<word>', got {:?}", lines[0]);
-    };
-    assert_eq!(
-        inner.replace("\\'", "'"),
-        bin.display().to_string(),
-        "fish-quoted word must round-trip to the raw path"
-    );
-    assert!(inner.contains("\\'"), "embedded apostrophe must become \\'");
+    assert_hook_env_path_round_trip("fish", &result.stdout, &bin);
 }
 
 /// Contract: with a version file present but nothing resolvable installed,

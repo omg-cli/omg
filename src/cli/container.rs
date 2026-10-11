@@ -141,13 +141,13 @@ fn go_tarball_digest(metadata: &serde_json::Value, tarball_url: &str) -> Result<
     anyhow::bail!("no matching release file")
 }
 
-/// Generate the Dockerfile with every remote installer pinned to a digest
-/// captured over TLS now, so root build steps verify the bytes they
-/// execute instead of trusting whatever the network returns at build time.
+/// Pin each installer using an explicit caller checksum or a digest resolved
+/// over TLS. The generated build step verifies the downloaded bytes.
 fn pinned_dockerfile(
     manager: &ContainerManager,
     base: &str,
     runtime_refs: &[(&str, &str)],
+    supplied: &InstallerDigests,
 ) -> Result<String> {
     let draft = manager.generate_dockerfile(base, runtime_refs, &InstallerDigests::new());
     anyhow::ensure!(
@@ -155,21 +155,33 @@ fn pinned_dockerfile(
         "Cannot generate a container that satisfies project runtime requests: {}",
         draft.runtime_errors.join("; ")
     );
+    for url in supplied.keys() {
+        anyhow::ensure!(
+            draft.unpinned_urls.contains(url),
+            "Installer digest URL is not required by this project: {url}"
+        );
+    }
     if draft.unpinned_urls.is_empty() {
         return Ok(draft.content);
     }
 
-    let urls = draft.unpinned_urls;
-    let digests = crate::cli::tea::run_blocking_future(async move {
-        let mut digests = InstallerDigests::new();
-        for url in &urls {
-            let digest = resolve_installer_digest(url)
-                .await
-                .with_context(|| format!("Failed to pin {url} for verification"))?;
-            digests.insert(url.clone(), digest);
-        }
-        Ok::<InstallerDigests, anyhow::Error>(digests)
-    })??;
+    let urls: Vec<_> = draft
+        .unpinned_urls
+        .into_iter()
+        .filter(|url| !supplied.contains_key(url))
+        .collect();
+    let mut digests = supplied.clone();
+    if !urls.is_empty() {
+        digests = crate::cli::tea::run_blocking_future(async move {
+            for url in &urls {
+                let digest = resolve_installer_digest(url)
+                    .await
+                    .with_context(|| format!("Failed to pin {url} for verification"))?;
+                digests.insert(url.clone(), digest);
+            }
+            Ok::<InstallerDigests, anyhow::Error>(digests)
+        })??;
+    }
 
     let verified = manager.generate_dockerfile(base, runtime_refs, &digests);
     anyhow::ensure!(
@@ -562,7 +574,29 @@ pub fn exec(container: &str, command: &[String]) -> Result<()> {
 
 /// Generate a Dockerfile for the current project
 pub fn init(base_image: Option<String>) -> Result<()> {
+    init_with_installer_digests(base_image, &[])
+}
+
+/// Generate a recipe using explicitly supplied checksums for required installers.
+pub fn init_with_installer_digests(base_image: Option<String>, entries: &[String]) -> Result<()> {
     use crate::cli::packages::execute_cmd;
+
+    let mut supplied = InstallerDigests::new();
+    for entry in entries {
+        let (url, digest) = entry
+            .split_once('=')
+            .context("Invalid installer digest: expected URL=SHA256")?;
+        anyhow::ensure!(
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Installer digest must contain 64 hexadecimal characters: {url}"
+        );
+        anyhow::ensure!(
+            supplied
+                .insert(url.to_string(), digest.to_ascii_lowercase())
+                .is_none(),
+            "Duplicate installer digest URL: {url}"
+        );
+    }
 
     let cwd = std::env::current_dir()?;
     let dockerfile_path = cwd.join("Dockerfile.omg");
@@ -588,7 +622,7 @@ pub fn init(base_image: Option<String>) -> Result<()> {
         .map(|(r, v)| (r.as_str(), v.as_str()))
         .collect();
 
-    let dockerfile = pinned_dockerfile(&manager, &base, &runtime_refs)?;
+    let dockerfile = pinned_dockerfile(&manager, &base, &runtime_refs, &supplied)?;
 
     // `COPY . .` must never embed untracked credentials or repository data.
     ensure_dockerignore(&cwd)?;
@@ -696,8 +730,13 @@ mod tests {
     #[test]
     fn container_generation_refuses_an_unsupported_python_constraint_before_writing() {
         let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
-        let error = pinned_dockerfile(&manager, "ubuntu:24.04", &[("python", ">=3.13")])
-            .expect_err("unsupported version constraints must not silently become distro defaults");
+        let error = pinned_dockerfile(
+            &manager,
+            "ubuntu:24.04",
+            &[("python", ">=3.13")],
+            &InstallerDigests::new(),
+        )
+        .expect_err("unsupported version constraints must not silently become distro defaults");
         assert!(error.to_string().contains("Python") || error.to_string().contains("python"));
     }
 

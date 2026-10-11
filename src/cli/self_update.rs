@@ -651,6 +651,14 @@ fn extract_update_binary(
         );
         fs::write(&dest_path, &content)
             .with_context(|| format!("Failed to stage update binary {}", dest_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Preflight executes these private candidates before installation.
+            // Normalize executable permissions without trusting archive modes.
+            fs::set_permissions(&dest_path, fs::Permissions::from_mode(0o755))
+                .context("Failed to make staged update binary executable")?;
+        }
         if wanted_cli {
             found = Some(dest_path);
         } else {
@@ -1266,6 +1274,86 @@ mod tests {
             fs::read(root.path().join("omgd")).unwrap(),
             fs::read(&daemon).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extracted_update_pair_passes_preflight_and_installs_with_safe_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Other parallel fixtures spawn probe children while writing files.
+        // Run this extraction-to-execution boundary without inherited writable
+        // candidate descriptors from an unrelated fork in the test harness.
+        if env::var_os("OMG_EXTRACTED_UPDATE_PROBE_CHILD").is_none() {
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::self_update::tests::extracted_update_pair_passes_preflight_and_installs_with_safe_modes",
+                    "--nocapture",
+                ])
+                .env("OMG_EXTRACTED_UPDATE_PROBE_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated extracted update probe failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        const ARCHIVE: &str = "omg-v1.2.3-x86_64-linux-fedora.tar.gz";
+        const CLI: &[u8] = b"#!/bin/sh\nprintf 'omg 1.2.3\\n'\n";
+        const DAEMON: &[u8] = b"#!/bin/sh\nprintf 'omgd 1.2.3\\n'\n";
+        for prefix in ["", "omg-v1.2.3-x86_64-linux-fedora/"] {
+            let mut builder = tar::Builder::new(Vec::new());
+            for (name, content) in [("omg", CLI), ("omgd", DAEMON)] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o7777);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, format!("{prefix}{name}"), content)
+                    .unwrap();
+            }
+            let bytes = gzip_bytes(&builder.into_inner().unwrap());
+            let root = tempfile::tempdir().unwrap();
+            let extracted = root.path().join("extracted");
+            let installed = root.path().join("installed");
+            fs::create_dir(&extracted).unwrap();
+            fs::create_dir(&installed).unwrap();
+            fs::write(installed.join("omg"), b"previous cli").unwrap();
+            fs::write(installed.join("omgd"), b"previous daemon").unwrap();
+            let (cli, daemon) = extract_update_pair(&bytes, &extracted, ARCHIVE).unwrap();
+            let (candidate_cli, candidate_daemon, destination) =
+                (cli.clone(), daemon.clone(), installed.join("omg"));
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(install_checked_update_pair(
+                    &candidate_cli,
+                    &candidate_daemon,
+                    &destination,
+                    &Version::new(1, 2, 3),
+                    std::time::Duration::from_secs(2),
+                ))
+            })
+            .await
+            .unwrap()
+            .expect("the extracted Fedora archive must pass executable preflight");
+            for (candidate, destination, content) in [
+                (&cli, installed.join("omg"), CLI),
+                (&daemon, installed.join("omgd"), DAEMON),
+            ] {
+                assert_eq!(fs::read(&destination).unwrap(), content);
+                for path in [candidate.as_path(), destination.as_path()] {
+                    assert_eq!(
+                        fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                        0o755,
+                        "archive permission bits must not affect {path:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

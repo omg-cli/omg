@@ -1268,11 +1268,24 @@ fn ensure_cache_loaded<C: PackageCache>(
 
 /// Ensure sync cache is loaded (fast if already loaded)
 fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
-    let current_mtime = SyncDbEpoch::from_sync_dir(sync_dir)?;
-    // The legacy sync_db bitcode stores a timestamp, not this identity.
-    ensure_cache_loaded(&SYNC_DB_CACHE, "sync_db_source_v1", current_mtime, || {
-        load_sync_packages(sync_dir)
-    })
+    let current_epoch = SyncDbEpoch::from_configured_sync_dir(sync_dir)?;
+    // Configuration participates in the source identity, so persisted entries
+    // produced before a repository-order change cannot be reused.
+    ensure_cache_loaded(&SYNC_DB_CACHE, "sync_db_source_v1", current_epoch, || {
+        let packages = load_sync_packages(sync_dir)?;
+        anyhow::ensure!(
+            current_epoch == SyncDbEpoch::from_configured_sync_dir(sync_dir)?,
+            "Package databases or configuration changed while loading; retry the operation"
+        );
+        Ok(packages)
+    })?;
+    // Reject observed changes before returning derived state, without claiming
+    // to lock external catalog or configuration writers.
+    anyhow::ensure!(
+        current_epoch == SyncDbEpoch::from_configured_sync_dir(sync_dir)?,
+        "Package databases or configuration changed while loading; retry the operation"
+    );
+    Ok(())
 }
 
 /// Ensure local cache is loaded (fast if already loaded)
@@ -1294,9 +1307,26 @@ impl SyncDbEpoch {
     /// An existing empty directory has its own observed identity.
     pub const UNIX_EPOCH: Self = Self(None);
 
-    /// Reads the current sync directory metadata identity.
+    /// Reads the sync catalog and expanded pacman configuration identity.
     pub fn observe() -> Result<Self> {
-        Self::from_sync_dir(&paths::pacman_sync_dir_result()?)
+        Self::from_configured_sync_dir(&paths::pacman_sync_dir_result()?)
+    }
+
+    fn from_configured_sync_dir(sync_dir: &Path) -> Result<Self> {
+        let directory = Self::from_sync_dir(sync_dir)?;
+        let configuration =
+            crate::core::pacman_conf::PacmanConfig::fingerprint(&paths::pacman_conf_path())?;
+        let mut hash = Sha256::new();
+        hash.update(b"omg-configured-sync-v1");
+        match directory.0 {
+            Some(identity) => {
+                hash.update([1]);
+                hash.update(identity);
+            }
+            None => hash.update([0]),
+        }
+        hash.update(configuration);
+        Ok(Self(Some(hash.finalize().into())))
     }
 
     /// Observe names and metadata, including symlink targets, without locking writers.
@@ -1420,7 +1450,7 @@ impl LocalDbEpoch {
     }
 }
 
-/// Combined on-disk identity for libalpm: sync catalogs and the local db.
+/// Combined identity for libalpm: configured sync catalogs and the local db.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlpmCatalogEpoch {
     pub(crate) sync: SyncDbEpoch,
@@ -1573,7 +1603,10 @@ pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
     Ok(updates)
 }
 
-fn compile_ignore_patterns(patterns: &[String], setting: &str) -> Result<globset::GlobSet> {
+pub(crate) fn compile_ignore_patterns(
+    patterns: &[String],
+    setting: &str,
+) -> Result<globset::GlobSet> {
     let mut builder = globset::GlobSetBuilder::new();
     for pattern in patterns {
         let glob = globset::Glob::new(pattern)
@@ -1788,10 +1821,12 @@ pub fn get_potential_aur_packages() -> Result<Vec<String>> {
 /// Reduce an alpm relation or optdepend string to the bare name that participates in
 /// dependency resolution: `"curl>=7.0"` → `"curl"`,
 /// `"libfoo.so=1-64"` → `"libfoo.so"`,
+/// `"lib:libfoo.so.1"` → `"lib:libfoo.so.1"`,
 /// `"python-pillow: for image support"` → `"python-pillow"`.
 fn dependency_base_name(relation: &str) -> &str {
+    let relation = relation.split_once(": ").map_or(relation, |(name, _)| name);
     relation
-        .split(['<', '>', '=', ':'])
+        .split(['<', '>', '='])
         .next()
         .unwrap_or(relation)
         .trim()
@@ -2632,6 +2667,124 @@ mod tests {
         assert_ne!(removed, populated);
     }
 
+    fn assert_configuration_change_updates_catalog_epoch(test_name: &str, included: bool) {
+        if crate::core::testing::run_isolated_test(test_name) {
+            return;
+        }
+        if crate::config::Settings::rerun_test_unprivileged(test_name) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "configuration fixture requires ordinary UID"
+        );
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let db = root.join("var/lib/pacman");
+        let sync = db.join("sync");
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::create_dir_all(db.join("local")).unwrap();
+        std::fs::write(db.join("local/ALPM_DB_VERSION"), "9\n").unwrap();
+        let conf = temp.path().join("pacman.conf");
+        let repos = temp.path().join("repositories.conf");
+        let first = "[first]\nServer = file:///no-network\n[second]\nServer = file:///no-network\n";
+        let second =
+            "[second]\nServer = file:///no-network\n[first]\nServer = file:///no-network\n";
+        let options = "[options]\nSigLevel = Never\nArchitecture = x86_64\n";
+        let changed = if included {
+            std::fs::write(&conf, format!("{options}Include = repositories.conf\n")).unwrap();
+            std::fs::write(&repos, first).unwrap();
+            repos
+        } else {
+            std::fs::write(&conf, format!("{options}{first}")).unwrap();
+            conf.clone()
+        };
+        let database = soname_fixture_catalog(&db);
+        let top_level = std::fs::read(&conf).unwrap();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+            }
+        }
+        let _restore = Restore;
+        crate::core::paths::set_test_overrides(Some(root), Some(db.clone()));
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", None),
+                ("OMG_PACMAN_CONF", Some(conf.to_str().unwrap())),
+            ],
+            || {
+                let metadata = SyncDbEpoch::from_sync_dir(&sync).unwrap();
+                let before = AlpmCatalogEpoch::observe().unwrap();
+                assert_eq!(
+                    before,
+                    AlpmCatalogEpoch::observe().unwrap(),
+                    "unchanged configuration is stable"
+                );
+                std::fs::write(
+                    &changed,
+                    if included {
+                        second.to_owned()
+                    } else {
+                        format!("{options}{second}")
+                    },
+                )
+                .unwrap();
+                let after = AlpmCatalogEpoch::observe().unwrap();
+                assert_eq!(
+                    metadata,
+                    SyncDbEpoch::from_sync_dir(&sync).unwrap(),
+                    "database metadata is unchanged"
+                );
+                assert_eq!(
+                    soname_fixture_catalog(&db),
+                    database,
+                    "catalog reads preserve fixture bytes and metadata"
+                );
+                if included {
+                    assert_eq!(
+                        std::fs::read(&conf).unwrap(),
+                        top_level,
+                        "only included file changed"
+                    );
+                }
+                assert_eq!(before.local, after.local, "local catalog did not change");
+                println!(
+                    "[config-epoch-fixture] included={included} uid={} before={before:?} after={after:?}",
+                    nix::unistd::geteuid()
+                );
+                assert_ne!(
+                    before, after,
+                    "repository-order configuration change must invalidate catalog state"
+                );
+                assert_eq!(
+                    after,
+                    AlpmCatalogEpoch::observe().unwrap(),
+                    "new configuration is stable"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn catalog_epoch_tracks_repository_order_configuration() {
+        assert_configuration_change_updates_catalog_epoch(
+            "package_managers::pacman_db::db::tests::catalog_epoch_tracks_repository_order_configuration",
+            false,
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn catalog_epoch_tracks_included_repository_order_configuration() {
+        assert_configuration_change_updates_catalog_epoch(
+            "package_managers::pacman_db::db::tests::catalog_epoch_tracks_included_repository_order_configuration",
+            true,
+        );
+    }
+
     #[test]
     fn catalog_epoch_changes_when_local_db_changes() {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -3302,6 +3455,153 @@ mod tests {
                 assert_eq!(ffi, expected, "libalpm path diverged on fixture");
                 assert_eq!(fast, ffi, "fast path and libalpm path must agree");
             },
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SonameFixtureEntry {
+        path: PathBuf,
+        contents: Option<Vec<u8>>,
+        device: u64,
+        inode: u64,
+        length: u64,
+        modified: SystemTime,
+    }
+
+    fn soname_fixture_catalog(path: &Path) -> Vec<SonameFixtureEntry> {
+        let metadata = std::fs::symlink_metadata(path).expect("fixture metadata");
+        let mut entries = vec![SonameFixtureEntry {
+            path: path.to_path_buf(),
+            contents: metadata
+                .is_file()
+                .then(|| std::fs::read(path).expect("fixture contents")),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified: metadata.modified().expect("fixture modification time"),
+        }];
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path).expect("fixture directory") {
+                entries.extend(soname_fixture_catalog(
+                    &entry.expect("fixture directory entry").path(),
+                ));
+            }
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        entries
+    }
+
+    fn assert_distinct_soname_providers_have_one_orphan(test_name: &str, app_relation: &str) {
+        if crate::core::testing::run_isolated_test(test_name) {
+            return;
+        }
+        if crate::config::Settings::rerun_test_unprivileged(test_name) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "SONAME fixture must run unprivileged"
+        );
+
+        let temp = tempfile::TempDir::new().expect("SONAME fixture directory");
+        let root = temp.path().join("root");
+        let db_dir = root.join("var/lib/pacman");
+        let local_dir = db_dir.join("local");
+        std::fs::create_dir_all(&local_dir).expect("private local database");
+        std::fs::create_dir_all(db_dir.join("sync")).expect("private sync directory");
+        std::fs::write(local_dir.join("ALPM_DB_VERSION"), "9\n")
+            .expect("real libalpm local database version");
+        for (name, reason, relations) in [
+            ("app", "0", app_relation),
+            ("used", "1", "\n%PROVIDES%\nlib:libfoo.so.1\n"),
+            ("unrelated", "1", "\n%PROVIDES%\nlib:libbar.so.1\n"),
+        ] {
+            let directory = local_dir.join(format!("{name}-1.0-1"));
+            std::fs::create_dir_all(&directory).expect("private package directory");
+            std::fs::write(
+                directory.join("desc"),
+                format!("%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%REASON%\n{reason}\n{relations}"),
+            )
+            .expect("private package description");
+        }
+
+        let conf = temp.path().join("pacman.conf");
+        std::fs::write(&conf, "[options]\n").expect("private pacman configuration");
+        let cache_dir = temp.path().join("omg-cache");
+        std::fs::create_dir_all(&cache_dir).expect("private OMG cache");
+        let database_before = soname_fixture_catalog(&db_dir);
+        let configuration_before = soname_fixture_catalog(&conf);
+
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+                crate::package_managers::alpm_direct::clear_alpm_cache();
+            }
+        }
+        let _restore = Restore;
+        crate::package_managers::alpm_direct::clear_alpm_cache();
+        crate::core::paths::set_test_overrides(Some(root), Some(db_dir.clone()));
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", None),
+                (
+                    "OMG_PACMAN_CONF",
+                    Some(conf.to_str().expect("configuration path")),
+                ),
+                (
+                    "OMG_CACHE_DIR",
+                    Some(cache_dir.to_str().expect("cache path")),
+                ),
+            ],
+            || {
+                assert!(std::env::var_os("OMG_TEST_MODE").is_none());
+                assert!(!crate::core::paths::test_mode());
+                let native = crate::package_managers::alpm_direct::get_counts()
+                    .expect("real libalpm counts");
+                assert_eq!(
+                    soname_fixture_catalog(&db_dir),
+                    database_before,
+                    "libalpm count reads must preserve the private database"
+                );
+                assert_eq!(soname_fixture_catalog(&conf), configuration_before);
+                assert_eq!(native, (3, 1, 1), "native literal positive control");
+
+                let fast = get_counts_fast().expect("real fast-path counts");
+                assert_eq!(
+                    soname_fixture_catalog(&db_dir),
+                    database_before,
+                    "fast count reads must preserve the private database"
+                );
+                assert_eq!(soname_fixture_catalog(&conf), configuration_before);
+                println!(
+                    "[omg-soname-fixture] test={test_name} uid={} test_mode=false native={native:?} fast={fast:?} expected=(3, 1, 1)",
+                    nix::unistd::geteuid()
+                );
+                assert_eq!(
+                    fast,
+                    (3, 1, 1),
+                    "distinct SONAME providers must leave unrelated as the only orphan"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fast_path_and_libalpm_counts_preserve_distinct_soname_dependencies() {
+        assert_distinct_soname_providers_have_one_orphan(
+            "package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_preserve_distinct_soname_dependencies",
+            "\n%DEPENDS%\nlib:libfoo.so.1\n",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fast_path_and_libalpm_counts_preserve_described_soname_optdependencies() {
+        assert_distinct_soname_providers_have_one_orphan(
+            "package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_preserve_described_soname_optdependencies",
+            "\n%OPTDEPENDS%\nlib:libfoo.so.1: optional runtime support\n",
         );
     }
 

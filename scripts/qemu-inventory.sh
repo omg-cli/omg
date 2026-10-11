@@ -155,6 +155,47 @@ except (AssertionError, ValueError, OSError) as error:
 PY
 }
 
+container_scaffold_state() {
+  python3 - <<'PY'
+import json, pathlib, stat
+try:
+    state = {}
+    for name in ('Dockerfile.omg', '.dockerignore', 'Dockerfile.omg.dockerignore', '.containerignore'):
+        path = pathlib.Path(name)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            state[name] = None
+            continue
+        assert stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1048576, 'not a bounded regular scaffold: ' + name
+        state[name] = {
+            'contents': path.read_bytes().hex(), 'size': metadata.st_size,
+            'device': metadata.st_dev, 'inode': metadata.st_ino,
+            'mode': metadata.st_mode, 'uid': metadata.st_uid, 'gid': metadata.st_gid,
+            'links': metadata.st_nlink, 'mtime_ns': metadata.st_mtime_ns,
+            'ctime_ns': metadata.st_ctime_ns,
+        }
+    print(json.dumps(state, sort_keys=True, separators=(',', ':')))
+except (AssertionError, OSError) as error:
+    raise SystemExit(f'assertion failed: container installer digest scaffold state: {error}')
+PY
+}
+
+check_container_installer_digest_refusal() {
+  local code=$1 stderr=$2 after
+  if [[ "$code" != 1 || -z "${container_digest_before:-}" ]] \
+    || ! grep -Fq 'Invalid installer digest: expected URL=SHA256' "$stderr"; then
+    printf 'assertion failed: container installer digest refusal has the wrong cause or no scaffold baseline\n' >&2
+    return 1
+  fi
+  after=$(container_scaffold_state) || return 1
+  if [[ "$after" != "$container_digest_before" ]]; then
+    printf 'assertion failed: container installer digest refusal changed scaffold state\n' >&2
+    return 1
+  fi
+  printf '[container-installer-digest-fixture] exit=1 cause=expected_URL_SHA256 scaffold_unchanged=true\n' >&2
+}
+
 check_runtime_usage() {
   local runtime=$1 mode
   mode=$(stat -c %a "$OMG_DATA_DIR") || mode=""
@@ -486,8 +527,26 @@ check_arch_doctor_graph() {
 # END DOCTOR BACKEND ORACLE
 
 # BEGIN INFO NATIVE PACKAGE ORACLE
+rpm_compatible_arches() {
+  set -o pipefail; LC_ALL=C timeout --kill-after=2s 10s rpm --showrc | awk '
+            /^compatible archs[[:space:]]*:/ {
+              rows++
+              sub(/^[^:]*:[[:space:]]*/, "")
+              sub(/[[:space:]]*$/, "")
+              count=split($0, arch, /[[:space:]]+/)
+              if (count < 1 || count > 64 || length($0) > 1024) bad=1
+              for (i=1; i<=count; i++) {
+                if (arch[i] !~ /^[A-Za-z0-9_]+$/) bad=1
+              }
+              compatible=$0
+            }
+            END { if (rows != 1 || bad) exit 1; print compatible }
+          '
+}
+
 check_info_native_package() {
-  local distro=$1 output=$2 status=0 version source actual_version actual_source
+  local distro=$1 output=$2 status=0 version='' source='' actual_name actual_version actual_source
+  local rpm_arches='' native_identity='' native_reference=''
   case "$distro" in
     arch)
       timeout --kill-after=2s 30 pacman -Si pacman > native-info.raw 2> native-info.stderr || status=$?
@@ -498,8 +557,20 @@ check_info_native_package() {
       version=$(awk '$1 == "Candidate:" {print $2}' native-info.raw)
       source='Official repository (apt)' ;;
     fedora)
-      timeout --kill-after=2s 30 dnf --cacheonly repoquery pacman --latest-limit=1 --queryformat '%{evr}' > native-info.raw 2> native-info.stderr || status=$?
-      version=$(cat native-info.raw)
+      rpm_arches=$(rpm_compatible_arches) || { printf 'native info RPM architecture compatibility unavailable\n' >&2; return 2; }
+      timeout --kill-after=2s 30 dnf --cacheonly repoquery pacman --latest-limit=1 --queryformat $'%{name}.%{arch}\t%{evr}\n' > native-info.raw 2> native-info.stderr || status=$?
+      if [[ "$status" == 0 ]]; then
+        native_reference=$(awk -F '\t' -v arches="$rpm_arches" '
+          BEGIN { count=split(arches, values, /[[:space:]]+/); for (i=1; i<=count; i++) supported[values[i]]=1 }
+          {
+            rows++
+            if (NF != 2 || substr($1, 1, 7) != "pacman." || !(substr($1, 8) in supported) || $2 !~ /^[0-9][^[:space:]]*$/) bad=1
+            identity=$1; evr=$2
+          }
+          END { if (rows != 1 || bad) exit 1; print identity "\t" evr }
+        ' native-info.raw) || { printf 'native info reference has an invalid or ambiguous RPM identity and EVR\n' >&2; return 2; }
+        IFS=$'\t' read -r native_identity version <<< "$native_reference"
+      fi
       source='Official repository (dnf)' ;;
     *) return 2 ;;
   esac
@@ -508,16 +579,18 @@ check_info_native_package() {
     head -c 4096 native-info.stderr >&2
     return 2
   fi
-  if [[ $(grep -Ec '^[[:space:]]*Name: pacman$' "$output") != 1 \
-    || $(grep -Ec '^[[:space:]]*Version: ' "$output") != 1 \
-    || $(grep -Ec '^[[:space:]]*Source: ' "$output") != 1 ]]; then
+  if [[ $(grep -Ec '^[[:space:]]*Name:' "$output") != 1 \
+    || $(grep -Ec '^[[:space:]]*Version:' "$output") != 1 \
+    || $(grep -Ec '^[[:space:]]*Source:' "$output") != 1 ]]; then
     printf 'assertion failed: info omitted a unique pacman name, version, or source\n' >&2
     return 1
   fi
-  actual_version=$(awk '$1 == "Version:" {print $2}' "$output")
+  actual_name=$(awk '$1 == "Name:" && NF == 2 {print $2}' "$output")
+  actual_version=$(awk '$1 == "Version:" && NF == 2 {print $2}' "$output")
   actual_source=$(sed -n 's/^[[:space:]]*Source: //p' "$output")
-  printf 'native info %s expected=%s source=%s actual=%s source=%s\n' "$distro" "$version" "$source" "$actual_version" "$actual_source" >&2
-  if [[ "$actual_version" != "$version" || "$actual_source" != "$source" ]]; then
+  printf 'native info %s expected=%s identity=%s source=%s actual=%s identity=%s source=%s\n' "$distro" "$version" "$native_identity" "$source" "$actual_version" "$actual_name" "$actual_source" >&2
+  if [[ ( "$actual_name" != pacman && ( "$distro" != fedora || "$actual_name" != "$native_identity" ) ) \
+    || "$actual_version" != "$version" || "$actual_source" != "$source" ]]; then
     printf 'assertion failed: info disagrees with the native %s package catalog\n' "$distro" >&2
     return 1
   fi
@@ -1597,6 +1670,8 @@ check_product_output() {
     printf 'assertion failed: product refusal lacks its own stderr explanation\n' >&2; return 1
   fi
   case "$assertion" in
+    container-installer-digest-refusal)
+      check_container_installer_digest_refusal "$code" "$stderr" || return 1 ;;
     workspace-missing-task|workspace-missing-lock)
       check_workspace_failure "$assertion" "$code" "$stdout" "$stderr" || return 1 ;;
     audit-log-filtered-export)
@@ -1986,26 +2061,50 @@ PY
       native-apt-orphan-removed|native-orphan-removed)
         check_native_orphan_removed "$distro" "$stdout" || return 1 ;;
       search-official-tree-output)
-        if ! awk '
+        local rpm_arches=''
+        if [[ "$distro" == fedora ]]; then
+          # RPM's install compatibility table includes multilib and noarch.
+          # Do not invent an ordering preference or infer it from uname.
+          rpm_arches=$(rpm_compatible_arches) || { printf 'assertion failed: unavailable RPM architecture compatibility\n' >&2; return 1; }
+        fi
+        if ! awk -v distro="$distro" -v arches="$rpm_arches" '
+          BEGIN { count=split(arches, values, /[[:space:]]+/); for (i=1; i<=count; i++) supported[values[i]]=1 }
+          function exact(name) {
+            return name == "tree" || (distro == "fedora" && substr(name, 1, 5) == "tree." && (substr(name, 6) in supported))
+          }
           /^  [^[:space:]]+ [^[:space:]]+  / {
             results++
-            if (results == 1 && ($1 != "tree" || $3 != "Official" || NF != 3)) bad=1
-            if ($1 == "tree") trees++
+            if (results == 1 && (!exact($1) || $2 !~ /^[0-9]/ || $3 != "Official" || NF != 3)) bad=1
+            if (exact($1)) {
+              trees++
+              if (identities[$1]++) bad=1
+              if ($2 !~ /^[0-9]/ || $3 != "Official" || NF != 3) bad=1
+            }
           }
-          END { exit !(results > 0 && trees == 1 && !bad) }
+          END { exit !(results > 0 && trees > 0 && !bad) }
         ' "$stdout"; then
           printf 'assertion failed: search lacks a ranked official tree result\n' >&2; return 1
         fi ;;
       search-firefox-results)
-        local target=firefox
+        local target=firefox rpm_arches=''
         [[ "$distro" != debian && "$distro" != debian-trixie ]] || target=firefox-esr
+        if [[ "$distro" == fedora ]]; then
+          rpm_arches=$(rpm_compatible_arches) || { printf 'assertion failed: unavailable RPM architecture compatibility\n' >&2; return 1; }
+        fi
         if [[ "$code" != 0 ]] || ! grep -Fxq '  | Search' "$stdout" \
           || ! grep -Fxq '    firefox' "$stdout" \
-          || ! awk -v target="$target" '
-            /^  [^[:space:]]+ [^[:space:]]+  / {
-              if ($1 == target && $2 ~ /^[0-9]/ && $3 == "Official" && NF == 3) matches++
+          || ! awk -v target="$target" -v distro="$distro" -v arches="$rpm_arches" '
+            BEGIN { count=split(arches, values, /[[:space:]]+/); for (i=1; i<=count; i++) supported[values[i]]=1 }
+            function exact(name) {
+              return name == target || (distro == "fedora" && substr(name, 1, 8) == "firefox." && (substr(name, 9) in supported))
             }
-            END { exit !(matches == 1) }
+            /^  [^[:space:]]/ {
+              if (exact($1)) {
+                matches++
+                if ($0 !~ /^  [^[:space:]]+ [^[:space:]]+  / || $2 !~ /^[0-9]/ || $3 != "Official" || NF != 3) bad=1
+              }
+            }
+            END { exit !(matches == 1 && !bad) }
           ' "$stdout"; then
           printf 'assertion failed: firefox search lacks its official package and version\n' >&2; return 1
         fi ;;
@@ -2340,7 +2439,15 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-capability-cleanup|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock|local:*|missing-lock-ci-refusal|missing-snapshot-refusal|invalid-runtime-refusal|missing-env-manifest-refusal|daemon-status-missing-socket|bash-hook-behavior|ci-cache-paths|container-init-artifacts|completion-env-capture|workspace-init-state|workspace-add-state|workspace-second-state|workspace-remove-state|workspace-list-state|workspace-status-state|bash-completion-stdout|bash-completion-installed|man-command-artifacts|search-firefox-results) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-initialized|workspace-project-added|workspace-project-listed|workspace-project-removed|workspace-filtered-output|workspace-all-output|container-init-scaffold|container-installer-digest-refusal|ci-github-workflow|ci-github-workflow-advanced|task-executed|watch-task-rerun|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-tree-rollback|native-apt-orphan-removed|native-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|diff-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-capability-cleanup|doctor-eol-state|doctor-network-state|doctor-network-live-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|golden-path-created|golden-path-listed|golden-path-deleted|golden-path-flags|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state|runtime-rust-installed|container-run-argv|container-shell-argv|container-build-argv|man-pages-generated|audit-export-absolute-refusal|team-compliance-no-report|enterprise-audit-export-evidence|audit-log-filtered-export|workspace-missing-task|workspace-missing-lock|local:*|missing-lock-ci-refusal|missing-snapshot-refusal|invalid-runtime-refusal|missing-env-manifest-refusal|daemon-status-missing-socket|bash-hook-behavior|ci-cache-paths|container-init-artifacts|completion-env-capture|workspace-init-state|workspace-add-state|workspace-second-state|workspace-remove-state|workspace-list-state|workspace-status-state|bash-completion-stdout|bash-completion-installed|man-command-artifacts|search-firefox-results) ;; *) exit 2 ;; esac
+  if [[ "$id" == container-init-invalid-installer-digest ]]; then
+    [[ "$a" == container-installer-digest-refusal && "$s" == controlled-error
+      && "$e" == 1 && "$resolved" == 1 && "$u" == pass && "$r" == -
+      && "$t" == hermetic && "$tg" == hermetic:pass && "$cleanup" == tempdir-drop ]] || exit 2
+    jq -e '. == ["container","init","--base","debian:bookworm","--installer-digest","missing-equals"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == container-installer-digest-refusal ]]; then
+    exit 2
+  fi
   case "$id:$a" in
     workspace-list:workspace-project-listed|workspace-list:workspace-list-state|workspace-remove:workspace-project-removed|workspace-remove:workspace-remove-state|container-init:container-init-scaffold) ;;
     workspace-list:*|workspace-remove:*|container-init:*|*:workspace-project-listed|*:workspace-project-removed|*:container-init-scaffold) exit 2 ;;
@@ -2777,6 +2884,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   if [[ "$assertions" == container-init-scaffold ]]; then
     remote+="; for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do printf '!.env\\n!secrets.key\\n' > \"\$ignore\"; done"
   fi
+  if [[ "$assertions" == container-installer-digest-refusal ]]; then
+    remote+="; for ignore in .dockerignore Dockerfile.omg.dockerignore .containerignore; do printf '!*\n# qemu-preserve-refusal\n' > \"\$ignore\"; chmod 644 \"\$ignore\"; done"
+  fi
   if [[ "$case" == run-all ]]; then
     remote+="; mkdir -p \"\$rowdir/run-all-bin\"; printf '#!/bin/sh\ncase \$1:\$2 in\n  --version:) echo 9.0.0 ;;\n  run:smoke) printf npm-smoke-task > npm-task.marker; echo npm-task-ok ;;\n  *) exit 96 ;;\nesac\n' > \"\$rowdir/run-all-bin/npm\"; printf '#!/bin/sh\necho v24.0.0\n' > \"\$rowdir/run-all-bin/node\"; chmod 755 \"\$rowdir/run-all-bin/npm\" \"\$rowdir/run-all-bin/node\"; export PATH=\"\$rowdir/run-all-bin:\$PATH\"; printf '%s\n' '{\"scripts\":{\"smoke\":\"echo npm-task-ok\"}}' > package.json"
   fi
@@ -2804,7 +2914,10 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; mkdir -p project/critical; printf '%s%s\n' '-----BEGIN ' 'PRIVATE KEY-----' > project/critical/key.pem"
   fi
   remote+="; printf 'smoke:\n\t@echo nested-smoke-task-ok\noverlap:\n\t@sh ../workspace-overlap.sh .. nested\n' > project/Makefile"
-  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_workspace_failure); $(declare -f check_product_output); $(declare -f check_workspace_state); $(declare -f check_bash_completion_artifact); $(declare -f check_man_artifacts); $(declare -f check_bash_hook_behavior); $(declare -f check_container_init_artifacts)"
+  remote+="; command -v jq >/dev/null; command -v grep >/dev/null; $(declare -f check_hook_lifecycle); $(declare -f check_config_value); $(declare -f check_config_oracle); $(declare -f check_golden_path_state); $(declare -f check_privacy_oracle); $(declare -f check_file_output_oracle); $(declare -f check_workspace_failure); $(declare -f rpm_compatible_arches); $(declare -f check_product_output); $(declare -f check_workspace_state); $(declare -f check_bash_completion_artifact); $(declare -f check_man_artifacts); $(declare -f check_bash_hook_behavior); $(declare -f check_container_init_artifacts)"
+  if [[ "$assertions" == container-installer-digest-refusal ]]; then
+    remote+="; $(declare -f container_scaffold_state); $(declare -f check_container_installer_digest_refusal); container_digest_before=\$(container_scaffold_state)"
+  fi
   if [[ "$assertions" == package-dry-run-* ]]; then
     remote+="; $(declare -f native_package_snapshot); $(declare -f native_installed_version); $(declare -f native_installed_identity); $(declare -f check_native_remove_preview)"
   fi
@@ -2969,6 +3082,13 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; versions=\"\$OMG_DATA_DIR/versions/$runtime_name\"; mkdir -p \"\$versions/$runtime_version/bin\" \"\$versions/$runtime_active\" \"\$versions/8.8.8\" \"\$rowdir/external-runtime\"; chmod 700 \"\$OMG_DATA_DIR\""
     remote+="; printf keep-selected > \"\$versions/$runtime_version/sentinel\"; printf keep-active > \"\$versions/$runtime_active/sentinel\"; printf keep-pending > \"\$versions/8.8.8/.omg-installing\"; printf keep-external > \"\$rowdir/external-runtime/sentinel\""
     remote+="; printf '#!/bin/sh\\nprintf runtime-fixture\\n' > \"\$versions/$runtime_version/bin/$runtime_launcher\"; chmod 755 \"\$versions/$runtime_version/bin/$runtime_launcher\"; ln -s \"\$rowdir/external-runtime\" \"\$versions/7.7.7\"; ln -s \"\$versions/$runtime_active\" \"\$versions/current\"; $(declare -f check_runtime_state); $(declare -f check_runtime_usage)"
+    if [[ "$runtime_name" == node ]]; then
+      # Node activation verifies the installed executable's exact version.
+      node_fixture=$(printf '%s\n' '#!/bin/sh' 'case "${1-}" in' \
+        "  --version) printf 'v$runtime_version\\n' ;;" \
+        '  *) printf runtime-fixture ;;' 'esac' | jq -Rrs '@sh')
+      remote+="; printf '%s' $node_fixture > \"\$versions/$runtime_version/bin/$runtime_launcher\""
+    fi
   fi
   if [[ "$distro" == arch && "$safety" == package-mutation && ( "$case" == update-fast || "$case" == update-turbo ) ]]; then
     # A loopback repository exposes a versioned native ALPM upgrade while

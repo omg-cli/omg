@@ -195,6 +195,16 @@ const PRIVILEGED_ENV_SCRUB: &[&str] = &[
     "DPKG_ROOT",
     "DPKG_ADMINDIR",
     "RPM_CONFIGDIR",
+    "DNF0",
+    "DNF1",
+    "DNF2",
+    "DNF3",
+    "DNF4",
+    "DNF5",
+    "DNF6",
+    "DNF7",
+    "DNF8",
+    "DNF9",
     "OMG_PACMAN_CONF",
     "OMG_PACMAN_ROOT",
     "OMG_PACMAN_DB_DIR",
@@ -351,19 +361,6 @@ pub fn set_yes_flag(value: bool) {
     YES_FLAG.store(value, Ordering::SeqCst);
 }
 
-/// Run an EXTERNAL program under sudo as one step inside a larger flow.
-///
-/// Unlike [`run_privileged_child`] this never re-executes omg: the native
-/// package manager (apt-get, dnf) runs directly with explicit arguments, so
-/// there is exactly one prompt and no re-listing/re-confirming of work the
-/// caller already resolved. Credentials are validated with a pre-flight
-/// `sudo -n -v`; when that fails and stdin is interactive, one authentication
-/// prompt is offered before giving up.
-///
-/// # Errors
-/// Dev/test mode bails without touching sudo. A password requirement in a
-/// non-interactive session, or a nonzero child status, is returned as an
-/// error.
 fn reject_privileged_program_in_dev_mode(
     dev_mode: bool,
     program: &str,
@@ -380,6 +377,17 @@ fn reject_privileged_program_in_dev_mode(
     Ok(())
 }
 
+/// Run an external program under sudo as one step inside a larger flow.
+///
+/// Unlike [`run_privileged_child`] this never re-executes omg: the native
+/// package manager runs directly with explicit arguments. Credentials are
+/// validated with `sudo -n -v`; when that fails in an interactive session,
+/// one authentication prompt is offered. The payload runs with `sudo -n`
+/// so expired credentials cannot cause a second prompt.
+///
+/// # Errors
+/// Dev/test mode bails without touching sudo. A password requirement in a
+/// non-interactive session, or a nonzero child status, is returned as an error.
 pub async fn run_privileged_program(program: &str, args: &[&str]) -> anyhow::Result<()> {
     // Detect dev/test mode — identical contract to run_self_sudo.
     reject_privileged_program_in_dev_mode(
@@ -402,10 +410,29 @@ pub async fn run_privileged_program(program: &str, args: &[&str]) -> anyhow::Res
         crate::core::security::policy::require_native_plan_support(program)?;
     }
     let program_path = root_controlled_program_path(program)?;
+    let sudo_program = root_controlled_program_path("sudo")?;
+    run_privileged_program_in(
+        &sudo_program,
+        program,
+        &program_path,
+        args,
+        console::user_attended(),
+    )
+    .await
+}
 
+async fn run_privileged_program_in(
+    sudo_program: &std::path::Path,
+    program: &str,
+    program_path: &std::path::Path,
+    args: &[&str],
+    attended: bool,
+) -> anyhow::Result<()> {
     // Pre-flight: validate/refresh credentials WITHOUT running the payload,
     // so a password requirement is detected before any partial work.
-    let authenticated = sudo_command()?
+    let mut preflight = tokio::process::Command::new(sudo_program);
+    scrub_privileged_env(&mut preflight);
+    let authenticated = preflight
         .arg("-n")
         .arg("-v")
         .stdin(std::process::Stdio::null())
@@ -416,7 +443,7 @@ pub async fn run_privileged_program(program: &str, args: &[&str]) -> anyhow::Res
         .is_ok_and(|s| s.success());
 
     if !authenticated {
-        if get_yes_flag() || !console::user_attended() {
+        if get_yes_flag() || !attended {
             anyhow::bail!(
                 "Privilege elevation requires a password but no interactive terminal is available.\n\
                  \n\
@@ -425,7 +452,7 @@ pub async fn run_privileged_program(program: &str, args: &[&str]) -> anyhow::Res
             );
         }
         // One interactive authentication prompt with inherited stdio.
-        let mut auth_cmd = sudo_command()?;
+        let mut auth_cmd = tokio::process::Command::new(sudo_program);
         scrub_privileged_env(&mut auth_cmd);
         let status = auth_cmd
             .arg("-v")
@@ -442,9 +469,12 @@ pub async fn run_privileged_program(program: &str, args: &[&str]) -> anyhow::Res
 
     let audit_targets = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     crate::core::security::audit::record_operation(program, &audit_targets, "attempt")?;
-    let mut elevated = sudo_command()?;
+    let mut elevated = tokio::process::Command::new(sudo_program);
     scrub_privileged_env(&mut elevated);
     let status = elevated
+        // Authentication is complete. If credentials expire now, fail rather
+        // than offering a second prompt inside a previously confirmed mutation.
+        .arg("-n")
         .arg("--")
         .arg(program_path)
         .args(args)
@@ -1236,6 +1266,165 @@ mod tests {
                         .any(|(name, value)| { name == "DNF_VAR_OMG_MIRROR" && value.is_none() })
                 );
             },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_command_does_not_pass_legacy_dnf_repository_variables() {
+        if crate::core::testing::run_isolated_test(
+            "core::privilege::tests::system_command_does_not_pass_legacy_dnf_repository_variables",
+        ) {
+            return;
+        }
+        let variables = (0..10)
+            .map(|index| format!("DNF{index}"))
+            .collect::<Vec<_>>();
+        let values = variables
+            .iter()
+            .map(|name| (name.as_str(), Some("redirected")))
+            .chain(std::iter::once(("DNF10", Some("kept"))))
+            .collect::<Vec<_>>();
+        temp_env::with_vars(values, || {
+            // BSD printenv reads one name; GNU printenv accepts several. Query
+            // each name through the actual native child on both platforms.
+            for variable in &variables {
+                let output = super::system_command("printenv")
+                    .unwrap()
+                    .arg(variable)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.stdout.is_empty(),
+                    "legacy repository variable {variable} must not reach native commands"
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "removed variable {variable} stays absent"
+                );
+            }
+            let output = super::system_command("printenv")
+                .unwrap()
+                .arg("DNF10")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.stdout, b"kept\n",
+                "unrelated repository variables must reach native commands"
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "unrelated variables stay present"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn external_sudo_expired_credentials_fail_without_prompting() {
+        if run_isolated_sudo_test("external_sudo_expired_credentials_fail_without_prompting") {
+            return;
+        }
+        set_yes_flag(true);
+        let _reset = YesFlagReset;
+        let (_directory, sudo, log) = fake_sudo(0, 0);
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = '-n' ] && [ \"$2\" = '-v' ]; then\n\
+               printf 'preflight\\n' >> '{}'; exit 0\n\
+             fi\n\
+             if [ \"$1\" = '-n' ]; then\n\
+               printf 'noninteractive-refusal\\n' >> '{}'; exit 7\n\
+             fi\n\
+             printf 'PASSWORD_PROMPT\\n' >> '{}'; exit 42\n",
+            log.display(),
+            log.display(),
+            log.display(),
+        );
+        std::fs::write(&sudo, script).expect("write expired-credential sudo fixture");
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_privileged_program_in(
+                &sudo,
+                "dnf",
+                std::path::Path::new("/bin/true"),
+                &["remove", "fixture"],
+                true,
+            ),
+        )
+        .await
+        .expect("expired credentials must not wait for a password")
+        .expect_err("credential refusal must propagate without replaying the payload");
+        assert_eq!(error.to_string(), "dnf failed with exit code 7");
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "preflight\nnoninteractive-refusal\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_sudo_failed_preflight_with_yes_never_authenticates() {
+        if run_isolated_sudo_test("external_sudo_failed_preflight_with_yes_never_authenticates") {
+            return;
+        }
+        set_yes_flag(true);
+        let _reset = YesFlagReset;
+        let (_directory, sudo, log) = fake_sudo(1, 0);
+        let error = run_privileged_program_in(
+            &sudo,
+            "dnf",
+            std::path::Path::new("/bin/true"),
+            &["remove", "fixture"],
+            true,
+        )
+        .await
+        .expect_err("--yes must fail before interactive authentication or payload execution");
+        assert!(error.to_string().contains("no interactive terminal"));
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "-n -v\n");
+    }
+
+    #[tokio::test]
+    async fn external_sudo_authenticates_once_then_runs_one_payload() {
+        if run_isolated_sudo_test("external_sudo_authenticates_once_then_runs_one_payload") {
+            return;
+        }
+        set_yes_flag(false);
+        let _reset = YesFlagReset;
+        let (directory, sudo, log) = fake_sudo(1, 0);
+        let completed = directory.path().join("completed");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = '-n' ] && [ \"$2\" = '-v' ]; then\n\
+               printf 'preflight\\n' >> '{}'; exit 1\n\
+             fi\n\
+             if [ \"$1\" = '-v' ]; then\n\
+               printf 'authentication\\n' >> '{}'; exit 0\n\
+             fi\n\
+             if [ \"$1\" = '-n' ] && [ \"$2\" = '--' ]; then\n\
+               printf 'payload\\n' >> '{}'; shift 2; exec \"$@\"\n\
+             fi\n\
+             printf 'PASSWORD_PROMPT\\n' >> '{}'; exit 42\n",
+            log.display(),
+            log.display(),
+            log.display(),
+            log.display(),
+        );
+        std::fs::write(&sudo, script).expect("write interactive authentication fixture");
+        let completion = format!("printf 'completed\\n' > '{}'", completed.display());
+        run_privileged_program_in(
+            &sudo,
+            "dnf",
+            std::path::Path::new("/bin/sh"),
+            &["-c", &completion],
+            true,
+        )
+        .await
+        .expect("authenticated payload should succeed");
+        assert_eq!(std::fs::read_to_string(completed).unwrap(), "completed\n");
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "preflight\nauthentication\npayload\n"
         );
     }
 

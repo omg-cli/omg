@@ -1,6 +1,8 @@
 """Regression checks for the consolidated CI optimization contracts."""
 import os
 import hashlib
+import gzip
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -21,6 +23,44 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_coverage_region_evidence_preserves_export_and_failure(self):
+        script = step_script('coverage.yml', 'Generate region evidence')
+        for export_status in (0, 23):
+            with self.subTest(export_status=export_status), tempfile.TemporaryDirectory() as directory:
+                exporter = """
+                cargo() {
+                    test "$*" = 'llvm-cov report --json --output-path coverage-regions.json' || return 99
+                    test "$EXPORT_STATUS" = 0 || return "$EXPORT_STATUS"
+                    printf '%s' '{"data":[{"functions":[{"regions":[[16,29,16,86,10,0,0,0]]}]}]}' > coverage-regions.json
+                }
+                """
+                result = subprocess.run(
+                    [BASH, '-e', '-c', textwrap.dedent(exporter) + script],
+                    cwd=directory, env=dict(os.environ, EXPORT_STATUS=str(export_status)),
+                    capture_output=True, text=True,
+                )
+                artifact = Path(directory) / 'coverage-regions.json.gz'
+                if export_status:
+                    self.assertEqual(result.returncode, export_status, result.stderr)
+                    self.assertFalse(artifact.exists(), 'failed export must not publish evidence')
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    with gzip.open(artifact, 'rt', encoding='utf-8') as handle:
+                        self.assertEqual(json.load(handle)['data'][0]['functions'][0]['regions'][0][4], 10)
+
+    def test_region_artifact_survives_downstream_comparison_failure_with_short_retention(self):
+        text = (WORKFLOWS / 'coverage.yml').read_text()
+        for name in ('Generate region evidence', 'Preserve region evidence'):
+            block = text.split(f'      - name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("steps.instrumented_tests.outcome == 'success'", block)
+            self.assertIn("steps.instrumented_tests.outcome == 'failure'", block)
+            self.assertNotIn('continue-on-error', block)
+        artifact = text.split('      - name: Preserve region evidence\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('name: coverage-regions', artifact)
+        self.assertIn('path: coverage-regions.json.gz', artifact)
+        self.assertIn('retention-days: 3', artifact)
+        self.assertIn('if-no-files-found: error', artifact)
+
     def test_portable_and_benchmark_preserve_native_cache_budget(self):
         for filename, old_prefix, new_prefix in (
             ('ci.yml', 'v2-portable', 'v3-portable-registry'),

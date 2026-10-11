@@ -184,7 +184,7 @@ fn tool_binary_hashes(install_dir: &Path) -> Result<BTreeMap<String, String>> {
         }
         for entry in fs::read_dir(directory)? {
             let path = entry?.path();
-            if is_venv && path.file_name().is_some_and(is_venv_base_tool) {
+            if is_venv && is_venv_base_entry(install_dir, &path)? {
                 continue;
             }
             let metadata = fs::symlink_metadata(&path)?;
@@ -243,7 +243,7 @@ fn validate_tool_binary_containment(install_dir: &Path) -> Result<()> {
         }
         for entry in fs::read_dir(&directory)? {
             let path = entry?.path();
-            if is_venv && path.file_name().is_some_and(is_venv_base_tool) {
+            if is_venv && is_venv_base_entry(install_dir, &path)? {
                 continue;
             }
             let metadata = fs::symlink_metadata(&path)?;
@@ -433,6 +433,122 @@ fn is_venv_base_tool(name: &std::ffi::OsStr) -> bool {
             name,
             "activate" | "activate.csh" | "activate.fish" | "Activate.ps1"
         )
+}
+
+fn is_venv_base_entry(install_dir: &Path, path: &Path) -> Result<bool> {
+    let Some(name) = path.file_name() else {
+        return Ok(false);
+    };
+    if is_venv_base_tool(name) {
+        return Ok(true);
+    }
+    if name != "𝜋thon" {
+        return Ok(false);
+    }
+    // CPython 3.14's UTF-8 alias is interpreter plumbing only when it points
+    // to (or is an exact contained copy of) this venv's recorded base Python.
+    let mut config = String::new();
+    fs::File::open(install_dir.join("pyvenv.cfg"))?
+        .take(64 * 1024)
+        .read_to_string(&mut config)?;
+    let Some(base) = config.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "executable").then(|| PathBuf::from(value.trim()))
+    }) else {
+        return Ok(false);
+    };
+    let base = fs::canonicalize(base)?;
+    let target = fs::canonicalize(path)?;
+    if !fs::metadata(&base)?.is_file() || !fs::metadata(&target)?.is_file() {
+        return Ok(false);
+    }
+    if target == base {
+        return Ok(true);
+    }
+    if !target.starts_with(fs::canonicalize(install_dir)?) {
+        return Ok(false);
+    }
+    let mut alias = fs::File::open(target)?;
+    let mut python = fs::File::open(base)?;
+    if alias.metadata()?.len() != python.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut alias_chunk = [0_u8; 8192];
+    let mut python_chunk = [0_u8; 8192];
+    loop {
+        let length = alias.read(&mut alias_chunk)?;
+        python.read_exact(&mut python_chunk[..length])?;
+        if alias_chunk[..length] != python_chunk[..length] {
+            return Ok(false);
+        }
+        if length == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn relocate_venv_entry_points(staging_dir: &Path, install_dir: &Path) -> Result<()> {
+    use std::io::{Seek as _, Write as _};
+
+    if !staging_dir.join("pyvenv.cfg").is_file() {
+        return Ok(());
+    }
+    let old = staging_dir
+        .to_str()
+        .context("Non-UTF-8 venv staging path")?;
+    let new = install_dir
+        .to_str()
+        .context("Non-UTF-8 venv install path")?;
+    let old_interpreter = format!("{old}/bin/python");
+    for entry in fs::read_dir(staging_dir.join("bin"))? {
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let mut file = fs::File::open(&path)?;
+        let mut prefix = Vec::new();
+        (&mut file).take(4096).read_to_end(&mut prefix)?;
+        // Only interpreter headers are relocation metadata. Never rewrite a
+        // package's script body or binary content that mentions the old path.
+        let header_len = prefix
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .nth(2)
+            .map_or(prefix.len(), |(offset, _)| offset + 1);
+        let Ok(header) = std::str::from_utf8(&prefix[..header_len]) else {
+            continue;
+        };
+        let direct = header.starts_with(&format!("#!{old_interpreter}"));
+        let trampoline = header.starts_with("#!/bin/sh\n'''exec' ")
+            && header
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.contains(&old_interpreter));
+        if !direct && !trampoline {
+            continue;
+        }
+        let first_line_end = header.find('\n').map_or(header.len(), |offset| offset + 1);
+        let replace_end = if direct {
+            first_line_end
+        } else {
+            first_line_end
+                + header[first_line_end..]
+                    .find('\n')
+                    .map_or(header.len() - first_line_end, |offset| offset + 1)
+        };
+        let relocated = header[..replace_end].replace(old, new);
+        let mut temp = tempfile::NamedTempFile::new_in(staging_dir.join("bin"))?;
+        temp.write_all(relocated.as_bytes())?;
+        file.seek(std::io::SeekFrom::Start(replace_end as u64))?;
+        std::io::copy(&mut file, &mut temp)?;
+        temp.as_file().set_permissions(metadata.permissions())?;
+        temp.as_file().sync_all()?;
+        temp.persist(&path)
+            .with_context(|| format!("Relocate venv entry point {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Pick the best available CPython launcher.
@@ -1082,6 +1198,11 @@ fn install_managed_blocking(
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
+    if let Err(error) = relocate_venv_entry_points(&staging_dir, &install_dir) {
+        pb.finish_and_clear();
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
     if let Err(error) = write_security_receipt(&staging_dir, manager, pkg) {
         pb.finish_and_clear();
         let _ = fs::remove_dir_all(&staging_dir);
@@ -1223,7 +1344,7 @@ fn link_binaries(install_dir: &Path, bin_dir: &Path, skip_venv_base_tools: bool)
                 let Some(filename) = path.file_name() else {
                     continue;
                 };
-                if skip_venv_base_tools && is_venv_base_tool(filename) {
+                if skip_venv_base_tools && is_venv_base_entry(install_dir, &path)? {
                     continue;
                 }
                 let target = fs::canonicalize(&path)?;
@@ -1345,6 +1466,7 @@ pub async fn remove(name: &str) -> Result<()> {
     }
 
     let mut found = false;
+    let mut removed_installs = Vec::new();
     for (manager, install_path) in candidates {
         if crate::runtimes::common::is_valid_version_dir(&install_path) {
             println!(
@@ -1354,6 +1476,7 @@ pub async fn remove(name: &str) -> Result<()> {
                 manager
             );
             fs::remove_dir_all(&install_path)?;
+            removed_installs.push(install_path);
             found = true;
         }
     }
@@ -1366,9 +1489,28 @@ pub async fn remove(name: &str) -> Result<()> {
         Ok(entries) => {
             for entry in entries {
                 let path = entry?.path();
-                if let Ok(target) = fs::read_link(&path)
-                    && !target.exists()
-                {
+                if let Ok(target) = fs::read_link(&path) {
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        bin_dir.join(target)
+                    };
+                    let mut normalized = PathBuf::new();
+                    for component in target.components() {
+                        if component == std::path::Component::ParentDir {
+                            normalized.pop();
+                        } else if component != std::path::Component::CurDir {
+                            normalized.push(component.as_os_str());
+                        }
+                    }
+                    if !removed_installs.iter().any(|install| {
+                        normalized
+                            .strip_prefix(install)
+                            .is_ok_and(|relative| relative.components().next().is_some())
+                    }) || path.exists()
+                    {
+                        continue;
+                    }
                     fs::remove_file(&path)?;
                     println!(
                         "    {} Removed link {}",
@@ -1561,6 +1703,252 @@ pub fn registry() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removing_one_tool_preserves_unrelated_and_relative_user_links() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::removing_one_tool_preserves_unrelated_and_relative_user_links",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("private fixture directory");
+        let data = directory.path().join("data");
+        let install = data.join("tools/cargo/private-fixture");
+        let bin = data.join("bin");
+        fs::create_dir_all(install.join("bin")).expect("selected installation");
+        fs::create_dir_all(&bin).expect("shared binaries");
+        fs::write(install.join("bin/owned"), b"selected tool").expect("selected binary");
+        symlink(install.join("bin/owned"), bin.join("owned")).expect("owned absolute link");
+        symlink(
+            "../tools/cargo/private-fixture/bin/owned",
+            bin.join("owned-relative"),
+        )
+        .expect("owned relative link");
+        symlink("/missing/private-user-command", bin.join("user-broken"))
+            .expect("unrelated dangling link");
+        fs::write(bin.join("user-target"), b"preserve user data").expect("user target");
+        symlink("user-target", bin.join("user-relative")).expect("valid user relative link");
+        let other = data.join("tools/cargo/other/bin/other");
+        fs::create_dir_all(other.parent().expect("other parent")).expect("other installation");
+        fs::write(&other, b"other tool").expect("other tool binary");
+        symlink(&other, bin.join("other")).expect("other tool link");
+        temp_env::with_vars(
+            [
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("1"))),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(remove("private-fixture"))
+                    .expect("remove selected tool");
+            },
+        );
+        assert!(!install.exists(), "selected tool must be removed");
+        assert!(fs::symlink_metadata(bin.join("owned")).is_err());
+        assert!(fs::symlink_metadata(bin.join("owned-relative")).is_err());
+        assert_eq!(
+            fs::read_link(bin.join("user-broken")).expect("unrelated dangling link preserved"),
+            PathBuf::from("/missing/private-user-command")
+        );
+        assert_eq!(
+            fs::read(bin.join("user-relative")).expect("valid relative user command preserved"),
+            b"preserve user data"
+        );
+        assert_eq!(
+            fs::read(bin.join("other")).expect("other tool preserved"),
+            b"other tool"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn python_venv_base_alias_is_not_published_as_a_tool_or_rejected_as_foreign() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let venv = directory.path().join("venv");
+        let status = Command::new("python3")
+            .args(["-m", "venv", "--without-pip"])
+            .arg(&venv)
+            .status()
+            .expect("Python venv prerequisite");
+        assert!(status.success(), "real venv creation must succeed");
+        // CPython 3.14 generates this alias itself. Characterize the same base
+        // executable relation on older supported interpreters too.
+        let alias = venv.join("bin/𝜋thon");
+        if !alias.exists() {
+            symlink("python3", &alias).expect("base interpreter alias");
+        }
+        let foreign = venv.join("bin/foreign-publisher-command");
+        symlink("/bin/sh", &foreign).expect("foreign executable control");
+        assert!(validate_tool_binary_containment(&venv).is_err());
+        fs::remove_file(foreign).expect("remove negative control");
+        validate_tool_binary_containment(&venv)
+            .expect("real base interpreter aliases are plumbing");
+        write_security_receipt(&venv, "pip", "fixture").expect("receipt excludes base aliases");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(venv.join(".omg-security-receipt.json")).expect("receipt bytes"),
+        )
+        .expect("receipt JSON");
+        assert_eq!(receipt["executable_sha256"], serde_json::json!({}));
+        let bin = directory.path().join("shared-bin");
+        fs::create_dir(&bin).expect("shared bin");
+        link_binaries(&venv, &bin, true).expect("link actual venv");
+        assert_eq!(fs::read_dir(bin).expect("shared entries").count(), 0);
+        fs::remove_file(&alias).expect("replace interpreter alias control");
+        symlink("/bin/sh", &alias).expect("foreign executable using alias name");
+        let error = validate_tool_binary_containment(&venv)
+            .expect_err("alias spelling must not admit a different base executable");
+        assert!(error.to_string().contains("outside its installation"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn python_venv_base_alias_inspection_rejects_nonregular_targets_without_blocking() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::python_venv_base_alias_inspection_rejects_nonregular_targets_without_blocking",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("alias fixture");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("venv bin");
+        let base = fs::canonicalize(which::which("python3").expect("Python3 prerequisite"))
+            .expect("base interpreter");
+        let config = directory.path().join("pyvenv.cfg");
+        fs::write(&config, format!("executable = {}\n", base.display())).expect("venv config");
+        let alias = bin.join("𝜋thon");
+        nix::unistd::mkfifo(&alias, nix::sys::stat::Mode::S_IRWXU).expect("private alias FIFO");
+        assert!(
+            !is_venv_base_entry(directory.path(), &alias).expect("bounded alias inspection"),
+            "a FIFO cannot be executable interpreter plumbing"
+        );
+        fs::remove_file(&alias).expect("remove alias FIFO");
+        fs::copy(&base, &alias).expect("contained interpreter copy");
+        let fifo_base = directory.path().join("fifo-base");
+        nix::unistd::mkfifo(&fifo_base, nix::sys::stat::Mode::S_IRWXU).expect("private base FIFO");
+        fs::write(&config, format!("executable = {}\n", fifo_base.display())).expect("FIFO config");
+        assert!(
+            !is_venv_base_entry(directory.path(), &alias).expect("bounded base inspection"),
+            "a FIFO cannot be the recorded base executable"
+        );
+        fs::remove_file(&alias).expect("remove interpreter copy");
+        symlink(&fifo_base, &alias).expect("alias pointing to nonregular base");
+        assert!(!is_venv_base_entry(directory.path(), &alias).expect("nonregular equal target"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_real_pip_entry_point_after_promotion(test_name: &str, with_spaces: bool) {
+        if crate::core::testing::run_isolated_test(test_name) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().expect("offline pip fixture");
+        let root = directory.path().join(if with_spaces {
+            "path with spaces and an apostrophe's value"
+        } else {
+            "plain"
+        });
+        let managers = root.join("managers");
+        let tools = root.join("tools");
+        let bin = root.join("bin");
+        fs::create_dir_all(&managers).expect("private managers");
+        fs::create_dir_all(&bin).expect("shared bin");
+        let python = which::which("python3").expect("Python3 prerequisite");
+        let wheel = managers.join("black-0.0.1-py3-none-any.whl");
+        let wheel_output = Command::new(&python).args(["-c", r#"
+import base64, hashlib, sys, zipfile
+entries = {
+    'worker03_black_fixture.py': b'def main():\n    print("offline-tool-runnable")\n',
+    'black-0.0.1.dist-info/METADATA': b'Metadata-Version: 2.1\nName: black\nVersion: 0.0.1\n',
+    'black-0.0.1.dist-info/WHEEL': b'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
+    'black-0.0.1.dist-info/entry_points.txt': b'[console_scripts]\nblack = worker03_black_fixture:main\n',
+}
+records = []
+for name, body in entries.items():
+    digest = base64.urlsafe_b64encode(hashlib.sha256(body).digest()).rstrip(b'=').decode()
+    records.append(f'{name},sha256={digest},{len(body)}')
+records.append('black-0.0.1.dist-info/RECORD,,')
+entries['black-0.0.1.dist-info/RECORD'] = ('\n'.join(records) + '\n').encode()
+with zipfile.ZipFile(sys.argv[1], 'w') as archive:
+    for name, body in entries.items():
+        archive.writestr(name, body)
+"#]).arg(&wheel).output().expect("build offline wheel with stdlib");
+        assert!(
+            wheel_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wheel_output.stderr)
+        );
+        let wrapper = managers.join("python3");
+        let python_literal = serde_json::to_string(&python).expect("Python literal");
+        let wheel_literal = serde_json::to_string(&wheel).expect("wheel literal");
+        let source = format!(
+            r"#!{python_path}
+import pathlib, shlex, subprocess, sys
+python = {python_literal}
+if sys.argv[1:] == ['--version']:
+    raise SystemExit(subprocess.call([python, '--version']))
+result = subprocess.call([python, *sys.argv[1:3], '--copies', *sys.argv[3:]])
+if result:
+    raise SystemExit(result)
+venv = pathlib.Path(sys.argv[-1])
+pip = venv / 'bin/pip'
+command = shlex.join([str(venv / 'bin/python3'), '-m', 'pip', 'install', '--no-index', '--no-deps', {wheel_literal}])
+pip.write_text('#!/bin/sh\nexec ' + command + '\n')
+pip.chmod(0o755)
+",
+            python_path = python.display()
+        );
+        fs::write(&wrapper, source).expect("private offline manager redirect");
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
+            .expect("wrapper executable");
+        let mut paths = vec![managers];
+        paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
+        let path = std::env::join_paths(paths).expect("fixture PATH");
+        with_managed_fixture_environment(&path, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(install_managed("pip", "black", "black", &tools, &bin))
+                .expect("actual pip installation must publish a runnable entry point");
+        });
+        let output = Command::new(bin.join("black"))
+            .output()
+            .expect("promoted pip console entry point must execute after staging disappears");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"offline-tool-runnable\n");
+        assert_eq!(
+            fs::read_dir(tools.join("pip"))
+                .expect("install entries")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_pip_console_entry_point_survives_staging_promotion() {
+        check_real_pip_entry_point_after_promotion(
+            "cli::tool::tests::real_pip_console_entry_point_survives_staging_promotion",
+            false,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_pip_console_entry_point_survives_staging_promotion_with_spaces() {
+        check_real_pip_entry_point_after_promotion(
+            "cli::tool::tests::real_pip_console_entry_point_survives_staging_promotion_with_spaces",
+            true,
+        );
+    }
 
     #[cfg(unix)]
     fn with_managed_fixture_environment(path: &std::ffi::OsStr, test: impl FnOnce()) {

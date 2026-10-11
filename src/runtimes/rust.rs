@@ -813,7 +813,9 @@ fn manifest_component_target<'a>(
         .get("pkg")
         .and_then(|pkg| pkg.get(manifest_package_name(component)))
         .and_then(|pkg| pkg.get("target"))
-        .and_then(|targets| targets.get(target))
+        // Source components are target-independent; an explicit host entry
+        // still takes precedence over the distribution's wildcard entry.
+        .and_then(|targets| targets.get(target).or_else(|| targets.get("*")))
         .ok_or_else(|| anyhow::anyhow!("Target '{target}' not found for component '{component}'"))
 }
 
@@ -1150,6 +1152,265 @@ mod tests {
                 toolchain.name().into()
             ])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rust_src_initial_install_downloads_source_and_records_component() -> Result<()> {
+        rust_src_contract_child(
+            "runtimes::rust::tests::rust_src_initial_install_downloads_source_and_records_component",
+            false,
+        )
+    }
+
+    #[test]
+    fn rust_src_incremental_install_preserves_toolchain_and_records_component() -> Result<()> {
+        rust_src_contract_child(
+            "runtimes::rust::tests::rust_src_incremental_install_preserves_toolchain_and_records_component",
+            true,
+        )
+    }
+
+    fn rust_src_contract_child(name: &str, incremental: bool) -> Result<()> {
+        const CHILD: &str = "OMG_RUST_SRC_CONTRACT_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            anyhow::ensure!(crate::core::paths::test_mode());
+            tokio::runtime::Runtime::new()?.block_on(async {
+                for selection in [
+                    SourceSelection::Wildcard,
+                    SourceSelection::HostPreferred,
+                    SourceSelection::Unavailable,
+                    SourceSelection::Missing,
+                ] {
+                    rust_src_install_fixture(incremental, selection).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
+            println!("RUST_SRC_CONTRACT_COMPLETED {name}");
+            return Ok(());
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .env("OMG_TEST_MODE", "1")
+            .output()?;
+        let stdout = String::from_utf8(output.stdout)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "isolated rust-src fixture failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(
+            stdout.contains(&format!("RUST_SRC_CONTRACT_COMPLETED {name}"))
+                && stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "isolated rust-src child did not execute its contract: {stdout}"
+        );
+        println!("{stdout}");
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SourceSelection {
+        Wildcard,
+        HostPreferred,
+        Unavailable,
+        Missing,
+    }
+
+    async fn rust_src_install_fixture(incremental: bool, selection: SourceSelection) -> Result<()> {
+        use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
+
+        let accepted = matches!(
+            selection,
+            SourceSelection::Wildcard | SourceSelection::HostPreferred
+        );
+        let toolchain = RustToolchainSpec::parse("1.93.1")?;
+        let source_path = "lib/rustlib/src/rust/library/core/src/lib.rs";
+        let mut manifest = String::from("[pkg.rustc]\nversion = \"1.93.1\"\n");
+        let mut routes = Vec::new();
+        for (component, path, payload) in [
+            ("cargo", "bin/cargo", b"installed cargo".as_slice()),
+            ("rust-src", source_path, b"wildcard source".as_slice()),
+            ("rust-std", "lib/libstd.rlib", b"installed std".as_slice()),
+            ("rustc", "bin/rustc", b"installed rustc".as_slice()),
+        ] {
+            if component == "rust-src" && !accepted {
+                let target = if matches!(selection, SourceSelection::Unavailable) {
+                    "*"
+                } else {
+                    "unrelated-target"
+                };
+                writeln!(
+                    manifest,
+                    "[pkg.rust-src.target.\"{target}\"]\navailable = false"
+                )?;
+                continue;
+            }
+            let target = if component == "rust-src" {
+                "*"
+            } else {
+                &toolchain.host
+            };
+            let archive = gzip_tar(&component_archive(
+                &format!("{component}-1.93.1/{component}/{path}"),
+                EntryType::Regular,
+                payload,
+            )?)?;
+            let hash = format!("{:x}", Sha256::digest(&archive));
+            writeln!(
+                manifest,
+                "[pkg.{component}.target.\"{target}\"]\navailable = true\nurl = \"ARCHIVE_BASE/{component}.tar.gz\"\nhash = \"{hash}\""
+            )?;
+            if component == "rust-src" {
+                if matches!(selection, SourceSelection::HostPreferred) {
+                    let archive = gzip_tar(&component_archive(
+                        &format!("rust-src-1.93.1/rust-src/{source_path}"),
+                        EntryType::Regular,
+                        b"host-specific source",
+                    )?)?;
+                    writeln!(
+                        manifest,
+                        "[pkg.rust-src.target.\"{}\"]\navailable = true\nurl = \"ARCHIVE_BASE/host-source.tar.gz\"\nhash = \"{:x}\"",
+                        toolchain.host,
+                        Sha256::digest(&archive)
+                    )?;
+                    routes.push(("/host-source.tar.gz".into(), archive));
+                } else {
+                    routes.push((format!("/{component}.tar.gz"), archive));
+                }
+            } else if !incremental && (accepted || component == "cargo") {
+                routes.push((format!("/{component}.tar.gz"), archive));
+            }
+        }
+        let expected_requests: Vec<_> = routes
+            .iter()
+            .map(|(path, _)| format!("GET {path} HTTP/1.1"))
+            .collect();
+        let archives = super::super::test_https::HttpFixture::new(routes).await?;
+        let manifest = manifest.replace("ARCHIVE_BASE", &format!("http://{}", archives.address));
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "static.rust-lang.org",
+            vec![(
+                "/dist/channel-rust-1.93.1.toml".into(),
+                manifest.into_bytes(),
+            )],
+        )
+        .await?;
+        let versions = TempDir::new()?;
+        let manager = RustManager {
+            versions_dir: versions.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        let previous = if incremental {
+            toolchain.clone()
+        } else {
+            RustToolchainSpec::parse("1.92.0")?
+        };
+        let previous_dir = manager.toolchain_dir(&previous);
+        fs::create_dir_all(previous_dir.join("bin"))?;
+        fs::create_dir_all(previous_dir.join("lib"))?;
+        fs::write(previous_dir.join("bin/rustc"), b"installed rustc")?;
+        fs::write(previous_dir.join("bin/cargo"), b"installed cargo")?;
+        fs::write(previous_dir.join("lib/libstd.rlib"), b"installed std")?;
+        RustManager::write_metadata(
+            &previous_dir,
+            &RustToolchainMetadata {
+                release: Some(if incremental { "1.93.1" } else { "1.92.0" }.into()),
+                components: BTreeSet::from(["cargo".into(), "rust-std".into(), "rustc".into()]),
+                targets: BTreeSet::new(),
+            },
+        )?;
+        let lease = manager.lock_mutations()?;
+        manager.activate_toolchain(&previous, &lease)?;
+        drop(lease);
+        let metadata_before = fs::read(previous_dir.join(RUST_METADATA_FILE))?;
+        let request = RustToolchainRequest {
+            channel: "1.93.1".into(),
+            profile: Some("minimal".into()),
+            components: vec!["rust-src".into()],
+            ..Default::default()
+        };
+        let result = manager.ensure_toolchain(&request).await;
+        let directory = manager.toolchain_dir(&toolchain);
+        if accepted {
+            result.with_context(|| {
+                format!("{selection:?}, incremental={incremental}: requested source must install")
+            })?;
+            let expected: &[u8] = if matches!(selection, SourceSelection::HostPreferred) {
+                b"host-specific source"
+            } else {
+                b"wildcard source"
+            };
+            assert_eq!(fs::read(directory.join(source_path))?, expected);
+            let metadata = RustManager::read_metadata(&directory)?;
+            assert_eq!(metadata.release.as_deref(), Some("1.93.1"));
+            assert_eq!(
+                metadata.components,
+                BTreeSet::from([
+                    "cargo".into(),
+                    "rust-src".into(),
+                    "rust-std".into(),
+                    "rustc".into()
+                ])
+            );
+            assert!(
+                manager
+                    .toolchain_status(&request)?
+                    .missing_components
+                    .is_empty()
+            );
+            manager.install("1.93.1").await?;
+            assert_eq!(fs::read_link(versions.path().join("current"))?, directory);
+        } else {
+            let error = result.expect_err("unavailable/missing source must refuse installation");
+            assert!(
+                error
+                    .to_string()
+                    .contains(if matches!(selection, SourceSelection::Unavailable) {
+                        "No download URL"
+                    } else {
+                        "not found for component"
+                    }),
+                "{error:#}"
+            );
+            assert!(!directory.join(source_path).exists());
+            assert!(incremental || !directory.exists());
+            assert_eq!(
+                fs::read(previous_dir.join(RUST_METADATA_FILE))?,
+                metadata_before
+            );
+            assert_eq!(
+                fs::read_link(versions.path().join("current"))?,
+                previous_dir
+            );
+        }
+        assert_eq!(
+            fs::read(previous_dir.join("bin/rustc"))?,
+            b"installed rustc"
+        );
+        assert_eq!(
+            fs::read(previous_dir.join("bin/cargo"))?,
+            b"installed cargo"
+        );
+        assert_eq!(
+            fs::read(previous_dir.join("lib/libstd.rlib"))?,
+            b"installed std"
+        );
+        assert_eq!(
+            fixture.finish().await?,
+            ["GET /dist/channel-rust-1.93.1.toml HTTP/1.1"]
+        );
+        assert_eq!(archives.finish().await?, expected_requests);
+        for entry in fs::read_dir(versions.path())? {
+            let name = entry?.file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(".install-")
+                    && !name.to_string_lossy().starts_with(".rust-component-"),
+                "unpublished scratch survived: {name:?}"
+            );
+        }
+        println!("rust-src {selection:?} incremental={incremental} accepted={accepted}");
         Ok(())
     }
 

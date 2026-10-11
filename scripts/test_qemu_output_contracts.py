@@ -18,6 +18,43 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipIf(os.name == 'nt', 'native preview assertions require POSIX bash')
 class NativeRemovalContracts(unittest.TestCase):
+    def test_benchmark_search_smoke_accepts_only_exact_guest_package_identity(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
+        begin = source.index('"$bin" search tree > evidence/search.txt\n')
+        end = source.index('sudo -n "$bin" install --yes tree\n', begin)
+        assertion = source[begin:end].split('\n', 1)[1]
+        cases = (
+            ('fedora', 'x86_64', '  tree.x86_64 2.2.1-4.fc44  Official\n', True),
+            ('fedora', 'aarch64', '  tree.aarch64 2.2.1-4.fc44  Official\n', True),
+            ('fedora', 'x86_64', '  tree 2.2.1-4.fc44  Official\n', True),
+            ('fedora', 'x86_64', '\ttree.x86_64\t2.2.1-4.fc44\tOfficial\n', True),
+            ('fedora', 'x86_64', '  tree.i686 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree.aarch64 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree.noarch 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree-sitter-cli.x86_64 0.26.11  Official\n', False),
+            ('fedora', 'x86_64', '  subtree.x86_64 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree.x86_64-extra 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree.x86_64.extra 2.2.1-4.fc44  Official\n', False),
+            ('fedora', 'x86_64', '  tree.x86_64', False),
+            ('fedora', 'x86_64', '', False),
+            ('arch', 'x86_64', '  tree 2.2.1-1  Official\n', True),
+            ('arch', 'x86_64', '  tree.x86_64 2.2.1-1  Official\n', False),
+            ('debian', 'x86_64', '  tree 2.2.1-1  Official\n', True),
+            ('debian', 'x86_64', '  tree.x86_64 2.2.1-1  Official\n', False),
+        )
+        for distro, guest_arch, output, accepted in cases:
+            with self.subTest(distro=distro, guest_arch=guest_arch, output=output):
+                with tempfile.TemporaryDirectory() as directory:
+                    evidence = Path(directory) / 'evidence'
+                    evidence.mkdir()
+                    (evidence / 'search.txt').write_text(output, encoding='utf-8')
+                    result = subprocess.run(
+                        [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
+                         assertion, '_'], cwd=directory, capture_output=True,
+                        text=True, timeout=5,
+                        env={**os.environ, 'distro': distro, 'guest_arch': guest_arch})
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
     def test_runtime_guest_enables_only_download_phase_diagnostics(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         line = next(line.strip() for line in source.splitlines()
@@ -308,6 +345,247 @@ trap 'printf "exit-trap\\n"' EXIT
 
 
 class OutputContracts(unittest.TestCase):
+    def test_fedora_firefox_requires_one_exact_compatible_official_identity(self):
+        showrc = 'compatible archs : x86_64 noarch i686\n'
+        header = '  | Search\n    firefox\n'
+        for name in ('firefox', 'firefox.x86_64', 'firefox.noarch', 'firefox.i686'):
+            output = header + f'  {name} 157.0.1-1.fc44  Official\n  firefox-langpacks.x86_64 157.0.1-1.fc44  Official\n'
+            with self.subTest(name=name):
+                result = self.run_oracle(assertion='search-firefox-results', distro='fedora', stdout=output, rpm_showrc=showrc)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        good = header + '  firefox.x86_64 157.0.1-1.fc44  Official\n'
+        for label, output, code in (
+            ('foreign suffix', good.replace('firefox.x86_64', 'firefox.aarch64'), 0),
+            ('nested suffix', good.replace('firefox.x86_64', 'firefox.x86_64.noarch'), 0),
+            ('prefix only', good.replace('firefox.x86_64', 'firefox-langpacks.x86_64'), 0),
+            ('suffix only', good.replace('firefox.x86_64', 'browserpass-firefox.x86_64'), 0),
+            ('duplicate target', good + '  firefox.x86_64 157.0.1-1.fc44  Official\n', 0),
+            ('duplicate missing EVR', good + '  firefox.x86_64\n', 0),
+            ('duplicate missing source', good + '  firefox.x86_64 157.0.1-1.fc44\n', 0),
+            ('duplicate wrong separator', good + '  firefox.x86_64 157.0.1-1.fc44 Official\n', 0),
+            ('two compatible targets', good + '  firefox.i686 157.0.1-1.fc44  Official\n', 0),
+            ('bare and qualified target', good + '  firefox 157.0.1-1.fc44  Official\n', 0),
+            ('invalid EVR', good.replace('157.0.1-1.fc44', 'unknown'), 0),
+            ('foreign source', good.replace('Official', 'AUR'), 0),
+            ('extra field', good.replace('Official\n', 'Official extra\n'), 0),
+            ('wrong header', good.replace('| Search', '| Info'), 0),
+            ('wrong query', good.replace('    firefox\n', '    fire\n'), 0),
+            ('nonzero product', good, 1),
+        ):
+            with self.subTest(label=label):
+                result = self.run_oracle(assertion='search-firefox-results', distro='fedora', stdout=output, code=code, rpm_showrc=showrc)
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
+    def test_fedora_firefox_refuses_missing_or_invalid_rpm_metadata_in_transport(self):
+        row = 'search\t["search","firefox"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tsearch-firefox-results\ttempdir-drop'
+        output = '  | Search\n    firefox\n  firefox 157.0.1-1.fc44  Official\n'
+        for label, metadata, status in (
+            ('absent', '', 0), ('native failed', 'compatible archs : x86_64\n', 7),
+            ('ambiguous', 'compatible archs : x86_64\ncompatible archs : i686\n', 0),
+            ('empty', 'compatible archs :\n', 0), ('bad token', 'compatible archs : x86_64.bad\n', 0),
+            ('too many tokens', 'compatible archs : ' + ' '.join(['x86_64'] * 65) + '\n', 0),
+            ('oversized', 'compatible archs : ' + 'a' * 1025 + '\n', 0),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(output) + '\n', [row],
+                    distro='fedora', native_commands=self.receiver_native(metadata=metadata, rpm_status=status))
+                self.assertEqual(evidence[0]['exit_code'], 0, logs)
+                self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertIn('unavailable RPM architecture compatibility', logs['search.log'])
+                self.assertNotIn('command not found', logs['search.log'])
+
+    @staticmethod
+    def receiver_info_output(name='pacman.x86_64', version='7.0.0-6.fc44', source='Official repository (dnf)'):
+        return f'  | Info\n    {name}\n          Name: {name}\n       Version: {version}\n        Source: {source}\n'
+
+    @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
+    def test_fedora_info_accepts_native_identity_and_bare_published_base(self):
+        row = 'info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tinfo-native-package\ttempdir-drop'
+        for native_name, shown in (('pacman.x86_64', 'pacman.x86_64'), ('pacman.i686', 'pacman.i686'),
+                                  ('pacman.noarch', 'pacman.noarch'), ('pacman.x86_64', 'pacman')):
+            with self.subTest(native=native_name, shown=shown):
+                output = self.receiver_info_output(shown)
+                result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(output) + '\n', [row],
+                    distro='fedora', native_commands=self.receiver_native(native_name + '\t7.0.0-6.fc44\n'))
+                self.assertEqual(result.returncode, 0, logs)
+                self.assertEqual(evidence[0]['exit_code'], 0, logs)
+                self.assertEqual(evidence[0]['result'], 'PASS', logs)
+                self.assertIn('identity=' + native_name, logs['info.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
+    def test_fedora_info_uses_native_dnf5_field_and_record_separators(self):
+        row = 'info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tinfo-native-package\ttempdir-drop'
+        cases = (
+            ('native identity', [('pacman', 'x86_64', '7.0.0-6.fc44')], 'PASS'),
+            ('noarch identity', [('pacman', 'noarch', '7.0.0-6.fc44')], 'PASS'),
+            ('duplicate identity', [('pacman', 'x86_64', '7.0.0-6.fc44')] * 2, 'BLOCKED'),
+            ('multiple architectures', [('pacman', 'x86_64', '7.0.0-6.fc44'), ('pacman', 'i686', '7.0.0-6.fc44')], 'BLOCKED'),
+            ('invalid EVR', [('pacman', 'x86_64', 'unknown')], 'BLOCKED'),
+        )
+        for label, records, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                observed = Path(directory) / 'native-argv.json'
+                native = self.receiver_native()
+                # Native DNF5 preserves literal backslash-t, expands backslash-n,
+                # and does not append a newline. This fixture records the real
+                # receiver argv and renders external records, not its parser.
+                native['dnf'] = (
+                    'exec /usr/bin/python3 - ' + shlex.quote(str(observed)) + ' "$@" <<\'PY\'\n'
+                    'import json, sys\nfrom pathlib import Path\n'
+                    'argv = sys.argv[2:]\n'
+                    'Path(sys.argv[1]).write_text(json.dumps(argv))\n'
+                    'assert len(argv) == 6 and argv[:5] == ["--cacheonly", "repoquery", "pacman", "--latest-limit=1", "--queryformat"]\n'
+                    'records = ' + repr(records) + '\n'
+                    'for name, arch, evr in records:\n'
+                    '    rendered = argv[5].replace("%{name}", name).replace("%{arch}", arch).replace("%{evr}", evr)\n'
+                    '    sys.stdout.write(rendered.replace(r"\\n", "\\n"))\nPY\n'
+                )
+                shown = 'pacman.noarch' if label == 'noarch identity' else 'pacman.x86_64'
+                result, evidence, logs = self.run_inventory(
+                    'printf %s ' + shlex.quote(self.receiver_info_output(shown)) + '\n',
+                    [row], distro='fedora', native_commands=native)
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1, logs)
+                argv = json.loads(observed.read_text())
+                self.assertEqual(argv[:5], ['--cacheonly', 'repoquery', 'pacman', '--latest-limit=1', '--queryformat'])
+                self.assertEqual(argv[5].encode('ascii'), b'%{name}.%{arch}\t%{evr}\n')
+
+    @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
+    def test_fedora_info_refuses_wrong_identity_evr_source_and_nonunique_fields(self):
+        row = 'info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tinfo-native-package\ttempdir-drop'
+        good = self.receiver_info_output()
+        for label, output, reason in (
+            ('different compatible arch', self.receiver_info_output('pacman.i686'), 'disagrees with the native'),
+            ('foreign arch', self.receiver_info_output('pacman.aarch64'), 'disagrees with the native'),
+            ('nested suffix', self.receiver_info_output('pacman.x86_64.noarch'), 'disagrees with the native'),
+            ('wrong base', self.receiver_info_output('pacman-gui'), 'disagrees with the native'),
+            ('wrong EVR', self.receiver_info_output(version='9.9-9'), 'disagrees with the native'),
+            ('extra name token', good.replace('Name: pacman.x86_64', 'Name: pacman.x86_64 extra'), 'disagrees with the native'),
+            ('extra version token', good.replace('Version: 7.0.0-6.fc44', 'Version: 7.0.0-6.fc44 extra'), 'disagrees with the native'),
+            ('foreign source', self.receiver_info_output(source='Official repository (copr)'), 'disagrees with the native'),
+            ('duplicate Name', good + 'Name: pacman\n', 'unique pacman'),
+            ('duplicate Version', good + 'Version: 7.0.0-6.fc44\n', 'unique pacman'),
+            ('duplicate Source', good + 'Source: Official repository (dnf)\n', 'unique pacman'),
+            ('missing Name', good.replace('          Name: pacman.x86_64\n', ''), 'unique pacman'),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(output) + '\n', [row],
+                    distro='fedora', native_commands=self.receiver_native())
+                self.assertEqual(evidence[0]['exit_code'], 0, logs)
+                self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertIn(reason, logs['info.log'])
+                self.assertNotIn('exit=97', logs['info.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
+    def test_fedora_info_blocks_invalid_or_ambiguous_native_references(self):
+        row = 'info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tinfo-native-package\ttempdir-drop'
+        good = self.receiver_info_output()
+        for label, reference, status in (
+            ('empty', '', 0), ('bare native name', 'pacman\t7.0.0-6.fc44\n', 0),
+            ('wrong base', 'pacman-gui.x86_64\t7.0.0-6.fc44\n', 0),
+            ('wrong arch', 'pacman.aarch64\t7.0.0-6.fc44\n', 0),
+            ('nested suffix', 'pacman.x86_64.noarch\t7.0.0-6.fc44\n', 0),
+            ('missing EVR', 'pacman.x86_64\t\n', 0), ('invalid EVR', 'pacman.x86_64\tunknown\n', 0),
+            ('spaced EVR', 'pacman.x86_64\t7.0.0 extra\n', 0),
+            ('extra field', 'pacman.x86_64\t7.0.0-6.fc44\textra\n', 0),
+            ('multiline', 'pacman.x86_64\t7.0.0-6.fc44\npacman.i686\t7.0.0-6.fc44\n', 0),
+            ('blank trailing record', 'pacman.x86_64\t7.0.0-6.fc44\n\n', 0),
+            ('native failed', '', 7),
+        ):
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(good) + '\n', [row],
+                    distro='fedora', native_commands=self.receiver_native(reference, dnf_status=status))
+                self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+                self.assertEqual(result.returncode, 1, logs)
+                expected = 'invalid or ambiguous RPM identity and EVR' if status == 0 else 'exit=7'
+                self.assertIn(expected, logs['info.log'])
+                self.assertNotIn('exit=97', logs['info.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
+    def test_fedora_info_blocks_unavailable_architecture_metadata_in_transport(self):
+        row = 'info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tinfo-native-package\ttempdir-drop'
+        for metadata, status in (('', 0), ('compatible archs : x86_64\n', 7),
+                                 ('compatible archs : x86_64.bad\n', 0),
+                                 ('compatible archs : x86_64\ncompatible archs : noarch\n', 0)):
+            with self.subTest(metadata=metadata, status=status):
+                result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(self.receiver_info_output('pacman')) + '\n',
+                    [row], distro='fedora', native_commands=self.receiver_native(metadata=metadata, rpm_status=status))
+                self.assertEqual(evidence[0]['result'], 'BLOCKED', logs)
+                self.assertEqual(result.returncode, 1, logs)
+                self.assertIn('native info RPM architecture compatibility unavailable', logs['info.log'])
+                self.assertNotIn('command not found', logs['info.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
+    def test_non_fedora_search_and_info_retain_literal_package_identity(self):
+        info = 'info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass\tinfo-native-package\ttempdir-drop'
+        for distro in ('arch', 'debian', 'debian-trixie', 'ubuntu'):
+            target = 'firefox-esr' if distro in ('debian', 'debian-trixie') else 'firefox'
+            for name, expected in ((target, 0), (target + '.x86_64', 1)):
+                with self.subTest(distro=distro, search_name=name):
+                    result = self.run_oracle(assertion='search-firefox-results', distro=distro,
+                        stdout='  | Search\n    firefox\n  ' + name + ' 157.0.1  Official\n')
+                    self.assertEqual(result.returncode, expected, result.stderr)
+            native = {'pacman': "printf 'Repository : core\\nVersion : 7.0.0-6.fc44\\n'\n"} if distro == 'arch' else {'apt-cache': "printf 'pacman:\\n  Candidate: 7.0.0-6.fc44\\n'\n"}
+            source = 'Official repository (core)' if distro == 'arch' else 'Official repository (apt)'
+            for name, expected in (('pacman', 'PASS'), ('pacman.x86_64', 'FAIL')):
+                with self.subTest(distro=distro, info_name=name):
+                    result, evidence, logs = self.run_inventory('printf %s ' + shlex.quote(self.receiver_info_output(name, source=source)) + '\n',
+                        [info], distro=distro, native_commands=native)
+                    self.assertEqual(evidence[0]['exit_code'], 0, logs)
+                    self.assertEqual(evidence[0]['result'], expected, logs)
+                    self.assertEqual(result.returncode, 0 if expected == 'PASS' else 1, logs)
+
+    INFO_QUERY_FORMAT = '%{name}.%{arch}\t%{evr}\n'
+
+    @staticmethod
+    def receiver_native(reference='pacman.x86_64\t7.0.0-6.fc44\n', metadata='compatible archs : x86_64 noarch i686\n', *, rpm_status=0, dnf_status=0):
+        query = OutputContracts.INFO_QUERY_FORMAT
+        return {
+            'rpm': '[ "$#" = 1 ] && [ "$1" = --showrc ] && [ "$LC_ALL" = C ] || exit 97\n'
+                   + 'printf %s ' + shlex.quote(metadata) + f'\nexit {rpm_status}\n',
+            'dnf': '[ "$#" = 6 ] && [ "$1" = --cacheonly ] && [ "$2" = repoquery ] '
+                   '&& [ "$3" = pacman ] && [ "$4" = --latest-limit=1 ] && [ "$5" = --queryformat ] '
+                   '&& [ "$6" = ' + shlex.quote(query) + ' ] || exit 97\n'
+                   + 'printf %s ' + shlex.quote(reference) + f'\nexit {dnf_status}\n',
+            'timeout': r'''case "$3" in
+  rpm) [[ "$#" = 4 && "$1" == --kill-after=2s && "$2" == 10s && "$4" == --showrc ]] || exit 96 ;;
+  dnf) [[ "$#" = 9 && "$1" == --kill-after=2s && "$2" == 30 ]] || exit 96 ;;
+esac
+exec /usr/bin/timeout "$@"
+''',
+        }
+
+    @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
+    def test_fedora_recorded_firefox_outputs_match_native_compatible_identity(self):
+        outputs = {'search': '\n  | Search\n    firefox\n  firefox.x86_64 157.0.1-1.fc44  Official\n  firefox-langpacks.x86_64 157.0.1-1.fc44  Official\n  browserpass-firefox.x86_64 3.1.2-5.fc44  Official\n  icecat.x86_64 4:140.17.0-5.rh1.fc44  Official\n  mozilla-https-everywhere.noarch 2022.5.11-10.fc44  Official\n  mozilla-noscript.noarch 13.6.34-1.fc44  Official\n  mozilla-ublock-origin.noarch 1.75.0-1.fc44  Official\n  textern.x86_64 0.8-8.fc44  Official\n\n\nOMG_QEMU_RECEIPT:product:0:1\n', 'search-quiet': '\n  | Search\n    firefox\n  firefox.x86_64 157.0.1-1.fc44  Official\n  firefox-langpacks.x86_64 157.0.1-1.fc44  Official\n  browserpass-firefox.x86_64 3.1.2-5.fc44  Official\n  icecat.x86_64 4:140.17.0-5.rh1.fc44  Official\n  mozilla-https-everywhere.noarch 2022.5.11-10.fc44  Official\n  mozilla-noscript.noarch 13.6.34-1.fc44  Official\n  mozilla-ublock-origin.noarch 1.75.0-1.fc44  Official\n  textern.x86_64 0.8-8.fc44  Official\n\n\nOMG_QEMU_RECEIPT:product:0:1\n'}
+        for case, output in outputs.items():
+            row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                       if line.startswith(case + '\t'))
+            with self.subTest(case=case):
+                result, evidence, logs = self.run_inventory(
+                    'printf %s ' + shlex.quote(output) + '\n', [row], distro='fedora',
+                    native_commands=self.receiver_native())
+                self.assertEqual(evidence[0]['exit_code'], 0, logs)
+                self.assertTrue(logs[case + '.stdout.log'].startswith(output), logs)
+                self.assertEqual(evidence[0]['result'], 'PASS', logs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full receiver needs POSIX shell descriptors')
+    def test_fedora_recorded_info_matches_the_exact_native_identity_and_evr(self):
+        output = '\n  | Info\n    pacman.x86_64\n          Name: pacman.x86_64\n       Version: 7.0.0-6.fc44\n        Source: Official repository (dnf)\n     Installed: no\n   Description: Package manager for the Arch distribution\n\nOMG_QEMU_RECEIPT:product:0:1\n'
+        row = ('info\t["info","pacman"]\tread\t0\tpass\t-\thermetic\thermetic:pass'
+               '\tinfo-native-package\ttempdir-drop')
+        result, evidence, logs = self.run_inventory(
+            'printf %s ' + shlex.quote(output) + '\n', [row], distro='fedora',
+            native_commands=self.receiver_native())
+        self.assertEqual(evidence[0]['exit_code'], 0, logs)
+        self.assertTrue(logs['info.stdout.log'].startswith(output), logs)
+        self.assertEqual(evidence[0]['result'], 'PASS', logs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_historical_declared_doctor_turbo_remains_explicit_skip(self):
         rows = ['help\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop',
                 'doctor-turbo\t["doctor","--turbo"]\tread\t-\tdeclared\t-\tqemu\tarch:pending,debian:pending,ubuntu:pending,fedora:pending\t-\tnone']
@@ -1260,6 +1538,102 @@ elif case=='init':
         save('omg.lock','schema_version = 1\npackages = '+json.dumps(packages)+'\ntimestamp = '+str(int(time.time()))+'\nhash = "'+hashlib.sha256(payload.encode()).hexdigest()+'"\n[runtimes]\nnode = "24.21.0"\npython = "3.12.14"\n')
     print('OMG Setting up with defaults...\n→ Shell hook: skipped\n→ Daemon setup: skipped\n→ Capturing environment... '+('(skipped: unrelated permission denied)' if mutant=='skipped' else '✓')+'\n✓ Setup complete!')
 ''' + '\nPY\n'
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_hook_env_accepts_confined_path_with_tracked_additions(self):
+        product = self.local_fixture_product()
+        old = next(line for line in product.splitlines() if "elif case=='hook-env': print(" in line)
+        replacement = """    elif case=='hook-env':
+        selected=str(data/'versions/node'/version/'bin')
+        quote=lambda value: "'"+value.replace("'", "'\\\\''")+"'"
+        print('_OMG_PATH_ADDITIONS=('+quote(selected)+')')
+        print('_omg_base=${_OMG_PATH_BASE-$PATH}')
+        print('export PATH="${_OMG_PATH_PREFIX:+${_OMG_PATH_PREFIX}:}"'+quote(selected)+'"${_omg_base:+:${_omg_base}}"')
+        print('unset _omg_base')"""
+        product = product.replace(old, replacement)
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('hook-env\t'))
+        producers = (
+            (product, 'PASS'),
+            (product.replace("mutant = 'none'", "mutant = 'version'"), 'FAIL'),
+            (product.replace("print('unset _omg_base')", "print('unset _omg_base'); print('true')"), 'FAIL'),
+        )
+        for producer, expected in producers:
+            with self.subTest(expected=expected, producer=producer):
+                result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(producer), [row])
+                self.assertEqual([item['result'] for item in evidence], [expected], f'{result.stdout}\n{result.stderr}\n{logs}')
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_team_hook_literal_quote_preserves_apostrophe_path(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('team-init\t'))
+        product = self.local_fixture_product() + r"""python3 - <<'PY'
+import os,pathlib
+exe=os.environ['OMG_QEMU_EXECUTABLE']
+quote=chr(39)+exe.replace(chr(39),chr(39)+chr(92)+chr(39)+chr(39))+chr(39)
+for name in ('post-checkout','post-merge'):
+    path=pathlib.Path('.git/hooks')/name
+    path.write_text(path.read_text().replace(chr(34)+exe+chr(34),quote))
+PY
+"""
+        for binary_name in ('product path', "product's path"):
+            with self.subTest(binary_name=binary_name):
+                result, evidence, logs = self.run_inventory(
+                    self.local_fixture_with_workspace(product), [row], binary_name=binary_name)
+                self.assertEqual([item['result'] for item in evidence], ['PASS'], str(logs))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_team_hook_quoting_preserves_active_binding_guard_and_arguments(self):
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('team-init\t'))
+        refusals = {
+            'comment-only': 'team hook executable binding exists only in comments or invokes another binary',
+            'wrong-binary': 'team hook executable binding exists only in comments or invokes another binary',
+            'duplicate': 'team hook executable binding exists only in comments or invokes another binary',
+            'extra-argument': 'team hook did not execute guarded env check',
+            'missing-guard': 'team hook runs without its guarded lock',
+            'invalid-shell': 'team init wrote invalid hook shell',
+        }
+        for mutation, refusal in refusals.items():
+            product = self.local_fixture_product() + r"""python3 - <<'PY'
+import os,pathlib
+exe=os.environ['OMG_QEMU_EXECUTABLE']
+invocation=chr(34)+exe+chr(34)+' env check'
+mutation='MUTATION'
+for name in ('post-checkout','post-merge'):
+    path=pathlib.Path('.git/hooks')/name
+    content=path.read_text()
+    if mutation=='comment-only': content=content.replace('  '+invocation,'  :\n  # '+invocation)
+    elif mutation=='wrong-binary': content=content.replace(invocation,chr(34)+exe+'-wrong'+chr(34)+' env check')+'\n# '+invocation+'\n'
+    elif mutation=='duplicate': content=content.replace('  '+invocation, '  '+invocation+' 2>/dev/null || true\n  '+invocation)
+    elif mutation=='extra-argument': content=content.replace(invocation,invocation+' unexpected')
+    elif mutation=='missing-guard': content=content.replace('if [ -f omg.lock ]; then\n','').replace('fi\n','')
+    elif mutation=='invalid-shell': content+='if\n'
+    path.write_text(content)
+PY
+""".replace('MUTATION', mutation)
+            with self.subTest(mutation=mutation):
+                result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(product), [row])
+                self.assertEqual([item['result'] for item in evidence], ['FAIL'], str(logs))
+                self.assertEqual(evidence[0]['exit_code'], 0, str(logs))
+                self.assertRegex(logs['team-init.stdout.log'], r'(?m)^OMG_QEMU_RECEIPT:product:0:[0-9]+$')
+                self.assertNotIn('SyntaxError', logs['team-init.stderr.log'])
+                self.assertIn(refusal, logs['team-init.stderr.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_team_init_accepts_single_quoted_pinned_executable(self):
+        product = self.local_fixture_product() + """python3 - <<'PY'
+import os,pathlib
+for name in ('post-checkout','post-merge'):
+    path=pathlib.Path('.git/hooks')/name
+    executable=os.environ['OMG_QEMU_EXECUTABLE']
+    path.write_text(path.read_text().replace(chr(34)+executable+chr(34),chr(39)+executable+chr(39)))
+PY
+"""
+        row = next(line for line in (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
+                   if line.startswith('team-init\t'))
+        result, evidence, logs = self.run_inventory(self.local_fixture_with_workspace(product), [row])
+        self.assertEqual([item['result'] for item in evidence], ['PASS'], f'{result.stdout}\n{result.stderr}\n{logs}')
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_local_family_contracts_accept_matching_output_and_state(self):
@@ -2292,11 +2666,13 @@ fi
             'arch': ('pacman', 'Repository : core\nVersion : 1.2-3\n', 'Official repository (core)'),
             'debian': ('apt-cache', 'pacman:\n  Candidate: 1.2-3\n', 'Official repository (apt)'),
             'ubuntu': ('apt-cache', 'pacman:\n  Candidate: 1.2-3\n', 'Official repository (apt)'),
-            'fedora': ('dnf', '1.2-3\n', 'Official repository (dnf)'),
+            'fedora': ('dnf', 'pacman.x86_64\t1.2-3\n', 'Official repository (dnf)'),
         }
         for distro, (tool, native_output, source) in references.items():
             with self.subTest(distro=distro):
                 native = {tool: 'printf %s ' + shlex.quote(native_output) + '\n'}
+                if distro == 'fedora':
+                    native = self.receiver_native(native_output)
                 def product(version):
                     return 'printf %s ' + shlex.quote(
                         f'  | Info\n    pacman\n          Name: pacman\n'
@@ -2312,7 +2688,8 @@ fi
                 self.assertIn('info disagrees with the native', logs['info.log'])
                 result, evidence, _ = self.run_inventory(
                     product('1.2-3'), [row], distro=distro,
-                    native_commands={tool: 'exit 7\n'})
+                    native_commands=(dict(native, **{tool: 'exit 7\n'}) if distro == 'fedora'
+                                     else {tool: 'exit 7\n'}))
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(evidence[0]['result'], 'BLOCKED')
 
@@ -2446,6 +2823,32 @@ fi
                         self.assertEqual(evidence[0]['result'], 'FAIL', logs)
                         self.assertEqual(result.returncode, 1, result.stderr)
                         self.assertIn('assertion failed: runtime', logs[case + '.log'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_runtime_switch_fixture_preserves_version_probe_and_generic_execution(self):
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        rows = [line for line in inventory.splitlines()
+                if re.match(r'^runtime-(node|python|go)-switch-installed\t', line)]
+        self.assertEqual(len(rows), 3)
+        versions = {'node': '24.21.0', 'python': '3.12.14', 'go': '1.27.1'}
+        launchers = {'node': 'node', 'python': 'python3', 'go': 'go'}
+        for row in rows:
+            runtime = row.split('\t', 1)[0].split('-')[1]
+            version = versions[runtime]
+            expected = f'v{version}' if runtime == 'node' else 'runtime-fixture'
+            executable = f'"$OMG_DATA_DIR/versions/{runtime}/{version}/bin/{launchers[runtime]}"'
+            product = (
+                f'[[ "$({executable} --version)" == {shlex.quote(expected)} ]] || '
+                '{ echo "assertion failed: emitted runtime fixture version probe" >&2; exit 67; }\n'
+                f'[[ "$({executable})" == runtime-fixture ]] || '
+                '{ echo "assertion failed: emitted runtime fixture generic execution" >&2; exit 68; }\n'
+                f'rm "$OMG_DATA_DIR/versions/{runtime}/current"; '
+                f'ln -s "$OMG_DATA_DIR/versions/{runtime}/{version}" "$OMG_DATA_DIR/versions/{runtime}/current"\n'
+                + self.runtime_usage_fixture(runtime))
+            with self.subTest(runtime=runtime):
+                result, evidence, logs = self.run_inventory(product, [row], tiers='container')
+                self.assertEqual(result.returncode, 0, result.stderr + str(logs))
+                self.assertEqual(evidence[0]['result'], 'PASS', logs)
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_config_rows_require_private_persisted_state(self):
@@ -3677,7 +4080,7 @@ esac
         self.assertEqual([row['result'] for row in evidence], ['PASS', 'FAIL', 'BLOCKED'])
         self.assertIn('regular JSON document', logs['refuse.log'])
 
-    def run_oracle(self, safety='read', assertion='-', code=0, stdout='', stderr='', artifact=None, hooks=None, distro='arch', tree_oracle_status=None):
+    def run_oracle(self, safety='read', assertion='-', code=0, stdout='', stderr='', artifact=None, hooks=None, distro='arch', tree_oracle_status=None, rpm_showrc=None, rpm_exit=0, timeout_exit=None):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         begin = source.index('# BEGIN PRODUCT OUTPUT ORACLE')
         end = source.index('# END PRODUCT OUTPUT ORACLE', begin)
@@ -3696,11 +4099,32 @@ esac
                     path = root / '.git/hooks' / name
                     path.write_text(content, encoding='utf-8', newline='\n')
                     path.chmod(mode)
+            env = dict(os.environ)
+            if rpm_showrc is not None:
+                tools = root / 'tools'
+                tools.mkdir()
+                rpm = tools / 'rpm'
+                rpm.write_text(
+                    '#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = --showrc ] || exit 97\n'
+                    + 'printf %s ' + shlex.quote(rpm_showrc) + '\n'
+                    + f'exit {rpm_exit}\n', encoding='utf-8', newline='\n')
+                rpm.chmod(0o755)
+                if timeout_exit is not None:
+                    # Argument recorder, not a claim about a real elapsed timeout.
+                    deadline = tools / 'timeout'
+                    deadline.write_text(
+                        '#!/bin/sh\n[ "$#" = 4 ] && [ "$1" = --kill-after=2s ] '
+                        '&& [ "$2" = 10s ] && [ "$3" = rpm ] '
+                        '&& [ "$4" = --showrc ] || exit 97\n'
+                        + 'printf "TIMEOUT_ARGV %s\\n" "$*" >&2\n'
+                        + f'exit {timeout_exit}\n', encoding='utf-8', newline='\n')
+                    deadline.chmod(0o755)
+                env['PATH'] = str(tools) + os.pathsep + env['PATH']
             result = subprocess.run(
                 [os.environ.get('OMG_TEST_BASH') or shutil.which('bash'), '-c',
                  function + '\ncheck_product_output "$@"', '_',
                  safety, assertion, str(code), 'stdout', 'stderr', distro],
-                cwd=root, capture_output=True, text=True, timeout=10)
+                cwd=root, capture_output=True, text=True, timeout=15, env=env)
             return result
 
     def test_exit_zero_without_help_is_not_success(self):
@@ -3740,6 +4164,114 @@ esac
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
                 if not accepted:
                     self.assertIn('changed DNF install reasons', result.stderr)
+
+
+    def test_release_search_accepts_native_compatible_rpm_exact_identities(self):
+        configurations = (
+            ('compatible archs      : x86_64_v3 x86_64_v2 x86_64 amd64 em64t athlon noarch i686 i586 i486 i386 fat\n',
+             ('tree.x86_64', 'tree.i686', 'tree.noarch', 'tree.x86_64_v3')),
+            ('compatible archs      : aarch64 noarch\n',
+             ('tree.aarch64', 'tree.noarch')),
+        )
+        for showrc, identities in configurations:
+            for identity in identities:
+                with self.subTest(identity=identity):
+                    output = f'  {identity} 2.2.1-4.fc44  Official\n  tree-sitter-cli.x86_64 0.26.11-1.fc44  Official\n'
+                    result = self.run_oracle(assertion='search-official-tree-output',
+                                             stdout=output, distro='fedora', rpm_showrc=showrc)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            # Multiarch exact names retain full identities and impose no native/noarch preference.
+            for ordered in (identities, tuple(reversed(identities))):
+                output = ''.join(f'  {identity} 2.2.1-4.fc44  Official\n' for identity in ordered)
+                with self.subTest(ordered=ordered):
+                    self.assertEqual(self.run_oracle(assertion='search-official-tree-output',
+                        stdout=output, distro='fedora', rpm_showrc=showrc).returncode, 0)
+        showrc = configurations[0][0]
+        # Catalog may contain foreign architectures; those later records do not disqualify the first exact match.
+        output = '  tree.x86_64 2.2.1-4.fc44  Official\n  tree.aarch64 2.2.1-4.fc44  Official\n'
+        self.assertEqual(self.run_oracle(assertion='search-official-tree-output',
+            stdout=output, distro='fedora', rpm_showrc=showrc).returncode, 0)
+        self.assertEqual(self.run_oracle(assertion='search-official-tree-output',
+            stdout='  tree 2.2.1-4.fc44  Official\n', distro='fedora', rpm_showrc=showrc).returncode, 0)
+
+    def test_release_search_rejects_unqualified_metadata_and_false_exact_names(self):
+        showrc = 'compatible archs      : x86_64 noarch i686\n'
+        invalid = (
+            '  tree.aarch64 2.2.1-4.fc44  Official\n',
+            '  tree.x86_64-extra 2.2.1-4.fc44  Official\n',
+            '  tree.x86_64.extra 2.2.1-4.fc44  Official\n',
+            '  tree.x86_64.aarch64 2.2.1-4.fc44  Official\n',
+            '  tree-sitter.x86_64 2.2.1-4.fc44  Official\n',
+            '  subtree.x86_64 2.2.1-4.fc44  Official\n',
+            '  tree. 2.2.1-4.fc44  Official\n',
+            '  tree.x86_64 not-a-version  Official\n',
+            '  tree.x86_64 2.2.1-4.fc44  AUR\n',
+            '  tree.x86_64 2.2.1-4.fc44  Official extra\n',
+            '  tree-sitter.x86_64 1.0  Official\n  tree.x86_64 2.2.1-4.fc44  Official\n',
+            '  tree.x86_64 2.2.1-4.fc44  Official\n  tree.x86_64 2.2.2-1.fc44  Official\n',
+        )
+        for output in invalid:
+            with self.subTest(output=output):
+                self.assertNotEqual(self.run_oracle(assertion='search-official-tree-output',
+                    stdout=output, distro='fedora', rpm_showrc=showrc).returncode, 0)
+        for metadata, status in (('', 0), (showrc, 7), (showrc + showrc, 0),
+                                 ('compatible archs : x86_64/extra\n', 0),
+                                 ('compatible build archs: x86_64 noarch\n', 0),
+                                 ('compatible archs : ' + ' '.join(['x86_64'] * 65) + '\n', 0)):
+            with self.subTest(metadata=metadata, status=status):
+                self.assertNotEqual(self.run_oracle(assertion='search-official-tree-output',
+                    stdout='  tree.x86_64 2.2.1-4.fc44  Official\n', distro='fedora',
+                    rpm_showrc=metadata, rpm_exit=status).returncode, 0)
+        for distro in ('arch', 'debian', 'debian-trixie', 'ubuntu'):
+            for identity, accepted in (('tree', True), ('tree.x86_64', False), ('tree.noarch', False)):
+                with self.subTest(distro=distro, identity=identity):
+                    result = self.run_oracle(assertion='search-official-tree-output',
+                        stdout=f'  {identity} 2.2.1-1  Official\n', distro=distro,
+                        rpm_showrc='', rpm_exit=99)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+
+    def test_release_search_fedora_metadata_is_bounded_and_required(self):
+        output = '  tree 2.2.1-4.fc44  Official\n'
+        showrc = 'compatible archs : x86_64 noarch i686\n'
+        cases = (('', 0), ('compatible archs : \n', 0), (showrc, 7),
+                 (showrc + showrc, 0), ('compatible archs : x86_64/extra\n', 0),
+                 ('compatible build archs : x86_64 noarch\n', 0),
+                 ('compatible archs : ' + ' '.join(['x86_64'] * 65) + '\n', 0),
+                 ('compatible archs : ' + 'a' * 1025 + '\n', 0))
+        for metadata, status in cases:
+            with self.subTest(metadata=metadata, status=status):
+                self.assertNotEqual(self.run_oracle(assertion='search-official-tree-output',
+                    stdout=output, distro='fedora', rpm_showrc=metadata, rpm_exit=status).returncode, 0)
+        # Enforce the actual timeout argv and refusal of its timeout status without sleeping.
+        result = self.run_oracle(assertion='search-official-tree-output', stdout=output,
+            distro='fedora', rpm_showrc=showrc, timeout_exit=124)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unavailable RPM architecture compatibility', result.stderr)
+        self.assertIn('TIMEOUT_ARGV --kill-after=2s 10s rpm --showrc', result.stderr)
+        # Original uniqueness contract is scoped to exact tree records.
+        output = ('  tree.x86_64 2.2.1-4.fc44  Official\n'
+                  '  tree-sitter.x86_64 1.0  Official\n'
+                  '  tree-sitter.x86_64 1.0  Official\n')
+        self.assertEqual(self.run_oracle(assertion='search-official-tree-output',
+            stdout=output, distro='fedora', rpm_showrc=showrc).returncode, 0)
+
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_release_search_fedora_runner_preserves_mutation_opt_out(self):
+        rows = [
+            'release-package-search-tree\t["search","tree"]\tread\t0\tpass\t-\tcontainer\tfedora:pass\tsearch-official-tree-output\tnone',
+            'search-mutation-guard\t["install","tree","--yes"]\tpackage-mutation\t0\tpass\t-\tcontainer\tfedora:pass\t-\tnone',
+        ]
+        product = '''[[ "$*" == 'search tree' ]] || exit 71
+printf '  tree.x86_64 2.2.1-4.fc44  Official\n  tree.i686 2.2.1-4.fc44  Official\n'
+'''
+        rpm = '[ "$#" = 1 ] && [ "$1" = --showrc ] || exit 97\nprintf "compatible archs : x86_64 noarch i686\\n"\n'
+        result, evidence, logs = self.run_inventory(product, rows, distro='fedora',
+            tiers='container', native_commands={'rpm': rpm})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([row['result'] for row in evidence], ['PASS', 'SKIPPED'], logs)
+        self.assertEqual([row['exit_code'] for row in evidence], [0, -1], logs)
 
     def test_release_search_requires_an_exact_ranked_official_result(self):
         valid = '  | Search\n    tree\n  tree 2.1.3  Official\n  tree-sitter 1.0  Official\n'
@@ -4005,6 +4537,103 @@ esac
         result, evidence, _ = self.run_inventory(product, rows)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual([row['result'] for row in evidence], ['FAIL', 'PASS', 'FAIL'])
+
+    @staticmethod
+    def container_digest_refusal_row():
+        inventory = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8')
+        return next(line for line in inventory.splitlines()
+                    if line.startswith('container-init-invalid-installer-digest\t'))
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_complete_inventory_validates_unselected_installer_digest_refusal_before_guest_dispatch(self):
+        rows = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()[1:]
+        result, evidence, logs = self.run_inventory(
+            'exit 99\n', rows, tiers='nested-container',
+            ssh_body='printf "unexpected guest dispatch\\n" >&2; exit 97\n')
+        # These four rows are declarations, never guest execution or a pass.
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual([(entry['case_id'], entry['result']) for entry in evidence], [
+            ('qemu-arch-container-run-detached', 'SKIPPED'),
+            ('qemu-arch-container-run-interactive', 'SKIPPED'),
+            ('qemu-arch-container-shell-flags', 'SKIPPED'),
+            ('qemu-arch-container-build-flags', 'SKIPPED'),
+            ('qemu-arch-inventory-selection', 'HARNESS_ERROR'),
+        ])
+        self.assertEqual(logs, {})
+        self.assertNotIn('invalid inventory configuration', result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_installer_digest_refusal_rejects_malformed_rows_before_any_guest_action(self):
+        fields = self.container_digest_refusal_row().split('\t')
+        mutations = [
+            ('wrong identity', 0, 'other-installer-digest'),
+            ('wrong args', 1, '["container","init","--installer-digest","https://sh.rustup.rs=aaaa"]'),
+            ('wrong safety', 2, 'read'), ('wrong exit', 3, '0'),
+            ('wrong UX', 4, 'declared'), ('prerequisite', 5, 'help'),
+            ('wrong tier', 6, 'container'),
+            ('wrong target', 7, 'arch:pass,debian:pass,ubuntu:pass,fedora:pass'),
+            ('missing assertion', 8, '-'), ('unknown assertion', 8, 'unknown-fixture-token'),
+            ('wrong cleanup', 9, 'none'),
+        ]
+        help_row = 'help\t["--help"]\thelp-boundary\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop'
+        for label, index, value in mutations:
+            with self.subTest(label=label):
+                altered = list(fields)
+                altered[index] = value
+                result, evidence, logs = self.run_inventory(
+                    'printf "Usage: fixture\\n"\n', [help_row, '\t'.join(altered)],
+                    ssh_body='printf "unexpected guest dispatch\\n" >&2; exit 97\n')
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(evidence, [])
+                self.assertEqual(logs, {})
+                self.assertIn('invalid inventory configuration', result.stderr)
+
+    def test_installer_digest_oracle_refuses_missing_scaffold_baseline(self):
+        result = self.run_oracle(
+            safety='controlled-error', assertion='container-installer-digest-refusal',
+            code=1, stderr='Error: Invalid installer digest: expected URL=SHA256\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('scaffold baseline', result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX jq process-substitution descriptors')
+    def test_actual_runner_requires_installer_digest_diagnostic_and_unchanged_scaffolds(self):
+        row = self.container_digest_refusal_row()
+        fields = row.split('\t')
+        self.assertEqual(json.loads(fields[1]), [
+            'container', 'init', '--base', 'debian:bookworm', '--installer-digest', 'missing-equals'])
+        refusal = ('[[ "$#" == 6 && "$1:$2:$3:$4:$5:$6" == '
+                   'container:init:--base:debian:bookworm:--installer-digest:missing-equals ]] || exit 96\n'
+                   'printf "Error: Invalid installer digest: expected URL=SHA256\\n" >&2\nexit 1\n')
+        cases = [
+            ('correct refusal', refusal, 'PASS'),
+            ('silent refusal', 'exit 1\n', 'FAIL'),
+            ('unrelated refusal', 'echo unrelated error >&2\nexit 1\n', 'FAIL'),
+            ('diagnostic only on stdout', 'echo "Invalid installer digest: expected URL=SHA256"\nexit 1\n', 'FAIL'),
+            ('wrong code', refusal.replace('exit 1\n', 'exit 2\n'), 'FAIL'),
+            ('false success', refusal.replace('exit 1\n', 'exit 0\n'), 'FAIL'),
+            ('created recipe', 'printf partial > Dockerfile.omg\n' + refusal, 'FAIL'),
+            ('changed root ignore', 'printf partial >> .dockerignore\n' + refusal, 'FAIL'),
+            ('changed BuildKit ignore', 'printf partial >> Dockerfile.omg.dockerignore\n' + refusal, 'FAIL'),
+            ('changed Podman ignore', 'printf partial >> .containerignore\n' + refusal, 'FAIL'),
+            ('removed ignore', 'rm .containerignore\n' + refusal, 'FAIL'),
+            ('changed permissions', 'chmod 600 .dockerignore\n' + refusal, 'FAIL'),
+            ('same-byte replacement', 'cp .dockerignore replacement; mv replacement .dockerignore\n' + refusal, 'FAIL'),
+            ('changed timestamp', 'touch -m -d @1 .dockerignore\n' + refusal, 'FAIL'),
+            ('symlink replacement', 'rm .dockerignore; ln -s .containerignore .dockerignore\n' + refusal, 'FAIL'),
+            ('directory replacement', 'rm .dockerignore; mkdir .dockerignore\n' + refusal, 'FAIL'),
+        ]
+        for label, product, expected in cases:
+            with self.subTest(label=label):
+                result, evidence, logs = self.run_inventory(product, [row])
+                self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stdout + result.stderr)
+                self.assertEqual(len(evidence), 1)
+                self.assertEqual(evidence[0]['case_id'], 'qemu-arch-container-init-invalid-installer-digest')
+                self.assertEqual(evidence[0]['result'], expected, logs)
+                if expected == 'PASS':
+                    self.assertEqual(evidence[0]['exit_code'], 1)
+                    self.assertIn('scaffold_unchanged=true', logs['container-init-invalid-installer-digest.log'])
+                else:
+                    self.assertIn('assertion failed:', logs['container-init-invalid-installer-digest.log'])
 
 
 if __name__ == '__main__':

@@ -250,12 +250,34 @@ fn hook_env_output(shell: &str, cwd: &Path) -> Result<String> {
                     .map(|p| posix_single_quoted(p))
                     .collect::<Vec<_>>()
                     .join(":");
-                writeln!(output, "export PATH={paths}:\"${{_OMG_PATH_BASE:-$PATH}}\"")?;
+                let owned = additions
+                    .iter()
+                    .map(|path| posix_single_quoted(path))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                writeln!(output, "_OMG_PATH_ADDITIONS=({owned})")?;
+                writeln!(output, "_omg_base=${{_OMG_PATH_BASE-$PATH}}")?;
+                writeln!(
+                    output,
+                    "export PATH=\"${{_OMG_PATH_PREFIX:+${{_OMG_PATH_PREFIX}}:}}\"{paths}\"${{_omg_base:+:${{_omg_base}}}}\""
+                )?;
+                writeln!(output, "unset _omg_base")?;
             }
         }
         "fish" => {
-            for path in additions.iter().rev() {
-                writeln!(output, "fish_add_path -g {}", fish_single_quoted(path))?;
+            if !additions.is_empty() {
+                let paths = additions
+                    .iter()
+                    .map(|path| fish_single_quoted(path))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                writeln!(output, "set -g _OMG_PATH_ADDITIONS {paths}")?;
+                writeln!(output, "set -l _omg_base $PATH")?;
+                writeln!(
+                    output,
+                    "if set -q _OMG_PATH_BASE; set _omg_base $_OMG_PATH_BASE; end"
+                )?;
+                writeln!(output, "set -gx PATH $_OMG_PATH_PREFIX {paths} $_omg_base")?;
             }
         }
         _ => anyhow::bail!("Unsupported shell: {shell}"),
@@ -660,13 +682,13 @@ fn validated_runtime_bin_dir(data_dir: &Path, runtime: &str, version: &str) -> O
 
 /// Render `value` as a POSIX single-quoted shell word (`'` becomes `'\''`),
 /// so no `$`, backtick, or double-quote inside can alter the emitted command.
-fn posix_single_quoted(value: &str) -> String {
+pub(crate) fn posix_single_quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Render `value` as a fish single-quoted word (`'` becomes `\'`).
+/// Render `value` as a fish single-quoted word, escaping backslashes and apostrophes.
 fn fish_single_quoted(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"\'"))
+    format!("'{}'", value.replace('\\', r"\\").replace('\'', r"\'"))
 }
 
 fn bun_version_bin_path(versions_dir: &Path, version: &str) -> Option<PathBuf> {
@@ -854,13 +876,41 @@ fi
 
 zmodload zsh/datetime
 
+_omg_reset_path() {
+  local _omg_path=":$PATH:" _omg_owned _omg_virtual_path="" _omg_venv_path="${VIRTUAL_ENV:-}/bin"
+  if [[ -n "${VIRTUAL_ENV:-}" && -n "${_OLD_VIRTUAL_PATH+x}" ]]; then
+    _omg_virtual_path=":$_OLD_VIRTUAL_PATH:"
+  fi
+  for _omg_owned in "${_OMG_PATH_ADDITIONS[@]}"; do
+    [[ -n "$_omg_owned" ]] && _omg_path=${_omg_path/":$_omg_owned:"/:}
+    if [[ -n "$_omg_owned" && -n "$_omg_virtual_path" ]]; then
+      _omg_virtual_path=${_omg_virtual_path/":$_omg_owned:"/:}
+    fi
+  done
+  if [[ -n "$_omg_virtual_path" ]]; then
+    _OLD_VIRTUAL_PATH=${_omg_virtual_path#:}
+    _OLD_VIRTUAL_PATH=${_OLD_VIRTUAL_PATH%:}
+  fi
+  _OMG_PATH_BASE=${_omg_path#:}
+  _OMG_PATH_BASE=${_OMG_PATH_BASE%:}
+  _OMG_PATH_PREFIX=
+  if [[ -n "${VIRTUAL_ENV:-}" && ":$_OMG_PATH_BASE:" == *":$_omg_venv_path:"* ]]; then
+    _OMG_PATH_PREFIX=$_omg_venv_path
+    _omg_path=":$_OMG_PATH_BASE:"
+    _omg_path=${_omg_path/":$_omg_venv_path:"/:}
+    _OMG_PATH_BASE=${_omg_path#:}
+    _OMG_PATH_BASE=${_OMG_PATH_BASE%:}
+  fi
+  unset _OMG_PATH_ADDITIONS
+  export PATH="${_OMG_PATH_PREFIX:+${_OMG_PATH_PREFIX}${_OMG_PATH_BASE:+:}}$_OMG_PATH_BASE"
+}
+
 _omg_hook() {
   setopt localoptions localtraps
   trap -- '' SIGINT
-  if [[ -z "${_OMG_PATH_BASE+x}" ]]; then _OMG_PATH_BASE=$PATH; fi
   eval "${_OMG_ENV_RESTORE:-}"
   unset _OMG_ENV_RESTORE
-  export PATH="$_OMG_PATH_BASE"
+  _omg_reset_path
   eval "$(\command omg hook-env -s zsh)"
   _omg_refresh_cache
   trap - SIGINT
@@ -902,12 +952,21 @@ _omg_status_file_valid() {
   [[ "$(od -An -j4 -N1 -tu1 "$f" 2>/dev/null)" -eq 1 ]] || return 1
   local timestamp=$(od -An -j24 -N8 -tu8 "$f" 2>/dev/null)
   local now=$EPOCHSECONDS
-  (( now < timestamp || now - timestamp <= 300 ))
+  timestamp=${timestamp//[[:space:]]/}
+  # Reject oversized unsigned timestamps before signed shell arithmetic.
+  (( ${#timestamp} <= ${#now} && timestamp <= now && now - timestamp <= 300 ))
 }
 
 _omg_refresh_cache() {
   local f=__OMG_STATUS_FILE__
-  _omg_status_file_valid || return 0
+  _omg_status_file_valid || {
+    _OMG_TOTAL=0
+    _OMG_EXPLICIT=0
+    _OMG_ORPHANS=0
+    _OMG_UPDATES=0
+    _OMG_CACHE_TIME=0
+    return 0
+  }
   local now=$EPOCHSECONDS
   # Only refresh every 60 seconds
   (( now - _OMG_CACHE_TIME < 60 )) && return
@@ -966,15 +1025,43 @@ if [[ $- == *i* && -z ${_OMG_NOTICE_STARTED+x} ]]; then
   \command omg __update-notice
 fi
 
+_omg_reset_path() {
+  local _omg_path=":$PATH:" _omg_owned _omg_virtual_path="" _omg_venv_path="${VIRTUAL_ENV:-}/bin"
+  if [[ -n "${VIRTUAL_ENV:-}" && -n "${_OLD_VIRTUAL_PATH+x}" ]]; then
+    _omg_virtual_path=":$_OLD_VIRTUAL_PATH:"
+  fi
+  for _omg_owned in "${_OMG_PATH_ADDITIONS[@]}"; do
+    [[ -n "$_omg_owned" ]] && _omg_path=${_omg_path/":$_omg_owned:"/:}
+    if [[ -n "$_omg_owned" && -n "$_omg_virtual_path" ]]; then
+      _omg_virtual_path=${_omg_virtual_path/":$_omg_owned:"/:}
+    fi
+  done
+  if [[ -n "$_omg_virtual_path" ]]; then
+    _OLD_VIRTUAL_PATH=${_omg_virtual_path#:}
+    _OLD_VIRTUAL_PATH=${_OLD_VIRTUAL_PATH%:}
+  fi
+  _OMG_PATH_BASE=${_omg_path#:}
+  _OMG_PATH_BASE=${_OMG_PATH_BASE%:}
+  _OMG_PATH_PREFIX=
+  if [[ -n "${VIRTUAL_ENV:-}" && ":$_OMG_PATH_BASE:" == *":$_omg_venv_path:"* ]]; then
+    _OMG_PATH_PREFIX=$_omg_venv_path
+    _omg_path=":$_OMG_PATH_BASE:"
+    _omg_path=${_omg_path/":$_omg_venv_path:"/:}
+    _OMG_PATH_BASE=${_omg_path#:}
+    _OMG_PATH_BASE=${_OMG_PATH_BASE%:}
+  fi
+  unset _OMG_PATH_ADDITIONS
+  export PATH="${_OMG_PATH_PREFIX:+${_OMG_PATH_PREFIX}${_OMG_PATH_BASE:+:}}$_OMG_PATH_BASE"
+}
+
 _omg_hook() {
   local previous_exit_status=$?
   local previous_int_trap
   previous_int_trap=$(trap -p SIGINT)
   trap -- '' SIGINT
-  if [[ -z "${_OMG_PATH_BASE+x}" ]]; then _OMG_PATH_BASE=$PATH; fi
   eval "${_OMG_ENV_RESTORE:-}"
   unset _OMG_ENV_RESTORE
-  export PATH="$_OMG_PATH_BASE"
+  _omg_reset_path
   eval "$(\command omg hook-env -s bash)"
   if [[ -n "$previous_int_trap" ]]; then
     eval "$previous_int_trap"
@@ -1023,7 +1110,9 @@ _omg_status_file_valid() {
   [[ "$(od -An -j4 -N1 -tu1 "$f" 2>/dev/null)" -eq 1 ]] || return 1
   local timestamp=$(od -An -j24 -N8 -tu8 "$f" 2>/dev/null)
   local now=$(date +%s)
-  (( now < timestamp || now - timestamp <= 300 ))
+  timestamp=${timestamp//[[:space:]]/}
+  # Reject oversized unsigned timestamps before signed shell arithmetic.
+  (( ${#timestamp} <= ${#now} && timestamp <= now && now - timestamp <= 300 ))
 }
 
 omg-explicit-count() {
@@ -1054,7 +1143,7 @@ alias omg-uc='omg-updates-count'
 "#;
 
 /// Fish hook script
-const FISH_HOOK: &str = r"
+const FISH_HOOK: &str = r#"
 # OMG Shell Hook for Fish
 # Add to ~/.config/fish/config.fish: omg hook fish | source
 
@@ -1064,20 +1153,40 @@ if status is-interactive; and not set -q _OMG_NOTICE_STARTED
 end
 
 function _omg_hook --on-variable PWD --on-event fish_prompt
-  if not set -q _OMG_PATH_BASE
-    set -g _OMG_PATH_BASE $PATH
-  end
   if set -q _OMG_ENV_RESTORE
     eval $_OMG_ENV_RESTORE
     set -e _OMG_ENV_RESTORE
   end
-  set -gx PATH $_OMG_PATH_BASE
+  set -l _omg_base $PATH
+  for _omg_owned in $_OMG_PATH_ADDITIONS
+    set -l index (contains -i -- $_omg_owned $_omg_base)
+    if test -n "$index"
+      set -e _omg_base[$index]
+    end
+    if set -q VIRTUAL_ENV; and set -q _OLD_VIRTUAL_PATH
+      set index (contains -i -- $_omg_owned $_OLD_VIRTUAL_PATH)
+      if test -n "$index"
+        set -e _OLD_VIRTUAL_PATH[$index]
+      end
+    end
+  end
+  set -g _OMG_PATH_PREFIX
+  if set -q VIRTUAL_ENV
+    set -l index (contains -i -- "$VIRTUAL_ENV/bin" $_omg_base)
+    if test -n "$index"
+      set -g _OMG_PATH_PREFIX "$VIRTUAL_ENV/bin"
+      set -e _omg_base[$index]
+    end
+  end
+  set -g _OMG_PATH_BASE $_omg_base
+  set -e _OMG_PATH_ADDITIONS
+  set -gx PATH $_OMG_PATH_PREFIX $_OMG_PATH_BASE
   # `command` bypasses fish functions and aliases, so a user-defined `omg`
   # function can neither shadow nor recursively invoke the real binary
   # (mirrors the `\command omg` guard in the zsh and bash hooks).
   command omg hook-env -s fish | source
 end
-";
+"#;
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used)] // Idiomatic in tests: panics on failure with clear error context
@@ -1086,6 +1195,91 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fish_hook_roundtrips_backslashes_and_apostrophes_in_runtime_paths() -> Result<()> {
+        use tokio::io::AsyncReadExt as _;
+        const NAME: &str =
+            "hooks::tests::fish_hook_roundtrips_backslashes_and_apostrophes_in_runtime_paths";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        if crate::core::testing::run_isolated_test(NAME) {
+            println!("FISH_RUNTIME_PATH_ALL_THREE_CASES_COMPLETED");
+            return Ok(());
+        }
+        anyhow::ensure!(!crate::core::is_root(), "fixture must run as ordinary user");
+        let directory = tempdir()?;
+        let project = directory.path().join("project");
+        fs::create_dir(&project)?;
+        fs::write(project.join(".python-version"), "3.12.0\n")?;
+        for dirname in ["normal", r"backslash\\pair", r"backslash\'apostrophe"] {
+            let data = directory.path().join(dirname);
+            let selected = data.join("versions/python/3.12.0/bin");
+            fs::create_dir_all(&selected)?;
+            let emitted = temp_env::with_var("OMG_DATA_DIR", Some(&data), || {
+                hook_env_output("fish", &project)
+            })?;
+            anyhow::ensure!(
+                emitted.contains("_OMG_PATH_ADDITIONS"),
+                "fixture must emit a path"
+            );
+            let script =
+                format!("{emitted}\nprintf '%s\\n' \"$PATH[1]\" \"$_OMG_PATH_ADDITIONS[1]\"\n");
+            let mut child = tokio::process::Command::new("fish")
+                .args(["--no-config", "-c", &script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .context("real Fish is mandatory for the path round-trip fixture")?;
+            let stdout = child.stdout.take().context("Fish stdout")?;
+            let stderr = child.stderr.take().context("Fish stderr")?;
+            let captured = async {
+                let (status, stdout, stderr) = tokio::try_join!(
+                    child.wait(),
+                    async {
+                        let mut bytes = Vec::new();
+                        stdout.take(16 * 1024).read_to_end(&mut bytes).await?;
+                        Ok::<_, std::io::Error>(bytes)
+                    },
+                    async {
+                        let mut bytes = Vec::new();
+                        stderr.take(16 * 1024).read_to_end(&mut bytes).await?;
+                        Ok::<_, std::io::Error>(bytes)
+                    },
+                )?;
+                Ok::<_, std::io::Error>((status, stdout, stderr))
+            };
+            let (status, stdout, stderr) =
+                match tokio::time::timeout(std::time::Duration::from_secs(2), captured).await {
+                    Ok(Ok(output)) => output,
+                    failure => {
+                        if child.try_wait()?.is_none() {
+                            child.kill().await?;
+                        }
+                        child.wait().await?;
+                        anyhow::bail!("Fish child failed; killed and reaped: {failure:?}");
+                    }
+                };
+            anyhow::ensure!(
+                status.success(),
+                "Fish failed: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            let expected = format!("{0}\n{0}\n", selected.display());
+            anyhow::ensure!(
+                stdout == expected.as_bytes(),
+                "Fish changed runtime path {dirname:?}; expected{expected:?}, got{:?}",
+                String::from_utf8_lossy(&stdout)
+            );
+            println!("FISH_RUNTIME_PATH_ROUNDTRIP_PASS {dirname:?}");
+        }
+        directory.close()?;
+        Ok(())
+    }
 
     #[test]
     fn managed_paths_require_readiness_and_support_swift_layout() {

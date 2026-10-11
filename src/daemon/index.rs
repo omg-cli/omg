@@ -10,7 +10,7 @@ use ahash::AHashMap;
 use anyhow::Result;
 
 use crate::daemon::protocol::{DetailedPackageInfo, PackageInfo, WirePackageSource};
-use crate::package_managers::PackageManager;
+use crate::package_managers::{PackageManager, SearchNameKind};
 
 struct PackageBloomFilter {
     bits: Vec<u64>,
@@ -144,6 +144,7 @@ impl TrigramIndex {
 }
 
 pub struct PackageIndex {
+    name_kind: SearchNameKind,
     items: Vec<CompactPackageInfo>,
     pool: StringPool,
     name_to_idx: AHashMap<String, usize>,
@@ -152,6 +153,7 @@ pub struct PackageIndex {
 }
 
 struct CompactPackageInfo {
+    rpm_eligible: bool,
     name_offset: u32,
     name_lower_offset: u32,
     version_offset: u32,
@@ -170,7 +172,7 @@ struct CompactPackageInfo {
 /// Higher scores = better matches
 ///
 /// Ordering: We use reverse sort (b.cmp(a)), so:
-/// - Higher rank values are better (4 > 3 > 2 > 1 > 0)
+/// - Higher rank values are better (5 > 4 > 3 > 2 > 1 > 0)
 /// - Lower `name_len` is better (shorter = more specific)
 /// - Lower idx is better (stable sort tiebreaker)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -186,7 +188,8 @@ struct RelevanceScore {
 }
 
 impl RelevanceScore {
-    const EXACT_NAME_MATCH: u8 = 4;
+    const EXACT_NAME_MATCH: u8 = 5;
+    const RPM_BASENAME_MATCH: u8 = 4;
     const PREFIX_MATCH: u8 = 3;
     const WORD_BOUNDARY_MATCH: u8 = 2;
     const SUBSTRING_MATCH: u8 = 1;
@@ -204,6 +207,7 @@ impl RelevanceScore {
 impl PackageIndex {
     fn with_capacity(capacity: usize) -> Self {
         Self {
+            name_kind: SearchNameKind::Literal,
             items: Vec::with_capacity(capacity),
             pool: StringPool::default(),
             name_to_idx: AHashMap::with_capacity(capacity),
@@ -227,6 +231,7 @@ impl PackageIndex {
         let name_lower = name.to_ascii_lowercase();
         let idx = self.items.len();
         self.items.push(CompactPackageInfo {
+            rpm_eligible: true,
             name_offset: self.pool.intern(name),
             name_lower_offset: self.pool.intern(&name_lower),
             version_offset: self.pool.intern(version),
@@ -266,9 +271,18 @@ impl PackageIndex {
         index
     }
 
-    fn from_packages(packages: Vec<crate::core::Package>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_rpm_records(records: &[(&str, &str, &str)]) -> Self {
+        let mut index = Self::from_records(records);
+        index.name_kind = SearchNameKind::RpmIdentity;
+        index
+    }
+
+    fn from_packages(packages: Vec<crate::core::Package>, name_kind: SearchNameKind) -> Self {
         let mut index = Self::with_capacity(packages.len());
+        index.name_kind = name_kind;
         for package in packages {
+            let idx = index.items.len();
             index.push(
                 &package.name,
                 &package.version.to_string(),
@@ -280,6 +294,8 @@ impl PackageIndex {
                 &[],
                 &[],
             );
+            // Keep original source provenance for ranking without changing wire output.
+            index.items[idx].rpm_eligible = package.source == crate::core::PackageSource::Official;
         }
         index
     }
@@ -308,7 +324,14 @@ impl PackageIndex {
 
     pub async fn for_package_manager(package_manager: Arc<dyn PackageManager>) -> Result<Self> {
         if Self::uses_manager_inventory(package_manager.as_ref()) {
-            return Ok(Self::from_packages(package_manager.package_index().await?));
+            let name_kind = SearchNameKind::for_manager(
+                package_manager.name(),
+                crate::core::paths::test_mode(),
+            );
+            return Ok(Self::from_packages(
+                package_manager.package_index().await?,
+                name_kind,
+            ));
         }
 
         tokio::task::spawn_blocking(Self::new).await?
@@ -398,6 +421,9 @@ impl PackageIndex {
             // panicking inside the daemon's blocking pool.
             return Vec::new();
         }
+        if self.name_kind == SearchNameKind::RpmIdentity {
+            return self.search_rpm(query, limit);
+        }
         let query_lower = query.to_ascii_lowercase();
         let query_bytes = query_lower.as_bytes();
 
@@ -412,8 +438,7 @@ impl PackageIndex {
                 let item = &self.items[idx as usize];
                 let name_lower = self.pool.get(item.name_lower_offset);
 
-                if let Some(score) = Self::score_name_match(&query_lower, name_lower, idx as usize)
-                {
+                if let Some(score) = self.score_name_match(&query_lower, name_lower, idx as usize) {
                     scored_matches.push((score, idx));
                     name_match_count += 1;
                 }
@@ -428,7 +453,10 @@ impl PackageIndex {
                     let desc_lower = self.pool.get(item.description_lower_offset);
                     if desc_finder.find(desc_lower.as_bytes()).is_some() {
                         let name_lower = self.pool.get(item.name_lower_offset);
-                        if Self::score_name_match(&query_lower, name_lower, idx).is_none() {
+                        if self
+                            .score_name_match(&query_lower, name_lower, idx)
+                            .is_none()
+                        {
                             scored_matches.push((
                                 RelevanceScore::new(
                                     RelevanceScore::DESCRIPTION_ONLY,
@@ -446,7 +474,7 @@ impl PackageIndex {
             for (idx, item) in self.items.iter().enumerate() {
                 let name_lower = self.pool.get(item.name_lower_offset);
 
-                if let Some(score) = Self::score_name_match(&query_lower, name_lower, idx) {
+                if let Some(score) = self.score_name_match(&query_lower, name_lower, idx) {
                     scored_matches.push((score, idx as u32));
                     name_match_count += 1;
                 } else if name_match_count < limit {
@@ -485,7 +513,77 @@ impl PackageIndex {
             .collect()
     }
 
-    fn score_name_match(query_lower: &str, name_lower: &str, idx: usize) -> Option<RelevanceScore> {
+    fn search_rpm(&self, query: &str, limit: usize) -> Vec<PackageInfo> {
+        use crate::core::packages::search::{SearchRanker, SearchScore};
+
+        let query_lower = query.to_lowercase();
+        let mut ranker = SearchRanker::new(query);
+        let mut scored: Vec<(SearchScore, usize)> = Vec::new();
+        // DNF admits name OR description substrings across the complete catalog.
+        // Score every eligible row before the bounded cache prefix is selected.
+        for (idx, item) in self.items.iter().enumerate() {
+            let name_lower = self.pool.get(item.name_offset).to_lowercase();
+            if !name_lower.contains(&query_lower)
+                && !self
+                    .pool
+                    .get(item.description_offset)
+                    .to_lowercase()
+                    .contains(&query_lower)
+            {
+                continue;
+            }
+            let kind = if item.rpm_eligible && item.source == WirePackageSource::Official {
+                SearchNameKind::RpmIdentity
+            } else {
+                SearchNameKind::Literal
+            };
+            scored.push((ranker.score(&name_lower, kind), idx));
+        }
+        let compare = |a: &(SearchScore, usize), b: &(SearchScore, usize)| {
+            a.0.cmp(&b.0)
+                .then_with(|| {
+                    self.pool
+                        .get(self.items[a.1].name_offset)
+                        .cmp(self.pool.get(self.items[b.1].name_offset))
+                })
+                .then_with(|| a.1.cmp(&b.1))
+        };
+        if scored.len() > limit {
+            scored.select_nth_unstable_by(limit - 1, compare);
+            scored.truncate(limit);
+        }
+        scored.sort_unstable_by(compare);
+        scored
+            .into_iter()
+            .map(|(_, idx)| {
+                let item = &self.items[idx];
+                PackageInfo {
+                    name: self.pool.get(item.name_offset).to_string(),
+                    version: self.pool.get(item.version_offset).to_string(),
+                    description: self.pool.get(item.description_offset).to_string(),
+                    source: item.source,
+                }
+            })
+            .collect()
+    }
+
+    fn score_name_match(
+        &self,
+        query_lower: &str,
+        name_lower: &str,
+        idx: usize,
+    ) -> Option<RelevanceScore> {
+        if name_lower != query_lower
+            && self.items[idx].rpm_eligible
+            && self.items[idx].source == WirePackageSource::Official
+            && self.name_kind.exact_key(query_lower, name_lower).is_some()
+        {
+            return Some(RelevanceScore::new(
+                RelevanceScore::RPM_BASENAME_MATCH,
+                name_lower.len(),
+                idx,
+            ));
+        }
         let query_len = query_lower.len();
         let mut found_substring = false;
 
@@ -571,8 +669,503 @@ impl PackageIndex {
 }
 
 #[cfg(test)]
+pub(crate) mod search_parity_fixture {
+    // Literal rows from the preserved native direct/daemon witness; no score oracle copy.
+    pub(crate) const RECORDS: &[(&str, &str, &str)] = &[
+        ("tree.x86_64", "2.2.1-4.fc44", "File system tree viewer"),
+        (
+            "tree-sitter-cli.x86_64",
+            "0.26.11-1.fc44",
+            "CLI tool for developing, testing, and using Tree-sitter parsers",
+        ),
+        (
+            "tree-sitter-srpm-macros.noarch",
+            "0.4.2-2.fc44",
+            "RPM macros for Tree-sitter parsers",
+        ),
+        (
+            "treeland-protocols-devel.noarch",
+            "0.5.4-1.fc44",
+            "Development files for treeland-protocols",
+        ),
+        (
+            "treelayout-demo.noarch",
+            "1.0.3-28.fc44",
+            "TreeLayout Core Demo",
+        ),
+        (
+            "treelayout-javadoc.noarch",
+            "1.0.3-28.fc44",
+            "Javadoc for treelayout",
+        ),
+        (
+            "treelayout.noarch",
+            "1.0.3-28.fc44",
+            "Efficient and customizable Tree Layout Algorithm in Java",
+        ),
+        (
+            "treescan.noarch",
+            "4.81-7.fc44",
+            "Scan directory trees, list directories/files, stat, sync, grep",
+        ),
+        (
+            "flexmark-java-tree-iteration.noarch",
+            "0.64.6-15.fc44",
+            "Flexmark library for recursive tree iteration",
+        ),
+        (
+            "golang-github-a8m-tree-devel.noarch",
+            "0-0.24.20210725gitce3525c.fc41",
+            "Implementation of the Unix tree command written in Go",
+        ),
+        (
+            "perl-Tree-DAG_Node.noarch",
+            "1.35-3.fc44",
+            "Class for representing nodes in a tree",
+        ),
+        (
+            "perl-Tree-R.noarch",
+            "0.072-30.fc44",
+            "Perl extension for the R-tree data structure and algorithms",
+        ),
+        (
+            "perl-Tree-Simple-VisitorFactory.noarch",
+            "0.16-14.fc44",
+            "Factory object for dispensing Visitor objects",
+        ),
+        (
+            "perl-Tree-Simple.noarch",
+            "1.34-15.fc44",
+            "Tree::Simple Perl module",
+        ),
+        (
+            "perl-Tree-XPathEngine.noarch",
+            "0.05-39.fc44",
+            "Re-usable XPath engine",
+        ),
+        (
+            "perl-Tree-tests.noarch",
+            "1.16-7.fc44",
+            "Tests for perl-Tree",
+        ),
+        (
+            "root-tree-dataframe.x86_64",
+            "6.40.04-1.fc44",
+            "A high level interface to ROOT trees",
+        ),
+        (
+            "root-tree-ml.x86_64",
+            "6.40.04-1.fc44",
+            "ROOT dataframe python",
+        ),
+        (
+            "root-tree-ntuple-browse.x86_64",
+            "6.40.04-1.fc44",
+            "N-Tuple browsing library for ROOT",
+        ),
+        (
+            "root-tree-ntuple-utils.x86_64",
+            "6.40.04-1.fc44",
+            "Ntuple utility library",
+        ),
+        (
+            "perl-HTML-Tree.noarch",
+            "1:5.07-30.fc44",
+            "HTML tree handling modules for Perl",
+        ),
+        (
+            "perl-Text-Tree.noarch",
+            "1.0-50.fc44",
+            "Format a simple tree of strings into a textual tree graph",
+        ),
+        ("perl-Tree.noarch", "1.16-7.fc44", "Tree data structure"),
+        (
+            "perl-XML-TreePP.noarch",
+            "0.43-32.fc44",
+            "Pure Perl implementation for parsing/writing XML documents",
+        ),
+        (
+            "root-tree.x86_64",
+            "6.40.04-1.fc44",
+            "Tree library for ROOT",
+        ),
+        (
+            "rubygem-treetop.noarch",
+            "1.6.12-9.fc44",
+            "A Ruby-based text parsing and interpretation DSL",
+        ),
+        (
+            "texlive-treesvr.noarch",
+            "12:svn71382-6.fc44",
+            "Tree macros",
+        ),
+        ("texlive-treetex.noarch", "12:svn28176-4.fc44", "Draw trees"),
+    ];
+    pub(crate) const EXPECTED: &[(&str, &str, &str)] = &[
+        ("tree.x86_64", "2.2.1-4.fc44", "File system tree viewer"),
+        (
+            "tree-sitter-cli.x86_64",
+            "0.26.11-1.fc44",
+            "CLI tool for developing, testing, and using Tree-sitter parsers",
+        ),
+        (
+            "tree-sitter-srpm-macros.noarch",
+            "0.4.2-2.fc44",
+            "RPM macros for Tree-sitter parsers",
+        ),
+        (
+            "treeland-protocols-devel.noarch",
+            "0.5.4-1.fc44",
+            "Development files for treeland-protocols",
+        ),
+        (
+            "treelayout-demo.noarch",
+            "1.0.3-28.fc44",
+            "TreeLayout Core Demo",
+        ),
+        (
+            "treelayout-javadoc.noarch",
+            "1.0.3-28.fc44",
+            "Javadoc for treelayout",
+        ),
+        (
+            "treelayout.noarch",
+            "1.0.3-28.fc44",
+            "Efficient and customizable Tree Layout Algorithm in Java",
+        ),
+        (
+            "treescan.noarch",
+            "4.81-7.fc44",
+            "Scan directory trees, list directories/files, stat, sync, grep",
+        ),
+        (
+            "flexmark-java-tree-iteration.noarch",
+            "0.64.6-15.fc44",
+            "Flexmark library for recursive tree iteration",
+        ),
+        (
+            "golang-github-a8m-tree-devel.noarch",
+            "0-0.24.20210725gitce3525c.fc41",
+            "Implementation of the Unix tree command written in Go",
+        ),
+        (
+            "perl-Tree-DAG_Node.noarch",
+            "1.35-3.fc44",
+            "Class for representing nodes in a tree",
+        ),
+        (
+            "perl-Tree-R.noarch",
+            "0.072-30.fc44",
+            "Perl extension for the R-tree data structure and algorithms",
+        ),
+        (
+            "perl-Tree-Simple-VisitorFactory.noarch",
+            "0.16-14.fc44",
+            "Factory object for dispensing Visitor objects",
+        ),
+        (
+            "perl-Tree-Simple.noarch",
+            "1.34-15.fc44",
+            "Tree::Simple Perl module",
+        ),
+        (
+            "perl-Tree-XPathEngine.noarch",
+            "0.05-39.fc44",
+            "Re-usable XPath engine",
+        ),
+        (
+            "perl-Tree-tests.noarch",
+            "1.16-7.fc44",
+            "Tests for perl-Tree",
+        ),
+        (
+            "root-tree-dataframe.x86_64",
+            "6.40.04-1.fc44",
+            "A high level interface to ROOT trees",
+        ),
+        (
+            "root-tree-ml.x86_64",
+            "6.40.04-1.fc44",
+            "ROOT dataframe python",
+        ),
+        (
+            "root-tree-ntuple-browse.x86_64",
+            "6.40.04-1.fc44",
+            "N-Tuple browsing library for ROOT",
+        ),
+        (
+            "root-tree-ntuple-utils.x86_64",
+            "6.40.04-1.fc44",
+            "Ntuple utility library",
+        ),
+    ];
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rpm_fixture_index(records: &[(&str, &str, &str)]) -> PackageIndex {
+        PackageIndex::from_rpm_records(records)
+    }
+
+    #[test]
+    fn fedora_search_index_ranks_rpm_basename_before_limit() {
+        let index = rpm_fixture_index(&[
+            ("tree2.i686", "1", "prefix"),
+            ("tree.x86_64", "2:2.2.1-4.fc44", "exact RPM basename"),
+        ]);
+        assert!("tree2.i686".len() < "tree.x86_64".len());
+        let results = index.search("tree", 1);
+        assert_eq!(results[0].name, "tree.x86_64");
+        assert_eq!(results[0].version, "2:2.2.1-4.fc44");
+        assert_eq!(results[0].description, "exact RPM basename");
+        assert_eq!(results[0].source, WirePackageSource::Official);
+        assert_eq!(index.get("tree.x86_64").unwrap().name, "tree.x86_64");
+        assert!(index.get("tree").is_none());
+        assert!(index.search("tree", 0).is_empty());
+        assert!(index.search("", 1).is_empty());
+    }
+
+    #[test]
+    fn fedora_search_index_full_identity_precedes_colliding_basename() {
+        let index = rpm_fixture_index(&[
+            ("tree.x86_64.aarch64", "1", "RPM basename equals query"),
+            ("tree.x86_64", "2", "full identity equals query"),
+            ("tree.x86_64-extra.i686", "3", "prefix"),
+        ]);
+        for limit in [1, 10] {
+            let results = index.search("tree.x86_64", limit);
+            assert_eq!(results[0].name, "tree.x86_64");
+            if limit == 10 {
+                assert_eq!(results[1].name, "tree.x86_64.aarch64");
+            }
+        }
+    }
+
+    #[test]
+    fn fedora_search_index_preserves_dotted_multiarch_and_short_query_order() {
+        let python = rpm_fixture_index(&[
+            ("python3.13-tools.i686", "1", "prefix"),
+            ("python3.13.x86_64", "2", "dotted basename"),
+        ]);
+        assert_eq!(python.search("python3.13", 1)[0].name, "python3.13.x86_64");
+        let index = rpm_fixture_index(&[
+            ("tree.noarch", "1", "first equal-length identity"),
+            ("tree.x86_64", "2", "second equal-length identity"),
+            ("tree.aarch64", "3", "longer identity"),
+            ("tree2.i686", "4", "shorter prefix"),
+        ]);
+        let results = index.search("tree", 10);
+        assert_eq!(
+            results
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            ["tree.aarch64", "tree.noarch", "tree.x86_64", "tree2.i686"]
+        );
+        let short = rpm_fixture_index(&[("go2.x", "1", "prefix"), ("go.x86_64", "2", "exact")]);
+        assert_eq!(short.search("go", 1)[0].name, "go.x86_64");
+    }
+
+    #[test]
+    fn fedora_search_index_generic_records_remain_literal() {
+        let records = [
+            ("tree2.i686", "1", "shorter prefix"),
+            ("tree.x86_64", "2", "dotted literal"),
+        ];
+        assert_eq!(
+            PackageIndex::from_records(&records).search("tree", 1)[0].name,
+            "tree2.i686"
+        );
+        let source_records = [
+            ("tree-sitter-cli.x86_64", "3", "CLI witness"),
+            ("tree-sitter-srpm-macros.noarch", "4", "macro witness"),
+            ("tree.x86_64", "2", "dotted literal"),
+        ];
+        let mut index = rpm_fixture_index(&source_records);
+        assert_eq!(index.search("tree", 1)[0].name, "tree.x86_64");
+        index.items[2].source = WirePackageSource::Aur;
+        let literal = index.search("tree", 1);
+        assert_eq!(literal[0].name, "tree-sitter-cli.x86_64");
+        assert_eq!(literal[0].version, "3");
+        assert_eq!(literal[0].description, "CLI witness");
+        index.items[2].source = WirePackageSource::Official;
+        let counterfactual = index.search("tree", 1);
+        assert_eq!(counterfactual[0].name, "tree.x86_64");
+        assert_eq!(counterfactual[0].version, "2");
+        assert_eq!(counterfactual[0].description, "dotted literal");
+    }
+
+    struct DnfRankingCatalog(crate::package_managers::mock::MockPackageManager);
+    type RankingFuture<'a, T> =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
+
+    impl PackageManager for DnfRankingCatalog {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+        fn package_index(&self) -> RankingFuture<'_, Vec<crate::core::Package>> {
+            Box::pin(async {
+                let mut packages = self.0.package_index().await?;
+                let target = packages
+                    .iter_mut()
+                    .find(|package| package.name == "tree.x86_64")
+                    .expect("AUR fixture identity");
+                target.source = crate::core::PackageSource::Aur;
+                Ok(packages)
+            })
+        }
+        fn search(&self, query: &str) -> RankingFuture<'_, Vec<crate::core::Package>> {
+            self.0.search(query)
+        }
+        fn install(&self, packages: &[String]) -> RankingFuture<'_, ()> {
+            self.0.install(packages)
+        }
+        fn remove(&self, packages: &[String]) -> RankingFuture<'_, ()> {
+            self.0.remove(packages)
+        }
+        fn update(&self) -> RankingFuture<'_, ()> {
+            self.0.update()
+        }
+        fn sync(&self) -> RankingFuture<'_, ()> {
+            self.0.sync()
+        }
+        fn info(&self, package: &str) -> RankingFuture<'_, Option<crate::core::Package>> {
+            self.0.info(package)
+        }
+        fn list_installed(&self) -> RankingFuture<'_, Vec<crate::core::Package>> {
+            self.0.list_installed()
+        }
+        fn get_status(&self, fast: bool) -> RankingFuture<'_, (usize, usize, usize, usize)> {
+            self.0.get_status(fast)
+        }
+        fn list_explicit(&self) -> RankingFuture<'_, Vec<String>> {
+            self.0.list_explicit()
+        }
+        fn list_updates(
+            &self,
+        ) -> RankingFuture<'_, Vec<crate::package_managers::types::UpdateInfo>> {
+            self.0.list_updates()
+        }
+        fn is_installed(&self, package: &str) -> RankingFuture<'_, bool> {
+            self.0.is_installed(package)
+        }
+    }
+
+    #[test]
+    fn fedora_search_manager_construction_respects_explicit_mock_mode() {
+        const CHILD: &str = "OMG_RPM_RANK_CONSTRUCTION_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let directory = tempfile::tempdir().expect("private construction catalog");
+            let manager = crate::package_managers::mock::MockPackageManager::new_in(
+                "fedora",
+                directory.path(),
+            );
+            manager.db.packages.lock().unwrap().clear();
+            manager
+                .db
+                .add_package("tree2.i686", "1", "prefix", "fedora");
+            manager
+                .db
+                .add_package("tree.x86_64", "2", "exact", "fedora");
+            manager
+                .db
+                .add_package("tree-sitter-cli.x86_64", "3", "CLI witness", "fedora");
+            manager.db.add_package(
+                "tree-sitter-srpm-macros.noarch",
+                "4",
+                "macro witness",
+                "fedora",
+            );
+            assert_eq!(manager.name(), "dnf");
+            let manager: Arc<dyn PackageManager> = if mode == "aur" {
+                Arc::new(DnfRankingCatalog(manager))
+            } else {
+                Arc::new(manager)
+            };
+            let mut index = PackageIndex::for_package_manager_blocking(manager).unwrap();
+            assert_eq!(
+                index.get("tree.x86_64").unwrap().source,
+                WirePackageSource::Official,
+                "preexisting output mapping is retained"
+            );
+            for (name, version, description) in [
+                ("tree2.i686", "1", "prefix"),
+                ("tree.x86_64", "2", "exact"),
+                ("tree-sitter-cli.x86_64", "3", "CLI witness"),
+                ("tree-sitter-srpm-macros.noarch", "4", "macro witness"),
+            ] {
+                let record = index.get(name).unwrap();
+                assert_eq!(record.version, version);
+                assert_eq!(record.description, description);
+                assert_eq!(record.source, WirePackageSource::Official);
+            }
+            let target = index
+                .items
+                .iter()
+                .position(|item| index.pool.get(item.name_offset) == "tree.x86_64")
+                .unwrap();
+            assert_eq!(index.items[target].rpm_eligible, mode != "aur");
+            let (expected, version, description) = match mode.as_str() {
+                "rpm" => ("tree.x86_64", "2", "exact"),
+                "mock" => ("tree2.i686", "1", "prefix"),
+                "aur" => ("tree-sitter-cli.x86_64", "3", "CLI witness"),
+                _ => panic!("unknown private construction mode"),
+            };
+            let result = index.search("tree", 1);
+            assert_eq!(result[0].name, expected, "{mode}");
+            assert_eq!(result[0].version, version);
+            assert_eq!(result[0].description, description);
+            if mode == "aur" {
+                index.items[target].rpm_eligible = true;
+                let counterfactual = index.search("tree", 1);
+                assert_eq!(counterfactual[0].name, "tree.x86_64");
+                assert_eq!(counterfactual[0].version, "2");
+                assert_eq!(counterfactual[0].description, "exact");
+                println!(
+                    "RANK_PROVENANCE_COUNTERFACTUAL restored_eligibility=tree.x86_64 version=2"
+                );
+            }
+            println!(
+                "RANK_CONSTRUCTION mode={mode} expected={expected} version={version} description={description}"
+            );
+            return;
+        }
+        let mut failures = Vec::new();
+        for mode in ["rpm", "mock", "aur"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "daemon::index::tests::fedora_search_manager_construction_respects_explicit_mock_mode", "--nocapture", "--test-threads=1"])
+                .env(CHILD, mode).env("RUST_BACKTRACE", "0")
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+            if mode == "mock" {
+                command.env("OMG_TEST_MODE", "1");
+            } else {
+                command.env_remove("OMG_TEST_MODE");
+            }
+            let mut child = command.spawn().expect("spawn bounded construction child");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child
+                        .kill()
+                        .expect("terminate timed out construction child");
+                    child.wait().expect("reap construction child");
+                    panic!("construction child timed out: {mode}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            if !output.status.success() {
+                failures.push((mode, output));
+            }
+        }
+        assert!(failures.is_empty(), "construction failures: {failures:?}");
+    }
 
     fn portable_manager_cases() -> [(
         crate::package_managers::mock::MockPackageManager,
@@ -797,5 +1390,156 @@ mod tests {
 
         // Lower index should have higher value (comes first in results)
         assert!(first > second);
+    }
+
+    #[test]
+    fn fedora_search_parity_native_rows_survive_ranking_before_limits() {
+        use super::search_parity_fixture::{EXPECTED, RECORDS};
+        for reverse in [false, true] {
+            let mut records = RECORDS.to_vec();
+            if reverse {
+                records.reverse();
+            }
+            let index = PackageIndex::from_rpm_records(&records);
+            for limit in [1, 20, 1000] {
+                let actual = index.search("tree", limit);
+                assert_eq!(actual.len(), limit.min(records.len()));
+                for (row, &(name, version, description)) in actual.iter().zip(EXPECTED) {
+                    assert_eq!(
+                        (&*row.name, &*row.version, &*row.description),
+                        (name, version, description),
+                        "reverse={reverse} limit={limit}"
+                    );
+                    assert_eq!(row.source, WirePackageSource::Official);
+                }
+                for row in actual {
+                    let expected = records.iter().find(|record| record.0 == row.name).unwrap();
+                    assert_eq!((&*row.version, &*row.description), (expected.1, expected.2));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fedora_search_parity_canonical_order_precedes_thousand_candidate_cap() {
+        let names: Vec<_> = (0..1200)
+            .rev()
+            .map(|i| format!("tree-{i:04}.noarch"))
+            .collect();
+        let mut records: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), "4:5-6.fc44", "tree name hit"))
+            .collect();
+        records.push(("tree.x86_64", "2:2.2.1-4.fc44", "last exact basename"));
+        let index = PackageIndex::from_rpm_records(&records);
+        for limit in [1, 20, 1000] {
+            let actual = index.search("tree", limit);
+            assert_eq!(actual.len(), limit);
+            assert_eq!(actual[0].name, "tree.x86_64");
+            for (i, row) in actual.iter().skip(1).enumerate() {
+                assert_eq!(row.name, format!("tree-{i:04}.noarch"));
+                assert_eq!(
+                    (&*row.version, &*row.description),
+                    ("4:5-6.fc44", "tree name hit")
+                );
+            }
+        }
+        assert!(index.search("tree", 0).is_empty());
+        assert!(index.search("", 1000).is_empty());
+    }
+
+    #[test]
+    fn fedora_search_parity_includes_late_description_hits_and_unicode() {
+        let names: Vec<_> = (0..25).map(|i| format!("tree-{i:02}.noarch")).collect();
+        let mut records: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), "1", "name match"))
+            .collect();
+        records.push(("late.noarch", "2", "a TREE description hit"));
+        let index = PackageIndex::from_rpm_records(&records);
+        assert_eq!(index.search("tree", 26).len(), 26);
+        // Candidate eligibility must not depend on whether name matches filled a prior limit.
+        let retained = index.search("tree", 1000);
+        assert!(
+            retained
+                .iter()
+                .any(|row| row.name == "late.noarch" && row.version == "2")
+        );
+        let unicode = PackageIndex::from_rpm_records(&[
+            ("Éclair.noarch", "3", "prefix hit"),
+            ("late.noarch", "4", "An ÉCLAIR description"),
+        ]);
+        let actual = unicode.search("é", 20);
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Éclair.noarch", "late.noarch"]
+        );
+        let actual = unicode.search("éclair", 20);
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].name, "Éclair.noarch");
+        assert_eq!(actual[1].description, "An ÉCLAIR description");
+    }
+
+    #[test]
+    fn fedora_search_parity_uses_cli_whole_words_not_dot_boundaries() {
+        let records = [
+            ("x.tree.noarch", "1", "dot substring"),
+            ("x-tree-tall.noarch", "2", "whole hyphenated word"),
+            ("tree-i18n-aa.noarch", "3", "language pack prefix"),
+            ("tree-tool.noarch", "4", "normal prefix"),
+        ];
+        let actual = PackageIndex::from_rpm_records(&records).search("tree", 20);
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "tree-tool.noarch",
+                "tree-i18n-aa.noarch",
+                "x-tree-tall.noarch",
+                "x.tree.noarch"
+            ]
+        );
+    }
+
+    #[test]
+    fn fedora_search_parity_late_description_is_scored_before_cache_cap() {
+        let names: Vec<_> = (0..1200)
+            .rev()
+            .map(|i| format!("zzztree-i18n-aa{i:04}.noarch"))
+            .collect();
+        let mut records: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), "1", "name substring"))
+            .collect();
+        records.push((
+            "t-r-e-e.noarch",
+            "7:8-9.fc44",
+            "tree viewer from description",
+        ));
+        let index = PackageIndex::from_rpm_records(&records);
+        for limit in [1, 20, 1000] {
+            let actual = index.search("tree", limit);
+            assert_eq!(actual.len(), limit);
+            assert_eq!(
+                (
+                    &*actual[0].name,
+                    &*actual[0].version,
+                    &*actual[0].description
+                ),
+                (
+                    "t-r-e-e.noarch",
+                    "7:8-9.fc44",
+                    "tree viewer from description"
+                )
+            );
+            for (i, row) in actual.iter().skip(1).enumerate() {
+                assert_eq!(row.name, format!("zzztree-i18n-aa{i:04}.noarch"));
+            }
+        }
     }
 }

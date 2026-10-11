@@ -616,11 +616,14 @@ fn snapshot_restores_all_registered_installed_runtimes_and_executes_selected_pay
         for version in [&target, &changed] {
             let path = versions.join(version).join(&binary);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &path,
-                format!("#!/bin/sh\nprintf '%s\\n' 'fixture-{name}-{version}'\n"),
-            )
-            .unwrap();
+            let script = if name == "node" {
+                format!(
+                    "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"--version\" ]; then\n    printf '%s\\n' 'v{version}'\nelse\n    printf '%s\\n' 'fixture-{name}-{version}'\nfi\n"
+                )
+            } else {
+                format!("#!/bin/sh\nprintf '%s\\n' 'fixture-{name}-{version}'\n")
+            };
+            std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
             if name == "pi" {
                 let manifest = versions
@@ -672,6 +675,14 @@ fn snapshot_restores_all_registered_installed_runtimes_and_executes_selected_pay
                 format!("fixture-{name}-{version}\n").as_bytes(),
                 "{name}"
             );
+            if name.as_str() == "node" {
+                let banner = std::process::Command::new(versions.join(directory).join(binary))
+                    .arg("--version")
+                    .output()
+                    .unwrap();
+                assert!(banner.status.success(), "node version: {banner:?}");
+                assert_eq!(banner.stdout, format!("v{version}\n").as_bytes());
+            }
         }
     }
     project.run(&["env", "check"]).assert_success();

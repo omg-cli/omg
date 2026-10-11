@@ -11,11 +11,11 @@ Usage:
     python3 scripts/debt-ratchet.py                 # gate (exit 1 on regression)
     python3 scripts/debt-ratchet.py --report        # verbose status for all files
     python3 scripts/debt-ratchet.py --refresh       # lower the floor after cleanup
-    python3 scripts/debt-ratchet.py --ci            # verified event-base floor
+    python3 scripts/debt-ratchet.py --ci            # verified independent base floor
     python3 scripts/debt-ratchet.py --base-revision <sha>  # exact local ancestor
 
-CI verifies the repository, checkout SHA and exact PR merge parents before
-reading the floor from the event base commit. Missing objects or baselines fail
+CI verifies the repository, checkout SHA and PR merge ancestry before reading
+the floor from the actual independent base parent. Missing objects or baselines fail
 closed; candidate floors cannot increase. Independent checks cannot refresh or
 seed floors. This enforces ratchet policy, not a boundary against rewriting the
 checker or workflow.
@@ -251,9 +251,22 @@ def ci_base_revision(root):
             raise ValueError('PR base repository mismatch')
         source = commit_identity(pr['head']['sha'])
         base = commit_identity(pr['base']['sha'])
-        if git_output(root, 'show', '-s', '--format=%P', head).split() != [base, source]:
-            raise ValueError('PR merge parents do not match event base/head')
-        return base
+        parents = git_output(root, 'show', '-s', '--format=%P', head).split()
+        if len(parents) != 2 or parents[1] != source or parents[0] == source:
+            raise ValueError(
+                'PR merge parents do not match event base/head: '
+                f'event base/head={base} {source}; '
+                f'actual parents={" ".join(parents)}; checkout={head}')
+        actual_base = commit_identity(parents[0])
+        try:
+            git_output(root, 'merge-base', '--is-ancestor', base, actual_base)
+        except subprocess.CalledProcessError as error:
+            raise ValueError(
+                f'cannot verify PR event base ancestry: event={base}; '
+                f'merge={actual_base}; checkout={head}') from error
+        if base != actual_base:
+            print(f'Verified PR base advancement: event={base}; merge={actual_base}')
+        return actual_base
     if kind == 'push':
         if event.get('after') != head:
             raise ValueError('push event does not match CI checkout')
@@ -315,7 +328,7 @@ def main(argv=None):
     parser.add_argument('--report', action='store_true')
     base = parser.add_mutually_exclusive_group()
     base.add_argument('--base-revision', help='exact ancestor commit supplying the independent floor')
-    base.add_argument('--ci', action='store_true', help='bind the floor to the GitHub event base')
+    base.add_argument('--ci', action='store_true', help='bind the floor to the verified GitHub base')
     args = parser.parse_args(argv)
     if args.refresh and (args.ci or args.base_revision):
         parser.error('independent base checks cannot seed or refresh baselines')

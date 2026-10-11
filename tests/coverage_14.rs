@@ -36,6 +36,24 @@ fn install_fake_local_db(project: &TestProject, packages: &[(&str, &str, u8, &[&
         .join("local");
     fs::create_dir_all(&local).expect("create fake local db directory");
     fs::write(local.join("ALPM_DB_VERSION"), "9\n").expect("write ALPM_DB_VERSION");
+    let root = project.pacman_root.path();
+    let sync = root.join("var/lib/pacman/sync");
+    let cache = root.join("var/cache/pacman/pkg");
+    let etc = root.join("etc/pacman.d");
+    for directory in [&sync, &cache, &etc] {
+        fs::create_dir_all(directory).expect("create private native fixture directory");
+    }
+    fs::write(etc.join("mirrorlist"), "").expect("write private empty mirrorlist");
+    fs::write(
+        root.join("etc/pacman.conf"),
+        format!(
+            "[options]\nRootDir = {}\nDBPath = {}\nCacheDir = {}\nArchitecture = auto\n",
+            root.display(),
+            root.join("var/lib/pacman").display(),
+            cache.display(),
+        ),
+    )
+    .expect("write private pacman configuration");
 
     for (name, version, reason, deps) in packages {
         let dir = local.join(format!("{name}-{version}"));
@@ -117,6 +135,88 @@ fn read_mock_state(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "arch")]
+#[derive(Debug, PartialEq, Eq)]
+struct NativeFixtureEntry {
+    directory: bool,
+    len: u64,
+    modified: std::time::SystemTime,
+    readonly: bool,
+    bytes: Vec<u8>,
+    #[cfg(unix)]
+    identity: (u64, u64, u32, u32, u32, i64, i64, i64, i64),
+}
+
+#[cfg(feature = "arch")]
+fn native_fixture_state(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, NativeFixtureEntry> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        state: &mut std::collections::BTreeMap<std::path::PathBuf, NativeFixtureEntry>,
+    ) {
+        let metadata = fs::symlink_metadata(path).expect("native fixture metadata");
+        assert!(
+            metadata.is_dir() || metadata.is_file(),
+            "native fixture must contain only real directories/files"
+        );
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt as _;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        state.insert(
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            NativeFixtureEntry {
+                directory: metadata.is_dir(),
+                len: metadata.len(),
+                modified: metadata
+                    .modified()
+                    .expect("native fixture modification time"),
+                readonly: metadata.permissions().readonly(),
+                bytes: if metadata.is_file() {
+                    fs::read(path).expect("native fixture bytes")
+                } else {
+                    Vec::new()
+                },
+                #[cfg(unix)]
+                identity,
+            },
+        );
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).expect("native fixture entries") {
+                visit(root, &entry.expect("native fixture entry").path(), state);
+            }
+        }
+    }
+    let mut state = std::collections::BTreeMap::new();
+    visit(root, root, &mut state);
+    state
+}
+
+#[cfg(feature = "arch")]
+fn run_native_why(project: &TestProject, args: &[&str]) -> CommandResult {
+    let before = native_fixture_state(project.pacman_root.path());
+    let result = project.run_native_arch_why(args);
+    assert_eq!(
+        native_fixture_state(project.pacman_root.path()),
+        before,
+        "why must preserve every private pacman file, directory, identity, metadata, and byte"
+    );
+    result
+}
+
+#[cfg(feature = "arch")]
 mod why_contracts {
     use super::*;
 
@@ -125,10 +225,13 @@ mod why_contracts {
     /// ("Try 'omg search'").
     #[test]
     fn uninstalled_package_fails_naming_cause_and_remedy() {
+        if !native_arch_fixture_available() {
+            return;
+        }
         let project = TestProject::new();
         install_fake_local_db(&project, &[("alpha", "1.0-1", 0, &["beta"])]);
 
-        let result = project.run(&["why", "ghost"]);
+        let result = run_native_why(&project, &["why", "ghost"]);
 
         result.assert_failure();
         let combined = result.combined_output();
@@ -140,6 +243,7 @@ mod why_contracts {
             combined.contains("'ghost' is not installed"),
             "failure must name the missing package, got:\n{combined}"
         );
+        project.close_checked();
     }
 
     /// Contract: an explicitly-installed package reports Name/Version/Reason
@@ -147,6 +251,9 @@ mod why_contracts {
     /// installed or not, and assesses removal safety as a user decision.
     #[test]
     fn explicit_package_reports_reason_dependencies_and_safety() {
+        if !native_arch_fixture_available() {
+            return;
+        }
         let project = TestProject::new();
         install_fake_local_db(
             &project,
@@ -156,7 +263,7 @@ mod why_contracts {
             ],
         );
 
-        let result = project.run(&["why", "alpha"]);
+        let result = run_native_why(&project, &["why", "alpha"]);
 
         result.assert_success();
         let out = &result.stdout;
@@ -183,19 +290,23 @@ mod why_contracts {
             out.contains("Safe to remove: User decision - explicitly installed"),
             "explicit package must be a user decision, got:\n{out}"
         );
+        project.close_checked();
     }
 
     /// Contract: a dependency-reason package required by nothing is reported
     /// as an orphan that can be removed, with safety YES.
     #[test]
     fn orphan_dependency_is_flagged_safe_to_remove() {
+        if !native_arch_fixture_available() {
+            return;
+        }
         let project = TestProject::new();
         install_fake_local_db(
             &project,
             &[("alpha", "1.0-1", 0, &[]), ("orphanlib", "0.5-2", 1, &[])],
         );
 
-        let result = project.run(&["why", "orphanlib"]);
+        let result = run_native_why(&project, &["why", "orphanlib"]);
 
         result.assert_success();
         let out = &result.stdout;
@@ -211,6 +322,7 @@ mod why_contracts {
             out.contains("Safe to remove: YES - orphan dependency"),
             "orphan dependency must be safe to remove, got:\n{out}"
         );
+        project.close_checked();
     }
 
     /// Contract: when another installed package depends on the target, `why`
@@ -218,13 +330,16 @@ mod why_contracts {
     /// the target package, and flips the safety verdict to NO.
     #[test]
     fn required_by_card_shows_dependent_and_dependency_path() {
+        if !native_arch_fixture_available() {
+            return;
+        }
         let project = TestProject::new();
         install_fake_local_db(
             &project,
             &[("alpha", "1.0-1", 0, &["beta"]), ("beta", "2.0-1", 1, &[])],
         );
 
-        let result = project.run(&["why", "beta"]);
+        let result = run_native_why(&project, &["why", "beta"]);
 
         result.assert_success();
         let out = &result.stdout;
@@ -252,12 +367,16 @@ mod why_contracts {
             out.contains("Safe to remove: NO - 1 packages depend on it"),
             "required package must be unsafe to remove, got:\n{out}"
         );
+        project.close_checked();
     }
 
     /// Contract: `--reverse` lists dependents with their install reason and
     /// warns against removal with exact counts.
     #[test]
     fn reverse_lists_dependents_with_safety_warning() {
+        if !native_arch_fixture_available() {
+            return;
+        }
         let project = TestProject::new();
         install_fake_local_db(
             &project,
@@ -268,7 +387,7 @@ mod why_contracts {
             ],
         );
 
-        let result = project.run(&["why", "sharedlib", "--reverse"]);
+        let result = run_native_why(&project, &["why", "sharedlib", "--reverse"]);
 
         result.assert_success();
         let out = &result.stdout;
@@ -301,16 +420,20 @@ mod why_contracts {
             ),
             "warning must break down counts exactly, got:\n{out}"
         );
+        project.close_checked();
     }
 
     /// Contract: `--reverse` for a package nobody needs succeeds with a YES
     /// verdict rather than failing.
     #[test]
     fn reverse_without_dependents_is_safe() {
+        if !native_arch_fixture_available() {
+            return;
+        }
         let project = TestProject::new();
         install_fake_local_db(&project, &[("loner", "2.2-1", 0, &[])]);
 
-        let result = project.run(&["why", "loner", "--reverse"]);
+        let result = run_native_why(&project, &["why", "loner", "--reverse"]);
 
         result.assert_success();
         let out = &result.stdout;
@@ -322,6 +445,23 @@ mod why_contracts {
             out.contains("Safe to remove: YES (if not needed)"),
             "got:\n{out}"
         );
+        project.close_checked();
+    }
+
+    #[test]
+    fn mock_why_refusal_preserves_private_native_database() {
+        let project = TestProject::new();
+        install_fake_local_db(&project, &[("alpha", "3.2-1", 0, &[])]);
+        let before = native_fixture_state(project.pacman_root.path());
+        let result = project.run(&["why", "alpha"]);
+        result.assert_failure();
+        assert!(
+            result
+                .combined_output()
+                .contains("Package dependency analysis is not implemented for the mock backend")
+        );
+        assert_eq!(native_fixture_state(project.pacman_root.path()), before);
+        project.close_checked();
     }
 }
 

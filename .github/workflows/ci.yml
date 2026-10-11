@@ -96,6 +96,12 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt
 
+      - name: Install Python workflow test dependencies
+        if: needs.quick-gate.outputs.checks-required == 'true'
+        run: |
+          sudo apt-get update --error-on=any
+          sudo apt-get install -y --no-install-recommends python3-venv
+
       - name: Run quick workflow checks
         if: needs.quick-gate.outputs.checks-required == 'true'
         run: make ci-workflow-quick
@@ -220,7 +226,7 @@ jobs:
             sudo apt-get update --error-on=any -qq && break || sleep 10
             if [ "$attempt" = 3 ]; then exit 1; fi
           done
-          sudo apt-get install -y --no-install-recommends zsh
+          sudo apt-get install -y --no-install-recommends zsh fish python3-venv
           set +e
           timeout -k 10s 30s zsh tests/shell_completion.zsh > /tmp/shell-completion.log 2>&1
           rc=$?
@@ -294,7 +300,7 @@ jobs:
             features: arch,pgp,license
             setup: |
               pacman -Syu --noconfirm
-              pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python
+              pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python fish
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
                 -o /tmp/rustup-init
@@ -311,7 +317,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
@@ -329,7 +335,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
@@ -354,7 +360,7 @@ jobs:
               test "$(uname -m)" = x86_64
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt jq \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish jq \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               ldconfig -p | grep -F 'libapt-pkg.so.7'
               curl --proto '=https' --tlsv1.2 -fsSL \
@@ -374,7 +380,7 @@ jobs:
               timeout -k 10s 12m dnf \
                 --setopt='*.skip_if_unavailable=False' \
                 install -y --setopt=install_weak_deps=False \
-                git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 \
+                git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 zsh fish \
                 rpm dnf sqlite yum-utils fedora-release
               rpm --initdb
               curl --proto '=https' --tlsv1.2 -fsSL \
@@ -400,6 +406,10 @@ jobs:
 
       - name: Fix git permissions
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Verify Python venv and offline pip prerequisites
+        if: contains(matrix.features, 'debian')
+        run: python3 scripts/test_python_venv_setup.py -v
 
       # sccache temporarily disabled due to service outage
 
@@ -497,6 +507,16 @@ jobs:
 
       - name: Run unit tests
         run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
+
+      - name: Test emitted shell hooks
+        if: matrix.platform == 'fedora'
+        env:
+          OMG_HOOK_TEST_BINARY: ${{ github.workspace }}/target/debug/omg
+          OMG_HOOK_TEST_REQUIRE_SHELLS: bash,zsh,fish
+        run: |
+          test -x "$OMG_HOOK_TEST_BINARY"
+          python3 -m unittest discover -s tests -p test_shell_hook_behavior.py
+          python3 -m unittest discover -s tests -p test_shell_hook_ci.py
 
       - name: Run serial library and binary contracts
         if: matrix.platform != 'debian-trixie' && matrix.platform != 'ubuntu-2604'
@@ -862,6 +882,9 @@ jobs:
       - name: Verify nextest
         run: cargo nextest --version
 
+      - name: Install Fish unit test dependency
+        run: brew list fish &>/dev/null || brew install fish
+
       - name: Run unit tests
         run: python3 scripts/run-native-contracts.py --features macos,pgp,license
 
@@ -994,7 +1017,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libapt-pkg-dev python3-apt \
+            libapt-pkg-dev python3-apt python3-venv fish \
             pkg-config \
             libssl-dev \
             clang \

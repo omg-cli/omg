@@ -806,6 +806,192 @@ mod tests {
         )));
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn aur_install_resolution_preserves_exact_candidates_beyond_cached_search_cap() -> Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+        const NAME: &str = "cli::packages::install::arch::tests::aur_install_resolution_preserves_exact_candidates_beyond_cached_search_cap";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !crate::core::is_root(),
+            "fixture must use ordinary cache overrides"
+        );
+        #[derive(Debug, PartialEq, Eq)]
+        struct FixtureFileState {
+            bytes: Vec<u8>,
+            device: u64,
+            inode: u64,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+            modified: (i64, i64),
+            changed: (i64, i64),
+        }
+        fn file_state(path: &std::path::Path) -> Result<FixtureFileState> {
+            let meta = std::fs::symlink_metadata(path)?;
+            anyhow::ensure!(meta.is_file(), "fixture remains a regular file");
+            Ok(FixtureFileState {
+                bytes: std::fs::read(path)?,
+                device: meta.dev(),
+                inode: meta.ino(),
+                mode: meta.mode(),
+                uid: meta.uid(),
+                gid: meta.gid(),
+                modified: (meta.mtime(), meta.mtime_nsec()),
+                changed: (meta.ctime(), meta.ctime_nsec()),
+            })
+        }
+        for (decoy_count, source_version, binary_version, expected) in [
+            (50, None, None, None),
+            (
+                50,
+                Some("1.0-1"),
+                Some("2.0-1"),
+                Some(("ztool-bin", "2.0-1", true)),
+            ),
+            (50, Some("1.0-1"), None, Some(("ztool", "1.0-1", false))),
+            (50, None, Some("2.0-1"), Some(("ztool-bin", "2.0-1", false))),
+            (
+                50,
+                Some("1.0-1"),
+                Some("not a version"),
+                Some(("ztool", "1.0-1", false)),
+            ),
+            (
+                3,
+                Some("1.0-1"),
+                Some("2.0-1"),
+                Some(("ztool-bin", "2.0-1", true)),
+            ),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let cache = directory.path().join("cache");
+            let meta_dir = cache.join("aur/_meta");
+            let config = directory.path().join("config");
+            std::fs::create_dir_all(&meta_dir)?;
+            std::fs::create_dir_all(&config)?;
+            let config_path = config.join("config.toml");
+            std::fs::write(
+                &config_path,
+                "[aur]\nuse_metadata_archive = true\nmetadata_cache_ttl_secs = 300\n",
+            )?;
+            let archive_path = meta_dir.join("packages-meta-ext-v1.json.gz");
+            let index_path = meta_dir.join("packages-meta-ext-v1.rkyv");
+            let mut records: Vec<_> = (0..decoy_count).map(|index| serde_json::json!({
+                "Name": format!("aaa-{index:03}"), "Version": "1.0-1",
+                "Description": "description mentions ztool", "Maintainer": null, "LastModified": 1
+            })).collect();
+            for (name, version) in [("ztool", source_version), ("ztool-bin", binary_version)] {
+                if let Some(version) = version {
+                    records.push(serde_json::json!({"Name":name,"Version":version,
+                        "Description":"exact install fixture","Maintainer":null,"LastModified":1}));
+                }
+            }
+            let mut gzip = flate2::write::GzEncoder::new(
+                std::fs::File::create(&archive_path)?,
+                flate2::Compression::fast(),
+            );
+            gzip.write_all(&serde_json::to_vec(&records)?)?;
+            gzip.finish()?;
+            crate::package_managers::build_test_aur_index(&archive_path, &index_path)?;
+            let index = crate::package_managers::TestAurIndex::open(&index_path)?;
+            // Independent producer/legacy-order controls: exact records exist,
+            // while the generic capped substring API has fifty earlier matches.
+            assert_eq!(index.get("ztool")?.is_some(), source_version.is_some());
+            assert_eq!(index.get("ztool-bin")?.is_some(), binary_version.is_some());
+            let decoys = index.search("ztool", 50)?;
+            let visible = if decoy_count == 50 { 50 } else { 5 };
+            assert_eq!(decoys.len(), visible);
+            for (number, entry) in decoys.iter().take(decoy_count).enumerate() {
+                assert_eq!(entry.name.as_str(), format!("aaa-{number:03}"));
+            }
+            let before_archive = file_state(&archive_path)?;
+            let before_index = file_state(&index_path)?;
+            let before_config = file_state(&config_path)?;
+            temp_env::with_vars(
+                [
+                    ("OMG_CACHE_DIR", Some(cache.as_os_str())),
+                    ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                    ("OMG_TEST_MODE", None),
+                    ("OMG_TEST_DISTRO", None),
+                    ("SUDO_USER", None),
+                    ("SUDO_HOME", None),
+                    ("DOAS_USER", None),
+                ],
+                || -> Result<()> {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(async {
+                        anyhow::ensure!(!crate::core::paths::test_mode());
+                        let client = AurClient::new()?;
+                        let results = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            client.search("ztool"),
+                        )
+                        .await??;
+                        assert!(
+                            !results.is_empty() && results.len() <= 50,
+                            "search remains bounded"
+                        );
+                        if decoy_count == 3 {
+                            assert_eq!(
+                                results.len(),
+                                5,
+                                "uncapped exact entries must not be duplicated"
+                            );
+                        }
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            resolve_aur_package("ztool"),
+                        )
+                        .await?;
+                        if let Some((name, version, preferred)) = expected {
+                            let (package, preferred_binary) = result?;
+                            assert_eq!(
+                                (
+                                    package.name.as_str(),
+                                    package.version.to_string(),
+                                    preferred_binary
+                                ),
+                                (name, version.to_string(), preferred)
+                            );
+                            assert_eq!(
+                                results
+                                    .iter()
+                                    .filter(|package| package.name == name)
+                                    .count(),
+                                1
+                            );
+                        } else {
+                            let error = result.expect_err(
+                                "decoys must not masquerade as exact install candidates",
+                            );
+                            assert!(is_aur_not_found(&error), "literal typed absence: {error:#}");
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })
+                },
+            )?;
+            assert_eq!(file_state(&archive_path)?, before_archive);
+            assert_eq!(file_state(&index_path)?, before_index);
+            assert_eq!(file_state(&config_path)?, before_config);
+            eprintln!(
+                "[aur-cap-fixture] uid={} source={source_version:?} binary={binary_version:?} expected={expected:?} metadata_unchanged=true",
+                nix::unistd::geteuid()
+            );
+            directory.close()?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn dry_run_and_install_share_aur_binary_preference() {
         let packages = vec![aur_package("example"), aur_package("example-bin")];

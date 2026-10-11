@@ -14,7 +14,7 @@ retries = 1
 # Nextest runs each test in a separate process. Fedora read assertions compare
 # snapshots of shared RPM state, so they cannot overlap a package mutation.
 [[profile.default.overrides]]
-filter = 'binary(=fedora_tests)'
+filter = 'binary(=fedora_tests) | test(=package_managers::dnf::tests::security_inventory_preserves_every_native_rpm_identity)'
 test-group = 'fedora-rpm-state'
 retries = 0
 

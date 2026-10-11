@@ -5,37 +5,11 @@ use serde::Serialize;
 
 use crate::cli::packages::common::validate_search_query;
 use crate::cli::{style, ui};
+use crate::core::packages::search::SearchRanker;
 use crate::core::{Package, PackageSource};
-use crate::package_managers::{VersionDisplay, get_package_manager};
-use nucleo_matcher::{
-    Config, Matcher, Utf32String,
-    pattern::{CaseMatching, Normalization, Pattern},
-};
-
-/// Display tier for one search hit. Lower sorts first. A single table owns
-/// result ordering for the daemon, native, and AUR paths together.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum MatchTier {
-    Exact,
-    Prefix,
-    WordBoundary,
-    Fuzzy,
-    Substring,
-}
+use crate::package_managers::{SearchNameKind, VersionDisplay, get_package_manager};
 
 pub(crate) const DEFAULT_SEARCH_LIMIT: usize = crate::cli::modern_ui::SUMMARY_LIST_CAP;
-
-/// Language packs flood generic queries (`firefox` matches hundreds of
-/// `firefox-*-i18n-*`). They sort after real packages in every tier and
-/// collapse into one group row unless the query names them directly.
-fn is_langpack(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower.contains("-i18n-")
-        || lower.ends_with("-i18n")
-        || lower.ends_with("-l10n")
-        || lower.ends_with("-lang")
-        || lower.ends_with("-locale")
-}
 
 /// Base name for grouping: `firefox-developer-edition-i18n-ach` groups
 /// under `firefox-developer-edition-i18n`.
@@ -44,47 +18,29 @@ fn group_base(name: &str) -> Option<&str> {
         .map(|index| &name[..index + "-i18n-".len() - 1])
 }
 
-fn match_tier(query: &str, name: &str) -> MatchTier {
-    if name == query {
-        return MatchTier::Exact;
-    }
-    if name.starts_with(query) {
-        return MatchTier::Prefix;
-    }
-    if name.split(['-', '_', ' ']).any(|word| word == query) {
-        return MatchTier::WordBoundary;
-    }
-    MatchTier::Substring
-}
-
 /// Order display packages so the user sees intent first: exact name, name
 /// prefix, whole-word hits, fuzzy hits, then plain substring hits.
 /// Language packs sink below same-tier real packages.
-fn rank_display_packages(query: &str, packages: &mut Vec<DisplayPackage>) {
-    let query_lower = query.to_lowercase();
-    let pattern = Pattern::parse(&query_lower, CaseMatching::Ignore, Normalization::Smart);
-    let mut matcher = Matcher::new(Config::DEFAULT);
+fn rank_display_packages(
+    query: &str,
+    packages: &mut Vec<DisplayPackage>,
+    name_kind: SearchNameKind,
+) {
+    let mut ranker = SearchRanker::new(query);
     let owned = std::mem::take(packages);
-    let mut scored: Vec<((MatchTier, bool, u32), DisplayPackage)> = owned
+    let mut scored: Vec<_> = owned
         .into_iter()
         .map(|pkg| {
             let name_lower = pkg.name.to_lowercase();
-            let mut tier = match_tier(&query_lower, &name_lower);
-            let haystack = Utf32String::from(name_lower.as_str());
-            let fuzzy = pattern.score(haystack.slice(..), &mut matcher).unwrap_or(0);
-            if tier == MatchTier::Substring && fuzzy > 0 {
-                tier = MatchTier::Fuzzy;
-            }
-            ((tier, is_langpack(&name_lower), fuzzy), pkg)
+            let kind = if PackageSource::from_label(&pkg.source) == Some(PackageSource::Official) {
+                name_kind
+            } else {
+                SearchNameKind::Literal
+            };
+            (ranker.score(&name_lower, kind), pkg)
         })
         .collect();
-    scored.sort_by(|a, b| {
-        a.0.0
-            .cmp(&b.0.0)
-            .then_with(|| a.0.1.cmp(&b.0.1))
-            .then_with(|| b.0.2.cmp(&a.0.2))
-            .then_with(|| a.1.name.cmp(&b.1.name))
-    });
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
     packages.extend(scored.into_iter().map(|(_, pkg)| pkg));
 }
 
@@ -140,8 +96,9 @@ fn present_search_results(
     mut packages: Vec<DisplayPackage>,
     json: bool,
     limit: usize,
+    name_kind: SearchNameKind,
 ) -> Vec<DisplayPackage> {
-    rank_display_packages(query, &mut packages);
+    rank_display_packages(query, &mut packages, name_kind);
     if !json {
         packages = group_langpacks(query, packages);
     }
@@ -172,6 +129,20 @@ struct DisplayPackage {
 }
 
 impl DisplayPackage {
+    #[cfg(unix)]
+    fn from_wire(p: crate::daemon::protocol::PackageInfo) -> Self {
+        Self {
+            name: p.name,
+            version: p.version,
+            description: p.description,
+            source: PackageSource::from(p.source).to_string(),
+            votes: None,
+            popularity: None,
+            maintainer: None,
+            out_of_date: None,
+        }
+    }
+
     fn from_package(p: Package) -> Self {
         Self {
             name: p.name,
@@ -222,6 +193,7 @@ async fn search_internal(
     limit: usize,
 ) -> Result<()> {
     validate_search_query(query)?;
+    let name_kind = SearchNameKind::from_backend(crate::package_managers::resolve_backend()?);
 
     let official_search = async { search_official_packages(query, limit).await };
 
@@ -263,7 +235,7 @@ async fn search_internal(
     let total_matches = official_total.saturating_add(aur_count);
 
     crate::core::usage::track_search_result(true);
-    display_packages = present_search_results(query, display_packages, json, limit);
+    display_packages = present_search_results(query, display_packages, json, limit, name_kind);
 
     if json {
         let json_str = serde_json::to_string_pretty(&display_packages)
@@ -364,16 +336,7 @@ async fn search_official_packages(
                 return Ok((
                     res.packages
                         .into_iter()
-                        .map(|pkg| DisplayPackage {
-                            name: pkg.name,
-                            version: pkg.version,
-                            description: pkg.description,
-                            source: pkg.source.label().to_string(),
-                            votes: None,
-                            popularity: None,
-                            maintainer: None,
-                            out_of_date: None,
-                        })
+                        .map(DisplayPackage::from_wire)
                         .collect(),
                     res.total,
                 ));
@@ -443,15 +406,16 @@ pub fn search_sync_cli_with_limit(
         return Ok(false);
     }
     let backend = crate::package_managers::resolve_backend()?;
+    let name_kind = SearchNameKind::from_backend(backend);
 
     // Fast path: official-only search via sync client (zero runtime overhead).
     #[cfg(any(feature = "debian", feature = "debian-pure"))]
     if crate::core::env::distro::is_debian_like() {
-        return search_sync_official_only(query, limit);
+        return search_sync_official_only(query, limit, name_kind);
     }
 
     if no_aur || backend != crate::package_managers::Backend::Arch {
-        return search_sync_official_only(query, limit);
+        return search_sync_official_only(query, limit, name_kind);
     }
 
     // AUR path requires async — create a minimal runtime only when necessary
@@ -473,7 +437,7 @@ pub fn search_sync_cli_with_limit(
 }
 
 /// Sync-only search: daemon IPC via `SyncDaemonClient`, no tokio runtime.
-fn search_sync_official_only(query: &str, limit: usize) -> Result<bool> {
+fn search_sync_official_only(query: &str, limit: usize, name_kind: SearchNameKind) -> Result<bool> {
     #[cfg(not(unix))]
     {
         return Ok(false); // Daemon not supported on Windows
@@ -499,18 +463,9 @@ fn search_sync_official_only(query: &str, limit: usize) -> Result<bool> {
         let mut packages: Vec<DisplayPackage> = res
             .packages
             .into_iter()
-            .map(|pkg| DisplayPackage {
-                name: pkg.name,
-                version: pkg.version,
-                description: pkg.description,
-                source: pkg.source.label().to_string(),
-                votes: None,
-                popularity: None,
-                maintainer: None,
-                out_of_date: None,
-            })
+            .map(DisplayPackage::from_wire)
             .collect();
-        packages = present_search_results(query, packages, false, limit);
+        packages = present_search_results(query, packages, false, limit, name_kind);
 
         let mut stdout = std::io::BufWriter::new(std::io::stdout());
         writeln!(
@@ -590,6 +545,72 @@ fn write_package_line<W: Write>(w: &mut W, pkg: &DisplayPackage) -> std::io::Res
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn assert_wire_search_json_source(
+        wire_source: crate::daemon::protocol::WirePackageSource,
+        expected_source: &str,
+    ) {
+        let package = DisplayPackage::from_wire(crate::daemon::protocol::PackageInfo {
+            name: "tree.x86_64".to_string(),
+            version: "2:2.2.1-4.fc44".to_string(),
+            description: "List \"directories\"\nrecursively".to_string(),
+            source: wire_source,
+        });
+        let actual =
+            serde_json::to_value(package).expect("serialize real wire-derived display row");
+        assert_eq!(
+            actual,
+            serde_json::json!({
+                "name": "tree.x86_64",
+                "version": "2:2.2.1-4.fc44",
+                "description": "List \"directories\"\nrecursively",
+                "source": expected_source,
+            }),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_json_source_official_wire_record() {
+        assert_wire_search_json_source(
+            crate::daemon::protocol::WirePackageSource::Official,
+            "Official",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_json_source_aur_wire_record() {
+        assert_wire_search_json_source(crate::daemon::protocol::WirePackageSource::Aur, "AUR");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_json_source_apt_wire_record() {
+        assert_wire_search_json_source(crate::daemon::protocol::WirePackageSource::Apt, "Official");
+    }
+
+    #[test]
+    #[cfg(not(feature = "arch"))]
+    fn search_json_source_native_record() {
+        let package = DisplayPackage::from_package(Package {
+            name: "tree.x86_64".to_string(),
+            version: crate::package_managers::types::Version::new("2:2.2.1-4.fc44"),
+            description: "List \"directories\"\nrecursively".to_string(),
+            source: PackageSource::Official,
+            installed: false,
+        });
+        assert_eq!(
+            serde_json::to_value(package).expect("serialize real native display row"),
+            serde_json::json!({
+                "name": "tree.x86_64",
+                "version": "2:2.2.1-4.fc44",
+                "description": "List \"directories\"\nrecursively",
+                "source": "Official",
+            }),
+        );
+    }
+
     /// Format a package through the real production writer so the tests
     /// assert the exact output users see instead of a duplicated format
     /// string.
@@ -610,6 +631,142 @@ mod tests {
             maintainer: None,
             out_of_date: None,
         }
+    }
+
+    fn fedora_presentation(
+        query: &str,
+        packages: Vec<DisplayPackage>,
+        json: bool,
+        limit: usize,
+    ) -> Vec<DisplayPackage> {
+        present_search_results(query, packages, json, limit, SearchNameKind::RpmIdentity)
+    }
+
+    #[test]
+    fn fedora_search_literal_contexts_keep_qualified_names_literal() {
+        use crate::package_managers::Backend;
+        for backend in [
+            Backend::Arch,
+            Backend::Debian,
+            Backend::MacOS,
+            Backend::Mock,
+        ] {
+            let results = present_search_results(
+                "tree",
+                vec![
+                    display("tree-sitter-cli.x86_64"),
+                    display("tree-sitter-srpm-macros.noarch"),
+                    display("tree.x86_64"),
+                ],
+                true,
+                1,
+                SearchNameKind::from_backend(backend),
+            );
+            assert_eq!(results[0].name, "tree-sitter-cli.x86_64", "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn fedora_search_basename_survives_limit_writer_and_json() {
+        for json in [false, true] {
+            let mut exact = display("tree.x86_64");
+            exact.version = "2:2.2.1-4.fc44".into();
+            exact.description = "List directories recursively".into();
+            let results = fedora_presentation(
+                "tree",
+                vec![
+                    display("tree-sitter-cli.x86_64"),
+                    display("tree-sitter-srpm-macros.noarch"),
+                    exact,
+                ],
+                json,
+                1,
+            );
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].name, "tree.x86_64");
+            assert_eq!(results[0].version, "2:2.2.1-4.fc44");
+            assert_eq!(results[0].description, "List directories recursively");
+            assert_eq!(results[0].source, "Official");
+            let serialized = serde_json::to_value(&results).expect("serialize ranked records");
+            assert_eq!(serialized[0]["name"], "tree.x86_64");
+            assert_eq!(serialized[0]["version"], "2:2.2.1-4.fc44");
+            assert_eq!(serialized[0]["description"], "List directories recursively");
+            let rendered = format_package(&results[0]);
+            assert!(rendered.contains("tree.x86_64"), "{rendered}");
+            assert!(rendered.contains("2:2.2.1-4.fc44"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn fedora_search_full_identity_precedes_colliding_rpm_basename() {
+        for limit in [1, 10] {
+            let results = fedora_presentation(
+                "tree.x86_64",
+                vec![
+                    display("tree.x86_64.aarch64"),
+                    display("tree.x86_64-extra.noarch"),
+                    display("tree.x86_64"),
+                ],
+                true,
+                limit,
+            );
+            assert_eq!(results[0].name, "tree.x86_64");
+            if limit == 10 {
+                assert_eq!(results[1].name, "tree.x86_64.aarch64");
+            }
+        }
+    }
+
+    #[test]
+    fn fedora_search_dotted_and_multiarch_basenames_keep_qualified_ties() {
+        let python = fedora_presentation(
+            "python3.13",
+            vec![
+                display("python3.13-tools.x86_64"),
+                display("python3.13.x86_64"),
+            ],
+            true,
+            1,
+        );
+        assert_eq!(python[0].name, "python3.13.x86_64");
+        let results = fedora_presentation(
+            "tree",
+            vec![
+                display("tree-sitter-cli.x86_64"),
+                display("tree.x86_64"),
+                display("tree.noarch"),
+                display("tree.aarch64"),
+            ],
+            true,
+            10,
+        );
+        let names: Vec<_> = results
+            .iter()
+            .map(|package| package.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "tree.aarch64",
+                "tree.noarch",
+                "tree.x86_64",
+                "tree-sitter-cli.x86_64"
+            ]
+        );
+    }
+
+    #[test]
+    fn fedora_search_aur_and_unknown_sources_keep_literal_names() {
+        for source in ["AUR", "aur", "unknown"] {
+            let mut neighbor = display("tree.aarch64");
+            neighbor.source = source.into();
+            let results =
+                fedora_presentation("tree", vec![neighbor, display("tree.x86_64")], true, 10);
+            assert_eq!(results[0].name, "tree.x86_64", "{source}");
+            assert_eq!(results[1].name, "tree.aarch64");
+            assert_eq!(results[1].source, source);
+        }
+        assert!(fedora_presentation("tree", vec![display("tree.x86_64")], true, 0).is_empty());
     }
 
     #[test]
@@ -661,7 +818,7 @@ mod tests {
             display("firefox-adblock-plus"),
             display("curl-impersonate"),
         ];
-        rank_display_packages("firefox", &mut packages);
+        rank_display_packages("firefox", &mut packages, SearchNameKind::Literal);
         let names: Vec<&str> = packages.iter().map(|pkg| pkg.name.as_str()).collect();
         assert_eq!(names[0], "firefox");
         assert!(names.contains(&"firefox-adblock-plus"));
@@ -674,7 +831,7 @@ mod tests {
             display("firefox-developer-edition-i18n-af"),
             display("firefox-developer-edition"),
         ];
-        rank_display_packages("firefox", &mut packages);
+        rank_display_packages("firefox", &mut packages, SearchNameKind::Literal);
         assert_eq!(packages[0].name, "firefox-developer-edition");
     }
 
@@ -735,7 +892,7 @@ mod tests {
             display("firefox-developer-edition-i18n-an"),
             display("firefox-developer-edition-i18n-ar"),
         ];
-        let json = present_search_results("firefox", packages, true, 50);
+        let json = present_search_results("firefox", packages, true, 50, SearchNameKind::Literal);
         let names: Vec<&str> = json.iter().map(|pkg| pkg.name.as_str()).collect();
         assert_eq!(names[0], "firefox");
         assert!(names.contains(&"firefox-developer-edition-i18n-af"));
@@ -752,6 +909,7 @@ mod tests {
             ],
             false,
             50,
+            SearchNameKind::Literal,
         );
         assert_eq!(human.len(), 2);
         assert_eq!(
@@ -888,5 +1046,79 @@ mod tests {
         assert!(!search_sync_cli("../passwd", false, true).unwrap());
 
         assert!(!search_sync_cli("test;ls", false, true).unwrap());
+    }
+
+    #[test]
+    fn fedora_search_parity_cli_native_literal_rows_are_the_expected_prefix() {
+        use crate::daemon::index::search_parity_fixture::{EXPECTED, RECORDS};
+        let packages = RECORDS
+            .iter()
+            .rev()
+            .map(|&(name, version, description)| DisplayPackage {
+                name: name.into(),
+                version: version.into(),
+                description: description.into(),
+                source: "Official".into(),
+                votes: None,
+                popularity: None,
+                maintainer: None,
+                out_of_date: None,
+            })
+            .collect();
+        let actual =
+            present_search_results("tree", packages, true, 20, SearchNameKind::RpmIdentity);
+        assert_eq!(actual.len(), 20);
+        for (row, &(name, version, description)) in actual.iter().zip(EXPECTED) {
+            assert_eq!(
+                (&*row.name, &*row.version, &*row.description),
+                (name, version, description)
+            );
+            assert_eq!(row.source, "Official");
+        }
+    }
+
+    #[test]
+    fn fedora_search_parity_cli_description_witness_precedes_language_packs() {
+        let mut packages: Vec<_> = (0..1200)
+            .rev()
+            .map(|i| DisplayPackage {
+                name: format!("zzztree-i18n-aa{i:04}.noarch"),
+                version: "1".into(),
+                description: "name substring".into(),
+                source: "Official".into(),
+                votes: None,
+                popularity: None,
+                maintainer: None,
+                out_of_date: None,
+            })
+            .collect();
+        packages.push(DisplayPackage {
+            name: "t-r-e-e.noarch".into(),
+            version: "7:8-9.fc44".into(),
+            description: "tree viewer from description".into(),
+            source: "Official".into(),
+            votes: None,
+            popularity: None,
+            maintainer: None,
+            out_of_date: None,
+        });
+        let actual =
+            present_search_results("tree", packages, true, 1000, SearchNameKind::RpmIdentity);
+        assert_eq!(actual.len(), 1000);
+        assert_eq!(
+            (
+                &*actual[0].name,
+                &*actual[0].version,
+                &*actual[0].description
+            ),
+            (
+                "t-r-e-e.noarch",
+                "7:8-9.fc44",
+                "tree viewer from description"
+            )
+        );
+        for (i, row) in actual.iter().skip(1).enumerate() {
+            assert_eq!(row.name, format!("zzztree-i18n-aa{i:04}.noarch"));
+        }
     }
 }

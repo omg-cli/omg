@@ -70,11 +70,19 @@ fn run_with_refused_metadata(args: &[&str]) -> CommandResult {
 fn installed_node(project: &TestProject, version: &str) -> std::path::PathBuf {
     let directory = project.data_dir.path().join("versions/node").join(version);
     std::fs::create_dir_all(directory.join("bin")).unwrap();
+    let binary = directory.join("bin/node");
     std::fs::write(
-        directory.join("bin/node"),
-        b"installed Node activation fixture",
+        &binary,
+        format!(
+            "#!/bin/sh\nif [ \"${{1:-}}\" = '--version' ]; then printf '%s\\n' 'v{version}'; exit 0; fi\nprintf '%s' 'installed Node activation fixture'\n"
+        ),
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     directory
 }
 
