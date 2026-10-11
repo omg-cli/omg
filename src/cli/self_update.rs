@@ -1786,6 +1786,9 @@ mod tests {
         std::fs::write(&source, b"new binary").expect("source");
         std::fs::write(&destination, b"old binary").expect("destination");
 
+        #[cfg(unix)]
+        let mut previous_reader = std::fs::File::open(&destination).expect("open old binary");
+
         install_binary_atomically(&source, &destination).expect("install binary");
 
         assert_eq!(
@@ -1798,7 +1801,17 @@ mod tests {
         );
         #[cfg(unix)]
         {
+            use std::io::Read as _;
             use std::os::unix::fs::PermissionsExt;
+
+            let mut previous_contents = Vec::new();
+            previous_reader
+                .read_to_end(&mut previous_contents)
+                .expect("read previously opened binary");
+            assert_eq!(
+                previous_contents, b"old binary",
+                "replacement must preserve the contents seen by existing readers",
+            );
             assert_eq!(
                 std::fs::metadata(destination)
                     .expect("metadata")

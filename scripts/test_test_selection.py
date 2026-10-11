@@ -155,6 +155,23 @@ fn probe() {
                     '<testcase name="unsupported" classname="omg::cli_surface"><skipped/></testcase>')
         self.assertEqual(SELECTION.reconcile(listing(), xml, ['omg::cli_surface'])['counts']['skipped'], 1)
 
+    def test_xml_declarations_refused_for_otherwise_admitted_execution(self):
+        plain = junit()
+        accepted = SELECTION.reconcile(listing(), plain, ['omg::cli_surface'])
+        self.assertEqual(accepted['counts']['executed'], 1)
+        self.assertEqual(accepted['counts']['passed'], 1)
+        self.assertEqual(accepted['tests']['omg::cli_surface::parser']['attempts'],
+                         [{'result': 'PASS', 'duration_ms': 1.0}])
+        documents = (
+            b'<!DOCTYPE testsuites>' + plain,
+            b'<!DOCTYPE testsuites [<!ENTITY duration "0.001">]>'
+            + junit('<testcase name="parser" classname="omg::cli_surface" time="&duration;"/>'),
+        )
+        for xml in documents:
+            with self.subTest(xml=xml), self.assertRaisesRegex(
+                    ValueError, '^XML declarations forbidden$'):
+                SELECTION.reconcile(listing(), xml, ['omg::cli_surface'])
+
     def test_xml_entities_nonfinite_time_and_conflicting_verdicts_rejected(self):
         for xml in (b'<!DOCTYPE x [<!ENTITY a "boom">]><testsuites/>',
                     junit('<testcase name="parser" classname="omg::cli_surface" time="NaN"/>'),
