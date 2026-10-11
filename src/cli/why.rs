@@ -483,15 +483,28 @@ mod tests {
         let error = run("tree", false)
             .await
             .expect_err("why requires a backend");
-        let expected = match crate::package_managers::resolve_backend() {
-            Ok(crate::package_managers::Backend::MacOS) => {
-                "Package dependency analysis is not implemented for Homebrew".to_string()
+        use crate::core::env::distro::Distro;
+        let expected = match crate::core::env::distro::detect_distro() {
+            Distro::MacOS => "Package dependency analysis is not implemented for Homebrew",
+            Distro::Arch => {
+                "This omg binary lacks the arch package backend required by Arch. Install the matching distro build, or rebuild with --no-default-features --features arch,pgp,license"
             }
-            Err(error) => error.to_string(),
-            Ok(_) => "requires a supported package backend".to_string(),
+            Distro::Debian => {
+                "This omg binary lacks the debian package backend required by Debian. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Ubuntu => {
+                "This omg binary lacks the debian package backend required by Ubuntu. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Fedora => {
+                "This omg binary lacks the fedora package backend required by Fedora. Install the matching distro build, or rebuild with --no-default-features --features fedora,pgp,license"
+            }
+            Distro::Unknown => {
+                "Unsupported Linux distribution: no live package backend can be selected"
+            }
         };
-        assert!(
-            error.to_string().contains(&expected),
+        assert_eq!(
+            error.to_string(),
+            expected,
             "selected backend must fail with its own unsupported-operation cause: {error}"
         );
     }
