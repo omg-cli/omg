@@ -127,9 +127,20 @@ exit "$rc"
             self.assertIn('libapt-pkg-dev', arguments)
             self.assertIn('python3-apt', arguments)
 
+    def build_recipes(self, architecture):
+        expected = {
+            'BUILD_X64': [('arch', 'arch,pgp,license'), ('debian', 'debian,pgp,license'),
+                          ('debian-trixie', 'debian,pgp,license'), ('fedora', 'fedora,pgp,license')],
+            'BUILD_ARM64': [('debian', 'debian,pgp,license'), ('fedora', 'fedora,pgp,license')],
+        }
+        recipes = json.loads(literal(PARENT, architecture, 10))
+        self.assertEqual(sorted((row['distro'], row['features']) for row in recipes),
+                         sorted(expected[architecture]), 'Required native build recipe identities changed')
+        return recipes
+
     def test_debian_build_recipes_install_external_lock_probe(self):
         for architecture in ('BUILD_X64', 'BUILD_ARM64'):
-            for recipe in json.loads(literal(PARENT, architecture, 10)):
+            for recipe in self.build_recipes(architecture):
                 if 'debian' not in recipe['features'].split(','):
                     continue
                 with self.subTest(architecture=architecture, distro=recipe['distro']):
@@ -142,7 +153,7 @@ exit "$rc"
 
     def test_unit_build_recipes_install_python_venv_and_fish_prerequisites(self):
         for architecture in ('BUILD_X64', 'BUILD_ARM64'):
-            for recipe in json.loads(literal(PARENT, architecture, 10)):
+            for recipe in self.build_recipes(architecture):
                 with self.subTest(architecture=architecture, distro=recipe['distro']):
                     with tempfile.TemporaryDirectory() as directory:
                         root = Path(directory)
