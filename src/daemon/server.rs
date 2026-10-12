@@ -1286,6 +1286,104 @@ mod tests {
             .await
             .expect("write task")
             .expect("write codec must accept a frame larger than the request budget");
+        let directory = tempfile::tempdir().expect("private codec fixture");
+        let state = Arc::new(
+            DaemonState::new_isolated(
+                directory.path(),
+                super::super::index::PackageIndex::empty(),
+                Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+                    "arch",
+                    directory.path(),
+                )),
+            )
+            .expect("isolated codec state"),
+        );
+        let package = PackageInfo {
+            name: "large-fixture".to_string(),
+            version: "1.0".to_string(),
+            description: "x".repeat(MAX_REQUEST_SIZE + 4096),
+            source: WirePackageSource::Official,
+        };
+        state
+            .cache
+            .insert_arc("large".to_string(), Arc::new(vec![package.clone()]));
+        let expected = Response::Success {
+            id: 71,
+            result: ResponseResult::Search(SearchResult {
+                packages: vec![package],
+                total: 1,
+            }),
+        };
+        let expected_frame = crate::daemon::protocol::encode_frame(&expected)
+            .expect("encode literal large search fixture");
+        assert!(
+            expected_frame.len() > MAX_REQUEST_SIZE,
+            "fixture must cross request cap"
+        );
+        assert!(
+            expected_frame.len() <= MAX_RESPONSE_SIZE,
+            "fixture must fit response cap"
+        );
+        let request = crate::daemon::protocol::encode_frame(&Request::Search {
+            id: 71,
+            query: "large".to_string(),
+            limit: Some(1),
+        })
+        .expect("encode tiny request");
+        assert!(request.len() < MAX_REQUEST_SIZE);
+
+        let (client, server) = tokio::net::UnixStream::pair().expect("private handler pair");
+        let cancellation = CancellationToken::new();
+        let mut task = tokio::spawn(handle_client_with_idle_timeout(
+            server,
+            state,
+            Duration::from_secs(5),
+            cancellation.clone(),
+        ));
+        let mut client = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_RESPONSE_SIZE)
+            .new_framed(client);
+        let exchange = tokio::time::timeout(Duration::from_secs(5), async {
+            client.send(request.into()).await?;
+            anyhow::Ok(client.next().await)
+        })
+        .await;
+        cancellation.cancel();
+        let retired = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+        let handler_result = match retired {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => panic!("HARNESS: handler task join failed: {error}"),
+            Err(error) => {
+                task.abort();
+                let aborted = task.await;
+                panic!("HARNESS: client retirement timed out: {error}; abort join: {aborted:?}");
+            }
+        };
+        let exchange = exchange
+            .expect("HARNESS: large response exchange timed out")
+            .expect("HARNESS: request transport failed");
+        let frame = exchange.map(|frame| frame.expect("HARNESS: response transport failed"));
+        if let Err(error) = &handler_result {
+            let expected_cap_rejection =
+                error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    error.kind() == std::io::ErrorKind::InvalidInput
+                        && error.to_string() == "frame size too big"
+                });
+            if !expected_cap_rejection {
+                panic!("HARNESS: unrelated handler error: {error:#}");
+            }
+            eprintln!("CODEC_WRITE_CAP_REJECTION: {error:#}");
+        }
+        assert!(
+            frame.is_some(),
+            "real handler must deliver a frame above request cap"
+        );
+        assert_eq!(
+            frame.unwrap().as_ref(),
+            expected_frame.as_slice(),
+            "real handler must deliver the complete literal cached search response"
+        );
+        handler_result.expect("real handler must finish after cancellation");
     }
 
     #[tokio::test]
