@@ -152,7 +152,7 @@ jobs:
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
@@ -243,6 +243,15 @@ jobs:
 
       - name: Run portable tests
         run: python3 scripts/run-native-contracts.py --features pgp,license
+
+      - name: Test isolated distro override harness
+        run: cargo test --test distro_override --no-default-features --features pgp,license --locked
+
+      - name: Test release distro override guard
+        run: cargo test --release --test distro_override --no-default-features --features pgp,license --locked
+
+      - name: Test root library documentation contracts
+        run: cargo test --doc --no-default-features --features pgp,license --locked
 
       - name: Prepare genuine Node activation fixture
         run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
