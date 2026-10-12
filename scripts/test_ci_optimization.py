@@ -58,7 +58,14 @@ class OptimizationContracts(unittest.TestCase):
         artifact = text.split('      - name: Preserve region evidence\n', 1)[1].split('\n      - ', 1)[0]
         self.assertIn('name: coverage-regions', artifact)
         self.assertIn('path: coverage-regions.json.gz', artifact)
-        self.assertIn('retention-days: 3', artifact)
+        lcov = text.split('      - name: Preserve LCOV evidence\n', 1)[1].split('\n      - ', 1)[0]
+        retention = []
+        for block in (lcov, artifact):
+            values = re.findall(r'(?m)^          retention-days: ([0-9]+)$', block)
+            self.assertEqual(len(values), 1, 'paired reports require explicit bounded retention')
+            retention.append(int(values[0]))
+        self.assertGreater(retention[0], 0)
+        self.assertGreaterEqual(retention[1], retention[0], 'region evidence must outlive the LCOV evidence it accompanies')
         self.assertIn('if-no-files-found: error', artifact)
 
     def test_portable_and_benchmark_preserve_native_cache_budget(self):

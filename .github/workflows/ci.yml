@@ -343,7 +343,7 @@ jobs:
               rm -f /tmp/rustup-init
               echo "$HOME/.cargo/bin" >> $GITHUB_PATH
             rust_components: |
-              "$HOME/.cargo/bin/rustup" component add clippy
+              "$HOME/.cargo/bin/rustup" component add clippy rustfmt
 
           - platform: debian-trixie
             image: debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
@@ -363,7 +363,7 @@ jobs:
               rm -f /tmp/rustup-init
               echo "$HOME/.cargo/bin" >> $GITHUB_PATH
             rust_components: |
-              "$HOME/.cargo/bin/rustup" component add clippy
+              "$HOME/.cargo/bin/rustup" component add clippy rustfmt
 
           # The Trixie archive is shipped for Ubuntu 26.04, but its native
           # APT 7 integration must also pass on Ubuntu itself. This lane does
@@ -391,7 +391,7 @@ jobs:
               rm -f /tmp/rustup-init
               echo "$HOME/.cargo/bin" >> $GITHUB_PATH
             rust_components: |
-              "$HOME/.cargo/bin/rustup" component add clippy
+              "$HOME/.cargo/bin/rustup" component add clippy rustfmt
 
           - platform: fedora
             image: fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
@@ -565,7 +565,11 @@ jobs:
                            and isinstance(manifest.get('date'), str)
                            and bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}', manifest['date']))
                            and isinstance(manifest.get('pkg'), dict)
-                           and not manifest.get('renames'))
+                           and isinstance(manifest.get('renames', {}), dict)
+                           and all(isinstance(name, str) and isinstance(rename, dict)
+                                   and set(rename) == {'to'} and isinstance(rename['to'], str)
+                                   and rename['to'] in manifest['pkg']
+                                   for name, rename in manifest.get('renames', {}).items()))
               if supported:
                   fmt_package = manifest['pkg'].get('rustfmt-preview')
                   fmt_targets = fmt_package.get('target') if isinstance(fmt_package, dict) else None
@@ -764,7 +768,7 @@ jobs:
           if __name__ == '__main__':
               raise SystemExit(main())
           RUSTUP_DIAGNOSTICS_PY
-          echo "ff645fc3a2c9fb992e895ab663309c88b57634ee7f75c6975006bfc44ed30990  $RUSTUP_DIAGNOSTICS_DIR/helper.py" | sha256sum --check
+          echo "039af9cfaeb167efbeb985e3676192e831922d71a5b25d5cd6d25e9eeec09bf3  $RUSTUP_DIAGNOSTICS_DIR/helper.py" | sha256sum --check
 
       - name: Install pinned Rust toolchain
         env:
@@ -831,7 +835,7 @@ jobs:
         run: |
           mkdir -p "$RUSTUP_DIAGNOSTICS_DIR"
           if command -v python3 >/dev/null 2>&1 && \
-             echo "ff645fc3a2c9fb992e895ab663309c88b57634ee7f75c6975006bfc44ed30990  $RUSTUP_DIAGNOSTICS_DIR/helper.py" | sha256sum --check; then
+             echo "039af9cfaeb167efbeb985e3676192e831922d71a5b25d5cd6d25e9eeec09bf3  $RUSTUP_DIAGNOSTICS_DIR/helper.py" | sha256sum --check; then
             python3 "$RUSTUP_DIAGNOSTICS_DIR/helper.py" summary --out "$RUSTUP_DIAGNOSTICS_DIR"
           else
             printf '%s\n' 'staging_error: verified helper or Python unavailable; stage files may be missing' > "$RUSTUP_DIAGNOSTICS_DIR/diagnostics-unavailable.txt"

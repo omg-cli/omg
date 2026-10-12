@@ -136,7 +136,11 @@ def bookkeeping(metadata, installer_components):
                  and isinstance(manifest.get('date'), str)
                  and bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}', manifest['date']))
                  and isinstance(manifest.get('pkg'), dict)
-                 and not manifest.get('renames'))
+                 and isinstance(manifest.get('renames', {}), dict)
+                 and all(isinstance(name, str) and isinstance(rename, dict)
+                         and set(rename) == {'to'} and isinstance(rename['to'], str)
+                         and rename['to'] in manifest['pkg']
+                         for name, rename in manifest.get('renames', {}).items()))
     if supported:
         fmt_package = manifest['pkg'].get('rustfmt-preview')
         fmt_targets = fmt_package.get('target') if isinstance(fmt_package, dict) else None

@@ -1,4 +1,4 @@
-import hashlib,importlib.util,json,pathlib,subprocess,tempfile,unittest
+import hashlib,importlib.util,json,os,pathlib,subprocess,tempfile,unittest
 C=pathlib.Path(__file__).resolve().parents[1]
 def helper():
  p=C/'scripts/ci-rustup-diagnostics.py'
@@ -131,7 +131,16 @@ class BookkeepingTests(unittest.TestCase):
   cases=[('broken [','bookkeeping_parse_error'),('config_version="9"\ncomponents=[]','bookkeeping_unknown_schema'),('config_version="1"\ncomponents=[{pkg="rustfmt-preview",target="*"}]','bookkeeping_unknown_schema'),('config_version="1"\ncomponents=[{pkg="rustfmt-preview",target="x86_64-unknown-linux-gnu"},{pkg="rustfmt-preview",target="x86_64-unknown-linux-gnu"}]','bookkeeping_unknown_schema')]
   for text,state in cases:
    with self.subTest(text=text):config.write_text(text);self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],state)
-  config.write_bytes(original);manifest=meta/'multirust-channel-manifest.toml';manifest.write_text(manifest.read_text()+'\n[renames.rustfmt]\nto="rustfmt-preview"\n');self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],'bookkeeping_unknown_schema')
+  config.write_bytes(original);manifest=meta/'multirust-channel-manifest.toml';manifest.write_text(manifest.read_text()+'\n[renames.rustfmt]\nto="missing-package"\n');self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],'bookkeeping_unknown_schema')
+ def test_valid_manifest_rename_preserves_canonical_membership(self):
+  meta=self.bookkeeping_fixture();m=helper();manifest=meta/'multirust-channel-manifest.toml'
+  manifest.write_text(manifest.read_text()+'\n[renames.rustfmt]\nto="rustfmt-preview"\n')
+  b=m.snapshot(self.tc)['rustup_bookkeeping'];self.assertEqual(b['state'],'bookkeeping_observed');self.assertEqual(b['rustfmt_config_membership'],{'rustfmt-preview-x86_64-unknown-linux-gnu':True})
+  (meta/'multirust-config.toml').write_text('config_version="1"\ncomponents=[]\n')
+  b=m.snapshot(self.tc)['rustup_bookkeeping'];self.assertEqual(b['state'],'installer_rustfmt_not_in_config');self.assertEqual(b['rustfmt_config_membership'],{'rustfmt-preview-x86_64-unknown-linux-gnu':False})
+  for invalid in ['[renames.rustfmt]\nto=17\n','[renames.rustfmt]\nto="rustfmt-preview"\nextra=true\n']:
+   with self.subTest(invalid=invalid):
+    manifest.write_text('manifest-version="2"\ndate="2026-04-16"\n[pkg.rustfmt-preview.target.x86_64-unknown-linux-gnu]\navailable=true\n'+invalid);self.assertEqual(m.snapshot(self.tc)['rustup_bookkeeping']['state'],'bookkeeping_unknown_schema')
  def test_actual_bookkeeping_read_identity_fault(self):
   from unittest.mock import patch
   meta=self.bookkeeping_fixture();m=helper();p=meta/'multirust-config.toml';replacement=self.root/'replacement';replacement.write_bytes(p.read_bytes());original=pathlib.Path.open
@@ -195,6 +204,22 @@ class WorkflowBytesTests(unittest.TestCase):
   for first,second in [('Stage Rustup diagnostics','Install pinned Rust toolchain'),('Install pinned Rust toolchain','uses: actions/checkout@'),('Join Rustup diagnostic source before first proxy','Cache Rust dependencies')]:self.assertLess(block.index(first),block.index(second))
   self.assertLess(block.index('observe before_minimal'),block.index('"$RUSTUP_INSTALL"'))
   upload=block.split('      - name: Preserve Rustup diagnostics\n',1)[1].split('\n      # sccache',1)[0];self.assertIn('        if: always()\n',upload);self.assertIn('          if-no-files-found: error\n',upload)
+ @unittest.skipUnless(os.name == "posix", "Linux bootstrap component shell contract")
+ def test_matrix_bootstrap_installs_declared_toolchain_components(self):
+  import os,re,tomllib
+  required=set(tomllib.loads((C/'rust-toolchain.toml').read_text())['toolchain']['components'])
+  block=(C/'.github/workflows/ci.yml').read_text().split('  linux-matrix:',1)[1].split('    container:',1)[0]
+  lanes=re.findall(r'^          - platform: (\S+)\n(.*?)(?=^          - platform: |\Z)',block,re.M|re.S)
+  self.assertEqual({lane for lane,_ in lanes},{'arch','debian','debian-trixie','ubuntu-2604','fedora'})
+  for lane,row in lanes:
+   with self.subTest(platform=lane),tempfile.TemporaryDirectory() as directory:
+    home=pathlib.Path(directory);fake=home/'.cargo/bin/rustup';fake.parent.mkdir(parents=True);record=home/'arguments.json'
+    fake.write_text('#!/usr/bin/python3\nimport json,os,sys\nfrom pathlib import Path\nPath(os.environ["RECORD"]).write_text(json.dumps(sys.argv[1:]))\nsys.exit(int(os.environ.get("FAKE_EXIT","0")))\n');fake.chmod(0o755)
+    match=re.search(r'^            rust_components: \|\n((?:              .*\n)+)',row,re.M);self.assertIsNotNone(match,lane)
+    snippet=''.join(line[14:]+'\n' for line in match.group(1).splitlines());environment=dict(os.environ,HOME=str(home),RECORD=str(record))
+    result=subprocess.run(['sh','-e','-c',snippet],env=environment,capture_output=True,text=True,timeout=5)
+    self.assertEqual(result.returncode,0,result.stdout+result.stderr);arguments=json.loads(record.read_text());self.assertEqual(arguments[:2],['component','add']);self.assertLessEqual(required,set(arguments[2:]),lane+' bootstrap omits declared toolchain components')
+    result=subprocess.run(['sh','-e','-c',snippet],env=dict(environment,FAKE_EXIT='42'),capture_output=True,text=True,timeout=5);self.assertEqual(result.returncode,42,'component failure must propagate')
  def test_job_environment_contexts_and_private_diagnostic_path(self):
   import re
   text=(C/'.github/workflows/ci.yml').read_text()
