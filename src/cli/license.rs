@@ -87,7 +87,7 @@ fn report_activation(result: Result<license::StoredLicense>) -> Result<()> {
                 e
             );
             println!(
-                "\n  Get a dashboard token from your OMG dashboard, then run `omg account link <token>`."
+                "\n  Get a dashboard token from your OMG dashboard, then run `omg account link --token-stdin`."
             );
             Err(e)
         }
@@ -135,7 +135,7 @@ pub fn status() -> Result<()> {
                 if let Some(expires) = &stored.expires_at {
                     println!("  Stored expiry: {expires}");
                 }
-                println!("  Relink: {}", style::dim("omg account link <token>"));
+                println!("  Relink: {}", style::dim("omg account link --token-stdin"));
             }
         }
     } else {
@@ -144,7 +144,7 @@ pub fn status() -> Result<()> {
             style::maybe_color("Not linked", |t| t.yellow().to_string())
         );
         println!(
-            "\n  Linking is optional. Run `omg account link <token>` to attribute opted-in usage to your dashboard."
+            "\n  Linking is optional. Run `omg account link --token-stdin` to attribute opted-in usage to your dashboard."
         );
     }
 
