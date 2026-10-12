@@ -2007,7 +2007,7 @@ pub(crate) fn resolve_partial_version(available: &[String], requested: &str) -> 
         return None;
     }
     let extends_request = |candidate: &str| -> bool {
-        let candidate = candidate.trim_start_matches(['v', 'V']);
+        let candidate = normalize_version(candidate);
         let candidate_parts: Vec<&str> = candidate.split('.').collect();
         candidate_parts.len() >= parts.len() && candidate_parts[..parts.len()] == parts[..]
     };
@@ -2019,7 +2019,7 @@ pub(crate) fn resolve_partial_version(available: &[String], requested: &str) -> 
         // Tie-break on the raw string to make the choice deterministic; a
         // final release already outranks a pre-release via `version_cmp`.
         .max_by(|a, b| version_cmp(a, b).then_with(|| a.cmp(b)))
-        .map(|newest| newest.trim_start_matches(['v', 'V']).to_owned())
+        .map(|newest| normalize_version(newest))
 }
 
 /// Parse and validate a SHA-256 digest returned by a runtime vendor.
@@ -3707,6 +3707,47 @@ mod tests {
         assert_eq!(resolve_partial_version(&available, "20"), None);
         // An exact request missing from the vendor list also misses.
         assert_eq!(resolve_partial_version(&available, "20.0.0"), None);
+    }
+
+    #[test]
+    fn version_request_preserves_partial_when_catalog_has_only_repeated_prefixes() {
+        for malformed in ["vv20.99.0", "VV20.99.0", "vV20.99.0", "Vv20.99.0"] {
+            let available = vec![malformed.to_owned()];
+            assert_eq!(
+                crate::runtimes::resolve_version_request(&available, "20"),
+                "20",
+                "malformed catalog entry {malformed:?} must not resolve the request"
+            );
+        }
+    }
+
+    #[test]
+    fn version_request_selects_valid_release_from_mixed_prefix_catalog() {
+        let available = [
+            "vv20.99.0",
+            "VV20.98.0",
+            "vV20.97.0",
+            "Vv20.96.0",
+            "20.10.0",
+            "v20.11.0",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            crate::runtimes::resolve_version_request(&available, "20"),
+            "20.11.0"
+        );
+    }
+
+    #[test]
+    fn version_request_accepts_single_lowercase_and_uppercase_prefixes() {
+        for available in [vec!["v20.10.0".to_owned()], vec!["V20.10.0".to_owned()]] {
+            assert_eq!(
+                crate::runtimes::resolve_version_request(&available, "20"),
+                "20.10.0"
+            );
+        }
     }
 
     #[test]

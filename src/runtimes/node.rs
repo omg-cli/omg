@@ -619,7 +619,7 @@ fn node_platform() -> Result<String> {
 fn available_version_names(versions: &[NodeVersion]) -> Vec<String> {
     versions
         .iter()
-        .map(|version| version.version.trim_start_matches('v').to_owned())
+        .map(|version| normalize_version(&version.version))
         .collect()
 }
 
@@ -1583,6 +1583,52 @@ mod tests {
             crate::runtimes::common::resolve_partial_version(&names, "20").as_deref(),
             Some("20.10.0")
         );
+    }
+
+    #[test]
+    fn partial_request_preserves_request_for_repeated_prefix_manifests() {
+        for manifest in [
+            r#"[{"version":"vv20.99.0","lts":false}]"#,
+            r#"[{"version":"VV20.99.0","lts":false}]"#,
+            r#"[{"version":"vV20.99.0","lts":false}]"#,
+            r#"[{"version":"Vv20.99.0","lts":false}]"#,
+        ] {
+            let versions: Vec<NodeVersion> = serde_json::from_str(manifest).unwrap();
+            let names = available_version_names(&versions);
+            assert_eq!(
+                crate::runtimes::resolve_version_request(&names, "20"),
+                "20",
+                "malformed manifest {manifest:?} must not resolve the request"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_request_selects_valid_release_from_mixed_prefix_manifest() {
+        let versions: Vec<NodeVersion> = serde_json::from_str(
+            r#"[{"version":"vv20.99.0","lts":false},{"version":"VV20.98.0","lts":false},{"version":"vV20.97.0","lts":false},{"version":"Vv20.96.0","lts":false},{"version":"v20.10.0","lts":"Iron"},{"version":"V20.11.0","lts":"Iron"}]"#,
+        )
+        .unwrap();
+        let names = available_version_names(&versions);
+        assert_eq!(
+            crate::runtimes::resolve_version_request(&names, "20"),
+            "20.11.0"
+        );
+    }
+
+    #[test]
+    fn partial_request_accepts_single_lowercase_and_uppercase_manifest_prefixes() {
+        for manifest in [
+            r#"[{"version":"v20.10.0","lts":false}]"#,
+            r#"[{"version":"V20.10.0","lts":false}]"#,
+        ] {
+            let versions: Vec<NodeVersion> = serde_json::from_str(manifest).unwrap();
+            let names = available_version_names(&versions);
+            assert_eq!(
+                crate::runtimes::resolve_version_request(&names, "20"),
+                "20.10.0"
+            );
+        }
     }
 
     #[test]
