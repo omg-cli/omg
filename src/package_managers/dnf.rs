@@ -2721,6 +2721,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn installed_details_preserve_order_and_distinct_native_reasons() {
+        let rows = DnfPackageManager::parse_installed_details(
+            b"tree\t2:2.2.1-4.fc44\ttree-2:2.2.1-4.fc44.x86_64\tExternal User\nhelper\t0:1.0-2.fc44\thelper-0:1.0-2.fc44.noarch\tWeak Dependency\n",
+        )
+        .expect("two native detail rows");
+        let payloads = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.name.as_str(),
+                    row.version.as_str(),
+                    row.identity.as_str(),
+                    row.reason.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            payloads,
+            [
+                (
+                    "tree",
+                    "2:2.2.1-4.fc44",
+                    "tree-2:2.2.1-4.fc44.x86_64",
+                    "External User",
+                ),
+                (
+                    "helper",
+                    "0:1.0-2.fc44",
+                    "helper-0:1.0-2.fc44.noarch",
+                    "Weak Dependency",
+                ),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_dnf_manager_creation() {
         let manager = DnfPackageManager::new();
@@ -2856,12 +2892,42 @@ mod tests {
     }
 
     #[test]
+    fn installed_details_query_arguments_preserve_reason_format_and_package() -> Result<()> {
+        assert_eq!(
+            DnfPackageManager::repository_query_args(RepositoryQuery::InstalledDetails("tree"))?,
+            [
+                "--setopt=disable_excludes=*",
+                "repoquery",
+                "--installed",
+                "--queryformat",
+                "%{name}\t%{evr}\t%{full_nevra}\t%{reason}\\n",
+                "tree",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn repository_selectors_preserve_native_rpm_version_characters() -> Result<()> {
         for selector in [
             "widget-0:1.0_git-1.fc43.x86_64",
             "widget-1:2.0^a-1_git.x86_64",
             "widget-name-1:2.0~rc1-1^a.noarch",
             "widget-2.0^a-1_git.x86_64",
+        ] {
+            let args = DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(
+                selector,
+            )))?;
+            assert_eq!(args.last().map(String::as_str), Some(selector));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repository_selectors_preserve_large_unsigned_rpm_epochs() -> Result<()> {
+        for selector in [
+            "widget-2147483648:2.0^a-1_git.x86_64",
+            "widget-4294967295:2.0~rc1-1.fc44.noarch",
         ] {
             let args = DnfPackageManager::repository_query_args(RepositoryQuery::Available(Some(
                 selector,
@@ -2902,6 +2968,31 @@ mod tests {
         assert_eq!(packages[0].version.to_string(), "2:2.2.1-4.fc44");
         assert_eq!(packages[0].description, "Directory listing");
         assert!(!packages[0].installed);
+    }
+
+    #[test]
+    fn available_repository_rows_preserve_official_source_and_complete_payload() {
+        let packages = DnfPackageManager::parse_available_packages(
+            b"tree.x86_64\t2:2.2.1-4.fc44\tDirectory listing\n",
+        )
+        .expect("valid official repository row");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(
+            (
+                packages[0].name.as_str(),
+                packages[0].version.to_string(),
+                packages[0].description.as_str(),
+                packages[0].source,
+                packages[0].installed,
+            ),
+            (
+                "tree.x86_64",
+                "2:2.2.1-4.fc44".to_owned(),
+                "Directory listing",
+                PackageSource::Official,
+                false,
+            )
+        );
     }
 
     #[test]
