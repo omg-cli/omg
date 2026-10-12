@@ -569,6 +569,13 @@ exit "$rc"
         self.assertIn('STAGED: ${{ inputs.staged }}', guest)
         script = literal(guest, 'run', 8)
         script = script.replace('${{ inputs.distro }}', 'arch').replace('${{ inputs.tag }}', 'v1.2.3')
+        archive_sha = 'a' * 64
+        image_id = 'sha256:' + 'b' * 64
+        receipt_sha = 'c' * 64
+        for expression, value in (('controller-archive-sha256', archive_sha),
+                                  ('controller-image-id', image_id),
+                                  ('controller-receipt-sha256', receipt_sha)):
+            script = script.replace('${{ inputs.' + expression + ' }}', value)
         # The runner-isolation probe deliberately rejects WSL/DrvFs hosts such
         # as /mnt/c (a supported local QEMU environment), so stub only that
         # probe and keep asserting the step still runs it. The probe's own
@@ -586,6 +593,10 @@ exit "$rc"
                     'QEMU_EVIDENCE_NAME': 'qemu-evidence-123-1-arch'}, Path(tmp))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 args = result.stdout.splitlines()
+                self.assertEqual(args[args.index('--controller-bundle') + 1], tmp + '/qemu-controller')
+                self.assertEqual(args[args.index('--controller-archive-sha256') + 1], archive_sha)
+                self.assertEqual(args[args.index('--controller-image-id') + 1], image_id)
+                self.assertEqual(args[args.index('--controller-receipt-sha256') + 1], receipt_sha)
                 self.assertEqual('--staged-dir' in args, staged)
                 self.assertEqual('--release-dir' in args, not staged)
                 self.assertEqual('--inventory-file' in args, not staged)
@@ -629,18 +640,22 @@ exit "$rc"
         for x64, arm in itertools.product([False, True], repeat=2):
             good = {'prepare': {'result': 'success', 'outputs': {'x64': str(x64).lower(), 'arm64': str(arm).lower()}},
                     'build-staged': {'result': 'skipped'},
+                    'build-controller': {'result': 'success' if x64 else 'skipped'},
                     'arm-runner-health': {'result': 'success' if arm else 'skipped'},
                     'guest': {'result': 'success' if x64 else 'skipped'},
                     'guest-arm': {'result': 'success' if arm else 'skipped'}}
             variants = [(good, True)]
             for job in good:
-                for status in ['failure', 'cancelled'] + (['skipped'] if job == 'prepare' or job == 'guest' and x64 or job in ('guest-arm', 'arm-runner-health') and arm else []):
+                for status in ['failure', 'cancelled'] + (['skipped'] if job == 'prepare' or job in ('guest', 'build-controller') and x64 or job in ('guest-arm', 'arm-runner-health') and arm else []):
                     changed = json.loads(json.dumps(good))
                     changed[job]['result'] = status
                     variants.append((changed, False))
             missing_health = json.loads(json.dumps(good))
             del missing_health['arm-runner-health']
             variants.append((missing_health, False))
+            missing_controller = json.loads(json.dumps(good))
+            del missing_controller['build-controller']
+            variants.append((missing_controller, False))
             for values, expected in variants:
                 with self.subTest(values=values), tempfile.TemporaryDirectory() as tmp:
                     result, _ = self.run_script(script, {'JOB_RESULTS': json.dumps(values)}, Path(tmp))
@@ -706,9 +721,9 @@ class SecurityBoundaryTests(unittest.TestCase):
 
     def test_manual_builds_are_independent_and_automatic_guests_follow_producers(self):
         caller = PARENT.split('\n  guest:\n', 1)[1].split('\n  arm-runner-health:', 1)[0]
-        self.assertIn('needs: prepare', caller)
+        self.assertIn('needs: [prepare, build-controller]', caller)
         self.assertIn('uses: ./.github/workflows/qemu-lane.yml', caller)
-        self.assertNotIn('needs: [prepare, build', caller)
+        self.assertNotIn('build-staged', caller.split('with:', 1)[0])
         self.assertNotIn('native-build-artifact.py ready', PARENT)
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
         automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  ci-success:', 1)[0]

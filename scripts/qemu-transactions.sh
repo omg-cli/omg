@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Runs inside the existing QEMU controller; measurement stays in the root driver.
 set -euo pipefail
+qemu_img=${OMG_QEMU_IMG:-/usr/bin/qemu-img}
+[[ "$qemu_img" == /usr/bin/qemu-img || "$qemu_img" == /opt/omg-qemu-10.0.14/bin/qemu-img ]] || exit 2
 [[ $# == 12 ]] || exit 2
 distro=$1; tag=$2; arch=$3; samples=$4
 shift 4
@@ -110,8 +112,8 @@ start_clone() {
 freeze_base() {
   local source=$1 operation=$2 vars=$3
   [[ ! -e qemu.pid ]] || return 1
-  qemu-img convert -f qcow2 -O qcow2 "$source" "$disks/$operation-base.qcow2"
-  qemu-img check "$disks/$operation-base.qcow2" > "$output/$operation-base-check.log"
+  "$qemu_img" convert -f qcow2 -O qcow2 "$source" "$disks/$operation-base.qcow2"
+  "$qemu_img" check "$disks/$operation-base.qcow2" > "$output/$operation-base-check.log"
   if [[ "${boot_args[0]}" == uefi ]]; then
     cp "$vars" "$disks/$operation-vars.fd"
     sha256sum "${boot_args[2]}" "$disks/$operation-vars.fd" > "$output/$operation-firmware.sha256"
@@ -212,7 +214,7 @@ stop_guest > "$output/stop-prepared-remove.log" 2>&1
 preparation_step=freeze-remove-base
 freeze_base overlay.qcow2 remove vars.fd
 preparation_step=create-prepare-install-disk
-qemu-img create -f qcow2 -F qcow2 -b "$disks/remove-base.qcow2" "$disks/prepare-install.qcow2"
+"$qemu_img" create -f qcow2 -F qcow2 -b "$disks/remove-base.qcow2" "$disks/prepare-install.qcow2"
 if [[ "${boot_args[0]}" == uefi ]]; then cp "$disks/remove-vars.fd" "$disks/prepare-vars.fd"; fi
 preparation_step=prepare-install-boot
 start_clone "$disks/prepare-install.qcow2" "$disks/prepare-vars.fd" "$output/prepare-install-serial.log" "$output/prepare-install-boot.log"
@@ -246,7 +248,7 @@ for operation in install remove; do
       write_summary false
       disk="$disks/$current_id.qcow2"
       vars="$disks/$current_id.fd"
-      qemu-img create -f qcow2 -F qcow2 -b "$base" "$disk" > "$trial/disk-create.log"
+      "$qemu_img" create -f qcow2 -F qcow2 -b "$base" "$disk" > "$trial/disk-create.log"
       if [[ "${boot_args[0]}" == uefi ]]; then cp "$disks/$operation-vars.fd" "$vars"; fi
       start_clone "$disk" "$vars" "$trial/serial.log" "$trial/boot.log"
       boot_id=$(remote_argv cat /proc/sys/kernel/random/boot_id)
@@ -322,7 +324,7 @@ done
 # Return a live, tree-absent guest to the inventory coordinator. These disks are
 # owned disposable state and are removed by its teardown after the controller.
 phase=restore
-qemu-img create -f qcow2 -F qcow2 -b "$disks/install-base.qcow2" "$disks/resume.qcow2" > "$output/resume-disk.log"
+"$qemu_img" create -f qcow2 -F qcow2 -b "$disks/install-base.qcow2" "$disks/resume.qcow2" > "$output/resume-disk.log"
 if [[ "${boot_args[0]}" == uefi ]]; then cp "$disks/install-vars.fd" "$disks/resume.fd"; fi
 start_clone "$disks/resume.qcow2" "$disks/resume.fd" "$output/resume-serial.log" "$output/resume-boot.log"
 phase=complete

@@ -4,6 +4,18 @@ name: QEMU distro lane
 on:
   workflow_call:
     inputs:
+      controller-artifact:
+        required: true
+        type: string
+      controller-archive-sha256:
+        required: true
+        type: string
+      controller-receipt-sha256:
+        required: true
+        type: string
+      controller-image-id:
+        required: true
+        type: string
       reuse-ci:
         default: false
         type: boolean
@@ -350,6 +362,18 @@ jobs:
             python3 -m unittest discover -s tests -p test_benchmark_records.py
           rmdir "$scratch"
 
+      - name: Require qualified same-run controller
+        env:
+          ARCHIVE_SHA256: ${{ inputs.controller-archive-sha256 }}
+          IMAGE_ID: ${{ inputs.controller-image-id }}
+          RECEIPT_SHA256: ${{ inputs.controller-receipt-sha256 }}
+        run: |
+          [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ && "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ && "$RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: ${{ inputs.controller-artifact }}
+          path: ${{ runner.temp }}/qemu-controller
+
       - name: Run disposable guest lifecycle + read benchmarks + inventory rows
         # Staged runs exercise current-source hermetic/container/network inventory; published runs add QEMU/PTY coverage.
         env:
@@ -363,6 +387,10 @@ jobs:
             # Declared-ux rows (self-update-*, daemon-foreground) self-skip.
             args+=(--release-dir published --inventory-file published/cases.tsv --inventory-tiers "hermetic,qemu,container,network,pty" --inventory-allow-mutations)
           fi
+          args+=(--controller-bundle "$RUNNER_TEMP/qemu-controller"
+            --controller-archive-sha256 "${{ inputs.controller-archive-sha256 }}"
+            --controller-image-id "${{ inputs.controller-image-id }}"
+            --controller-receipt-sha256 "${{ inputs.controller-receipt-sha256 }}")
           args+=(--inventory-isolate-hermetic)
           args+=(--benchmark-transactions 1)
           args+=(--storage-faults)

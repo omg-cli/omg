@@ -58,7 +58,7 @@ dpkg() { [[ "$1" == --compare-versions && "$3" == ge && ( "$4" == '1:10.0.11+ds-
     def test_controller_checks_before_image_parsing_and_boot(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         check = source.index('bash /work/check-qemu-controller.sh')
-        self.assertLess(check, source.index('qemu-img info base.qcow2'))
+        self.assertLess(check, source.index('"$2" info base.qcow2'))
         self.assertNotIn('controller_image=debian:bookworm', source)
         self.assertEqual(source.count('controller_image_x86_64=debian:trixie@sha256:'), 1)
         self.assertEqual(source.count('controller_image_aarch64=debian:trixie@sha256:'), 1)

@@ -38,7 +38,7 @@ def verify_package(path, architecture, pin):
     return fields
 
 
-def install(qemu_package):
+def install(qemu_package, qemu_binary=None):
     architecture = subprocess.check_output(
         ["dpkg", "--print-architecture"], text=True, timeout=10).strip()
     if architecture not in PINS:
@@ -62,7 +62,10 @@ def install(qemu_package):
     if installed != ["installed", VERSION, architecture]:
         raise ValueError("Installed libslirp identity mismatch")
     binary = "qemu-system-x86_64" if qemu_package == "qemu-system-x86" else "qemu-system-aarch64"
-    links = subprocess.check_output(["ldd", "/usr/bin/" + binary], text=True, timeout=10)
+    executable = qemu_binary or "/usr/bin/" + binary
+    if executable not in ("/usr/bin/" + binary, "/opt/omg-qemu-10.0.14/bin/qemu-system-x86_64"):
+        raise ValueError("Unsupported controller executable path")
+    links = subprocess.check_output(["ldd", executable], text=True, timeout=10)
     matches = re.findall(r"^\s*libslirp\.so\.0 => (/[^\s]+) \(0x[0-9a-f]+\)$", links, re.MULTILINE)
     if len(matches) != 1:
         raise ValueError("QEMU must resolve exactly one libslirp library")
@@ -73,13 +76,15 @@ def install(qemu_package):
         raise ValueError("Loaded libslirp version mismatch")
     print(json.dumps({"url": url, "sha256": pin["sha256"], "size": pin["size"],
                       "package": fields, "installed": installed, "library": matches[0],
-                      "runtime_version": runtime, "qemu_binary": binary}, sort_keys=True))
+                      "runtime_version": runtime, "qemu_binary": executable}, sort_keys=True))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("qemu_package", choices=("qemu-system-x86", "qemu-system-arm"))
-    install(parser.parse_args().qemu_package)
+    parser.add_argument("--qemu-binary")
+    args = parser.parse_args()
+    install(args.qemu_package, args.qemu_binary)
 
 
 if __name__ == "__main__":

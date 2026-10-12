@@ -11,6 +11,11 @@ image_policy=
 image_cache=
 image_cache_budget_bytes=4294967296
 arch=
+controller_bundle=
+controller_archive_sha256=
+controller_image_id=
+controller_receipt_sha256=
+qemu_img=/usr/bin/qemu-img
 print_pins=false
 benchmark=false
 transaction_samples=0
@@ -26,7 +31,7 @@ root="$HOME/.cache/build-targets/omg-qemu-benchmark"
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 while (($#)); do
   case "$1" in
-    --distro|--release|--staged-dir|--release-dir|--inventory-file|--inventory-policy|--image-policy|--image-cache|--image-cache-budget-bytes|--evidence-dir|--inventory-tiers|--arch)
+    --distro|--release|--staged-dir|--release-dir|--inventory-file|--inventory-policy|--image-policy|--image-cache|--image-cache-budget-bytes|--evidence-dir|--inventory-tiers|--arch|--controller-bundle|--controller-archive-sha256|--controller-image-id|--controller-receipt-sha256)
       [[ $# -ge 2 && -n "$2" ]] || exit 2
       case "$1" in
         --distro) distro=$2 ;; --release) tag=$2 ;; --staged-dir) staged_dir=$2 ;; --evidence-dir) root=$2 ;;
@@ -36,6 +41,10 @@ while (($#)); do
         --image-cache) image_cache=$2 ;;
         --image-cache-budget-bytes) [[ "$2" =~ ^[0-9]+$ ]] || exit 2; image_cache_budget_bytes=$2 ;;
         --inventory-tiers) inventory_tiers=$2 ;; --arch) arch=$2 ;;
+        --controller-bundle) controller_bundle=$2 ;;
+        --controller-archive-sha256) controller_archive_sha256=$2 ;;
+        --controller-image-id) controller_image_id=$2 ;;
+        --controller-receipt-sha256) controller_receipt_sha256=$2 ;;
       esac
       shift 2 ;;
     --benchmark) benchmark=true; shift ;;
@@ -222,6 +231,7 @@ if [[ "$distro" == all ]]; then
   suite=$(mktemp -d "$root/suite-XXXXXX")
   rc=0
   args=(--release "$tag" --arch "$arch")
+  [[ -z "$controller_bundle" ]] || args+=(--controller-bundle "$controller_bundle" --controller-archive-sha256 "$controller_archive_sha256" --controller-image-id "$controller_image_id" --controller-receipt-sha256 "$controller_receipt_sha256")
   [[ -z "$staged_dir" ]] || args+=(--staged-dir "$staged_dir")
   [[ -z "$release_dir" ]] || args+=(--release-dir "$release_dir")
   [[ -z "$inventory_file" ]] || args+=(--inventory-file "$inventory_file")
@@ -389,8 +399,23 @@ read -r digest filename extra < "$work/release/$archive.sha256"
 [[ $(wc -l < "$work/release/$archive.sha256") -eq 1 ]]
 (cd "$work/release" && sha256sum -c "$archive.sha256") > "$work/release-checksum.txt"
 printf 'distro=%s\narch=%s\nhost_arch=%s\naccel=%s\ntiming_scope=%s\nrelease=%s\nartifact_source=%s\nimage_url=%s\nimage_digest=%s\nfirmware=%s\nqemu=%s -machine %s\ncontroller=%s\ncase_id=%s\n' "$distro" "$arch" "$host_arch" "$qemu_accel" "$([[ "$qemu_accel" == kvm ]] && printf benchmark || printf correctness-only)" "$tag" "$source_kind" "$image_url" "$image_hash" "$firmware" "$qemu_bin" "$qemu_machine" "$controller_image" "$case_id" > "$work/metadata.txt"
-bash "$here/pull-qemu-controller.sh" "$controller_image" "$work/controller-pull-attempt.log" \
+if [[ -n "$controller_bundle" ]]; then
+  [[ "$arch" == x86_64 && "$qemu_accel" == kvm ]] || exit 2
+  python3 "$here/qemu-controller-bundle.py" load "$controller_bundle" \
+    --repository "${GITHUB_REPOSITORY:?}" --source-sha "${GITHUB_SHA:?}" \
+    --run-id "${GITHUB_RUN_ID:?}" --run-attempt "${GITHUB_RUN_ATTEMPT:?}" --architecture amd64 \
+    --archive-sha256 "$controller_archive_sha256" --image-id "$controller_image_id" --receipt-sha256 "$controller_receipt_sha256" > "$work/controller-load.json"
+  controller_image=$controller_image_id
+  qemu_bin=/opt/omg-qemu-10.0.14/bin/qemu-system-x86_64
+  qemu_img=/opt/omg-qemu-10.0.14/bin/qemu-img
+  jq '.receipt' "$work/controller-load.json" > "$work/controller-bundle.json"
+  cp "$here/qemu-controller-bundle.py" "$work/qemu-controller-bundle.py"
+else
+  [[ -z "$controller_archive_sha256" && -z "$controller_image_id" && -z "$controller_receipt_sha256" ]] || exit 2
+  bash "$here/pull-qemu-controller.sh" "$controller_image" "$work/controller-pull-attempt.log" \
   > "$work/controller-pull.log" 2>&1 || exit 3
+fi
+printf 'selected_controller=%s\nselected_qemu=%s\nselected_qemu_img=%s\ncontroller_route=%s\n' "$controller_image" "$qemu_bin" "$qemu_img" "$([[ -n "$controller_bundle" ]] && printf same-run-bundle || printf legacy-package)" >> "$work/metadata.txt"
 started=true
 timeout 120 docker run --pull=never -d --name "$controller" --cpus 2 --memory 3g --memory-swap 3g --pids-limit 512 --log-opt max-size=10m --log-opt max-file=2 "${docker_device_args[@]}" \
   --cap-drop NET_RAW --cap-drop NET_ADMIN --dns 1.1.1.1 --dns 9.9.9.9 \
@@ -403,7 +428,13 @@ if [[ "$restrict_egress" == true ]]; then
 fi
 timeout --kill-after=5s 600 docker exec "$controller" sh -c "apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends $qemu_pkg qemu-utils cloud-image-utils openssh-client curl ca-certificates $firmware_pkg jq" > "$work/controller-setup.log" 2>&1
 cp "$here/install-qemu-libslirp.py" "$work/install-qemu-libslirp.py"
-timeout --kill-after=5s 120 docker exec "$controller" python3 /work/install-qemu-libslirp.py "$qemu_pkg" > "$work/controller-security.log" 2>&1
+slirp_args=("$qemu_pkg")
+if [[ -n "$controller_bundle" ]]; then slirp_args+=(--qemu-binary "$qemu_bin"); fi
+timeout --kill-after=5s 120 docker exec "$controller" python3 /work/install-qemu-libslirp.py "${slirp_args[@]}" > "$work/controller-security.log" 2>&1
+if [[ -n "$controller_bundle" ]]; then
+  timeout 30 docker exec "$controller" python3 /work/qemu-controller-bundle.py runtime \
+    /work/controller-bundle.json /opt/omg-qemu-10.0.14 > "$work/controller-runtime.json"
+fi
 cp "$here/check-qemu-controller.sh" "$work/check-qemu-controller.sh"
 cp "$here/check-qemu-cloud-init.sh" "$work/check-qemu-cloud-init.sh"
 timeout 30 docker exec "$controller" bash /work/check-qemu-controller.sh "$qemu_pkg" >> "$work/controller-security.log" 2>&1
@@ -438,7 +469,7 @@ if [[ -n "$image_policy" ]]; then
   timeout 90 python3 "$here/verify-qemu-image.py" --manifest "$image_policy" --identity "$distro-$arch" \
     --url "$image_url" --digest "$image_hash" --image "$work/guest/base.qcow2" > "$work/image-provenance.json"
 fi
-timeout 30 docker exec -w /work/guest "$controller" bash -c '"$1" --version; qemu-img info base.qcow2' _ "$qemu_bin" >> "$work/image-setup.log" 2>&1
+timeout 30 docker exec -w /work/guest "$controller" bash -c '"$1" --version; "$2" info base.qcow2' _ "$qemu_bin" "$qemu_img" >> "$work/image-setup.log" 2>&1
 cp "$here/qemu-boot-budget.sh" "$work/qemu-boot-budget.sh"
 cp "$here/qemu-boot-diagnostics.sh" "$work/qemu-boot-diagnostics.sh"
 source "$work/qemu-boot-budget.sh"
@@ -446,6 +477,8 @@ cat > "$work/boot.sh" <<'BOOT'
 #!/usr/bin/env bash
 set -euo pipefail
 source /work/qemu-boot-budget.sh
+qemu_img=${OMG_QEMU_IMG:-/usr/bin/qemu-img}
+[[ "$qemu_img" == /usr/bin/qemu-img || "$qemu_img" == /opt/omg-qemu-10.0.14/bin/qemu-img ]] || exit 2
 cd /work/guest
 initial=true
 vm_disk=overlay.qcow2; vm_vars=vars.fd; vm_serial=serial.log
@@ -515,8 +548,8 @@ printf 'instance-id: omg-qemu-fresh\n' > meta-data
 printf '[127.0.0.1]:2222 ' > known_hosts
 cat guest-host-key.pub >> known_hosts
 cloud-localds seed.img user-data meta-data
-qemu-img create -f qcow2 -F qcow2 -b /work/guest/base.qcow2 overlay.qcow2
-qemu-img resize overlay.qcow2 12G
+"$qemu_img" create -f qcow2 -F qcow2 -b /work/guest/base.qcow2 overlay.qcow2
+"$qemu_img" resize overlay.qcow2 12G
 fi
 firmware=()
 if [[ "$1" == uefi ]]; then
@@ -559,7 +592,7 @@ awk '
 ' "/proc/$qemu_pid/status" || { printf 'QEMU isolation verification failed\n' >&2; exit 1; }
 printf 'QEMU isolation verified: uid=65534 gid=65534 capabilities=none no_new_privs=1 seccomp=2\n'
 }
-export initial vm_disk vm_vars vm_serial
+export initial vm_disk vm_vars vm_serial qemu_img
 if timeout --kill-after="${BOOT_PHASE_KILL_GRACE}s" "${BOOT_SETUP_TIMEOUT}s" bash -euo pipefail -c "$(declare -f setup_boot); setup_boot \"\$@\"" _ "$@"; then :; else
   rc=$?; printf 'Boot setup failed: exit=%s\n' "$rc" >&2; exit "$rc"
 fi
@@ -881,7 +914,7 @@ if [[ "$qemu_accel" == tcg ]]; then
 fi
 printf 'boot_timeout=%s guest_timeout=%s\n' "$boot_timeout" "$guest_timeout" >> "$work/metadata.txt"
 boot_rc=0
-timeout --kill-after=5s "$boot_timeout" docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1 || boot_rc=$?
+timeout --kill-after=5s "$boot_timeout" docker exec --env "OMG_QEMU_IMG=$qemu_img" "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1 || boot_rc=$?
 timeout --kill-after=2s 3s docker exec "$controller" bash /work/qemu-boot-diagnostics.sh > "$work/boot.diagnostics.log" 2>&1 || printf 'Boot diagnostics unavailable\n' >> "$work/boot.diagnostics.log"
 [[ "$boot_rc" == 0 ]] || exit "$boot_rc"
 if [[ -n "$inventory_tiers" ]]; then
@@ -1314,7 +1347,7 @@ if [[ "$benchmark" == true && "$rc" == 0 ]]; then
 fi
 if [[ "$transaction_samples" != 0 && "$rc" == 0 ]]; then
   transaction_rc=0
-  timeout --kill-after=10s 21600 docker exec -w /work "$controller" bash /work/qemu-transactions.sh \
+  timeout --kill-after=10s 21600 docker exec --env "OMG_QEMU_IMG=$qemu_img" -w /work "$controller" bash /work/qemu-transactions.sh \
     "$distro" "$tag" "$arch" "$transaction_samples" "$firmware" "$ssh_service" \
     "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" \
     > "$work/transactions.log" 2>&1 || transaction_rc=$?

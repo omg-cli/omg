@@ -1,0 +1,6 @@
+FROM debian:trixie@sha256:6788062a1b42ac281f053ac876170b79a3eaed5d61383b8ed7eaca6c6965f3b1
+RUN apt-get -o APT::Update::Error-Mode=any update && \
+    apt-get install -y --no-install-recommends build-essential ninja-build \
+    python3 python3-venv pkg-config libglib2.0-dev libpixman-1-dev \
+    libslirp-dev libseccomp-dev qemu-system-x86 qemu-utils seabios \
+    curl ca-certificates && rm -rf /var/lib/apt/lists/*

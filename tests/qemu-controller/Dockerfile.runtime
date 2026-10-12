@@ -1,0 +1,10 @@
+FROM debian:trixie@sha256:6788062a1b42ac281f053ac876170b79a3eaed5d61383b8ed7eaca6c6965f3b1
+ARG SOURCE_SHA
+LABEL org.opencontainers.image.revision=$SOURCE_SHA
+RUN apt-get -o APT::Update::Error-Mode=any update && \
+    apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils \
+    seabios python3 curl ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY install-qemu-libslirp.py /tmp/install-qemu-libslirp.py
+RUN python3 /tmp/install-qemu-libslirp.py qemu-system-x86 && rm /tmp/install-qemu-libslirp.py
+COPY opt/ /opt/
+RUN dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\n' | sort > /opt/omg-qemu-10.0.14/runtime-packages.tsv

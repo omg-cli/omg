@@ -690,6 +690,24 @@ class DescriptorTests(unittest.TestCase):
         for name in names:
             self.assertEqual((self.destination / name).read_bytes(), b"bounded preparation evidence")
 
+    def test_selected_controller_receipts_survive_export_without_bundle_bytes(self):
+        expected = {
+            'run-test/controller-load.json': b'{"image_id":"sha256:producer"}\n',
+            'run-test/controller-bundle.json': b'{"source_sha":"same-run"}\n',
+            'run-test/controller-runtime.json': b'{"firmware":"verified"}\n',
+        }
+        for name, content in expected.items():
+            self.fixture(name, content)
+        self.fixture('run-test/controller.tar', b'private image bytes')
+        self.fixture('run-test/controller-source.json', b'unselected')
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(set(report['copied']), set(expected))
+        for name, content in expected.items():
+            self.assertEqual((self.destination / name).read_bytes(), content)
+        self.assertFalse((self.destination / 'run-test/controller.tar').exists())
+        self.assertFalse((self.destination / 'run-test/controller-source.json').exists())
+
     def test_daemon_ipc_snapshots_survive_export(self):
         prefix = "run-test/guest/evidence/"
         names = (

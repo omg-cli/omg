@@ -224,11 +224,39 @@ jobs:
           printf 'Harness/build revision: `%s`\n\nArtifact source: staged=%s, tag=%s\n\nSelected: distro=%s, x64=%s, arm64=%s\n' \
             "$GITHUB_SHA" "$STAGED" "$tag" "$REQUESTED_DISTRO" "$x64" "$arm64" >> "$GITHUB_STEP_SUMMARY"
 
+  build-controller:
+    name: "Authenticated QEMU x86 controller"
+    needs: prepare
+    if: needs.prepare.outputs.x64 == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      archive-sha256: ${{ steps.build.outputs.archive-sha256 }}
+      image-id: ${{ steps.build.outputs.image-id }}
+      receipt-sha256: ${{ steps.build.outputs.receipt-sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Verify bundle admission controls
+        run: python3 scripts/test_qemu_controller_bundle.py
+      - name: Build one controller for all x86 lanes
+        id: build
+        run: bash scripts/build-qemu-controller.sh "$RUNNER_TEMP/qemu-controller"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: qemu-controller-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qemu-controller/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
   # Automatic calls are scheduled after native producers by CI.
   # Standalone nightly/manual runs retain their independent build paths.
   guest:
     name: "Distro lane (${{ matrix.distro }})"
-    needs: prepare
+    needs: [prepare, build-controller]
     if: needs.prepare.outputs.x64 == 'true'
     strategy:
       fail-fast: false
@@ -239,6 +267,10 @@ jobs:
       contents: read
       actions: read
     with:
+      controller-artifact: qemu-controller-${{ github.run_id }}-${{ github.run_attempt }}
+      controller-archive-sha256: ${{ needs.build-controller.outputs.archive-sha256 }}
+      controller-image-id: ${{ needs.build-controller.outputs.image-id }}
+      controller-receipt-sha256: ${{ needs.build-controller.outputs.receipt-sha256 }}
       reuse-ci: ${{ github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
       distro: ${{ matrix.distro }}
       staged: ${{ needs.prepare.outputs.staged == 'true' }}
@@ -564,7 +596,7 @@ jobs:
   # code. Guest execution never receives issue-write permission.
   summary:
     name: "QEMU matrix result"
-    needs: [prepare, arm-runner-health, build-staged-arm, build-staged-ubuntu-arm, guest, guest-arm]
+    needs: [prepare, build-controller, arm-runner-health, build-staged-arm, build-staged-ubuntu-arm, guest, guest-arm]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -590,7 +622,7 @@ jobs:
             .prepare.result == "success" and
             (all(.[]; .result == "success" or .result == "skipped")) and
             (if .prepare.outputs.arm64 == "true" then .["arm-runner-health"].result == "success" else .["arm-runner-health"].result == "skipped" end) and
-            (if .prepare.outputs.x64 == "true" then .guest.result == "success" else .guest.result == "skipped" end) and
+            (if .prepare.outputs.x64 == "true" then .guest.result == "success" and .["build-controller"].result == "success" else .guest.result == "skipped" and .["build-controller"].result == "skipped" end) and
             (if .prepare.outputs.arm64 == "true" then .["guest-arm"].result == "success" else .["guest-arm"].result == "skipped" end)
           ' <<< "$JOB_RESULTS"
 
