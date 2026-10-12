@@ -1,4 +1,8 @@
 """Receipts must derive from observed executions of reviewed assertions."""
+import contextlib
+import io
+import sys
+import xml.etree.ElementTree as ET
 import importlib.util
 import copy
 import hashlib
@@ -326,7 +330,8 @@ class NativeReceipts(unittest.TestCase):
         manifest = {'contracts': [{'id': 'reviewed-contract'}]}
         gaps = [{'id': 'known-gap'}]
         listing = {'rust-suites': {
-            name: {'binary-path': name} for name in ('omg::cli_surface', 'omg::bin/omgd')}}
+            name: {'binary-path': name, 'package-id': 'fixture-package'}
+            for name in ('omg::cli_surface', 'omg::bin/omgd')}}
 
         def read_json(path):
             return {'manifest.json': manifest, 'gaps.json': {'gaps': gaps},
@@ -349,7 +354,17 @@ class NativeReceipts(unittest.TestCase):
                 patch.object(NATIVE.COVERAGE, 'read_json', side_effect=read_json), \
                 patch.object(NATIVE.SELECTION, 'selected_tests'), \
                 patch.object(NATIVE, 'mapped_behavior_subjects', side_effect=reject_binding) as binding, \
-                patch.object(NATIVE.subprocess, 'run') as command:
+                patch.object(NATIVE.subprocess, 'run') as command, contextlib.chdir(directory):
+            target = Path(directory) / 'target'
+            target.mkdir()
+            library = target / 'omg_lib'
+            library.write_bytes(b'owning library fixture')
+            listing['rust-build-meta'] = {'target-directory': str(target)}
+            listing['rust-suites']['omg'] = {
+                'binary-id': 'omg', 'binary-name': 'omg_lib', 'kind': 'lib',
+                'package-name': 'omg', 'package-id': 'fixture-package',
+                'binary-path': str(library),
+            }
             self.assertEqual(NATIVE.main(), 2)
             binding.assert_called_once()
             self.assertEqual(command.call_count, 1)
@@ -593,6 +608,217 @@ class NativeReceipts(unittest.TestCase):
         self.assertEqual(receipts[0]['result'], 'BLOCKED')
         self.assertEqual(receipts[0]['assertions'], [])
         self.assertEqual(receipts[0]['cleanup'], 'NOT_STARTED')
+
+
+SOURCE = '1' * 40
+LIBRARY_BYTES = b'library-A'
+PACKAGE = 'path+file:///fixture#0.1.224'
+DAEMON_CASE = 'package_inventory_and_updates_survive_the_production_transport'
+SUITES = ('cli_surface', 'git_hooks_contract', 'coverage_10', 'coverage_18',
+          'e2e_runtime_management', 'env_lockfile_integrity', 'daemon_e2e_caching',
+          'daemon_e2e_concurrency', 'init_daemon_startup', 'cli_comprehensive',
+          'security_daemon_optional', 'fedora_tests', 'metadata_backend_routing')
+
+
+class LibraryIdentity(unittest.TestCase):
+    def exercise(self, fault=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / 'target'
+            deps = target / 'debug/deps'
+            deps.mkdir(parents=True)
+            out = target / 'contract-surfaces'
+            out.mkdir()
+            for name in ('Cargo.toml', 'Cargo.lock', '.config/nextest.toml',
+                         '.github/workflows/ci.yml', 'scripts/native-test-runner.sh'):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'fixture configuration')
+            suites = {}
+            for identity in ('omg', 'omg::bin/omg', 'omg::bin/omgd') + tuple(
+                    'omg::' + name for name in SUITES):
+                name = 'omg_lib' if identity == 'omg' else identity.replace('::', '-').replace('/', '-')
+                path = deps / name
+                path.write_bytes(LIBRARY_BYTES if identity == 'omg' else identity.encode())
+                case = DAEMON_CASE if identity == 'omg::coverage_18' else 'fixture_case'
+                suites[identity] = {
+                    'binary-id': identity, 'binary-name': name, 'binary-path': str(path),
+                    'package-name': 'omg', 'package-id': PACKAGE,
+                    'kind': 'lib' if identity == 'omg' else 'test',
+                    'build-platform': 'target', 'cwd': str(root), 'status': 'listed',
+                    'testcases': {case: {'ignored': False, 'filter-match': {'status': 'matches'}}},
+                }
+            library = Path(suites['omg']['binary-path'])
+            if fault in ('missing', 'stale-missing'):
+                del suites['omg']
+            elif fault == 'wrong-kind':
+                suites['omg']['kind'] = 'bin'
+            elif fault == 'wrong-package':
+                suites['omg']['package-id'] = 'path+file:///foreign#0.1.224'
+            if fault == 'zero-selected':
+                suites['omg']['testcases']['fixture_case'].update(
+                    ignored=True, **{'filter-match': {'status': 'mismatch', 'reason': 'expression'}})
+            if fault == 'stale-missing':
+                stale = out / 'execution/library-identity.json'
+                stale.parent.mkdir()
+                stale.write_text('{"matched": true, "source_sha": "old"}')
+            listing = {'rust-build-meta': {'target-directory': str(target)},
+                       'rust-suites': suites, 'test-count': len(suites)}
+            build = dict(source_sha=SOURCE, platform='fedora', os='win32', arch='x86_64',
+                         features=['fedora', 'license', 'pgp'])
+            surfaces = [dict(schema_version=1, binary=binary, available=True, build=build,
+                             commands=[dict(path=binary, arguments=[])])
+                        for binary in ('omg', 'omgd')]
+            contracts = []
+            for binary in ('omg', 'omgd'):
+                contracts.append(dict(
+                    id=binary + '.parser', source='fixture.rs', binary=binary, surface=binary,
+                    platforms=['fedora'], requires=['parser'], critical=False,
+                    assertions={'parser': ['literal-parser']}, tests=[dict(
+                        lane='native-parser', id=('omg::cli_surface' if binary == 'omg'
+                        else 'omg::bin/omgd') + '::fixture_case', evidence=['parser'],
+                        assertions=['literal-parser'])]))
+            contracts.append(dict(
+                id='omgd.fixture', source='fixture.rs', binary='omgd', surface='omgd',
+                platforms=['fedora'], requires=['success'], critical=False,
+                assertions={'success': ['literal-response']}, tests=[dict(
+                    lane='native-daemon-fixture', id='omg::coverage_18::' + DAEMON_CASE,
+                    evidence=['success'], assertions=['literal-response', 'fixture-cleanup'])]))
+            manifest = dict(schema_version=1, contracts=contracts, surface_digests=[dict(
+                binary=surface['binary'], platform='fedora', features=build['features'],
+                sha256=hashlib.sha256(json.dumps(
+                    {k: v for k, v in surface.items() if k != 'build'}, sort_keys=True,
+                    separators=(',', ':')).encode()).hexdigest()) for surface in surfaces])
+            contracts_dir = root / 'tests/contracts'
+            contracts_dir.mkdir(parents=True)
+            (contracts_dir / 'manifest.json').write_text(json.dumps(manifest))
+            (contracts_dir / 'gaps.json').write_text('{"gaps": []}')
+
+            events = []
+
+            def command(argv, **kwargs):
+                if argv == ['git', 'rev-parse', 'HEAD']:
+                    return subprocess.CompletedProcess(argv, 0, SOURCE + '\n', '')
+                if argv == ['rustc', '-vV']:
+                    return subprocess.CompletedProcess(argv, 0, 'rustc 1.95.0\nhost: x86_64-pc-windows-msvc\n', '')
+                if argv in (['cargo', '--version'], ['cargo', 'nextest', '--version']):
+                    return subprocess.CompletedProcess(argv, 0, 'fixture tool version\n', '')
+                if argv[:3] == ['cargo', 'nextest', 'list']:
+                    events.append('list')
+                    kwargs['stdout'].write(json.dumps(listing).encode())
+                    return subprocess.CompletedProcess(argv, 0)
+                if argv[:3] == ['cargo', 'nextest', 'run']:
+                    events.append('run')
+                    if fault == 'same-size-change':
+                        library.write_bytes(b'library-B')
+                    junit = ET.Element('testsuites')
+                    for identity, suite in suites.items():
+                        group = ET.SubElement(junit, 'testsuite', name=identity)
+                        for name, case in suite['testcases'].items():
+                            if case['ignored'] or case['filter-match']['status'] != 'matches':
+                                continue
+                            ET.SubElement(group, 'testcase', classname=identity, name=name, time='0.001')
+                    report = target / 'nextest/ci/junit.xml'
+                    report.parent.mkdir(parents=True)
+                    report.write_bytes(ET.tostring(junit))
+                    for surface in surfaces:
+                        (out / (surface['binary'] + '.json')).write_text(json.dumps(surface))
+                    return subprocess.CompletedProcess(argv, 0)
+                raise AssertionError('unexpected external command: ' + repr(argv))
+
+            environment = dict(OMG_CONTRACT_SURFACE_OUT=str(out), OMG_CONTRACT_SOURCE_SHA=SOURCE,
+                               OMG_CONTRACT_PLATFORM='fedora', GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1')
+            stdout, stderr = io.StringIO(), io.StringIO()
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(os.environ, environment, clear=True), \
+                        patch.object(sys, 'argv', ['run-native-contracts.py', '--features', 'fedora,pgp,license']), \
+                        patch.object(NATIVE.sys, 'platform', 'win32'), \
+                        patch.object(NATIVE.platform, 'machine', return_value='AMD64'), \
+                        patch.object(NATIVE.subprocess, 'run', side_effect=command), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    status = NATIVE.main()
+            finally:
+                os.chdir(previous)
+            evidence = out / 'execution'
+            retained = {name: json.loads((evidence / name).read_text()) for name in
+                        ('recipe.json', 'selection.json', 'provenance.json', 'library-identity.json',
+                         'admission-error.json') if (evidence / name).exists()}
+            file_hashes = {name: hashlib.sha256((evidence / name).read_bytes()).hexdigest()
+                           for name in ('list.json', 'selection.json') if (evidence / name).exists()}
+            result = dict(file_hashes=file_hashes, status=status, events=events, stdout=stdout.getvalue(),
+                          stderr=stderr.getvalue(), evidence=retained)
+            receipt_dir = os.environ.get('LIBRARY_TEST_RECEIPTS')
+            if receipt_dir:
+                path = Path(receipt_dir) / ((fault or 'intact') + '.json')
+                path.write_text(json.dumps(result, indent=2) + '\n')
+            return result
+
+    def test_main_emits_separate_owning_library_identity(self):
+        result = self.exercise()
+        self.assertEqual(result['status'], 0, result['stderr'])
+        self.assertEqual(result['events'], ['list', 'run'])
+        self.assertIn('library-identity.json', result['evidence'])
+        receipt = result['evidence']['library-identity.json']
+        self.assertEqual(receipt.get('subject_kind'), 'nextest-library-test-harness')
+        self.assertEqual(receipt.get('os'), 'win32')
+        self.assertEqual(receipt.get('arch'), 'x86_64')
+        self.assertEqual(receipt['binary_id'], 'omg')
+        self.assertEqual(receipt['binary_name'], 'omg_lib')
+        self.assertEqual(receipt['kind'], 'lib')
+        self.assertEqual(receipt['package_id'], PACKAGE)
+        self.assertEqual(receipt['source_sha'], SOURCE)
+        self.assertEqual((receipt['run_id'], receipt['run_attempt']), ('123', 1))
+        self.assertEqual(receipt['sha256_before'], hashlib.sha256(LIBRARY_BYTES).hexdigest())
+        self.assertEqual(receipt['sha256_after'], hashlib.sha256(LIBRARY_BYTES).hexdigest())
+        self.assertEqual(receipt['recipe_sha256'], hashlib.sha256(json.dumps(
+            result['evidence']['recipe.json'], sort_keys=True, separators=(',', ':')).encode()).hexdigest())
+        self.assertEqual(receipt['listing_sha256'], result['file_hashes']['list.json'])
+        self.assertEqual(receipt['selection_sha256'], result['file_hashes']['selection.json'])
+        self.assertEqual(receipt['platform'], 'fedora')
+        self.assertEqual(receipt['features'], ['fedora', 'license', 'pgp'])
+        self.assertTrue(receipt['matched'])
+        self.assertNotEqual(receipt['sha256_before'], result['evidence']['provenance.json']['binaries']['omg'])
+
+    def test_main_refuses_same_size_library_change(self):
+        result = self.exercise('same-size-change')
+        self.assertEqual(result['events'], ['list', 'run'])
+        self.assertNotEqual(result['status'], 0)
+        self.assertIn('admission-error.json', result['evidence'])
+        self.assertNotIn('library-identity.json', result['evidence'])
+
+    def test_main_refuses_missing_library_before_run(self):
+        result = self.exercise('missing')
+        self.assertNotEqual(result['status'], 0)
+        self.assertEqual(result['events'], ['list'])
+        self.assertIn('admission-error.json', result['evidence'])
+
+    def test_main_refuses_wrong_library_kind_before_run(self):
+        result = self.exercise('wrong-kind')
+        self.assertNotEqual(result['status'], 0)
+        self.assertEqual(result['events'], ['list'])
+        self.assertIn('admission-error.json', result['evidence'])
+
+    def test_main_refuses_foreign_library_package_before_run(self):
+        result = self.exercise('wrong-package')
+        self.assertNotEqual(result['status'], 0)
+        self.assertEqual(result['events'], ['list'])
+        self.assertIn('admission-error.json', result['evidence'])
+
+
+    def test_main_refuses_zero_selected_library_before_run(self):
+        result = self.exercise('zero-selected')
+        self.assertNotEqual(result['status'], 0)
+        self.assertEqual(result['events'], ['list'])
+        self.assertIn('admission-error.json', result['evidence'])
+
+    def test_main_clears_stale_library_receipt_on_refusal(self):
+        result = self.exercise('stale-missing')
+        self.assertNotIn('library-identity.json', result['evidence'])
+        self.assertNotEqual(result['status'], 0)
+        self.assertEqual(result['events'], ['list'])
+        self.assertIn('admission-error.json', result['evidence'])
 
 
 if __name__ == '__main__':
