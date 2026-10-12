@@ -867,6 +867,14 @@ if [[ -n "${FAKE_BREW_LOG:-}" ]]; then printf '%s\n' "$*" >> "$FAKE_BREW_LOG"; f
 case "${1:-}" in
   update)
     if [[ "${FAKE_BREW_HANG_UPDATE:-0}" == 1 ]]; then exec sleep 30; fi
+    if [[ "${FAKE_BREW_MIGRATE_UNRELATED:-0}" == 1 ]]; then
+      printf 'update flag=%s\n' "${HOMEBREW_DISABLE_LOAD_FORMULA:-absent}" >> "${FAKE_BREW_ENV_LOG:?}"
+      [[ "${HOMEBREW_DISABLE_LOAD_FORMULA:-}" == 1 ]] || exec sleep 30
+      if [[ "${FAKE_BREW_RETRY_ONCE:-0}" == 1 && ! -f "${FAKE_BREW_ATTEMPT:?}" ]]; then
+        : > "$FAKE_BREW_ATTEMPT"
+        exit 1
+      fi
+    fi
     exit 0
     ;;
   list)
@@ -893,6 +901,7 @@ if [[ -n "${FAKE_NATIVE_OMG_LOG:-}" ]]; then printf '%s\n' "$*" >> "$FAKE_NATIVE
 case "${1:-}" in
   --version) printf 'omg 9.9.9\n' ;;
   search)
+    [[ -z "${HOMEBREW_DISABLE_LOAD_FORMULA+x}" ]] || exit 91
     [[ "${2:-}" == tree ]] || exit 1
     if [[ "${FAKE_NATIVE_HANG_SEARCH:-0}" == 1 ]]; then exec sleep 30; fi
     printf '  tree  directory listing\n'
@@ -978,6 +987,15 @@ grep -q '"result":"PRODUCT_FAIL","exit_code":124' "$(results_file "$scratch/nati
 FAKE_BREW_HANG_UPDATE=1 assert_rc 3 "$runner" "${native_args[@]}" --case release-package-search-tree --timeout-seconds 1 --evidence-dir "$scratch/native-index-timeout"
 [[ ! -s "$FAKE_NATIVE_OMG_LOG" ]] || fail 'Homebrew deadline fixture reached OMG'
 grep -q '"result":"HARNESS_ERROR","exit_code":124' "$(results_file "$scratch/native-index-timeout")" || fail 'Homebrew prerequisite timeout was blamed on OMG'
+
+export FAKE_BREW_ENV_LOG="$scratch/brew-env.log" FAKE_BREW_ATTEMPT="$scratch/brew-attempt"
+: > "$FAKE_BREW_ENV_LOG"
+: > "$FAKE_NATIVE_OMG_LOG"
+FAKE_BREW_MIGRATE_UNRELATED=1 FAKE_BREW_RETRY_ONCE=1 assert_rc 0 "$runner" "${native_args[@]}" --case release-package-search-tree --timeout-seconds 25 --evidence-dir "$scratch/native-metadata-only"
+grep -qx 'search tree' "$FAKE_NATIVE_OMG_LOG" || fail 'metadata-only prerequisite never reached normal OMG search'
+[[ "$(grep -cx 'update flag=1' "$FAKE_BREW_ENV_LOG")" -eq 2 ]] || fail 'both index attempts must suppress unrelated migrations'
+grep -q '"result":"PASS","exit_code":0' "$(results_file "$scratch/native-metadata-only")" || fail 'metadata-only search did not pass'
+unset FAKE_BREW_ENV_LOG FAKE_BREW_ATTEMPT
 unset FAKE_NATIVE_OMG_LOG
 
 assert_rc 0 "$runner" "${native_args[@]}" --evidence-dir "$scratch/native-evidence"
