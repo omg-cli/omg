@@ -345,7 +345,9 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 bin="${OMG_PROBE_ROOT:-/probe}/${OMG_PROBE_BIN}"
 daemon_bin="${bin%/omg}/omgd"
+if [[ -n "${OMG_PROBE_PHASE_FILE:-}" ]]; then printf 'prerequisite\n' > "$OMG_PROBE_PHASE_FILE"; fi
 bash -c "${OMG_PROBE_INDEX_CMD}" || exit 120
+if [[ -n "${OMG_PROBE_PHASE_FILE:-}" ]]; then printf 'product\n' > "$OMG_PROBE_PHASE_FILE"; fi
 version_line="$(printf '%s\n' "$("$bin" --version)" | head -n 1 | tr -d '[:space:]')"
 [[ "$version_line" == "omg${OMG_PROBE_VERSION_NUM}" ]]
 daemon_version_line="$(printf '%s\n' "$("$daemon_bin" --version)" | head -n 1 | tr -d '[:space:]')"
@@ -508,6 +510,9 @@ run_case() (
     trap 'exit 143' TERM
     # Best effort: the probe's own asserts stay authoritative.
     bash -c "${distro_native_reset_cmd:?native executor needs a reset command}" || true
+    # This fresh per-case file distinguishes setup from product deadlines.
+    printf 'prerequisite\n' > "$stage/probe-${case_id}.phase"
+    OMG_PROBE_PHASE_FILE="$stage/probe-${case_id}.phase" \
     OMG_SMOKE_PROBE_KIND="$probe_kind" \
       OMG_PROBE_VERSION_NUM="$version" \
       OMG_PROBE_BIN="$probe_bin" \
@@ -566,6 +571,11 @@ run_case() (
   case "$observed_exit" in
     120|125|126|127|255) result="HARNESS_ERROR" ;;
   esac
+  if [[ "$executor" == native && "$observed_exit" -eq 124 &&
+        -f "$stage/probe-${case_id}.phase" &&
+        "$(cat "$stage/probe-${case_id}.phase")" == prerequisite ]]; then
+    result="HARNESS_ERROR"
+  fi
   if [[ "$cleanup_ok" != true ]]; then
     result="HARNESS_ERROR"
   fi
