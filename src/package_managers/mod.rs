@@ -832,6 +832,10 @@ mod backend_selection_tests {
             resolve_for(Distro::Unknown, ARCH, true).unwrap(),
             Backend::Mock
         );
+        assert_eq!(
+            resolve_for(Distro::Fedora, FEDORA, false).unwrap(),
+            Backend::Fedora
+        );
     }
 
     #[test]

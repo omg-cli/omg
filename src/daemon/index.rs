@@ -1504,6 +1504,18 @@ mod tests {
                 "x.tree.noarch"
             ]
         );
+        let witness = PackageIndex::from_rpm_records(&[
+            ("perl-HTML-Tree.noarch", "1", "dot-suffixed substring"),
+            ("perl-Tree-DAG_Node.noarch", "2", "whole hyphenated word"),
+        ])
+        .search("tree", 20);
+        assert_eq!(
+            witness
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["perl-Tree-DAG_Node.noarch", "perl-HTML-Tree.noarch"]
+        );
     }
 
     #[test]
