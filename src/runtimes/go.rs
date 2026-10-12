@@ -45,7 +45,7 @@ impl GoVersion {
     /// Get the version string without the "go" prefix
     #[must_use]
     pub fn version(&self) -> &str {
-        self.version.trim_start_matches("go")
+        self.version.strip_prefix("go").unwrap_or(&self.version)
     }
 
     #[must_use]
@@ -331,6 +331,57 @@ mod tests {
             crate::runtimes::common::resolve_partial_version(&names, "1.22"),
             None
         );
+    }
+
+    #[test]
+    fn partial_request_ignores_repeated_go_prefixes_in_mixed_manifest() {
+        let mut releases: Vec<GoVersion> = serde_json::from_str(
+            r#"[{"version":"gogo1.99.0","stable":true},{"version":"go1.21.5","stable":true},{"version":"go1.22rc1","stable":false}]"#,
+        )
+        .unwrap();
+        let names = available_version_names(&releases);
+        assert_eq!(
+            crate::runtimes::resolve_version_request(&names, "1"),
+            "1.21.5"
+        );
+
+        releases.reverse();
+        let reversed_names = available_version_names(&releases);
+        assert_eq!(
+            crate::runtimes::resolve_version_request(&reversed_names, "1"),
+            "1.21.5"
+        );
+    }
+
+    #[test]
+    fn partial_request_preserves_request_for_repeated_go_prefix_manifest() {
+        for manifest in [
+            r#"[{"version":"gogo1.21.99","stable":true}]"#,
+            r#"[{"version":"gogogo1.21.99","stable":true}]"#,
+        ] {
+            let releases: Vec<GoVersion> = serde_json::from_str(manifest).unwrap();
+            let names = available_version_names(&releases);
+            assert_eq!(
+                crate::runtimes::resolve_version_request(&names, "1.21"),
+                "1.21",
+                "malformed manifest {manifest:?} must not resolve the request"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_request_accepts_single_go_prefix_and_plain_manifest_versions() {
+        for manifest in [
+            r#"[{"version":"go1.21.5","stable":true}]"#,
+            r#"[{"version":"1.21.5","stable":true}]"#,
+        ] {
+            let releases: Vec<GoVersion> = serde_json::from_str(manifest).unwrap();
+            let names = available_version_names(&releases);
+            assert_eq!(
+                crate::runtimes::resolve_version_request(&names, "1.21"),
+                "1.21.5"
+            );
+        }
     }
 
     #[test]
