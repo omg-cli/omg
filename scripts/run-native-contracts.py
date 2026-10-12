@@ -100,6 +100,21 @@ DAEMON_TESTS = frozenset('omg::coverage_18::' + name for name in (
     'active_connection_metric_returns_to_baseline_after_disconnect'))
 
 
+def library_subject(listing, root):
+    suite = listing['rust-suites'].get('omg')
+    require(isinstance(suite, dict) and suite.get('binary-id') == 'omg'
+            and suite.get('binary-name') == 'omg_lib' and suite.get('kind') == 'lib'
+            and suite.get('package-name') == 'omg', 'invalid owning library metadata')
+    require(suite.get('package-id') == listing['rust-suites']['omg::bin/omgd']['package-id']
+            == listing['rust-suites']['omg::cli_surface']['package-id'], 'owning library package mismatch')
+    target = Path(listing['rust-build-meta']['target-directory']).resolve(strict=True)
+    require(target.is_relative_to(root.resolve()), 'library target directory escapes checkout')
+    path = Path(suite['binary-path'])
+    require(path.is_file() and not path.is_symlink() and path.resolve(strict=True).is_relative_to(target),
+            'invalid owning library binary')
+    return path
+
+
 def daemon_subject(listing, root):
     """The production server runs inside coverage_18, not a child omgd binary."""
     target = Path(listing['rust-build-meta']['target-directory']).resolve(strict=True)
@@ -434,7 +449,7 @@ def main():
     try:
         for name in ('recipe.json', 'list.json', 'provenance.json', 'junit.xml',
                      'selection.json', 'receipts.json', 'required.json', 'coverage.json',
-                     'aggregate.json', 'admission-error.json'):
+                     'aggregate.json', 'admission-error.json', 'library-identity.json'):
             (evidence / name).unlink(missing_ok=True)
         source = command_output(['git', 'rev-parse', 'HEAD'])
         require(source == os.environ['OMG_CONTRACT_SOURCE_SHA'], 'checkout source mismatch')
@@ -471,9 +486,11 @@ def main():
             subprocess.run(['cargo', 'nextest', 'list', *cargo_args, '--message-format', 'json'],
                            stdout=stream, check=True)
         listing = COVERAGE.read_json(evidence / 'list.json')
-        required_binaries = ['omg::bin/omgd'] + [
+        required_binaries = ['omg', 'omg::bin/omgd'] + [
             'omg::' + cargo_args[index + 1] for index, value in enumerate(cargo_args) if value == '--test']
         SELECTION.selected_tests(listing, required_binaries)
+        library_path = library_subject(listing, Path.cwd())
+        library_before = sha256_file(library_path)
         subjects = {'omg': 'omg::cli_surface', 'omgd': 'omg::bin/omgd'}
         binaries = {binary: sha256_file(listing['rust-suites'][identity]['binary-path'])
                     for binary, identity in subjects.items()}
@@ -514,9 +531,22 @@ def main():
         for binary, identity in subjects.items():
             require(sha256_file(listing['rust-suites'][identity]['binary-path']) == binaries[binary],
                     'test binary changed between listing and execution')
+        library_after = sha256_file(library_path)
+        require(library_after == library_before, 'owning library changed between listing and execution')
         execution = SELECTION.reconcile(listing, junit.read_bytes(), required_binaries)
         write_json(evidence / 'selection.json', execution)
         require(execution['executed_required_binaries'], 'required test binary had no executed tests')
+        write_json(evidence / 'library-identity.json', {
+            'schema_version': 1, 'binary_id': 'omg', 'binary_name': 'omg_lib', 'kind': 'lib',
+            'subject_kind': 'nextest-library-test-harness', 'os': provenance['os'], 'arch': provenance['arch'],
+            'package_id': listing['rust-suites']['omg']['package-id'], 'binary_path': str(library_path),
+            'source_sha': source, 'recipe_sha256': provenance['recipe_sha256'],
+            'run_id': provenance['run_id'], 'run_attempt': provenance['run_attempt'],
+            'platform': provenance['platform'], 'features': provenance['features'],
+            'sha256_before': library_before, 'sha256_after': library_after,
+            'listing_sha256': sha256_file(evidence / 'list.json'),
+            'selection_sha256': sha256_file(evidence / 'selection.json'), 'matched': True,
+        })
         receipts, required = parser_receipts(manifest, provenance, execution)
         write_json(evidence / 'receipts.json', receipts)
         write_json(evidence / 'required.json', required)
