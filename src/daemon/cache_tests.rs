@@ -52,6 +52,15 @@ fn test_cache_miss_handling() {
     };
     cache.insert_info(info);
     assert!(!cache.is_info_miss("missing"));
+    let cached = cache.get_info("missing");
+    assert_eq!(
+        cached.as_ref().map(|info| info.name.as_str()),
+        Some("missing")
+    );
+    assert_eq!(
+        cached.as_ref().map(|info| info.version.as_str()),
+        Some("1.0")
+    );
 }
 
 #[test]
@@ -68,6 +77,25 @@ fn oversized_search_value_is_not_admitted_to_the_byte_bounded_cache() {
     cache.sync();
 
     assert!(cache.get("large").is_none());
+    cache.insert_arc(
+        "small".to_string(),
+        Arc::new(vec![PackageInfo {
+            name: "small-package".to_string(),
+            version: "1.0".to_string(),
+            description: "small payload".to_string(),
+            source: crate::daemon::protocol::WirePackageSource::Official,
+        }]),
+    );
+    cache.sync();
+    let cached = cache.get("small");
+    assert_eq!(
+        cached.as_ref().map(|rows| rows[0].name.as_str()),
+        Some("small-package")
+    );
+    assert_eq!(
+        cached.as_ref().map(|rows| rows[0].version.as_str()),
+        Some("1.0")
+    );
 }
 
 #[test]
@@ -107,6 +135,9 @@ fn test_system_status_cache() {
     cache.update_status(Arc::new(status));
     let cached = cache.get_status().unwrap();
     assert_eq!(cached.total_packages, 100);
+    assert_eq!(cached.explicit_packages, 10);
+    assert_eq!(cached.orphan_packages, 5);
+    assert_eq!(cached.updates_available, 2);
 }
 
 fn populated_cache(ttl_secs: u64, status_ttl_secs: u64) -> PackageCache {
