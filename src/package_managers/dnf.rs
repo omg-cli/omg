@@ -3465,7 +3465,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn string_arrays_require_every_declared_terminator() {
         for kind in [8, 9] {
