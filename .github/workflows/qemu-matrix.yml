@@ -94,6 +94,7 @@ jobs:
       - name: Workflow selection regression checks
         run: |
           python3 -m unittest discover -s tests -p test_qemu_workflow.py
+          python3 -m unittest discover -s tests -p test_qemu_companion_completeness.py
           python3 -m unittest discover -s tests -p test_qemu_verdict.py
           python3 -m unittest discover -s scripts -p test_prepare_qemu_release.py
           python3 -m unittest discover -s scripts -p test_qemu_arch_preparation.py
@@ -107,7 +108,7 @@ jobs:
           python3 -m unittest discover -s scripts -p test_qemu_maintenance_request.py
           python3 -m unittest discover -s scripts -p test_qemu_process_isolation.py
           python3 -m unittest discover -s scripts -p test_qemu_boot_diagnostics.py
-          python3 -m unittest discover -s scripts -p test_qemu_boot_timeout_budget.py
+          python3 scripts/run_qemu_boot_timeout_budget.py discover -s scripts -p test_qemu_boot_timeout_budget.py
           python3 -m unittest discover -s scripts -p test_qemu_runner_isolation.py
           python3 -m unittest discover -s scripts -p test_qemu_controller_floor.py
 
@@ -316,8 +317,14 @@ jobs:
           cache-bin: false
           cache-on-failure: false
 
+      - name: Install nextest for native Fedora integration tests
+        if: contains(matrix.features, 'fedora')
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: nextest
+
       - name: Run library and binary unit tests (including omgd)
-        run: cargo test --lib --bins --no-default-features --features ${{ matrix.features }} --locked --no-fail-fast -- --test-threads=1
+        run: python3 scripts/run-native-contracts.py --staged-units --features ${{ matrix.features }} --output "$RUNNER_TEMP/staged-unit-tests"
 
       - name: Build
         run: |
@@ -328,7 +335,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cargo-timings-arm64-${{ matrix.distro }}
-          path: target/cargo-timings/
+          path: |
+            target/cargo-timings/
+            ${{ runner.temp }}/staged-unit-tests/
           retention-days: 7
           if-no-files-found: ignore
 

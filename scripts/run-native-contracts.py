@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -330,10 +331,102 @@ def command_output(argv):
     return subprocess.check_output(argv, text=True, encoding='utf-8').strip()
 
 
+def fedora_source_tests():
+    source = Path('tests/fedora_tests.rs').read_text()
+    require(source.startswith('#![cfg(all(target_os = "linux", feature = "fedora"))]'),
+            'unreviewed Fedora target cfg')
+    require(len(re.findall(r'#!?\[cfg\(', source)) == 1, 'unreviewed Fedora conditional declarations')
+    modules = list(re.finditer(r'^mod (\w+) \{', source, re.M))
+    require([module[1] for module in modules] ==
+            ['dnf_integration', 'dnf_rpm_database', 'dnf_operations', 'dnf_error_handling'],
+            'unreviewed Fedora source modules')
+    pattern = r'    #\[(?:test|tokio::test)\]\n((?:    #\[[^\n]+\]\n)*)    (?:async )?fn (\w+)\('
+    declared = {}
+    for index, module in enumerate(modules):
+        section = source[module.end():modules[index + 1].start() if index + 1 < len(modules) else len(source)]
+        for attributes, name in re.findall(pattern, section):
+            require(all(re.fullmatch(r'    #\[(?:ignore = "[^"]+"|serial_test::serial\(history_ownership\))\]', line)
+                        for line in attributes.splitlines()), 'unreviewed Fedora test attributes')
+            identity = module[1] + '::' + name
+            require(identity not in declared, 'duplicate Fedora source test')
+            declared[identity] = '#[ignore' in attributes
+    require(len(declared) == len(re.findall(r'#\[(?:test|tokio::test)\]', source)),
+            'unaccounted Fedora source test')
+    common = Path('tests/common/mod.rs').read_text()
+    helper_tests = re.findall(pattern, common)
+    require(helper_tests == [('', 'explicit_timeout_overrides_inherited_timeout')],
+            'unreviewed Fedora helper tests')
+    require(len(helper_tests) == len(re.findall(r'#\[(?:test|tokio::test)\]', common)),
+            'unaccounted Fedora helper test')
+    require(not re.search(r'#\[(?:test|tokio::test)\]', Path('tests/platform_semantics.rs').read_text()),
+            'unreviewed Fedora platform helper tests')
+    declared['common::tests::explicit_timeout_overrides_inherited_timeout'] = False
+    return declared
+
+
+def staged_units(features, directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    if 'fedora' not in COVERAGE.strings(features.split(',')):
+        return subprocess.run(['cargo', 'test', '--lib', '--bins', '--no-default-features',
+                               '--features', features, '--locked', '--no-fail-fast',
+                               '--', '--test-threads=1'], check=False).returncode
+    native_args = cargo_test_args(features)
+    require('fedora_tests' in native_args, 'native Fedora target policy missing')
+    args = ['--lib', '--bins', '--test', 'fedora_tests'] + native_args[native_args.index('--no-default-features'):]
+    required = ['omg', 'omg::bin/omg', 'omg::bin/omgd', 'omg::fedora_tests']
+    junit = Path('target/nextest/ci/junit.xml')
+    for name in ('list.json', 'selection.json', 'recipe.json', 'admission-error.json',
+                 'source-tests.json', 'list.stderr.log', 'run.stdout.log', 'run.stderr.log', 'junit.xml'):
+        (directory / name).unlink(missing_ok=True)
+    junit.unlink(missing_ok=True)
+    try:
+        source = command_output(['git', 'rev-parse', 'HEAD'])
+        require(source == os.environ['GITHUB_SHA'], 'staged checkout source mismatch')
+        declared = fedora_source_tests()
+        write_json(directory / 'source-tests.json', {'fedora_tests': declared})
+        write_json(directory / 'recipe.json', {'source_sha': source, 'features': features,
+                   'cargo_args': args, 'required_binaries': required,
+                   'files': {name: sha256_file(name) for name in
+                             ('Cargo.toml', 'Cargo.lock', '.config/nextest.toml',
+                              'tests/fedora_tests.rs', 'tests/common/mod.rs', 'tests/platform_semantics.rs')}})
+        listed = subprocess.run(['cargo', 'nextest', 'list', *args, '--message-format', 'json'],
+                                capture_output=True, check=False)
+        (directory / 'list.json').write_bytes(listed.stdout)
+        (directory / 'list.stderr.log').write_bytes(listed.stderr)
+        require(listed.returncode == 0, 'staged native listing failed')
+        listing = COVERAGE.read_json(directory / 'list.json')
+        SELECTION.selected_tests(listing, required)
+        cases = listing['rust-suites']['omg::fedora_tests']['testcases']
+        require(declared.keys() <= cases.keys(), 'Fedora declaration missing from compiled listing')
+        require(cases.keys() == declared.keys(), 'unreviewed compiled Fedora test')
+        require(all(case['ignored'] == declared[name] and
+                    (declared[name] or case['filter-match']['status'] == 'matches')
+                    for name, case in cases.items()), 'Fedora declaration disposition mismatch')
+        result = subprocess.run(['cargo', 'nextest', 'run', *args, '--no-fail-fast', '--test-threads=1'],
+                                capture_output=True, check=False)
+        (directory / 'run.stdout.log').write_bytes(result.stdout)
+        (directory / 'run.stderr.log').write_bytes(result.stderr)
+        (directory / 'junit.xml').write_bytes(junit.read_bytes())
+        execution = SELECTION.reconcile(listing, junit.read_bytes(), required)
+        write_json(directory / 'selection.json', execution)
+        counts = execution['counts']
+        return int(bool(result.returncode or counts['failed'] or counts['retried']
+                        or counts['passed'] != counts['selected']
+                        or not execution['executed_required_binaries']))
+    except (ValueError, OSError, KeyError) as error:
+        write_json(directory / 'admission-error.json', {'error': str(error)})
+        return 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--features', required=True)
+    parser.add_argument('--staged-units', action='store_true')
+    parser.add_argument('--output', type=Path)
     args = parser.parse_args()
+    if args.staged_units:
+        require(args.output is not None, 'staged unit output directory required')
+        return staged_units(args.features, args.output)
     directory = Path(os.environ['OMG_CONTRACT_SURFACE_OUT'])
     directory.mkdir(parents=True, exist_ok=True)
     evidence = directory / 'execution'
