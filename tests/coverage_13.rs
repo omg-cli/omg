@@ -113,10 +113,18 @@ fn init_detects_project_runtimes_into_dockerfile() {
     project.create_file("go.mod", "module t\n");
     project.create_file("requirements.txt", "requests==2.31.0\n");
 
-    let result = project.run(&["container", "init"]);
+    use sha2::Digest as _;
+    let installer = b"#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$OMG_INSTALLER_PAYLOAD\"\n";
+    let digest = format!("{:x}", sha2::Sha256::digest(installer));
+    let pin = format!("https://sh.rustup.rs={digest}");
+    let result = project.run(&["container", "init", "--installer-digest", &pin]);
     result.assert_success();
 
     let dockerfile = project.read_file("Dockerfile.omg").expect("dockerfile");
+    assert!(
+        dockerfile.contains(&digest),
+        "supplied installer checksum must appear in recipe: {dockerfile}"
+    );
     for (runtime, package) in [
         ("node", "nodejs"),
         ("go", "golang-go"),
@@ -473,4 +481,409 @@ fn run_reports_malformed_env_entry_with_exact_guidance() {
     result.assert_failure();
     result.assert_stderr_contains("Invalid environment variable 'MALFORMED_NO_SEPARATOR'");
     result.assert_stderr_contains("expected KEY=VALUE");
+}
+
+#[test]
+fn init_rejects_invalid_installer_digests_before_project_writes() {
+    for (pins, expected) in [
+        (
+            vec!["https://sh.rustup.rs".to_string()],
+            "expected URL=SHA256",
+        ),
+        (
+            vec!["https://sh.rustup.rs=xyz".to_string()],
+            "64 hexadecimal characters",
+        ),
+        (
+            vec![
+                format!("https://sh.rustup.rs={}", "a".repeat(64)),
+                format!("https://sh.rustup.rs={}", "b".repeat(64)),
+            ],
+            "Duplicate installer digest",
+        ),
+        (
+            vec![format!(
+                "https://unused.invalid/installer={}",
+                "a".repeat(64)
+            )],
+            "not required by this project",
+        ),
+    ] {
+        let project = TestProject::new();
+        project.create_file("Cargo.toml", "[package]\nname = \"t\"\n");
+        let marker = fs::read(project.path().join("Cargo.toml")).expect("marker bytes");
+        let mut args = vec!["container", "init"];
+        for pin in &pins {
+            args.extend(["--installer-digest", pin.as_str()]);
+        }
+        let result = project.run(&args);
+        result.assert_failure();
+        result.assert_stderr_contains(expected);
+        assert!(!project.path().join("Dockerfile.omg").exists());
+        assert!(!project.path().join(".dockerignore").exists());
+        assert_eq!(
+            fs::read(project.path().join("Cargo.toml")).expect("marker survives"),
+            marker
+        );
+        project.close_checked();
+    }
+}
+
+#[test]
+fn init_generated_installer_chain_checks_bytes_before_execution() {
+    use sha2::Digest as _;
+    let project = TestProject::new();
+    project.create_file("Cargo.toml", "[package]\nname = \"t\"\n");
+    let installer = b"#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$OMG_INSTALLER_PAYLOAD\"\n";
+    let digest = format!("{:x}", sha2::Sha256::digest(installer));
+    let pin = format!("https://sh.rustup.rs={}", digest.to_ascii_uppercase());
+    let result = project.run(&["container", "init", "--installer-digest", &pin]);
+    result.assert_success();
+    let dockerfile = project
+        .read_file("Dockerfile.omg")
+        .expect("generated recipe");
+    let start = dockerfile
+        .find("RUN curl --proto")
+        .expect("installer RUN command");
+    let emitted = dockerfile[start..].split("\n\n").next().expect("RUN block");
+    let fixture = TempDir::new().expect("private installer provider");
+    let downloaded = fixture.path().join("downloaded.sh");
+    let bytes = fixture.path().join("installer.bytes");
+    let payload = fixture.path().join("payload.args");
+    let download_path = downloaded.to_str().expect("UTF-8 private path");
+    assert!(
+        download_path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+    );
+    // Translate only the fixed Docker /tmp path into this private fixture.
+    let chain = emitted
+        .strip_prefix("RUN ")
+        .expect("RUN prefix")
+        .replace("/tmp/omg-rustup-init.sh", download_path);
+    fs::write(&bytes, installer).expect("controlled installer bytes");
+    let curl = fixture.path().join("curl");
+    fs::write(&curl, "#!/bin/sh\nset -eu\n[ \"$#\" -eq 7 ]\n[ \"$1\" = --proto ]\n[ \"$2\" = '=https' ]\n[ \"$3\" = --tlsv1.2 ]\n[ \"$4\" = -sSf ]\n[ \"$5\" = -o ]\n[ \"$6\" = \"$OMG_PRIVATE_DOWNLOAD\" ]\n[ \"$7\" = https://sh.rustup.rs ]\ncat \"$OMG_INSTALLER_BYTES\" > \"$6\"\n").expect("curl fixture");
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).expect("executable provider");
+    let run = || {
+        std::process::Command::new("/bin/sh")
+            .args(["-c", chain.as_str()])
+            .current_dir(fixture.path())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", fixture.path().display()),
+            )
+            .env("OMG_PRIVATE_DOWNLOAD", &downloaded)
+            .env("OMG_INSTALLER_BYTES", &bytes)
+            .env("OMG_INSTALLER_PAYLOAD", &payload)
+            .output()
+            .expect("execute emitted chain")
+    };
+    let positive = run();
+    assert!(
+        positive.status.success(),
+        "{}",
+        String::from_utf8_lossy(&positive.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&payload).expect("installer ran"),
+        "-s -- -y --default-toolchain stable\n"
+    );
+    assert!(
+        !downloaded.exists(),
+        "successful chain cleans its private download"
+    );
+    fs::remove_file(&payload).expect("reset payload witness");
+    fs::write(
+        &bytes,
+        b"#!/bin/sh\nprintf tampered > \"$OMG_INSTALLER_PAYLOAD\"\n",
+    )
+    .expect("changed installer bytes");
+    let rejected = run();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stdout).contains("FAILED"));
+    assert!(
+        !payload.exists(),
+        "checksum failure must prevent installer execution"
+    );
+    assert!(
+        downloaded.exists(),
+        "changed bytes reached the real checksum check"
+    );
+    eprintln!(
+        "[installer-chain-fixture] matching_bytes=executed changed_bytes=rejected checksum=real_sha256sum translated_path=private"
+    );
+    fixture.close().expect("checked private provider cleanup");
+    project.close_checked();
+}
+
+// A local transport fixture: records CONNECT targets, returns 502, never forwards.
+struct InstallerRefusalProxy {
+    endpoint: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<std::io::Result<Vec<String>>>>,
+}
+
+impl InstallerRefusalProxy {
+    fn new() -> Self {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind private installer refusal proxy");
+        let endpoint = format!("http://{}", listener.local_addr().expect("proxy address"));
+        listener.set_nonblocking(true).expect("nonblocking proxy");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = std::sync::Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            while !worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+                        stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+                        let mut header = Vec::new();
+                        while !header.ends_with(b"\r\n\r\n") {
+                            if header.len() >= 8192 {
+                                return Err(std::io::Error::other(
+                                    "proxy header exceeded fixture bound",
+                                ));
+                            }
+                            let mut byte = [0];
+                            stream.read_exact(&mut byte)?;
+                            header.push(byte[0]);
+                        }
+                        let header = String::from_utf8(header).map_err(std::io::Error::other)?;
+                        requests.push(header.lines().next().unwrap_or_default().to_string());
+                        stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(requests)
+        });
+        Self {
+            endpoint,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn run(&self, project: &TestProject, args: &[&str]) -> CommandResult {
+        project.run_with_env(
+            args,
+            &[
+                ("HTTPS_PROXY", &self.endpoint),
+                ("https_proxy", &self.endpoint),
+                ("HTTP_PROXY", &self.endpoint),
+                ("http_proxy", &self.endpoint),
+                ("ALL_PROXY", &self.endpoint),
+                ("all_proxy", &self.endpoint),
+                ("NO_PROXY", ""),
+                ("no_proxy", ""),
+                ("PATH", no_runtime_path().as_str()),
+                ("OMG_TEST_COMMAND_TIMEOUT_SECS", "25"),
+            ],
+        )
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.worker
+            .take()
+            .expect("owned proxy worker")
+            .join()
+            .expect("proxy worker panicked")
+            .expect("proxy fixture I/O failed")
+    }
+}
+
+impl Drop for InstallerRefusalProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            match worker.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("installer proxy cleanup I/O error: {error}"),
+                Err(_) => eprintln!("installer proxy cleanup observed worker panic"),
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InstallerFixtureFile {
+    bytes: Vec<u8>,
+    len: u64,
+    mode: u32,
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    links: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn installer_fixture_file(project: &TestProject, name: &str) -> InstallerFixtureFile {
+    use std::os::unix::fs::MetadataExt as _;
+    let path = project.path().join(name);
+    let metadata = fs::symlink_metadata(&path).expect("fixture file metadata");
+    assert!(
+        metadata.is_file(),
+        "fixture must remain a regular file: {name}"
+    );
+    InstallerFixtureFile {
+        bytes: fs::read(path).expect("fixture file bytes"),
+        len: metadata.len(),
+        mode: metadata.mode(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        group: metadata.gid(),
+        links: metadata.nlink(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    }
+}
+
+fn installer_fixture_members(project: &TestProject) -> Vec<std::ffi::OsString> {
+    let mut names = fs::read_dir(project.path())
+        .expect("private project membership")
+        .map(|entry| entry.expect("private project entry").file_name())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[test]
+fn init_repeatable_explicit_installer_pins_avoid_fetch_for_both_urls() {
+    const NODE_PIN: &str = "https://deb.nodesource.com/setup_20.x=0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+    const RUST_PIN: &str =
+        "https://sh.rustup.rs=FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210";
+    for pins in [[NODE_PIN, RUST_PIN], [RUST_PIN, NODE_PIN]] {
+        let project = TestProject::new();
+        project.create_file(".node-version", "20\n");
+        project.create_file(
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        );
+        let before_node = installer_fixture_file(&project, ".node-version");
+        let before_cargo = installer_fixture_file(&project, "Cargo.toml");
+        let proxy = InstallerRefusalProxy::new();
+        let result = proxy.run(
+            &project,
+            &[
+                "container",
+                "init",
+                "--installer-digest",
+                pins[0],
+                "--installer-digest",
+                pins[1],
+            ],
+        );
+        let requests = proxy.finish();
+        result.assert_success();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            requests,
+            Vec::<String>::new(),
+            "all explicit pins must avoid installer requests"
+        );
+        result.assert_stdout_contains("Created Dockerfile.omg");
+        result.assert_stdout_contains("node: 20");
+        result.assert_stdout_contains("rust: stable");
+        let recipe = project
+            .read_file("Dockerfile.omg")
+            .expect("generated recipe");
+        assert!(recipe.starts_with("FROM ubuntu:24.04\n"));
+        assert!(recipe.contains("ENV NODE_VERSION=20\n"));
+        assert!(recipe.contains(
+            "RUN curl -fsSL -o /tmp/nodesource-setup.sh https://deb.nodesource.com/setup_20.x \\\n"
+        ));
+        assert!(recipe.contains("    https://sh.rustup.rs \\\n"));
+        assert!(recipe.contains("    && echo \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  /tmp/nodesource-setup.sh\" | sha256sum -c - \\\n"));
+        assert!(recipe.contains("    && echo \"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210  /tmp/omg-rustup-init.sh\" | sha256sum -c - \\\n"));
+        assert_eq!(recipe.matches("sha256sum -c -").count(), 2);
+        assert!(recipe.contains("--default-toolchain stable"));
+        assert!(!recipe.contains("# WARNING: no pinned digest"));
+        assert_eq!(
+            installer_fixture_file(&project, ".node-version"),
+            before_node
+        );
+        assert_eq!(installer_fixture_file(&project, "Cargo.toml"), before_cargo);
+        eprintln!(
+            "[installer-two-pin-fixture] supplied=2 requests=0 normalized_checksums=2 input_state=unchanged"
+        );
+        project.close_checked();
+    }
+}
+
+#[test]
+fn init_partial_installer_pins_fetch_only_missing_url_and_preserve_outputs_on_error() {
+    for (supplied, missing, connect) in [
+        (
+            "https://sh.rustup.rs=FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210",
+            "https://deb.nodesource.com/setup_20.x",
+            "CONNECT deb.nodesource.com:443 HTTP/1.1",
+        ),
+        (
+            "https://deb.nodesource.com/setup_20.x=0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+            "https://sh.rustup.rs",
+            "CONNECT sh.rustup.rs:443 HTTP/1.1",
+        ),
+    ] {
+        let project = TestProject::new();
+        project.create_file(".node-version", "20\n");
+        project.create_file(
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        );
+        for name in [
+            ".dockerignore",
+            "Dockerfile.omg.dockerignore",
+            ".containerignore",
+        ] {
+            project.create_file(name, "# keep my build context rules\n!local-fixture.txt\n");
+            fs::set_permissions(project.path().join(name), fs::Permissions::from_mode(0o640))
+                .expect("private ignore permissions");
+        }
+        let names = [
+            ".node-version",
+            "Cargo.toml",
+            ".dockerignore",
+            "Dockerfile.omg.dockerignore",
+            ".containerignore",
+        ];
+        let before = names.map(|name| installer_fixture_file(&project, name));
+        let membership = installer_fixture_members(&project);
+        let proxy = InstallerRefusalProxy::new();
+        let result = proxy.run(
+            &project,
+            &["container", "init", "--installer-digest", supplied],
+        );
+        let requests = proxy.finish();
+        result.assert_failure();
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(
+            requests,
+            [connect],
+            "fetch must target exactly the missing installer"
+        );
+        result.assert_stderr_contains(&format!("Failed to pin {missing} for verification"));
+        result.assert_stderr_contains(&format!("Failed to fetch {missing} for digest pinning"));
+        assert!(!result.stderr.contains("[test harness timeout]"));
+        assert!(!result.stdout.contains("Created Dockerfile.omg"));
+        assert!(!project.path().join("Dockerfile.omg").exists());
+        assert_eq!(installer_fixture_members(&project), membership);
+        assert_eq!(
+            names.map(|name| installer_fixture_file(&project, name)),
+            before
+        );
+        eprintln!(
+            "[installer-partial-pin-fixture] missing={missing} requests=1 exit=1 project_state=unchanged"
+        );
+        project.close_checked();
+    }
 }

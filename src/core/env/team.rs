@@ -455,6 +455,7 @@ impl TeamWorkspace {
         // pull or checkout.
         let omg = std::env::current_exe()
             .map_or_else(|_| "omg".to_string(), |exe| exe.display().to_string());
+        let omg = crate::hooks::posix_single_quoted(&omg);
 
         let hooks_dir = self.root.join(".git/hooks");
         std::fs::create_dir_all(&hooks_dir)
@@ -470,7 +471,7 @@ impl TeamWorkspace {
 
 if [ -f "omg.lock" ]; then
     echo "🔄 OMG: Checking for environment drift..."
-    "{omg}" env check 2>/dev/null || echo "⚠️  OMG: Environment drift detected! Run 'omg env check' for details."
+    {omg} env check 2>/dev/null || echo "⚠️  OMG: Environment drift detected! Run 'omg env check' for details."
 fi
 "#,
             ),
@@ -484,7 +485,7 @@ fi
 # Auto-check for environment drift after git checkout
 
 if [ -f "omg.lock" ]; then
-    "{omg}" env check 2>/dev/null || true
+    {omg} env check 2>/dev/null || true
 fi
 "#,
             ),

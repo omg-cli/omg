@@ -216,3 +216,4 @@ runtime-node-switch-installed	["use","node","v24.21.0"]	isolated-write	0	pass	-	
 runtime-python-switch-installed	["use","python","v3.12.14"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop
 runtime-go-switch-installed	["use","go","v1.27.1"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-switch-state	tempdir-drop
 runtime-rust-install	["use","rust","1.85.0"]	isolated-write	0	pass	-	container	arch:pass,debian:pass,ubuntu:pass,fedora:pass	runtime-rust-installed	tempdir-drop
+container-init-invalid-installer-digest	["container","init","--base","debian:bookworm","--installer-digest","missing-equals"]	controlled-error	1	pass	-	hermetic	hermetic:pass	container-installer-digest-refusal	tempdir-drop

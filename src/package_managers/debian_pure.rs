@@ -910,11 +910,21 @@ mod tests {
 
     #[tokio::test]
     async fn native_sync_executes_exact_apt_update_command() {
-        let (_directory, program) = fake_apt_script("[ \"$#\" -eq 1 ] && [ \"$1\" = update ]");
+        let (_directory, program) = fake_apt_script(
+            "printf '%s\n' \"$#\" \"$@\" >> \"$0.invocations\"\n[ \"$#\" -eq 1 ] && [ \"$1\" = update ]",
+        );
+        let invocations = program.with_extension("invocations");
+        std::fs::write(&invocations, []).expect("initialize private apt invocation record");
 
         update_apt_lists(&program, false)
             .await
             .expect("apt update command must succeed");
+
+        assert_eq!(
+            std::fs::read(&invocations).expect("read apt invocation record"),
+            b"1\nupdate\n",
+            "apt must run exactly once with the sole argument update",
+        );
     }
 
     #[tokio::test]
@@ -929,5 +939,59 @@ mod tests {
             chain.contains("exit status: 23"),
             "unexpected apt failure: {chain}"
         );
+    }
+    #[test]
+    fn package_url_normalizes_trailing_slash_on_publishing_repository() {
+        let package = DebianPackage {
+            name: "example".to_string(),
+            version: "1.0".to_string(),
+            description: String::new(),
+            section: "utils".to_string(),
+            priority: "optional".to_string(),
+            installed_size: 1,
+            maintainer: String::new(),
+            architecture: "amd64".to_string(),
+            depends: Vec::new(),
+            filename: "pool/example_1.0_amd64.deb".to_string(),
+            size: 1,
+            sha256: "a".repeat(64),
+            homepage: String::new(),
+            component: "main".to_string(),
+            suite: "stable".to_string(),
+            source_key: "trusted.example_debian".to_string(),
+        };
+        let packages = HashMap::from([(package.name.clone(), package)]);
+        let repository = |uri: &str| Repository {
+            repo_type: RepoType::Binary,
+            uri: uri.to_string(),
+            suite: "stable".to_string(),
+            components: vec!["main".to_string()],
+            arch: None,
+            signed_by: None,
+            enabled: true,
+            source_file: PathBuf::from("sources.list"),
+            options: HashMap::new(),
+        };
+        for uri in [
+            "https://trusted.example/debian/",
+            "https://trusted.example/debian",
+        ] {
+            let repos = vec![repository(uri)];
+            let mut action = PackageAction {
+                name: "example".to_string(),
+                version: String::new(),
+                deb_path: None,
+                url: None,
+                size: 0,
+                sha256: None,
+            };
+
+            populate_action_url(&mut action, &packages, &repos)
+                .expect("publishing repository must be selected");
+            assert_eq!(
+                action.url.as_deref(),
+                Some("https://trusted.example/debian/pool/example_1.0_amd64.deb")
+            );
+        }
     }
 }

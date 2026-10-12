@@ -1013,6 +1013,7 @@ fn check_pacman_lock(db_path: Option<&str>) -> usize {
 fn check_eol_runtimes() -> Result<usize> {
     let mut issues = 0;
     let mut probed = 0;
+    let mut unknown = 0;
     let now = jiff::Timestamp::now();
     let warning_ts = crate::runtimes::eol::eol_warning_cutoff(now)
         .context("Failed to compute EOL warning window")?;
@@ -1031,24 +1032,33 @@ fn check_eol_runtimes() -> Result<usize> {
             let mut eol_warning = None;
 
             let components = crate::runtimes::eol::version_components(&version);
-            if let Some(entry) = crate::runtimes::eol::find_eol_entry(runtime, &components) {
-                let eol_date = jiff::civil::Date::strptime("%Y-%m-%d", entry.eol_date)
-                    .with_context(|| {
-                        format!(
-                            "Invalid EOL date {:?} for {runtime} in the canonical runtime table",
-                            entry.eol_date
-                        )
-                    })?;
-                let zoned = eol_date
-                    .at(0, 0, 0, 0)
-                    .to_zoned(jiff::tz::TimeZone::UTC)
-                    .context("Failed to convert runtime EOL date to UTC")?;
-                let eol_timestamp = zoned.timestamp();
-                if now > eol_timestamp {
-                    eol_warning = Some(format!("EOL since {}", entry.eol_date));
-                } else if warning_ts > eol_timestamp {
-                    eol_warning = Some(format!("EOL on {}", entry.eol_date));
-                }
+            let Some(entry) = crate::runtimes::eol::find_eol_entry(runtime, &components) else {
+                println!(
+                    "  {} {} {} - {}",
+                    style::warning("?"),
+                    style::runtime(runtime),
+                    style::version(&version),
+                    style::dim("Support data unavailable")
+                );
+                unknown += 1;
+                continue;
+            };
+            let eol_date =
+                jiff::civil::Date::strptime("%Y-%m-%d", entry.eol_date).with_context(|| {
+                    format!(
+                        "Invalid EOL date {:?} for {runtime} in the canonical runtime table",
+                        entry.eol_date
+                    )
+                })?;
+            let zoned = eol_date
+                .at(0, 0, 0, 0)
+                .to_zoned(jiff::tz::TimeZone::UTC)
+                .context("Failed to convert runtime EOL date to UTC")?;
+            let eol_timestamp = zoned.timestamp();
+            if now > eol_timestamp {
+                eol_warning = Some(format!("EOL since {}", entry.eol_date));
+            } else if warning_ts > eol_timestamp {
+                eol_warning = Some(format!("EOL on {}", entry.eol_date));
             }
 
             if let Some(warning) = eol_warning {
@@ -1073,7 +1083,7 @@ fn check_eol_runtimes() -> Result<usize> {
 
     if probed == 0 {
         println!("  {}", style::dim("No managed runtimes were detected."));
-    } else if issues == 0 {
+    } else if issues == 0 && unknown == 0 {
         println!(
             "  {}",
             style::dim("All detected runtimes are within support period.")

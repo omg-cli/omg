@@ -94,6 +94,7 @@ jobs:
       - name: Workflow selection regression checks
         run: |
           python3 -m unittest discover -s tests -p test_qemu_workflow.py
+          python3 -m unittest discover -s tests -p test_qemu_companion_completeness.py
           python3 -m unittest discover -s tests -p test_qemu_verdict.py
           python3 -m unittest discover -s scripts -p test_prepare_qemu_release.py
           python3 -m unittest discover -s scripts -p test_qemu_arch_preparation.py
@@ -103,9 +104,20 @@ jobs:
           python3 -m unittest discover -s scripts -p test_qemu_guest_profile.py
           python3 -m unittest discover -s scripts -p test_qemu_image_provenance.py
           python3 -m unittest discover -s scripts -p test_qemu_image_cache.py
+          python3 -m unittest discover -s scripts -p test_qemu_review.py
+          python3 -m unittest discover -s scripts -p test_qemu_maintenance_request.py
           python3 -m unittest discover -s scripts -p test_qemu_process_isolation.py
+          python3 -m unittest discover -s scripts -p test_qemu_boot_diagnostics.py
+          python3 scripts/run_qemu_boot_timeout_budget.py discover -s scripts -p test_qemu_boot_timeout_budget.py
           python3 -m unittest discover -s scripts -p test_qemu_runner_isolation.py
           python3 -m unittest discover -s scripts -p test_qemu_controller_floor.py
+
+      - name: Verify update identity and daemon lifecycle rejection cases
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          python3 -B -m unittest discover -s scripts -p test_update_identity_runner.py -v
+          python3 -B -m unittest discover -s scripts -p test_debian_daemon_catalog_lifecycle.py -v
 
       - name: Verify harness and reporting fixtures before guest builds
         run: |
@@ -133,25 +145,25 @@ jobs:
                 "distro": "arch",
                 "image": "archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6",
                 "features": "arch,pgp,license",
-                "setup": "pacman -Syu --noconfirm\npacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq\n"
+                "setup": "pacman -Syu --noconfirm\npacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python fish\n"
               },
               {
                 "distro": "debian",
                 "image": "debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931",
                 "features": "debian,pgp,license",
-                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
+                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 python3-venv fish \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
               },
               {
                 "distro": "debian-trixie",
                 "image": "debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958",
                 "features": "debian,pgp,license",
-                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 python3-apt \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
+                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
               },
               {
                 "distro": "fedora",
                 "image": "fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
                 "features": "fedora,pgp,license",
-                "setup": "timeout -k 10s 12m dnf \\\n  --setopt='*.skip_if_unavailable=False' \\\n  install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\n"
+                "setup": "timeout -k 10s 12m dnf \\\n  --setopt='*.skip_if_unavailable=False' \\\n  install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 fish \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\n"
               }
             ]
           BUILD_ARM64: |
@@ -160,13 +172,13 @@ jobs:
                 "distro": "debian",
                 "image": "debian:bookworm@sha256:5eac3978974cfa26a880057766c683e55c5763355d30a8beecbd263e0e1621d9",
                 "features": "debian,pgp,license",
-                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
+                "setup": "apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  ca-certificates curl git build-essential pkg-config sudo python3 python3-venv fish \\\n  libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev\n"
               },
               {
                 "distro": "fedora",
                 "image": "fedora:latest@sha256:e402cca673711fee025f9ce21c6c08b1bd25ee26b3c482119c8675fbaaedbc85",
                 "features": "fedora,pgp,license",
-                "setup": "timeout -k 10s 12m dnf \\\n  --setopt='*.skip_if_unavailable=False' \\\n  install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\n"
+                "setup": "timeout -k 10s 12m dnf \\\n  --setopt='*.skip_if_unavailable=False' \\\n  install -y --setopt=install_weak_deps=False \\\n  git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 fish \\\n  rpm dnf sqlite yum-utils fedora-release\nrpm --initdb\n"
               }
             ]
           REQUESTED_RELEASE_TAG: ${{ inputs.tag }}
@@ -305,8 +317,14 @@ jobs:
           cache-bin: false
           cache-on-failure: false
 
+      - name: Install nextest for native Fedora integration tests
+        if: contains(matrix.features, 'fedora')
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: nextest
+
       - name: Run library and binary unit tests (including omgd)
-        run: cargo test --lib --bins --no-default-features --features ${{ matrix.features }} --locked --no-fail-fast -- --test-threads=1
+        run: python3 scripts/run-native-contracts.py --staged-units --features ${{ matrix.features }} --output "$RUNNER_TEMP/staged-unit-tests"
 
       - name: Build
         run: |
@@ -317,7 +335,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cargo-timings-arm64-${{ matrix.distro }}
-          path: target/cargo-timings/
+          path: |
+            target/cargo-timings/
+            ${{ runner.temp }}/staged-unit-tests/
           retention-days: 7
           if-no-files-found: ignore
 
@@ -355,7 +375,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libapt-pkg-dev \
+            libapt-pkg-dev python3-venv fish \
             pkg-config \
             libssl-dev \
             clang \

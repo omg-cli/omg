@@ -605,15 +605,28 @@ mod tests {
         let error = clean(true, false, false, false, false, true)
             .await
             .expect_err("orphan removal with no backend must not look like success");
-        let expected = match crate::package_managers::resolve_backend() {
-            Ok(crate::package_managers::Backend::MacOS) => {
-                "Package cleanup is not implemented for the Homebrew backend".to_string()
+        use crate::core::env::distro::Distro;
+        let expected = match crate::core::env::distro::detect_distro() {
+            Distro::MacOS => "Package cleanup is not implemented for the Homebrew backend",
+            Distro::Arch => {
+                "This omg binary lacks the arch package backend required by Arch. Install the matching distro build, or rebuild with --no-default-features --features arch,pgp,license"
             }
-            Err(error) => error.to_string(),
-            Ok(_) => "not available without an Arch or Debian package backend".to_string(),
+            Distro::Debian => {
+                "This omg binary lacks the debian package backend required by Debian. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Ubuntu => {
+                "This omg binary lacks the debian package backend required by Ubuntu. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Fedora => {
+                "This omg binary lacks the fedora package backend required by Fedora. Install the matching distro build, or rebuild with --no-default-features --features fedora,pgp,license"
+            }
+            Distro::Unknown => {
+                "Unsupported Linux distribution: no live package backend can be selected"
+            }
         };
-        assert!(
-            error.to_string().contains(&expected),
+        assert_eq!(
+            error.to_string(),
+            expected,
             "selected backend must fail with its own unsupported-operation cause: {error}"
         );
     }
@@ -629,15 +642,28 @@ mod tests {
         let error = clean(false, true, false, false, false, true)
             .await
             .expect_err("cache cleanup with no backend must not look like success");
-        let expected = match crate::package_managers::resolve_backend() {
-            Ok(crate::package_managers::Backend::MacOS) => {
-                "Package cleanup is not implemented for the Homebrew backend".to_string()
+        use crate::core::env::distro::Distro;
+        let expected = match crate::core::env::distro::detect_distro() {
+            Distro::MacOS => "Package cleanup is not implemented for the Homebrew backend",
+            Distro::Arch => {
+                "This omg binary lacks the arch package backend required by Arch. Install the matching distro build, or rebuild with --no-default-features --features arch,pgp,license"
             }
-            Err(error) => error.to_string(),
-            Ok(_) => "not available without a package manager backend".to_string(),
+            Distro::Debian => {
+                "This omg binary lacks the debian package backend required by Debian. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Ubuntu => {
+                "This omg binary lacks the debian package backend required by Ubuntu. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Fedora => {
+                "This omg binary lacks the fedora package backend required by Fedora. Install the matching distro build, or rebuild with --no-default-features --features fedora,pgp,license"
+            }
+            Distro::Unknown => {
+                "Unsupported Linux distribution: no live package backend can be selected"
+            }
         };
-        assert!(
-            error.to_string().contains(&expected),
+        assert_eq!(
+            error.to_string(),
+            expected,
             "selected backend must fail with its own unsupported-operation cause: {error}"
         );
     }
@@ -648,15 +674,37 @@ mod tests {
         let error = clean(false, false, true, false, false, true)
             .await
             .expect_err("AUR cleanup without the Arch backend must not look like success");
-        let expected = match crate::package_managers::resolve_backend() {
-            Ok(crate::package_managers::Backend::MacOS) => {
-                "Package cleanup is not implemented for the Homebrew backend".to_string()
+        use crate::core::env::distro::Distro;
+        let expected = match crate::core::env::distro::detect_distro() {
+            Distro::MacOS => "Package cleanup is not implemented for the Homebrew backend",
+            Distro::Debian | Distro::Ubuntu if cfg!(feature = "debian") => {
+                "AUR cleanup is not available without the Arch backend"
             }
-            Err(error) => error.to_string(),
-            Ok(_) => "AUR cleanup is not available".to_string(),
+            Distro::Debian | Distro::Ubuntu if cfg!(feature = "debian-pure") => {
+                "The Debian indexing feature is not a live APT backend. Install the Debian/Ubuntu omg build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Fedora if cfg!(feature = "fedora") => {
+                "AUR cleanup is not available without the Arch backend"
+            }
+            Distro::Arch => {
+                "This omg binary lacks the arch package backend required by Arch. Install the matching distro build, or rebuild with --no-default-features --features arch,pgp,license"
+            }
+            Distro::Debian => {
+                "This omg binary lacks the debian package backend required by Debian. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Ubuntu => {
+                "This omg binary lacks the debian package backend required by Ubuntu. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Fedora => {
+                "This omg binary lacks the fedora package backend required by Fedora. Install the matching distro build, or rebuild with --no-default-features --features fedora,pgp,license"
+            }
+            Distro::Unknown => {
+                "Unsupported Linux distribution: no live package backend can be selected"
+            }
         };
-        assert!(
-            error.to_string().contains(&expected),
+        assert_eq!(
+            error.to_string(),
+            expected,
             "AUR cleanup without Arch must fail closed; got: {error}"
         );
     }

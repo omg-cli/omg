@@ -42,6 +42,50 @@ fn save_then_load_round_trips_and_recomputes_the_hash() -> anyhow::Result<()> {
     let loaded = EnvironmentState::load(&path)?;
     assert_eq!(loaded, state, "round trip must preserve the captured state");
     assert_eq!(loaded.hash, loaded.calculate_hash());
+    assert_eq!(
+        loaded.hash, "53dfe6793863d51c845812eb17564e2467145bebb0ec5e0393a8b1d8748e1279",
+        "saving schema 1 must preserve its persisted checksum format"
+    );
+    Ok(())
+}
+
+#[test]
+fn load_accepts_an_existing_schema_one_checksum_vector() -> anyhow::Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let path = dir.path().join("omg.lock");
+    // Persisted schema-1 compatibility fixture: its checksum is independent
+    // of calculate_hash, save, and the round-trip fixture helper.
+    let existing = r#"schema_version = 1
+packages = ["curl", "git"]
+timestamp = 1700000000
+hash = "d4200fe86d90a99e4978323dac506e87218cc2715056e0d2705db2e3b492112e"
+
+[runtimes]
+node = "22.1.0"
+rust = "1.95.0"
+"#;
+    std::fs::write(&path, existing)?;
+    let loaded =
+        EnvironmentState::load(&path).expect("an existing schema-1 lockfile must remain readable");
+    assert_eq!(loaded.schema_version, 1);
+    assert_eq!(
+        loaded.runtimes,
+        BTreeMap::from([
+            ("node".to_owned(), "22.1.0".to_owned()),
+            ("rust".to_owned(), "1.95.0".to_owned()),
+        ])
+    );
+    assert_eq!(loaded.packages, ["curl", "git"]);
+    assert_eq!(loaded.timestamp, 1_700_000_000);
+    assert_eq!(
+        loaded.hash,
+        "d4200fe86d90a99e4978323dac506e87218cc2715056e0d2705db2e3b492112e"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        existing,
+        "loading a compatible lockfile must not rewrite it"
+    );
     Ok(())
 }
 
@@ -616,11 +660,14 @@ fn snapshot_restores_all_registered_installed_runtimes_and_executes_selected_pay
         for version in [&target, &changed] {
             let path = versions.join(version).join(&binary);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &path,
-                format!("#!/bin/sh\nprintf '%s\\n' 'fixture-{name}-{version}'\n"),
-            )
-            .unwrap();
+            let script = if name == "node" {
+                format!(
+                    "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"--version\" ]; then\n    printf '%s\\n' 'v{version}'\nelse\n    printf '%s\\n' 'fixture-{name}-{version}'\nfi\n"
+                )
+            } else {
+                format!("#!/bin/sh\nprintf '%s\\n' 'fixture-{name}-{version}'\n")
+            };
+            std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
             if name == "pi" {
                 let manifest = versions
@@ -672,6 +719,14 @@ fn snapshot_restores_all_registered_installed_runtimes_and_executes_selected_pay
                 format!("fixture-{name}-{version}\n").as_bytes(),
                 "{name}"
             );
+            if name.as_str() == "node" {
+                let banner = std::process::Command::new(versions.join(directory).join(binary))
+                    .arg("--version")
+                    .output()
+                    .unwrap();
+                assert!(banner.status.success(), "node version: {banner:?}");
+                assert_eq!(banner.stdout, format!("v{version}\n").as_bytes());
+            }
         }
     }
     project.run(&["env", "check"]).assert_success();

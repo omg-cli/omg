@@ -149,10 +149,16 @@ fn test_install_dry_run() {
 #[test]
 fn test_remove_dry_run() {
     // ===== ARRANGE =====
+    let project = TestProject::new();
+    project.mock_install("pacman", "6.0.2").unwrap();
+    let state_path = project.data_dir.path().join("mock_state_pacman.json");
+    let before = std::fs::read(&state_path).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(state["installed"]["pacman"].as_str(), Some("6.0.2"));
     let package = "pacman";
 
     // ===== ACT =====
-    let result = run_omg(&["remove", "--dry-run", package]);
+    let result = project.run(&["remove", "--dry-run", package]);
 
     // ===== ASSERT =====
     result.assert_success();
@@ -162,6 +168,10 @@ fn test_remove_dry_run() {
         "Remove preview should state dry-run mode. Got:\n{}",
         result.stdout
     );
+    result.assert_stdout_contains("6.0.2");
+    result.assert_stdout_contains("No changes made (dry run)");
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    project.close_checked();
 }
 
 // Falsifiable contract: doctor must run to completion and render its report

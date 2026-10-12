@@ -698,30 +698,42 @@ fn open_read_file(path: &Path) -> Result<File, AuditError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    options.open(path).map_err(|source| AuditError::Open {
-        path: path.display().to_string(),
-        source,
-    })
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    open_regular_audit_file(&options, path)
 }
 
 fn open_lock_file(path: &Path) -> Result<File, AuditError> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
     #[cfg(unix)]
-    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    options.open(path).map_err(|source| AuditError::Open {
-        path: path.display().to_string(),
-        source,
-    })
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    open_regular_audit_file(&options, path)
 }
 
 fn open_append_file(path: &Path) -> Result<File, AuditError> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).append(true);
     #[cfg(unix)]
-    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    options.open(path).map_err(|source| AuditError::Open {
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    open_regular_audit_file(&options, path)
+}
+
+fn open_regular_audit_file(options: &OpenOptions, path: &Path) -> Result<File, AuditError> {
+    let open = || -> io::Result<File> {
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audit storage must be a regular file",
+            ));
+        }
+        Ok(file)
+    };
+    open().map_err(|source| AuditError::Open {
         path: path.display().to_string(),
         source,
     })
@@ -2898,6 +2910,92 @@ mod completeness_tests {
 mod recovery_diagnostic_tests {
     use super::*;
     use anyhow::Context;
+
+    #[cfg(unix)]
+    async fn special_file_contract(name: &str, mode: &str) -> anyhow::Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+        const MARKER: &str = "OMG_AUDIT_SPECIAL_FILE_CHILD";
+        if let Some(path) = std::env::var_os(MARKER) {
+            let path = PathBuf::from(path);
+            let mut logger = AuditLogger::new_in(&path)?;
+            logger.log(
+                AuditEventType::SecurityAudit,
+                AuditSeverity::Info,
+                "pkg",
+                "retained",
+            )?;
+            let original = std::fs::read(&path)?;
+            let target = if mode == "lock" {
+                path.with_extension("lock")
+            } else {
+                path.clone()
+            };
+            let retained = target.with_extension("retained");
+            std::fs::rename(&target, &retained)?;
+            nix::unistd::mkfifo(
+                &target,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )?;
+            let error = match mode {
+                "constructor" | "lock" => AuditLogger::new_in(&path).err(),
+                "recent" => logger.get_recent(10).err(),
+                "verify" => logger.verify_integrity().err(),
+                _ => anyhow::bail!("unknown special-file fixture"),
+            }
+            .context("audit storage must refuse a special file")?;
+            anyhow::ensure!(
+                matches!(error, AuditError::Open { ref source, .. }
+                if source.kind() == io::ErrorKind::InvalidInput),
+                "{error:?}"
+            );
+            if mode == "lock" {
+                assert_eq!(std::fs::read(&path)?, original);
+            } else {
+                assert_eq!(std::fs::read(&retained)?, original);
+            }
+            assert!(std::fs::symlink_metadata(&target)?.file_type().is_fifo());
+            println!("AUDIT_SPECIAL_FILE_COMPLETED {mode}");
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        isolated_child(name, MARKER, path.as_os_str()).await?;
+        let retained = if mode == "lock" {
+            path.with_extension("lock").with_extension("retained")
+        } else {
+            path.with_extension("retained")
+        };
+        anyhow::ensure!(
+            retained.is_file(),
+            "owned child must execute the storage fixture"
+        );
+        directory.close()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_constructor_refuses_fifo_without_waiting() -> anyhow::Result<()> {
+        special_file_contract("core::security::audit::recovery_diagnostic_tests::audit_constructor_refuses_fifo_without_waiting", "constructor").await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_recent_refuses_fifo_without_waiting() -> anyhow::Result<()> {
+        special_file_contract("core::security::audit::recovery_diagnostic_tests::audit_recent_refuses_fifo_without_waiting", "recent").await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_verify_refuses_fifo_without_waiting() -> anyhow::Result<()> {
+        special_file_contract("core::security::audit::recovery_diagnostic_tests::audit_verify_refuses_fifo_without_waiting", "verify").await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_lock_refuses_fifo_without_waiting() -> anyhow::Result<()> {
+        special_file_contract("core::security::audit::recovery_diagnostic_tests::audit_lock_refuses_fifo_without_waiting", "lock").await
+    }
 
     fn quarantines(parent: &Path) -> anyhow::Result<Vec<PathBuf>> {
         Ok(std::fs::read_dir(parent)?

@@ -9,6 +9,7 @@ pub(super) fn query_args(details: bool) -> Vec<&'static str> {
     vec![
         if details { "--cacheonly" } else { "--refresh" },
         "--setopt=*.skip_if_unavailable=false",
+        "--setopt=disable_excludes=*",
         "advisory",
         if details { "info" } else { "list" },
         "--available",
@@ -208,6 +209,38 @@ pub(super) fn join_advisories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires Fedora DNF5 and a metadata-only advisory fixture configuration"]
+    fn native_advisory_scope_includes_excluded_installed_packages() -> Result<()> {
+        let config = std::env::var("OMG_DNF_ADVISORY_FIXTURE_CONFIG")
+            .context("set the isolated Fedora advisory fixture configuration")?;
+        let mut responses = Vec::new();
+        for details in [false, true] {
+            let output = crate::core::privilege::system_command("dnf")?
+                .arg(format!("--config={config}"))
+                .args(["--disable-plugin=*", "--setopt=excludepkgs=glibc*"])
+                .args(query_args(details))
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "native advisory fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            responses.push(output.stdout);
+        }
+        let joined = join_advisories(&responses[0], &responses[1])?;
+        let findings = joined
+            .iter()
+            .map(|(row, _)| (row.name.as_str(), row.severity.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            findings,
+            vec![("OMG-QEMU-FEDORA-616", "Important")],
+            "excluded installed software must remain in security findings"
+        );
+        Ok(())
+    }
 
     #[test]
     fn missing_repository_scope_cannot_be_reported_clean() {

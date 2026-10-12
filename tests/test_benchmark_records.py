@@ -634,6 +634,65 @@ class FedoraBenchmarkIdentityTests(unittest.TestCase):
         body = text.split(marker, 1)[1].split("\n    }\n", 1)[0]
         return name + "() {\n" + body + "\n}\n"
 
+    def search_result(self, value: str, native: bool = False, distro: str = "fedora",
+                      arch: str = "x86_64", kind: str = "search") -> subprocess.CompletedProcess[str]:
+        path = self.directory / "search-input.txt"
+        path.write_text(value, encoding="utf-8")
+        invocation = ('set -euo pipefail\ndistro=$1\nhost_arch=$2\n'
+                      'uname() { printf "%s\\n" "$host_arch"; }\n'
+                      + self.definition("omg_names") + self.definition("search_names")
+                      + ('search_names dnf "$3"\n' if native else 'omg_names "$4" "$3"\n'))
+        return subprocess.run(["/bin/bash", "-s", "--", distro, arch, str(path), kind],
+                              input=invocation, cwd=self.directory, capture_output=True,
+                              text=True, check=False, timeout=10)
+
+    def test_recorded_fedora_search_reaches_required_package_and_native_equivalence(self) -> None:
+        # Run38009788242 artifact11652634624, ZIP SHA0ce89c5d02105ab9205a08214480df7d6697623b7a41a59cc26b89af67fe4113.
+        product = json.dumps([{"name": name} for name in
+                              ("ripgrep-edit-emacs.noarch", "ripgrep-edit.x86_64", "ripgrep.x86_64")])
+        native = ("Matched fields: name (exact)\n ripgrep.x86_64\tLine-oriented search tool\n"
+                  "Matched fields: name, summary\n ripgrep-edit.x86_64\tEdit ripgrep search results across multiple files\n"
+                  " ripgrep-edit-emacs.noarch\tUse Emacs to edit ripgrep search results across multiple files\n")
+        expected = "ripgrep\nripgrep-edit\nripgrep-edit-emacs\n"
+        for value, is_native in ((product, False), (native, True)):
+            with self.subTest(native=is_native):
+                result = self.search_result(value, is_native)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+                self.assertIn("ripgrep", result.stdout.splitlines())
+
+    def test_fedora_search_preserves_dotted_names_and_deduplicates_host_and_noarch(self) -> None:
+        value = json.dumps([{"name": name} for name in
+                            ("ripgrep.aarch64", "ripgrep.noarch", "ripgrep.plugin.aarch64")])
+        result = self.search_result(value, arch="aarch64")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ripgrep\nripgrep.plugin\n")
+
+    def test_fedora_search_refuses_foreign_or_unqualified_names_before_output(self) -> None:
+        for name in ("ripgrep.i686", "ripgrep.aarch64", "ripgrep", "ripgrep.x86-64", ".x86_64"):
+            with self.subTest(name=name):
+                value = json.dumps([{"name": "ripgrep.x86_64"}, {"name": name}])
+                result = self.search_result(value)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "")
+
+    def test_search_refuses_empty_malformed_and_potentially_truncated_product_sets(self) -> None:
+        for value in ("[]", "{}", '[{"name": null}]', '[{"name": "bad name"}]', "[",
+                      json.dumps([{"name": "ripgrep.x86_64"}] * 100000)):
+            with self.subTest(length=len(value)):
+                result = self.search_result(value)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "")
+
+    def test_other_distro_and_explicit_name_sets_retain_existing_identity(self) -> None:
+        for distro in ("arch", "debian", "ubuntu"):
+            result = self.search_result('[{"name":"ripgrep.plugin.x86_64"}]', distro=distro)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "ripgrep.plugin.x86_64\n")
+        result = self.search_result('{"packages":["ripgrep.plugin","ripgrep.x86_64"]}', kind="explicit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ripgrep.plugin\nripgrep.x86_64\n")
+
     def normalize(self, value: str, native: bool = False, phase: str = "installed",
                   arch: str = "x86_64", evr: str = "2.2.1-4.fc44") -> subprocess.CompletedProcess[str]:
         path = self.directory / "input.txt"
@@ -701,7 +760,7 @@ class FedoraBenchmarkIdentityTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
 
     def test_available_shape_is_explicit_and_epoch_remains_bound(self) -> None:
-        available = self.PRODUCT.replace("tree.x86_64", "tree").replace("Installed: yes", "Installed: no")
+        available = self.PRODUCT.replace("Installed: yes", "Installed: no")
         for value, native in ((available, False), (self.NATIVE, True)):
             result = self.normalize(value, native, "available")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -714,6 +773,88 @@ class FedoraBenchmarkIdentityTests(unittest.TestCase):
         self.assertEqual(self.normalize(self.NATIVE + "Epoch: 2\n", True, evr="2:2.2.1-4.fc44").stdout,
                          "tree.x86_64\t2:2.2.1-4.fc44\n")
         self.assertNotEqual(self.normalize(self.NATIVE + "Epoch: 1\n", True, evr="2:2.2.1-4.fc44").returncode, 0)
+
+    def test_recorded_available_info_reaches_transaction_identity_verification(self) -> None:
+        # CI38012420409, artifact11655081916, verified ZIP SHA256
+        # 04d7577b1fbecbd681fa71a035a03f8c9840a523b227b5005ae735f26e10bc8b.
+        available = self.PRODUCT.replace("Installed: yes", "Installed: no")
+        self.assertEqual(hashlib.sha256(available.encode()).hexdigest(),
+                         "9e9c189cc32640cd193986b3b2b07efc99383de8629815fe164cff8ff9c3a10c")
+        product = self.directory / "product-info.txt"
+        product.write_text(available, encoding="utf-8")
+        native = self.directory / "native-info.txt"
+        native.write_text(self.NATIVE, encoding="utf-8")
+        tools = self.directory / "tools"
+        tools.mkdir()
+        for name, body in (
+            ("omg", 'cat -- "$PRODUCT_INFO"'),
+            ("rpm", "printf 'x86_64\\n'"),
+            ("dnf", 'if [ "$1" = --cacheonly ]; then '
+                    "printf 'tree\\tx86_64\\t0:2.2.1-4.fc44\\n'; "
+                    'else cat -- "$NATIVE_INFO"; fi'),
+        ):
+            executable = tools / name
+            executable.write_text("#!/bin/sh\nset -eu\n" + body + "\n", encoding="utf-8")
+            executable.chmod(0o700)
+        evidence = self.directory / "evidence"
+        evidence.mkdir()
+        text = self.script.read_text(encoding="utf-8")
+        marker = "        verify_tree_identity() {\n"
+        body = text.split(marker, 1)[1].split("\n        }\n", 1)[0]
+        definitions = "".join(self.definition(name) for name in (
+            "fedora_identity_from_query", "capture_fedora_info_identity",
+            "prepare_info_reference", "normalize_info",
+        )) + "verify_tree_identity() {\n" + body + "\n}\n"
+        invocation = ('set -euo pipefail\ndistro=fedora\nGUEST_TRANSACTION=install\n'
+                      'expected_version=2.2.1-4.fc44\nEXPORT_DIR=$1\nOMG=$2\n'
+                      'privileged=()\nnative=(dnf -C info tree)\n'
+                      + definitions + 'verify_tree_identity before\n')
+        result = subprocess.run(
+            ["/bin/bash", "-s", "--", str(evidence), str(tools / "omg")],
+            input=invocation, cwd=self.directory,
+            env={**os.environ, "PATH": str(tools) + ":" + os.environ["PATH"],
+                 "PRODUCT_INFO": str(product), "NATIVE_INFO": str(native)},
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in ("omg-identity-before.tsv", "native-identity-before.tsv", "expected-identity.tsv"):
+            self.assertEqual((evidence / name).read_text(), "tree.x86_64\t2.2.1-4.fc44\n")
+        self.assertEqual((evidence / "omg-info-before.stdout").read_text(), available)
+
+    def test_published_available_name_preserves_exact_native_identity(self) -> None:
+        # Actual v0.1.224, verified official archive SHA256
+        # e662941133def3df5ed9daf6848af5e0bcffbbc9e3697647dc3c64ab19f5c122.
+        available = '\n  | Info\n    tree\n          Name: tree\n       Version: 2.2.1-4.fc44\n        Source: Official repository (dnf)\n     Installed: no\n   Description: File system tree viewer\n'
+        self.assertEqual(hashlib.sha256(available.encode()).hexdigest(),
+                         "580ec8f9d54fa0a14eb87113564de9c08c79c16a375ccf1ba80586bf8eb28e8e")
+        result = self.normalize(available, phase="available")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "tree.x86_64\t2.2.1-4.fc44\n")
+        self.assertNotEqual(self.normalize(available, phase="installed").returncode, 0)
+        for value in (
+            available.replace("2.2.1-4.fc44", "2.2.2-4.fc44"),
+            available + "Architecture: i686\n",
+            available + "Name: tree\n",
+            available + "Installed: no\n",
+        ):
+            with self.subTest(value=value):
+                rejected = self.normalize(value, phase="available")
+                self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+                self.assertEqual(rejected.stdout, "")
+
+    def test_available_product_refuses_foreign_identity(self) -> None:
+        available = self.PRODUCT.replace("Installed: yes", "Installed: no")
+        for value in (
+            available.replace("tree.x86_64", "tree.addon"),
+            available.replace("tree.x86_64", "tree.i686"),
+            available.replace("2.2.1-4.fc44", "2.2.2-4.fc44"),
+            available + "Name: tree.x86_64\n",
+            available + "Installed: no\n",
+        ):
+            with self.subTest(value=value):
+                result = self.normalize(value, phase="available")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "")
 
     def test_machine_query_pins_one_installed_or_exact_available_candidate(self) -> None:
         installed = "tree\tx86_64\t0:2.2.1-4.fc44\n"

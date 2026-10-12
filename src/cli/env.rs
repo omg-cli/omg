@@ -335,12 +335,19 @@ async fn sync_lockfile_with_api_base(url_or_id: &str, root: &Path, api_base: &st
 /// exists and actually differs from the incoming content.
 fn backup_replaced_lock(root: &Path, incoming: &str) -> Result<bool> {
     let lock_path = root.join("omg.lock");
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).context("Failed to inspect local omg.lock before pull");
+        }
+    }
     // Read through the hardened lockfile reader: symlinks and oversized
     // files are refused instead of being pulled into memory
     // (csf_4fe23b28).
-    let Ok(existing) = crate::core::env::fingerprint::read_lockfile(&lock_path) else {
-        return Ok(false);
-    };
+    let existing = crate::core::env::fingerprint::read_lockfile(&lock_path)
+        .context("Failed to read local omg.lock before pull")?;
     if existing == incoming {
         return Ok(false);
     }
@@ -373,6 +380,230 @@ mod tests {
         };
         state.hash = state.calculate_hash();
         toml::to_string_pretty(&state).expect("serialize valid lockfile")
+    }
+
+    async fn sync_from_inline_gist_fixture(
+        root: &std::path::Path,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback gist fixture");
+        let api_base = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let metadata = serde_json::json!({
+            "html_url": "https://gist.github.com/0123abcdef",
+            "files": {"omg.lock": {
+                "raw_url": "http://127.0.0.1:1/never-fetch",
+                "content": content,
+                "truncated": false
+            }}
+        })
+        .to_string();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("expected gist metadata request")
+                    .expect("accept gist metadata request");
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).await.expect("read request");
+            assert!(request[..count].starts_with(b"GET /gists/0123abcdef "));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{metadata}",
+                metadata.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write gist response");
+        });
+        let result = sync_lockfile_with_api_base("0123abcdef", root, &api_base).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), fixture)
+            .await
+            .expect("gist fixture completed")
+            .expect("gist fixture passed");
+        result
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_preserves_unreadable_regular_local_lock() {
+        const NAME: &str = "cli::env::tests::sync_preserves_unreadable_regular_local_lock";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission fixture must run as ordinary user"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = tempfile::tempdir().expect("isolated workspace");
+        let lock = workspace.path().join("omg.lock");
+        let original = lockfile_with_package("local-package");
+        std::fs::write(&lock, &original).expect("seed local lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000))
+            .expect("deny local lock reads");
+        let denied = std::fs::read(&lock).expect_err("fixture must deny reads");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        let result = sync_from_inline_gist_fixture(
+            workspace.path(),
+            &lockfile_with_package("remote-package"),
+        )
+        .await;
+        let mode = std::fs::metadata(&lock)
+            .expect("retained lock")
+            .permissions()
+            .mode()
+            & 0o777;
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600))
+            .expect("restore fixture readability");
+        let retained = std::fs::read(&lock).expect("read retained bytes");
+        println!(
+            "[omg-lock-sync] uid={} result={result:?} mode={mode:o} retained={} backup={}",
+            nix::unistd::geteuid(),
+            retained == original.as_bytes(),
+            workspace.path().join("omg.lock.backup").exists()
+        );
+        assert_eq!(
+            retained,
+            original.as_bytes(),
+            "sync must retain unreadable local lock bytes"
+        );
+        assert_eq!(mode, 0o000, "failed sync must preserve the original mode");
+        assert!(!workspace.path().join("omg.lock.backup").exists());
+        let error = result.expect_err("unreadable regular lock must refuse replacement");
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+            "sync must retain the permission error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_preserves_oversized_regular_local_lock() {
+        const NAME: &str = "cli::env::tests::sync_preserves_oversized_regular_local_lock";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "lock preservation fixture must run as ordinary user"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = tempfile::tempdir().expect("isolated workspace");
+        let lock = workspace.path().join("omg.lock");
+        let original = format!(
+            "{}# {}",
+            lockfile_with_package("local-package"),
+            "x".repeat(16 * 1024 * 1024)
+        );
+        std::fs::write(&lock, &original).expect("seed oversized local lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o640))
+            .expect("set original mode");
+        let result = sync_from_inline_gist_fixture(
+            workspace.path(),
+            &lockfile_with_package("remote-package"),
+        )
+        .await;
+        let retained = std::fs::read(&lock).expect("read retained bytes");
+        let mode = std::fs::metadata(&lock)
+            .expect("retained lock")
+            .permissions()
+            .mode()
+            & 0o777;
+        println!(
+            "[omg-lock-sync] uid={} result={result:?} original_len={} retained_len={} mode={mode:o} backup={}",
+            nix::unistd::geteuid(),
+            original.len(),
+            retained.len(),
+            workspace.path().join("omg.lock.backup").exists()
+        );
+        assert_eq!(
+            retained.len(),
+            original.len(),
+            "sync must retain oversized local lock length"
+        );
+        assert_eq!(
+            retained,
+            original.as_bytes(),
+            "sync must retain oversized local lock bytes"
+        );
+        assert_eq!(mode, 0o640, "failed sync must preserve the original mode");
+        assert!(!workspace.path().join("omg.lock.backup").exists());
+        result.expect_err("oversized regular lock must refuse replacement");
+    }
+
+    #[tokio::test]
+    async fn sync_missing_identical_and_different_local_lock_controls() {
+        let incoming = lockfile_with_package("remote-package");
+        let different = lockfile_with_package("local-package");
+        for (label, original, expected_backup) in [
+            ("missing", None, None),
+            ("identical", Some(incoming.as_str()), None),
+            (
+                "different",
+                Some(different.as_str()),
+                Some(different.as_str()),
+            ),
+        ] {
+            let workspace = tempfile::tempdir().expect("isolated workspace");
+            if let Some(original) = original {
+                std::fs::write(workspace.path().join("omg.lock"), original)
+                    .expect("seed local lock");
+            }
+            sync_from_inline_gist_fixture(workspace.path(), &incoming)
+                .await
+                .expect(label);
+            assert_eq!(
+                std::fs::read_to_string(workspace.path().join("omg.lock")).expect("synced lock"),
+                incoming,
+                "{label}"
+            );
+            match expected_backup {
+                Some(expected) => assert_eq!(
+                    std::fs::read_to_string(workspace.path().join("omg.lock.backup"))
+                        .expect("backup"),
+                    expected,
+                    "{label}"
+                ),
+                None => assert!(
+                    !workspace.path().join("omg.lock.backup").exists(),
+                    "{label}"
+                ),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_replaces_symlink_without_reading_or_changing_its_target() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().expect("isolated workspace");
+        let outside = tempfile::tempdir().expect("external target directory");
+        let target = outside.path().join("outside.lock");
+        std::fs::write(&target, "external-sentinel").expect("seed target");
+        let lock = workspace.path().join("omg.lock");
+        symlink(&target, &lock).expect("seed local symlink");
+        let incoming = lockfile_with_package("remote-package");
+        sync_from_inline_gist_fixture(workspace.path(), &incoming)
+            .await
+            .expect("sync replaces link itself");
+        assert!(
+            std::fs::symlink_metadata(&lock)
+                .expect("synced lock")
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock).expect("synced lock"),
+            incoming
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("untouched target"),
+            "external-sentinel"
+        );
+        assert!(!workspace.path().join("omg.lock.backup").exists());
     }
 
     #[tokio::test]

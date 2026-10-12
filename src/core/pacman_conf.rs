@@ -97,6 +97,26 @@ fn validate_repository_name(name: &str) -> Result<()> {
 }
 
 impl PacmanConfig {
+    /// Identify the ordered configuration consumed by this parser, including
+    /// recursively expanded includes. This observes bytes; it does not lock writers.
+    pub(crate) fn fingerprint(path: &Path) -> Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
+        let canonical = path.canonicalize().with_context(|| {
+            format!("Failed to resolve pacman configuration {}", path.display())
+        })?;
+        let mut content = String::new();
+        load_config_with_includes(&canonical, &mut HashSet::new(), &mut content)?;
+        let mut hash = Sha256::new();
+        hash.update(b"omg-pacman-config-v1");
+        let path_bytes = canonical.as_os_str().as_encoded_bytes();
+        hash.update((path_bytes.len() as u64).to_le_bytes());
+        hash.update(path_bytes);
+        hash.update((content.len() as u64).to_le_bytes());
+        hash.update(content.as_bytes());
+        Ok(hash.finalize().into())
+    }
+
     pub fn parse<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut content = String::new();
         load_config_with_includes(path.as_ref(), &mut HashSet::new(), &mut content)?;

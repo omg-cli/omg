@@ -199,20 +199,14 @@ impl Model for StatusModel {
 
     fn view(&self) -> String {
         match self.state {
-            StatusState::Idle => String::new(),
+            // The returned failure command leaves reporting to the process owner.
+            StatusState::Idle | StatusState::Failed => String::new(),
             StatusState::Loading => style::accent("⟳ Gathering system status..."),
             StatusState::Complete => {
                 if let Some(data) = &self.data {
                     data.render()
                 } else {
                     "No data available".to_string()
-                }
-            }
-            StatusState::Failed => {
-                if let Some(err) = &self.error {
-                    format!("\n✗ Status failed: {}\n", style::negative(err))
-                } else {
-                    "\n✗ Status failed\n".to_string()
                 }
             }
         }

@@ -762,6 +762,11 @@ mod daemon_tests {
         // yields the exact payload
         let buf = wire.into_inner();
         assert_eq!(buf.len(), 4 + message.len());
+        assert_eq!(
+            buf.as_slice(),
+            b"\x00\x00\x00\x14test message content",
+            "outer frame must use the documented big-endian length prefix"
+        );
         let decoded = read_frame(&mut Cursor::new(&buf))?;
         assert_eq!(decoded, message.to_vec(), "frame payload must round-trip");
 
@@ -775,6 +780,19 @@ mod daemon_tests {
         let err = read_frame(&mut Cursor::new(&hostile)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 
+        Ok(())
+    }
+
+    /// Accept a big-endian transport frame authored independently of the writer.
+    #[test]
+    fn test_read_frame_accepts_big_endian_wire_fixture() -> Result<()> {
+        use omg_lib::daemon::protocol::read_frame;
+        use std::io::Cursor;
+
+        let wire = b"\x00\x00\x00\x14test message content";
+        let decoded = read_frame(&mut Cursor::new(wire))
+            .expect("reader must accept the documented big-endian length prefix");
+        assert_eq!(decoded, b"test message content");
         Ok(())
     }
 

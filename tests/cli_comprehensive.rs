@@ -18,6 +18,10 @@ pub mod common;
 #[path = "support/recovery_fixture.rs"]
 mod recovery_fixture;
 
+#[cfg(feature = "arch")]
+#[path = "support/native_inventory_fixture.rs"]
+mod native_inventory_fixture;
+
 use clap::{CommandFactory, Parser};
 use common::*;
 use omg_lib::cli::Cli;
@@ -924,6 +928,7 @@ enum Assertion {
     WorkspaceProjectListed,
     WorkspaceProjectRemoved,
     ContainerInitScaffold,
+    ContainerInstallerDigestRefusal,
     CiGithubWorkflow,
     CiGithubWorkflowAdvanced,
     PackageDryRunInstall,
@@ -1057,6 +1062,7 @@ impl Assertion {
             "workspace-project-listed" => Self::WorkspaceProjectListed,
             "workspace-project-removed" => Self::WorkspaceProjectRemoved,
             "container-init-scaffold" => Self::ContainerInitScaffold,
+            "container-installer-digest-refusal" => Self::ContainerInstallerDigestRefusal,
             "ci-github-workflow" => Self::CiGithubWorkflow,
             "ci-github-workflow-advanced" => Self::CiGithubWorkflowAdvanced,
             "package-dry-run-install" => Self::PackageDryRunInstall,
@@ -2225,6 +2231,58 @@ fn legacy_security_configuration_refuses_cli_reads_and_writes_without_rewrites()
 
 #[test]
 #[serial]
+#[cfg(feature = "arch")]
+fn native_inventory_reports_still_refuse_default_mock_receiver() {
+    let project = TestProject::for_distro("arch");
+    native_inventory_fixture::prepare(&project).unwrap();
+    let db = native_inventory_fixture::snapshot(project.pacman_root.path()).unwrap();
+    let history =
+        native_inventory_fixture::snapshot(&project.data_dir.path().join("history.json")).unwrap();
+    for (args, diagnostic) in [
+        (
+            vec!["why", "pacman"],
+            "Package dependency analysis is not implemented for the mock backend",
+        ),
+        (
+            vec!["why", "--reverse", "pacman"],
+            "Package dependency analysis is not implemented for the mock backend",
+        ),
+        (
+            vec!["size", "--limit", "3"],
+            "Package size analysis is not implemented for the mock backend",
+        ),
+        (
+            vec!["size", "--tree", "pacman"],
+            "Package size analysis is not implemented for the mock backend",
+        ),
+        (
+            vec!["blame", "pacman"],
+            "Package installation history is not implemented for the mock backend",
+        ),
+    ] {
+        let output = project.run(&args);
+        assert!(!output.success, "{}", output.combined_output());
+        assert_eq!(output.exit_code, 1, "{}", output.combined_output());
+        assert!(
+            output.stderr.contains(diagnostic),
+            "{}",
+            output.combined_output()
+        );
+        assert_eq!(
+            native_inventory_fixture::snapshot(project.pacman_root.path()).unwrap(),
+            db
+        );
+        assert_eq!(
+            native_inventory_fixture::snapshot(&project.data_dir.path().join("history.json"))
+                .unwrap(),
+            history
+        );
+    }
+    project.close_checked();
+}
+
+#[test]
+#[serial]
 #[cfg(feature = "arch")] // This inventory fixture explicitly seeds a pacman database.
 fn behavior_inventory_runs_in_hermetic_state() {
     use std::fmt::Write as _;
@@ -2249,6 +2307,7 @@ fn behavior_inventory_runs_in_hermetic_state() {
         "case\tcommand\tsafety\texpected_exit\texit\tstdout_bytes\tstderr_bytes\telapsed_ms\tissues\tux_verdict\n",
     );
     let mut failures = Vec::new();
+    let mut native_unavailable = 0;
 
     for (number, case) in behavior_cases().into_iter().enumerate() {
         // Missing-input probes must not inherit files written by earlier rows
@@ -2338,8 +2397,8 @@ fn behavior_inventory_runs_in_hermetic_state() {
             }
             continue;
         }
-        // The hermetic fixture always runs the arch mock backend, so the
-        // arch expectation governs here; release lanes resolve their own.
+        // The Arch expectation governs both Mock rows and the five private
+        // native reports; release lanes resolve their own expectation.
         // Native offline guests have installed packages and must refuse an
         // unavailable advisory source. This fixture has an empty mock inventory,
         // so its distinct contract is a completed empty scan with exit zero.
@@ -2353,6 +2412,29 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 .expect("executable rows declare an exit code")
                 .exit_for(Distro::Arch)
         };
+        if native_inventory_fixture::is_native_row(&case.id) && !native_arch_fixture_available() {
+            let args: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
+            native_inventory_fixture::check_argv(&case.id, &args);
+            native_unavailable += 1;
+            let reason = "native Arch receiver unavailable: requires actual Arch and an ordinary UID; row not admitted";
+            writeln!(
+                index,
+                "{}\t{command}\t{}\t{expected_exit}\tnot-run\t0\t0\t0.0\t{reason}\tunavailable",
+                case.id,
+                case.safety.as_str()
+            )
+            .expect("write unavailable native inventory row");
+            eprintln!(
+                "[native-inventory-unavailable] case={} expected_exit={expected_exit} exit=not-run ux_verdict=unavailable; {reason}",
+                case.id
+            );
+            if let Some(dir) = &evidence_dir {
+                std::fs::write(dir.join(format!("{:03}-{}.txt", number + 1, case.id)),
+                    format!("command: {command}\nsafety: {}\nexpected_exit: {expected_exit}\nexit: not-run\nelapsed_ms: 0.0\nissues: {reason}\nux_verdict: unavailable\nnative_admission: unavailable\n--- stdout ---\n\n--- stderr ---\n",
+                        case.safety.as_str())).expect("write unavailable native inventory transcript");
+            }
+            continue;
+        }
         let args: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
         if case.id == "run-all" {
             let prior_marker = project.path().join("smoke-task.marker");
@@ -2609,10 +2691,52 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 audit_data.to_str().expect("UTF-8 audit fixture path"),
             ));
         }
+        let native_project = native_inventory_fixture::is_native_row(&case.id).then(|| {
+            native_inventory_fixture::check_argv(&case.id, &args);
+            let native = TestProject::for_distro("arch");
+            native_inventory_fixture::prepare(&native).expect("prepare private native inventory");
+            native
+        });
+        let native_before = native_project.as_ref().map(|native| {
+            let db = native_inventory_fixture::snapshot(native.pacman_root.path()).unwrap();
+            let history =
+                native_inventory_fixture::snapshot(&native.data_dir.path().join("history.json"))
+                    .unwrap();
+            native_inventory_fixture::check_alpm(native).expect("literal independent ALPM oracle");
+            assert_eq!(
+                native_inventory_fixture::snapshot(native.pacman_root.path()).unwrap(),
+                db
+            );
+            (db, history)
+        });
+        let digest_before = case
+            .assertions
+            .contains(&Assertion::ContainerInstallerDigestRefusal)
+            .then(|| native_inventory_fixture::scaffold_state(project.path()).unwrap());
         let started = Instant::now();
-        let result = project.run_with_env(&args, &command_env);
+        let result = if let Some(native) = &native_project {
+            native.run_native_arch_inventory_report(&args)
+        } else {
+            project.run_with_env(&args, &command_env)
+        };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut issues = Vec::new();
+        if let Some(native) = native_project {
+            let (db_before, history_before) = native_before.unwrap();
+            if native_inventory_fixture::snapshot(native.pacman_root.path()).unwrap() != db_before {
+                issues.push(
+                    "native inventory changed private database/cache content or metadata".into(),
+                );
+            }
+            if native_inventory_fixture::snapshot(&native.data_dir.path().join("history.json"))
+                .unwrap()
+                != history_before
+            {
+                issues.push("native inventory changed private history content or metadata".into());
+            }
+            native_inventory_fixture::check_output(&case.id, &result, &mut issues);
+            native.close_checked();
+        }
         if result.exit_code != expected_exit {
             issues.push(format!(
                 "expected exit {expected_exit}, got {}",
@@ -3447,6 +3571,14 @@ fn behavior_inventory_runs_in_hermetic_state() {
                         issues.push("workspace remove did not report the removed fixture".to_string());
                     }
                 }
+                Assertion::ContainerInstallerDigestRefusal => {
+                    if !result.stderr.contains("Invalid installer digest: expected URL=SHA256")
+                        || native_inventory_fixture::scaffold_state(project.path()).unwrap()
+                            != *digest_before.as_ref().expect("digest refusal has a scaffold baseline")
+                    {
+                        issues.push("malformed installer digest did not refuse before scaffold changes".into());
+                    }
+                }
                 Assertion::ContainerInitScaffold => {
                     let read_regular = |name: &str| {
                         let path = project.path().join(name);
@@ -3641,6 +3773,9 @@ fn behavior_inventory_runs_in_hermetic_state() {
         }
     }
 
+    eprintln!(
+        "[native-inventory-coverage] unavailable_rows={native_unavailable}; unavailable rows are not native admission"
+    );
     if let Some(dir) = evidence_dir {
         std::fs::write(dir.join("index.tsv"), index).expect("write CLI behavior index");
     }

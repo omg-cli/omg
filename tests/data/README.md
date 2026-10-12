@@ -61,3 +61,18 @@ SHA-256 values:
 
 - Installed: `fe05430102cda666217ecf3a1fbd01d91a133086995078a4cf3d5df22467e823`.
 - Upgrades: `10ca59439c192f538a7aa50ea340a335e17f68ebcc1fb1ccdcf76842a410a2f3`.
+
+## Native epoch identity header
+
+`fedora-xz-libs.rpmhdr` is the unmodified `Packages.blob` for `xz-libs`
+from the FedoraLinux-44 WSL audit environment on 2026-10-09. Native RPM returned
+`xz-libs 1:5.8.2-2.fc44.x86_64`; EPOCH (1003) has INT32 type 4 and count 1.
+The fixture SHA-256 is
+`d6a49c91d15926152661bd2912cd07865bb4cc0e86a013b97514c59bea1ea09b`.
+It is an inert database header, with no executable payload.
+
+The inventory regression changes only EPOCH type/count while preserving its
+four payload bytes. Native librpm rejects BIN/count4, INT16/count2 and
+INT8/count4 variants; the reader must reject these instead of interpreting
+their bytes as a valid package epoch. The unmodified fixture verifies the
+package name, architecture and exact EVR returned through SQLite.

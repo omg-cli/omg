@@ -5,10 +5,14 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+import subprocess
+import sys
+import shutil
 
 spec = importlib.util.spec_from_file_location('fedora_evidence', Path(__file__).with_name('qemu-fedora-advisory-evidence.py'))
 checker = importlib.util.module_from_spec(spec)
@@ -71,6 +75,18 @@ class FedoraEvidenceTests(unittest.TestCase):
             'modifyrepo': ['modifyrepo_c', '--compress-type', 'gz', '--mdtype', 'updateinfo', '/tmp/omg-fedora-advisory-qemu-616/updateinfo.xml', '/tmp/omg-fedora-advisory-qemu-616/repo/repodata'],
             'verify': ['gpg', '--verify', '/tmp/omg-fedora-advisory-qemu-616/repo/repodata/repomd.xml.asc', '/tmp/omg-fedora-advisory-qemu-616/repo/repodata/repomd.xml'],
         }.items()}
+        self.put('excluded-dnf.conf', '[main]\ninstall_weak_deps=True\nreposdir=/tmp/omg-fedora-advisory-qemu-616/repos\nexcludepkgs=glibc*\n')
+        self.receipt['excluded_installed_advisory_scope'] = True
+        self.put('native-excluded-default-list.stdout', '[]\n')
+        for suffix in ('list', 'info'):
+            self.put('native-excluded-override-'+suffix+'.stdout',
+                     (self.evidence/('native-advisory-'+suffix+'.stdout')).read_bytes())
+        for label, arguments in {
+            'native-excluded-default-list': ['--cacheonly', 'advisory', 'list', '--available', '--security', '--json'],
+            'native-excluded-override-list': ['--setopt=disable_excludes=*', '--cacheonly', 'advisory', 'list', '--available', '--security', '--json'],
+            'native-excluded-override-info': ['--setopt=disable_excludes=*', '--cacheonly', 'advisory', 'info', '--available', '--security', '--json'],
+        }.items():
+            self.commands[label] = {'argv': common+arguments, 'exit_code': 0}
         self.put('commands.json', json.dumps(self.commands))
         self.write()
 
@@ -87,6 +103,93 @@ class FedoraEvidenceTests(unittest.TestCase):
         try: admitted = self.check()
         except ValueError as error: self.fail('complete native metadata must replay: '+str(error))
         self.assertEqual(admitted, self.receipt)
+
+    @unittest.skipUnless(shutil.which('bash') and shutil.which('install'), 'requires Linux evidence-copy tools')
+    def test_guest_copy_loop_preserves_complete_native_advisory_evidence(self):
+        wrapper = Path(__file__).with_name('qemu-fedora-advisory-check.sh').read_text()
+        copy_loop = wrapper[wrapper.index('files=('):wrapper.index('if ! cmp -s')]
+        copy_loop = copy_loop.replace('/tmp/omg-fedora-advisory-qemu-616/evidence/',
+                                      '${OMG_ADVISORY_COPY_FIXTURE}/')
+        copied = self.root/'copied'
+        destination = copied/'fedora-advisory'
+        destination.mkdir(parents=True)
+        for phase in ('before', 'after'):
+            filename = 'parent-system-'+phase+'.sha256'
+            shutil.copyfile(self.evidence/filename, destination/filename)
+        commands = self.root/'commands'
+        commands.mkdir()
+        sudo = commands/'sudo'
+        sudo.write_text('#!/bin/sh\n[ "$1" != -n ] || shift\nexec "$@"\n')
+        sudo.chmod(0o700)
+        result = subprocess.run(['bash', '-euo', 'pipefail', '-c',
+                                 'evidence=$1\n'+copy_loop, 'evidence-copy', str(copied)],
+                                env=dict(os.environ, PATH=str(commands)+os.pathsep+os.environ['PATH'],
+                                         OMG_ADVISORY_COPY_FIXTURE=str(self.evidence)),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for filename in ('excluded-dnf.conf', 'native-excluded-default-list.stdout',
+                         'native-excluded-override-list.stdout', 'native-excluded-override-info.stdout'):
+            with self.subTest(filename=filename):
+                self.assertTrue((destination/filename).is_file(), 'guest evidence was not copied')
+                self.assertEqual((destination/filename).read_bytes(), (self.evidence/filename).read_bytes())
+        self.assertEqual(checker.validate_structure(destination, self.archive, self.fixture), self.receipt)
+
+    def test_missing_excluded_installed_package_controls_are_refused(self):
+        # Native installed-package advisories must stay visible even when
+        # ordinary package selection excludes their package name.
+        for filename in ('excluded-dnf.conf', 'native-excluded-default-list.stdout',
+                         'native-excluded-override-list.stdout', 'native-excluded-override-info.stdout'):
+            path = self.evidence/filename
+            saved = path.read_bytes()
+            path.unlink()
+            with self.subTest(filename=filename), self.assertRaises(ValueError):
+                self.check()
+            path.write_bytes(saved)
+
+    def test_exclusion_controls_must_prove_hidden_then_visible_installed_advisory(self):
+        for filename, replacement in (
+            ('excluded-dnf.conf', '[main]\nexcludepkgs=unrelated\n'),
+            ('native-excluded-default-list.stdout', (self.evidence/'native-advisory-list.stdout').read_bytes()),
+            ('native-excluded-override-list.stdout', '[]'),
+            ('native-excluded-override-info.stdout', '[]'),
+        ):
+            path = self.evidence/filename
+            saved = path.read_bytes()
+            self.put(filename, replacement)
+            with self.subTest(filename=filename), self.assertRaises(ValueError):
+                self.check()
+            path.write_bytes(saved)
+        self.receipt['excluded_installed_advisory_scope'] = False
+        self.write()
+        with self.assertRaises(ValueError):
+            self.check()
+
+    def test_optimized_python_rejects_false_clean_native_results(self):
+        script = '''import importlib.util, sys
+from types import SimpleNamespace
+spec = importlib.util.spec_from_file_location("oracle", sys.argv[1])
+oracle = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(oracle)
+valid = "Found 1 vulnerabilities (1 high severity)\\n  glibc (1 issues):\\n    → OMG-QEMU-FEDORA-616 - Synthetic [Advisory severity: Important]\\n"
+oracle.verify_native_result(SimpleNamespace(returncode=0, stdout=valid, stderr=""))
+print("valid")
+for result, fail in [(SimpleNamespace(returncode=0, stdout="No vulnerabilities found", stderr=""), False),
+                     (SimpleNamespace(returncode=1, stdout=valid, stderr=""), True),
+                     (SimpleNamespace(returncode=7, stdout=valid, stderr=""), False)]:
+    try:
+        oracle.verify_native_result(result, fail)
+    except (AssertionError, ValueError):
+        print("rejected")
+    else:
+        print("accepted invalid")
+'''
+        oracle = Path(__file__).with_name("qemu-fedora-advisory-oracle.py")
+        for flags in ([], ["-O"]):
+            with self.subTest(flags=flags):
+                result = subprocess.run([sys.executable, *flags, "-c", script, str(oracle)],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "valid\nrejected\nrejected\nrejected\n")
 
     def test_wrong_source_state_identity_severity_and_counters_are_refused(self):
         original = copy.deepcopy(self.receipt)

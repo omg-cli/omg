@@ -100,6 +100,19 @@ class TransactionSummary(unittest.TestCase):
         self.assertEqual(json.loads((self.root / "results.json").read_text()),
                          [{"id": "trial", "result": "HARNESS_ERROR", "exit_code": 19}])
 
+    def test_finish_preserves_trial_bytes_when_result_serializer_partially_fails(self):
+        previous = (self.root / "results.json").read_bytes()
+        fault = '''jq() {
+          if [[ "$1" != -n ]]; then printf partial; return 17; fi
+          command jq "$@"
+        }'''
+        result = self.run_shell('current_id=trial\ntrap finish EXIT\nexit 73', fault)
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertEqual((self.root / "results.json").read_bytes(), previous)
+        self.assertIn("Could not record failed trial", result.stderr)
+        self.assertEqual(json.loads(self.summary.read_text())["results"],
+                         [{"id": "trial", "result": "NOT_RUN"}])
+
 
 if __name__ == "__main__":
     unittest.main()

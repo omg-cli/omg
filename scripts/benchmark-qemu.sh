@@ -133,7 +133,7 @@ pins_for() {
   firmware=bios
   ssh_service=sshd
   qemu_bin=qemu-system-x86_64
-  qemu_machine=q35
+  qemu_machine=q35,sata=off
   qemu_pkg=qemu-system-x86
   firmware_pkg=ovmf
   firmware_code=/usr/share/OVMF/OVMF_CODE_4M.fd
@@ -524,12 +524,14 @@ if [[ "$1" == uefi ]]; then
   [[ -f "$vm_vars" ]] || exit 2
   firmware=(-drive if=pflash,format=raw,readonly=on,file="$3" -drive if=pflash,format=raw,file="$vm_vars")
 fi
+legacy_apic=()
+case "$6" in q35|q35,*) legacy_apic=(-global apic-common.vapic=false) ;; esac
 accel=$7
 [[ "$accel" != tcg ]] || accel=tcg,thread=multi
 nohup "$5" -machine "$6" -accel "$accel" -cpu "$8" -smp 2 -m 1536 \
   -run-with user=65534:65534 \
   -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny \
-  -monitor none \
+  -monitor none "${legacy_apic[@]}" \
   "${firmware[@]}" -display none -serial "file:$vm_serial" \
   -drive "file=$vm_disk,if=virtio,format=qcow2" -drive file=seed.img,if=virtio,format=raw \
   -netdev user,id=n,ipv6=off,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n,romfile= \
@@ -570,31 +572,271 @@ boot_ssh() {
 }
 wait_ssh() {
   local before=${1:-} after pid serial_bytes kernel_banner qemu_state
-  local deadline=$(( SECONDS + SSH_WAIT_BUDGET )) remaining probe_timeout delay
-  while (( SECONDS < deadline )); do
+  local remaining_cs probe_timeout delay delay_cs
+  local mode=initial attempt=0 probe_rc=0 boot_id=not-applicable uptime phase_deadline_cs
+  read -r uptime _ < /proc/uptime
+  phase_deadline_cs=$(( ${uptime/./} + SSH_WAIT_BUDGET * 100 ))
+  [[ -z "$before" ]] || { mode=reboot; boot_id=unavailable; }
+  # One wait-local record; failed or partial allocation grants no ownership.
+  local allocated_record='' owned_record='' allocation_cs allocation_timeout
+  local -x OMG_SSH_LAST_PROBE_RECORD=''
+  read -r uptime _ < /proc/uptime
+  allocation_cs=$(( phase_deadline_cs - ${uptime/./} - SSH_KILL_GRACE * 100 - 5 ))
+  if (( allocation_cs > 0 )); then
+    printf -v allocation_timeout '%d.%02d' "$(( allocation_cs / 100 ))" "$(( allocation_cs % 100 ))"
+    if allocated_record=$(timeout --kill-after="${SSH_KILL_GRACE}s" "${allocation_timeout}s" mktemp ./ssh-last-probe.XXXXXXXX); then
+      if [[ "$allocated_record" =~ ^\./ssh-last-probe\.[[:alnum:]]{8}$
+            && -f "$allocated_record" && ! -L "$allocated_record"
+            && -O "$allocated_record" && ! -s "$allocated_record" ]]; then
+        owned_record=$allocated_record
+        OMG_SSH_LAST_PROBE_RECORD=$owned_record
+      fi
+    fi
+  fi
+  retire_probe_record() {
+    if [[ -n "$owned_record" ]]; then rm -f -- "$owned_record" || true; fi
+  }
+  last_probe() {
+    python3 - "$@" <<'PROBE'
+import base64
+import datetime
+import json
+import os
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+record_path = os.environ.get('OMG_SSH_LAST_PROBE_RECORD', '')
+action, mode, attempt = sys.argv[1:4]
+if action == 'emit':
+    expected_exit, boot_id = int(sys.argv[4]), sys.argv[5]
+    capture_state = 'unavailable'
+    try:
+        with open(record_path, 'rb') as stream:
+            raw = stream.read(8193)
+        capture_state = 'invalid'
+        if len(raw) > 8192:
+            raise ValueError('last probe record exceeds its bound')
+        record = json.loads(raw)
+        if (type(record['mode']) is not str or record['mode'] != mode
+                or type(record['attempt']) is not int or record['attempt'] <= 0
+                or record['attempt'] != int(attempt)
+                or type(record['helper_exit']) is not int
+                or not 0 <= record['helper_exit'] <= 255
+                or record['helper_exit'] != expected_exit):
+            raise ValueError('last probe record does not match this attempt')
+        error = record['capture_error']
+        if error is not None and (type(error) is not str or len(error) > 256):
+            raise ValueError('invalid capture error')
+        if record['status_state'] == 'observed':
+            if (type(record['exit']) is not int or not 0 <= record['exit'] <= 255
+                    or record['exit'] != record['helper_exit']):
+                raise ValueError('invalid observed producer status')
+        elif record['status_state'] == 'unavailable':
+            if (record['exit'] is not None or record['helper_exit'] != 125
+                    or error is None or 'producer-status-unavailable' not in error.split(',')):
+                raise ValueError('invalid unavailable producer status')
+        else:
+            raise ValueError('invalid producer status state')
+        tail = base64.b64decode(record['stderr_tail'], validate=True)
+        if (len(tail) > 4096 or type(record['observed_bytes']) is not int
+                or record['observed_bytes'] < len(tail)
+                or type(record['capture_complete']) is not bool
+                or type(record['elapsed_ms']) is not int or record['elapsed_ms'] < 0
+                or any(not isinstance(record[k], str) or len(record[k]) > 64
+                       for k in ['started_utc', 'ended_utc'])):
+            raise ValueError('invalid last probe record')
+        capture_state = 'complete' if record['capture_complete'] else 'partial'
+    except (OSError, ValueError, KeyError, TypeError):
+        record = {'observed_bytes': 0, 'capture_complete': False, 'elapsed_ms': 0,
+                  'started_utc': 'unavailable', 'ended_utc': 'unavailable'}
+        tail = b''
+    header = (f'SSH last probe: mode={mode} attempt={attempt} exit={record.get("exit", "unavailable") if record.get("exit", "unavailable") is not None else "unavailable"} '
+              f'helper_exit={expected_exit} capture_error={record.get("capture_error") or "none"} '
+              f'boot_id={boot_id} stderr_bytes={len(tail)} '
+              f'stderr_observed_bytes={record["observed_bytes"]} '
+              f'stderr_truncated={"yes" if record["observed_bytes"] > 4096 else "no"} '
+              f'capture_complete={"yes" if record["capture_complete"] else "no"} '
+              f'capture_state={capture_state} elapsed_ms={record["elapsed_ms"]} '
+              f'started_utc={record["started_utc"]} ended_utc={record["ended_utc"]}\n')
+    sys.stderr.buffer.write(header.encode() + b'Last SSH probe stderr (tail):\n' + tail)
+    if tail and not tail.endswith(b'\n'):
+        sys.stderr.buffer.write(b'\n')
+    sys.exit(0)
+
+probe_timeout, kill_grace = sys.argv[4:6]
+phase_deadline = int(sys.argv[6]) / 100
+clock = lambda: time.clock_gettime(time.CLOCK_BOOTTIME)
+# Reserve bounded capture/reaping time inside the existing absolute phase budget.
+remaining = phase_deadline - clock()
+duration = min(float(probe_timeout), max(.001, remaining - float(kill_grace) - .05))
+argv = ['timeout', f'--kill-after={kill_grace}s', f'{duration:g}s', 'ssh'] + sys.argv[7:]
+started = time.monotonic()
+started_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+tail = bytearray()
+observed_bytes = 0
+complete = False
+selector = None
+nonblocking = False
+producer_status = None
+capture_errors = []
+identity = None
+cleanup = 'not-observed'
+stage = 'popen'
+child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                         start_new_session=True)
+try:
+    stage = 'identity'
+    identity = open(f'/proc/{child.pid}/stat').read().rsplit(') ', 1)[1].split()[19]
+    stage = 'selector'
+    selector = selectors.DefaultSelector()
+    stage = 'nonblocking'
+    os.set_blocking(child.stderr.fileno(), False)
+    nonblocking = True
+    stage = 'register'
+    selector.register(child.stderr, selectors.EVENT_READ)
+    stage = 'capture'
+    while os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+        if clock() >= phase_deadline - .05:
+            break
+        for key, _ in selector.select(min(.02, max(0, phase_deadline - .05 - clock()))):
+            data = os.read(key.fd, 4096)
+            if not data:
+                complete = True
+                selector.unregister(child.stderr)
+                break
+            observed_bytes += len(data)
+            tail.extend(data)
+            del tail[:-4096]
+except Exception:
+    capture_errors.append(stage)
+finally:
+    # The direct Popen child remains unreaped: its PID and new session are owned.
+    # Missing observer identity cannot remove that ownership or skip cleanup.
+    if child.returncode is None:
+        try:
+            if identity is not None:
+                current = open(f'/proc/{child.pid}/stat').read().rsplit(') ', 1)[1].split()[19]
+                if current != identity or os.getpgid(child.pid) != child.pid:
+                    raise RuntimeError('probe process group identity changed')
+        except Exception:
+            capture_errors.append('cleanup-identity')
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+            cleanup = 'owned-group-signalled'
+        except ProcessLookupError:
+            cleanup = 'owned-group-gone'
+        except OSError:
+            capture_errors.append('cleanup-signal')
+        # A transient first wait failure must not discard a successful second wait.
+        for _ in range(2):
+            try:
+                producer_status = child.wait(timeout=max(.001, phase_deadline - clock()))
+                cleanup = 'owned-child-reaped'
+                break
+            except subprocess.TimeoutExpired:
+                cleanup = 'reap-deadline-expired'
+            except OSError:
+                capture_errors.append('cleanup-wait')
+    else:
+        producer_status = child.returncode
+    # Drain immediately available bytes only; never wait for descendant EOF.
+    try:
+        if not nonblocking:
+            os.set_blocking(child.stderr.fileno(), False)
+            nonblocking = True
+        for _ in range(16):
+            try:
+                data = os.read(child.stderr.fileno(), 4096)
+            except BlockingIOError:
+                complete = False
+                break
+            if not data:
+                complete = True
+                break
+            observed_bytes += len(data)
+            tail.extend(data)
+            del tail[:-4096]
+        else:
+            complete = False
+    except OSError:
+        complete = False
+        capture_errors.append('final-drain')
+    if selector is not None:
+        try:
+            selector.close()
+        except Exception:
+            capture_errors.append('selector-close')
+    try:
+        child.stderr.close()
+    except Exception:
+        capture_errors.append('stderr-close')
+
+probe_exit = producer_status
+if probe_exit is not None and probe_exit < 0:
+    probe_exit = 128 - probe_exit
+helper_exit = probe_exit if probe_exit is not None else 125
+if producer_status is None:
+    capture_errors.append('producer-status-unavailable')
+record = {'mode': mode, 'attempt': int(attempt), 'exit': probe_exit,
+          'helper_exit': helper_exit, 'capture_error': ','.join(capture_errors)[:256] or None,
+          'status_state': 'observed' if probe_exit is not None else 'unavailable',
+          'stderr_tail': base64.b64encode(tail).decode('ascii'), 'observed_bytes': observed_bytes,
+          'capture_complete': complete, 'cleanup': cleanup,
+          'elapsed_ms': int((time.monotonic() - started) * 1000),
+          'started_utc': started_utc,
+          'ended_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+try:
+    with open(record_path, 'w', encoding='utf-8') as stream:
+        json.dump(record, stream)
+except OSError:
+    sys.exit(helper_exit)
+sys.exit(helper_exit)
+PROBE
+  }
+  while :; do
     pid=$(<qemu.pid)
     if ! kill -0 "$pid" 2>/dev/null; then
+      if (( attempt > 0 )); then last_probe emit "$mode" "$attempt" "$probe_rc" "$boot_id" || true; fi
       printf 'QEMU exited before SSH became ready\n' >&2
       cat qemu-startup.log >&2
+      retire_probe_record
       return 1
     fi
-    remaining=$(( deadline - SECONDS ))
+    read -r uptime _ < /proc/uptime
+    remaining_cs=$(( phase_deadline_cs - ${uptime/./} ))
     # Never start a probe unless its SIGKILL grace fits inside this phase.
-    (( remaining > SSH_KILL_GRACE )) || break
-    probe_timeout=$(( remaining - SSH_KILL_GRACE ))
-    (( probe_timeout <= SSH_ATTEMPT_TIMEOUT )) || probe_timeout=$SSH_ATTEMPT_TIMEOUT
+    (( remaining_cs > SSH_KILL_GRACE * 100 + 5 )) || break
+    probe_timeout=$SSH_ATTEMPT_TIMEOUT
+    attempt=$((attempt + 1))
     if [[ -z "$before" ]]; then
-      if timeout --kill-after="${SSH_KILL_GRACE}s" "${probe_timeout}s" ssh "${opts[@]}" bench@127.0.0.1 true 2>/dev/null; then return 0; fi
-    elif after=$(timeout --kill-after="${SSH_KILL_GRACE}s" "${probe_timeout}s" ssh "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id 2>/dev/null) && [[ "$after" != "$before" ]]; then
-      printf 'reboot verified: %s -> %s\n' "$before" "$after"
-      return 0
+      if last_probe capture "$mode" "$attempt" "$probe_timeout" "$SSH_KILL_GRACE" "$phase_deadline_cs" "${opts[@]}" bench@127.0.0.1 true; then probe_rc=0; else probe_rc=$?; fi
+      if (( probe_rc == 0 )); then last_probe emit "$mode" "$attempt" "$probe_rc" "$boot_id" || true; retire_probe_record; return 0; fi
+    else
+      if after=$(last_probe capture "$mode" "$attempt" "$probe_timeout" "$SSH_KILL_GRACE" "$phase_deadline_cs" "${opts[@]}" bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id); then probe_rc=0; else probe_rc=$?; fi
+      boot_id=unavailable
+      if (( probe_rc == 0 )); then
+        boot_id=same
+        if [[ "$after" != "$before" ]]; then
+          boot_id=changed
+          last_probe emit "$mode" "$attempt" "$probe_rc" "$boot_id" || true
+          printf 'reboot verified: %s -> %s\n' "$before" "$after"
+          retire_probe_record
+          return 0
+        fi
+      fi
     fi
-    remaining=$(( deadline - SECONDS ))
-    (( remaining > 0 )) || break
-    delay=$SSH_RETRY_DELAY
-    (( delay <= remaining )) || delay=$remaining
+    read -r uptime _ < /proc/uptime
+    remaining_cs=$(( phase_deadline_cs - ${uptime/./} ))
+    (( remaining_cs > 0 )) || break
+    delay_cs=$(( SSH_RETRY_DELAY * 100 ))
+    (( delay_cs <= remaining_cs )) || delay_cs=$remaining_cs
+    printf -v delay '%d.%02d' "$(( delay_cs / 100 ))" "$(( delay_cs % 100 ))"
     sleep "$delay"
   done
+  if (( attempt > 0 )); then last_probe emit "$mode" "$attempt" "$probe_rc" "$boot_id" || true; fi
   serial_bytes=$(wc -c < "$vm_serial")
   kernel_banner=no
   if grep -aqm1 'Linux version ' "$vm_serial"; then kernel_banner=yes; fi
@@ -604,6 +846,7 @@ wait_ssh() {
   if [[ -n "$before" ]]; then printf 'Reboot readiness timed out: previous_boot_id=%s\n' "$before" >&2; fi
   printf 'Last guest serial lines:\n' >&2
   tail -n 6 "$vm_serial" >&2
+  retire_probe_record
   return 1
 }
 wait_ssh
@@ -763,7 +1006,11 @@ installed() {
 }
 if installed >/dev/null 2>&1; then echo 'fixture requires tree absent' >&2; exit 120; fi
 "$bin" search tree > evidence/search.txt
-grep -Eqi '^[[:space:]]+tree[[:space:]]' evidence/search.txt
+if [[ "$distro" == fedora ]]; then
+  grep -Eq "^[[:space:]]+tree([.]${guest_arch})?[[:space:]]" evidence/search.txt
+else
+  grep -Eqi '^[[:space:]]+tree[[:space:]]' evidence/search.txt
+fi
 sudo -n "$bin" install --yes tree
 installed
 "$bin" info tree > evidence/omg-info.txt

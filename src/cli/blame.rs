@@ -17,17 +17,19 @@ const REVERSE_DEPENDENCY_DISPLAY_LIMIT: usize = 20;
     )
 )]
 pub async fn run(package: &str) -> Result<()> {
+    let backend = crate::package_managers::resolve_backend()?;
     anyhow::ensure!(
-        crate::package_managers::resolve_backend()? != crate::package_managers::Backend::MacOS,
+        backend != crate::package_managers::Backend::MacOS,
         "Package installation history is not implemented for Homebrew"
+    );
+    anyhow::ensure!(
+        backend != crate::package_managers::Backend::Mock,
+        "Package installation history is not implemented for the mock backend"
     );
     crate::core::security::validate_package_name(package)?;
 
     #[cfg(feature = "fedora")]
-    if matches!(
-        crate::core::env::distro::detect_distro(),
-        crate::core::env::distro::Distro::Fedora
-    ) {
+    if backend == crate::package_managers::Backend::Fedora {
         crate::cli::tea::run_report(build_blame_fedora(package).await?)?;
         return Ok(());
     }
@@ -372,15 +374,28 @@ mod tests {
         let error = run("bash")
             .await
             .expect_err("blame with no backend must not look like not-installed");
-        let expected = match crate::package_managers::resolve_backend() {
-            Ok(crate::package_managers::Backend::MacOS) => {
-                "Package installation history is not implemented for Homebrew".to_string()
+        use crate::core::env::distro::Distro;
+        let expected = match crate::core::env::distro::detect_distro() {
+            Distro::MacOS => "Package installation history is not implemented for Homebrew",
+            Distro::Arch => {
+                "This omg binary lacks the arch package backend required by Arch. Install the matching distro build, or rebuild with --no-default-features --features arch,pgp,license"
             }
-            Err(error) => error.to_string(),
-            Ok(_) => "not available without an Arch or Debian package backend".to_string(),
+            Distro::Debian => {
+                "This omg binary lacks the debian package backend required by Debian. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Ubuntu => {
+                "This omg binary lacks the debian package backend required by Ubuntu. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+            }
+            Distro::Fedora => {
+                "This omg binary lacks the fedora package backend required by Fedora. Install the matching distro build, or rebuild with --no-default-features --features fedora,pgp,license"
+            }
+            Distro::Unknown => {
+                "Unsupported Linux distribution: no live package backend can be selected"
+            }
         };
-        assert!(
-            error.to_string().contains(&expected),
+        assert_eq!(
+            error.to_string(),
+            expected,
             "selected backend must fail with its own unsupported-operation cause: {error}"
         );
     }

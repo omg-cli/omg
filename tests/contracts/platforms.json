@@ -162,6 +162,7 @@
       "omgd": true,
       "native_integration_suites": [
         "fedora_tests",
+        "metadata_backend_routing",
         "git_hooks_contract",
         "coverage_10",
         "coverage_18",

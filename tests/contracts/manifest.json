@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "status": "Reviewed parser, Debian status/consent, exact mock search and bounded runtime fixture contracts; broader behavioral inventory remains incomplete",
-  "inventory_source": "Baseline compiled artifacts CI 35540033061 at e689113c; reviewed additive counter grammar from local Arch compilation; unchanged grammar verified, other owner schemas must match on hosted compilation",
+  "inventory_source": "Reviewed compiled artifacts from CI38112238543 attempt1, merge f26674f41caa5c9a5fd6ce861538163523a6e1d6 (PR head1c313261). Eight exported owners agree; only installer-digest argument and Init group changed. Pure Debian shape derived by removing the sole license-gated Account subtree; old derived shape matches its existing fingerprint, fresh pure-owner execution remains required.",
   "contracts": [
     {
       "id": "omg.config.validate.access-error.fixture",
@@ -4053,7 +4053,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
+      "sha256": "e1c3acc7857d9982f1b193138bed303c4462fe9b47e1104af88875fe0a071956"
     },
     {
       "binary": "omgd",
@@ -4073,7 +4073,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
+      "sha256": "e1c3acc7857d9982f1b193138bed303c4462fe9b47e1104af88875fe0a071956"
     },
     {
       "binary": "omgd",
@@ -4093,7 +4093,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
+      "sha256": "e1c3acc7857d9982f1b193138bed303c4462fe9b47e1104af88875fe0a071956"
     },
     {
       "binary": "omgd",
@@ -4113,7 +4113,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
+      "sha256": "e1c3acc7857d9982f1b193138bed303c4462fe9b47e1104af88875fe0a071956"
     },
     {
       "binary": "omgd",
@@ -4133,7 +4133,7 @@
         "macos",
         "pgp"
       ],
-      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
+      "sha256": "e1c3acc7857d9982f1b193138bed303c4462fe9b47e1104af88875fe0a071956"
     },
     {
       "binary": "omgd",
@@ -4151,7 +4151,7 @@
       "features": [
         "debian-pure"
       ],
-      "sha256": "290cccb9dd58c954a47da0e612cdfb65068f785d206241685ba18d1c8d6352b4"
+      "sha256": "57881a59f8d1fedc3ebfe630d2ebfeda3df8c9f72dab08024fc8c71fe691beb4"
     },
     {
       "binary": "omgd",
@@ -4168,7 +4168,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
+      "sha256": "e1c3acc7857d9982f1b193138bed303c4462fe9b47e1104af88875fe0a071956"
     },
     {
       "binary": "omgd",
@@ -4187,7 +4187,7 @@
         "license",
         "pgp"
       ],
-      "sha256": "e84da6ef2610f8e29fd658102d4ac90f215348426d1d61dc5ebe470739a13760"
+      "sha256": "e1c3acc7857d9982f1b193138bed303c4462fe9b47e1104af88875fe0a071956"
     },
     {
       "binary": "omgd",

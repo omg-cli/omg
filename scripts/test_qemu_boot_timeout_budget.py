@@ -52,7 +52,26 @@ class BootTimeoutExceedsReadinessWait(unittest.TestCase):
         self.assertNotRegex(BUDGET.read_text(), r"SSH_WAIT_ATTEMPTS")
 
     def test_driver_no_longer_hardcodes_a_short_boot_timeout(self):
-        self.assertNotRegex(DRIVER.read_text(), r"(?m)^\s*boot_timeout=\d+\s*$")
+        shell = BootShellDeadlineTests()
+        handoff = DRIVER.read_text(encoding="utf-8").split("\nBOOT\n", 1)[1].split('\nif [[ -n "$inventory_tiers" ]]', 1)[0]
+        for mode, expected_status in (("positive", 0), ("overdue", 124)):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = shell.fixture(directory, "raise SystemExit('unused SSH fixture')\n")
+                (root / "child-mode").write_text(mode)
+                docker = root / "bin/docker"
+                docker.write_text("#!/usr/bin/env python3\nimport pathlib, sys, time\nargs = sys.argv[1:]\nif args == ['exec', 'fixture-controller', 'bash', '/work/qemu-boot-diagnostics.sh']:\n    print('private-diagnostics-complete', flush=True)\n    raise SystemExit(0)\nif args != ['exec', 'fixture-controller', 'bash', '/work/boot.sh', 'bios', 'ssh', 'firmware-code', 'firmware-vars', 'qemu-bin', 'machine', 'kvm', 'cpu']:\n    print('unexpected-docker-argv:' + repr(args), file=sys.stderr)\n    raise SystemExit(99)\nmode = pathlib.Path('child-mode').read_text()\nprint('real-child-begin:' + mode, flush=True)\ntime.sleep(1.2 if mode == 'positive' else 30)\nprint('real-child-complete:' + mode, flush=True)\n", encoding="utf-8")
+                docker.chmod(0o755)
+                script = 'set -euo pipefail\nwork=$PWD\nBOOT_TIMEOUT=2\nSSH_WAIT_BUDGET=1\nqemu_accel=kvm\ncontroller=fixture-controller\nfirmware=bios\nssh_service=ssh\nfirmware_code=firmware-code\nfirmware_vars_src=firmware-vars\nqemu_bin=qemu-bin\nqemu_machine=machine\nqemu_cpu=cpu\n' + handoff
+                result, elapsed = shell.run_shell(root, script, limit=10)
+                log = (root / "boot.log").read_text()
+                self.assertEqual(result.returncode, expected_status, result.stderr + log)
+                self.assertIn("real-child-begin:" + mode, log)
+                if mode == "positive":
+                    self.assertIn("real-child-complete:positive", log)
+                else:
+                    self.assertNotIn("real-child-complete:overdue", log)
+                self.assertEqual((root / "boot.diagnostics.log").read_text(), "private-diagnostics-complete\n")
+                self.assertLess(elapsed, 8, result.stderr + log)
 
     def test_driver_boot_timeout_clears_the_inner_budget(self):
         wait, clone, initial = budget_values()
@@ -112,15 +131,28 @@ timeout() {
         self.assertIn('timeout --kill-after=5s "$clone_boot_timeout" bash /work/boot.sh', text)
 
     def test_wait_loop_still_has_the_documented_shape(self):
-        source = boot_source()
-        self.assertEqual(source.count('local deadline=$(( SECONDS + SSH_WAIT_BUDGET ))'), 1)
-        self.assertIn('wait_ssh "$before"', source)
-        self.assertIn('(( remaining > SSH_KILL_GRACE )) || break', source)
-        self.assertIn('probe_timeout=$(( remaining - SSH_KILL_GRACE ))', source)
-        self.assertIn('(( delay <= remaining )) || delay=$remaining', source)
-        self.assertEqual(source.count('\nboot_ssh '), 4)
-        self.assertIn('before=$(boot_ssh cat /proc/sys/kernel/random/boot_id)', source)
-        self.assertNotRegex(source, r"(?m)^ssh ")
+        shell = BootShellDeadlineTests()
+        with tempfile.TemporaryDirectory() as directory:
+            root = shell.fixture(directory, """import pathlib, time
+count_path = pathlib.Path('probe-count')
+count = int(count_path.read_text()) + 1 if count_path.exists() else 1
+count_path.write_text(str(count))
+time.sleep(0.1)
+print('old-id', flush=True)
+with pathlib.Path('completed-probes').open('a') as completed:
+    completed.write(f'{count}:old-id\\n')
+""")
+            result, elapsed = shell.run_shell(
+                root, shell.prefix() + 'wait_ssh old-id\n', limit=10)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertLess(elapsed, 6, result.stderr)
+            count = int((root / 'probe-count').read_text())
+            completed = (root / 'completed-probes').read_text().splitlines()
+            self.assertGreaterEqual(count, 2, result.stderr)
+            self.assertEqual(completed, [f'{n}:old-id' for n in range(1, count + 1)])
+            self.assertIn('Reboot readiness timed out: previous_boot_id=old-id', result.stderr)
+            self.assertRegex(result.stderr, r'SSH last probe: mode=reboot attempt=\d+ exit=0 helper_exit=0 .*boot_id=same ')
+            self.assertIn('last serial marker', result.stderr)
 
 
 class BootShellDeadlineTests(unittest.TestCase):

@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -32,6 +33,201 @@ def step(name):
 
 
 class QemuWorkflowTests(unittest.TestCase):
+    def _required_companion_prepare_control(self, mode):
+        script = literal(step('Workflow selection regression checks'), 'run', 8)
+        fixture_base = WORKFLOW.parents[2] / 'tests' / 'fixtures' / 'qemu-companion-completeness'
+        expected = sorted(json.loads((fixture_base / 'expected-identities.json').read_text())["identities"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / 'fixture'
+            shutil.copytree(fixture_base / mode, fixture)
+            tools = root / 'bin'
+            tools.mkdir()
+            capture = root / 'arguments.jsonl'
+            python = tools / 'python3'
+            python.write_text(f'#!{sys.executable}\n' + "import json, os, subprocess, sys\nargs = sys.argv[1:]\nwith open(os.environ['CAPTURE'], 'a') as stream:\n    stream.write(json.dumps(args) + '\\n')\nif args == ['scripts/run_qemu_boot_timeout_budget.py', 'discover', '-s', 'scripts', '-p', 'test_qemu_boot_timeout_budget.py']:\n    env = {key: value for key, value in os.environ.items() if key not in ('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP')}\n    result = subprocess.run([sys.executable, os.environ['COMPANION_RUNNER'], *args[1:]], cwd=os.environ['FIXTURE_CWD'], env=env,\n                            capture_output=True, timeout=5, check=False)\n    os.write(1, result.stdout)\n    os.write(2, result.stderr)\n    raise SystemExit(result.returncode)\n")
+            python.chmod(0o755)
+            env = {key: value for key, value in os.environ.items() if key not in ('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP')}
+            env.update(PATH=str(tools) + os.pathsep + os.environ['PATH'], CAPTURE=str(capture),
+                       FIXTURE_CWD=str(fixture), COMPANION_RUNNER=str(WORKFLOW.parents[2] / 'scripts/run_qemu_boot_timeout_budget.py'), PYTHONNOUSERSITE='1', PYTHONDONTWRITEBYTECODE='1')
+            result = subprocess.run([self.bash, '--noprofile', '--norc', '-euo', 'pipefail', '-c', script],
+                                    cwd=WORKFLOW.parents[2], env=env, capture_output=True, text=True, timeout=10)
+            lines = result.stdout.splitlines()
+            discovered = [json.loads(line.removeprefix('FIXTURE_DISCOVERED ')) for line in lines if line.startswith('FIXTURE_DISCOVERED ')]
+            outcomes = [json.loads(line.removeprefix('FIXTURE_OUTCOME ')) for line in lines if line.startswith('FIXTURE_OUTCOME ')]
+            bodies = [line.removeprefix('FIXTURE_BODY_EXECUTED ') for line in lines if line.startswith('FIXTURE_BODY_EXECUTED ')]
+            calls = [json.loads(line) for line in capture.read_text().splitlines()]
+            dispatch = ['scripts/run_qemu_boot_timeout_budget.py', 'discover', '-s', 'scripts', '-p', 'test_qemu_boot_timeout_budget.py']
+            self.assertEqual(calls.count(dispatch), 1, result.stderr)
+            actual_expected = [name for name in expected if name != 'test_qemu_boot_timeout_budget.BootShellDeadlineTests.test_slow_successful_initial_and_clone_compositions'] if mode == 'partial-omission' else expected
+            self.assertEqual(discovered, [actual_expected], result.stdout + result.stderr)
+            self.assertEqual([row['identity'] for row in outcomes], actual_expected, result.stdout)
+            for row in outcomes:
+                self.assertEqual(row['actual_result_delta'], dict(testsRun=1, skipped=int(mode == 'all-skipped'),
+                                 failures=0, errors=0, expectedFailures=0, unexpectedSuccesses=0), result.stdout)
+                self.assertEqual(row['outcome'], 'skipped' if mode == 'all-skipped' else 'success', result.stdout)
+            self.assertEqual(bodies, [] if mode == 'all-skipped' else actual_expected, result.stdout)
+            gate_records = [json.loads(line.removeprefix('REQUIRED_QEMU_COMPANION '))
+                            for line in result.stderr.splitlines() if line.startswith('REQUIRED_QEMU_COMPANION ')]
+            self.assertEqual(len(gate_records), 1, result.stdout + result.stderr)
+            gate = gate_records[0]
+            self.assertEqual(sorted(gate['required']), expected)
+            self.assertEqual(gate['starts'], actual_expected)
+            self.assertEqual(gate['successes'], [] if mode == 'all-skipped' else actual_expected)
+            self.assertEqual(gate['adverse'], [{'identity': name, 'kind': 'skip'} for name in actual_expected]
+                             if mode == 'all-skipped' else [])
+            self.assertIs(gate['complete'], mode == 'intact')
+            observed = dict(mode=mode, returncode=result.returncode, expected_identities=expected, gate=gate,
+                            discovered=discovered[0], outcomes=outcomes, bodies=bodies,
+                            missing=[name for name in expected if name not in discovered[0]],
+                            stdout=result.stdout, stderr=result.stderr, dispatch_count=calls.count(dispatch))
+            print('REQUIRED_PREPARE_OBSERVED ' + json.dumps(observed), flush=True)
+            return result
+
+    def test_prepare_rejects_missing_required_companion_identity(self):
+        result = self._required_companion_prepare_control('partial-omission')
+        self.assertEqual(result.returncode, 1, 'prepare accepted a missing required identity: ' + result.stdout + result.stderr)
+
+    def test_prepare_rejects_skipped_required_companion_bodies(self):
+        result = self._required_companion_prepare_control('all-skipped')
+        self.assertEqual(result.returncode, 1, 'prepare accepted skipped required bodies: ' + result.stdout + result.stderr)
+
+    def test_prepare_accepts_all_required_companion_bodies(self):
+        result = self._required_companion_prepare_control('intact')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_prepare_executes_boot_observer_and_budget_regressions_before_selection(self):
+        # Execute the real prepare step. The private executables record the
+        # discovery payload and fail on demand; they do not run guests or sudo.
+        regression = step('Workflow selection regression checks')
+        self.assertLess(PARENT.index(regression), PARENT.index('      - name: Resolve selection\n'))
+        script = literal(regression, 'run', 8)
+        observer = ['-m', 'unittest', 'discover', '-s', 'scripts', '-p', 'test_qemu_boot_diagnostics.py']
+        budget = ['scripts/run_qemu_boot_timeout_budget.py', 'discover', '-s', 'scripts', '-p', 'test_qemu_boot_timeout_budget.py']
+        for failed, expected in (('', 0), ('test_qemu_boot_diagnostics.py', 37),
+                                 ('test_qemu_boot_timeout_budget.py', 37)):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                capture = root / 'arguments.jsonl'
+                python = root / 'python3'
+                python.write_text(f'#!{sys.executable}\n' +
+                    'import json, os, sys\n'
+                    'with open(os.environ["CAPTURE"], "a") as stream:\n'
+                    '    stream.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                    'if os.environ["FAIL_TEST"] and sys.argv[-1] == os.environ["FAIL_TEST"]:\n'
+                    '    print("fixture regression failed", file=sys.stderr)\n'
+                    '    sys.exit(37)\n')
+                python.chmod(0o755)
+                sudo = root / 'sudo'
+                sudo.write_text('#!/bin/sh\n[ "$1" != -n ] || shift\nexec "$@"\n')
+                sudo.chmod(0o755)
+                result = subprocess.run([self.bash, '--noprofile', '--norc', '-euo', 'pipefail', '-c', script],
+                    cwd=WORKFLOW.parents[2], env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                    CAPTURE=str(capture), FAIL_TEST=failed), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                calls = [json.loads(line) for line in capture.read_text().splitlines()]
+                self.assertIn(observer, calls)
+                if failed == 'test_qemu_boot_diagnostics.py':
+                    self.assertEqual(calls[-1], observer)
+                    self.assertNotIn(budget, calls)
+                else:
+                    self.assertIn(budget, calls)
+                    self.assertLess(calls.index(observer), calls.index(budget))
+                    if failed:
+                        self.assertEqual(calls[-1], budget)
+
+        script = literal(step('Workflow selection regression checks'), 'run', 8)
+        dispatch = ['-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_qemu_companion_completeness.py']
+        control_root = WORKFLOW.parents[2]
+        wanted = [
+            'test_qemu_companion_completeness.RequiredCompanionObserverCliTests.test_complete_required_cli_control',
+            'test_qemu_companion_completeness.RequiredCompanionObserverCliTests.test_duplicate_required_cli_is_rejected',
+            'test_qemu_companion_completeness.RequiredCompanionObserverCliTests.test_extra_cli_identity_is_rejected',
+            'test_qemu_companion_completeness.RequiredCompanionObserverCliTests.test_expected_failure_cli_is_rejected',
+            'test_qemu_companion_completeness.RequiredCompanionObserverCliTests.test_failed_subtest_cli_is_rejected',
+            'test_qemu_companion_completeness.RequiredCompanionObserverCliTests.test_class_setup_failure_cli_is_rejected',
+        ]
+        wrapper = textwrap.dedent("""\
+            import json, os, subprocess, sys
+            args = sys.argv[1:]
+            with open(os.environ['CAPTURE'], 'a') as stream:
+                stream.write(json.dumps(args) + '\\n')
+            dispatch = ['-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_qemu_companion_completeness.py']
+            if args == dispatch:
+                if os.environ['FAIL_OBSERVER'] == '1':
+                    print('CI_OBSERVER_DISPATCH_FAILURE37', file=sys.stderr)
+                    raise SystemExit(37)
+                env = {key: value for key, value in os.environ.items() if key not in ('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP')}
+                result = subprocess.run([sys.executable, '-B', *dispatch, '-v'],
+                                        cwd=os.environ['CONTROL_ROOT'], env=env,
+                                        capture_output=True, timeout=5, check=False)
+                os.write(1, result.stdout)
+                os.write(2, result.stderr)
+                raise SystemExit(result.returncode)
+            """)
+        for failed in (False, True):
+            with self.subTest(observer_failure=failed), tempfile.TemporaryDirectory(prefix='qemu-observer-dispatch-') as directory:
+                root = Path(directory)
+                capture = root / 'arguments.jsonl'
+                python = root / 'python3'
+                python.write_text(f'#!{sys.executable}\n' + wrapper)
+                python.chmod(0o755)
+                sudo = root / 'sudo'
+                sudo.write_text('#!/bin/sh\n[ "$1" != -n ] || shift\nexec "$@"\n')
+                sudo.chmod(0o755)
+                env = {key: value for key, value in os.environ.items() if key not in ('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP')}
+                env.update(PATH=str(root) + os.pathsep + os.environ['PATH'], CAPTURE=str(capture),
+                           CONTROL_ROOT=str(control_root), FAIL_OBSERVER=str(int(failed)),
+                           PYTHONNOUSERSITE='1', PYTHONDONTWRITEBYTECODE='1')
+                command = script + "\nprintf '%s\\n' 'CI_OBSERVER_SELECTION_REACHED'\n"
+                result = subprocess.run([self.bash, '--noprofile', '--norc', '-euo', 'pipefail', '-c', command],
+                                        cwd=control_root, env=env, capture_output=True, text=True, timeout=10)
+                calls = [json.loads(line) for line in capture.read_text().splitlines()]
+                records = [json.loads(line.removeprefix('OBSERVER_SENSITIVITY_OBSERVED '))
+                           for line in result.stdout.splitlines() if line.startswith('OBSERVER_SENSITIVITY_OBSERVED ')]
+                named = re.findall(r'^test_\w+ \(([^)]+)\) \.\.\. ok$', result.stderr, re.M)
+                observed = dict(failed=failed, actual_prepare_exit=result.returncode, dispatch_count=calls.count(dispatch),
+                                calls=calls, owning_named_successes=named, owning_records=records,
+                                selection_boundary_reached='CI_OBSERVER_SELECTION_REACHED' in result.stdout,
+                                stdout=result.stdout, stderr=result.stderr)
+                print('CI_OBSERVER_DISPATCH_OBSERVED ' + json.dumps(observed), flush=True)
+                self.assertEqual(calls.count(dispatch), 1, 'prepare omitted the real observer-control dispatch: ' + json.dumps(observed))
+                self.assertEqual(result.returncode, 37 if failed else 0, result.stdout + result.stderr)
+                if failed:
+                    self.assertEqual(calls[-1], dispatch)
+                    self.assertNotIn('CI_OBSERVER_SELECTION_REACHED', result.stdout)
+                    self.assertIn('CI_OBSERVER_DISPATCH_FAILURE37', result.stderr)
+                    self.assertEqual(named, [])
+                    self.assertEqual(records, [])
+                else:
+                    self.assertLess(calls.index(dispatch), calls.index(['-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_qemu_verdict.py']))
+                    self.assertIn('CI_OBSERVER_SELECTION_REACHED', result.stdout)
+                    self.assertEqual(named, sorted(wanted))
+                    self.assertEqual(len(records), 6)
+                    actual = {row['mode']: row for row in records}
+                    self.assertEqual(set(actual), {'intact', 'duplicate', 'extra', 'expected-failure', 'subtest-failure', 'class-setup-failure'})
+                    for mode, discovered, starts, successes, adverse in (
+                            ('intact', 11, 11, 11, 0), ('duplicate', 12, 12, 12, 0),
+                            ('extra', 12, 12, 12, 0), ('expected-failure', 11, 11, 10, 1),
+                            ('subtest-failure', 11, 11, 10, 1), ('class-setup-failure', 11, 5, 5, 1)):
+                        row = actual[mode]
+                        self.assertEqual(row['returncode'], 0 if mode == 'intact' else 1)
+                        self.assertEqual(len(row['discovered']), discovered)
+                        self.assertEqual(len(row['gate']['starts']), starts)
+                        self.assertEqual(len(row['gate']['successes']), successes)
+                        self.assertEqual(len(row['gate']['adverse']), adverse)
+                        self.assertEqual(len(row['bodies']), starts)
+                        self.assertIs(row['gate']['complete'], mode == 'intact')
+                        embedded_gate = [json.loads(line.removeprefix('REQUIRED_QEMU_COMPANION '))
+                                         for line in row['stderr'].splitlines() if line.startswith('REQUIRED_QEMU_COMPANION ')]
+                        embedded_bodies = [line.removeprefix('FIXTURE_BODY_EXECUTED ')
+                                           for line in row['stdout'].splitlines() if line.startswith('FIXTURE_BODY_EXECUTED ')]
+                        embedded_discovery = [json.loads(line.removeprefix('FIXTURE_DISCOVERED '))
+                                              for line in row['stdout'].splitlines() if line.startswith('FIXTURE_DISCOVERED ')]
+                        self.assertEqual(embedded_gate, [row['gate']])
+                        self.assertEqual(embedded_bodies, row['bodies'])
+                        self.assertEqual(embedded_discovery, [row['discovered']])
+
     def test_benchmark_all_runs_complete_arch_specific_profile(self):
         source = (WORKFLOW.parents[2] / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         defaults = source[:source.index('here=$(cd')]
@@ -86,9 +282,20 @@ exit "$rc"
             self.assertIn('libapt-pkg-dev', arguments)
             self.assertIn('python3-apt', arguments)
 
+    def build_recipes(self, architecture):
+        expected = {
+            'BUILD_X64': [('arch', 'arch,pgp,license'), ('debian', 'debian,pgp,license'),
+                          ('debian-trixie', 'debian,pgp,license'), ('fedora', 'fedora,pgp,license')],
+            'BUILD_ARM64': [('debian', 'debian,pgp,license'), ('fedora', 'fedora,pgp,license')],
+        }
+        recipes = json.loads(literal(PARENT, architecture, 10))
+        self.assertEqual(sorted((row['distro'], row['features']) for row in recipes),
+                         sorted(expected[architecture]), 'Required native build recipe identities changed')
+        return recipes
+
     def test_debian_build_recipes_install_external_lock_probe(self):
         for architecture in ('BUILD_X64', 'BUILD_ARM64'):
-            for recipe in json.loads(literal(PARENT, architecture, 10)):
+            for recipe in self.build_recipes(architecture):
                 if 'debian' not in recipe['features'].split(','):
                     continue
                 with self.subTest(architecture=architecture, distro=recipe['distro']):
@@ -98,6 +305,30 @@ exit "$rc"
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn('python3', result.stdout.splitlines(),
                         'Debian transaction tests require an external Python POSIX lock probe')
+
+    def test_unit_build_recipes_install_python_venv_and_fish_prerequisites(self):
+        for architecture in ('BUILD_X64', 'BUILD_ARM64'):
+            for recipe in self.build_recipes(architecture):
+                with self.subTest(architecture=architecture, distro=recipe['distro']):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        for name in ('apt-get', 'pacman', 'dnf', 'rpm'):
+                            tool = root / name
+                            tool.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$CAPTURE"\n')
+                            tool.chmod(0o755)
+                        result = subprocess.run(
+                            [self.bash, '-e', '-c', recipe['setup']],
+                            env=dict(os.environ, PATH=directory + ':' + os.environ['PATH'],
+                                     CAPTURE=str(root / 'args')),
+                            capture_output=True, text=True, timeout=15,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        arguments = (root / 'args').read_text().splitlines()
+                        required = ('python', 'fish') if recipe['distro'] == 'arch' else ('python3', 'fish')
+                        if 'debian' in recipe['features'].split(','):
+                            required += ('python3-venv',)
+                        for package in required:
+                            self.assertIn(package, arguments)
 
     def copy_inventory_to_controller(self, root):
         repository = WORKFLOW.parents[2]
@@ -501,8 +732,139 @@ class SecurityBoundaryTests(unittest.TestCase):
             self.assertNotIn('--image-cache', workflow)
             self.assertIn('--image-policy tests/qemu-image-provenance/manifest.json', workflow)
 
+    def test_staged_fedora_target_is_executed_and_reconciled(self):
+        bash = shutil.which('bash')
+        self.assertIsNotNone(bash, 'staged workflow regression requires Bash')
+        for (label, workflow, feature_expression), mode in itertools.product((
+            ('lane', LANE, '${{ inputs.features }}'),
+            ('matrix-arm', PARENT, '${{ matrix.features }}'),
+        ), ('intact', 'missing-target', 'missing-library', 'missing-cli', 'missing-declaration', 'missing-body', 'selected-skip',
+            'default-ignored', 'ignored-selected', 'default-filtered', 'reused-refusal')):
+            with self.subTest(workflow=label, mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                tools = root / 'bin'
+                tools.mkdir()
+                capture = root / 'calls.jsonl'
+                for name in ('Cargo.toml', 'Cargo.lock', '.config/nextest.toml',
+                             'tests/fedora_tests.rs', 'tests/common/mod.rs', 'tests/platform_semantics.rs'):
+                    target = root / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(WORKFLOW.parents[2] / name, target)
+                cargo = tools / 'cargo'
+                cargo.write_text(f'#!{sys.executable}\n' + r'''
+import json, os, pathlib, sys, xml.etree.ElementTree as ET
+args = sys.argv[1:]
+with open(os.environ['CAPTURE'], 'a') as output: output.write(json.dumps(args)+'\n')
+fedora = {'dnf_integration::native_daemon_starts_and_searches_without_installed_inventory_changes': False, 'dnf_integration::native_catalog_observation_survives_readonly_rpm_and_dnf_queries': False, 'dnf_integration::native_catalog_observation_survives_ordinary_user_readonly_wal': False, 'dnf_integration::test_dnf_package_manager_creation': False, 'dnf_integration::repository_lookup_finds_uninstalled_package': False, 'dnf_integration::repository_info_resolves_architecture_and_nevra_selectors': False, 'dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch': False, 'dnf_integration::installed_status_resolves_native_full_nevra_with_zero_epoch': False, 'dnf_integration::cli_info_resolves_native_full_nevra': False, 'dnf_integration::cli_json_info_resolves_native_full_nevra': False, 'dnf_integration::repository_search_has_one_installed_row_per_architecture': False, 'dnf_integration::explicit_cli_matches_native_backend_without_a_daemon': False, 'dnf_integration::size_cli_matches_native_installed_packages': False, 'dnf_integration::installed_metadata_does_not_hide_excluded_packages': False, 'dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements': False, 'dnf_integration::blame_cli_uses_native_details_and_canonical_omg_history': False, 'dnf_integration::native_transactions_record_install_remove_and_ignore_noops': False, 'dnf_integration::native_history_honors_custom_and_disabled_service_history': False, 'dnf_integration::cleanup_preview_preserves_installed_packages': False, 'dnf_integration::test_search_common_package': False, 'dnf_integration::test_search_nonexistent_package': False, 'dnf_integration::test_list_installed_packages': False, 'dnf_integration::installed_rpm_selection_rejects_inexact_or_noninstalled_records': False, 'dnf_integration::test_list_updates': False, 'dnf_integration::test_is_installed_check': False, 'dnf_rpm_database::test_rpm_database_query': False, 'dnf_operations::test_orphan_cleanup_history': True, 'dnf_operations::test_update_all_packages': True, 'dnf_operations::test_sync_repository_metadata': True, 'dnf_error_handling::test_install_invalid_package': False, 'common::tests::explicit_timeout_overrides_inherited_timeout': False}
+listing = {'rust-suites': {
+    'omg': {'binary-id': 'omg', 'status': 'listed', 'testcases': {
+        'library_smoke': {'ignored': False, 'filter-match': {'status': 'matches'}}}},
+    'omg::bin/omg': {'binary-id': 'omg::bin/omg', 'status': 'listed', 'testcases': {
+        'cli_smoke': {'ignored': False, 'filter-match': {'status': 'matches'}}}},
+    'omg::bin/omgd': {'binary-id': 'omg::bin/omgd', 'status': 'listed', 'testcases': {
+        'daemon_smoke': {'ignored': False, 'filter-match': {'status': 'matches'}}}},
+    'omg::fedora_tests': {'binary-id': 'omg::fedora_tests', 'status': 'listed', 'testcases': {
+        name: {'ignored': ignored, 'filter-match': {'status': 'matches'}} for name, ignored in fedora.items()}}}}
+mode = os.environ['STAGED_FIXTURE']
+if mode == 'missing-target': del listing['rust-suites']['omg::fedora_tests']
+if mode == 'missing-library': del listing['rust-suites']['omg']
+if mode == 'missing-cli': del listing['rust-suites']['omg::bin/omg']
+if mode == 'missing-declaration':
+    del listing['rust-suites']['omg::fedora_tests']['testcases']['dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch']
+if mode in ('default-ignored', 'default-filtered'):
+    case = listing['rust-suites']['omg::fedora_tests']['testcases']['dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch']
+    if mode == 'default-ignored': case['ignored'] = True
+    else: case['filter-match']['status'] = 'mismatch'
+if mode == 'ignored-selected':
+    listing['rust-suites']['omg::fedora_tests']['testcases']['dnf_operations::test_orphan_cleanup_history']['ignored'] = False
+listing['test-count'] = sum(len(suite['testcases']) for suite in listing['rust-suites'].values())
+if args[:2] == ['nextest', 'list']:
+    print(json.dumps(listing))
+elif args[:2] == ['nextest', 'run']:
+    junit = pathlib.Path('target/nextest/ci/junit.xml')
+    junit.parent.mkdir(parents=True, exist_ok=True)
+    document = ET.Element('testsuites')
+    for identity, values in listing['rust-suites'].items():
+        suite = ET.SubElement(document, 'testsuite', name=identity)
+        for name, case in values['testcases'].items():
+            if not case['ignored']:
+                ET.SubElement(suite, 'testcase', classname=identity, name=name, time='0.001')
+    junit.write_text(ET.tostring(document, encoding='unicode'))
+    if mode in ('missing-body', 'selected-skip'):
+        document = ET.fromstring(junit.read_text())
+        suite = document.find("testsuite[@name='omg::fedora_tests']")
+        if mode == 'missing-body': suite.remove(suite[-1])
+        else: ET.SubElement(suite[0], 'skipped')
+        junit.write_text(ET.tostring(document, encoding='unicode'))
+''')
+                cargo.chmod(0o755)
+                git = tools / 'git'
+                git.write_text('#!/bin/sh\nprintf "%s\\n" fixture-stage-source\n')
+                git.chmod(0o755)
+                block = workflow.split('- name: Run library and binary unit tests (including omgd)\n', 1)[1]
+                match = re.match(r'        run: (.*)\n', block)
+                self.assertIsNotNone(match)
+                script = match.group(1).replace(feature_expression, 'fedora,pgp,license')
+                script = script.replace('scripts/run-native-contracts.py', str(WORKFLOW.parents[2] / 'scripts/run-native-contracts.py'))
+                env = dict(os.environ, PATH=str(tools)+os.pathsep+os.environ['PATH'],
+                           CAPTURE=str(capture), STAGED_FIXTURE=mode, RUNNER_TEMP=str(root), GITHUB_SHA='fixture-stage-source',
+                           OMG_CONTRACT_SOURCE_SHA='fixture-stage-source', PYTHONDONTWRITEBYTECODE='1')
+                result = subprocess.run([bash, '--noprofile', '--norc', '-euo', 'pipefail', '-c', script],
+                                        cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                if mode == 'reused-refusal':
+                    self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                    output = root / 'staged-unit-tests'
+                    evidence = ('source-tests.json', 'list.json', 'list.stderr.log', 'selection.json',
+                                'recipe.json', 'run.stdout.log', 'run.stderr.log', 'junit.xml')
+                    self.assertTrue(all((output / name).is_file() for name in evidence))
+                    (output / 'unrelated.txt').write_text('retain unrelated output')
+                    source = root / 'tests/fedora_tests.rs'
+                    source.write_text(source.read_text().replace('feature = "fedora"', 'feature = "arch"', 1))
+                    first_status = result.returncode
+                    result = subprocess.run([bash, '--noprofile', '--norc', '-euo', 'pipefail', '-c', script],
+                                            cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                    calls = [json.loads(line) for line in capture.read_text().splitlines()]
+                    remaining = [name for name in evidence if (output / name).exists()]
+                    error = json.loads((output / 'admission-error.json').read_text())
+                    print('STAGED_UNIT_REUSE '+json.dumps(dict(workflow=label, first_status=first_status,
+                          refusal_status=result.returncode, remaining_owned_evidence=remaining,
+                          unrelated=(output / 'unrelated.txt').read_text(), calls=calls, error=error)))
+                    self.assertEqual(result.returncode, 1, result.stdout+result.stderr)
+                    self.assertIn('unreviewed Fedora target cfg', error['error'])
+                    self.assertEqual(len(calls), 2, 'source refusal must not invoke cargo')
+                    self.assertEqual((output / 'unrelated.txt').read_text(), 'retain unrelated output')
+                    self.assertEqual(remaining, [], 'failed reuse must remove prior owned run evidence')
+                    continue
+                calls = [json.loads(line) for line in capture.read_text().splitlines()]
+                self.assertTrue(any('--test' in args and args[args.index('--test')+1] == 'fedora_tests'
+                                    for args in calls), result.stdout+result.stderr+repr(calls))
+                error = root / 'staged-unit-tests' / 'admission-error.json'
+                self.assertEqual(result.returncode, int(mode != 'intact'), result.stdout+result.stderr+
+                                 (error.read_text() if error.exists() else ''))
+                if mode in ('missing-target', 'missing-library', 'missing-cli', 'missing-declaration', 'missing-body',
+                            'default-ignored', 'ignored-selected', 'default-filtered'):
+                    self.assertIn('required binary missing' if mode in ('missing-target', 'missing-library', 'missing-cli') else
+                                  'Fedora declaration missing' if mode == 'missing-declaration' else
+                                  'Fedora declaration disposition mismatch' if mode in
+                                  ('default-ignored', 'ignored-selected', 'default-filtered') else 'missing selected execution',
+                                  json.loads(error.read_text())['error'])
+                    self.assertEqual(len(calls), 2 if mode == 'missing-body' else 1)
+                    print('STAGED_UNIT_FIXTURE '+json.dumps(dict(workflow=label, mode=mode,
+                          status=result.returncode, calls=calls, error=json.loads(error.read_text()))))
+                    continue
+                observed = json.loads((root / 'staged-unit-tests' / 'selection.json').read_text())
+                self.assertEqual(observed['counts'], dict(discovered=34, selected=31, executed=31,
+                                  passed=31, failed=0, skipped=3, filtered=0, retried=0) if mode == 'intact'
+                                  else dict(discovered=34, selected=31, executed=30, passed=30, failed=0,
+                                            skipped=4, filtered=0, retried=0))
+                self.assertTrue(observed['executed_required_binaries'])
+                self.assertEqual(set(observed['tests']), {'omg::bin/omg::cli_smoke', 'omg::fedora_tests::dnf_integration::installed_rpm_selection_rejects_inexact_or_noninstalled_records', 'omg::fedora_tests::dnf_integration::explicit_cli_matches_native_backend_without_a_daemon', 'omg::fedora_tests::dnf_integration::test_is_installed_check', 'omg::fedora_tests::dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements', 'omg::fedora_tests::dnf_integration::installed_metadata_does_not_hide_excluded_packages', 'omg::fedora_tests::dnf_integration::cli_info_resolves_native_full_nevra', 'omg::fedora_tests::dnf_integration::test_search_common_package', 'omg::fedora_tests::dnf_integration::repository_search_has_one_installed_row_per_architecture', 'omg::fedora_tests::dnf_integration::size_cli_matches_native_installed_packages', 'omg::fedora_tests::dnf_integration::native_catalog_observation_survives_ordinary_user_readonly_wal', 'omg::fedora_tests::dnf_integration::test_list_installed_packages', 'omg::fedora_tests::dnf_rpm_database::test_rpm_database_query', 'omg::fedora_tests::dnf_integration::repository_lookup_finds_uninstalled_package', 'omg::fedora_tests::dnf_integration::native_catalog_observation_survives_readonly_rpm_and_dnf_queries', 'omg::fedora_tests::dnf_integration::cleanup_preview_preserves_installed_packages', 'omg::fedora_tests::dnf_integration::test_list_updates', 'omg::library_smoke', 'omg::fedora_tests::dnf_integration::installed_status_resolves_native_full_nevra_with_zero_epoch', 'omg::fedora_tests::dnf_integration::native_transactions_record_install_remove_and_ignore_noops', 'omg::fedora_tests::dnf_integration::native_daemon_starts_and_searches_without_installed_inventory_changes', 'omg::fedora_tests::dnf_integration::repository_info_resolves_architecture_and_nevra_selectors', 'omg::bin/omgd::daemon_smoke', 'omg::fedora_tests::dnf_integration::native_history_honors_custom_and_disabled_service_history', 'omg::fedora_tests::dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch', 'omg::fedora_tests::common::tests::explicit_timeout_overrides_inherited_timeout', 'omg::fedora_tests::dnf_error_handling::test_install_invalid_package', 'omg::fedora_tests::dnf_integration::test_dnf_package_manager_creation', 'omg::fedora_tests::dnf_integration::test_search_nonexistent_package', 'omg::fedora_tests::dnf_integration::cli_json_info_resolves_native_full_nevra', 'omg::fedora_tests::dnf_integration::blame_cli_uses_native_details_and_canonical_omg_history'})
+                print('STAGED_UNIT_FIXTURE '+json.dumps(dict(workflow=label, mode=mode,
+                      status=result.returncode, calls=calls, selection=observed)))
+
     def test_all_distros_keep_daemon_release_compilation_and_unit_tests(self):
-        self.assertEqual(TEXT.count('cargo test --lib --bins '), 4)
+        self.assertEqual(TEXT.count('cargo test --lib --bins ') +
+                         TEXT.count('--staged-units --features '), 4)
         self.assertEqual(TEXT.count('cargo build --timings --release --no-default-features '), 4)
         self.assertNotIn('--bin omg', TEXT)
 

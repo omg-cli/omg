@@ -110,6 +110,8 @@ follows npm's own transport settings.
 
 OMG stages archive extraction before publishing a version directory. Its data directory is normally under `~/.local/share/omg` on a non-root Unix account, but XDG and privilege rules can change the path. Use [configuration](./configuration.md) to find the current paths. User-local runtime storage does not remove platform prerequisites or grant sandbox isolation to code run with a runtime.
 
+Node.js candidates must start and report the requested version before OMG publishes or selects them. Official Linux Node.js binaries from version 25 require the system `libatomic` runtime (`libatomic` on Fedora, commonly `libatomic1` on Debian/Ubuntu); see [Node's platform requirements](https://github.com/nodejs/node/blob/v26.11.1/BUILDING.md#official-binary-platforms-and-toolchains). OMG reports a failed version probe and preserves the previous selection; it does not install system libraries automatically.
+
 ## If something goes wrong
 
 | What you see | What to check |

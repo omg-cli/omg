@@ -367,15 +367,19 @@ pub fn view_audit_log(
 
         println!(
             "  {} [{}] {} - {}",
-            style::dim(&entry.timestamp),
+            style::dim(&style::sanitize_terminal_text(&entry.timestamp)),
             severity_color,
             style::maybe_color(&format!("{:?}", entry.event_type), |t| {
                 t.cyan().to_string()
             }),
-            entry.description
+            style::sanitize_terminal_text(&entry.description)
         );
         if !entry.resource.is_empty() {
-            println!("      {} {}", style::dim("Resource:"), entry.resource);
+            println!(
+                "      {} {}",
+                style::dim("Resource:"),
+                style::sanitize_terminal_text(&entry.resource)
+            );
         }
     }
 
@@ -461,7 +465,9 @@ pub fn verify_audit_log(_ctx: &CliContext) -> Result<()> {
             println!(
                 "  {} {}",
                 style::dim("First Invalid:"),
-                style::maybe_color(first_invalid, |t| t.red().to_string())
+                style::maybe_color(&style::sanitize_terminal_text(first_invalid), |t| t
+                    .red()
+                    .to_string())
             );
         }
     }

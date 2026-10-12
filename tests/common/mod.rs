@@ -380,6 +380,16 @@ fn run_omg_with_home(
     env_vars: &[(&str, &str)],
     home: &Path,
 ) -> CommandResult {
+    run_omg_with_home_without_env(args, dir, env_vars, home, &[])
+}
+
+fn run_omg_with_home_without_env(
+    args: &[&str],
+    dir: Option<&Path>,
+    env_vars: &[(&str, &str)],
+    home: &Path,
+    removed_env: &[&str],
+) -> CommandResult {
     #[cfg(not(debug_assertions))]
     panic!("Hermetic CLI tests require the debug profile; release binaries ignore OMG_TEST_MODE");
     let start = Instant::now();
@@ -450,6 +460,9 @@ fn run_omg_with_home(
 
     for (key, value) in env_vars {
         cmd.env(key, value);
+    }
+    for key in removed_env {
+        cmd.env_remove(key);
     }
 
     #[cfg(unix)]
@@ -560,6 +573,40 @@ fn run_shell(cmd: &str) -> CommandResult {
 // TEST PROJECT HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Native fixture skips are explicit; an admitted Arch run must require them.
+#[cfg(feature = "arch")]
+pub fn native_arch_fixture_available() -> bool {
+    #[cfg(unix)]
+    let ordinary = !nix::unistd::Uid::effective().is_root();
+    #[cfg(not(unix))]
+    let ordinary = false;
+    // Read the real host identity: init_test_env intentionally sets mock mode
+    // in this test process, so library distro detection would select the mock.
+    let arch = fs::read_to_string("/etc/os-release").is_ok_and(|contents| {
+        contents.lines().any(|line| {
+            line.strip_prefix("ID=")
+                .is_some_and(|id| id.trim().trim_matches(['\'', '"']) == "arch")
+        })
+    });
+    let available = cfg!(target_os = "linux") && ordinary && arch;
+    if env::var_os("OMG_CONTRACT_REQUIRE_NATIVE_ARCH").is_some() {
+        assert!(
+            available,
+            "native Arch contract requires actual Arch and an ordinary UID"
+        );
+    }
+    if available {
+        #[cfg(unix)]
+        eprintln!(
+            "[native-arch-fixture] uid={} actual_id=arch",
+            nix::unistd::Uid::effective().as_raw()
+        );
+    } else {
+        eprintln!("[native-arch-fixture-skip] requires actual Arch and an ordinary UID");
+    }
+    available
+}
+
 /// A test project with managed temp directory
 pub struct TestProject {
     pub dir: TempDir,
@@ -648,6 +695,109 @@ impl TestProject {
             vars.push(("OMG_TEST_DISTRO", self.distro()));
         }
         run_omg_with_home(args, Some(self.path()), &vars, self.home_dir.path())
+    }
+
+    /// Preserve the coverage14 why-only entry point.
+    #[cfg(feature = "arch")]
+    pub fn run_native_arch_why(&self, args: &[&str]) -> CommandResult {
+        assert_eq!(args.first().copied(), Some("why"));
+        self.run_native_arch_dependency_report(args)
+    }
+
+    /// Exercise only ordinary Arch dependency reports against prepared private data.
+    #[cfg(feature = "arch")]
+    pub fn run_native_arch_dependency_report(&self, args: &[&str]) -> CommandResult {
+        assert!(matches!(
+            args,
+            ["why" | "blame", _]
+                | ["why", _, "--reverse"]
+                | ["why", "--reverse", _]
+                | ["size", "--tree", _]
+        ));
+        self.run_native_arch_readonly_report(args, &[])
+    }
+
+    /// The five inventory rows use their exact argv, a private home, and a 20s deadline.
+    #[cfg(feature = "arch")]
+    pub fn run_native_arch_inventory_report(&self, args: &[&str]) -> CommandResult {
+        assert!(matches!(
+            args,
+            ["why" | "blame", "pacman"]
+                | ["why", "--reverse", "pacman"]
+                | ["size", "--limit", "3"]
+                | ["size", "--tree", "pacman"]
+        ));
+        self.run_native_arch_readonly_report(
+            args,
+            &[
+                ("TERM", "dumb"),
+                ("SHELL", "/bin/bash"),
+                ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
+            ],
+        )
+    }
+
+    #[cfg(feature = "arch")]
+    fn run_native_arch_readonly_report(
+        &self,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> CommandResult {
+        assert!(native_arch_fixture_available());
+        let root = self.pacman_root.path();
+        let db = root.join("var/lib/pacman");
+        let local = db.join("local");
+        let sync = db.join("sync");
+        let cache = root.join("var/cache/pacman/pkg");
+        let cache_root = root.join("var/cache/pacman");
+        let conf = root.join("etc/pacman.conf");
+        let mirrorlist = root.join("etc/pacman.d/mirrorlist");
+        assert_eq!(fs::read(local.join("ALPM_DB_VERSION")).unwrap(), b"9\n");
+        for path in [
+            root,
+            db.as_path(),
+            local.as_path(),
+            sync.as_path(),
+            cache.as_path(),
+            cache_root.as_path(),
+        ] {
+            assert!(path.is_absolute() && path.is_dir());
+        }
+        assert!(conf.is_file() && mirrorlist.is_file());
+        let omg_cache = self.data_dir.path().join("cache");
+        let daemon_data = self.data_dir.path().join("daemon");
+        let socket = self.home_dir.path().join(".run/omg.sock");
+        let mut vars = vec![
+            ("OMG_DATA_DIR", Self::utf8_path(self.data_dir.path())),
+            ("OMG_CONFIG_DIR", Self::utf8_path(self.config_dir.path())),
+            ("OMG_CACHE_DIR", Self::utf8_path(&omg_cache)),
+            ("OMG_DAEMON_DATA_DIR", Self::utf8_path(&daemon_data)),
+            ("OMG_SOCKET_PATH", Self::utf8_path(&socket)),
+            ("OMG_PACMAN_ROOT", Self::utf8_path(root)),
+            ("OMG_PACMAN_DB_DIR", Self::utf8_path(&db)),
+            ("OMG_PACMAN_LOCAL_DIR", Self::utf8_path(&local)),
+            ("OMG_PACMAN_SYNC_DIR", Self::utf8_path(&sync)),
+            ("OMG_PACMAN_CONF", Self::utf8_path(&conf)),
+            ("OMG_PACMAN_CACHE_DIR", Self::utf8_path(&cache)),
+            ("OMG_PACMAN_CACHE_ROOT_DIR", Self::utf8_path(&cache_root)),
+            ("OMG_PACMAN_MIRRORLIST", Self::utf8_path(&mirrorlist)),
+            ("NO_COLOR", "1"),
+        ];
+        vars.extend_from_slice(extra_env);
+        run_omg_with_home_without_env(
+            args,
+            Some(self.path()),
+            &vars,
+            self.home_dir.path(),
+            &[
+                "OMG_TEST_MODE",
+                "OMG_TEST_DISTRO",
+                "OMG_NATIVE_TEST_DATA_DIR",
+                "SUDO_USER",
+                "SUDO_HOME",
+                "DOAS_USER",
+            ],
+        )
     }
 
     pub fn mock_install(&self, package: &str, version: &str) -> Result<()> {

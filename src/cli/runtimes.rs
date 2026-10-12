@@ -511,7 +511,7 @@ pub async fn list_versions(runtime: Option<&str>, available: bool, json: bool) -
     ui::print_spacer();
 
     // `!available` already returned above, so all arms here list remote versions
-    match rt.to_lowercase().as_str() {
+    match canonical_runtime_name(rt).as_str() {
         "node" | "nodejs" => {
             let mgr = NodeManager::new();
             println!("{} Available remote versions:", style::informative("→"));

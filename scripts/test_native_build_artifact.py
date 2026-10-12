@@ -306,7 +306,29 @@ class NativeBuildAdmission(unittest.TestCase):
         for owner in ('build-staged', 'build-staged-ubuntu'):
             block = job_block(lane, owner)
             self.assertIn('!inputs.reuse-ci', block)
-            self.assertIn('--locked --no-fail-fast -- --test-threads=1', block)
+            if owner == 'build-staged-ubuntu':
+                self.assertIn('--locked --no-fail-fast -- --test-threads=1', block)
+                continue
+            from test_native_contracts import NATIVE
+            import shlex
+            self.assertIn('run: python3 scripts/run-native-contracts.py ', block)
+            command = block.split('run: python3 scripts/run-native-contracts.py ', 1)[1].splitlines()[0]
+            with tempfile.TemporaryDirectory() as directory:
+                arguments = shlex.split(command.replace('${{ inputs.features }}', 'debian,pgp,license')
+                                       .replace('$RUNNER_TEMP', directory))
+                self.assertIn('--staged-units', arguments)
+                self.assertEqual(arguments[arguments.index('--output') + 1],
+                                 directory + '/staged-unit-tests')
+                for status in (0, 37):
+                    with self.subTest(owner=owner, status=status), \
+                            patch('sys.argv', ['run-native-contracts.py', *arguments]), \
+                            patch.object(NATIVE.subprocess, 'run',
+                                         return_value=subprocess.CompletedProcess([], status)) as run:
+                        self.assertEqual(NATIVE.main(), status)
+                        run.assert_called_once_with(
+                            ['cargo', 'test', '--lib', '--bins', '--no-default-features',
+                             '--features', 'debian,pgp,license', '--locked', '--no-fail-fast',
+                             '--', '--test-threads=1'], check=False)
         guest = job_block(lane, 'guest')
         self.assertIn('native-build-artifact.py reuse', guest)
         self.assertIn('--timeout 60', guest)

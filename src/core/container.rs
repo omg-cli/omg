@@ -394,16 +394,18 @@ impl ContainerManager {
         let mut runtime_errors = Vec::new();
 
         // Install common dependencies based on base image
-        if base_image.contains("ubuntu") || base_image.contains("debian") {
+        if image_family(base_image) == ImageFamily::Debian {
             dockerfile.push_str("RUN apt-get update && apt-get install -y \\\n");
             dockerfile.push_str("    curl wget git build-essential ca-certificates \\\n");
             dockerfile.push_str("    && rm -rf /var/lib/apt/lists/*\n\n");
-        } else if base_image.contains("arch") {
+        } else if image_family(base_image) == ImageFamily::Arch {
             dockerfile.push_str("RUN pacman -Syu --noconfirm && pacman -S --noconfirm \\\n");
             dockerfile.push_str("    curl wget git base-devel\n\n");
-        } else if base_image.contains("alpine") {
+        } else if image_family(base_image) == ImageFamily::Alpine {
             dockerfile.push_str("RUN apk add --no-cache \\\n");
             dockerfile.push_str("    curl wget git build-base\n\n");
+        } else if image_family(base_image) == ImageFamily::Fedora {
+            dockerfile.push_str("RUN dnf install -y curl wget git gcc gcc-c++ make ca-certificates && dnf clean all\n\n");
         }
 
         // Install runtimes
@@ -452,6 +454,14 @@ impl ContainerManager {
                     "# {runtime}: distribution default (no version pin)"
                 );
                 push_package_install(&mut dockerfile, base_image, &package);
+                continue;
+            }
+            if *runtime == "go" && !is_debian_base(base_image) {
+                runtime_errors.push(
+                    "Go container archives require Debian amd64; use system or a custom Dockerfile"
+                        .to_string(),
+                );
+                push_runtime_request_failure(&mut dockerfile, runtime);
                 continue;
             }
             if !is_debian_base(base_image)
@@ -869,46 +879,71 @@ fn is_safe_image_reference(image: &str) -> bool {
     crate::core::security::validate_image_ref(image).is_ok()
 }
 
-/// Whether [`push_package_install`] knows how to emit an install line for
-/// this base-image family.
+/// Package-manager family selected from the image repository name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageFamily {
+    Debian,
+    Arch,
+    Alpine,
+    Fedora,
+    Rhel,
+    OpenSuse,
+    Unknown,
+}
+
+fn image_family(image: &str) -> ImageFamily {
+    let repository = image.split('@').next().unwrap_or(image);
+    let mut components = repository.rsplit('/');
+    let leaf = components.next().unwrap_or(repository);
+    let name = leaf.split(':').next().unwrap_or(leaf);
+    match name {
+        "ubuntu" | "debian" => ImageFamily::Debian,
+        "arch" | "archlinux" => ImageFamily::Arch,
+        "base" if components.next() == Some("archlinux") => ImageFamily::Arch,
+        "alpine" => ImageFamily::Alpine,
+        "fedora" | "fedora-minimal" | "fedora-toolbox" | "fedora-bootc" => ImageFamily::Fedora,
+        "rhel" | "rhel7" | "rhel8" | "rhel9" | "rhel10" | "centos" | "centos-stream" => {
+            ImageFamily::Rhel
+        }
+        "opensuse" | "opensuse-leap" | "opensuse-tumbleweed" => ImageFamily::OpenSuse,
+        "leap" | "tumbleweed" if components.next() == Some("opensuse") => ImageFamily::OpenSuse,
+        _ => ImageFamily::Unknown,
+    }
+}
+
 fn is_debian_base(base_image: &str) -> bool {
-    base_image.contains("ubuntu") || base_image.contains("debian")
+    image_family(base_image) == ImageFamily::Debian
 }
 
 fn push_package_install_supported(base_image: &str) -> bool {
-    is_debian_base(base_image)
-        || base_image.contains("arch")
-        || base_image.contains("alpine")
-        || base_image.contains("fedora")
-        || base_image.contains("rhel")
-        || base_image.contains("centos")
-        || base_image.contains("opensuse")
+    image_family(base_image) != ImageFamily::Unknown
 }
 
 fn runtime_system_package(base_image: &str, runtime: &str, version: &str) -> Option<String> {
+    let family = image_family(base_image);
     match runtime {
         "node" => Some("nodejs".to_string()),
-        "python" if base_image.contains("arch") => Some("python".to_string()),
+        "python" if family == ImageFamily::Arch => Some("python".to_string()),
         "python" => Some("python3".to_string()),
         "go" if version == "system" && is_debian_base(base_image) => Some("golang-go".to_string()),
         "go" if version == "system"
-            && (base_image.contains("arch") || base_image.contains("alpine")) =>
+            && matches!(family, ImageFamily::Arch | ImageFamily::Alpine) =>
         {
             Some("go".to_string())
         }
         "go" if version == "system" => Some("golang".to_string()),
-        "java" if base_image.contains("arch") => Some("jdk-openjdk".to_string()),
-        "java" if base_image.contains("alpine") => {
+        "java" if family == ImageFamily::Arch => Some("jdk-openjdk".to_string()),
+        "java" if family == ImageFamily::Alpine => {
             let major = version.split('.').next().filter(|part| {
                 !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
             });
             Some(format!("openjdk{}", major.unwrap_or("21")))
         }
         "java"
-            if base_image.contains("fedora")
-                || base_image.contains("rhel")
-                || base_image.contains("centos")
-                || base_image.contains("opensuse") =>
+            if matches!(
+                family,
+                ImageFamily::Fedora | ImageFamily::Rhel | ImageFamily::OpenSuse
+            ) =>
         {
             let major = version.split('.').next().filter(|part| {
                 !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
@@ -929,24 +964,24 @@ fn push_package_install(dockerfile: &mut String, base_image: &str, package: &str
     use std::fmt::Write as _;
 
     let _ = writeln!(dockerfile, "# Install {package}");
-    if base_image.contains("ubuntu") || base_image.contains("debian") {
+    if image_family(base_image) == ImageFamily::Debian {
         let _ = writeln!(
             dockerfile,
             "RUN apt-get update && apt-get install -y {package} && rm -rf /var/lib/apt/lists/*\n"
         );
-    } else if base_image.contains("arch") {
+    } else if image_family(base_image) == ImageFamily::Arch {
         let _ = writeln!(dockerfile, "RUN pacman -S --noconfirm {package}\n");
-    } else if base_image.contains("alpine") {
+    } else if image_family(base_image) == ImageFamily::Alpine {
         let _ = writeln!(dockerfile, "RUN apk add --no-cache {package}\n");
-    } else if base_image.contains("fedora")
-        || base_image.contains("rhel")
-        || base_image.contains("centos")
-    {
+    } else if matches!(
+        image_family(base_image),
+        ImageFamily::Fedora | ImageFamily::Rhel
+    ) {
         let _ = writeln!(
             dockerfile,
             "RUN dnf install -y {package} && dnf clean all\n"
         );
-    } else if base_image.contains("opensuse") {
+    } else if image_family(base_image) == ImageFamily::OpenSuse {
         let _ = writeln!(
             dockerfile,
             "RUN zypper install -y {package} && zypper clean\n"
@@ -1016,7 +1051,7 @@ pub struct ImageInfo {
 
 /// Detect the best shell for a container image
 fn detect_container_shell(image: &str) -> &'static str {
-    if image.contains("alpine") {
+    if image_family(image) == ImageFamily::Alpine {
         "/bin/sh"
     } else {
         "/bin/bash"
@@ -1094,6 +1129,162 @@ mod tests {
         assert!(dockerfile.contains("FROM ubuntu:24.04"));
         // Check for Node.js installation (new format installs runtimes)
         assert!(dockerfile.contains("Install Node.js") || dockerfile.contains("NODE_VERSION"));
+    }
+
+    #[test]
+    fn fedora_generation_ignores_namespaces_tags_and_digests() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let digest = "0".repeat(64);
+        for image in [
+            "fedora:44".to_owned(),
+            "registry.example/research/fedora:44".to_owned(),
+            "registry.example/ubuntu/fedora:44".to_owned(),
+            format!("registry.example/research/fedora@sha256:{digest}"),
+            "fedora:search".to_owned(),
+            "registry.example/alpine/fedora:44".to_owned(),
+        ] {
+            let generated = manager.generate_dockerfile(
+                &image,
+                &[("python", "system"), ("node", "20"), ("java", "21")],
+                &InstallerDigests::new(),
+            );
+            assert!(generated.runtime_errors.is_empty(), "{image}");
+            assert!(generated.unpinned_urls.is_empty(), "{image}");
+            for package in ["python3", "nodejs", "java-21-openjdk-devel"] {
+                assert!(
+                    generated
+                        .content
+                        .contains(&format!("RUN dnf install -y {package} && dnf clean all")),
+                    "{image}: {}",
+                    generated.content
+                );
+            }
+            assert!(!generated.content.contains("pacman"), "{image}");
+            assert!(!generated.content.contains("apt-get"), "{image}");
+            assert!(!generated.content.contains("apk add"), "{image}");
+            assert_eq!(detect_container_shell(&image), "/bin/bash");
+        }
+    }
+
+    #[test]
+    fn known_container_image_leaves_keep_their_native_providers() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        for (image, command, shell) in [
+            (
+                "arm64v8/ubuntu:24.04",
+                "apt-get install -y python3",
+                "/bin/bash",
+            ),
+            (
+                "registry.example/fedora/debian:bookworm",
+                "apt-get install -y python3",
+                "/bin/bash",
+            ),
+            (
+                "archlinux:latest",
+                "pacman -S --noconfirm python",
+                "/bin/bash",
+            ),
+            (
+                "archlinux/base:latest",
+                "pacman -S --noconfirm python",
+                "/bin/bash",
+            ),
+            (
+                "registry.example/fedora/alpine:3.21",
+                "apk add --no-cache python3",
+                "/bin/sh",
+            ),
+            ("fedora-minimal:44", "dnf install -y python3", "/bin/bash"),
+            ("centos:stream9", "dnf install -y python3", "/bin/bash"),
+            (
+                "opensuse/leap:15.6",
+                "zypper install -y python3",
+                "/bin/bash",
+            ),
+            (
+                "opensuse/tumbleweed:latest",
+                "zypper install -y python3",
+                "/bin/bash",
+            ),
+        ] {
+            let generated = manager.generate_dockerfile(
+                image,
+                &[("python", "system")],
+                &InstallerDigests::new(),
+            );
+            assert!(generated.runtime_errors.is_empty(), "{image}");
+            assert!(
+                generated.content.contains(command),
+                "{image}: {}",
+                generated.content
+            );
+            assert_eq!(detect_container_shell(image), shell);
+        }
+        let unknown = manager.generate_dockerfile(
+            "registry.example/fedora/custom:latest",
+            &[("python", "system")],
+            &InstallerDigests::new(),
+        );
+        assert!(unknown.content.contains("Unknown base image"));
+        assert!(!unknown.content.contains("RUN "));
+    }
+
+    #[test]
+    fn fedora_development_image_installs_its_build_dependencies() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated = manager.generate_dockerfile("fedora:44", &[], &InstallerDigests::new());
+        assert!(
+            generated.content.contains(
+                "RUN dnf install -y curl wget git gcc gcc-c++ make ca-certificates && dnf clean all"
+            ),
+            "{}",
+            generated.content
+        );
+    }
+
+    #[test]
+    fn unsupported_go_archive_provider_is_refused_before_download_selection() {
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        for image in [
+            "fedora:44",
+            "archlinux:latest",
+            "alpine:3.21",
+            "registry.example/custom:latest",
+        ] {
+            let generated =
+                manager.generate_dockerfile(image, &[("go", "1.23.5")], &InstallerDigests::new());
+            assert!(!generated.runtime_errors.is_empty(), "{image}");
+            assert!(generated.unpinned_urls.is_empty(), "{image}");
+            assert!(
+                generated
+                    .content
+                    .contains("OMG cannot satisfy runtime version request for go"),
+                "{image}"
+            );
+            assert!(!generated.content.contains("https://go.dev/dl/"), "{image}");
+        }
+        let system =
+            manager.generate_dockerfile("fedora:44", &[("go", "system")], &InstallerDigests::new());
+        assert!(system.runtime_errors.is_empty());
+        assert!(system.unpinned_urls.is_empty());
+        assert!(
+            system
+                .content
+                .contains("RUN dnf install -y golang && dnf clean all")
+        );
+        let debian = manager.generate_dockerfile(
+            "debian:bookworm",
+            &[("go", "1.23.5")],
+            &InstallerDigests::new(),
+        );
+        assert!(debian.runtime_errors.is_empty());
+        assert!(
+            debian
+                .unpinned_urls
+                .iter()
+                .any(|url| url.ends_with("go1.23.5.linux-amd64.tar.gz"))
+        );
     }
 
     #[test]

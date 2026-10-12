@@ -1095,3 +1095,12 @@ fn test_cli_debian_package_name_validation() {
         assert_runs_without_panic(&result, &format!("search {name}"));
     }
 }
+
+#[test]
+fn test_malformed_epoch_uses_zero_for_comparison() {
+    use std::cmp::Ordering;
+    // The public comparator normalizes a non-numeric epoch to zero.
+    assert_eq!(compare_versions("bad:1.0", "0:1.0"), Ordering::Equal);
+    assert_eq!(compare_versions("bad:1.0", "1:0"), Ordering::Less);
+    assert_eq!(compare_versions("1:0", "bad:1.0"), Ordering::Greater);
+}

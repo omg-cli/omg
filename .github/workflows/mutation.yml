@@ -93,6 +93,11 @@ jobs:
           python3 -m unittest discover -s scripts -p test_mutation_runner_observer.py
           python3 -m unittest discover -s scripts -p test_mutation_build_budget.py
 
+      - name: Install shell contract dependencies
+        run: |
+          sudo apt-get update --error-on=any
+          sudo apt-get install -y --no-install-recommends zsh fish python3-venv
+
       - name: Validate portable mutation baseline
         if: github.event_name == 'pull_request' || inputs.baseline-only == true
         run: cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast

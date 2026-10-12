@@ -445,10 +445,11 @@ if [[ "$GUEST_MODE" == true ]]; then
                 }
                 if (version "-" release != base_evr) exit 1;
               } else if (rpm_release == "false") {
-                expected_name=(phase == "installed" ? "tree." arch : "tree");
+                expected_name="tree." arch;
                 sub(/^0:/, "", version);
                 expected_installed=(phase == "installed" ? "yes" : "no");
-                if (name != expected_name || version != expected_evr ||
+                if ((name != expected_name && !(phase == "available" && name == "tree")) ||
+                    version != expected_evr ||
                     installed_fields != 1 || installed != expected_installed ||
                     architectures > 1 || (architectures == 1 && architecture != arch) ||
                     releases > 1 || epochs > 1 || (epochs == 1 && epoch != expected_epoch)) exit 1;
@@ -711,11 +712,17 @@ if [[ "$GUEST_MODE" == true ]]; then
             search_native=(dnf -C search ripgrep); search_name=dnf ;;
     esac
     omg_names() {
-        jq -er --arg kind "$1" '
+        jq -er --arg kind "$1" --arg distro "$distro" --arg arch "$(uname -m)" '
           (if $kind == "search" then map(.name) else .packages end) |
           if type == "array" and length > 0 and length < 100000 and
              all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9+._:@-]*$"))
-          then .[] else error("invalid or potentially truncated package-name set") end
+          then . else error("invalid or potentially truncated package-name set") end |
+          if $distro == "fedora" and $kind == "search" then
+            map(capture("^(?<name>[A-Za-z0-9][A-Za-z0-9+._-]*)\\.(?<arch>[A-Za-z0-9_]+)$") //
+                error("invalid Fedora package architecture")) |
+            if all(.[]; .arch == $arch or .arch == "noarch") then map(.name)
+            else error("unexpected Fedora package architecture") end
+          else . end | .[]
         ' "$2" | sort -u
     }
     search_names() {

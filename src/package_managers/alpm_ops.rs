@@ -335,6 +335,10 @@ fn clean_cache_internal(keep_versions: usize, dry_run: bool) -> Result<(usize, u
                 removed += 1;
                 let archive_len = std::fs::metadata(&old).map_or(0, |metadata| metadata.len());
                 freed = freed.saturating_add(archive_len);
+                let signature = old.with_added_extension("sig");
+                let signature_len =
+                    std::fs::metadata(signature).map_or(0, |metadata| metadata.len());
+                freed = freed.saturating_add(signature_len);
             } else {
                 // Only credit bytes that were actually freed; failures are
                 // logged with their cause so callers are not told space was
@@ -2279,6 +2283,48 @@ mod tests {
         assert_eq!(package_base_name("not-a-package-file.tar.zst"), None);
         assert_eq!(package_base_name("linux-6.7.0-1-x86_64.zip"), None);
         assert_eq!(package_base_name("-1-2-x86_64.pkg.tar.zst"), None);
+    }
+
+    #[test]
+    fn clean_cache_preview_counts_detached_signature_bytes() {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::alpm_ops::tests::clean_cache_preview_counts_detached_signature_bytes",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("private cache fixture");
+        let cache = temp.path().join("var/cache/pacman/pkg");
+        std::fs::create_dir_all(&cache).expect("create cache");
+        let old = cache.join("demo-1.0-1-x86_64.pkg.tar.zst");
+        let old_signature = old.with_added_extension("sig");
+        let current = cache.join("demo-2.0-1-x86_64.pkg.tar.zst");
+        let current_signature = current.with_added_extension("sig");
+        std::fs::write(&old, b"old").expect("old archive");
+        std::fs::write(&old_signature, b"sig").expect("old signature");
+        std::fs::write(&current, b"current").expect("current archive");
+        std::fs::write(&current_signature, b"current-signature").expect("current signature");
+        paths::set_test_overrides(Some(temp.path().to_path_buf()), None);
+
+        let preview = clean_cache_preview(1).expect("preview");
+        assert_eq!(std::fs::read(&old).unwrap(), b"old");
+        assert_eq!(std::fs::read(&old_signature).unwrap(), b"sig");
+        assert_eq!(std::fs::read(&current).unwrap(), b"current");
+        assert_eq!(
+            std::fs::read(&current_signature).unwrap(),
+            b"current-signature"
+        );
+        assert_eq!(preview, (1, 6), "preview must include companion bytes");
+
+        let cleaned = clean_cache(1).expect("cleanup");
+        paths::reset_test_overrides();
+        assert_eq!(cleaned, (2, 6));
+        assert!(!old.exists());
+        assert!(!old_signature.exists());
+        assert_eq!(std::fs::read(&current).unwrap(), b"current");
+        assert_eq!(
+            std::fs::read(&current_signature).unwrap(),
+            b"current-signature"
+        );
     }
 
     #[test]

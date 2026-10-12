@@ -413,7 +413,11 @@ docker() {
                     HEALTH.collect()
 
     def test_capability_loss_or_boot_change_during_collection_cannot_admit(self):
-        for changed_boot in (False, True):
+        for changed_boot, lost_socket, expected_error in (
+            (False, False, None),
+            (False, True, "crash channel is absent, disabled, pending or failed"),
+            (True, False, "crash channel or guest boot changed during collection"),
+        ):
             original = self.processing_query(["", ""], "")
             sockets = 0
 
@@ -422,16 +426,25 @@ docker() {
                 result = original(argv)
                 if argv[-1] == "systemd-coredump.socket":
                     sockets += 1
-                    if sockets == 2 and not changed_boot:
+                    if sockets == 2 and lost_socket:
                         return result.replace("ActiveState=active", "ActiveState=inactive")
                 return result
 
-            with self.subTest(changed_boot=changed_boot), \
-                    patch.object(HEALTH.Path, "read_text", side_effect=[self.payload["boot_id"],
-                                 "00000000-1111-2222-3333-555555555555"]), \
+            initial_boot = self.payload["boot_id"]
+            final_boot = "00000000-1111-2222-3333-555555555555" if changed_boot else initial_boot
+            with self.subTest(changed_boot=changed_boot, lost_socket=lost_socket), \
+                    patch.object(HEALTH.Path, "read_text", side_effect=[initial_boot, final_boot]) as read_boot, \
                     patch.object(HEALTH, "query", side_effect=query):
-                with self.assertRaises(ValueError):
-                    HEALTH.collect()
+                if expected_error is None:
+                    receipt = HEALTH.collect()
+                    self.assertTrue(receipt["complete"])
+                    self.assertEqual(receipt["boot_id"], initial_boot)
+                else:
+                    with self.assertRaises(ValueError) as failure:
+                        HEALTH.collect()
+                    self.assertEqual(str(failure.exception), expected_error)
+                self.assertEqual(sockets, 2)
+                self.assertEqual(read_boot.call_count, 1 if lost_socket else 2)
 
     def test_receipt_requires_positive_same_boot_capability(self):
         for field, value in (("boot_id", "00000000-1111-2222-3333-555555555555"),

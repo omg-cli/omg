@@ -107,6 +107,21 @@ fn create_test_project(dir: &Path, config_type: &str) {
     }
 }
 
+fn write_node_fixture(binary: &Path, version: &str, ordinary_output: &str) {
+    fs::write(
+        binary,
+        format!(
+            "#!/bin/sh\nif [ \"${{1:-}}\" = '--version' ]; then printf '%s\\n' 'v{version}'; exit 0; fi\nprintf '%s' '{ordinary_output}'\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(binary, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 /// Exercise detection and activation of an installed runtime without downloads.
 fn detect_installed_runtime(
     project: &TestProject,
@@ -135,11 +150,19 @@ fn detect_installed_runtime(
     };
     let installed = versions.join(installed_name);
     fs::create_dir_all(installed.join("bin")).unwrap();
-    fs::write(
-        installed.join("bin").join(binary),
-        b"installed runtime fixture",
-    )
-    .unwrap();
+    if runtime == "node" {
+        write_node_fixture(
+            &installed.join("bin").join(binary),
+            version,
+            "installed runtime fixture",
+        );
+    } else {
+        fs::write(
+            installed.join("bin").join(binary),
+            b"installed runtime fixture",
+        )
+        .unwrap();
+    }
     assert!(!versions.join("current").exists());
     let result = run_omg_with_options(
         &["use", runtime],
@@ -597,7 +620,15 @@ mod runtime_management {
             let versions_dir = project.data_dir.path().join("versions").join(runtime);
             let version_dir = versions_dir.join(version);
             fs::create_dir_all(version_dir.join("bin")).unwrap();
-            fs::write(version_dir.join("bin").join(binary), b"runtime fixture").unwrap();
+            if runtime == "node" {
+                write_node_fixture(
+                    &version_dir.join("bin").join(binary),
+                    version,
+                    "runtime fixture",
+                );
+            } else {
+                fs::write(version_dir.join("bin").join(binary), b"runtime fixture").unwrap();
+            }
             assert!(!versions_dir.join("current").exists());
 
             let result = project.run_with_env(&["use", runtime], &[("PATH", "")]);
@@ -1048,7 +1079,7 @@ mod edge_cases {
         let versions_dir = project.data_dir.path().join("versions/node");
         let version_dir = versions_dir.join("20.10.0");
         fs::create_dir_all(version_dir.join("bin")).unwrap();
-        fs::write(version_dir.join("bin/node"), b"runtime fixture").unwrap();
+        write_node_fixture(&version_dir.join("bin/node"), "20.10.0", "runtime fixture");
         assert!(!versions_dir.join("current").exists());
 
         let deep_path = project.create_dir("a/b/c/d/e");

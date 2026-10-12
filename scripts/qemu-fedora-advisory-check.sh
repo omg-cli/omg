@@ -12,8 +12,8 @@ timeout --kill-after=5s 120s sudo -n unshare --mount --net --propagation private
   --fixture-root /tmp/omg-fedora-advisory-qemu-616 --archive-sha256 "$archive_sha256" \
   > "$evidence/fedora-advisory/worker.log" 2>&1 || worker_rc=$?
 sha256sum /etc/dnf/dnf.conf > "$evidence/fedora-advisory/parent-system-after.sha256"
-files=(receipt.json native-query.tsv os-release daemon.log commands.json native-version-comparison.txt native-dnf-before.conf private-dnf.conf fixture.repo fixture-key.asc updateinfo.xml updateinfo.xml.gz repomd.xml repomd.xml.asc)
-for phase in untrusted-metadata direct-plain direct-findings daemon-plain daemon-findings daemon-before daemon-after native-advisory-list native-advisory-info native-repository verify; do
+files=(receipt.json native-query.tsv os-release daemon.log commands.json native-version-comparison.txt native-dnf-before.conf private-dnf.conf excluded-dnf.conf fixture.repo fixture-key.asc updateinfo.xml updateinfo.xml.gz repomd.xml repomd.xml.asc)
+for phase in untrusted-metadata direct-plain direct-findings daemon-plain daemon-findings daemon-before daemon-after native-advisory-list native-advisory-info native-excluded-default-list native-excluded-override-list native-excluded-override-info native-repository verify; do
   files+=("$phase.stdout" "$phase.stderr")
 done
 for name in "${files[@]}"; do
