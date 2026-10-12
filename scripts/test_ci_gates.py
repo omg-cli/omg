@@ -269,7 +269,7 @@ class CiDeduplicationTests(unittest.TestCase):
     def test_workflow_recipe_executes_checks_and_propagates_failure(self) -> None:
         commands = [
             ["cargo", "fmt", "--all", "--", "--check"],
-            ["python3", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"],
+            ["python3", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py", "-v"],
             ["python3", "tests/test_benchmark_records.py"],
             ["python3", "tests/test_terminal_update_notice.py"],
             ["python3", "tests/test_audit_repair_shell.py"],
