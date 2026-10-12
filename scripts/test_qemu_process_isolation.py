@@ -60,7 +60,7 @@ class QemuProcessIsolationTests(unittest.TestCase):
                 self.assertEqual(result.stdout.strip(), 'q35,sata=off' if arch == 'x86_64' else 'virt')
 
     @unittest.skipIf(os.name == 'nt', 'launch fixture requires POSIX executable scripts')
-    def test_headless_launch_disables_vga_and_preserves_serial_and_network(self):
+    def test_headless_launch_preserves_default_vga_serial_and_network(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         launch = 'nohup "$5"' + source.split('nohup "$5"', 1)[1].split('# Launch from the controller', 1)[0]
         with tempfile.TemporaryDirectory() as directory:
@@ -77,8 +77,8 @@ class QemuProcessIsolationTests(unittest.TestCase):
                                             cwd=root, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     arguments = json.loads((root / 'qemu-startup.log').read_text())
-                    self.assertIn('-vga', arguments)
-                    self.assertEqual(arguments[arguments.index('-vga') + 1], 'none')
+                    self.assertNotIn('-vga', arguments)
+                    self.assertEqual(arguments[arguments.index('-display') + 1], 'none')
                     self.assertEqual(arguments[arguments.index('-serial') + 1], 'file:serial.log')
                     self.assertIn('virtio-net-pci,netdev=n,romfile=', arguments)
                     self.assertIn('user=65534:65534', arguments)
