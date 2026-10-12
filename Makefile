@@ -287,7 +287,7 @@ debt-refresh:
 # Required hosted checks run alongside independent platform jobs.
 ci-workflow-quick: check-shell-syntax
 	cargo fmt --all -- --check
-	python3 -m unittest discover -s scripts -p 'test_*.py'
+	python3 -m unittest discover -s scripts -p 'test_*.py' -v
 	python3 tests/test_benchmark_records.py
 	python3 tests/test_terminal_update_notice.py
 	python3 tests/test_audit_repair_shell.py
