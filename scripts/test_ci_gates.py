@@ -367,5 +367,159 @@ class ShellSyntaxGateTests(unittest.TestCase):
                 self.assertFalse((root / "should-not-run").exists())
 
 
+class OwnerInventoryError(AssertionError):
+    pass
+
+
+class NormalPrOriginalOwners(unittest.TestCase):
+    EXPECTED = [
+        [
+            "cargo", "test", "--test", "distro_override", "--no-default-features",
+            "--features", "pgp,license", "--locked",
+        ],
+        [
+            "cargo", "test", "--release", "--test", "distro_override",
+            "--no-default-features", "--features", "pgp,license", "--locked",
+        ],
+        [
+            "cargo", "test", "--doc", "--no-default-features", "--features",
+            "pgp,license", "--locked",
+        ],
+    ]
+
+    @staticmethod
+    def owners(text: str) -> list[tuple[str, str, list[str]]]:
+        import shlex
+
+        block = job_block(text, "portable")
+        steps = re.split(r"(?=^      - )", block, flags=re.M)
+        commands: list[tuple[str, str, list[str]]] = []
+        for step in steps:
+            run = re.search(r"^        run: (cargo .+)$", step, re.M)
+            if not run:
+                continue
+            argv = shlex.split(run[1])
+            if "--doc" in argv or (
+                "--test" in argv
+                and argv[argv.index("--test") + 1] == "distro_override"
+            ):
+                if re.search(r"^        (if:|continue-on-error:)", step, re.M):
+                    raise OwnerInventoryError(
+                        "Owner has independent conditional/error suppression"
+                    )
+                commands.append((step, run[1], argv))
+        keys = [
+            "docs" if "--doc" in argv else "release" if "--release" in argv else "debug"
+            for _, _, argv in commands
+        ]
+        if keys != ["debug", "release", "docs"]:
+            raise OwnerInventoryError(
+                "Missing/duplicate/reordered original owner inventory: " + repr(keys)
+            )
+        return commands
+
+    def test_selected_original_owners_execute_literal_argv_and_stop_each_failure(self) -> None:
+        commands = self.owners(CI_YML.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = root / "record.py"
+            record.write_text(
+                'import json,os,pathlib,sys\n'
+                'p=pathlib.Path(os.environ["OWNER_LOG"])\n'
+                'rows=p.read_text().splitlines() if p.exists() else []\n'
+                'with p.open("a") as f:f.write(json.dumps(["cargo"]+sys.argv[1:])+"\\n")\n'
+                'sys.exit(23 if len(rows)+1==int(os.environ["FAIL_OWNER"]) else 0)\n',
+                encoding="utf-8",
+            )
+            cargo = root / "cargo"
+            cargo.write_text(
+                f'#!/bin/sh\nexec "{sys.executable}" "{record}" "$@"\n',
+                encoding="utf-8",
+            )
+            cargo.chmod(0o755)
+            log = root / "rows.jsonl"
+            for failed in (0, 1, 2, 3):
+                with self.subTest(failed=failed):
+                    log.unlink(missing_ok=True)
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", "\n".join(x[1] for x in commands)],
+                        env=dict(
+                            os.environ,
+                            PATH=str(root) + os.pathsep + os.environ["PATH"],
+                            OWNER_LOG=str(log),
+                            FAIL_OWNER=str(failed),
+                        ),
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0 if failed == 0 else 23, result.stderr)
+                    self.assertEqual(
+                        [json.loads(x) for x in log.read_text().splitlines()],
+                        self.EXPECTED[:failed or 3],
+                    )
+
+    def test_missing_each_named_owner_refuses_even_when_other_owners_succeed(self) -> None:
+        text = CI_YML.read_text(encoding="utf-8")
+        commands = self.owners(text)
+        for step, _, _ in commands:
+            with self.subTest(omitted=step.splitlines()[0]):
+                with self.assertRaises(OwnerInventoryError):
+                    self.owners(text.replace(step, "", 1))
+
+    def test_original_source_paths_select_normal_pr_owner_using_real_git_diff(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "actual_scope", Path(__file__).with_name("ci-change-scope.py")
+        )
+        assert spec is not None and spec.loader is not None
+        scope = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scope)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args: str) -> str:
+                return subprocess.check_output(
+                    [
+                        "git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                        "-c", "user.name=Owner Fixture", "-c",
+                        "user.email=fixture@example.invalid", *args,
+                    ],
+                    cwd=root,
+                ).decode().strip()
+
+            git("init", "-q")
+            (root / "README.md").write_text("base", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-qm", "baseline")
+            base = git("rev-parse", "HEAD")
+            for name, expected in [
+                ("tests/distro_override.rs", True),
+                ("src/core/env/distro.rs", True),
+                ("src/core/client.rs", True),
+                ("src/core/sudoloop.rs", True),
+                ("src/cli/tea/mod.rs", True),
+                ("README.md", False),
+            ]:
+                with self.subTest(path=name):
+                    git("checkout", "-q", "--detach", base)
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("changed", encoding="utf-8")
+                    git("add", ".")
+                    git("commit", "-qm", name)
+                    event = {
+                        "pull_request": {
+                            "base": {"sha": base},
+                            "head": {"sha": git("rev-parse", "HEAD")},
+                        }
+                    }
+                    self.assertEqual(scope.changed_paths(event, root), [name])
+                    self.assertEqual(
+                        scope.classify_scope("pull_request", event, root),
+                        (expected, expected),
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
