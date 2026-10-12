@@ -33,6 +33,14 @@ static void require(int ok, const char *phase) {
     exit(2);
   }
 }
+static void workload_result(int rc, sqlite3 *db, const char *phase) {
+  if ((rc & 0xff) == SQLITE_CORRUPT) {
+    fprintf(stderr, "DATA_FAILURE %s rc=%d message=%s\n", phase, rc,
+            error_message(db));
+    exit(1);
+  }
+  require(rc == SQLITE_OK, phase);
+}
 static void sql(sqlite3 *db, const char *query) {
   int rc = execute(db, query, 0, 0, 0);
   if (rc != SQLITE_OK) {
@@ -128,8 +136,8 @@ int main(int argc, char **argv) {
     int rc = checkpoint(reader, "main", SQLITE_CHECKPOINT_PASSIVE, 0, 0);
     atomic_store(&stopped, 1);
     require(pthread_join(thread, 0) == 0, "join writer");
-    require(rc == SQLITE_OK, "racing checkpoint");
-    require(atomic_load(&worker_error) == 0, "writer SQL");
+    workload_result(rc, reader, "racing checkpoint");
+    workload_result(atomic_load(&worker_error), writer, "writer SQL");
     rounds++;
     long visible = count(helper, "SELECT count(*) FROM canary");
     if (visible < 0 || visible < atomic_load(&committed)) {
@@ -139,9 +147,9 @@ int main(int argc, char **argv) {
       break;
     }
   }
-  require(checkpoint(helper, "main", SQLITE_CHECKPOINT_TRUNCATE, 0, 0) ==
-              SQLITE_OK,
-          "final checkpoint");
+  if (!lost)
+    workload_result(checkpoint(helper, "main", SQLITE_CHECKPOINT_TRUNCATE, 0, 0),
+                    helper, "final checkpoint");
   long recovered = count(helper, "SELECT count(*) FROM canary");
   sqlite3_stmt *check = 0;
   int integrity =
@@ -151,12 +159,16 @@ int main(int argc, char **argv) {
   if (check)
     finalize(check);
   long writes = atomic_load(&committed);
-  printf("rounds=%d committed=%ld recovered=%ld integrity_ok=%d\n", rounds,
-         writes, recovered, integrity);
+  char membership_query[100];
+  snprintf(membership_query, sizeof(membership_query),
+           "SELECT count(*) FROM canary WHERE id < 1 OR id > %ld", writes);
+  long unexpected = count(helper, membership_query);
+  printf("rounds=%d committed=%ld recovered=%ld integrity_ok=%d unexpected_ids=%ld\n",
+         rounds, writes, recovered, integrity, unexpected);
   require(writes > 0, "writer executed");
   close_db(writer);
   close_db(helper);
   close_db(reader);
   dlclose(library);
-  return lost || recovered != writes || !integrity ? 1 : 0;
+  return lost || recovered != writes || !integrity || unexpected != 0 ? 1 : 0;
 }

@@ -31,10 +31,14 @@ timeout --kill-after=5s 60s prlimit --cpu=50 --as=2147483648 \
 ```
 
 Retain stdout, stderr, exit code, elapsed time, library digest and source ID
-before cleanup. Exit 1 means missing/unreadable committed rows or a failed
-integrity check. Exit 2 means a harness/setup error; timeout or signal termination
-is also a harness failure. Exit 0 means this bounded run recovered all committed
-rows and passed the integrity check. The race is timing-dependent: a green run
+before cleanup. Exit 1 means missing/unreadable committed IDs, a failed integrity
+check, or `SQLITE_CORRUPT` from the racing checkpoint, writer, or final checkpoint.
+Those corruption paths retain the phase, result code and SQLite error message.
+Once missing/unreadable rows are observed, final-checkpoint errors cannot override
+that data-failure result. Exit 2 means a harness/setup error or another failed
+workload operation; timeout or signal termination is also a harness failure.
+Exit 0 requires exactly the committed IDs `1..N` and a passing integrity check:
+row count alone cannot detect a same-count substitution. The race is timing-dependent: a green run
 alone does not establish that an affected build is fixed. Confirm the publisher's
 package signature and source patch or a known fixed upstream version as well.
 
