@@ -49,10 +49,10 @@ def validate_run(run, commit, event_name, workflow_id, base=False):
         raise ValueError("Base coverage must come from a successful main push")
 
 
-def validate_artifact(artifacts, run_id, commit):
-    selected = [a for a in artifacts if a.get("name") == "coverage-lcov"]
+def validate_artifact(artifacts, run_id, commit, name="coverage-lcov"):
+    selected = [a for a in artifacts if a.get("name") == name]
     if len(selected) != 1:
-        raise ValueError("Expected exactly one coverage-lcov artifact")
+        raise ValueError(f"Expected exactly one {name} artifact")
     artifact = selected[0]
     identity = artifact.get("workflow_run", {})
     if (artifact.get("expired") is not False or identity.get("id") != run_id
@@ -61,20 +61,35 @@ def validate_artifact(artifacts, run_id, commit):
     return artifact
 
 
-def download(run, commit, destination):
+def download(run, commit, destination, name="coverage-lcov"):
     artifacts = api(f"repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts?per_page=100")
     if artifacts["total_count"] != len(artifacts["artifacts"]):
         raise ValueError("Coverage artifact listing is incomplete")
-    artifact = validate_artifact(artifacts["artifacts"], run["id"], commit)
+    artifact = validate_artifact(artifacts["artifacts"], run["id"], commit, name)
     destination.mkdir(parents=True, exist_ok=False)
     subprocess.run(["gh", "run", "download", str(run["id"]), "--repo", REPOSITORY,
-                    "--name", "coverage-lcov", "--dir", str(destination)],
+                    "--name", name, "--dir", str(destination)],
                    check=True, timeout=180)
-    report = destination / "lcov.info"
+    report = destination / ("lcov.info" if name == "coverage-lcov" else "coverage-regions.json.gz")
     if (not report.is_file() or report.is_symlink()
             or list(destination.iterdir()) != [report] or report.stat().st_size > 128 * 1024 * 1024):
         raise ValueError("Coverage artifact must contain one bounded lcov.info report")
     return artifact, report
+
+
+def ensure_source_commit(repo, commit):
+    commit = sha(commit)
+    command = ["git", "-C", str(repo)]
+    present = subprocess.run(command + ["cat-file", "-e", commit + "^{commit}"],
+                             capture_output=True, timeout=30)
+    if present.returncode != 0:
+        subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-C", str(repo),
+                        "fetch", "--no-auto-maintenance", "--no-tags", "--depth=1", "origin", commit],
+                       check=True, capture_output=True, timeout=180)
+    resolved = subprocess.run(command + ["rev-parse", "--verify", commit + "^{commit}"],
+                              check=True, capture_output=True, text=True, timeout=30).stdout.strip()
+    if resolved != commit:
+        raise ValueError("Acquired source commit identity mismatch")
 
 
 def main():
@@ -83,6 +98,8 @@ def main():
     event_name = os.environ["GITHUB_EVENT_NAME"]
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
     base_sha, head_sha = identities(event_name, event, os.environ["GITHUB_SHA"])
+    ensure_source_commit(Path.cwd(), base_sha)
+    ensure_source_commit(Path.cwd(), head_sha)
     current_id = int(os.environ["GITHUB_RUN_ID"])
     current = api(f"repos/{REPOSITORY}/actions/runs/{current_id}")
     workflow_id = api(f"repos/{REPOSITORY}/actions/workflows/coverage.yml")["id"]
@@ -97,12 +114,18 @@ def main():
     root.mkdir(exist_ok=False)
     base_artifact, base_report = download(base, base_sha, root / "base")
     head_artifact, head_report = download(current, head_sha, root / "head")
-    receipt = {"base_sha": base_sha, "head_sha": head_sha,
+    base_regions_artifact, base_regions = download(base, base_sha, root / "base-regions", "coverage-regions")
+    head_regions_artifact, head_regions = download(current, head_sha, root / "head-regions", "coverage-regions")
+    receipt = {"base_regions_artifact": base_regions_artifact["id"],
+               "head_regions_artifact": head_regions_artifact["id"],
+               "base_sha": base_sha, "head_sha": head_sha,
                "base_run": base["id"], "head_run": current_id,
                "base_artifact": base_artifact["id"], "head_artifact": head_artifact["id"]}
     (root / "identity.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
     result = subprocess.run([sys.executable, str(Path(__file__).with_name("check-line-coverage.py")),
-                             "--base", str(base_report), "--head", str(head_report)],
+                             "--base", str(base_report), "--head", str(head_report),
+                             "--base-regions", str(base_regions), "--head-regions", str(head_regions),
+                             "--source-repo", str(Path.cwd()), "--base-sha", base_sha, "--head-sha", head_sha],
                             capture_output=True, text=True, timeout=60)
     (root / "comparison.log").write_text(result.stdout + result.stderr, encoding="utf-8")
     print(json.dumps(receipt, sort_keys=True))

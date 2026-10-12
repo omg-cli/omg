@@ -1,5 +1,7 @@
 """Refuse source/run/artifact substitution before coverage comparison."""
 import copy
+import subprocess
+import tempfile
 import importlib.util
 from pathlib import Path
 import unittest
@@ -22,6 +24,26 @@ class BaseCoverageTests(unittest.TestCase):
         return {"id": 102, "name": "coverage-lcov", "expired": False,
                 "workflow_run": {"id": 101, "head_sha": SHA}}
 
+    def test_exact_base_is_acquired_after_multi_commit_push_into_shallow_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); origin = root / "origin"; origin.mkdir()
+            def git(*args):
+                return subprocess.check_output(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args], stderr=subprocess.DEVNULL).decode().strip()
+            git("-C", str(origin), "init")
+            (origin / "source.rs").write_text("fn baseline() {}\n")
+            git("-C", str(origin), "add", ".")
+            git("-C", str(origin), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base")
+            base = git("-C", str(origin), "rev-parse", "HEAD")
+            for index in range(3):
+                (origin / "sequence.txt").write_text(str(index)); git("-C", str(origin), "add", ".")
+                git("-C", str(origin), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", str(index))
+            shallow = root / "shallow"; git("clone", "--depth", "2", origin.as_uri(), str(shallow))
+            self.assertNotEqual(subprocess.run(["git", "-C", str(shallow), "cat-file", "-e", base + "^{commit}"], capture_output=True).returncode, 0)
+            acquire = getattr(coverage, "ensure_source_commit", None)
+            self.assertIsNotNone(acquire, "Exact source acquisition must handle a pushed base outside depth2")
+            acquire(shallow, base)
+            self.assertEqual(git("-C", str(shallow), "show", base + ":source.rs"), "fn baseline() {}")
+
     def test_exact_base_run(self):
         coverage.validate_run(self.run_fixture(), SHA, "push", 123, base=True)
 
@@ -39,6 +61,18 @@ class BaseCoverageTests(unittest.TestCase):
         run = self.run_fixture()
         run.update(event="pull_request", head_branch="feature", status="in_progress", conclusion=None)
         coverage.validate_run(run, SHA, "pull_request", 123)
+
+    def test_regions_require_the_same_exact_run_and_commit(self):
+        artifact = self.artifact_fixture()
+        artifact["name"] = "coverage-regions"
+        self.assertEqual(coverage.validate_artifact([artifact], 101, SHA, "coverage-regions"), artifact)
+        with self.assertRaises(ValueError):
+            coverage.validate_artifact([artifact], 101, "b" * 40, "coverage-regions")
+        with self.assertRaises(ValueError):
+            coverage.validate_artifact([artifact], 101, SHA)
+        artifact["expired"] = True
+        with self.assertRaises(ValueError):
+            coverage.validate_artifact([artifact], 101, SHA, "coverage-regions")
 
     def test_exact_artifact(self):
         artifact = self.artifact_fixture()

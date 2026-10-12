@@ -1382,17 +1382,6 @@ async fn handle_status(state: Arc<DaemonState>, id: RequestId) -> Response {
 }
 
 /// Handle security audit request
-/// Parse a vulnerability score string into its numeric CVSS score.
-#[cfg(test)]
-fn vulnerability_score(score: &str) -> Option<f64> {
-    score.parse::<f64>().ok().or_else(|| {
-        score
-            .parse::<cvss::Cvss>()
-            .ok()
-            .map(|vector| vector.score())
-    })
-}
-
 async fn handle_security_audit(state: Arc<DaemonState>, id: RequestId) -> Response {
     GLOBAL_METRICS.inc_security_audit_requests();
     match state.scan_security().await {
@@ -3309,6 +3298,8 @@ mod tests {
 
     #[test]
     fn vulnerability_score_parses_osv_cvss_vectors() {
+        use crate::core::security::vulnerability::parse_severity_score as vulnerability_score;
+
         assert_eq!(vulnerability_score("7.5"), Some(7.5));
         assert_eq!(
             vulnerability_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
