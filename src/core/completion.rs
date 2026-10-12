@@ -357,6 +357,14 @@ mod tests {
             PersistedCompletionCache::FORMAT_VERSION
         );
         assert!(decoded.entries.is_empty());
+        let valid = PersistedCompletionCache::decode(
+            r#"{"format_version":1,"entries":{"aur_packages":"pkg-one,pkg-two"}}"#,
+        );
+        assert_eq!(valid.format_version, 1);
+        assert_eq!(
+            valid.entries.get("aur_packages").map(String::as_str),
+            Some("pkg-one,pkg-two")
+        );
     }
 
     #[test]
@@ -469,6 +477,9 @@ mod tests {
 
         let suggestions = CompletionEngine::probe_context_from(&child, "node").unwrap();
         assert!(suggestions.is_empty());
+        std::fs::write(child.join(".nvmrc"), "20.11.1\n").unwrap();
+        let suggestions = CompletionEngine::probe_context_from(&child, "node").unwrap();
+        assert_eq!(suggestions, vec!["20.11.1".to_string()]);
     }
 
     #[test]
@@ -486,6 +497,13 @@ mod tests {
     fn read_optional_file_missing_is_none() {
         let missing = TempDir::new().unwrap().path().join("does-not-exist");
         assert!(read_optional_file(&missing).unwrap().is_none());
+        let directory = TempDir::new().unwrap();
+        let present = directory.path().join(".python-version");
+        std::fs::write(&present, "3.12.0\n").unwrap();
+        assert_eq!(
+            read_optional_file(&present).unwrap(),
+            Some("3.12.0\n".to_string())
+        );
     }
 
     #[test]
