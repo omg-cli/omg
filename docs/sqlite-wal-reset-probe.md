@@ -48,8 +48,9 @@ inconclusive. A null integrity text result refuses exit 2, and an otherwise
 clean run with no acknowledged writer commits also refuses exit 2. The writer
 records errors atomically and is joined before connection diagnostics or
 cleanup. An unexpected join failure exits 2 without closing a possibly live
-writer connection; keep the external timeout/process supervisor. Exit 0 means this bounded run recovered all committed
-rows and passed the integrity check. The race is timing-dependent: a green run
+writer connection; keep the external timeout/process supervisor. Exit 0 requires exactly the committed IDs `1..N` and a passing integrity check.
+The canary primary key is unique; count `N` plus zero IDs outside `1..N` rejects
+a same-count substitution that row count alone would miss. The race is timing-dependent: a green run
 alone does not establish that an affected build is fixed. Confirm the publisher's
 package signature and source patch or a known fixed upstream version as well.
 

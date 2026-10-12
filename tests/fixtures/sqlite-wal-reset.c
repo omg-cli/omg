@@ -266,8 +266,14 @@ int main(int argc, char **argv) {
   long writes = atomic_load(&committed);
   if (recovered.ok && recovered.value != writes)
     record_loss();
-  printf("rounds=%d committed=%ld recovered=%ld integrity_ok=%d\n", rounds,
-         writes, recovered.value, integrity);
+  char membership_query[100];
+  snprintf(membership_query, sizeof(membership_query),
+           "SELECT count(*) FROM canary WHERE id < 1 OR id > %ld", writes);
+  Count unexpected = count(helper, membership_query, "canary ID membership");
+  if (unexpected.ok && unexpected.value != 0)
+    record_loss();
+  printf("rounds=%d committed=%ld recovered=%ld integrity_ok=%d unexpected_ids=%ld\n",
+         rounds, writes, recovered.value, integrity, unexpected.value);
   if (writes <= 0)
     harness_error("writer executed");
 cleanup:
