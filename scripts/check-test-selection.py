@@ -91,11 +91,19 @@ def read_junit(data):
                     'conflicting JUnit verdicts')
             output = '\n'.join(''.join(child.itertext()) for child in case
                                if child.tag in ('system-out', 'system-err'))
-            runtime_skip = '[omg-skip]' in output
-            markers = [line.removeprefix('[omg-skip] ').strip() for line in output.splitlines()
-                       if line.startswith('[omg-skip] ')]
+            markers = [line for line in output.splitlines() if '[omg-skip]' in line]
             require(len(markers) <= 1, 'ambiguous runtime skip reason')
-            skip_reason = markers[0] if markers else None
+            runtime_skip = bool(markers)
+            skip_reason = None
+            if markers:
+                require(markers[0].startswith('[omg-skip] ') and markers[0].count('[omg-skip]') == 1,
+                        'malformed runtime skip reason')
+                skip_reason = markers[0].removeprefix('[omg-skip] ').strip()
+                require(bool(skip_reason), 'empty runtime skip reason')
+            runner_message = skipped[0].get('message') if skipped else None
+            runner_text = ''.join(skipped[0].itertext()) if skipped else None
+            runner_type = skipped[0].get('type') if skipped else None
+            runner_reason = ((runner_message or '').strip() or (runner_text or '').strip() or None)
             attempts = []
             if skipped:
                 attempts.append({'result': 'SKIPPED', 'duration_ms': 0.0})
@@ -107,7 +115,12 @@ def read_junit(data):
                 attempts.append({'result': 'SKIPPED' if runtime_skip else 'PASS', 'duration_ms': duration(case)})
             require(len(attempts) <= 100, 'too many execution attempts')
             observed[identity] = {'attempts': attempts, 'runtime_skip': runtime_skip,
-                                  'runtime_skip_reason': skip_reason}
+                                  'runtime_skip_reason': skip_reason,
+                                  'runner_skip_message': runner_message,
+                                  'runner_skip_text': runner_text,
+                                  'runner_skip_type': runner_type,
+                                  'runner_skip_reason': runner_reason,
+                                  'runner_skip_reason_known': runner_reason is not None}
     return observed
 
 
