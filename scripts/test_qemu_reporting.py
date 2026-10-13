@@ -921,6 +921,20 @@ class ReportingBoundaryTests(unittest.TestCase):
         self.assertEqual(receipt["case_id"], "qemu-matrix-x86-workflow")
         self.assertEqual(receipt["distro"], "fedora")
 
+    def test_trixie_terminal_guest_failure_preserves_complete_workflow_receipt(self):
+        for conclusion in ("cancelled", "action_required"):
+            with self.subTest(conclusion=conclusion):
+                jobs = [
+                    {"name": "QEMU behavioral verification / Distro lane (debian-trixie) / QEMU guest (debian-trixie)",
+                     "conclusion": conclusion},
+                    {"name": "QEMU behavioral verification / Distro lane (ubuntu) / QEMU guest (ubuntu)",
+                     "conclusion": "success"},
+                ]
+                self.assertEqual(REPORT.workflow_receipt(jobs, conclusion), dict(
+                    case_id="qemu-matrix-x86-workflow", distro="debian-trixie",
+                    result="HARNESS_ERROR", exit_code=1, elapsed_seconds=0,
+                ))
+
     def test_workflow_failure_without_one_guest_distro_uses_matrix_identity(self):
         jobs = [
             {"name": "QEMU behavioral verification / Distro lane (fedora) / QEMU guest (fedora)",
