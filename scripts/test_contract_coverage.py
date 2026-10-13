@@ -60,6 +60,49 @@ def fixture():
     return manifest, [surface], [receipt], provenance, [contract['id']]
 
 
+def native_owner_pair_fixture(mutation=None):
+    """Admit each owner against its own consistent provenance before union."""
+    manifest, surfaces, receipts, provenance, required = fixture()
+    first = manifest['contracts'][0]
+    first['id'] = 'fixture.install.state'
+    first['tests'][0].update(lane='native-cli-fixture', id='fixture-state')
+    second = copy.deepcopy(first)
+    second.update(id='fixture.install.parser', surface='omg install',
+                  requires=['parser'], assertions={'parser': ['literal-parser-result']})
+    second['tests'] = [{'lane': 'native-parser', 'id': 'fixture-parser',
+                       'evidence': ['parser'], 'assertions': ['literal-parser-result']}]
+    manifest.update(contracts=[first, second], gaps=[], behavioral_inventory_reviewed=True)
+    if mutation and mutation[0] in ('platform', 'features'):
+        policy = copy.deepcopy(manifest['surface_digests'][0])
+        policy[mutation[0]] = mutation[1]
+        manifest['surface_digests'].append(policy)
+        if mutation[0] == 'platform':
+            for contract in manifest['contracts']:
+                contract['platforms'].append(mutation[1])
+    rows = []
+    for index, contract in enumerate(manifest['contracts']):
+        binding = contract['tests'][0]
+        current = copy.deepcopy(provenance)
+        current['lane'] = binding['lane']
+        if index:
+            current.update(recipe_sha256='e' * 64, binaries={'omg': 'd' * 64})
+        if index and mutation:
+            current[mutation[0]] = copy.deepcopy(mutation[1])
+        surface = copy.deepcopy(surfaces[0])
+        surface['build'] = {key: copy.deepcopy(current[key]) for key in
+                            ('source_sha', 'platform', 'os', 'arch', 'features')}
+        receipt = copy.deepcopy(receipts[0])
+        for key in ('source_sha', 'run_id', 'run_attempt', 'recipe_sha256',
+                    'platform', 'os', 'arch', 'features', 'lane'):
+            receipt[key] = copy.deepcopy(current[key])
+        receipt.update(contract=contract['id'], test_id=binding['id'],
+                       binary_sha256=current['binaries']['omg'],
+                       evidence=copy.deepcopy(binding['evidence']),
+                       assertions=copy.deepcopy(binding['assertions']))
+        rows.append((current, [surface], [receipt], [contract['id']]))
+    return manifest, rows
+
+
 class ContractAdmission(unittest.TestCase):
     def test_native_owner_union_requires_every_reviewed_contract(self):
         manifest, surfaces, receipts, provenance, required = fixture()
@@ -370,6 +413,57 @@ class ContractAdmission(unittest.TestCase):
             report = COVERAGE.admit(*args)
             self.assertTrue(report['passed'])
             self.assertEqual(report['counts']['gaps'], 2001)
+
+
+    def admitted_native_owner_pair(self, mutation=None):
+        manifest, rows = native_owner_pair_fixture(mutation)
+        admissions = []
+        for provenance, surfaces, receipts, required in rows:
+            report = COVERAGE.admit(manifest, surfaces, receipts, provenance, required)
+            self.assertIs(report['passed'], True)
+            for key, value in {'supported': 2, 'required': 1, 'passed': 1, 'failed': 0, 'skipped': 0, 'retried': 0}.items():
+                self.assertEqual(report['counts'][key], value)
+            admissions.append((provenance, report, required))
+        self.assertNotEqual(admissions[0][0]['recipe_sha256'], admissions[1][0]['recipe_sha256'])
+        self.assertNotEqual(admissions[0][0]['binaries'], admissions[1][0]['binaries'])
+        return (manifest, admissions)
+
+    def assert_native_owner_mismatch_rejected(self, key, value):
+        manifest, admissions = self.admitted_native_owner_pair((key, value))
+        try:
+            COVERAGE.aggregate_admissions(manifest, admissions)
+        except ValueError as error:
+            self.assertEqual(str(error), 'source identity mismatch')
+        else:
+            self.fail('CI-R2_MIXED_OWNER_IDENTITY_ACCEPTED: ' + key)
+
+    def test_matched_distinct_owners_allow_distinct_recipes_and_binaries(self):
+        result = COVERAGE.aggregate_admissions(*self.admitted_native_owner_pair())
+        self.assertIs(result['passed'], True)
+        self.assertEqual(result['contracts'], {'supported': 2, 'selected': 2, 'passed': 2})
+        self.assertEqual(result['lanes'], ['native-cli-fixture', 'native-parser'])
+        self.assertEqual(result['run_attempt'], 1)
+
+    def test_mixed_run_attempt_rejected(self):
+        self.assert_native_owner_mismatch_rejected('run_attempt', 2)
+
+    def test_mixed_source_rejected(self):
+        self.assert_native_owner_mismatch_rejected('source_sha', 'f' * 40)
+
+    def test_mixed_run_id_rejected(self):
+        self.assert_native_owner_mismatch_rejected('run_id', '124')
+
+    def test_mixed_platform_rejected(self):
+        self.assert_native_owner_mismatch_rejected('platform', 'debian')
+
+    def test_mixed_os_rejected(self):
+        self.assert_native_owner_mismatch_rejected('os', 'other-os')
+
+    def test_mixed_arch_rejected(self):
+        self.assert_native_owner_mismatch_rejected('arch', 'aarch64')
+
+    def test_mixed_features_rejected(self):
+        self.assert_native_owner_mismatch_rejected('features', ['license'])
 
 
 class StrictEvidenceReader(unittest.TestCase):
