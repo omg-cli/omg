@@ -1286,6 +1286,10 @@ mod tests {
             .await
             .expect("write task")
             .expect("write codec must accept a frame larger than the request budget");
+        assert_real_handler_delivers_frame_above_request_budget().await;
+    }
+
+    async fn assert_real_handler_delivers_frame_above_request_budget() {
         let directory = tempfile::tempdir().expect("private codec fixture");
         let state = Arc::new(
             DaemonState::new_isolated(
