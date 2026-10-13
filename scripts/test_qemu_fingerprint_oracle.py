@@ -101,6 +101,21 @@ class FingerprintOracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.run_case("migrate-export")
 
+    def test_migration_export_rejects_duplicate_native_package(self):
+        self.output.write_text("Exported to manifest.json Packages: 2")
+        manifest = {"version": "1.0", "source_distro": "fedora", "packages": [
+            {"original_name": "curl"}, {"original_name": "git"}]}
+        self.write("manifest.json", json.dumps(manifest))
+        self.assertIsNone(self.run_case("migrate-export"))
+        manifest["packages"].append({"original_name": "curl"})
+        self.write("manifest.json", json.dumps(manifest))
+        with self.assertRaises(AssertionError) as error:
+            self.run_case("migrate-export")
+        self.assertEqual(str(error.exception), "migration omitted native explicit packages")
+        manifest["packages"].pop()
+        self.write("manifest.json", json.dumps(manifest))
+        self.assertIsNone(self.run_case("migrate-export"))
+
     def test_trixie_migration_requires_debian_backend_and_complete_native_packages(self):
         self.output.write_text("Exported to manifest.json Packages: 2")
         manifest = {"version": "1.0", "source_distro": "debian", "packages": [
