@@ -1,0 +1,65 @@
+{
+  "status": "PASS_ACTUAL_ORIGINAL_SNAPSHOT_NAMED_REGISTRY_ASSERTION_RED_ONLY",
+  "parents": [
+    {
+      "directory": "D:\\omg-audit-private\\deno-v10-registry-contract-red-action-source-v3",
+      "seal_sha256": "60538930a90b703d2f7a0939c0fb912b93a72c71d0a6b82a09d738565f18d74d",
+      "members_rehashed": 30
+    },
+    {
+      "directory": "D:\\omg-audit-private\\deno-v10-registry-contract-red-action-v3-independent-review",
+      "seal_sha256": "6688c796c4fc3b6ee9df8f027ca9d9af540339a2baee8e501a5a8abb2527914c",
+      "members_rehashed": 6
+    },
+    {
+      "directory": "D:\\omg-audit-private\\cargo-red-concrete-branch-independent-review",
+      "seal_sha256": "ce86893fcaf88cba92c5a9253a67966287d431032483bf831e639b20d520f9e0",
+      "members_rehashed": 58
+    },
+    {
+      "directory": "D:\\omg-audit-private\\cargo-red-dispatch-utility-independent-review",
+      "seal_sha256": "4eb44d171fc53bce1e536035cb578e8776ffe58d335a2a5984b48c7319a41429",
+      "members_rehashed": 56
+    }
+  ],
+  "source_members_rehashed": 150,
+  "run": 38429323539,
+  "job": 115407042954,
+  "attempt": 1,
+  "head": "407c6e455d7d343957fcd536dc36d4f3245f1856",
+  "actor": "PyRo1121",
+  "workflow_id": 223126843,
+  "artifact_id": 11829853114,
+  "artifact_sha256": "bfe4d39dab9cf64317c482621688e0b56f69cb4d00969f0ccbdcde24b848d67a",
+  "artifact_members": 36,
+  "artifact_inflated_bytes": 16447976,
+  "exact_named_test": "test_registry_snapshot_contract.RegistrySnapshotContract.test_locked_registry_source_without_vendor_checksum_is_accepted",
+  "tests_run": 1,
+  "expected_assertion_failures": 1,
+  "errors": 0,
+  "skips": 0,
+  "original_helper_sha256": "4fde5e7f12878282c65b700de084b820b1a511a4c492536a6502c01e41e748fb",
+  "test_sha256": "2744a84d0ad6188f1045f76b649b6ba2d36a6ad7306f8208aaf43ef11e2ef6fe",
+  "genuine_missing_filename": "/__w/_temp/deno-alias-proof/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.17/.cargo-checksum.json",
+  "source_git_batch_objects": 942,
+  "fixture_files": 3,
+  "registry_source_records": 15,
+  "registry_archive_sha256": "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2",
+  "genuine_provider_commands": 9,
+  "owned_retirement_receipts": 10,
+  "resource_samples": 11,
+  "container_caps_evidence": "Immutable admitted initialize predicates succeeded; no separate raw cgroup-stat file uploaded.",
+  "controller_uid": 0,
+  "ordinary_uid_prequalified_only": 1000,
+  "ordinary_subject_execution_credit": 0,
+  "Deno_compiler_credit": 0,
+  "active_Fedora548_integrity_credit": 0,
+  "prior_V9_credit_transferred": false,
+  "reruns_or_subject_execution_by_reviewer": 0,
+  "correction_implementation_authorized_by_review": false,
+  "root_status": "ROOT_ADMITTED_ORIGINAL_SNAPSHOT_NAMED_ASSERTION_RED_ONLY",
+  "observation_seal_sha256": "d6dba831908ac7fc3b0bbd5453f56794933d96b1a523716aabb7a550dd947948",
+  "observation_members_rehashed": 58,
+  "correction_source_work_may_begin": true,
+  "correction_execution_credit": 0
+}

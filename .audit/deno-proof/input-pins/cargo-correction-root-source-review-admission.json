@@ -1,0 +1,34 @@
+{
+  "status": "ROOT_ADMITTED_CORRECTION_SOURCE_REVIEW_ONLY",
+  "packages": [
+    {
+      "package": "deno-v10-cargo-provenance-correction-candidate",
+      "seal_sha256": "7d783b471adf7a5976b3f80abd8ed133264b996946c53af783bb542ce9a1afb7",
+      "members": 28
+    },
+    {
+      "package": "deno-v10-cargo-provenance-correction-independent-review",
+      "seal_sha256": "792548899b45cfca195b8f89181501959fc3e63e1722e1c11f712c9c154100fa",
+      "members": 11
+    }
+  ],
+  "root_read_complete_final_report": true,
+  "source_qualifications": [
+    "physical_headers is entry/first-terminator ordinal; second terminator and zero tail remain fully expanded-byte-accounted",
+    "byte and implied-node limits are checked with bounded observation overshoot, not universal host quotas",
+    "compressed ceiling is pre/post file size/hash/identity, not an in-parser compressed byte counter; static protected input plus owned deadline required, or reviewed streaming limiter for a hard during-parse claim",
+    "conservative supported archive domain must be proven compatible with all 548 actual registry archives"
+  ],
+  "runtime_obligations": [
+    "protected exclusive fixture ancestry and all fixture namespaces in sampled resource scope",
+    "owned supervised child for synchronous verification and default-bound real resource fixtures",
+    "fresh positive contexts and genuine metadata; full provider-command and scan deadline accounting",
+    "complete evidence sizing and bounded capture/export without suppressed methods or observations",
+    "37 intact methods and 11 nested negatives, then complete four fault controls and intact controls",
+    "all 548 registry compatibility and exact actual graph/lock/root joins before Deno matrix"
+  ],
+  "action_source_preparation_may_continue": true,
+  "execution_released": false,
+  "runtime_compiler_fault_credit": 0,
+  "canonical_source_coverage_unchanged": 1336
+}
