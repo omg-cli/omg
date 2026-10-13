@@ -97,6 +97,23 @@ class BackendMismatchReceiptTests(unittest.TestCase):
                 PROBE.validate_receipt(
                     dict(self.receipt(), **{f"{command}_mismatch": False}), "arch")
 
+    def test_fedora_rpmdb_execution_is_native_access(self):
+        receipt = dict(self.receipt(), distro="fedora", fixture_distro="debian")
+        self.assertIsNone(PROBE.validate_receipt(receipt, "fedora"))
+        self.assertFalse(PROBE.native_db_access(
+            'execve("/usr/bin/date", ["date"], 0x0) = 0', "fedora"))
+        for trace in (
+            'execve("/usr/bin/rpmdb", ["rpmdb", "--verifydb"], 0x0) = 0',
+            'execve("/bin/rpmdb", ["rpmdb", "--verifydb"], 0x0) = 0',
+        ):
+            with self.subTest(trace=trace):
+                access = PROBE.native_db_access(trace, "fedora")
+                self.assertTrue(access)
+                with self.assertRaises(ValueError) as error:
+                    PROBE.validate_receipt(
+                        dict(receipt, update_check_native_db_access=access), "fedora")
+                self.assertEqual(str(error.exception), "update_check accessed the native package database")
+
     def test_trace_detects_native_database_or_tool_use_for_every_distro(self):
         paths = {"arch": "/var/lib/pacman/local/bash-5", "debian": "/var/lib/dpkg/status",
                  "ubuntu": "/var/lib/apt/extended_states", "fedora": "/usr/lib/sysimage/rpm/rpmdb.sqlite"}

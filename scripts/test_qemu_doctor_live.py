@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class LiveDoctorTests(unittest.TestCase):
-    def probe(self, fault=None, distro='debian'):
+    def probe(self, fault=None, distro='debian', *, warning_status=None):
         oracle = ROOT / 'scripts/qemu-doctor-live-oracle.py'
         self.assertTrue(oracle.is_file(), 'the live-network report oracle is missing')
         names = [('Kernel.org', 'https://kernel.org'), ('GitHub', 'https://github.com')]
@@ -24,6 +24,9 @@ class LiveDoctorTests(unittest.TestCase):
         mirrors = [f'  ✓ {name} (15 ms)\n' for name, _ in names]
         dns = [f'    ✓ {host} (2 addresses)\n' for host in hosts]
         count = 1
+        if warning_status is not None:
+            mirrors[-1] = f'  ⚠ {names[-1][0]} (HTTP {warning_status})\n'
+            count += 1
         if fault == 'mixed-failures':
             mirrors[-1] = f'  ✗ {names[-1][0]} (request failed for {names[-1][1]}/)\n'
             dns[-1] = f'    ✗ {hosts[-1]} (resolver unavailable)\n'
@@ -67,6 +70,38 @@ class LiveDoctorTests(unittest.TestCase):
             with self.subTest(fault=fault):
                 result = self.probe(fault)
                 self.assertNotEqual(result.returncode, 0)
+
+    def test_http_status_warning_preserves_live_report_acceptance(self):
+        backends = (
+            ("debian", 1, 2, ["Kernel.org", "GitHub"], ["kernel.org", "github.com"]),
+            ("arch", 3, 3, ["Arch Linux", "Kernel.org", "GitHub", "AUR"],
+             ["archlinux.org", "aur.archlinux.org", "github.com"]),
+        )
+        for distro, http_positive, dns_positive, mirrors, hosts in backends:
+            for status in (503, 404):
+                with self.subTest(distro=distro, status=status):
+                    result = self.probe(distro=distro, warning_status=status)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    receipt = json.loads(result.stdout)
+                    expected = {
+                        "schema_version": 1, "kind": "doctor-live-network", "complete": True,
+                        "distro": distro, "network_scope": "network", "exit_code": 1,
+                        "baseline_exit_code": 1, "baseline_issues": 1, "health_issues": 2,
+                        "network_issues": 1, "http_positive": http_positive,
+                        "dns_positive": dns_positive, "mirror_targets": mirrors,
+                        "dns_targets": hosts,
+                    }
+                    self.assertEqual({key: receipt[key] for key in expected}, expected)
+            for status in (302, 50):
+                with self.subTest(distro=distro, status=status):
+                    result = self.probe(distro=distro, warning_status=status)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(
+                        "live Doctor proof failed: mirror outcome lacks its actual status, latency or requested URL",
+                        result.stderr,
+                    )
 
     def test_live_row_is_distinct_and_requires_network_scope(self):
         rows = (ROOT / 'tests/cli_behavior_inventory.tsv').read_text().splitlines()
