@@ -62,6 +62,29 @@ class DoctorIndexReceiptTests(unittest.TestCase):
         result = self.check(self.receipt())
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_issue_counts_reject_bool_and_float(self):
+        accepted = self.check(self.receipt())
+        self.assertEqual(accepted.returncode, 0)
+        self.assertEqual(accepted.stdout, "")
+        self.assertEqual(accepted.stderr, "")
+        for case, issue_count, message in (
+            ("empty", True, "PRODUCT_FAIL: empty did not establish counted native index health\n"),
+            ("corrupt-gzip", 2.0, "PRODUCT_FAIL: corrupt-gzip did not establish counted native index health\n"),
+        ):
+            with self.subTest(case=case, issue_count=issue_count):
+                receipt = self.receipt()
+                original = receipt["cases"][case]["issues"]
+                receipt["cases"][case]["issues"] = issue_count
+                rejected = self.check(receipt)
+                self.assertEqual(rejected.returncode, 1)
+                self.assertEqual(rejected.stdout, "")
+                self.assertEqual(rejected.stderr, message)
+                receipt["cases"][case]["issues"] = original
+                restored = self.check(receipt)
+                self.assertEqual(restored.returncode, 0)
+                self.assertEqual(restored.stdout, "")
+                self.assertEqual(restored.stderr, "")
+
     def test_health_strings_or_missing_negative_cases_cannot_pass(self):
         for alteration in ('missing', 'healthy', 'uncounted', 'no-diagnostic', 'changed-db', 'wrong-distro'):
             with self.subTest(alteration=alteration):
