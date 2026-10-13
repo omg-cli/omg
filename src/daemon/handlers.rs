@@ -1483,6 +1483,10 @@ fn validation_error(id: RequestId, message: impl Into<String>) -> Response {
 /// device I/O), so the synchronous read is effectively free.
 fn process_rss_mb() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_process_rss_mb(&status)
+}
+
+fn parse_process_rss_mb(status: &str) -> Option<u64> {
     let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
     let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kb / 1024)
@@ -3695,6 +3699,16 @@ mod tests {
     fn health_reports_resident_memory_from_procfs() {
         let rss_mb = process_rss_mb().expect("VmRSS must be readable on Linux");
         assert!(rss_mb > 0, "a running test process has non-zero RSS");
+
+        assert_eq!(
+            parse_process_rss_mb("Name:\tfixture\nVmSize:\t9999999 kB\nVmRSS:\t2048 kB\n"),
+            Some(2),
+            "procfs RSS is expressed in KiB and health reports whole MiB"
+        );
+        assert_eq!(parse_process_rss_mb("VmRSS: 3071 kB\n"), Some(2));
+        assert_eq!(parse_process_rss_mb("VmRSS: 1023 kB\n"), Some(0));
+        assert_eq!(parse_process_rss_mb("VmSize: 2048 kB\n"), None);
+        assert_eq!(parse_process_rss_mb("VmRSS: invalid kB\n"), None);
     }
 
     #[test]
