@@ -1369,9 +1369,10 @@ mod tests {
                     error.kind() == std::io::ErrorKind::InvalidInput
                         && error.to_string() == "frame size too big"
                 });
-            if !expected_cap_rejection {
-                panic!("HARNESS: unrelated handler error: {error:#}");
-            }
+            assert!(
+                expected_cap_rejection,
+                "HARNESS: unrelated handler error: {error:#}"
+            );
             eprintln!("CODEC_WRITE_CAP_REJECTION: {error:#}");
         }
         assert!(
