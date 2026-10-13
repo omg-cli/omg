@@ -1362,25 +1362,40 @@ mod tests {
             }
         }
 
-        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let task_dropped = Arc::clone(&dropped);
-        let (started, ready) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _witness = DropWitness(task_dropped);
-            started.send(()).expect("retirement fixture receiver");
-            std::future::pending::<Result<()>>().await
-        });
-        ready
-            .await
-            .expect("pending task must start before deadline");
-        let retired = retire_handler_fixture(task, Duration::from_secs(5)).await;
-        assert!(matches!(
-            retired,
-            Err(HandlerFixtureRetirementError::Deadline {
-                abort_join: Err(error)
-            }) if error.is_cancelled()
-        ));
-        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        for complete in [true, false] {
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let task_dropped = Arc::clone(&dropped);
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, completion) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _witness = DropWitness(task_dropped);
+                started.send(()).expect("retirement fixture receiver");
+                completion.await.expect("retirement fixture release");
+                anyhow::Ok(())
+            });
+            ready.await.expect("task must start before retirement");
+            let held_release = if complete {
+                release.send(()).expect("completed fixture receiver");
+                None
+            } else {
+                Some(release)
+            };
+            let retired = retire_handler_fixture(task, Duration::from_secs(5)).await;
+            if complete {
+                retired
+                    .expect("released task must join")
+                    .expect("released task must complete successfully");
+            } else {
+                assert!(matches!(
+                    retired,
+                    Err(HandlerFixtureRetirementError::Deadline {
+                        abort_join: Err(error)
+                    }) if error.is_cancelled()
+                ));
+            }
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            drop(held_release);
+        }
     }
 
     #[tokio::test]
