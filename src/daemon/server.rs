@@ -1288,6 +1288,140 @@ mod tests {
             .expect("write codec must accept a frame larger than the request budget");
     }
 
+    #[derive(Debug)]
+    enum HandlerFixtureRetirementError {
+        Join(tokio::task::JoinError),
+        Deadline {
+            abort_join: std::result::Result<Result<()>, tokio::task::JoinError>,
+        },
+    }
+
+    async fn retire_handler_fixture(
+        mut task: tokio::task::JoinHandle<Result<()>>,
+        deadline: Duration,
+    ) -> std::result::Result<Result<()>, HandlerFixtureRetirementError> {
+        match tokio::time::timeout(deadline, &mut task).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => Err(HandlerFixtureRetirementError::Join(error)),
+            Err(_) => {
+                task.abort();
+                let abort_join = task.await;
+                Err(HandlerFixtureRetirementError::Deadline { abort_join })
+            }
+        }
+    }
+
+    fn check_handler_fixture_write_result(result: &Result<()>) -> Result<()> {
+        if let Err(error) = result {
+            let expected_cap_rejection =
+                error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    error.kind() == std::io::ErrorKind::InvalidInput
+                        && error.to_string() == "frame size too big"
+                });
+            anyhow::ensure!(
+                expected_cap_rejection,
+                "HARNESS: unrelated handler error: {error:#}"
+            );
+            eprintln!("CODEC_WRITE_CAP_REJECTION: {error:#}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handler_fixture_retirement_preserves_completed_results() {
+        let success = tokio::spawn(async { Ok(()) });
+        retire_handler_fixture(success, Duration::from_secs(5))
+            .await
+            .expect("completed task must join")
+            .expect("completed successful task must stay successful");
+
+        let failure = tokio::spawn(async { Err(anyhow::anyhow!("fixture completed error")) });
+        let error = retire_handler_fixture(failure, Duration::from_secs(5))
+            .await
+            .expect("completed failed task must join")
+            .expect_err("completed task error must be preserved");
+        assert_eq!(error.to_string(), "fixture completed error");
+    }
+
+    #[tokio::test]
+    async fn handler_fixture_retirement_reports_spawned_panics() {
+        let task = tokio::spawn(async { panic!("fixture handler panic") });
+        let retired = retire_handler_fixture(task, Duration::from_secs(5)).await;
+        assert!(matches!(
+            retired,
+            Err(HandlerFixtureRetirementError::Join(error)) if error.is_panic()
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handler_fixture_retirement_aborts_and_joins_pending_tasks() {
+        struct DropWitness(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _witness = DropWitness(task_dropped);
+            started.send(()).expect("retirement fixture receiver");
+            std::future::pending::<Result<()>>().await
+        });
+        ready
+            .await
+            .expect("pending task must start before deadline");
+        let retired = retire_handler_fixture(task, Duration::from_secs(5)).await;
+        assert!(matches!(
+            retired,
+            Err(HandlerFixtureRetirementError::Deadline {
+                abort_join: Err(error)
+            }) if error.is_cancelled()
+        ));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn handler_fixture_write_result_accepts_only_the_typed_codec_cap() {
+        check_handler_fixture_write_result(&Ok(())).expect("successful handler result");
+        let (_client, server) = tokio::net::UnixStream::pair().expect("private codec pair");
+        let mut writer = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_REQUEST_SIZE)
+            .new_write(server);
+        let error = writer
+            .send(vec![0u8; MAX_REQUEST_SIZE + 1].into())
+            .await
+            .expect_err("actual codec must reject an oversized write");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "frame size too big");
+        check_handler_fixture_write_result(&Err(error.into()))
+            .expect("typed codec cap error must reach the delivery assertion");
+    }
+
+    #[test]
+    fn handler_fixture_write_result_refuses_unrelated_errors() {
+        for (error, expected) in [
+            (
+                anyhow::anyhow!("frame size too big"),
+                "HARNESS: unrelated handler error: frame size too big",
+            ),
+            (
+                std::io::Error::other("frame size too big").into(),
+                "HARNESS: unrelated handler error: frame size too big",
+            ),
+            (
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "different error").into(),
+                "HARNESS: unrelated handler error: different error",
+            ),
+        ] {
+            let refused = check_handler_fixture_write_result(&Err(error))
+                .expect_err("unrelated error must stay a harness failure");
+            assert_eq!(refused.to_string(), expected);
+        }
+    }
+
     #[tokio::test]
     async fn real_handler_delivers_frames_above_the_request_budget() {
         let directory = tempfile::tempdir().expect("private codec fixture");
@@ -1338,7 +1472,7 @@ mod tests {
 
         let (client, server) = tokio::net::UnixStream::pair().expect("private handler pair");
         let cancellation = CancellationToken::new();
-        let mut task = tokio::spawn(handle_client_with_idle_timeout(
+        let task = tokio::spawn(handle_client_with_idle_timeout(
             server,
             state,
             Duration::from_secs(5),
@@ -1353,32 +1487,15 @@ mod tests {
         })
         .await;
         cancellation.cancel();
-        let retired = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
-        let handler_result = match retired {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => panic!("HARNESS: handler task join failed: {error}"),
-            Err(error) => {
-                task.abort();
-                let aborted = task.await;
-                panic!("HARNESS: client retirement timed out: {error}; abort join: {aborted:?}");
-            }
-        };
+        let handler_result = retire_handler_fixture(task, Duration::from_secs(5))
+            .await
+            .expect("HARNESS: handler task retirement failed");
         let exchange = exchange
             .expect("HARNESS: large response exchange timed out")
             .expect("HARNESS: request transport failed");
         let frame = exchange.map(|frame| frame.expect("HARNESS: response transport failed"));
-        if let Err(error) = &handler_result {
-            let expected_cap_rejection =
-                error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                    error.kind() == std::io::ErrorKind::InvalidInput
-                        && error.to_string() == "frame size too big"
-                });
-            assert!(
-                expected_cap_rejection,
-                "HARNESS: unrelated handler error: {error:#}"
-            );
-            eprintln!("CODEC_WRITE_CAP_REJECTION: {error:#}");
-        }
+        check_handler_fixture_write_result(&handler_result)
+            .expect("HARNESS: handler write result must be qualified before delivery");
         assert!(
             frame.is_some(),
             "real handler must deliver a frame above request cap"
