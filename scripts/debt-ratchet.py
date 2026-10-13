@@ -153,8 +153,86 @@ def count_rust_lint_attributes(text):
     return count
 
 
+
+MARKER_PATTERN = re.compile(r'\b(?:TODO|FIXME|HACK|XXX)\b')
+JSON_SPACE = re.compile(r'[ \t\r\n]*')
+
+
+class InvalidInventoryJSON(ValueError):
+    pass
+
+
+def inventory_path_spans(text):
+    """Locate path values only in a complete, unambiguous source inventory."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise InvalidInventoryJSON('duplicate key: ' + key)
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise InvalidInventoryJSON('non-JSON numeric constant: ' + value)
+
+    decoder = json.JSONDecoder(object_pairs_hook=unique_object, parse_constant=invalid_constant)
+    try:
+        document = decoder.decode(text)
+    except (ValueError, RecursionError):
+        return []
+    if (type(document) is not dict or type(document.get('schema')) is not int
+            or document['schema'] != 1 or type(document.get('closure')) is not list):
+        return []
+    fields = {'path', 'mode', 'blob', 'bytes', 'sha256'}
+    paths = set()
+    for row in document['closure']:
+        if type(row) is not dict or set(row) != fields:
+            return []
+        path = row['path']
+        if (type(path) is not str or not re.fullmatch(r'[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*', path)
+                or any(part in ('.', '..') for part in path.split('/')) or path in paths
+                or type(row['bytes']) is not int or row['bytes'] < 0
+                or type(row['mode']) is not str or row['mode'] not in ('100644', '100755')
+                or type(row['blob']) is not str or not re.fullmatch(r'[0-9a-f]{40}', row['blob'])
+                or type(row['sha256']) is not str or not re.fullmatch(r'[0-9a-f]{64}', row['sha256'])):
+            return []
+        paths.add(path)
+
+    def values(start):
+        # The complete document has already been decoded and validated. Use
+        # the same decoder's exact offsets rather than searching repeated text.
+        offset = JSON_SPACE.match(text, start + 1).end()
+        while text[offset] != '}':
+            key, offset = decoder.raw_decode(text, offset)
+            offset = JSON_SPACE.match(text, offset).end() + 1  # colon
+            start_value = JSON_SPACE.match(text, offset).end()
+            value, end_value = decoder.raw_decode(text, start_value)
+            yield key, start_value, end_value
+            offset = JSON_SPACE.match(text, end_value).end()
+            if text[offset] == ',':
+                offset = JSON_SPACE.match(text, offset + 1).end()
+
+    start = JSON_SPACE.match(text).end()
+    closure_start = next(first for key, first, last in values(start) if key == 'closure')
+    offset = JSON_SPACE.match(text, closure_start + 1).end()
+    spans = []
+    for row in document['closure']:
+        value, end = decoder.raw_decode(text, offset)
+        spans.extend((first, last) for key, first, last in values(offset) if key == 'path')
+        offset = JSON_SPACE.match(text, end).end()
+        if text[offset] == ',':
+            offset = JSON_SPACE.match(text, offset + 1).end()
+    return spans
+
+
+def count_todo_markers(text):
+    spans = inventory_path_spans(text)
+    return sum(not any(first <= match.start() and match.end() <= last
+                       for first, last in spans)
+               for match in MARKER_PATTERN.finditer(text))
+
 RATCHETS = {
-    'todo-markers': re.compile(r'\b(?:TODO|FIXME|HACK|XXX)\b'),
+    'todo-markers': count_todo_markers,
     'dead-code-allows': count_rust_lint_attributes,
 }
 

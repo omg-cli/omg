@@ -26,8 +26,20 @@ Utility scripts for development, testing, and CI of the OMG project.
 Each ratchet counts one debt pattern per file and compares the result against a committed
 baseline in `scripts/debt-ratchets/`:
 
-- `todo-markers` — uppercase todo/fixme/hack/xxx marker tokens in any maintained text file.
+- `todo-markers` — uppercase todo/fixme/hack/xxx marker tokens in maintained text, except source-inventory path values under the strict contract below.
 - `dead-code-allows` — `allow(...)`/`expect(...)` annotations for `dead_code` or `unused*`.
+
+
+Source inventory JSON must have integer `schema: 1` and a `closure` list of unique
+canonical relative paths. Every row must have exactly `path`, `mode`, `blob`,
+`bytes`, and `sha256`: paths use slash-separated ASCII filename components without
+whitespace, dot/parent components or aliases; modes are `100644`/`100755`; byte
+counts are nonnegative integers (excluding booleans/floats), with lowercase
+40/64-digit object/content hashes. Duplicate keys anywhere or an invalid row
+leave all raw markers counted. Only the exact JSON path-value span is metadata;
+identical text in messages, keys or other values remains debt. This validates
+metadata shape, not file existence, object authenticity or a repository-owner
+boundary. Comments and free work items retain the raw marker rule.
 
 A file with no baseline entry must have zero findings, so new code is born clean; a listed
 file may only shrink. The baseline was seeded from the tree as it stood when the gate
