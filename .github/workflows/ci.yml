@@ -27,6 +27,19 @@ on:
         description: "Skip cache restoration"
         type: boolean
         default: false
+      deno-proof-head:
+        description: Exact root-reviewed private branch commit
+        type: string
+        default: ''
+      deno-proof-contract:
+        description: Root-reviewed canonical proof manifest SHA256
+        type: string
+        default: ''
+      deno-proof-release:
+        description: Root-reviewed runtime admission
+        type: string
+        default: hold
+
 
 concurrency:
   group: ci-${{ github.head_ref || github.ref }}
@@ -1826,3 +1839,65 @@ jobs:
           # Release explicitly so GitHub Latest is not left on a 7-month-old tag.
           gh workflow run release.yml --ref "$TAG" -f dry_run=false
           echo "Dispatched Release for $TAG"
+
+  deno-alias-proof:
+    if: github.event_name == 'workflow_dispatch' && inputs.deno-proof-release == 'root-reviewed' && startsWith(github.ref, 'refs/heads/codex/deno-alias-proof-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 210
+    permissions:
+      contents: read
+    container:
+      image: fedora:latest@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
+      options: --memory=6g --memory-swap=6g --pids-limit=512
+    steps:
+      - name: Existing Fedora prerequisites
+        timeout-minutes: 13
+        run: |
+          set -eu
+          timeout -k 10s 12m dnf --setopt='*.skip_if_unavailable=False' \
+            install -y --setopt=install_weak_deps=False \
+            git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 zsh fish \
+            rpm dnf sqlite yum-utils fedora-release
+          rpm --initdb
+      - name: Pinned Rust provider
+        timeout-minutes: 21
+        run: |
+          set -eu
+          timeout -k 15s 1200s sh -eu -c '
+            curl --proto "=https" --tlsv1.2 -fsSL https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init -o /tmp/rustup-init
+            echo "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init" | sha256sum --check
+            chmod +x /tmp/rustup-init
+            /tmp/rustup-init -y --profile minimal --default-toolchain 1.95.0'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Ordinary test identity
+        timeout-minutes: 1
+        run: |
+          set -eu
+          if getent passwd omg-deno-proof; then exit 1; fi
+          useradd --create-home omg-deno-proof
+          test "$(id -u omg-deno-proof)" -gt 0
+      - name: Independently owned actual proof
+        id: deno-proof
+        timeout-minutes: 137
+        run: |
+          set -eu
+          receipt_path="$RUNNER_TEMP/deno-alias-proof/receipts"
+          printf 'receipt-path=%s\n' "$receipt_path" >> "$GITHUB_OUTPUT"
+          printf 'DENO_PROOF_RECEIPT_PATH=%s\n' "$receipt_path"
+          timeout -k 45s 8100s python3 -I -B .audit/deno-proof/supervisor.py
+      - name: Preserve actual receipts and baseline source batch
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: deno-alias-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.deno-proof.outputs.receipt-path }}
+          retention-days: 14
+          if-no-files-found: error
+# Evidence includes942 intact baseline source bodies from actual Git batch stdout.
+# State source copies/target/Cargo sources/fault files/libtest binaries are excluded.
+# Workspace disposition is retained; root confirms upload before scoped cleanup.
