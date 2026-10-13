@@ -15,7 +15,7 @@ SPEC.loader.exec_module(MODULE)
 
 
 class AuditLogOracleTests(unittest.TestCase):
-    def check_export(self, change=None):
+    def check_export(self, change=None, *, export_bytes=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             subprocess.run([sys.executable, str(ORACLE), "prepare", directory], check=True)
@@ -25,7 +25,14 @@ class AuditLogOracleTests(unittest.TestCase):
             if change:
                 change(rows)
             export = root / "audit-log-export.json"
-            export.write_text(json.dumps(rows))
+            payload = json.dumps(rows).encode("utf-8")
+            if export_bytes is not None:
+                self.assertLessEqual(len(payload), export_bytes)
+                payload = b" " * (export_bytes - len(payload)) + payload
+                self.assertEqual(len(payload), export_bytes)
+            export.write_bytes(payload)
+            if export_bytes is not None:
+                self.assertEqual(export.stat().st_size, export_bytes)
             export.chmod(0o600)
             result = subprocess.run(
                 [sys.executable, str(ORACLE), "check", directory],
@@ -36,6 +43,16 @@ class AuditLogOracleTests(unittest.TestCase):
 
     def test_explicit_legacy_version_is_required_and_source_stays_legacy(self):
         self.assertEqual(self.check_export().returncode, 0)
+
+    def test_export_byte_bound_accepts_32768_and_rejects_32769(self):
+        accepted = self.check_export(export_bytes=32768)
+        self.assertEqual(accepted.returncode, 0)
+        self.assertEqual(accepted.stdout, "")
+        self.assertEqual(accepted.stderr, "")
+        rejected = self.check_export(export_bytes=32769)
+        self.assertEqual(rejected.returncode, 1)
+        self.assertEqual(rejected.stdout, "")
+        self.assertIn("audit fixture/export exceeds byte bound", rejected.stderr)
 
     def test_missing_version_is_rejected(self):
         self.assertNotEqual(self.check_export(lambda rows: rows[0].pop("hash_version")).returncode, 0)

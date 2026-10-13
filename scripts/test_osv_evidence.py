@@ -94,6 +94,25 @@ class PositiveEvidenceTests(unittest.TestCase):
     def test_complete_bound_native_evidence_is_admitted(self):
         self.assertEqual(self.admit(), self.receipt)
 
+    def test_duplicate_raw_daemon_counters_are_refused(self):
+        self.assertEqual(self.admit(), self.receipt)
+        duplicates = (
+            ("daemon-before", b"omg_security_audit_requests_total 0\nomg_security_audit_requests_total 0\n"),
+            ("daemon-after", b"omg_security_audit_requests_total 2\nomg_security_audit_requests_total 2\n"),
+        )
+        for phase, payload in duplicates:
+            with self.subTest(phase=phase):
+                path = self.evidence / (phase + ".stdout")
+                original = path.read_bytes()
+                try:
+                    path.write_bytes(payload)
+                    with self.assertRaises(ValueError) as error:
+                        self.admit()
+                    self.assertEqual(str(error.exception), "missing daemon audit counter")
+                finally:
+                    path.write_bytes(original)
+                self.assertEqual(self.admit(), self.receipt)
+
     def test_trixie_requires_its_archive_and_debian_13_ecosystem(self):
         with tarfile.open(self.archive, 'w:gz') as archive:
             for name, data in {'omg': b'native product fixture', 'omgd': b'native daemon fixture'}.items():
