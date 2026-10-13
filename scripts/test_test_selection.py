@@ -29,6 +29,19 @@ def junit(contents='<testcase name="parser" classname="omg::cli_surface" time="0
             + '</testsuite></testsuites>').encode()
 
 
+def unselected_execution_fixture(disposition, result):
+    data = listing()
+    unselected = data['rust-suites']['omg::cli_surface']['testcases']['unsupported']
+    unselected['ignored'] = disposition == 'ignored'
+    unselected['filter-match'] = {'status': 'mismatch', 'reason': disposition}
+    verdict = {'PASS': '', 'FAIL': '<failure message="fixture failure"/>',
+               'SKIPPED': '<skipped message="fixture skip"/>'}[result]
+    contents = ('<testcase name="parser" classname="omg::cli_surface" time="0.001"/>'
+                '<testcase name="unsupported" classname="omg::cli_surface" time="0.001">'
+                + verdict + '</testcase>')
+    return data, junit(contents), ['omg::cli_surface']
+
+
 class TestSelection(unittest.TestCase):
     def test_debian_like_refusal_has_no_execution_credit(self):
         """Execute repository macro/reporter; host predicates are controlled doubles.
@@ -191,6 +204,38 @@ fn probe() {
                 data['test-count'] = 0
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 SELECTION.reconcile(data, junit(), ['omg::cli_surface'])
+
+
+    def assert_unselected_execution_rejected(self, disposition, result):
+        try:
+            SELECTION.reconcile(*unselected_execution_fixture(disposition, result))
+        except ValueError as error:
+            self.assertEqual(str(error), 'unselected test executed')
+        else:
+            self.fail('CI-R1_FORBIDDEN_UNSELECTED_EXECUTION_ACCEPTED: ' + disposition + '/' + result)
+
+    def assert_unselected_skip_allowed(self, disposition):
+        report = SELECTION.reconcile(*unselected_execution_fixture(disposition, 'SKIPPED'))
+        self.assertEqual(report['counts'], {'discovered': 2, 'selected': 1, 'executed': 1, 'passed': 1, 'failed': 0, 'skipped': 1 if disposition == 'ignored' else 0, 'filtered': 1 if disposition == 'filtered' else 0, 'retried': 0})
+        self.assertEqual(report['tests']['omg::cli_surface::unsupported']['attempts'], [{'result': 'SKIPPED', 'duration_ms': 0.0}])
+
+    def test_filtered_pass_rejected(self):
+        self.assert_unselected_execution_rejected('filtered', 'PASS')
+
+    def test_filtered_failure_rejected(self):
+        self.assert_unselected_execution_rejected('filtered', 'FAIL')
+
+    def test_ignored_pass_rejected(self):
+        self.assert_unselected_execution_rejected('ignored', 'PASS')
+
+    def test_ignored_failure_rejected(self):
+        self.assert_unselected_execution_rejected('ignored', 'FAIL')
+
+    def test_filtered_skip_allowed(self):
+        self.assert_unselected_skip_allowed('filtered')
+
+    def test_ignored_skip_allowed(self):
+        self.assert_unselected_skip_allowed('ignored')
 
 
 if __name__ == '__main__':
