@@ -3302,6 +3302,65 @@ mod tests {
     }
 
     #[test]
+    fn native_interruption_preserves_prior_committed_history() -> Result<()> {
+        use crate::core::history::{HistoryManager, PackageChange, Transaction, TransactionType};
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("history.json");
+        let history = HistoryManager::new_in(&path)?;
+        let prior = Transaction {
+            id: "prior-install-001".to_owned(),
+            timestamp: "2026-01-01T00:00:00Z".parse()?,
+            transaction_type: TransactionType::Install,
+            changes: vec![PackageChange {
+                name: "tree".to_owned(),
+                old_version: None,
+                new_version: Some("2.2.1-4.fc44".to_owned()),
+                source: "fedora".to_owned(),
+            }],
+            success: true,
+        };
+        history.save(std::slice::from_ref(&prior))?;
+        let before = std::fs::read(&path)?;
+        let transactions: Vec<NativeTransaction> = serde_json::from_str(
+            r#"[{"id":41,"comment":"omg-started-preservation","status":"Started","description":"dnf remove tree","packages":[{"nevra":"tree-0:2.2.1-4.fc44.x86_64","action":"Remove"}]}]"#,
+        )?;
+
+        let error = DnfPackageManager::record_native_result(
+            TransactionType::Remove,
+            &history,
+            Err(anyhow::anyhow!("original exit 1")),
+            DnfPackageManager::native_outcome(&transactions, "omg-started-preservation"),
+        )
+        .expect_err("a Started removal must remain unresolved");
+        let diagnostic = format!("{error:#}");
+        for expected in [
+            "original exit 1",
+            "transaction 41",
+            "comment 'omg-started-preservation'",
+            "Started",
+            "inspect native DNF history and package state before deciding on recovery",
+        ] {
+            assert!(
+                diagnostic.contains(expected),
+                "missing {expected}: {diagnostic}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&path)?,
+            before,
+            "an interrupted removal must preserve previously committed history bytes"
+        );
+        let reopened = HistoryManager::new_in(&path)?;
+        assert_eq!(
+            reopened.load()?,
+            vec![prior],
+            "prior committed history must survive reopening without a new removal record"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn native_interruption_is_diagnostic_only_and_preserves_operation_error() {
         let directory = tempfile::tempdir().unwrap();
         let history =
