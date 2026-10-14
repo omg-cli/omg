@@ -1,10 +1,13 @@
 """Refuse source/run/artifact substitution before coverage comparison."""
 import copy
+import os
+import sys
 import subprocess
 import tempfile
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
     "base_coverage", Path(__file__).with_name("require-base-coverage.py"))
@@ -107,6 +110,36 @@ class BaseCoverageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             coverage.identities("schedule", {}, SHA)
 
+
+class DownloadMemberBehaviorTests(unittest.TestCase):
+    payload = b"SF:/fixture/src/shared.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"
+
+    def download(self, destination, extra):
+        real_run = subprocess.run
+        fixture = Path(__file__).parent / "fixtures" / "coverage_gh.py"
+        def transport(argv, **kwargs):
+            if not argv or argv[0] != "gh":
+                raise AssertionError("Undeclared transport command: " + repr(argv))
+            return real_run([sys.executable, "-X", "utf8", "-I", "-B",
+                             str(fixture), *argv[1:]], **kwargs)
+        with patch.dict(os.environ, {"COVERAGE_GH_EXTRA": "1" if extra else "0"}):
+            with patch.object(coverage.subprocess, "run", side_effect=transport):
+                return coverage.download({"id": 101}, "a" * 40, destination)
+
+    def test_download_refuses_unexpected_artifact_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "download"
+            with self.assertRaisesRegex(
+                    ValueError, "^Coverage artifact must contain one bounded lcov[.]info report$"):
+                self.download(destination, extra=True)
+
+    def test_download_returns_exact_single_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "download"
+            artifact, report = self.download(destination, extra=False)
+            self.assertEqual(artifact["id"], 102)
+            self.assertEqual(report, destination / "lcov.info")
+            self.assertEqual(report.read_bytes(), self.payload)
 
 if __name__ == "__main__":
     unittest.main()
