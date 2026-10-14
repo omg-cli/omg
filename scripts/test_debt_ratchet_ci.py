@@ -271,7 +271,7 @@ class DebtRatchetCITests(unittest.TestCase):
             f'tree {tree}\nparent {candidate}\nparent {candidate}\n'
             'author Debt regression <regression@example.invalid> 1 +0000\n'
             'committer Debt regression <regression@example.invalid> 1 +0000\n'
-            '\nduplicate source parents\n', encoding='utf-8')
+            '\nduplicate source parents\n', encoding='utf-8', newline='\n')
         merge = self.git('hash-object', '-t', 'commit', '-w', str(commit_file))
         self.git('checkout', '--detach', merge)
         self.assertEqual(self.git('show', '-s', '--format=%P', merge).split(),
