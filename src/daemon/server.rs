@@ -1698,6 +1698,77 @@ mod tests {
         Ok(())
     }
 
+    use super::super::handlers::tests::{PausedInfoBackend, PausedLookup};
+
+    #[tokio::test]
+    async fn shutdown_after_explicit_inventory_keeps_search_cache_cold() -> Result<()> {
+        for cancel_after_inventory in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let inner =
+                crate::package_managers::mock::MockPackageManager::new_in("arch", directory.path());
+            inner.set_installed_version("git", "1")?;
+            let backend = Arc::new(PausedInfoBackend {
+                inner,
+                started: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+                lookup: PausedLookup::Explicit,
+            });
+            let state = Arc::new(DaemonState::new_isolated(
+                directory.path(),
+                super::super::index::PackageIndex::from_records(&[("git", "1", "Git fixture")]),
+                backend.clone(),
+            )?);
+            let cancellation = CancellationToken::new();
+            let worker_state = Arc::clone(&state);
+            let worker_cancellation = cancellation.clone();
+            let mut workers = tokio::task::JoinSet::new();
+            workers.spawn(async move {
+                prewarm_caches(&worker_state, &worker_cancellation).await;
+            });
+            tokio::time::timeout(Duration::from_secs(5), backend.started.notified())
+                .await
+                .context("prewarm did not finish reading explicit inventory")?;
+            if cancel_after_inventory {
+                cancellation.cancel();
+            }
+            backend.resume.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), workers.join_next())
+                .await
+                .context("prewarm did not finish after the inventory handoff")?
+                .context("prewarm worker was missing")?
+                .context("prewarm worker panicked")?;
+            assert_eq!(
+                state.cache.get_explicit().as_deref().map(Vec::as_slice),
+                Some(["git".to_string()].as_slice())
+            );
+            assert_eq!(state.cache.get_explicit_count(), Some(1));
+            for query in ["", "linux", "python", "node", "firefox", "git"] {
+                if cancel_after_inventory {
+                    assert!(
+                        state.cache.get(query).is_none(),
+                        "query {query:?} warmed after shutdown at the inventory handoff"
+                    );
+                } else {
+                    assert!(
+                        state.cache.get(query).is_some(),
+                        "healthy prewarm omitted query {query:?}"
+                    );
+                }
+            }
+            if !cancel_after_inventory {
+                let packages = state
+                    .cache
+                    .get("git")
+                    .context("healthy git cache missing")?;
+                assert_eq!(packages.len(), 1);
+                assert_eq!(packages[0].name, "git");
+                assert_eq!(packages[0].version, "1");
+                assert_eq!(packages[0].description, "Git fixture");
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn cancelled_prewarm_keeps_caches_cold() -> Result<()> {
         let directory = tempfile::tempdir()?;
