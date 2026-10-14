@@ -3512,6 +3512,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_history_query_rejects_output_larger_than_64_mib() -> Result<()> {
+        let mut command = tokio::process::Command::new("/usr/bin/head");
+        command.args(["-c", "67108864", "/dev/zero"]);
+        let bytes = DnfPackageManager::query_output_with_deadline(
+            command,
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
+        assert_eq!(bytes.len(), 67_108_864);
+        assert!(
+            bytes.iter().all(|byte| *byte == 0),
+            "the accepted boundary payload must contain only zero bytes"
+        );
+        drop(bytes);
+
+        let mut command = tokio::process::Command::new("/usr/bin/head");
+        command.args(["-c", "67108865", "/dev/zero"]);
+        match DnfPackageManager::query_output_with_deadline(
+            command,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(bytes) => panic!(
+                "DNF query accepted oversized output: received {} bytes",
+                bytes.len()
+            ),
+            Err(error) => assert_eq!(error.to_string(), "DNF query output exceeds 64 MiB"),
+        }
+        Ok(())
+    }
+
     #[test]
     fn native_failure_does_not_turn_planned_versions_into_committed_changes() {
         let transactions: Vec<NativeTransaction> = serde_json::from_str(r#"[{"id":1,"comment":"ours","status":"Error","packages":[{"nevra":"a-0:1-1.noarch","action":"Install"}]}]"#).unwrap();
