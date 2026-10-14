@@ -1644,7 +1644,7 @@ fn not_found_error(id: RequestId, message: impl Into<String>) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::daemon::protocol::PackageInfo;
 
@@ -2677,16 +2677,16 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum PausedLookup {
+    pub(in crate::daemon) enum PausedLookup {
         Info,
         Explicit,
     }
 
-    struct PausedInfoBackend {
-        inner: crate::package_managers::mock::MockPackageManager,
-        started: tokio::sync::Notify,
-        resume: tokio::sync::Notify,
-        lookup: PausedLookup,
+    pub(in crate::daemon) struct PausedInfoBackend {
+        pub(in crate::daemon) inner: crate::package_managers::mock::MockPackageManager,
+        pub(in crate::daemon) started: tokio::sync::Notify,
+        pub(in crate::daemon) resume: tokio::sync::Notify,
+        pub(in crate::daemon) lookup: PausedLookup,
     }
 
     impl PackageManager for PausedInfoBackend {
