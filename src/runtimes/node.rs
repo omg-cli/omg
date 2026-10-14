@@ -1348,6 +1348,156 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn cleanup_owned_node_reap_control(mut child: std::process::Child) {
+        let pid = nix::unistd::Pid::from_raw(
+            i32::try_from(child.id()).expect("owned cleanup PID must fit i32"),
+        );
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Err(error) => assert_eq!(error.raw_os_error(), Some(nix::libc::ECHILD)),
+            Ok(None) => {
+                child.kill().expect("terminate owned live reap control");
+                reap_owned_node_descendant(pid, pid)
+                    .expect("reap owned live control after SIGKILL");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_owned_reap_deadline_cleans_up_live_child() -> Result<()> {
+        if run_node_descendant_test_in_child()? {
+            return Ok(());
+        }
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        let child = scopeguard::guard(child, cleanup_owned_node_reap_control);
+        assert!(
+            child.stdin.is_some(),
+            "control must retain its stdin writer"
+        );
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Ok(WaitStatus::StillAlive)
+        );
+        let began = Instant::now();
+        let error = reap_owned_node_descendant(pid, pid).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Node descendant remained alive before fixture cleanup"
+        );
+        assert!(
+            began.elapsed() >= Duration::from_secs(2),
+            "reaper refused before its deadline"
+        );
+        assert_eq!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+        // External reaping selects the cleanup helper's real ECHILD outcome.
+        drop(child);
+        println!("NODE_DESCENDANT_OWNED_REAP_ESRCH {pid}");
+        println!("NODE_LEADER_REAP_ESRCH {pid}");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_owned_reap_control_drop_kills_and_reaps_live_child() -> Result<()> {
+        if run_node_descendant_test_in_child()? {
+            return Ok(());
+        }
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+
+        let child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        let child = scopeguard::guard(child, cleanup_owned_node_reap_control);
+        assert!(
+            child.stdin.is_some(),
+            "control must retain its stdin writer"
+        );
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Ok(WaitStatus::StillAlive)
+        );
+        // No EOF, signal or reap occurs before this guard invokes the real
+        // live-child cleanup path.
+        drop(child);
+        assert_eq!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+        println!("NODE_DESCENDANT_OWNED_REAP_ESRCH {pid}");
+        println!("NODE_LEADER_REAP_ESRCH {pid}");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_owned_reap_control_drop_accepts_cached_terminal_child() -> Result<()> {
+        if run_node_descendant_test_in_child()? {
+            return Ok(());
+        }
+        use nix::sys::wait::{WaitPidFlag, waitpid};
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        use std::process::{Command, Stdio};
+
+        let child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        let mut child = scopeguard::guard(child, cleanup_owned_node_reap_control);
+        assert!(
+            child.stdin.is_some(),
+            "control must retain its stdin writer"
+        );
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
+        child.kill()?;
+        // The existing exact-test supervisor owns a 20-second wall deadline
+        // around this genuine wait, captures streams and reaps its harness.
+        assert_eq!(child.wait()?.signal(), Some(9));
+        drop(child);
+        assert_eq!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+        println!("NODE_DESCENDANT_OWNED_REAP_ESRCH {pid}");
+        println!("NODE_LEADER_REAP_ESRCH {pid}");
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn assert_probe_dead(directory: &Path, descendant: bool) -> Result<()> {
         if directory.join("probe.pid").try_exists()? {
