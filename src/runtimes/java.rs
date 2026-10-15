@@ -544,11 +544,17 @@ mod tests {
 
     #[test]
     fn java_platform_is_host_specific() {
-        let (os, _arch) = java_platform().expect("host platform should be supported");
-        if std::env::consts::OS == "linux" {
-            assert_eq!(os, "linux");
-        } else {
-            assert_ne!(os, "linux");
-        }
+        let platform = java_platform().expect("host platform should be supported");
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => ("linux", "x64"),
+            ("linux", "aarch64") => ("linux", "aarch64"),
+            ("macos", "x86_64") => ("mac", "x64"),
+            ("macos", "aarch64") => ("mac", "aarch64"),
+            (os, arch) => panic!("unexpected test host platform: {os}/{arch}"),
+        };
+        assert_eq!(
+            platform, expected,
+            "Java platform must match host operating system and architecture"
+        );
     }
 }
