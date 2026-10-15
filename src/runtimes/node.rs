@@ -787,10 +787,10 @@ mod tests {
                 !message.contains("pid: 56,"),
                 "snapshot tail escaped: {message}"
             );
+            let diagnostic_bytes = message.len();
             assert!(
-                message.len() < 8192,
-                "diagnostic grew to {} bytes",
-                message.len()
+                diagnostic_bytes < 8192,
+                "diagnostic grew to {diagnostic_bytes} bytes"
             );
             Ok(())
         }
