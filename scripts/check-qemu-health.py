@@ -150,10 +150,12 @@ def socket_unit_properties(unit, properties):
 
 
 def validate_socket_channel(channel, boot_id):
-    if (set(channel) != {"kind", "boot_id", "core_pattern", "manager", "registration", "identity", "listener"}
+    if (set(channel) != {"kind", "boot_id", "core_pattern", "manager", "registration", "identity", "listener", "manager_warning_count"}
             or channel["kind"] != "systemd-coredump-kernel-socket" or channel["boot_id"] != boot_id
             or channel["core_pattern"] != SOCKET_PATTERN):
         raise ValueError("invalid kernel socket channel")
+    if type(channel["manager_warning_count"]) is not int or channel["manager_warning_count"] != 0:
+        raise ValueError("invalid manager warning history witness")
     manager, registration = channel["manager"], channel["registration"]
     for fields, properties, unit, substate in (
         (manager, MANAGER_PROPERTIES, "systemd-coredumpd.service", "running"),
@@ -273,8 +275,13 @@ def kernel_socket_channel(boot_id, pattern):
                                    port_id=exact["port_id"], inode=inode, cookie=cookie, name=SOCKET_NAME.encode(), request=request)
     listener["cookie"] = list(listener["cookie"])
     listener["name"] = listener["name"].decode("ascii")
+    history = query(["journalctl", "--boot=" + boot_id.replace("-", ""), "--quiet", "--no-pager", "--output=json",
+                     "--output-fields=_BOOT_ID,_SYSTEMD_UNIT,PRIORITY", "--priority=warning",
+                     "_SYSTEMD_UNIT=systemd-coredumpd.service"])
+    if history.strip():
+        raise ValueError("manager warning history prevents health admission")
     channel = {"kind": "systemd-coredump-kernel-socket", "boot_id": boot_id, "core_pattern": pattern,
-               "manager": manager, "registration": registration, "identity": exact["identity"], "listener": listener}
+               "manager": manager, "registration": registration, "identity": exact["identity"], "listener": listener, "manager_warning_count": 0}
     validate_socket_channel(channel, boot_id)
     if (socket_unit_properties("systemd-coredumpd.service", MANAGER_PROPERTIES) != manager
             or socket_unit_properties("systemd-coredump-register.service", REGISTRATION_PROPERTIES) != registration):

@@ -65,6 +65,7 @@ class DeclaredOS:
         self.manager_reads = 0
         self.registration_reads = 0
         self.journal_started = False
+        self.history_reads = 0
         self.trace = []
 
     def properties(self, argv, fields):
@@ -124,6 +125,33 @@ class DeclaredOS:
             self.journal_started = True
             return "Linux version 7.2.9 declared fixture\n"
         if argv == cores:
+            return ""
+        manager_history = ["journalctl", "--boot=" + BOOT.replace("-", ""), "--quiet", "--no-pager", "--output=json",
+                           "--output-fields=_BOOT_ID,_SYSTEMD_UNIT,PRIORITY", "--priority=warning",
+                           "_SYSTEMD_UNIT=systemd-coredumpd.service"]
+        if argv == manager_history:
+            self.history_reads += 1
+            if self.fault == "history-timeout":
+                raise subprocess.TimeoutExpired(argv, 1)
+            if self.fault == "history-query-failed":
+                raise ValueError("declared manager history query failed")
+            if self.fault == "history-query-oversized":
+                raise ValueError("declared manager history query exceeded output limit")
+            if self.fault == "history-second-warning" and self.history_reads == 2:
+                return '{"_BOOT_ID":"00000000111122223333444444444444","_SYSTEMD_UNIT":"systemd-coredumpd.service","PRIORITY":"4"}\n'
+            history_rows = {
+                "history-auto-fields": '{"__CURSOR":"fixture","__REALTIME_TIMESTAMP":"1","__MONOTONIC_TIMESTAMP":"2","_BOOT_ID":"00000000111122223333444444444444","_SYSTEMD_UNIT":"systemd-coredumpd.service","PRIORITY":"4"}',
+                "history-malformed": "not-json PRIVATE-HISTORY-SENTINEL",
+                "history-duplicate": '{"PRIORITY":"4","PRIORITY":"4"}',
+                "history-wrong-boot": '{"_BOOT_ID":"wrong","PRIORITY":"4"}',
+                "history-boolean-priority": '{"PRIORITY":true}',
+                "history-numeric-priority": '{"PRIORITY":4}',
+            }
+            if self.fault in history_rows:
+                return history_rows[self.fault] + "\n"
+            if self.fault == "completed-manager-worker-warning":
+                return ('{"_BOOT_ID":"00000000111122223333444444444444",'
+                        '"_SYSTEMD_UNIT":"systemd-coredumpd.service","PRIORITY":"4"}\n')
             return ""
         if argv and argv[0] == "/usr/bin/nsenter":
             return self.transport(argv)
@@ -214,9 +242,32 @@ class SocketHealthTests(unittest.TestCase):
             "schema_version": 2, "complete": True, "boot_id": BOOT,
             "crash_channel": {"kind": "systemd-coredump-kernel-socket", "boot_id": BOOT,
                               "core_pattern": PATTERN, "manager": MANAGER, "registration": REGISTRATION,
-                              "identity": IDENTITY, "listener": LISTENER},
+                              "identity": IDENTITY, "listener": LISTENER, "manager_warning_count": 0},
             "kernel_bytes": 37, "fatal_signatures": [], "product_crashes": [],
         })
+
+    def test_socket_mode_refuses_completed_manager_warning_after_worker_retired(self):
+        code, output, errors, _ = self.collect("completed-manager-worker-warning")
+        self.assertEqual(code, 2, "completed manager warning was accepted as healthy: " + output)
+        self.assertEqual(output, "")
+
+    def test_socket_mode_refuses_nonempty_history_without_exporting_content(self):
+        for fault in ("history-auto-fields", "history-malformed", "history-duplicate",
+                      "history-wrong-boot", "history-boolean-priority", "history-numeric-priority"):
+            with self.subTest(fault=fault):
+                code, output, errors, _ = self.collect(fault)
+                self.assertEqual((code, output), (2, ""))
+                self.assertNotIn("PRIVATE-HISTORY-SENTINEL", errors)
+
+    def test_socket_mode_refuses_warning_only_in_final_history_snapshot(self):
+        code, output, errors, _ = self.collect("history-second-warning")
+        self.assertEqual((code, output), (2, ""), errors)
+
+    def test_socket_mode_refuses_unavailable_history_query(self):
+        for fault in ("history-timeout", "history-query-failed", "history-query-oversized"):
+            with self.subTest(fault=fault):
+                code, output, errors, _ = self.collect(fault)
+                self.assertEqual((code, output), (2, ""), errors)
 
     def test_socket_mode_refuses_pending_or_missing_queue(self):
         for fault in ("pending-queue", "missing-queue", "short-queue"):
@@ -282,7 +333,7 @@ def saved_payload(boot=BOOT):
         "crash_channel": {"kind": "systemd-coredump-kernel-socket", "boot_id": boot,
                           "core_pattern": PATTERN, "manager": copy.deepcopy(MANAGER),
                           "registration": copy.deepcopy(REGISTRATION), "identity": copy.deepcopy(IDENTITY),
-                          "listener": copy.deepcopy(LISTENER)},
+                          "listener": copy.deepcopy(LISTENER), "manager_warning_count": 0},
         "kernel_bytes": 37, "fatal_signatures": [], "product_crashes": [],
     }
 
@@ -352,6 +403,38 @@ class SavedSocketHealthTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.guest.write_text(json.dumps(payload), encoding="utf-8")
                 self.assert_refusal(self.trial_arguments())
+
+    def test_saved_trial_requires_exact_zero_manager_warning_witness(self):
+        self.assert_success(self.trial_arguments())
+        for value in (True, False, 0.0, "0", 1, -1, None):
+            with self.subTest(value=value):
+                payload = saved_payload()
+                payload["crash_channel"]["manager_warning_count"] = value
+                self.guest.write_text(json.dumps(payload), encoding="utf-8")
+                self.assert_refusal(self.trial_arguments())
+        payload = saved_payload()
+        del payload["crash_channel"]["manager_warning_count"]
+        self.guest.write_text(json.dumps(payload), encoding="utf-8")
+        self.assert_refusal(self.trial_arguments())
+
+    def test_saved_preparations_refuse_missing_history_witness(self):
+        self.preparation_files()
+        arguments = ["verify-preparations", "--root", str(self.root)]
+        self.assert_success(arguments)
+        health = self.root / "transactions/prepare-install-health.json"
+        payload = json.loads(health.read_text(encoding="utf-8"))
+        del payload["crash_channel"]["manager_warning_count"]
+        health.write_text(json.dumps(payload), encoding="utf-8")
+        self.assert_refusal(arguments)
+
+    def test_saved_final_refuses_nonzero_history_witness(self):
+        arguments = ["verify", "--guest", str(self.guest), "--serial", str(self.serial),
+                     "--controller", str(self.controller), "--boot-id", BOOT]
+        self.assert_success(arguments)
+        payload = saved_payload()
+        payload["crash_channel"]["manager_warning_count"] = 1
+        self.guest.write_text(json.dumps(payload), encoding="utf-8")
+        self.assert_refusal(arguments)
 
     def test_saved_trial_requires_exact_boot_binding(self):
         self.assert_success(self.trial_arguments())
