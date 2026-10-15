@@ -375,13 +375,28 @@ mod terminal_group {
     ) -> Result<()> {
         let owned = owned
             .map_err(|error| anyhow::anyhow!("Node.js probe ownership unavailable: {error:#}"))?;
-        let first = observation(owned, first)?;
-        let second = observation(owned, second)?;
-        ensure!(
-            first == second,
-            "Node.js probe group changed between observations"
-        );
-        Ok(())
+        let census = |stage| {
+            format!(
+                "stage={stage} owned={:?} first_count={} second_count={} first_truncated={} second_truncated={} first={:?} second={:?}",
+                owned.0,
+                first.len(),
+                second.len(),
+                first.len() > CAPACITY,
+                second.len() > CAPACITY,
+                &first[..first.len().min(CAPACITY)],
+                &second[..second.len().min(CAPACITY)],
+            )
+        };
+        let observed_first = observation(owned, first).with_context(|| census("first"))?;
+        let observed_second = observation(owned, second).with_context(|| census("second"))?;
+        (|| {
+            ensure!(
+                observed_first == observed_second,
+                "Node.js probe group changed between observations"
+            );
+            Ok(())
+        })()
+        .with_context(|| census("comparison"))
     }
 
     #[cfg(target_os = "macos")]
@@ -681,6 +696,103 @@ mod tests {
                 },
                 ..leader()
             }
+        }
+
+        #[test]
+        fn terminal_group_error_census_records_first_nonterminal_leader() -> Result<()> {
+            let leader = leader();
+            let owned = owned(leader)?;
+            let live = Member {
+                state: State::Other(3),
+                ..leader
+            };
+            let error = terminal_group::verify(Ok(&owned), &[live], &[leader]).unwrap_err();
+            let message = format!("{error:#}");
+            for expected in [
+                "Node.js probe group still has a nonterminal member",
+                "stage=first",
+                "owned=Identity { pid: 40, pgid: 40, ppid: 20, uid: 501, ruid: 501, start_sec: 100, start_usec: 123 }",
+                "first_count=1",
+                "second_count=1",
+                "first_truncated=false",
+                "second_truncated=false",
+                "first=[Member { identity: Identity { pid: 40, pgid: 40, ppid: 20, uid: 501, ruid: 501, start_sec: 100, start_usec: 123 }, state: Other(3) }]",
+                "second=[Member { identity: Identity { pid: 40, pgid: 40, ppid: 20, uid: 501, ruid: 501, start_sec: 100, start_usec: 123 }, state: Zombie }]",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "missing {expected:?}: {message}"
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn terminal_group_error_census_records_second_nonterminal_other() -> Result<()> {
+            let leader = leader();
+            let owned = owned(leader)?;
+            let child = descendant(41);
+            let live = Member {
+                state: State::Other(3),
+                ..child
+            };
+            let error =
+                terminal_group::verify(Ok(&owned), &[leader, child], &[leader, live]).unwrap_err();
+            let message = format!("{error:#}");
+            for expected in [
+                "Node.js probe group still has a nonterminal member",
+                "stage=second",
+                "owned=Identity { pid: 40, pgid: 40, ppid: 20, uid: 501, ruid: 501, start_sec: 100, start_usec: 123 }",
+                "first_count=2",
+                "second_count=2",
+                "first_truncated=false",
+                "second_truncated=false",
+                "first=[Member { identity: Identity { pid: 40, pgid: 40, ppid: 20, uid: 501, ruid: 501, start_sec: 100, start_usec: 123 }, state: Zombie }, Member { identity: Identity { pid: 41, pgid: 40, ppid: 1, uid: 501, ruid: 501, start_sec: 101, start_usec: 123 }, state: Zombie }]",
+                "second=[Member { identity: Identity { pid: 40, pgid: 40, ppid: 20, uid: 501, ruid: 501, start_sec: 100, start_usec: 123 }, state: Zombie }, Member { identity: Identity { pid: 41, pgid: 40, ppid: 1, uid: 501, ruid: 501, start_sec: 101, start_usec: 123 }, state: Other(3) }]",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "missing {expected:?}: {message}"
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn terminal_group_error_census_bounds_both_refused_snapshots() -> Result<()> {
+            let leader = leader();
+            let owned = owned(leader)?;
+            let members: Vec<_> = std::iter::once(leader)
+                .chain((41..1064).map(descendant))
+                .collect();
+            let error = terminal_group::verify(Ok(&owned), &members, &members).unwrap_err();
+            let message = format!("{error:#}");
+            for expected in [
+                "Incomplete Node.js probe group observation",
+                "stage=first",
+                "owned=Identity { pid: 40, pgid: 40, ppid: 20, uid: 501, ruid: 501, start_sec: 100, start_usec: 123 }",
+                "first_count=1024",
+                "second_count=1024",
+                "first_truncated=true",
+                "second_truncated=true",
+                "pid: 55, pgid: 40, ppid: 1, uid: 501, ruid: 501, start_sec: 101, start_usec: 123",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "missing {expected:?}: {message}"
+                );
+            }
+            assert_eq!(message.matches("Member {").count(), 32, "{message}");
+            assert!(
+                !message.contains("pid: 56,"),
+                "snapshot tail escaped: {message}"
+            );
+            assert!(
+                message.len() < 8192,
+                "diagnostic grew to {} bytes",
+                message.len()
+            );
+            Ok(())
         }
 
         #[test]
