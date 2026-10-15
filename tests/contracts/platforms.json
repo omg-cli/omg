@@ -38,6 +38,7 @@
       "omgd": true,
       "native_integration_suites": [
         "debian_tests",
+        "ubuntu_compatibility_tests",
         "debian_daemon_tests",
         "debian_ipc_tests",
         "debian_search_integration",
@@ -96,6 +97,7 @@
       "omgd": true,
       "native_integration_suites": [
         "debian_tests",
+        "ubuntu_compatibility_tests",
         "debian_daemon_tests",
         "debian_ipc_tests",
         "debian_search_integration",
@@ -129,6 +131,7 @@
       "omgd": true,
       "native_integration_suites": [
         "debian_tests",
+        "ubuntu_compatibility_tests",
         "debian_daemon_tests",
         "debian_ipc_tests",
         "debian_search_integration",
@@ -190,6 +193,7 @@
       "omgd": true,
       "native_integration_suites": [
         "debian_tests",
+        "ubuntu_compatibility_tests",
         "debian_daemon_tests",
         "debian_ipc_tests",
         "debian_search_integration",
