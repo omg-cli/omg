@@ -455,17 +455,37 @@ mod tests {
 
     #[test]
     fn dotnet_rid_names_the_host_platform() {
-        let rid = dotnet_rid().expect("host platform should be supported");
-        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux", "x86_64") => "linux-x64",
-            ("linux", "aarch64") => "linux-arm64",
-            ("macos", "x86_64") => "osx-x64",
-            ("macos", "aarch64") => "osx-arm64",
-            (os, arch) => panic!("unexpected test host platform: {os}/{arch}"),
-        };
-        assert_eq!(
-            rid, expected,
-            ".NET SDK RID must match host operating system and architecture"
-        );
+        #[cfg(all(
+            any(target_os = "linux", target_os = "macos"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            let expected = "linux-x64";
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            let expected = "linux-arm64";
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            let expected = "osx-x64";
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let expected = "osx-arm64";
+
+            let rid = dotnet_rid().expect("host platform should be supported");
+            assert_eq!(
+                rid, expected,
+                ".NET SDK RID must match host operating system and architecture"
+            );
+        }
+        #[cfg(not(all(
+            any(target_os = "linux", target_os = "macos"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            let _ = dotnet_rid().expect("host platform should be supported");
+            panic!(
+                "unexpected test host platform: {}/{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
+        }
     }
 }
