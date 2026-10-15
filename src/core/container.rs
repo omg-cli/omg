@@ -1823,6 +1823,26 @@ mod tests {
         );
         // Every installer verifies before executing.
         assert_eq!(generated.content.matches("sha256sum -c -").count(), 4);
+
+        let commands = [
+            "RUN curl -fsSL -o /tmp/nodesource-setup.sh https://deb.nodesource.com/setup_20.x",
+            "&& echo \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  /tmp/nodesource-setup.sh\" | sha256sum -c -",
+            "&& bash /tmp/nodesource-setup.sh",
+        ];
+        assert_eq!(generated.content.matches(commands[0]).count(), 1);
+        let start = generated.content.find(commands[0]).expect("Node download");
+        let node_run = generated.content[start..]
+            .split("\n\n")
+            .next()
+            .expect("Node installer RUN block");
+        let positions = commands.map(|command| {
+            assert_eq!(node_run.matches(command).count(), 1, "{node_run}");
+            node_run.find(command).expect("Node installer command")
+        });
+        assert!(
+            positions[0] < positions[1] && positions[1] < positions[2],
+            "Node installer must verify downloaded bytes before execution: {node_run}"
+        );
     }
 
     #[test]
