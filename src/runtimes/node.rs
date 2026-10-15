@@ -2263,7 +2263,8 @@ mod tests {
         Ok(waitid(
             WaitId::Pid(pid),
             WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-        )?.is_some())
+        )?
+        .is_some())
     }
 
     #[cfg(target_os = "macos")]
@@ -2275,20 +2276,31 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut release = loop {
             // SAFETY: private NUL-terminated FIFO path; descriptor ownership transfers once.
-            let fd = unsafe { nix::libc::open(path.as_ptr(), nix::libc::O_WRONLY | nix::libc::O_NONBLOCK) };
+            let fd = unsafe {
+                nix::libc::open(path.as_ptr(), nix::libc::O_WRONLY | nix::libc::O_NONBLOCK)
+            };
             if fd >= 0 {
                 // SAFETY: fd was created above and has no other owner.
                 break unsafe { std::fs::File::from_raw_fd(fd) };
             }
             let error = std::io::Error::last_os_error();
-            anyhow::ensure!(error.raw_os_error() == Some(nix::libc::ENXIO), "FIFO open failed: {error}");
-            anyhow::ensure!(std::time::Instant::now() < end, "FIFO reader did not arrive");
+            anyhow::ensure!(
+                error.raw_os_error() == Some(nix::libc::ENXIO),
+                "FIFO open failed: {error}"
+            );
+            anyhow::ensure!(
+                std::time::Instant::now() < end,
+                "FIFO reader did not arrive"
+            );
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
         release.write_all(b"release\n")?;
         drop(release);
         while !cleanup_probe_exit_ready(pid)? {
-            anyhow::ensure!(std::time::Instant::now() < end, "fixture did not exit after release");
+            anyhow::ensure!(
+                std::time::Instant::now() < end,
+                "fixture did not exit after release"
+            );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         Ok(())
@@ -2298,18 +2310,35 @@ mod tests {
     async fn assert_node_cleanup_boundary(case: NodeCleanupCase) -> Result<()> {
         use std::os::unix::ffi::OsStrExt as _;
         let directory = tempfile::tempdir()?;
-        let path = std::ffi::CString::new(directory.path().join("probe.release").as_os_str().as_bytes())?;
+        let path = std::ffi::CString::new(
+            directory
+                .path()
+                .join("probe.release")
+                .as_os_str()
+                .as_bytes(),
+        )?;
         // SAFETY: private owned NUL-terminated FIFO path, mode0600.
-        anyhow::ensure!(unsafe { nix::libc::mkfifo(path.as_ptr(), 0o600) } == 0, "create fixture FIFO: {}", std::io::Error::last_os_error());
-        write_node_probe(directory.path(), &format!(
-            r#"trap '' PIPE; printf '%s\n' "$$" > probe.pid; printf READY > probe.ready; printf '%s' '{}'; IFS= read -r release < probe.release"#,
-            "x".repeat(5000)
-        ), true)?;
+        anyhow::ensure!(
+            unsafe { nix::libc::mkfifo(path.as_ptr(), 0o600) } == 0,
+            "create fixture FIFO: {}",
+            std::io::Error::last_os_error()
+        );
+        write_node_probe(
+            directory.path(),
+            &format!(
+                r#"trap '' PIPE; printf '%s\n' "$$" > probe.pid; printf READY > probe.ready; printf '%s' '{}'; IFS= read -r release < probe.release"#,
+                "x".repeat(5000)
+            ),
+            true,
+        )?;
         let group_errors = std::cell::RefCell::new(Vec::new());
         let leader_errors = std::cell::RefCell::new(Vec::new());
         let groups = std::cell::RefCell::new(Vec::new());
         let leader_calls = std::cell::Cell::new(0);
-        let result = probe_node_with_signals(directory.path(), "22.0.0", std::time::Duration::from_secs(5),
+        let result = probe_node_with_signals(
+            directory.path(),
+            "22.0.0",
+            std::time::Duration::from_secs(5),
             |group| {
                 groups.borrow_mut().push(group.as_raw());
                 let observed = if matches!(case, NodeCleanupCase::AlreadyTerminal) {
@@ -2320,37 +2349,75 @@ mod tests {
                         Ok(())
                     })
                 };
-                if let Err(error) = observed { group_errors.borrow_mut().push(format!("{error:#}")); }
+                if let Err(error) = observed {
+                    group_errors.borrow_mut().push(format!("{error:#}"));
+                }
                 Err(nix::errno::Errno::EPERM)
             },
             |child| {
                 leader_calls.set(leader_calls.get() + 1);
                 match case {
                     NodeCleanupCase::Live => child.start_kill(),
-                    NodeCleanupCase::AlreadyTerminal => Err(std::io::Error::from_raw_os_error(nix::libc::EIO)),
+                    NodeCleanupCase::AlreadyTerminal => {
+                        Err(std::io::Error::from_raw_os_error(nix::libc::EIO))
+                    }
                     NodeCleanupCase::ExitRaceEsrch | NodeCleanupCase::ExitRaceEio => {
-                        let observed = child.id().context("fixture child identity absent").and_then(|pid| {
-                            let pid = i32::try_from(pid)?;
-                            release_cleanup_probe(directory.path(), pid)
-                        });
-                        if let Err(error) = observed { leader_errors.borrow_mut().push(format!("{error:#}")); }
-                        Err(std::io::Error::from_raw_os_error(if matches!(case, NodeCleanupCase::ExitRaceEsrch) {
-                            nix::libc::ESRCH
-                        } else { nix::libc::EIO }))
+                        let observed = child
+                            .id()
+                            .context("fixture child identity absent")
+                            .and_then(|pid| {
+                                let pid = i32::try_from(pid)?;
+                                release_cleanup_probe(directory.path(), pid)
+                            });
+                        if let Err(error) = observed {
+                            leader_errors.borrow_mut().push(format!("{error:#}"));
+                        }
+                        Err(std::io::Error::from_raw_os_error(
+                            if matches!(case, NodeCleanupCase::ExitRaceEsrch) {
+                                nix::libc::ESRCH
+                            } else {
+                                nix::libc::EIO
+                            },
+                        ))
                     }
                 }
-            }).await;
-        anyhow::ensure!(group_errors.borrow().is_empty() && leader_errors.borrow().is_empty(),
-            "HARNESS boundary precondition failed after cleanup: group={:?} leader={:?} result={result:?}", group_errors.borrow(), leader_errors.borrow());
+            },
+        )
+        .await;
+        anyhow::ensure!(
+            group_errors.borrow().is_empty() && leader_errors.borrow().is_empty(),
+            "HARNESS boundary precondition failed after cleanup: group={:?} leader={:?} result={result:?}",
+            group_errors.borrow(),
+            leader_errors.borrow()
+        );
         let error = result.expect_err("oversized probe must never be accepted");
         let message = format!("{error:#}");
-        let expected = if matches!(case, NodeCleanupCase::ExitRaceEio) { "Failed to terminate Node.js probe leader" } else { "exceeds 4096" };
+        let expected = if matches!(case, NodeCleanupCase::ExitRaceEio) {
+            "Failed to terminate Node.js probe leader"
+        } else {
+            "exceeds 4096"
+        };
         assert!(message.contains(expected), "wrong refusal: {message}");
-        assert_eq!(leader_calls.get(), if matches!(case, NodeCleanupCase::AlreadyTerminal) { 0 } else { 1 });
-        assert_eq!(fs::read_to_string(directory.path().join("probe.ready"))?, "READY");
-        let pid: i32 = fs::read_to_string(directory.path().join("probe.pid"))?.trim().parse()?;
+        assert_eq!(
+            leader_calls.get(),
+            if matches!(case, NodeCleanupCase::AlreadyTerminal) {
+                0
+            } else {
+                1
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("probe.ready"))?,
+            "READY"
+        );
+        let pid: i32 = fs::read_to_string(directory.path().join("probe.pid"))?
+            .trim()
+            .parse()?;
         assert_eq!(*groups.borrow(), [pid]);
-        assert_eq!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None), Err(nix::errno::Errno::ESRCH));
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
         Ok(())
     }
 
@@ -2377,6 +2444,4 @@ mod tests {
     async fn node_cleanup_racing_exit_eio_remains_failure() -> Result<()> {
         assert_node_cleanup_boundary(NodeCleanupCase::ExitRaceEio).await
     }
-
-
 }

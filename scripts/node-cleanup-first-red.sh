@@ -3,7 +3,7 @@ set -euo pipefail
 proof="$RUNNER_TEMP/node-cleanup-first-red"
 mkdir "$proof"
 node_source="$GITHUB_WORKSPACE/src/runtimes/node.rs"
-node_sha=4a4880b485be886b5dd87ea1116b45c51facfb643786ce1cdb3ce3cf3d4c6e59
+node_sha=ba492a2f64e6c4b5babbb425751f44c5ae27fb6479225e75fc92c69e58441796
 supervisor="$GITHUB_WORKSPACE/scripts/node-cleanup-proof-supervisor.py"
 cargo_provider=$(command -v cargo)
 rustc_provider=$(command -v rustc)
