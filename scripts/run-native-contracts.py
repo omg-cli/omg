@@ -266,7 +266,8 @@ def cargo_test_args(features):
         suites.append('security_daemon_optional')
     if active & {'debian', 'debian-pure'}:
         suites.extend(['debian_tests', 'debian_daemon_tests', 'debian_ipc_tests',
-                       'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests'])
+                       'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests',
+                       'ubuntu_compatibility_tests'])
     if 'debian-pure' in active:
         suites.append('debian_pure_integration')
     if 'debian' in active:

@@ -167,6 +167,23 @@ def parser_fixture():
 
 
 class NativeReceipts(unittest.TestCase):
+    def test_debian_native_recipe_selects_ubuntu_compatibility(self):
+        args = NATIVE.cargo_test_args('debian,pgp,license')
+        suites = [args[index + 1] for index, value in enumerate(args) if value == '--test']
+        self.assertEqual(suites.count('ubuntu_compatibility_tests'), 1)
+
+    def test_debian_pure_native_recipe_selects_ubuntu_compatibility(self):
+        args = NATIVE.cargo_test_args('debian-pure')
+        suites = [args[index + 1] for index, value in enumerate(args) if value == '--test']
+        self.assertEqual(suites.count('ubuntu_compatibility_tests'), 1)
+
+    def test_incompatible_native_recipes_do_not_select_ubuntu_compatibility(self):
+        for features in ('pgp,license', 'arch,pgp,license', 'fedora,pgp,license', 'macos,pgp,license'):
+            with self.subTest(features=features):
+                args = NATIVE.cargo_test_args(features)
+                suites = [args[index + 1] for index, value in enumerate(args) if value == '--test']
+                self.assertEqual(suites.count('ubuntu_compatibility_tests'), 0)
+
     def test_every_native_owner_selects_daemon_cache_and_concurrency_suites(self):
         for features in ('pgp,license', 'arch,pgp,license', 'debian,pgp,license',
                          'debian-pure', 'fedora,pgp,license', 'macos,pgp,license'):
@@ -547,7 +564,8 @@ class NativeReceipts(unittest.TestCase):
 
     def test_native_backend_files_are_selected_on_compatible_owners(self):
         common_debian = {'debian_tests', 'debian_daemon_tests', 'debian_ipc_tests',
-                         'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests'}
+                         'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests',
+                         'ubuntu_compatibility_tests'}
         for features, expected in (
             ('pgp,license', set()), ('arch,pgp,license', {'security_daemon_optional'}),
             ('debian,pgp,license', common_debian | {'security_daemon_optional', 'apt_version_ordering'}),
