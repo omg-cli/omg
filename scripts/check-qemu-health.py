@@ -5,6 +5,7 @@ Only kernel messages and selected coredump identity fields are queried. Never
 collect core files, process environments, command lines or arbitrary journals.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -60,7 +61,9 @@ def crash_channel_capability(boot_id):
     pattern = query(["cat", "/proc/sys/kernel/core_pattern"]).strip()
     match = CORE_PATTERN.fullmatch(pattern)
     if not match:
-        raise ValueError("unsupported kernel crash handler")
+        encoded = pattern.encode("utf-8")
+        raise ValueError("unsupported kernel crash handler: "
+                         f"bytes={len(encoded)} sha256={hashlib.sha256(encoded).hexdigest()}")
     # Check executable availability without invoking the handler or reading cores.
     query(["test", "-x", match[1]])
     channel = {"kind": "systemd-coredump-pipe", "boot_id": boot_id,

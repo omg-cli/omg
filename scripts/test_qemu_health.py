@@ -1,4 +1,6 @@
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -27,6 +29,35 @@ def channel_fixture(boot):
 
 
 class HealthTests(unittest.TestCase):
+    def test_unsupported_handler_cli_records_private_pattern_fingerprint(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(sys, "argv", ["check-qemu-health.py", "collect"]), \
+                patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
+                patch.object(HEALTH, "query", return_value="@@/run/systemd/coredumpd/kernel"), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = HEALTH.main()
+        self.assertEqual(result, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(),
+                         "QEMU health evidence failed admission: unsupported kernel crash handler: "
+                         "bytes=31 sha256=54abd39894357fa9bf0b3a58363d7ca503d0481840b59999a795ce41dfcb6cc2\n")
+
+    def test_unsupported_handler_cli_does_not_publish_configured_path_or_controls(self):
+        pattern = "|/private/owner-data/" + "x" * 8192 + "\x1b[31m\nforged diagnostic"
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(sys, "argv", ["check-qemu-health.py", "collect"]), \
+                patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
+                patch.object(HEALTH, "query", return_value=pattern), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = HEALTH.main()
+        self.assertEqual(result, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertRegex(errors.getvalue(),
+                         r"\AQEMU health evidence failed admission: unsupported kernel crash handler: "
+                         r"bytes=[0-9]+ sha256=[0-9a-f]{64}\n\Z")
+        self.assertNotIn("/private/owner-data", errors.getvalue())
+        self.assertNotIn("\x1b", errors.getvalue())
+
     def test_debian_vendor_limit_keeps_crash_capability_required(self):
         boot = "12345678-1234-1234-1234-123456789abc"
         channel = channel_fixture(boot)
