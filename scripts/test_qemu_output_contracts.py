@@ -3263,6 +3263,15 @@ esac
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(evidence[0]['result'], 'PASS', logs)
 
+        delayed_product = product.replace('sleep 2\n', 'sleep 4\n', 1)
+        result, evidence, logs = self.run_inventory(delayed_product, rows, row_timeout=1)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(evidence[0]['case_id'], 'qemu-arch-runtime-go-install')
+        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+        self.assertEqual(evidence[0]['exit_code'], 124, logs)
+        self.assertIn('command exceeded 3s QEMU row deadline', logs['runtime-go-install.log'])
+        self.assertIn('OMG_QEMU_RECEIPT:executor:124:1', logs['runtime-go-install.stdout.log'])
+
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_python_download_outlives_generic_budget_but_failure_stays_fatal(self):
         rows = ['runtime-python-install\t["use","python","3.12.14"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
