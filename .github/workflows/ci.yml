@@ -992,7 +992,7 @@ jobs:
           OMG_BENCH_REGRESSION_MULTIPLIER: "2.0"
         run: |
           cargo test --test bench_debian --no-default-features --features ${{ matrix.features }} --locked \
-            bench_debian_deterministic_matrix -- --nocapture
+            -- --nocapture
 
       - name: Upload Debian benchmark artifact
         if: matrix.platform == 'debian'
