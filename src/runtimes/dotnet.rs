@@ -456,10 +456,16 @@ mod tests {
     #[test]
     fn dotnet_rid_names_the_host_platform() {
         let rid = dotnet_rid().expect("host platform should be supported");
-        match std::env::consts::ARCH {
-            "x86_64" => assert!(rid.contains("x64"), "{rid}"),
-            "aarch64" => assert!(rid.contains("arm64"), "{rid}"),
-            arch => panic!("unexpected test host arch: {arch}"),
-        }
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "linux-x64",
+            ("linux", "aarch64") => "linux-arm64",
+            ("macos", "x86_64") => "osx-x64",
+            ("macos", "aarch64") => "osx-arm64",
+            (os, arch) => panic!("unexpected test host platform: {os}/{arch}"),
+        };
+        assert_eq!(
+            rid, expected,
+            ".NET SDK RID must match host operating system and architecture"
+        );
     }
 }
