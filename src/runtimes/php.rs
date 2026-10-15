@@ -685,7 +685,10 @@ mod tests {
         let digest = format!("sha256:{}", "cd".repeat(32));
         let checksum = checksum_for_asset(&asset("php_8.5+ubuntu24.04.tar.xz", Some(&digest)))
             .expect("digest must verify");
-        assert_eq!(checksum.len(), 64);
+        assert_eq!(
+            checksum,
+            "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        );
         let missing = checksum_for_asset(&asset("php_8.5+ubuntu24.04.tar.xz", None))
             .expect_err("missing digest must fail closed");
         assert!(missing.to_string().contains("unverified"), "{missing:#}");
