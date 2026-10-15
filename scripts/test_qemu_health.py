@@ -33,14 +33,14 @@ class HealthTests(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
         with patch.object(sys, "argv", ["check-qemu-health.py", "collect"]), \
                 patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
-                patch.object(HEALTH, "query", return_value="@@/run/systemd/coredumpd/kernel"), \
+                patch.object(HEALTH, "query", return_value="@@/run/systemd/coredumpd/not-kernel"), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             result = HEALTH.main()
         self.assertEqual(result, 2)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(errors.getvalue(),
                          "QEMU health evidence failed admission: unsupported kernel crash handler: "
-                         "bytes=31 sha256=54abd39894357fa9bf0b3a58363d7ca503d0481840b59999a795ce41dfcb6cc2\n")
+                         "bytes=35 sha256=adbf739e34a18ded8ef1bdc9147da6b2a78fee99b887b5d15039243d1a9afd6c\n")
 
     def test_unsupported_handler_cli_does_not_publish_configured_path_or_controls(self):
         pattern = "|/private/owner-data/" + "x" * 8192 + "\x1b[31m\nforged diagnostic"
@@ -223,7 +223,7 @@ docker() {
         # Verify fail-closed behavior there; positive guest admission remains
         # mandatory in the launcher's actual collect/verify path.
         pattern = HEALTH.query(["cat", "/proc/sys/kernel/core_pattern"]).strip()
-        if not HEALTH.CORE_PATTERN.fullmatch(pattern):
+        if not (HEALTH.CORE_PATTERN.fullmatch(pattern) or pattern == "@@/run/systemd/coredumpd/kernel"):
             with self.assertRaisesRegex(ValueError, "unsupported kernel crash handler"):
                 HEALTH.collect()
             return
@@ -245,16 +245,18 @@ docker() {
                 patch.object(HEALTH, "collect", return_value=self.payload):
             with self.assertRaises(AssertionError):
                 probe(self)
-        with patch.object(HEALTH, "query", return_value=channel_fixture(
-                self.payload["boot_id"])["core_pattern"]), \
-                patch.object(HEALTH, "collect", return_value=self.payload) as collect:
-            probe(self)
-            collect.assert_called_once_with()
-        with patch.object(HEALTH, "query", return_value=channel_fixture(
-                self.payload["boot_id"])["core_pattern"]), \
-                patch.object(HEALTH, "collect", side_effect=ValueError("missing socket")):
-            with self.assertRaisesRegex(ValueError, "missing socket"):
+        for pattern in (channel_fixture(self.payload["boot_id"])["core_pattern"],
+                        "@@/run/systemd/coredumpd/kernel"):
+            with self.subTest(pattern=pattern, outcome="healthy"), \
+                    patch.object(HEALTH, "query", return_value=pattern), \
+                    patch.object(HEALTH, "collect", return_value=self.payload) as collect:
                 probe(self)
+                collect.assert_called_once_with()
+            with self.subTest(pattern=pattern, outcome="missing-proof"), \
+                    patch.object(HEALTH, "query", return_value=pattern), \
+                    patch.object(HEALTH, "collect", side_effect=ValueError("missing socket")):
+                with self.assertRaisesRegex(ValueError, "missing socket"):
+                    probe(self)
 
     def test_collector_binds_optional_boot_argument_and_accepts_no_crashes(self):
         with patch.object(HEALTH.Path, "read_text", return_value=self.payload["boot_id"]), \
