@@ -554,10 +554,12 @@ async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Durat
     let group_cleanup = match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
         #[cfg(target_os = "macos")]
-        Err(nix::errno::Errno::EPERM)
-            if terminal_group::macos::prove(&owned_leader, group.as_raw()).is_ok() =>
-        {
-            Ok(())
+        Err(error @ nix::errno::Errno::EPERM) => {
+            terminal_group::macos::prove(&owned_leader, group.as_raw()).with_context(|| {
+                format!(
+                    "Failed to terminate Node.js probe process group ({error}); terminal-state proof rejected"
+                )
+            })
         }
         Err(error) => Err(error).context("Failed to terminate Node.js probe process group"),
     };
