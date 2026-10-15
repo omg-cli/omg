@@ -14,7 +14,7 @@ uname -a > "$proof/uname"
 sw_vers > "$proof/sw-vers"
 python3 "$supervisor" --out "$proof/rustc" --source "$node_source" --source-sha256 "$node_sha" --deadline 15 --expected-exit 0 -- "$rustc_provider" -vV
 python3 "$supervisor" --out "$proof/cargo" --source "$node_source" --source-sha256 "$node_sha" --deadline 15 --expected-exit 0 -- "$cargo_provider" --version
-python3 "$supervisor" --out "$proof/build" --source "$node_source" --source-sha256 "$node_sha" --deadline 600 --expected-exit 0 -- "$cargo_provider" test --lib --no-default-features --features macos,pgp,license --locked --profile ci --no-run --message-format=json-render-diagnostics
+python3 "$supervisor" --out "$proof/build" --source "$node_source" --source-sha256 "$node_sha" --deadline 600 --expected-exit 0 -- "$cargo_provider" test --lib --no-default-features --features macos,pgp,license --locked --profile test --no-run --message-format=json-render-diagnostics
 python3 - "$proof" "$GITHUB_WORKSPACE" <<'PYARTIFACT'
 import json, pathlib, sys
 out, root = map(pathlib.Path, sys.argv[1:])
