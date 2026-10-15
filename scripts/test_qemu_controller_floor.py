@@ -10,10 +10,10 @@ BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
 
 
 class QemuControllerFloorTests(unittest.TestCase):
-    def run_gate(self, query_status=0, comparator_status=0, version='1:10.0.11+ds-0+deb13u1', package='qemu-system-x86', slirp_version='4.9.5-1'):
+    def run_gate(self, query_status=0, comparator_status=0, version='1:10.0.13+ds-0+deb13u1', package='qemu-system-x86', slirp_version='4.9.5-1'):
         gate = (ROOT / 'scripts/check-qemu-controller.sh').read_text(encoding='utf-8')
         prefix = '''dpkg-query() { if [[ "$3" == libslirp0 ]]; then printf '%s' "$SLIRP_VERSION"; else printf '%s' "$FIXTURE_VERSION"; fi; return "$QUERY_STATUS"; }
-dpkg() { [[ "$1" == --compare-versions && "$3" == ge && ( "$4" == '1:10.0.11+ds-0+deb13u1' || "$4" == '4.9.5-1' ) ]] || return 99; return "$COMPARATOR_STATUS"; }
+dpkg() { [[ "$1" == --compare-versions && "$3" == ge && ( "$4" == '1:10.0.13+ds-0+deb13u1' || "$4" == '4.9.5-1' ) ]] || return 99; return "$COMPARATOR_STATUS"; }
 '''
         return subprocess.run([BASH, '-c', prefix + gate, '_', package],
             env=dict(os.environ, FIXTURE_VERSION=version, QUERY_STATUS=str(query_status),
@@ -45,15 +45,26 @@ dpkg() { [[ "$1" == --compare-versions && "$3" == ge && ( "$4" == '1:10.0.11+ds-
     @unittest.skipUnless(shutil.which('dpkg'), 'Debian version comparison runs in Linux CI')
     def test_real_debian_version_ordering(self):
         gate = (ROOT / 'scripts/check-qemu-controller.sh').read_text(encoding='utf-8')
-        prefix = 'dpkg-query() { if [[ "$3" == libslirp0 ]]; then printf "4.9.5-1"; else printf "%s" "$FIXTURE_VERSION"; fi; }\n'
-        for version, expected in [('1:7.2+dfsg-7+deb12u18', False),
-                                  ('1:10.0.2+ds-2+deb13u1', False),
-                                  ('1:10.0.11+ds-0+deb13u1', True),
-                                  ('1:10.0.13+ds-0+deb13u1', True)]:
-            with self.subTest(version=version):
-                result = subprocess.run([BASH, '-c', prefix + gate, '_', 'qemu-system-x86'],
-                    env=dict(os.environ, FIXTURE_VERSION=version), capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode == 0, expected, result.stderr)
+        prefix = '''dpkg-query() {
+    if [[ "$3" == libslirp0 ]]; then printf "4.9.5-1";
+    elif [[ "$3" == "$FIXTURE_PACKAGE" ]]; then printf "%s" "$FIXTURE_VERSION";
+    else printf "1:10.0.13+ds-0+deb13u1"; fi;
+}
+'''
+        for selected in ('qemu-system-x86', 'qemu-system-arm'):
+            for package in (selected, 'qemu-system-common', 'qemu-utils'):
+                for version, expected in [('1:7.2+dfsg-7+deb12u18', False),
+                                          ('1:10.0.2+ds-2+deb13u1', False),
+                                          ('1:10.0.11+ds-0+deb13u1', False),
+                                          ('1:10.0.12+ds-0+deb13u1', False),
+                                          ('1:10.0.13+ds-0+deb13u1~rc1', False),
+                                          ('1:10.0.13+ds-0+deb13u1', True),
+                                          ('1:10.0.14+ds-0+deb13u1', True)]:
+                    with self.subTest(selected=selected, package=package, version=version):
+                        result = subprocess.run([BASH, '-c', prefix + gate, '_', selected],
+                            env=dict(os.environ, FIXTURE_VERSION=version, FIXTURE_PACKAGE=package),
+                            capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
 
     def test_controller_checks_before_image_parsing_and_boot(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')

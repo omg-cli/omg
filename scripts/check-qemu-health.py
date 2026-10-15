@@ -5,11 +5,13 @@ Only kernel messages and selected coredump identity fields are queried. Never
 collect core files, process environments, command lines or arbitrary journals.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -34,7 +36,320 @@ CORE_PATTERN = re.compile(
 CAPABILITY_PROPERTIES = "Id,LoadState,ActiveState,SubState,Result,UnitFileState"
 
 
+SOCKET_PATTERN = "@@/run/systemd/coredumpd/kernel"
+SOCKET_NAME = "/run/systemd/coredumpd/kernel"
+MANAGER_PROPERTIES = ("Id,LoadState,ActiveState,SubState,Result,UnitFileState,MainPID,ControlGroup,"
+                      "PrivateNetwork,ExecMainStartTimestampMonotonic,ConditionResult,AssertResult,Upholds")
+REGISTRATION_PROPERTIES = ("Id,LoadState,ActiveState,SubState,Result,UnitFileState,ExecMainCode,ExecMainStatus,"
+                           "ExecMainStartTimestampMonotonic,ConditionResult,AssertResult,BindsTo,"
+                           "RefuseManualStart,RefuseManualStop")
+SOCKET_OBSERVER_PROGRAM = r'''
+import json, os, re, socket, stat, struct, sys, time
+from pathlib import Path
+def require(ok):
+    if not ok: raise ValueError("invalid bounded manager observation")
+def read(path):
+    with open(path, "rb") as f: data = f.read(1048577)
+    require(len(data) <= 1048576)
+    return data.decode("utf-8", "strict")
+require(len(sys.argv) == 5 and all(re.fullmatch(r"0|[1-9][0-9]*", x) for x in sys.argv[1:]))
+pid, low, high, sequence = map(int, sys.argv[1:])
+require(0 < pid <= 2147483647 and 0 < sequence <= 0xffffffff and 0 <= low <= 0xffffffff and 0 <= high <= 0xffffffff)
+base = "/proc/" + str(pid)
+name = "/run/systemd/coredumpd/kernel"
+def identity():
+    text = read(base + "/stat")
+    close = text.rfind(")")
+    require(close > 0 and text[:text.find("(")].strip() == str(pid))
+    fields = text[close + 1:].split()
+    require(len(fields) >= 20)
+    start = int(fields[19])
+    status = read(base + "/status")
+    uids = [line.split()[1:] for line in status.splitlines() if line.startswith("Uid:")]
+    require(uids == [["0", "0", "0", "0"]])
+    require(read(base + "/cgroup").strip() == "0::/system.slice/systemd-coredumpd.service")
+    namespace = os.stat(base + "/ns/net").st_ino
+    require(namespace == os.stat("/proc/self/ns/net").st_ino)
+    cg = Path("/sys/fs/cgroup/system.slice/systemd-coredumpd.service")
+    subgroups = 0
+    for number, entry in enumerate(cg.iterdir(), 1):
+        require(number <= 256)
+        subgroups += entry.is_dir()
+    raw_pids = read(str(cg / "cgroup.procs")).split()
+    require(len(raw_pids) <= 64 and all(re.fullmatch(r"[1-9][0-9]*", x) for x in raw_pids))
+    cgroup_pids = sorted(map(int, raw_pids))
+    require(cgroup_pids == [pid] and subgroups == 0)
+    executable = os.readlink(base + "/exe")
+    require(executable in ("/usr/lib/systemd/systemd-coredump", "/usr/lib64/systemd/systemd-coredump", "/lib/systemd/systemd-coredump", "/lib64/systemd/systemd-coredump"))
+    ex = os.stat(base + "/exe")
+    require(stat.S_ISREG(ex.st_mode) and ex.st_uid == 0 and ex.st_mode & 0o111 and not ex.st_mode & 0o022)
+    parents = [os.lstat(p) for p in ("/run", "/run/systemd", "/run/systemd/coredumpd")]
+    require(all(stat.S_ISDIR(p.st_mode) and p.st_uid == 0 and not p.st_mode & 0o022 for p in parents))
+    vfs = os.lstat(name)
+    require(stat.S_ISSOCK(vfs.st_mode) and vfs.st_uid == 0 and 0 < vfs.st_ino <= 0xffffffff)
+    table = read(base + "/net/unix").splitlines()
+    require(table and table[0].split() == ["Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path"] and len(table) <= 4097)
+    endpoint = []
+    listener = []
+    for line in table[1:]:
+        row = line.split(None, 7)
+        require(len(row) in (7, 8))
+        if len(row) == 8 and row[7] == name:
+            require(re.fullmatch(r"[0-9]+", row[6]) is not None)
+            inode = int(row[6])
+            endpoint.append(inode)
+            if int(row[4], 16) == 1 and int(row[3], 16) == 0x10000:
+                listener.append(inode)
+    require(len(endpoint) == 1 and endpoint == listener and 0 < listener[0] <= 0xffffffff)
+    socket_fds = []
+    for number, fd in enumerate(Path(base + "/fd").iterdir(), 1):
+        require(number <= 1024)
+        require(re.fullmatch(r"0|[1-9][0-9]*", fd.name) is not None)
+        if os.readlink(fd) == "socket:[" + str(listener[0]) + "]": socket_fds.append(int(fd.name))
+    require(socket_fds)
+    return dict(pid=pid, start_ticks=start, namespace_inode=namespace, cgroup_pids=cgroup_pids,
+                subgroup_count=subgroups, executable=executable, executable_uid=ex.st_uid, executable_mode=ex.st_mode,
+                socket_inode=listener[0], socket_fds=sorted(socket_fds), vfs_inode=vfs.st_ino,
+                vfs_major=os.major(vfs.st_dev), vfs_minor=os.minor(vfs.st_dev), socket_uid=vfs.st_uid,
+                parent_uids=[p.st_uid for p in parents], parent_modes=[p.st_mode for p in parents],
+                endpoint_socket_inodes=endpoint)
+before = identity()
+with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 4) as netlink:
+    netlink.bind((0, 0))
+    port, groups = netlink.getsockname()
+    require(0 < port <= 0xffffffff and groups == 0)
+    request = struct.pack("=IHHIIBBHIIIII", 40, 20, 1, sequence, port, 1, 0, 0, 1024, before["socket_inode"], 83, low, high)
+    deadline = time.monotonic() + 1
+    netlink.settimeout(1)
+    require(netlink.sendto(request, (0, 0)) == 40)
+    remaining = deadline - time.monotonic()
+    require(remaining > 0)
+    netlink.settimeout(remaining)
+    data, ancillary, flags, sender = netlink.recvmsg(65536, 256)
+    require(time.monotonic() <= deadline)
+after = identity()
+require(before == after)
+result = dict(identity=before, request_hex=request.hex(), reply_hex=data.hex(), sender=list(sender),
+              msg_flags=flags, ancillary_count=len(ancillary), port_id=port, sequence=sequence, namespace_inode=before["namespace_inode"])
+encoded = json.dumps(result, separators=(",", ":"))
+require(len(encoded) <= 1048576)
+print(encoded)
+'''
+
+
+def socket_unit_properties(unit, properties):
+    fields = {}
+    for line in query(["systemctl", "show", "--all", "--property=" + properties, unit]).splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key not in properties.split(",") or key in fields:
+            raise ValueError("invalid manager unit evidence")
+        fields[key] = value
+    if set(fields) != set(properties.split(",")):
+        raise ValueError("incomplete manager unit evidence")
+    return fields
+
+
+def validate_socket_channel(channel, boot_id):
+    if (set(channel) != {"kind", "boot_id", "core_pattern", "manager", "registration", "identity", "listener", "manager_warning_count"}
+            or channel["kind"] != "systemd-coredump-kernel-socket" or channel["boot_id"] != boot_id
+            or channel["core_pattern"] != SOCKET_PATTERN):
+        raise ValueError("invalid kernel socket channel")
+    if type(channel["manager_warning_count"]) is not int or channel["manager_warning_count"] != 0:
+        raise ValueError("invalid manager warning history witness")
+    manager, registration = channel["manager"], channel["registration"]
+    for fields, properties, unit, substate in (
+        (manager, MANAGER_PROPERTIES, "systemd-coredumpd.service", "running"),
+        (registration, REGISTRATION_PROPERTIES, "systemd-coredump-register.service", "exited"),
+    ):
+        if (not isinstance(fields, dict) or set(fields) != set(properties.split(","))
+                or any(not isinstance(v, str) for v in fields.values())
+                or fields["Id"] != unit or fields["LoadState"] != "loaded"
+                or fields["ActiveState"] != "active" or fields["SubState"] != substate
+                or fields["Result"] != "success" or fields["ConditionResult"] != "yes" or fields["AssertResult"] != "yes"
+                or fields["UnitFileState"] not in ("enabled", "enabled-runtime", "static")
+                or not re.fullmatch(r"[1-9][0-9]*", fields["ExecMainStartTimestampMonotonic"])):
+            raise ValueError("manager or registration absent, pending or failed")
+    if (not re.fullmatch(r"[1-9][0-9]*", manager["MainPID"])
+            or int(manager["MainPID"]) > 2147483647
+            or manager["ControlGroup"] != "/system.slice/systemd-coredumpd.service" or manager["PrivateNetwork"] != "yes"
+            or "systemd-coredump-register.service" not in manager["Upholds"].split()
+            or "systemd-coredumpd.service" not in registration["BindsTo"].split()
+            or registration["RefuseManualStart"] != "yes" or registration["RefuseManualStop"] != "yes"
+            or registration["ExecMainCode"] != "1" or registration["ExecMainStatus"] != "0"
+            or int(registration["ExecMainStartTimestampMonotonic"]) < int(manager["ExecMainStartTimestampMonotonic"])):
+        raise ValueError("invalid manager registration identity")
+    identity = channel["identity"]
+    integer_fields = {"pid", "start_ticks", "namespace_inode", "subgroup_count", "executable_uid", "executable_mode",
+                      "socket_inode", "vfs_inode", "vfs_major", "vfs_minor", "socket_uid"}
+    array_fields = {"cgroup_pids", "socket_fds", "parent_uids", "parent_modes", "endpoint_socket_inodes"}
+    if (not isinstance(identity, dict) or set(identity) != integer_fields | array_fields | {"executable"}
+            or any(type(identity[k]) is not int or identity[k] < 0 for k in integer_fields)
+            or any(not isinstance(identity[k], list) or len(identity[k]) > 1024
+                   or any(type(v) is not int or v < 0 for v in identity[k]) for k in array_fields)):
+        raise ValueError("invalid bounded manager identity")
+    if (identity["pid"] != int(manager["MainPID"]) or identity["start_ticks"] <= 0 or identity["namespace_inode"] <= 0
+            or identity["cgroup_pids"] != [identity["pid"]] or identity["subgroup_count"] != 0
+            or identity["executable"] not in ("/usr/lib/systemd/systemd-coredump", "/usr/lib64/systemd/systemd-coredump",
+                                              "/lib/systemd/systemd-coredump", "/lib64/systemd/systemd-coredump")
+            or identity["executable_uid"] != 0 or not stat.S_ISREG(identity["executable_mode"])
+            or not identity["executable_mode"] & 0o111 or identity["executable_mode"] & 0o022
+            or not 0 < identity["socket_inode"] <= 0xFFFFFFFF or not 0 < identity["vfs_inode"] <= 0xFFFFFFFF
+            or identity["socket_uid"] != 0 or not identity["socket_fds"]
+            or identity["socket_fds"] != sorted(set(identity["socket_fds"]))
+            or identity["endpoint_socket_inodes"] != [identity["socket_inode"]]
+            or identity["parent_uids"] != [0, 0, 0] or len(identity["parent_modes"]) != 3
+            or any(not stat.S_ISDIR(v) or v & 0o022 for v in identity["parent_modes"])):
+        raise ValueError("manager worker, endpoint or identity is unsafe")
+    listener = channel["listener"]
+    if (not isinstance(listener, dict)
+            or set(listener) != {"inode", "cookie", "name", "vfs_inode", "vfs_major", "vfs_minor", "rqueue", "wqueue", "uid", "shutdown"}
+            or any(type(listener[k]) is not int or listener[k] < 0 for k in listener if k not in ("cookie", "name"))
+            or not isinstance(listener["cookie"], list) or len(listener["cookie"]) != 2
+            or any(type(v) is not int or not 0 <= v <= 0xFFFFFFFF for v in listener["cookie"])
+            or tuple(listener["cookie"]) in ((0, 0), (0xFFFFFFFF, 0xFFFFFFFF))
+            or listener["name"] != SOCKET_NAME or listener["inode"] != identity["socket_inode"]
+            or any(listener[k] != identity[k] for k in ("vfs_inode", "vfs_major", "vfs_minor"))
+            or listener["uid"] != 0 or listener["rqueue"] != 0 or listener["wqueue"] <= 0 or listener["shutdown"] != 0):
+        raise ValueError("kernel socket listener is pending or invalid")
+
+
+def socket_transport_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate socket transport field")
+        result[key] = value
+    return result
+
+
+def observe_socket_transport(pid, cookie, sequence):
+    text = query(["/usr/bin/nsenter", "--target", str(pid), "--net", "--", "/usr/bin/python3", "-I", "-B", "-c",
+                  SOCKET_OBSERVER_PROGRAM, str(pid), str(cookie[0]), str(cookie[1]), str(sequence)])
+    if len(text.encode()) > LIMIT:
+        raise ValueError("oversized socket transport")
+    record = json.loads(text, object_pairs_hook=socket_transport_object)
+    if (not isinstance(record, dict)
+            or set(record) != {"identity", "request_hex", "reply_hex", "sender", "msg_flags", "ancillary_count", "port_id", "sequence", "namespace_inode"}
+            or record["sequence"] != sequence or type(record["sequence"]) is not int
+            or type(record["port_id"]) is not int or not 0 < record["port_id"] <= 0xFFFFFFFF
+            or type(record["namespace_inode"]) is not int
+            or not isinstance(record["identity"], dict)
+            or record["namespace_inode"] != record["identity"].get("namespace_inode")
+            or record["sender"] != [0, 0] or any(type(v) is not int for v in record["sender"])
+            or type(record["msg_flags"]) is not int or record["msg_flags"] != 0
+            or type(record["ancillary_count"]) is not int or record["ancillary_count"] != 0):
+        raise ValueError("invalid socket transport boundary")
+    for key, size in (("request_hex", 80), ("reply_hex", 131072)):
+        if not isinstance(record[key], str) or not 0 < len(record[key]) <= size or len(record[key]) % 2 or re.fullmatch(r"[0-9a-f]+", record[key]) is None:
+            raise ValueError("invalid socket wire encoding")
+    request, reply = bytes.fromhex(record["request_hex"]), bytes.fromhex(record["reply_hex"])
+    inode = record["identity"].get("socket_inode")
+    if type(inode) is not int or not 0 < inode <= 0xFFFFFFFF:
+        raise ValueError("invalid socket request inode")
+    expected = struct.pack("=IHHIIBBHIIIII", 40, 20, 1, sequence, record["port_id"], 1, 0, 0, 1024, inode, 83, *cookie)
+    if request != expected:
+        raise ValueError("socket request differs")
+    return record, request, reply
+
+
+def kernel_socket_channel(boot_id, pattern):
+    manager = socket_unit_properties("systemd-coredumpd.service", MANAGER_PROPERTIES)
+    registration = socket_unit_properties("systemd-coredump-register.service", REGISTRATION_PROPERTIES)
+    if not re.fullmatch(r"[1-9][0-9]*", manager["MainPID"]) or int(manager["MainPID"]) > 2147483647:
+        raise ValueError("invalid manager PID")
+    pid = int(manager["MainPID"])
+    first, _, discovery = observe_socket_transport(pid, (0xFFFFFFFF, 0xFFFFFFFF), 1)
+    if len(discovery) < 32:
+        raise ValueError("short unqualified cookie discovery")
+    inode = first["identity"].get("socket_inode")
+    if (struct.unpack_from("=IHHII", discovery) != (len(discovery), 20, 0, 1, first["port_id"])
+            or struct.unpack_from("=BBBBI", discovery, 16) != (1, 1, 10, 0, inode)):
+        raise ValueError("unqualified discovery identity differs")
+    cookie = struct.unpack_from("=II", discovery, 24)
+    if cookie in ((0, 0), (0xFFFFFFFF, 0xFFFFFFFF)):
+        raise ValueError("unusable discovery cookie")
+    exact, request, reply = observe_socket_transport(pid, cookie, 2)
+    if exact["identity"] != first["identity"]:
+        raise ValueError("manager identity changed during socket observation")
+    listener = decode_socket_reply(reply, sender=tuple(exact["sender"]), msg_flags=exact["msg_flags"], seq=2,
+                                   port_id=exact["port_id"], inode=inode, cookie=cookie, name=SOCKET_NAME.encode(), request=request)
+    listener["cookie"] = list(listener["cookie"])
+    listener["name"] = listener["name"].decode("ascii")
+    history = query(["journalctl", "--boot=" + boot_id.replace("-", ""), "--quiet", "--no-pager", "--output=json",
+                     "--output-fields=_BOOT_ID,_SYSTEMD_UNIT,PRIORITY", "--priority=warning",
+                     "_SYSTEMD_UNIT=systemd-coredumpd.service"])
+    if history.strip():
+        raise ValueError("manager warning history prevents health admission")
+    channel = {"kind": "systemd-coredump-kernel-socket", "boot_id": boot_id, "core_pattern": pattern,
+               "manager": manager, "registration": registration, "identity": exact["identity"], "listener": listener, "manager_warning_count": 0}
+    validate_socket_channel(channel, boot_id)
+    if (socket_unit_properties("systemd-coredumpd.service", MANAGER_PROPERTIES) != manager
+            or socket_unit_properties("systemd-coredump-register.service", REGISTRATION_PROPERTIES) != registration):
+        raise ValueError("manager registration changed during socket observation")
+    return channel
+
+
+def decode_socket_reply(data, *, sender, msg_flags, seq, port_id, inode, cookie, name, request):
+    if sender != (0, 0) or msg_flags != 0 or not 16 <= len(data) <= 65536:
+        raise ValueError("invalid receive boundary")
+    length, kind, flags, observed_seq, observed_port = struct.unpack_from("=IHHII", data)
+    if length != len(data) or observed_seq != seq or observed_port != port_id:
+        raise ValueError("reply identity or length mismatch")
+    if len(request) != 40:
+        raise ValueError("unexpected request length")
+    request_header = struct.unpack_from("=IHHII", request)
+    request_body = struct.unpack_from("=BBHIIIII", request, 16)
+    if (request_header != (40, 20, 1, seq, port_id)
+            or request_body != (1, 0, 0, 1024, inode, 83, *cookie)
+            or not 0 < inode <= 0xFFFFFFFF
+            or cookie in ((0, 0), (0xFFFFFFFF, 0xFFFFFFFF))):
+        raise ValueError("unqualified request identity")
+    if kind == 2:
+        if flags not in (0, 0x100) or len(data) < 36:
+            raise ValueError("invalid error reply")
+        error = struct.unpack_from("=i", data, 16)[0]
+        expected_echo = request[:16] if flags == 0x100 else request
+        if data[20:] != expected_echo or not -4095 <= error < 0:
+            raise ValueError("invalid error code or request echo")
+        raise OSError(-error, "UNIX diagnostic kernel error")
+    if kind != 20 or flags != 0 or len(data) < 32:
+        raise ValueError("unexpected diagnostic message")
+    family, socket_type, state, pad, found_inode, low, high = struct.unpack_from("=BBBBIII", data, 16)
+    if (family, socket_type, state, pad, found_inode, low, high) != (1, 1, 10, 0, inode, *cookie):
+        raise ValueError("socket identity or listener state mismatch")
+    attributes = {}
+    offset = 32
+    while offset < len(data):
+        if len(data) - offset < 4:
+            raise ValueError("truncated attribute header")
+        size, attribute_type = struct.unpack_from("=HH", data, offset)
+        aligned_size = (size + 3) & ~3
+        if size < 4 or offset + aligned_size > len(data):
+            raise ValueError("truncated attribute payload or padding")
+        if attribute_type not in (0, 1, 4, 6, 7) or attribute_type in attributes:
+            raise ValueError("unknown, flagged or duplicate attribute")
+        attributes[attribute_type] = data[offset + 4:offset + size]
+        offset += aligned_size
+    if set(attributes) != {0, 1, 4, 6, 7}:
+        raise ValueError("missing required attribute")
+    if attributes[0] != name + b"\0" or not name or b"\0" in name or not name.startswith(b"/"):
+        raise ValueError("unexpected filesystem socket name")
+    if any(len(attributes[key]) != size for key, size in ((1, 8), (4, 8), (6, 1), (7, 4))):
+        raise ValueError("invalid attribute size")
+    vfs_inode, device = struct.unpack("=II", attributes[1])
+    rqueue, wqueue = struct.unpack("=II", attributes[4])
+    uid = struct.unpack("=I", attributes[7])[0]
+    return {
+        "inode": found_inode, "cookie": (low, high), "name": name,
+        "vfs_inode": vfs_inode, "vfs_major": device >> 20,
+        "vfs_minor": device & 0xFFFFF, "rqueue": rqueue, "wqueue": wqueue,
+        "uid": uid, "shutdown": attributes[6][0],
+    }
+
+
 def validate_crash_channel(channel, boot_id):
+    if isinstance(channel, dict) and channel.get("kind") == "systemd-coredump-kernel-socket":
+        return validate_socket_channel(channel, boot_id)
     if (not isinstance(channel, dict)
             or channel.get("kind") != "systemd-coredump-pipe"
             or channel.get("boot_id") != boot_id
@@ -58,9 +373,13 @@ def validate_crash_channel(channel, boot_id):
 
 def crash_channel_capability(boot_id):
     pattern = query(["cat", "/proc/sys/kernel/core_pattern"]).strip()
+    if pattern == SOCKET_PATTERN:
+        return kernel_socket_channel(boot_id, pattern)
     match = CORE_PATTERN.fullmatch(pattern)
     if not match:
-        raise ValueError("unsupported kernel crash handler")
+        encoded = pattern.encode("utf-8")
+        raise ValueError("unsupported kernel crash handler: "
+                         f"bytes={len(encoded)} sha256={hashlib.sha256(encoded).hexdigest()}")
     # Check executable availability without invoking the handler or reading cores.
     query(["test", "-x", match[1]])
     channel = {"kind": "systemd-coredump-pipe", "boot_id": boot_id,

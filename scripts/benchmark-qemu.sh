@@ -142,15 +142,15 @@ pins_for() {
   controller_image=$controller_image_x86_64
   case "$pin_distro-$pin_arch" in
     arch-x86_64)
-      image_url=https://geo.mirror.pkgbuild.com/images/v20260901.583572/Arch-Linux-x86_64-cloudimg-20260901.583572.qcow2
-      image_hash=e3e688f97a71b265ce202905a504253f60f3680cf57d011a45411c43bedfa930
+      image_url=https://geo.mirror.pkgbuild.com/images/v20261001.604814/Arch-Linux-x86_64-cloudimg-20261001.604814.qcow2
+      image_hash=360f0fa49db6813bdc8e35bed230a2dc2ae3567b7b5ab74719c0a706e4e34e87
       firmware=uefi ;;
     arch-aarch64)
       printf 'error: no aarch64 cloud image pinned for arch (upstream publishes x86_64 only)\n' >&2
       return 1 ;;
     debian-x86_64)
-      image_url=https://cloud.debian.org/images/cloud/bookworm/20260903-2590/debian-12-generic-amd64-20260903-2590.qcow2
-      image_hash=804377dd07318360c39a75e57b326243442a43bae1e12b33d5f490a64713c15c080a0323cb55d52b381139db9187702d38f36b8b142b8ef36da1031d9de41c2d
+      image_url=https://cloud.debian.org/images/cloud/bookworm/20261006-2623/debian-12-generic-amd64-20261006-2623.qcow2
+      image_hash=f631afb1d8123a29779f720f7f08a97e9f2ce5f5c705b8d9f753df8ed0c3afddeb34e4f254dfa41a6330e9a637387c80a8fe453d789446f9d8be7d7714d0ce7e
       hash_tool=sha512sum
       ssh_service=ssh ;;
     debian-trixie-x86_64)
@@ -159,17 +159,17 @@ pins_for() {
       hash_tool=sha512sum
       ssh_service=ssh ;;
     debian-aarch64)
-      image_url=https://cloud.debian.org/images/cloud/bookworm/20260903-2590/debian-12-generic-arm64-20260903-2590.qcow2
-      image_hash=b0144c1c8e09b187b54af300c8ffc22f17b318d0aa6f5a2caba13f3102441572badbeb098458e599b6897bc80dad50fd0094d6e4b9da9f4a2bd63a8f4c99dea5
+      image_url=https://cloud.debian.org/images/cloud/bookworm/20261006-2623/debian-12-generic-arm64-20261006-2623.qcow2
+      image_hash=991f0dd77ee442eb2406568fc27c537190af0c78ab211b0e2adcf568cd203aebf696b94a05e64c7e00d3e05e0e532fdd941311e34ef862ad06bc1bc69a92a3fb
       hash_tool=sha512sum
       ssh_service=ssh ;;
     ubuntu-x86_64)
-      image_url=https://cloud-images.ubuntu.com/noble/20260826/noble-server-cloudimg-amd64.img
-      image_hash=d0fe84bb5f80853425fa6be28e2c106f30104c3cfe8611933f2e65c9b63f0e30
+      image_url=https://cloud-images.ubuntu.com/noble/20260926/noble-server-cloudimg-amd64.img
+      image_hash=6a81c37564db9b1ee84e141922625e1d7c5b389b99bb3c572e0243607d5bb4d2
       ssh_service=ssh ;;
     ubuntu-aarch64)
-      image_url=https://cloud-images.ubuntu.com/noble/20260826/noble-server-cloudimg-arm64.img
-      image_hash=afa139bac6f2629c1e1f2f8f34215f3a9ad9779801bcb945521ba1a45016743f
+      image_url=https://cloud-images.ubuntu.com/noble/20260926/noble-server-cloudimg-arm64.img
+      image_hash=1d6bffe64b848468ac97f821d369a4846d983de1800ccf6b5ec8853e85cefc55
       ssh_service=ssh ;;
     fedora-x86_64)
       image_url=https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2

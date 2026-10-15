@@ -27,15 +27,26 @@ class ImageProvenanceTests(unittest.TestCase):
         self.assertEqual(len(lines), 8)
         for line in lines:
             distro, arch, url, digest, algorithm, _ = line.split("\t")
-            entry = IMAGE.policy(MANIFEST, distro + "-" + arch, url, digest, date(2026, 10, 3))
+            entry = IMAGE.policy(MANIFEST, distro + "-" + arch, url, digest,
+                                 date.fromisoformat(self.manifest["reviewed_on"]))
             self.assertEqual(entry["algorithm"] + "sum", algorithm)
 
     def test_expired_or_changed_pin_cannot_boot(self):
         entry = self.manifest["images"]["ubuntu-x86_64"]
-        with self.assertRaises(ValueError):
-            IMAGE.policy(MANIFEST, "ubuntu-x86_64", entry["url"], entry["digest"], date(2026, 10, 15))
-        with self.assertRaises(ValueError):
-            IMAGE.policy(MANIFEST, "ubuntu-x86_64", entry["url"], "0" * 64, date(2026, 10, 3))
+        fixture = dict(self.manifest, reviewed_on="2026-10-03", review_expires="2026-10-15")
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_text(json.dumps(fixture))
+            for day in (date(2026, 10, 3), date(2026, 10, 14)):
+                with self.subTest(day=day):
+                    accepted = IMAGE.policy(manifest, "ubuntu-x86_64", entry["url"], entry["digest"], day)
+                    self.assertEqual(accepted, entry)
+            for day in (date(2026, 10, 2), date(2026, 10, 15), date(2026, 10, 16)):
+                with self.subTest(day=day):
+                    with self.assertRaisesRegex(ValueError, "image provenance review is expired or future-dated"):
+                        IMAGE.policy(manifest, "ubuntu-x86_64", entry["url"], entry["digest"], day)
+            with self.assertRaisesRegex(ValueError, "image selection differs from reviewed provenance"):
+                IMAGE.policy(manifest, "ubuntu-x86_64", entry["url"], "0" * 64, date(2026, 10, 3))
 
     def test_trixie_has_a_versioned_x64_pin_and_explicit_unsigned_checksum_policy(self):
         bash = os.environ.get("OMG_TEST_BASH") or shutil.which("bash")
@@ -50,7 +61,8 @@ class ImageProvenanceTests(unittest.TestCase):
         self.assertEqual((distro, arch, algorithm), ('debian-trixie', 'x86_64', 'sha512sum'))
         self.assertEqual(url, 'https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-amd64-20261001-2618.qcow2')
         self.assertEqual(digest, 'f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d')
-        entry = IMAGE.policy(MANIFEST, 'debian-trixie-x86_64', url, digest, date(2026, 10, 3))
+        entry = IMAGE.policy(MANIFEST, 'debian-trixie-x86_64', url, digest,
+                             date.fromisoformat(self.manifest['reviewed_on']))
         self.assertEqual(entry['algorithm'], 'sha512')
         self.assertEqual(entry['signature_policy'], 'publisher-unsigned-cloud-checksums')
         self.assertFalse(IMAGE.verify_signature(entry, MANIFEST.parent, Path('unused'))['signature_verified'])
