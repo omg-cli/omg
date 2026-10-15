@@ -544,11 +544,37 @@ mod tests {
 
     #[test]
     fn java_platform_is_host_specific() {
-        let (os, _arch) = java_platform().expect("host platform should be supported");
-        if std::env::consts::OS == "linux" {
-            assert_eq!(os, "linux");
-        } else {
-            assert_ne!(os, "linux");
+        #[cfg(all(
+            any(target_os = "linux", target_os = "macos"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            let expected = ("linux", "x64");
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            let expected = ("linux", "aarch64");
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            let expected = ("mac", "x64");
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let expected = ("mac", "aarch64");
+
+            let platform = java_platform().expect("host platform should be supported");
+            assert_eq!(
+                platform, expected,
+                "Java platform must match host operating system and architecture"
+            );
+        }
+        #[cfg(not(all(
+            any(target_os = "linux", target_os = "macos"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            let _ = java_platform().expect("host platform should be supported");
+            panic!(
+                "unexpected test host platform: {}/{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
         }
     }
 }
