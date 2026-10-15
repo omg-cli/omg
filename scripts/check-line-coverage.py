@@ -193,7 +193,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             if tag == "equal":
                 if old != new and any(before.get(line, 0) > 0 for line in range(a + 1, b + 1)):
                     block = "\n" + "\n".join(old[a:b]) + "\n"
-                    if ("\n" + "\n".join(old) + "\n").count(block) != 1 or ("\n" + "\n".join(new) + "\n").count(block) != 1:
+                    anchored_suffix = b == len(old) and d == len(new)
+                    if not anchored_suffix and (("\n" + "\n".join(old) + "\n").count(block) != 1 or
+                                                ("\n" + "\n".join(new) + "\n").count(block) != 1):
                         raise ValueError("Ambiguous unchanged source correspondence")
                 retained.update(zip(range(a + 1, b + 1), range(c + 1, d + 1)))
             elif tag == "delete":

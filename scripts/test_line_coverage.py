@@ -304,5 +304,20 @@ class SourceAwareCoverageTests(unittest.TestCase):
                 coverage.require_source_no_regression(value, value, region_path, region_path,
                     {"example.rs": old}, {"example.rs": new})
 
+    def test_covered_file_suffix_survives_repeated_closing_braces(self):
+        old = b"mod tests {\n    fn first() {\n        first();\n    }\n}\nmod last {\n    fn changed() {\n        old();\n    }\n}\n"
+        new = old.replace(b"        old();", b"        new();\n        checked();")
+        actual = self.compare(before=[(9, 1)], after=[(10, 1)],
+                              sources=({"example.rs": old}, {"example.rs": new}))
+        self.assertEqual(actual, {"deleted_summary_found": 0, "deleted_summary_hit": 0,
+                                  "deleted_mapped": 0, "deleted_mapped_hit": 0})
+
+    def test_covered_file_suffix_loss_is_refused_despite_repeated_closing_braces(self):
+        old = b"mod tests {\n    fn first() {\n        first();\n    }\n}\nmod last {\n    fn changed() {\n        old();\n    }\n}\n"
+        new = old.replace(b"        old();", b"        new();\n        checked();")
+        with self.assertRaisesRegex(ValueError, "Retained covered line lost coverage"):
+            self.compare(before=[(9, 1)], after=[(10, 0)],
+                         sources=({"example.rs": old}, {"example.rs": new}))
+
 if __name__ == "__main__":
     unittest.main()
