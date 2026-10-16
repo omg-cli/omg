@@ -325,6 +325,7 @@ mod tests {
             ("example-lib>=2:1.0", "1:9.0-1", false),
             ("example-lib>=2:1.0", "2:1.0-1", true),
             ("example-lib>1.0", "1.0-1", false),
+            ("example-lib>1.0", "2.0-1", true),
             ("example-lib<2.0", "1.0-1", true),
             ("example-lib<=1.0", "1.0-1", true),
         ] {

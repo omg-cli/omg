@@ -1,0 +1,95 @@
+name: Temporary Wave10 AUR test-quality proof
+'on':
+  push:
+    branches:
+      - codex/arch-test-quality-wave10-20261015
+permissions:
+  contents: read
+concurrency:
+  group: wave10-test-quality-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  wave10:
+    name: Arch Wave10 selected proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    container:
+      image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Setup Arch environment
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python fish
+      - name: Checkout exact branch event
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install verified Rust 1.95
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
+            -o /tmp/rustup-init
+          echo "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init" | sha256sum --check
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --profile minimal --default-toolchain 1.95.0
+          rm -f /tmp/rustup-init
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" component add clippy rustfmt
+      - name: Establish unique job paths
+        run: |
+          set -euo pipefail
+          printf '%s\n' "WAVE10_BASE=$RUNNER_TEMP/wave10-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          printf '%s\n' "CARGO_TARGET_DIR=$RUNNER_TEMP/wave10-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/target" >> "$GITHUB_ENV"
+      - name: Bind measured runtime to reviewed static policy
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          python3 scripts/wave10-hosted-proof/bind-runtime.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --root-policy scripts/wave10-hosted-proof/root-policy.json \
+            --plan scripts/wave10-hosted-proof/plan.json \
+            --operator scripts/wave10-hosted-proof/runner.py \
+            --source-manifest scripts/wave10-hosted-proof/immutable-source-manifest.json \
+            --context "$WAVE10_BASE/context" \
+            --target "$CARGO_TARGET_DIR"
+      - name: Run independently reviewed Wave10 proof operator
+        timeout-minutes: 55
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/codex/arch-test-quality-wave10-20261015
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f scripts/wave10-hosted-proof/runner.py
+          test -f scripts/wave10-hosted-proof/plan.json
+          test -f "$WAVE10_BASE/context/binding.json"
+          python3 scripts/wave10-hosted-proof/runner.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --plan scripts/wave10-hosted-proof/plan.json \
+            --root-policy scripts/wave10-hosted-proof/root-policy.json \
+            --runtime-binding "$WAVE10_BASE/context/binding.json" \
+            --target "$CARGO_TARGET_DIR" \
+            --output "$WAVE10_BASE/evidence"
+      - name: Preserve bounded compact evidence
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          python3 scripts/wave10-hosted-proof/compact-export.py
+      - name: Upload bounded compact proof evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: wave10-selected-proof-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wave10-compact-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
