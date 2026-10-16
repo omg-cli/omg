@@ -49,6 +49,8 @@ jobs:
           set -euo pipefail
           printf '%s\n' "WAVE10_BASE=$RUNNER_TEMP/wave10-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
           printf '%s\n' "CARGO_TARGET_DIR=$RUNNER_TEMP/wave10-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/target" >> "$GITHUB_ENV"
+          test -z "${GIT_CONFIG_COUNT:-}"
+          printf '%s\n' "GIT_CONFIG_COUNT=1" "GIT_CONFIG_KEY_0=safe.directory" "GIT_CONFIG_VALUE_0=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Bind measured runtime to reviewed static policy
         timeout-minutes: 2
         run: |

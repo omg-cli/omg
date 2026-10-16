@@ -11,7 +11,7 @@
     "scripts/wave10-hosted-proof/immutable-source-manifest.json": "ef8ce6117674c3c686e13d4cc8e36b471b2f6b149c4a94337366217360f421f4",
     "scripts/wave10-hosted-proof/bind-runtime.py": "05a80dc85aab0ebf51fe344eafd60202e03704c1a3ea648813c31829d337cdd6",
     "scripts/wave10-hosted-proof/compact-export.py": "d037613a268e4fb8c5eb74190060aab892662b895949095a7c7953773b804c58",
-    ".github/workflows/wave10-aur-test-quality-proof.yml": "a7999842c367e2acf9a3627be6cd2f562ffb9ddcb68449de5b7c0a8eb3e86f55",
+    ".github/workflows/wave10-aur-test-quality-proof.yml": "847339642a75845745bd53c99dc7766304fca33b1a29a79cce5ffb953fa113ee",
     "src/package_managers/aur_deps.rs": "4bdd44ba033268bfe8edbce9ccfcf3629ad2a03240c7343f8839259627e13353",
     "src/package_managers/aur/parallel_build.rs": "4a49e44545f7354dfa9047dba226864f62a9619407593061a7ca693c19e210b0"
   },
