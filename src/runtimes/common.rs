@@ -1175,8 +1175,11 @@ pub(crate) async fn extract_zip(
         anyhow::ensure!(archive.len() <= MAX_ARCHIVE_ENTRIES, "Archive contains too many entries");
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
+            let entry_name = file.name().with_context(|| {
+                format!("Failed to decode ZIP entry name at index {i}")
+            })?;
             let path = file.enclosed_name().ok_or_else(|| {
-                anyhow::anyhow!("Unsafe path in runtime ZIP archive: {}", file.name())
+                anyhow::anyhow!("Unsafe path in runtime ZIP archive: {entry_name}")
             })?;
             entry_budget.charge(&path)?;
             let Some(stripped) = stripped_archive_path(&path, strip_components)? else {
@@ -4324,18 +4327,54 @@ mod tests {
         let archive_path = temp.path().join("runtime.zip");
         let file = File::create(&archive_path)?;
         let mut archive = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o6755);
+        let options = zip::write::SimpleFileOptions::default().external_attributes(0o106755 << 16);
         archive.start_file("runtime/bin/tool", options)?;
         archive.write_all(b"tool")?;
         archive.finish()?;
 
+        {
+            let mut fixture = zip::ZipArchive::new(File::open(&archive_path)?)?;
+            let archived_mode = fixture.by_index(0)?.external_attributes() >> 16;
+            assert_eq!(
+                archived_mode & 0o6000,
+                0o6000,
+                "fixture must contain setuid and setgid bits"
+            );
+        }
+
         let destination = temp.path().join("destination");
         extract_zip(&archive_path, &destination, 1).await?;
+        assert_eq!(
+            fs::read(destination.join("bin/tool"))?,
+            b"tool",
+            "ZIP extraction must preserve file contents"
+        );
         let mode = fs::metadata(destination.join("bin/tool"))?
             .permissions()
             .mode();
         assert_eq!(mode & 0o7000, 0, "special mode bits must be stripped");
         assert_eq!(mode & 0o777, 0o755);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zip_extraction_reports_unsafe_entry_name() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let archive_path = temp.path().join("runtime.zip");
+        let mut archive = zip::ZipWriter::new(File::create(&archive_path)?);
+        archive.start_file("../outside-tool", zip::write::SimpleFileOptions::default())?;
+        archive.write_all(b"must not extract")?;
+        archive.finish()?;
+
+        let destination = temp.path().join("destination");
+        let error = extract_zip(&archive_path, &destination, 0)
+            .await
+            .expect_err("parent entry must be refused");
+        assert_eq!(
+            error.to_string(),
+            "Unsafe path in runtime ZIP archive: ../outside-tool"
+        );
+        assert!(!temp.path().join("outside-tool").exists());
         Ok(())
     }
 
