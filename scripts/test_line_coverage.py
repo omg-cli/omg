@@ -319,5 +319,82 @@ class SourceAwareCoverageTests(unittest.TestCase):
             self.compare(before=[(9, 1)], after=[(10, 0)],
                          sources=({"example.rs": old}, {"example.rs": new}))
 
+
+    def test_covered_retained_function_edit_needs_no_deletion_credit(self):
+        old = b"fn retained() {\n  obsolete_step();\n  keep();\n}\n"
+        new = b"fn retained() {\n  keep();\n}\n"
+        def retained_owner(base, head):
+            for value, end in [(base, 4), (head, 3)]:
+                value["data"][0]["functions"] = [{
+                    "name": "retained", "filenames": ["/src/example.rs"],
+                    "regions": [[1, 1, end, 2, 1, 0, 0, 0]]}]
+        try:
+            actual = self.compare(before=[(1, 1), (2, 1), (3, 1), (4, 1)],
+                                  after=[(1, 1), (2, 1), (3, 1)],
+                                  mutate=retained_owner,
+                                  sources=({"example.rs": old}, {"example.rs": new}))
+        except ValueError as error:
+            self.fail(f"fully covered retained-function edit was refused: {error}")
+        self.assertEqual(actual, {"deleted_summary_found": 0, "deleted_summary_hit": 0,
+                                  "deleted_mapped": 0, "deleted_mapped_hit": 0})
+
+    def test_reused_owner_symbol_needs_no_credit_when_raw_coverage_improves(self):
+        def reused_owner(base, head):
+            head["data"][0]["functions"].append(
+                copy.deepcopy(base["data"][0]["functions"][-1]))
+        try:
+            actual = self.compare(after=[(1, 1), (2, 1), (3, 1), (4, 1)], mutate=reused_owner)
+        except ValueError as error:
+            self.fail(f"unadjusted coverage gain was refused: {error}")
+        self.assertEqual(actual, {"deleted_summary_found": 0, "deleted_summary_hit": 0,
+                                  "deleted_mapped": 0, "deleted_mapped_hit": 0})
+
+    def test_retained_hit_loss_is_fatal_even_with_raw_ratio_gain(self):
+        with self.assertRaisesRegex(ValueError, "Retained covered line"):
+            self.compare(after=[(1, 0), (2, 1), (3, 1), (4, 1)])
+
+    def test_new_zero_is_fatal_even_with_raw_ratio_gain(self):
+        with self.assertRaisesRegex(ValueError, "New uncovered"):
+            self.compare(after=[(1, 1), (2, 1), (3, 1), (4, 1), (5, 0)],
+                         sources=({"example.rs": self.old_source},
+                                  {"example.rs": self.new_source + b"untested_new();\n"}))
+
+    def raw_ratio_retained_owner_compare(self, head_summary, head_counts):
+        old = b"fn retained() {\n  obsolete_step();\n  keep();\n  untested();\n}\n"
+        new = b"fn retained() {\n  keep();\n  untested();\n}\n"
+        before = [(1, 1), (2, 1), (3, 1), (4, 0), (5, 0)]
+        after = list(enumerate(head_counts, 1))
+        def lcov(rows, summary):
+            found, hit = summary
+            return "SF:/src/example.rs\n" + "".join(
+                f"DA:{line},{count}\n" for line, count in rows
+            ) + f"LF:{found}\nLH:{hit}\nend_of_record\n"
+        def regions(rows, summary):
+            found, hit = summary
+            return {"type": "llvm.coverage.json.export", "version": "3.1.0", "data": [{
+                "files": [{"filename": "/src/example.rs", "summary": {
+                    "lines": {"count": found, "covered": hit}}}],
+                "functions": [{"name": "retained", "filenames": ["/src/example.rs"],
+                               "regions": [[line, 1, line, 2, count, 0, 0, 0]
+                                           for line, count in rows]}]}]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bp, hp, bg, hg = (root / name for name in ("b.info", "h.info", "b.gz", "h.gz"))
+            bp.write_text(lcov(before, (6, 4)), encoding="utf-8")
+            hp.write_text(lcov(after, head_summary), encoding="utf-8")
+            bg.write_bytes(gzip.compress(json.dumps(regions(before, (6, 4))).encode("utf-8")))
+            hg.write_bytes(gzip.compress(json.dumps(regions(after, head_summary)).encode("utf-8")))
+            return coverage.require_source_no_regression(
+                coverage.read_coverage(bp), coverage.read_coverage(hp), bg, hg,
+                {"example.rs": old}, {"example.rs": new})
+
+    def test_source_aware_summary_regression_refused_when_mapping_improves(self):
+        with self.assertRaisesRegex(ValueError, "Line coverage decreased|retained or ambiguous"):
+            self.raw_ratio_retained_owner_compare((6, 3), (1, 1, 1, 0))
+
+    def test_source_aware_mapping_regression_refused_when_summary_holds(self):
+        with self.assertRaisesRegex(ValueError, "Mapped line coverage decreased|retained or ambiguous"):
+            self.raw_ratio_retained_owner_compare((6, 4), (1, 1, 0, 0))
+
 if __name__ == "__main__":
     unittest.main()

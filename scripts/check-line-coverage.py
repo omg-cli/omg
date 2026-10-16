@@ -211,6 +211,11 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         removed[name] = gone
         deleted_mapped += sum(line in gone for line in before)
         deleted_hit += sum(line in gone and count > 0 for line, count in before.items())
+    if (head.hit * base.found >= base.hit * head.found and
+            head.mapped_hit * base.mapped >= base.mapped_hit * head.mapped):
+        require_no_regression(base, head)
+        return {"deleted_summary_found": 0, "deleted_summary_hit": 0,
+                "deleted_mapped": 0, "deleted_mapped_hit": 0}
     head_names = {f["name"] for f in hf}; deleted_found = deleted_summary_hit = 0
     base_name_counts = {}
     for function in bf:

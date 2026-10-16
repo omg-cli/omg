@@ -481,7 +481,42 @@ mod terminal_group {
     }
 }
 
+fn node_probe_exit_observed(group: nix::unistd::Pid) -> Result<bool> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let pid = Pid::from_raw(group.as_raw()).context("Invalid Node.js probe process ID")?;
+    Ok(waitid(
+        WaitId::Pid(pid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    )
+    .context("Failed to observe Node.js probe exit")?
+    .is_some())
+}
+
+async fn observe_node_probe_exit(group: nix::unistd::Pid) -> Result<()> {
+    while !node_probe_exit_observed(group)? {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    Ok(())
+}
+
 async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Duration) -> Result<()> {
+    probe_node_with_signals(
+        directory,
+        expected,
+        deadline,
+        |group| nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL),
+        tokio::process::Child::start_kill,
+    )
+    .await
+}
+
+async fn probe_node_with_signals(
+    directory: &Path,
+    expected: &str,
+    deadline: std::time::Duration,
+    signal_group: impl FnOnce(nix::unistd::Pid) -> nix::Result<()>,
+    signal_leader: impl FnOnce(&mut tokio::process::Child) -> std::io::Result<()>,
+) -> Result<()> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt as _;
 
@@ -521,17 +556,6 @@ async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Durat
     let owned_leader = terminal_group::macos::capture(group.as_raw());
     // Keep the leader unreaped until group cleanup. Its PID then cannot be
     // recycled while a descendant still holds a probe output pipe open.
-    let mut exit_observer = tokio::task::spawn_blocking(move || {
-        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
-        let pid = Pid::from_raw(group.as_raw()).context("Invalid Node.js probe process ID")?;
-        waitid(
-            WaitId::Pid(pid),
-            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
-        )
-        .context("Failed to observe Node.js probe exit")?
-        .context("Node.js probe exit was not reported")?;
-        Ok::<_, anyhow::Error>(())
-    });
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let read_output = |stream: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>| async move {
@@ -546,18 +570,13 @@ async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Durat
         );
         Ok::<_, anyhow::Error>(bytes)
     };
-    let mut exit_observed = false;
     let capture = tokio::time::timeout(deadline, async {
         let stdout = stdout.context("Missing Node.js version probe stdout")?;
         let stderr = stderr.context("Missing Node.js version probe stderr")?;
         tokio::try_join!(
             read_output(Box::pin(stdout)),
             read_output(Box::pin(stderr)),
-            async {
-                let result = (&mut exit_observer).await;
-                exit_observed = true;
-                result.context("Node.js probe exit observer panicked")?
-            }
+            observe_node_probe_exit(group)
         )
     })
     .await
@@ -566,11 +585,35 @@ async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Durat
 
     // Every post-spawn path terminates the isolated group before reaping the
     // leader, including bounded-read failures and inherited-pipe timeouts.
-    let group_cleanup = match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+    let cleanup_end = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let observation_end = cleanup_end - std::time::Duration::from_millis(250);
+    let group_signal = signal_group(group);
+    let leader_cleanup = if group_signal.is_err() && group_signal != Err(nix::errno::Errno::ESRCH) {
+        node_probe_exit_observed(group).and_then(|terminal| {
+            if terminal {
+                Ok(())
+            } else {
+                signal_leader(&mut child).context("Failed to terminate Node.js probe leader")
+            }
+        })
+    } else {
+        Ok(())
+    };
+    let observer_cleanup = tokio::time::timeout_at(observation_end, observe_node_probe_exit(group))
+        .await
+        .context("Node.js probe exit observation timed out during cleanup")
+        .and_then(std::convert::identity);
+    let group_cleanup = match group_signal {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
         #[cfg(target_os = "macos")]
         Err(error @ nix::errno::Errno::EPERM) => {
-            terminal_group::macos::prove(&owned_leader, group.as_raw()).with_context(|| {
+            let proof = match &observer_cleanup {
+                Ok(()) => terminal_group::macos::prove(&owned_leader, group.as_raw()),
+                Err(error) => Err(anyhow::anyhow!(
+                    "Node.js probe leader exit was not observed: {error:#}"
+                )),
+            };
+            proof.with_context(|| {
                 format!(
                     "Failed to terminate Node.js probe process group ({error}); terminal-state proof rejected"
                 )
@@ -578,27 +621,40 @@ async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Durat
         }
         Err(error) => Err(error).context("Failed to terminate Node.js probe process group"),
     };
-    let leader_cleanup = if group_cleanup.is_err() {
-        child.start_kill()
-    } else {
-        Ok(())
-    };
-    let observer_cleanup = if exit_observed {
-        Ok(())
-    } else {
-        exit_observer
-            .await
-            .context("Node.js probe exit observer panicked")
-            .and_then(std::convert::identity)
-    };
-    let status = child
-        .wait()
+    let status = tokio::time::timeout_at(cleanup_end, child.wait())
         .await
-        .context("Failed to reap Node.js version probe");
-    group_cleanup?;
-    leader_cleanup.context("Failed to terminate Node.js probe leader")?;
-    observer_cleanup?;
-    let status = status?;
+        .context("Node.js probe reap timed out during cleanup")
+        .and_then(|status| status.context("Failed to reap Node.js version probe"));
+    #[cfg(target_os = "macos")]
+    let leader_cleanup = match leader_cleanup {
+        Err(error)
+            if group_signal == Err(nix::errno::Errno::EPERM)
+                && group_cleanup.is_ok()
+                && observer_cleanup.is_ok()
+                && status.is_ok()
+                && error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(nix::libc::ESRCH)) =>
+        {
+            Ok(())
+        }
+        result => result,
+    };
+    let status = match group_cleanup
+        .and(leader_cleanup)
+        .and(observer_cleanup)
+        .and(status)
+    {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(match &capture {
+                Err(capture_error) => error.context(format!(
+                    "Node.js probe capture also failed: {capture_error:#}"
+                )),
+                Ok(_) => error,
+            });
+        }
+    };
     let (stdout, stderr, ()) = capture?;
     anyhow::ensure!(
         status.success(),
@@ -2227,6 +2283,372 @@ mod tests {
         assert!(
             actual.is_ok(),
             "valid candidate refused after paired native cause proof: {actual:?}"
+        );
+        Ok(())
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[derive(Clone, Copy)]
+    enum NodeCleanupCase {
+        Live,
+        AlreadyTerminal,
+        ExitRaceEsrch,
+        ExitRaceEio,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn cleanup_probe_exit_ready(pid: i32) -> Result<bool> {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        let pid = Pid::from_raw(pid).context("invalid fixture PID")?;
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        )
+        .map(|status| status.is_some())
+        .context("observe cleanup fixture exit")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn release_cleanup_probe(root: &Path, pid: i32) -> Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut release = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(root.join("probe.release"))
+            {
+                Ok(file) => break file,
+                Err(error) if error.raw_os_error() != Some(nix::libc::ENXIO) => {
+                    return Err(error).context("FIFO open failed");
+                }
+                Err(_) => {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < end,
+                        "FIFO reader did not arrive"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        };
+        release.write_all(b"release\n")?;
+        drop(release);
+        while !cleanup_probe_exit_ready(pid)? {
+            anyhow::ensure!(
+                std::time::Instant::now() < end,
+                "fixture did not exit after release"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn counted_signal<'a>(
+        calls: &'a mut usize,
+        delegate: impl FnOnce(&mut tokio::process::Child) -> std::io::Result<()> + 'a,
+    ) -> impl FnOnce(&mut tokio::process::Child) -> std::io::Result<()> + 'a {
+        move |child| {
+            *calls += 1;
+            delegate(child)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn assert_node_cleanup_boundary(case: NodeCleanupCase) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        nix::unistd::mkfifo(
+            directory.path().join("probe.release").as_path(),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .context("create fixture FIFO")?;
+        write_node_probe(
+            directory.path(),
+            &format!(
+                r#"trap '' PIPE; printf '%s\n' "$$" > probe.pid; printf READY > probe.ready; printf '%s' '{}'; IFS= read -r release < probe.release"#,
+                "x".repeat(5000)
+            ),
+            true,
+        )
+        .context("write oversized cleanup fixture")?;
+        let mut group_precondition = Ok(());
+        let mut leader_precondition = Ok(());
+        let mut groups = Vec::new();
+        let mut leader_calls = 0_usize;
+        let result = probe_node_with_signals(
+            directory.path(),
+            "22.0.0",
+            std::time::Duration::from_secs(5),
+            |group| {
+                groups.push(group.as_raw());
+                group_precondition = if matches!(case, NodeCleanupCase::AlreadyTerminal) {
+                    release_cleanup_probe(directory.path(), group.as_raw())
+                } else {
+                    cleanup_probe_exit_ready(group.as_raw()).and_then(|ready| {
+                        anyhow::ensure!(!ready, "leader exited before injected group EPERM");
+                        Ok(())
+                    })
+                };
+                Err(nix::errno::Errno::EPERM)
+            },
+            counted_signal(&mut leader_calls, |child| {
+                leader_precondition = match case {
+                    NodeCleanupCase::ExitRaceEsrch | NodeCleanupCase::ExitRaceEio => child
+                        .id()
+                        .context("fixture child identity absent")
+                        .and_then(|pid| {
+                            release_cleanup_probe(directory.path(), i32::try_from(pid)?)
+                        }),
+                    NodeCleanupCase::Live | NodeCleanupCase::AlreadyTerminal => Ok(()),
+                };
+                match case {
+                    NodeCleanupCase::Live => child.start_kill(),
+                    NodeCleanupCase::ExitRaceEsrch => {
+                        Err(std::io::Error::from_raw_os_error(nix::libc::ESRCH))
+                    }
+                    NodeCleanupCase::AlreadyTerminal | NodeCleanupCase::ExitRaceEio => {
+                        Err(std::io::Error::from_raw_os_error(nix::libc::EIO))
+                    }
+                }
+            }),
+        )
+        .await;
+        group_precondition.context("HARNESS group boundary precondition failed after cleanup")?;
+        leader_precondition.context("HARNESS leader boundary precondition failed after cleanup")?;
+        let error = result.expect_err("oversized probe must never be accepted");
+        let message = format!("{error:#}");
+        #[cfg(target_os = "macos")]
+        {
+            let expected = if matches!(case, NodeCleanupCase::ExitRaceEio) {
+                "Failed to terminate Node.js probe leader"
+            } else {
+                "exceeds 4096"
+            };
+            assert!(message.contains(expected), "wrong refusal: {message}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                message.contains("Node.js version probe output exceeds 4096 bytes"),
+                "capture refusal was lost: {message}"
+            );
+            assert!(
+                message.contains("Failed to terminate Node.js probe process group"),
+                "group refusal was lost: {message}"
+            );
+            assert_eq!(
+                error.downcast_ref::<nix::errno::Errno>(),
+                Some(&nix::errno::Errno::EPERM)
+            );
+        }
+        assert_eq!(
+            leader_calls,
+            usize::from(!matches!(case, NodeCleanupCase::AlreadyTerminal))
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("probe.ready"))?,
+            "READY"
+        );
+        let pid: i32 = fs::read_to_string(directory.path().join("probe.pid"))?
+            .trim()
+            .parse()?;
+        assert_eq!(groups, [pid]);
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn node_cleanup_live_overflow_injected_group_eperm() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::Live).await
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn node_cleanup_already_terminal_skips_direct_signal() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::AlreadyTerminal).await
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn node_cleanup_racing_exit_esrch_retains_overflow() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::ExitRaceEsrch).await
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn node_cleanup_racing_exit_eio_remains_failure() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::ExitRaceEio).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_linux_cleanup_live_overflow_injected_group_eperm() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::Live).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_linux_cleanup_already_terminal_skips_direct_signal() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::AlreadyTerminal).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_linux_cleanup_racing_exit_esrch_retains_overflow() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::ExitRaceEsrch).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_linux_cleanup_racing_exit_eio_retains_group_failure() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::ExitRaceEio).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_linux_cleanup_valid_output_retains_group_failure() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        write_node_probe(
+            directory.path(),
+            r#"printf '%s\n' "$$" > probe.pid; printf READY > probe.ready; printf 'v22.0.0\n'"#,
+            true,
+        )
+        .context("write valid-output cleanup fixture")?;
+        let mut group_precondition = Ok(());
+        let mut groups = Vec::new();
+        let mut leader_calls = 0_usize;
+        let result = probe_node_with_signals(
+            directory.path(),
+            "22.0.0",
+            std::time::Duration::from_secs(5),
+            |group| {
+                groups.push(group.as_raw());
+                group_precondition = cleanup_probe_exit_ready(group.as_raw()).and_then(|ready| {
+                    anyhow::ensure!(
+                        ready,
+                        "valid-output leader was not terminal at group cleanup"
+                    );
+                    Ok(())
+                });
+                Err(nix::errno::Errno::EPERM)
+            },
+            counted_signal(&mut leader_calls, tokio::process::Child::start_kill),
+        )
+        .await;
+        group_precondition.context("HARNESS valid-output precondition failed after cleanup")?;
+        let error = result.expect_err("valid output must not hide failed group cleanup");
+        assert_eq!(
+            error.to_string(),
+            "Failed to terminate Node.js probe process group"
+        );
+        assert_eq!(
+            error.downcast_ref::<nix::errno::Errno>(),
+            Some(&nix::errno::Errno::EPERM)
+        );
+        assert_eq!(leader_calls, 0);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("probe.ready"))?,
+            "READY"
+        );
+        let pid: i32 = fs::read_to_string(directory.path().join("probe.pid"))?
+            .trim()
+            .parse()?;
+        assert_eq!(groups, [pid]);
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn node_cleanup_release_missing_fifo_reports_enoent() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let error =
+            release_cleanup_probe(directory.path(), 1).expect_err("missing release FIFO must fail");
+        assert_eq!(error.to_string(), "FIFO open failed");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(nix::libc::ENOENT)
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn node_cleanup_release_fifo_without_reader_reports_timeout() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        nix::unistd::mkfifo(
+            directory.path().join("probe.release").as_path(),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .context("create readerless cleanup FIFO")?;
+        let started = std::time::Instant::now();
+        let error = release_cleanup_probe(directory.path(), 1)
+            .expect_err("release FIFO without a reader must fail within its bound");
+        assert_eq!(error.to_string(), "FIFO reader did not arrive");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= std::time::Duration::from_secs(2));
+        assert!(elapsed < std::time::Duration::from_secs(10));
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn node_cleanup_release_live_reader_reports_exit_timeout() -> Result<()> {
+        use std::process::Stdio;
+        let directory = tempfile::tempdir()?;
+        for name in ["probe.release", "probe.hold"] {
+            nix::unistd::mkfifo(
+                directory.path().join(name).as_path(),
+                nix::sys::stat::Mode::from_bits_truncate(0o600),
+            )
+            .context("create held-reader cleanup FIFO")?;
+        }
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "IFS= read -r release < probe.release; printf '%s' \"$release\" > probe.observed; printf HELD > probe.held; IFS= read -r hold < probe.hold",
+            ])
+            .current_dir(directory.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn held cleanup reader")?;
+        let pid = child.id().and_then(|pid| i32::try_from(pid).ok());
+        let result = pid
+            .context("held reader PID unavailable")
+            .and_then(|pid| release_cleanup_probe(directory.path(), pid));
+        let killed = child.start_kill();
+        let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+        let status = reaped
+            .context("held cleanup reader reap timed out")?
+            .context("reap held cleanup reader")?;
+        killed.context("terminate held cleanup reader")?;
+        let pid = pid.context("held reader PID unavailable after cleanup")?;
+        let error = result.expect_err("a released live reader must reach the exit deadline");
+        assert_eq!(error.to_string(), "fixture did not exit after release");
+        assert_eq!(
+            fs::read_to_string(directory.path().join("probe.observed"))?,
+            "release"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("probe.held"))?,
+            "HELD"
+        );
+        assert!(!status.success());
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
         );
         Ok(())
     }
