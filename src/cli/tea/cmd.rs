@@ -229,23 +229,24 @@ mod tests {
     #[test]
     fn test_cmd_batch() {
         let cmd: Cmd<()> = Cmd::batch([Cmd::println("a"), Cmd::println("b"), Cmd::none()]);
-        let Cmd::Batch(commands) = cmd else {
-            panic!("expected an ordered batch");
-        };
         assert!(matches!(
-            commands.as_slice(),
-            [Cmd::View(View::PrintLn(first)), Cmd::View(View::PrintLn(second)), Cmd::None]
-                if first == "a" && second == "b"
+            cmd,
+            Cmd::Batch(commands) if matches!(
+                commands.as_slice(),
+                [Cmd::View(View::PrintLn(first)), Cmd::View(View::PrintLn(second)), Cmd::None]
+                    if first == "a" && second == "b"
+            )
         ));
     }
 
     #[test]
     fn test_cmd_exec() {
         let cmd: Cmd<String> = Cmd::exec(|| "result".to_string());
-        let Cmd::Exec(execute) = cmd else {
-            panic!("expected an executable command");
-        };
-        assert_eq!(execute(), "result");
+        let mut result = None;
+        if let Cmd::Exec(execute) = cmd {
+            result = Some(execute());
+        }
+        assert_eq!(result.as_deref(), Some("result"));
     }
 
     #[test]
