@@ -1186,10 +1186,7 @@ mod new_features {
     #[test]
     fn test_ci_init_github() {
         let project = TestProject::for_distro("debian");
-        let result = project.run_with_env(
-            &["ci", "init", "github"],
-            &[("NO_COLOR", "1")],
-        );
+        let result = project.run_with_env(&["ci", "init", "github"], &[("NO_COLOR", "1")]);
         assert!(!result.stderr_contains("panicked at"), "Should not panic");
         result.assert_success();
         result.assert_stdout_contains("Created .github/workflows/ci.yml");
@@ -1209,10 +1206,7 @@ mod new_features {
             );
         }
         project.create_file(".github/workflows/ci.yml", "name: Keep authored workflow\n");
-        let existing = project.run_with_env(
-            &["ci", "init", "github"],
-            &[("NO_COLOR", "1")],
-        );
+        let existing = project.run_with_env(&["ci", "init", "github"], &[("NO_COLOR", "1")]);
         existing.assert_success();
         existing.assert_stdout_contains("already exists - not overwriting");
         assert_eq!(
