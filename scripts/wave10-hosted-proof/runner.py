@@ -43,22 +43,47 @@ def regular(path):
 
 def sample(target, reserve, ceiling):
     started = time.monotonic()
-    total = entries = 0
+    root = target.lstat()
+    require(stat.S_ISDIR(root.st_mode), "target root must be a directory")
+
+    def verify_root():
+        current = target.lstat()
+        require(stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) ==
+                (root.st_dev, root.st_ino), "target root identity changed")
+
+    total = entries = vanished_entries = vanished_directories = 0
     pending = [target]
     while pending:
+        require(time.monotonic() - started < 3, "target census incomplete")
         directory = pending.pop()
-        with os.scandir(directory) as iterator:
+        try:
+            scan = os.scandir(directory)
+        except FileNotFoundError:
+            if directory == target:
+                raise
+            verify_root()
+            vanished_directories += 1
+            continue
+        with scan as iterator:
             for item in iterator:
                 entries += 1
                 require(entries <= 300000 and time.monotonic() - started < 3,
                         "target census incomplete")
-                info = item.stat(follow_symlinks=False)
+                try:
+                    info = item.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    verify_root()
+                    vanished_entries += 1
+                    continue
                 if stat.S_ISDIR(info.st_mode):
                     pending.append(Path(item.path))
                 else:
                     total += getattr(info, "st_blocks", (info.st_size + 511) // 512) * 512
+    verify_root()
+    require(time.monotonic() - started < 3, "target census incomplete")
     value = {"at_monotonic": time.monotonic(), "target_bytes": total,
-             "host_free_bytes": shutil.disk_usage(target).free, "entries": entries}
+             "host_free_bytes": shutil.disk_usage(target).free, "entries": entries,
+             "vanished_entries": vanished_entries, "vanished_directories": vanished_directories}
     if total > ceiling:
         return value, "target budget exceeded"
     if value["host_free_bytes"] < reserve:
