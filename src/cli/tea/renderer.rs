@@ -153,6 +153,33 @@ mod tests {
 
     #[test]
     fn test_renderer_flush() {
+        struct SharedSink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+        impl Write for SharedSink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.borrow_mut().write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.borrow_mut().flush()
+            }
+        }
+
+        struct FlushFailure;
+
+        impl Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                io::sink().write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "literal fixture flush failure",
+                ))
+            }
+        }
+
         let mut cursor = Cursor::new(Vec::new());
         let mut renderer = Renderer::with_writer(&mut cursor);
 
@@ -161,6 +188,31 @@ mod tests {
 
         let output = String::from_utf8(cursor.into_inner()).unwrap();
         assert_eq!(output, "test\n");
+
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let buffered = BufWriter::new(SharedSink(std::rc::Rc::clone(&published)));
+        let mut buffered_renderer = Renderer::with_writer(buffered);
+        buffered_renderer.println("test").unwrap();
+        assert!(
+            published.borrow().is_empty(),
+            "the fixture must buffer bytes before the explicit renderer flush"
+        );
+        buffered_renderer.flush().unwrap();
+        assert_eq!(
+            published.borrow().as_slice(),
+            b"test\n",
+            "renderer flush must publish the buffered bytes while the writer is alive"
+        );
+
+        let mut failing_renderer = Renderer::with_writer(FlushFailure);
+        failing_renderer
+            .println("write succeeds before flush failure")
+            .unwrap();
+        let error = failing_renderer
+            .flush()
+            .expect_err("renderer flush must preserve the writer error");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "literal fixture flush failure");
     }
 
     #[test]
