@@ -172,7 +172,7 @@ fn assert_no_installed_packages(project: &common::TestProject) {
 }
 
 fn write_preview_package(path: &std::path::Path) {
-    let pkginfo = b"pkgname = vim\npkgbase = vim\nxdata = pkgtype=pkg\npkgver = 9.1.0001\npkgdesc = preview fixture\nurl = https://example.invalid/\nbuilddate = 1700000000\npackager = fixture\nsize = 4096\narch = x86_64\nlicense = MIT\n";
+    let pkginfo = b"pkgname = vim\npkgbase = vim\nxdata = pkgtype=pkg\npkgver = 9.1.0001-1\npkgdesc = preview fixture\nurl = https://example.invalid/\nbuilddate = 1700000000\npackager = fixture\nsize = 4096\narch = x86_64\nlicense = MIT\n";
     let file = std::fs::File::create(path).unwrap();
     let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     {
@@ -807,7 +807,7 @@ mod e2e_workflow_tests {
             &result,
             &[
                 ("firefox", "122.0", "Official"),
-                ("vim", "9.1.0001", "Local archive"),
+                ("vim", "9.1.0001-1", "Local archive"),
                 ("git", "2.43.0", "Official"),
             ],
         );
