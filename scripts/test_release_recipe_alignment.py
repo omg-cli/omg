@@ -12,6 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleaseRecipeAlignment(unittest.TestCase):
+    def test_native_tests_run_before_release_builds(self):
+        ci = job_block((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'), 'linux-matrix')
+        for preparation in ('Install nextest', 'Verify nextest', 'Prepare genuine Node activation fixture'):
+            self.assertLess(ci.index('      - name: ' + preparation + '\n'),
+                            ci.index('      - name: Run unit tests\n'))
+        for build in ('Build release', 'Build Ubuntu 26.04 validation binary'):
+            self.assertLess(ci.index('      - name: Run unit tests\n'),
+                            ci.index('      - name: ' + build + '\n'))
+
     def test_ci_release_cpu_baseline_matches_arch_and_generic_distros(self):
         ci = job_block((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'), 'linux-matrix')
         block = ci.split('      - name: Build release\n', 1)[1].split('\n      - name:', 1)[0]
