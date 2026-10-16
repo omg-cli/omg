@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn partial_wave_counts_successful_and_failed_outputs_separately() {
-        let mut summary = ParallelBuildSummary::default();
+        let mut wave = ParallelBuildSummary::default();
         let postgresql = BuildJob::for_package_base(
             "postgresql18".to_string(),
             vec!["postgresql18".to_string(), "postgresql18-libs".to_string()],
@@ -459,8 +459,10 @@ mod tests {
         );
         let huggingface = BuildJob::new("python-huggingface-hub-git".to_string(), vec![]);
 
-        summary.record_job_result(&postgresql, Ok(()));
-        summary.record_job_result(&huggingface, Err(anyhow::anyhow!("build failed")));
+        wave.record_job_result(&postgresql, Ok(()));
+        wave.record_job_result(&huggingface, Err(anyhow::anyhow!("build failed")));
+        let mut summary = ParallelBuildSummary::default();
+        summary.merge(wave);
 
         assert_eq!(summary.succeeded_output_count(), 2);
         assert_eq!(summary.failed_output_count(), 1);
@@ -471,6 +473,27 @@ mod tests {
                 .map(|(package, error)| (package, error.to_string()))
                 .collect::<Vec<_>>(),
             [("python-huggingface-hub-git", "build failed".to_string())]
+        );
+
+        let mut second_wave = ParallelBuildSummary::default();
+        let tool = BuildJob::new("second-tool".to_string(), vec![]);
+        let failed_tool = BuildJob::new("second-failed-tool".to_string(), vec![]);
+        second_wave.record_job_result(&tool, Ok(()));
+        second_wave.record_job_result(&failed_tool, Err(anyhow::anyhow!("second failure")));
+        summary.merge(second_wave);
+
+        assert_eq!(summary.succeeded_output_count(), 3);
+        assert_eq!(summary.failed_output_count(), 2);
+        assert_eq!(summary.skipped_output_count(), 0);
+        assert_eq!(
+            summary
+                .failures()
+                .map(|(package, error)| (package, error.to_string()))
+                .collect::<Vec<_>>(),
+            [
+                ("python-huggingface-hub-git", "build failed".to_string()),
+                ("second-failed-tool", "second failure".to_string()),
+            ]
         );
     }
 
