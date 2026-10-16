@@ -1108,30 +1108,150 @@ mod new_features {
 
     #[test]
     fn test_snapshot_create() {
-        let project = TestProject::new();
-        let result = project.run(&["snapshot", "create"]);
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("git", "2.43.0")
+            .expect("seed explicit git");
+        let state_path = project.data_dir.path().join("mock_state_apt.json");
+        let state_before = std::fs::read(&state_path).expect("read seeded package state");
+        let result = project.run_with_env(
+            &[
+                "snapshot",
+                "create",
+                "--message",
+                "Debian snapshot contract",
+            ],
+            &[("NO_COLOR", "1")],
+        );
         assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        result.assert_success();
+        result.assert_stdout_contains("Snapshot created!");
+        let snapshots = project.data_dir.path().join("snapshots");
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(snapshots.join("index.json")).expect("read snapshot index"),
+        )
+        .expect("snapshot index JSON");
+        let entries = index["snapshots"].as_array().expect("snapshot entries");
+        assert_eq!(entries.len(), 1);
+        let id = entries[0]["id"].as_str().expect("snapshot ID");
+        assert!(!id.is_empty());
+        assert_eq!(entries[0]["message"], "Debian snapshot contract");
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(snapshots.join(format!("{id}.json"))).expect("read created snapshot"),
+        )
+        .expect("snapshot JSON");
+        assert_eq!(snapshot["id"], id);
+        assert_eq!(snapshot["message"], "Debian snapshot contract");
+        assert_eq!(snapshot["state"]["schema_version"], 1);
+        assert_eq!(snapshot["state"]["packages"], serde_json::json!(["git"]));
+        assert_eq!(snapshot["state"]["hash"], entries[0]["hash"]);
+        result.assert_stdout_contains(&format!("ID: {id}"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+        project.close_checked();
     }
 
     #[test]
     fn test_snapshot_list() {
-        let project = TestProject::new();
-        let result = project.run(&["snapshot", "list"]);
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("git", "2.43.0")
+            .expect("seed explicit git");
+        let empty = project.run_with_env(&["snapshot", "list"], &[("NO_COLOR", "1")]);
+        empty.assert_success();
+        empty.assert_stdout_contains("No snapshots found");
+        let created = project.run_with_env(
+            &["snapshot", "create", "--message", "Listed Debian snapshot"],
+            &[("NO_COLOR", "1")],
+        );
+        created.assert_success();
+        let snapshots = project.data_dir.path().join("snapshots");
+        let index_path = snapshots.join("index.json");
+        let index_before = std::fs::read(&index_path).expect("read index before listing");
+        let index: serde_json::Value = serde_json::from_slice(&index_before).expect("index JSON");
+        let entries = index["snapshots"].as_array().expect("snapshot entries");
+        assert_eq!(entries.len(), 1);
+        let id = entries[0]["id"].as_str().expect("snapshot ID");
+        let snapshot_path = snapshots.join(format!("{id}.json"));
+        let snapshot_before = std::fs::read(&snapshot_path).expect("read snapshot before listing");
+        let result = project.run_with_env(&["snapshot", "list"], &[("NO_COLOR", "1")]);
         result.assert_success();
+        result.assert_stdout_contains(id);
+        result.assert_stdout_contains("Listed Debian snapshot");
+        result.assert_stdout_contains("1 snapshots total");
+        assert_eq!(std::fs::read(&index_path).unwrap(), index_before);
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), snapshot_before);
+        project.close_checked();
     }
 
     #[test]
     fn test_ci_init_github() {
-        let project = TestProject::new();
-        let result = project.run(&["ci", "init", "--provider", "github"]);
+        let project = TestProject::for_distro("debian");
+        let result = project.run_with_env(&["ci", "init", "github"], &[("NO_COLOR", "1")]);
         assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        result.assert_success();
+        result.assert_stdout_contains("Created .github/workflows/ci.yml");
+        let workflow = project
+            .read_file(".github/workflows/ci.yml")
+            .expect("generated GitHub workflow");
+        for expected in [
+            "name: CI",
+            "on: [push, pull_request]",
+            "contents: read",
+            "run: omg run build",
+            "run: omg run test",
+        ] {
+            assert!(
+                workflow.contains(expected),
+                "missing workflow contract {expected}: {workflow}"
+            );
+        }
+        project.create_file(".github/workflows/ci.yml", "name: Keep authored workflow\n");
+        let existing = project.run_with_env(&["ci", "init", "github"], &[("NO_COLOR", "1")]);
+        existing.assert_success();
+        existing.assert_stdout_contains("already exists - not overwriting");
+        assert_eq!(
+            project.read_file(".github/workflows/ci.yml").unwrap(),
+            "name: Keep authored workflow\n"
+        );
+        project.close_checked();
     }
 
     #[test]
     fn test_migrate_export() {
-        let project = TestProject::new();
-        let result = project.run(&["migrate", "export", "--output", "manifest.toml"]);
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("git", "2.43.0")
+            .expect("seed explicit git");
+        let state_path = project.data_dir.path().join("mock_state_apt.json");
+        let state_before = std::fs::read(&state_path).expect("read seeded state");
+        let result = project.run_with_env(
+            &["migrate", "export", "--output", "manifest.toml"],
+            &[("NO_COLOR", "1")],
+        );
         assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        result.assert_success();
+        result.assert_stdout_contains("Exported to manifest.toml");
+        result.assert_stdout_contains("Source distro: debian");
+        result.assert_stdout_contains("Packages: 1");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &project
+                .read_file("manifest.toml")
+                .expect("exported JSON manifest"),
+        )
+        .expect("migration export uses JSON even with a .toml filename");
+        assert_eq!(manifest["version"], "1.0");
+        assert_eq!(manifest["source_distro"], "debian");
+        assert!(manifest["created_at"].as_i64().is_some());
+        assert_eq!(manifest["runtimes"], serde_json::json!({}));
+        assert_eq!(
+            manifest["packages"],
+            serde_json::json!([{
+                "original_name": "git", "category": "application",
+                "description": null, "alternatives": ["git"]
+            }])
+        );
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+        project.close_checked();
     }
 }
 
@@ -1403,8 +1523,47 @@ mod migration {
 
     #[test]
     fn test_migrate_import_dry_run() {
-        let project = TestProject::new();
-        // Create a minimal manifest
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("git", "2.43.0")
+            .expect("seed installed git");
+        let state_path = project.data_dir.path().join("mock_state_apt.json");
+        let state_before = std::fs::read(&state_path).expect("read seeded state");
+        let manifest = r#"{
+            "version": "1.0", "source_distro": "arch", "created_at": 1700000000,
+            "runtimes": {"node": "20.10.0"},
+            "packages": [
+                {"original_name": "git", "category": "application", "description": null, "alternatives": ["git"]},
+                {"original_name": "curl", "category": "application", "description": null, "alternatives": ["curl"]}
+            ]
+        }"#;
+        let versions = project.data_dir.path().join("versions");
+        assert!(!versions.exists());
+        project.create_file("manifest.json", manifest);
+        let result = project.run_with_env(
+            &["migrate", "import", "--dry-run", "manifest.json"],
+            &[("NO_COLOR", "1")],
+        );
+        assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        result.assert_success();
+        for expected in [
+            "Previewing manifest...",
+            "Source: arch → Target: debian",
+            "Mapped: 0/2 packages (2 unmapped)",
+            "- git",
+            "- curl",
+            "node @ 20.10.0",
+            "Mutation summary: 2 package installation(s), 1 runtime installation(s)",
+            "No changes made (dry run)",
+        ] {
+            result.assert_stdout_contains(expected);
+        }
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+        assert_eq!(project.read_file("manifest.json").unwrap(), manifest);
+        assert!(
+            !versions.exists(),
+            "dry run must not create managed runtime installations"
+        );
         project.create_file(
             "manifest.toml",
             r#"
@@ -1416,10 +1575,13 @@ git = "2.43.0"
 curl = "8.5.0"
 "#,
         );
-
-        let result = project.run(&["migrate", "import", "--dry-run", "manifest.toml"]);
-        // Should show what would be installed without doing it
-        assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        let invalid = project.run(&["migrate", "import", "--dry-run", "manifest.toml"]);
+        common::assertions::assert_process_completed(&invalid);
+        assert!(!invalid.success, "TOML is not a migration JSON manifest");
+        assert!(!invalid.stderr.trim().is_empty());
+        assert!(!invalid.stderr_contains("panicked at"), "Should not panic");
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+        project.close_checked();
     }
 
     #[test]

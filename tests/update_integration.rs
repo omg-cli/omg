@@ -5,8 +5,7 @@
 //!
 //! Run: cargo test --test update_integration --features arch
 //!
-//! Environment variables:
-//!   OMG_RUN_SYSTEM_TESTS=1    - Enable tests requiring real system access
+//! Commands use the shared isolated mock backend. Check mode is read-only.
 
 #![expect(clippy::unwrap_used)]
 #![expect(clippy::pedantic)]
@@ -42,8 +41,6 @@ mod check_mode_tests {
 
     #[test]
     fn test_check_mode_succeeds() {
-        require_system_tests!();
-
         let result = run_omg(&["update", "--check"]);
         assert_no_password_prompt(&result);
 
@@ -56,8 +53,6 @@ mod check_mode_tests {
 
     #[test]
     fn test_check_mode_reports_status() {
-        require_system_tests!();
-
         let result = run_omg(&["update", "--check"]);
         assert_no_password_prompt(&result);
 
@@ -77,8 +72,6 @@ mod check_mode_tests {
 
     #[test]
     fn test_check_mode_with_yes_flag() {
-        require_system_tests!();
-
         let result = run_omg(&["update", "--check", "--yes"]);
         assert_no_password_prompt(&result);
 
@@ -274,8 +267,6 @@ mod elm_workflow_tests {
     fn test_elm_update_cycle() {
         // The Model-Update-View cycle completes and the View renders its
         // outcome on stdout (phase header, up-to-date notice, or findings).
-        require_system_tests!();
-
         let result = run_omg(&["update", "--check"]);
         assert_runs_without_panic(&result);
 
@@ -453,17 +444,52 @@ mod security_tests {
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// The real contract behind every former `success || !contains("panicked")`:
-/// the process must not panic (no `panicked at`, exit 101) and must render
-/// SOME outcome. The old form passed for any output whatsoever — including
-/// the panic message itself.
-fn assert_runs_without_panic(result: &CommandResult) {
-    let combined = result.combined_output();
-    assert!(
-        !combined.contains("panicked at"),
-        "command must not panic. Got:\n{combined}"
+#[test]
+fn completion_oracle_rejects_abnormal_process_results() {
+    let cases = [
+        ("timeout", -1, "", "[test harness timeout]"),
+        ("signal", -1, "terminated", ""),
+        ("panic exit", 101, "failed", ""),
+        ("stdout panic", 0, "panicked at fixture", ""),
+        ("stderr panic", 1, "", "panicked at fixture"),
+        ("success", 0, "completed", ""),
+        ("reported failure", 1, "", "package not found"),
+        ("usage error", 2, "", "Usage: omg update"),
+        ("empty output", 0, "", ""),
+        ("timeout with zero status", 0, "", "[test harness timeout]"),
+    ];
+    let observed: Vec<_> = cases
+        .into_iter()
+        .map(|(name, exit_code, stdout, stderr)| {
+            let result = CommandResult {
+                success: exit_code == 0,
+                exit_code,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            };
+            let accepted = std::panic::catch_unwind(|| assert_runs_without_panic(&result)).is_ok();
+            (name, accepted)
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            ("timeout", false),
+            ("signal", false),
+            ("panic exit", false),
+            ("stdout panic", false),
+            ("stderr panic", false),
+            ("success", true),
+            ("reported failure", true),
+            ("usage error", true),
+            ("empty output", false),
+            ("timeout with zero status", false),
+        ]
     );
-    assert_ne!(result.exit_code, 101, "panic exit code observed");
+}
+
+fn assert_runs_without_panic(result: &CommandResult) {
+    common::assertions::assert_process_completed(result);
     assert!(
         !result.stdout.is_empty() || !result.stderr.is_empty(),
         "command produced no output at all"
@@ -471,6 +497,7 @@ fn assert_runs_without_panic(result: &CommandResult) {
 }
 
 fn assert_no_password_prompt(result: &CommandResult) {
+    common::assertions::assert_process_completed(result);
     let combined = result.combined_output();
     assert!(
         !combined.contains("[sudo]")

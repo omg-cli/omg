@@ -223,39 +223,63 @@ mod tests {
     #[test]
     fn test_cmd_msg() {
         let cmd: Cmd<String> = Cmd::msg("hello".to_string());
-        assert!(matches!(cmd, Cmd::Msg(_)));
+        assert!(matches!(cmd, Cmd::Msg(message) if message == "hello"));
     }
 
     #[test]
     fn test_cmd_batch() {
         let cmd: Cmd<()> = Cmd::batch([Cmd::println("a"), Cmd::println("b"), Cmd::none()]);
-        assert!(matches!(cmd, Cmd::Batch(_)));
+        assert!(matches!(
+            cmd,
+            Cmd::Batch(commands) if matches!(
+                commands.as_slice(),
+                [Cmd::View(View::PrintLn(first)), Cmd::View(View::PrintLn(second)), Cmd::None]
+                    if first == "a" && second == "b"
+            )
+        ));
     }
 
     #[test]
     fn test_cmd_exec() {
         let cmd: Cmd<String> = Cmd::exec(|| "result".to_string());
         assert!(matches!(cmd, Cmd::Exec(_)));
+        let mut results = Vec::new();
+        for command in [cmd, Cmd::none()] {
+            if let Cmd::Exec(execute) = command {
+                results.push(execute());
+            }
+        }
+        assert_eq!(results, ["result"]);
     }
 
     #[test]
     fn test_cmd_print_variants() {
-        let _: Cmd<()> = Cmd::println("test");
-        let _: Cmd<()> = Cmd::info("test");
-        let _: Cmd<()> = Cmd::success("test");
-        let _: Cmd<()> = Cmd::warning("test");
-        let _: Cmd<()> = Cmd::error("test");
+        assert!(
+            matches!(Cmd::<()>::println("test"), Cmd::View(View::PrintLn(text)) if text == "test")
+        );
+        assert!(matches!(Cmd::<()>::info("test"), Cmd::View(View::Info(text)) if text == "test"));
+        assert!(
+            matches!(Cmd::<()>::success("test"), Cmd::View(View::Success(text)) if text == "test")
+        );
+        assert!(
+            matches!(Cmd::<()>::warning("test"), Cmd::View(View::Warning(text)) if text == "test")
+        );
+        assert!(matches!(Cmd::<()>::error("test"), Cmd::View(View::Error(text)) if text == "test"));
     }
 
     #[test]
     fn test_cmd_header() {
         let cmd: Cmd<()> = Cmd::header("Title", "Body");
-        assert!(matches!(cmd, Cmd::View(View::Header(_, _))));
+        assert!(
+            matches!(cmd, Cmd::View(View::Header(title, body)) if title == "Title" && body == "Body")
+        );
     }
 
     #[test]
     fn test_cmd_card() {
         let cmd: Cmd<()> = Cmd::card("Title", vec!["line1".to_string(), "line2".to_string()]);
-        assert!(matches!(cmd, Cmd::View(View::Card(_, _))));
+        assert!(
+            matches!(cmd, Cmd::View(View::Card(title, content)) if title == "Title" && content == ["line1", "line2"])
+        );
     }
 }

@@ -139,6 +139,7 @@ class NativeRunner(unittest.TestCase):
             root = Path(directory)
             root.chmod(0o755)
             for name in ('cli_comprehensive-fixture', 'install_update_comprehensive-fixture',
+                         'update_integration-fixture',
                          'coverage_10-fixture', 'e2e_runtime_management-fixture',
                          'env_lockfile_integrity-fixture', 'init_daemon_startup-fixture', 'other-fixture'):
                 binary = root / name
@@ -569,7 +570,7 @@ class NativeReceipts(unittest.TestCase):
                          'ubuntu_compatibility_tests'}
         for features, expected in (
             ('pgp,license', set()),
-            ('arch,pgp,license', {'security_daemon_optional', 'install_update_comprehensive'}),
+            ('arch,pgp,license', {'security_daemon_optional', 'install_update_comprehensive', 'update_integration'}),
             ('debian,pgp,license', common_debian | {'security_daemon_optional', 'apt_version_ordering'}),
             ('debian-pure', common_debian | {'debian_pure_integration'}),
             ('fedora,pgp,license', {'fedora_tests', 'security_daemon_optional', 'metadata_backend_routing'}),
