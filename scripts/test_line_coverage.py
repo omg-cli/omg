@@ -150,6 +150,44 @@ class SourceAwareCoverageTests(unittest.TestCase):
             self.compare(after=[(1, 1), (2, 1), (3, 0), (4, 0), (5, 0)],
                          sources=({"example.rs": self.old_source}, {"example.rs": self.new_source + b"untested_new();\n"}))
 
+
+    def new_uncovered_diagnostic(self, added_lines):
+        source_name = "src/runtimes/common.rs"
+        before = [(1, 1)]
+        after = [(1, 1)] + [(line, 0) for line in range(2, added_lines + 2)]
+        def lcov(rows):
+            return "SF:/checkout/src/runtimes/common.rs\n" + "".join(
+                f"DA:{line},{count}\n" for line, count in rows
+            ) + f"LF:{len(rows)}\nLH:1\nend_of_record\n"
+        def regions(rows):
+            value = self.regions(rows, False)
+            value["data"][0]["files"][0]["filename"] = "/checkout/src/runtimes/common.rs"
+            value["data"][0]["functions"] = []
+            return gzip.compress(json.dumps(value).encode("utf-8"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bp, hp, bg, hg = (root / name for name in ("b.info", "h.info", "b.gz", "h.gz"))
+            bp.write_text(lcov(before), encoding="utf-8")
+            hp.write_text(lcov(after), encoding="utf-8")
+            bg.write_bytes(regions(before))
+            hg.write_bytes(regions(after))
+            with self.assertRaises(ValueError) as caught:
+                coverage.require_source_no_regression(
+                    coverage.read_coverage(bp), coverage.read_coverage(hp), bg, hg,
+                    {source_name: b"keep();\n"},
+                    {source_name: b"keep();\n" + b"uncovered();\n" * added_lines})
+            return str(caught.exception)
+
+    def test_new_uncovered_diagnostic_identifies_actual_source_and_line(self):
+        self.assertEqual(
+            self.new_uncovered_diagnostic(1),
+            "New uncovered instrumented line: src/runtimes/common.rs:2")
+
+    def test_new_uncovered_diagnostic_reports_one_location_for_many_zeroes(self):
+        self.assertEqual(
+            self.new_uncovered_diagnostic(1000),
+            "New uncovered instrumented line: src/runtimes/common.rs:2")
+
     def test_missing_region_owner_is_fatal(self):
         with self.assertRaisesRegex(ValueError, "lacks region"):
             self.compare(mutate=lambda b, h: b["data"][0]["functions"].pop())

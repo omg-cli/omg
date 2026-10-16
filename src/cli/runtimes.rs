@@ -760,6 +760,30 @@ mod tests {
             value["installed"].as_array().map(std::vec::Vec::len),
             Some(2)
         );
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "runtime": "node",
+                "current": "20.10.0",
+                "installed": ["20.10.0", "18.0.0"],
+            })
+        );
+        assert_eq!(
+            super::runtime_versions_value("node", Ok(vec![]), None)
+                .expect("empty version payload must serialize"),
+            serde_json::json!({"runtime": "node", "current": null, "installed": []})
+        );
+        let error = super::runtime_versions_value(
+            "node",
+            Err(anyhow::anyhow!("literal fixture listing failure")),
+            None,
+        )
+        .expect_err("listing failures must remain errors");
+        assert_eq!(error.to_string(), "Failed to list installed node versions");
+        assert_eq!(
+            error.root_cause().to_string(),
+            "literal fixture listing failure"
+        );
     }
 
     #[test]
@@ -796,6 +820,8 @@ mod tests {
     fn unsupported_runtime_names_are_preserved_for_diagnostics() {
         assert_eq!(canonical_runtime_name("Erlang"), "erlang");
         assert_eq!(canonical_runtime_name("deno"), "deno");
+        assert_eq!(canonical_runtime_name("COBOL"), "cobol");
+        assert_eq!(canonical_runtime_name("Acme-Tool"), "acme-tool");
     }
 
     #[test]
@@ -825,6 +851,80 @@ mod tests {
                 "{name} is known"
             );
         }
+        let expected: Vec<String> = [
+            "actionlint",
+            "bat",
+            "bun",
+            "consul",
+            "delta",
+            "delve",
+            "deno",
+            "dive",
+            "dotnet",
+            "duf",
+            "dust",
+            "elixir",
+            "erlang",
+            "eza",
+            "fd",
+            "fnm",
+            "fzf",
+            "gh",
+            "ghcup",
+            "glow",
+            "go",
+            "golangci-lint",
+            "hadolint",
+            "helix",
+            "helm",
+            "hyperfine",
+            "java",
+            "jq",
+            "just",
+            "k9s",
+            "kind",
+            "kotlin",
+            "kustomize",
+            "lazydocker",
+            "lazygit",
+            "minikube",
+            "neovim",
+            "node",
+            "opentofu",
+            "packer",
+            "pandoc",
+            "php",
+            "pi",
+            "procs",
+            "protoc",
+            "python",
+            "ripgrep",
+            "ruby",
+            "ruff",
+            "rust",
+            "scala",
+            "shellcheck",
+            "shfmt",
+            "skaffold",
+            "starship",
+            "stylua",
+            "swift",
+            "task",
+            "terraform",
+            "terragrunt",
+            "tilt",
+            "tokei",
+            "uv",
+            "vault",
+            "yq",
+            "zellij",
+            "zig",
+            "zoxide",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(runtimes, expected, "complete runtime membership and order");
     }
 
     #[test]
