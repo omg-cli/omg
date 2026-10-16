@@ -453,6 +453,50 @@ mod security_tests {
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[test]
+fn completion_oracle_rejects_abnormal_process_results() {
+    let cases = [
+        ("timeout", -1, "", "[test harness timeout]"),
+        ("signal", -1, "terminated", ""),
+        ("panic exit", 101, "failed", ""),
+        ("stdout panic", 0, "panicked at fixture", ""),
+        ("stderr panic", 1, "", "panicked at fixture"),
+        ("success", 0, "completed", ""),
+        ("reported failure", 1, "", "package not found"),
+        ("usage error", 2, "", "Usage: omg update"),
+        ("empty output", 0, "", ""),
+        ("timeout with zero status", 0, "", "[test harness timeout]"),
+    ];
+    let observed: Vec<_> = cases
+        .into_iter()
+        .map(|(name, exit_code, stdout, stderr)| {
+            let result = CommandResult {
+                success: exit_code == 0,
+                exit_code,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            };
+            let accepted = std::panic::catch_unwind(|| assert_runs_without_panic(&result)).is_ok();
+            (name, accepted)
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            ("timeout", false),
+            ("signal", false),
+            ("panic exit", false),
+            ("stdout panic", false),
+            ("stderr panic", false),
+            ("success", true),
+            ("reported failure", true),
+            ("usage error", true),
+            ("empty output", false),
+            ("timeout with zero status", false),
+        ]
+    );
+}
+
 /// The real contract behind every former `success || !contains("panicked")`:
 /// the process must not panic (no `panicked at`, exit 101) and must render
 /// SOME outcome. The old form passed for any output whatsoever — including
