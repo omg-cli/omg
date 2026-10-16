@@ -243,9 +243,13 @@ mod tests {
     fn test_cmd_exec() {
         let cmd: Cmd<String> = Cmd::exec(|| "result".to_string());
         assert!(matches!(cmd, Cmd::Exec(_)));
-        if let Cmd::Exec(execute) = cmd {
-            assert_eq!(execute(), "result");
+        let mut results = Vec::new();
+        for command in [cmd, Cmd::none()] {
+            if let Cmd::Exec(execute) = command {
+                results.push(execute());
+            }
         }
+        assert_eq!(results, ["result"]);
     }
 
     #[test]
