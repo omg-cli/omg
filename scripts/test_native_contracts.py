@@ -138,7 +138,8 @@ class NativeRunner(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             root.chmod(0o755)
-            for name in ('cli_comprehensive-fixture', 'coverage_10-fixture', 'e2e_runtime_management-fixture',
+            for name in ('cli_comprehensive-fixture', 'install_update_comprehensive-fixture',
+                         'coverage_10-fixture', 'e2e_runtime_management-fixture',
                          'env_lockfile_integrity-fixture', 'init_daemon_startup-fixture', 'other-fixture'):
                 binary = root / name
                 binary.write_text('#!/bin/sh\nid -u\nprintf "%s\\n" "$1"\nexit 23\n')
@@ -567,7 +568,8 @@ class NativeReceipts(unittest.TestCase):
                          'debian_search_integration', 'debian_cache_tests', 'debian_e2e_tests',
                          'ubuntu_compatibility_tests'}
         for features, expected in (
-            ('pgp,license', set()), ('arch,pgp,license', {'security_daemon_optional'}),
+            ('pgp,license', set()),
+            ('arch,pgp,license', {'security_daemon_optional', 'install_update_comprehensive'}),
             ('debian,pgp,license', common_debian | {'security_daemon_optional', 'apt_version_ordering'}),
             ('debian-pure', common_debian | {'debian_pure_integration'}),
             ('fedora,pgp,license', {'fedora_tests', 'security_daemon_optional', 'metadata_backend_routing'}),
@@ -837,6 +839,69 @@ class LibraryIdentity(unittest.TestCase):
         self.assertNotEqual(result['status'], 0)
         self.assertEqual(result['events'], ['list'])
         self.assertIn('admission-error.json', result['evidence'])
+
+
+
+
+class ArchInstallAdmission(unittest.TestCase):
+    def test_arch_install_suite_is_selected_only_for_arch(self):
+        for features, expected in (
+                ('arch,pgp,license', 1), ('license,arch,pgp', 1),
+                ('pgp,license', 0), ('debian,pgp,license', 0),
+                ('debian-pure', 0), ('fedora,pgp,license', 0),
+                ('macos,pgp,license', 0)):
+            with self.subTest(features=features):
+                args = NATIVE.cargo_test_args(features)
+                suites = [args[i + 1] for i, value in enumerate(args) if value == '--test']
+                self.assertEqual(suites.count('install_update_comprehensive'), expected)
+
+    def test_arch_runner_routes_root_and_preserves_ordinary_arguments_and_exit(self):
+        if os.name == 'nt':
+            bash = Path(os.environ.get('ProgramFiles', 'C:/Program Files')) / 'Git/bin/bash.exe'
+            if not bash.is_file():
+                raise RuntimeError('Installed Git Bash required for contained runner test')
+            bash = str(bash)
+        else:
+            bash = shutil.which('bash')
+            if not bash:
+                raise RuntimeError('Bash required for contained runner test')
+        def shell_path(path):
+            if os.name != 'nt':
+                return str(path)
+            result = subprocess.run([bash, '-c', 'cygpath -u -- "$1"', 'fixture', str(path)],
+                                    capture_output=True, text=True, timeout=5, check=True)
+            return result.stdout.strip()
+        runner = Path(__file__).with_name('native-test-runner.sh').resolve()
+        with tempfile.TemporaryDirectory(prefix='omg-native-runner-fixture-') as name:
+            root = Path(name).resolve()
+            bins = root / 'bin'
+            bins.mkdir()
+            files = {'id': '#!/bin/sh\nprintf "%s\\n" "$FIXTURE_UID"\n',
+                     'runuser': '#!/bin/sh\n[ "$1" = "-u" ] && [ "$2" = "nobody" ] && [ "$3" = "--" ] || exit 99\nshift 3\nexport FIXTURE_UID=65534\nexec "$@"\n'}
+            for filename, content in files.items():
+                path = bins / filename
+                path.write_bytes(content.encode())
+                path.chmod(0o755)
+            payload = '#!/bin/sh\nprintf "%s\\n" "$FIXTURE_UID" "$1"\nexit 23\n'
+            for binary_name, uid, expected in (
+                    ('install_update_comprehensive-fixture', '0', '65534'),
+                    ('install_update_comprehensive-fixture', '1000', '1000'),
+                    ('other-fixture', '0', '0')):
+                with self.subTest(binary=binary_name, uid=uid):
+                    binary = root / binary_name
+                    binary.write_bytes(payload.encode())
+                    binary.chmod(0o755)
+                    environment = dict(os.environ, PATH=shell_path(bins) + ':/usr/bin:/bin',
+                                       FIXTURE_UID=uid)
+                    result = subprocess.run([bash, '-c',
+                                             'export PATH="$1:/usr/bin:/bin"; shift; exec "$@"',
+                                             'fixture', shell_path(bins), shell_path(Path(bash)),
+                                             shell_path(runner), shell_path(binary),
+                                             'literal argument with spaces'], env=environment,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 23, result.stderr)
+                    self.assertEqual(result.stdout.splitlines(),
+                                     [expected, 'literal argument with spaces'])
 
 
 if __name__ == '__main__':

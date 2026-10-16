@@ -79,7 +79,8 @@
         "security_daemon_optional",
         "daemon_e2e_caching",
         "daemon_e2e_concurrency",
-        "init_daemon_startup"
+        "init_daemon_startup",
+        "install_update_comprehensive"
       ]
     },
     {

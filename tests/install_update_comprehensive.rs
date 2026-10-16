@@ -18,9 +18,9 @@
 //!
 //! Harness contract: `run_omg` sets `OMG_TEST_MODE=1`, which routes the
 //! package-manager trait to the mock backend seeded with pacman/firefox/git
-//! (src/package_managers/mock.rs `MockPackageDb::arch_defaults`). Surfaces
-//! that bypass the trait (`info`, `install --dry-run`) read real ALPM data
-//! and the AUR RPC instead.
+//! (src/package_managers/mock.rs `MockPackageDb::arch_defaults`). Official
+//! package info and previews use that isolated index. Local archive previews
+//! read real package metadata against a private ALPM root.
 //!
 //! Run: cargo test --test install_update_comprehensive --features arch
 //!
@@ -130,6 +130,63 @@ fn run_omg_with_env(args: &[&str], env_vars: &[(&str, &str)]) -> TestResult {
         stderr: result.stderr,
         exit_code: result.exit_code,
     }
+}
+
+fn run_in_project(project: &common::TestProject, args: &[&str]) -> TestResult {
+    let result = project.run_with_env(args, &[("NO_COLOR", "1")]);
+    TestResult {
+        success: result.success,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exit_code: result.exit_code,
+    }
+}
+
+fn assert_preview_rows(result: &TestResult, expected: &[(&str, &str, &str)]) {
+    result.assert_success();
+    result.assert_contains("Install Preview");
+    result.assert_contains("No changes will be made (dry run)");
+    let rows: Vec<_> = result
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<_> = line.split(['│', '┆']).map(str::trim).collect();
+            if cells.len() == 6 && cells[1] != "Package" {
+                Some((cells[1], cells[2], cells[4].trim_start_matches('✓').trim()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(rows, expected, "preview package/version/source rows");
+}
+
+fn assert_no_installed_packages(project: &common::TestProject) {
+    let inventory = project.run(&["explicit", "--json"]);
+    inventory.assert_success();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&inventory.stdout).unwrap(),
+        serde_json::json!({"packages": [], "count": 0})
+    );
+    assert!(!project.data_dir.path().join("history.json").exists());
+}
+
+fn write_preview_package(path: &std::path::Path) {
+    let pkginfo = b"pkgname = vim\npkgbase = vim\nxdata = pkgtype=pkg\npkgver = 9.1.0001-1\npkgdesc = preview fixture\nurl = https://example.invalid/\nbuilddate = 1700000000\npackager = fixture\nsize = 4096\narch = x86_64\nlicense = MIT\n";
+    let file = std::fs::File::create(path).unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    {
+        let mut archive = tar::Builder::new(&mut encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_path(".PKGINFO").unwrap();
+        header.set_size(pkginfo.len() as u64);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append(&header, pkginfo.as_slice()).unwrap();
+        archive.finish().unwrap();
+    }
+    encoder.finish().unwrap().sync_all().unwrap();
 }
 
 fn system_tests_enabled() -> bool {
@@ -242,12 +299,13 @@ mod install_resolution_tests {
 
     #[test]
     fn test_install_dry_run_shows_packages() {
-        if !system_tests_enabled() {
-            return;
-        }
-        let result = run_omg(&["install", "--dry-run", "vim"]);
-        result.assert_success();
-        result.assert_contains("vim");
+        let project = common::TestProject::for_distro("arch");
+        project.mock_available("vim", "9.1.0001").unwrap();
+        assert_no_installed_packages(&project);
+        let result = run_in_project(&project, &["install", "--dry-run", "vim"]);
+        assert_preview_rows(&result, &[("vim", "9.1.0001", "Official")]);
+        assert_no_installed_packages(&project);
+        project.close_checked();
     }
 
     #[test]
@@ -688,24 +746,19 @@ mod e2e_workflow_tests {
 
     #[test]
     fn test_full_install_workflow_dry_run() {
-        if !system_tests_enabled() {
-            return;
-        }
-
-        // Complete workflow: search -> info -> install --dry-run. Search hits
-        // the mock official index (seeded: pacman/firefox/git); info and
-        // dry-run read real ALPM data.
-        let search = run_omg(&["search", "git"]);
+        let project = common::TestProject::for_distro("arch");
+        project.mock_available("vim", "9.1.0001").unwrap();
+        assert_no_installed_packages(&project);
+        let search = run_in_project(&project, &["search", "git"]);
         search.assert_success();
         search.assert_contains("git");
-
-        let info = run_omg(&["info", "pacman"]);
+        let info = run_in_project(&project, &["info", "pacman"]);
         info.assert_success();
         info.assert_contains("Description");
-
-        let install = run_omg(&["install", "--dry-run", "vim"]);
-        install.assert_success();
-        install.assert_contains("vim");
+        let install = run_in_project(&project, &["install", "--dry-run", "vim"]);
+        assert_preview_rows(&install, &[("vim", "9.1.0001", "Official")]);
+        assert_no_installed_packages(&project);
+        project.close_checked();
     }
 
     #[test]
@@ -731,16 +784,35 @@ mod e2e_workflow_tests {
 
     #[test]
     fn test_install_multiple_packages_mixed_sources() {
-        if !system_tests_enabled() {
-            return;
+        let project = common::TestProject::for_distro("arch");
+        project.mock_available("vim", "9.1.0001").unwrap();
+        for directory in ["var/lib/pacman/local", "var/lib/pacman/sync"] {
+            std::fs::create_dir_all(project.pacman_root.path().join(directory)).unwrap();
         }
-
-        // Every requested package must appear in the dry-run preview table.
-        let result = run_omg(&["install", "--dry-run", "firefox", "vim", "git"]);
-        result.assert_success();
-        result.assert_contains("firefox");
-        result.assert_contains("vim");
-        result.assert_contains("git");
+        let archive = project.path().join("decoy-1.0-1-x86_64.pkg.tar.gz");
+        write_preview_package(&archive);
+        assert_no_installed_packages(&project);
+        let result = run_in_project(
+            &project,
+            &[
+                "install",
+                "--dry-run",
+                "--allow-local-file",
+                "firefox",
+                archive.to_str().unwrap(),
+                "git",
+            ],
+        );
+        assert_preview_rows(
+            &result,
+            &[
+                ("firefox", "122.0", "Official"),
+                ("vim", "9.1.0001-1", "Local archive"),
+                ("git", "2.43.0", "Official"),
+            ],
+        );
+        assert_no_installed_packages(&project);
+        project.close_checked();
     }
 
     #[test]
@@ -1104,30 +1176,24 @@ mod command_integration_tests {
 
     #[test]
     fn test_multiple_commands_in_sequence() {
-        if !system_tests_enabled() {
-            return;
-        }
-
-        // Realistic CLI usage session; each command must deliver its own
-        // observable result, not merely avoid panicking.
-        let status = run_omg(&["status"]);
+        let project = common::TestProject::for_distro("arch");
+        project.mock_available("vim", "9.1.0001").unwrap();
+        assert_no_installed_packages(&project);
+        let status = run_in_project(&project, &["status"]);
         status.assert_success();
-        status.assert_contains("packages installed");
-
-        let search = run_omg(&["search", "firefox"]);
+        status.assert_contains("0 packages installed");
+        let search = run_in_project(&project, &["search", "firefox"]);
         search.assert_success();
         search.assert_contains("firefox");
-
-        let info = run_omg(&["info", "pacman"]);
+        let info = run_in_project(&project, &["info", "pacman"]);
         info.assert_success();
         info.assert_contains("Description");
-
-        let install = run_omg(&["install", "--dry-run", "vim"]);
-        install.assert_success();
-        install.assert_contains("(dry run)");
-
-        let update = run_omg(&["update", "--check"]);
+        let install = run_in_project(&project, &["install", "--dry-run", "vim"]);
+        assert_preview_rows(&install, &[("vim", "9.1.0001", "Official")]);
+        let update = run_in_project(&project, &["update", "--check"]);
         update.assert_success();
         update.assert_reports_update_status();
+        assert_no_installed_packages(&project);
+        project.close_checked();
     }
 }
