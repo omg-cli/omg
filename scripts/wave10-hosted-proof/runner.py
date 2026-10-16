@@ -12,6 +12,7 @@ import stat
 import subprocess
 import threading
 import time
+import tomllib
 
 
 def require(condition, message):
@@ -237,7 +238,17 @@ def artifact(raw, repo, target, plan):
                   and x.get("target", {}).get("name") == "omg_lib" and x.get("executable")]
     require(len(candidates) == 1, "ambiguous owning library artifact")
     row = candidates[0]
-    require(row["package_id"] == f"path+{repo.as_uri()}#omg@{plan['package_version']}", "root package identity")
+    manifest = repo / "Cargo.toml"
+    require(row.get("manifest_path") == str(manifest), "root manifest identity")
+    manifest_raw = manifest.read_bytes()
+    require(digest(manifest_raw) == plan["source_pins"]["Cargo.toml"], "root manifest pin")
+    package = tomllib.loads(manifest_raw.decode())["package"]
+    require(package.get("name") == "omg" and package.get("version") == plan["package_version"],
+            "root manifest package")
+    identities = {f"path+{repo.as_uri()}#omg@{plan['package_version']}"}
+    if repo.name == "omg":
+        identities.add(f"path+{repo.as_uri()}#{plan['package_version']}")
+    require(row["package_id"] in identities, "root package identity")
     require(row["target"]["kind"] == ["lib"] and Path(row["target"]["src_path"]).resolve() == repo / "src/lib.rs",
             "owning library source identity")
     require(row["fresh"] is False, "fresh library compiler artifact required")
