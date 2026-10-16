@@ -1187,7 +1187,7 @@ mod new_features {
     fn test_ci_init_github() {
         let project = TestProject::for_distro("debian");
         let result = project.run_with_env(
-            &["ci", "init", "--provider", "github"],
+            &["ci", "init", "github"],
             &[("NO_COLOR", "1")],
         );
         assert!(!result.stderr_contains("panicked at"), "Should not panic");
@@ -1210,7 +1210,7 @@ mod new_features {
         }
         project.create_file(".github/workflows/ci.yml", "name: Keep authored workflow\n");
         let existing = project.run_with_env(
-            &["ci", "init", "--provider", "github"],
+            &["ci", "init", "github"],
             &[("NO_COLOR", "1")],
         );
         existing.assert_success();
