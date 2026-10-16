@@ -242,11 +242,10 @@ mod tests {
     #[test]
     fn test_cmd_exec() {
         let cmd: Cmd<String> = Cmd::exec(|| "result".to_string());
-        let mut result = None;
+        assert!(matches!(cmd, Cmd::Exec(_)));
         if let Cmd::Exec(execute) = cmd {
-            result = Some(execute());
+            assert_eq!(execute(), "result");
         }
-        assert_eq!(result.as_deref(), Some("result"));
     }
 
     #[test]
