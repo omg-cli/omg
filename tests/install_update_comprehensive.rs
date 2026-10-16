@@ -242,9 +242,6 @@ mod install_resolution_tests {
 
     #[test]
     fn test_install_dry_run_shows_packages() {
-        if !system_tests_enabled() {
-            return;
-        }
         let result = run_omg(&["install", "--dry-run", "vim"]);
         result.assert_success();
         result.assert_contains("vim");
@@ -688,10 +685,6 @@ mod e2e_workflow_tests {
 
     #[test]
     fn test_full_install_workflow_dry_run() {
-        if !system_tests_enabled() {
-            return;
-        }
-
         // Complete workflow: search -> info -> install --dry-run. Search hits
         // the mock official index (seeded: pacman/firefox/git); info and
         // dry-run read real ALPM data.
@@ -731,10 +724,6 @@ mod e2e_workflow_tests {
 
     #[test]
     fn test_install_multiple_packages_mixed_sources() {
-        if !system_tests_enabled() {
-            return;
-        }
-
         // Every requested package must appear in the dry-run preview table.
         let result = run_omg(&["install", "--dry-run", "firefox", "vim", "git"]);
         result.assert_success();
@@ -1104,10 +1093,6 @@ mod command_integration_tests {
 
     #[test]
     fn test_multiple_commands_in_sequence() {
-        if !system_tests_enabled() {
-            return;
-        }
-
         // Realistic CLI usage session; each command must deliver its own
         // observable result, not merely avoid panicking.
         let status = run_omg(&["status"]);
