@@ -206,8 +206,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             if oldline in before and before[oldline] > 0 and after.get(newline, 0) == 0:
                 raise ValueError("Retained covered line lost coverage or mapping")
         retained_new = set(retained.values())
-        if any(count == 0 and line not in retained_new for line, count in after.items()):
-            raise ValueError("New uncovered instrumented line")
+        uncovered = next((line for line, count in after.items()
+                          if count == 0 and line not in retained_new), None)
+        if uncovered is not None:
+            raise ValueError(f"New uncovered instrumented line: {name}:{uncovered}")
         removed[name] = gone
         deleted_mapped += sum(line in gone for line in before)
         deleted_hit += sum(line in gone and count > 0 for line, count in before.items())
