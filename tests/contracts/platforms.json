@@ -80,7 +80,8 @@
         "daemon_e2e_caching",
         "daemon_e2e_concurrency",
         "init_daemon_startup",
-        "install_update_comprehensive"
+        "install_update_comprehensive",
+        "update_integration"
       ]
     },
     {

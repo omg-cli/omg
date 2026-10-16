@@ -261,7 +261,7 @@ def cargo_test_args(features):
               'e2e_runtime_management', 'env_lockfile_integrity',
               'daemon_e2e_caching', 'daemon_e2e_concurrency', 'init_daemon_startup']
     if 'arch' in active:
-        suites.append('install_update_comprehensive')
+        suites.extend(['install_update_comprehensive', 'update_integration'])
     if active & {'arch', 'debian', 'debian-pure', 'fedora'}:
         suites.append('cli_comprehensive')
     if active & {'arch', 'debian', 'fedora'}:
