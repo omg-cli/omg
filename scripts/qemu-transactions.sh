@@ -75,6 +75,34 @@ remote_argv() {
   printf -v command '%q ' "$@"
   ssh_guest "$command"
 }
+handler_observation() {
+  local diagnostic_phase=$1 diagnostic_exit=0
+  remote_argv timeout --kill-after=2s 5s sudo -n python3 - "$diagnostic_phase" "$boot_id" \
+    >> "$trial/boot.log" 2>/dev/null <<'PY' || diagnostic_exit=$?
+import datetime,hashlib,json,re,sys
+phase,expected=sys.argv[1:]
+row=dict(kind="kernel-handler-identity",phase=phase,observed_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),expected_boot_id=expected,boot_id=None,status="unavailable",error=None,bytes=None,sha256=None)
+def read(path,limit):
+    with open(path,"rb") as stream: data=stream.read(limit+1)
+    if len(data)>limit: raise OverflowError
+    return data.decode("utf-8","strict").strip()
+try:
+    row["boot_id"]=read("/proc/sys/kernel/random/boot_id",128)
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",expected) or row["boot_id"]!=expected:
+        row["error"]="boot-mismatch"
+    else:
+        value=read("/proc/sys/kernel/core_pattern",4096).encode("utf-8")
+        row.update(status="observed",bytes=len(value),sha256=hashlib.sha256(value).hexdigest())
+except OSError: row["error"]="read-error"
+except UnicodeError: row["error"]="invalid-utf8"
+except OverflowError: row["error"]="oversized-input"
+print(json.dumps(row,separators=(",",":"),sort_keys=True))
+PY
+  if [[ "$diagnostic_exit" != 0 ]]; then
+    printf '{"kind":"kernel-handler-identity","phase":"%s","expected_boot_id":"%s","status":"transport-error","transport_exit":%s}\n' \
+      "$diagnostic_phase" "$boot_id" "$diagnostic_exit" >> "$trial/boot.log"
+  fi
+}
 stop_guest() {
   local pid state
   pid=$(<qemu.pid)
@@ -261,6 +289,7 @@ for operation in install remove; do
       mv "$output/results.next.json" "$output/results.json"
       token=$(remote_argv cat /proc/sys/kernel/random/uuid)
       printf '%s\n' "$token" | ssh_guest 'sudo -n tee /run/omg-qemu-benchmark >/dev/null; sudo -n chmod 444 /run/omg-qemu-benchmark'
+      handler_observation before-measurement
       phase=measurement
       code=0
       remote_argv env "OMG_BENCH_BINARY=$bin" \
@@ -305,6 +334,7 @@ for operation in install remove; do
       if [[ -f "$output/$operation-manual-before.names" ]]; then
         cmp "$output/$operation-manual-before.names" "$evidence/manual-before.names"
       else cp "$evidence/manual-before.names" "$output/$operation-manual-before.names"; fi
+      handler_observation before-health
       phase=cleanup
       remote_argv sudo -n python3 - collect < /work/check-qemu-health.py \
         > "$trial/health.json" 2> "$trial/health.log"

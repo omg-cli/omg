@@ -312,7 +312,32 @@ jobs:
             features: arch,pgp,license
             setup: |
               pacman -Syu --noconfirm
-              pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python fish
+              setup_log=$(mktemp)
+              trap 'rm -f "$setup_log"' 0
+              for setup_attempt in 1 2; do
+                if pacman -S --noconfirm --needed base-devel git pkgconf openssl libarchive clang cmake curl jq python fish > "$setup_log" 2>&1; then
+                  cat "$setup_log"
+                  break
+                else
+                  setup_status=$?
+                fi
+                cat "$setup_log" || exit "$setup_status"
+                if [ "$setup_attempt" = 2 ]; then
+                  exit "$setup_status"
+                fi
+                if ! awk '
+                  { previous = last; last = $0 }
+                  END {
+                    retrieval = "error: failed to commit transaction (failed to retrieve some files)"
+                    trailer = "Errors occurred, no packages were upgraded."
+                    exit !(last == retrieval || (last == trailer && previous == retrieval))
+                  }
+                ' "$setup_log"; then
+                  exit "$setup_status"
+                fi
+                printf 'Retrying dependency retrieval after failed attempt %s/2\n' "$setup_attempt" >&2
+                sleep 2
+              done
             rust_install: |
               curl --proto '=https' --tlsv1.2 -fsSL \
                 https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
