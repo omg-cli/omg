@@ -1487,6 +1487,21 @@ jobs:
       - name: Build release
         run: python3 scripts/native-build-artifact.py build --distro ubuntu --image ubuntu-24.04 --features debian,pgp,license --destination "$RUNNER_TEMP/native-release"
 
+      - name: Selected ordinary Node Linux RED proof
+        timeout-minutes: 12
+        env:
+          PR940_RED_OUT: ${{ runner.temp }}/pr940-node-linux-red-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 -I -B scripts/pr940-node-linux-red-proof.py
+
+      - name: Preserve selected ordinary Node Linux RED proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr940-node-linux-red-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr940-node-linux-red-${{ github.run_id }}-${{ github.run_attempt }}/
+          retention-days: 14
+          if-no-files-found: error
+
       - name: Verify complete native APT daemon catalogue
         shell: bash
         run: |

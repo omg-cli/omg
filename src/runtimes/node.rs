@@ -481,31 +481,13 @@ mod terminal_group {
     }
 }
 
-fn node_probe_exit_observed(group: nix::unistd::Pid) -> Result<bool> {
-    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
-    let pid = Pid::from_raw(group.as_raw()).context("Invalid Node.js probe process ID")?;
-    Ok(waitid(
-        WaitId::Pid(pid),
-        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-    )
-    .context("Failed to observe Node.js probe exit")?
-    .is_some())
-}
-
-async fn observe_node_probe_exit(group: nix::unistd::Pid) -> Result<()> {
-    while !node_probe_exit_observed(group)? {
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-    Ok(())
-}
-
 async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Duration) -> Result<()> {
     probe_node_with_signals(
         directory,
         expected,
         deadline,
         |group| nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL),
-        tokio::process::Child::start_kill,
+        |child| child.start_kill(),
     )
     .await
 }
@@ -556,6 +538,17 @@ async fn probe_node_with_signals(
     let owned_leader = terminal_group::macos::capture(group.as_raw());
     // Keep the leader unreaped until group cleanup. Its PID then cannot be
     // recycled while a descendant still holds a probe output pipe open.
+    let mut exit_observer = tokio::task::spawn_blocking(move || {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        let pid = Pid::from_raw(group.as_raw()).context("Invalid Node.js probe process ID")?;
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        )
+        .context("Failed to observe Node.js probe exit")?
+        .context("Node.js probe exit was not reported")?;
+        Ok::<_, anyhow::Error>(())
+    });
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let read_output = |stream: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>| async move {
@@ -570,13 +563,18 @@ async fn probe_node_with_signals(
         );
         Ok::<_, anyhow::Error>(bytes)
     };
+    let mut exit_observed = false;
     let capture = tokio::time::timeout(deadline, async {
         let stdout = stdout.context("Missing Node.js version probe stdout")?;
         let stderr = stderr.context("Missing Node.js version probe stderr")?;
         tokio::try_join!(
             read_output(Box::pin(stdout)),
             read_output(Box::pin(stderr)),
-            observe_node_probe_exit(group)
+            async {
+                let result = (&mut exit_observer).await;
+                exit_observed = true;
+                result.context("Node.js probe exit observer panicked")?
+            }
         )
     })
     .await
@@ -585,35 +583,11 @@ async fn probe_node_with_signals(
 
     // Every post-spawn path terminates the isolated group before reaping the
     // leader, including bounded-read failures and inherited-pipe timeouts.
-    let cleanup_end = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    let observation_end = cleanup_end - std::time::Duration::from_millis(250);
-    let group_signal = signal_group(group);
-    let leader_cleanup = if group_signal.is_err() && group_signal != Err(nix::errno::Errno::ESRCH) {
-        node_probe_exit_observed(group).and_then(|terminal| {
-            if terminal {
-                Ok(())
-            } else {
-                signal_leader(&mut child).context("Failed to terminate Node.js probe leader")
-            }
-        })
-    } else {
-        Ok(())
-    };
-    let observer_cleanup = tokio::time::timeout_at(observation_end, observe_node_probe_exit(group))
-        .await
-        .context("Node.js probe exit observation timed out during cleanup")
-        .and_then(std::convert::identity);
-    let group_cleanup = match group_signal {
+    let group_cleanup = match signal_group(group) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
         #[cfg(target_os = "macos")]
         Err(error @ nix::errno::Errno::EPERM) => {
-            let proof = match &observer_cleanup {
-                Ok(()) => terminal_group::macos::prove(&owned_leader, group.as_raw()),
-                Err(error) => Err(anyhow::anyhow!(
-                    "Node.js probe leader exit was not observed: {error:#}"
-                )),
-            };
-            proof.with_context(|| {
+            terminal_group::macos::prove(&owned_leader, group.as_raw()).with_context(|| {
                 format!(
                     "Failed to terminate Node.js probe process group ({error}); terminal-state proof rejected"
                 )
@@ -621,40 +595,27 @@ async fn probe_node_with_signals(
         }
         Err(error) => Err(error).context("Failed to terminate Node.js probe process group"),
     };
-    let status = tokio::time::timeout_at(cleanup_end, child.wait())
+    let leader_cleanup = if group_cleanup.is_err() {
+        signal_leader(&mut child)
+    } else {
+        Ok(())
+    };
+    let observer_cleanup = if exit_observed {
+        Ok(())
+    } else {
+        exit_observer
+            .await
+            .context("Node.js probe exit observer panicked")
+            .and_then(std::convert::identity)
+    };
+    let status = child
+        .wait()
         .await
-        .context("Node.js probe reap timed out during cleanup")
-        .and_then(|status| status.context("Failed to reap Node.js version probe"));
-    #[cfg(target_os = "macos")]
-    let leader_cleanup = match leader_cleanup {
-        Err(error)
-            if group_signal == Err(nix::errno::Errno::EPERM)
-                && group_cleanup.is_ok()
-                && observer_cleanup.is_ok()
-                && status.is_ok()
-                && error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.raw_os_error() == Some(nix::libc::ESRCH)) =>
-        {
-            Ok(())
-        }
-        result => result,
-    };
-    let status = match group_cleanup
-        .and(leader_cleanup)
-        .and(observer_cleanup)
-        .and(status)
-    {
-        Ok(status) => status,
-        Err(error) => {
-            return Err(match &capture {
-                Err(capture_error) => error.context(format!(
-                    "Node.js probe capture also failed: {capture_error:#}"
-                )),
-                Ok(_) => error,
-            });
-        }
-    };
+        .context("Failed to reap Node.js version probe");
+    group_cleanup?;
+    leader_cleanup.context("Failed to terminate Node.js probe leader")?;
+    observer_cleanup?;
+    let status = status?;
     let (stdout, stderr, ()) = capture?;
     anyhow::ensure!(
         status.success(),
@@ -2286,7 +2247,7 @@ mod tests {
         );
         Ok(())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[derive(Clone, Copy)]
     enum NodeCleanupCase {
         Live,
@@ -2295,7 +2256,7 @@ mod tests {
         ExitRaceEio,
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn cleanup_probe_exit_ready(pid: i32) -> Result<bool> {
         use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
         let pid = Pid::from_raw(pid).context("invalid fixture PID")?;
@@ -2306,7 +2267,7 @@ mod tests {
         .is_some())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn release_cleanup_probe(root: &Path, pid: i32) -> Result<()> {
         use std::io::Write as _;
         use std::os::fd::FromRawFd as _;
@@ -2345,7 +2306,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn assert_node_cleanup_boundary(case: NodeCleanupCase) -> Result<()> {
         use std::os::unix::ffi::OsStrExt as _;
         let directory = tempfile::tempdir()?;
@@ -2431,12 +2392,30 @@ mod tests {
         );
         let error = result.expect_err("oversized probe must never be accepted");
         let message = format!("{error:#}");
-        let expected = if matches!(case, NodeCleanupCase::ExitRaceEio) {
-            "Failed to terminate Node.js probe leader"
-        } else {
-            "exceeds 4096"
-        };
-        assert!(message.contains(expected), "wrong refusal: {message}");
+        #[cfg(target_os = "macos")]
+        {
+            let expected = if matches!(case, NodeCleanupCase::ExitRaceEio) {
+                "Failed to terminate Node.js probe leader"
+            } else {
+                "exceeds 4096"
+            };
+            assert!(message.contains(expected), "wrong refusal: {message}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                message.contains("Node.js version probe output exceeds 4096 bytes"),
+                "capture refusal was lost: {message}"
+            );
+            assert!(
+                message.contains("Failed to terminate Node.js probe process group"),
+                "group refusal was lost: {message}"
+            );
+            assert_eq!(
+                error.downcast_ref::<nix::errno::Errno>(),
+                Some(&nix::errno::Errno::EPERM)
+            );
+        }
         assert_eq!(
             leader_calls.get(),
             if matches!(case, NodeCleanupCase::AlreadyTerminal) {
@@ -2482,5 +2461,95 @@ mod tests {
     #[tokio::test]
     async fn node_cleanup_racing_exit_eio_remains_failure() -> Result<()> {
         assert_node_cleanup_boundary(NodeCleanupCase::ExitRaceEio).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_linux_cleanup_live_overflow_injected_group_eperm() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::Live).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_linux_cleanup_already_terminal_skips_direct_signal() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::AlreadyTerminal).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_linux_cleanup_racing_exit_esrch_retains_overflow() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::ExitRaceEsrch).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_linux_cleanup_racing_exit_eio_retains_group_failure() -> Result<()> {
+        assert_node_cleanup_boundary(NodeCleanupCase::ExitRaceEio).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_linux_cleanup_valid_output_retains_group_failure() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        write_node_probe(
+            directory.path(),
+            r#"printf '%s\n' "$$" > probe.pid; printf READY > probe.ready; printf 'v22.0.0\n'"#,
+            true,
+        )?;
+        let group_errors = std::cell::RefCell::new(Vec::new());
+        let groups = std::cell::RefCell::new(Vec::new());
+        let leader_calls = std::cell::Cell::new(0);
+        let result = probe_node_with_signals(
+            directory.path(),
+            "22.0.0",
+            std::time::Duration::from_secs(5),
+            |group| {
+                groups.borrow_mut().push(group.as_raw());
+                let observed = cleanup_probe_exit_ready(group.as_raw()).and_then(|ready| {
+                    anyhow::ensure!(
+                        ready,
+                        "valid-output leader was not terminal at group cleanup"
+                    );
+                    Ok(())
+                });
+                if let Err(error) = observed {
+                    group_errors.borrow_mut().push(format!("{error:#}"));
+                }
+                Err(nix::errno::Errno::EPERM)
+            },
+            |child| {
+                leader_calls.set(leader_calls.get() + 1);
+                child.start_kill()
+            },
+        )
+        .await;
+        anyhow::ensure!(
+            group_errors.borrow().is_empty(),
+            "HARNESS valid-output precondition failed after cleanup: group={:?} result={result:?}",
+            group_errors.borrow()
+        );
+        let error = result.expect_err("valid output must not hide failed group cleanup");
+        assert_eq!(
+            error.to_string(),
+            "Failed to terminate Node.js probe process group"
+        );
+        assert_eq!(
+            error.downcast_ref::<nix::errno::Errno>(),
+            Some(&nix::errno::Errno::EPERM)
+        );
+        assert_eq!(leader_calls.get(), 0);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("probe.ready"))?,
+            "READY"
+        );
+        let pid: i32 = fs::read_to_string(directory.path().join("probe.pid"))?
+            .trim()
+            .parse()?;
+        assert_eq!(*groups.borrow(), [pid]);
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        Ok(())
     }
 }
