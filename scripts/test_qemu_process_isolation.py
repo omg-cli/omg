@@ -39,7 +39,7 @@ class QemuProcessIsolationTests(unittest.TestCase):
                         self.assertNotIn('-global', arguments)
                     for retained in ('user=65534:65534', 'on,obsolete=deny,spawn=deny,resourcecontrol=deny',
                                      'file:serial.log', 'file=disk.qcow2,if=virtio,format=qcow2',
-                                     'file=seed.img,if=virtio,format=raw', 'virtio-net-pci,netdev=n,romfile='):
+                                     'file=seed.img,if=virtio,format=raw', 'virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile='):
                         self.assertIn(retained, arguments)
                     self.assertEqual('if=pflash,format=raw,file=vars.fd' in arguments, firmware == 'uefi')
 
@@ -80,7 +80,7 @@ class QemuProcessIsolationTests(unittest.TestCase):
                     self.assertNotIn('-vga', arguments)
                     self.assertEqual(arguments[arguments.index('-display') + 1], 'none')
                     self.assertEqual(arguments[arguments.index('-serial') + 1], 'file:serial.log')
-                    self.assertIn('virtio-net-pci,netdev=n,romfile=', arguments)
+                    self.assertIn('virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile=', arguments)
                     self.assertIn('user=65534:65534', arguments)
                     self.assertIn('on,obsolete=deny,spawn=deny,resourcecontrol=deny', arguments)
 

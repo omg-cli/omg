@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import hashlib
 import importlib.util
 import json
@@ -453,21 +454,24 @@ class QemuCloudInitTests(unittest.TestCase):
         self.text = script.read_text(encoding="utf-8")
         self.bash = os.environ.get("OMG_TEST_BASH") or "/bin/bash"
 
-    def test_generated_seed_preserves_hostname_and_pins_host_key(self) -> None:
+    def generate_seed(self, root: Path) -> str:
         seed = self.text.split("ssh-keygen -q -t ed25519 -N '' -f guest-host-key\n", 1)[1]
         seed = seed.split("cloud-localds seed.img user-data meta-data", 1)[0]
+        (root / "client-key.pub").write_text("ssh-ed25519 fixture-client\n")
+        (root / "guest-host-key").write_text("fixture-private-key\n")
+        (root / "guest-host-key.pub").write_text("ssh-ed25519 fixture-host\n")
+        result = subprocess.run(
+            [self.bash, "-euo", "pipefail", "-c", seed],
+            cwd=root, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return (root / "user-data").read_text()
+
+    def test_generated_seed_preserves_hostname_and_pins_host_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "client-key.pub").write_text("ssh-ed25519 fixture-client\n")
-            (root / "guest-host-key").write_text("fixture-private-key\n")
-            (root / "guest-host-key.pub").write_text("ssh-ed25519 fixture-host\n")
-            result = subprocess.run(
-                [self.bash, "-euo", "pipefail", "-c", seed],
-                cwd=root, capture_output=True, text=True, timeout=10,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
+            seed_text = self.generate_seed(root)
             self.assertIn("\npreserve_hostname: true\n", (root / "user-data").read_text())
-            seed_text = (root / "user-data").read_text()
             self.assertIn("path: /etc/systemd/system/omg-boot-network.service", seed_text)
             self.assertIn("TTYPath=/dev/ttyS0", seed_text)
             self.assertIn("TimeoutStartSec=15", seed_text)
@@ -479,6 +483,74 @@ class QemuCloudInitTests(unittest.TestCase):
                 (root / "known_hosts").read_text(),
                 "[127.0.0.1]:2222 ssh-ed25519 fixture-host\n",
             )
+
+    def boot_command(self, seed: str, root: Path, distro: str) -> str:
+        block = seed.split("bootcmd:\n  - |\n", 1)[1].split("write_files:\n", 1)[0]
+        command = "\n".join(line.removeprefix("    ") for line in block.splitlines())
+        release = root / "os-release"
+        release.write_text(f"ID={distro}\n")
+        command = command.replace("/etc/os-release", shlex.quote(str(release)))
+        command = command.replace("/etc/systemd/network", shlex.quote(str(root / "network")))
+        return "systemctl() { printf 'not-found\\n'; }\n" + command
+
+    def test_generated_bootcmd_persists_static_network_only_for_arch(self) -> None:
+        for distro in ("arch", "debian", "fedora"):
+            with self.subTest(distro=distro), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                seed = self.generate_seed(root)
+                network = root / "network"
+                command = self.boot_command(seed, root, distro)
+                for _ in range(2):
+                    result = subprocess.run(["/bin/sh", "-c", command],
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    if distro != "arch":
+                        self.assertFalse(network.exists())
+                        continue
+                    config = network / "05-omg-qemu.network"
+                    self.assertTrue(config.is_file(), "Arch clone has no persistent IPv4 configuration")
+                    parser = configparser.ConfigParser()
+                    parser.read(config)
+                    self.assertEqual(dict(parser["Match"]), {"macaddress": "52:54:00:12:34:56"})
+                    self.assertEqual(dict(parser["Link"]), {"requiredforonline": "no-carrier"})
+                    self.assertEqual(dict(parser["Network"]), {
+                        "gateway": "10.0.2.2", "dns": "10.0.2.3", "dhcp": "no",
+                        "ipv6acceptra": "no", "linklocaladdressing": "no",
+                        "configurewithoutcarrier": "yes",
+                    })
+                    self.assertEqual(dict(parser["Address"]), {
+                        "address": "10.0.2.15/24", "duplicateaddressdetection": "none",
+                    })
+                    self.assertEqual(config.stat().st_mode & 0o777, 0o644)
+                    self.assertFalse((network / "05-omg-qemu.network.tmp").exists())
+
+    def test_arch_network_install_failure_remains_fatal_without_errexit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = self.boot_command(self.generate_seed(root), root, "arch")
+            (root / "network").write_text("not a directory")
+            result = subprocess.run(["/bin/sh", "-c", command],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0, "cloud-init must reject a failed network install")
+
+    def test_generated_qemu_launch_pins_the_guest_network(self) -> None:
+        launch = 'nohup "$5" -machine' + self.text.split('nohup "$5" -machine', 1)[1].split("\n# Launch", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "qemu"
+            fixture.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$CAPTURE"\n')
+            fixture.chmod(0o755)
+            preamble = "firmware=(); legacy_apic=(); accel=kvm; vm_disk=disk; vm_serial=serial\n"
+            preamble += "set -- bios sshd unused unused " + shlex.quote(str(fixture)) + " q35 kvm host\n"
+            result = subprocess.run([self.bash, "-euo", "pipefail", "-c", preamble + launch + '\nwait "$!"\n'],
+                                    cwd=root, env=dict(os.environ, CAPTURE=str(root / "argv")),
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = (root / "argv").read_text().splitlines()
+            self.assertEqual(args[args.index("-netdev") + 1],
+                             "user,id=n,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,ipv6=off,hostfwd=tcp:127.0.0.1:2222-10.0.2.15:22")
+            self.assertEqual(args[args.index("-device") + 1],
+                             "virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile=")
 
     def test_guest_probe_runs_after_cloud_init_gate_and_keeps_failures_fatal(self) -> None:
         gate = 'bash /work/check-qemu-cloud-init.sh bench@127.0.0.1 "${opts[@]}"'

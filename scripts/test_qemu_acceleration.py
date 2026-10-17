@@ -37,7 +37,7 @@ class QemuAccelerationTests(unittest.TestCase):
         self.assertIn('qemu_cpu=host', source)
         self.assertIn('-machine "$6" -accel "$accel" -cpu "$8"', source)
         self.assertIn('accel=tcg,thread=multi', source)
-        self.assertIn('-device virtio-net-pci,netdev=n,romfile=', source)
+        self.assertIn('-device virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile=', source)
         self.assertNotIn('-machine "$6,accel=kvm" -cpu host', source)
 
     def test_cross_arch_tcg_uses_a_native_controller(self):
